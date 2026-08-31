@@ -5,6 +5,7 @@ use bota_proto::{
     WorldView,
 };
 
+use crate::feature::RaggedFeatureArena;
 use crate::{
     ABILITY_FEATURE_TOKENS, ABILITY_FEATURES, ActionKind, ActionSpace, FEATURE_SCHEMA_HASH,
     FEATURE_SCHEMA_VERSION, FeatureAuditConfig, FeatureEncoder, FeatureFrame, GLOBAL_FEATURES,
@@ -39,6 +40,52 @@ fn feature_schema_dimensions_and_hash_are_stable() {
     assert_eq!((PROJECTILE_FEATURE_TOKENS, PROJECTILE_FEATURES), (32, 20));
     assert_eq!((LOOT_FEATURE_TOKENS, LOOT_FEATURES), (16, 16));
     assert_eq!(MAP_FEATURES, 96);
+}
+
+#[test]
+fn ragged_feature_arena_roundtrips_exact_capacity_and_rejects_invalid_ranges() {
+    let mut frame = FeatureFrame::new();
+    for row in frame.units.iter_mut().chain(&mut frame.remembered_units) {
+        row[unit_feature::TOKEN_PRESENT] = 1.0;
+    }
+    for row in &mut frame.points {
+        row[point_feature::TOKEN_PRESENT] = 1.0;
+    }
+    for row in &mut frame.abilities {
+        row[ability_feature::TOKEN_PRESENT] = 1.0;
+    }
+    for row in &mut frame.items {
+        row[item_feature::TOKEN_PRESENT] = 1.0;
+    }
+    for row in &mut frame.projectiles {
+        row[projectile_feature::TOKEN_PRESENT] = 1.0;
+    }
+    for row in &mut frame.loot {
+        row[loot_feature::TOKEN_PRESENT] = 1.0;
+    }
+    let padded_rows = UNIT_FEATURE_TOKENS
+        + REMEMBERED_UNIT_FEATURE_TOKENS
+        + POINT_FEATURE_TOKENS
+        + ABILITY_FEATURE_TOKENS
+        + ITEM_FEATURE_TOKENS
+        + PROJECTILE_FEATURE_TOKENS
+        + LOOT_FEATURE_TOKENS;
+    let mut arena = RaggedFeatureArena::new(1);
+
+    let header = arena.push(&frame).expect("exact arena capacity");
+
+    assert_eq!(arena.stored_rows(), padded_rows);
+    assert_eq!(arena.expand(&header).expect("roundtrip"), frame);
+    assert_eq!(
+        arena.push(&frame).expect_err("second frame exceeds bound"),
+        "ragged feature arena capacity exceeded"
+    );
+    let mut malformed = header;
+    malformed.corrupt_unit_offset_for_test();
+    assert_eq!(
+        arena.expand(&malformed).expect_err("invalid offset"),
+        "ragged feature range is invalid"
+    );
 }
 
 #[test]

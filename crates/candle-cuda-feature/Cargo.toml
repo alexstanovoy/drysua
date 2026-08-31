@@ -1,0 +1,8 @@
+[package]
+name = "candle-cuda-feature"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+candle-core = { version = "0.11.0", default-features = false, features = ["cuda"] }

@@ -27,6 +27,9 @@ use crate::{
     TrainingSlot, unit_feature,
 };
 
+#[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
+use crate::PolicyDevice;
+
 #[test]
 fn unit_kind_tokens_enter_their_semantic_pool() {
     let groups = [
@@ -382,8 +385,8 @@ fn adam_rejects_invalid_config_nonfinite_and_extreme_updates_without_partial_sta
 
 #[test]
 fn model_schema_and_head_dimensions_are_stable() {
-    assert_eq!(MODEL_SCHEMA_VERSION, 3);
-    assert_eq!(MODEL_SCHEMA_HASH, 6_172_692_684_479_642_043);
+    assert_eq!(MODEL_SCHEMA_VERSION, 4);
+    assert_eq!(MODEL_SCHEMA_HASH, 9_866_443_454_266_023_146);
     assert_eq!(MODEL_KIND_HEAD, 16);
     assert_eq!(MODEL_UNIT_HEAD, 2);
     assert_eq!(MODEL_ABILITY_HEAD, 8);
@@ -502,6 +505,42 @@ fn initialization_is_seed_deterministic_for_parameters_and_outputs() {
     assert_ne!(
         first.evaluate(&frame).expect("first output"),
         different.evaluate(&frame).expect("different output")
+    );
+}
+
+#[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
+#[test]
+#[ignore = "requires a CUDA device"]
+fn cuda_model_runs_forward_backward_and_parameter_export_on_selected_device() {
+    let cpu = PolicyModel::fresh(17_002).expect("CPU model");
+    let gpu = PolicyModel::fresh_on(17_002, PolicyDevice::Cuda { ordinal: 0 }).expect("CUDA model");
+    let frame = populated_frame();
+
+    assert_eq!(gpu.device(), PolicyDevice::Cuda { ordinal: 0 });
+    assert_eq!(
+        cpu.export_parameters().expect("CPU parameters"),
+        gpu.export_parameters().expect("CUDA parameters")
+    );
+    assert_outputs_close(
+        &cpu.evaluate(&frame).expect("CPU output"),
+        &gpu.evaluate(&frame).expect("CUDA output"),
+        1.0e-4,
+    );
+
+    let sample = model_sample();
+    let mut adam = gpu
+        .claim_adam_for_test(AdamConfig::default())
+        .expect("CUDA Adam");
+    let report = gpu
+        .behavioral_update(&[&sample], &mut adam)
+        .expect("CUDA update");
+    assert_eq!(report.sample_count, 1);
+    assert_eq!(report.optimizer_step, 1);
+    assert!(
+        gpu.export_parameters()
+            .expect("updated CUDA parameters")
+            .iter()
+            .all(|value| value.is_finite())
     );
 }
 

@@ -6,12 +6,20 @@ edition = "2024"
 [features]
 default = []
 builtin = ["dep:bota-server"]
+cuda = ["dep:candle-cuda-feature"]
+metal = ["dep:candle-metal-feature"]
 
 [dependencies]
 bota-proto = { path = "../bota/crates/bota-proto", default-features = false }
 bota-server = { path = "../bota/crates/bota-server", default-features = false, optional = true }
 candle-core = { version = "0.11.0", default-features = false }
 clap = { version = "4.6.6", default-features = false, features = ["derive", "error-context", "help", "std", "suggestions", "usage"] }
+
+[target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
+candle-cuda-feature = { path = "crates/candle-cuda-feature", default-features = false, optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+candle-metal-feature = { path = "crates/candle-metal-feature", default-features = false, optional = true }
 
 [[bin]]
 name = "drysua"

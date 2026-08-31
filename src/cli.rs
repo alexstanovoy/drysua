@@ -1,4 +1,4 @@
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 
 /// Drysua command line arguments.
 #[derive(Parser)]
@@ -61,6 +61,12 @@ struct TrainArgs {
     /// Simulator map id, zero or one.
     #[arg(long, default_value_t = 1)]
     map: u16,
+    /// Learner tensor backend; actors and simulation remain on CPU.
+    #[arg(long, value_enum, default_value_t = LearnerDevice::Cpu)]
+    device: LearnerDevice,
+    /// CUDA or Metal device ordinal.
+    #[arg(long, default_value_t = 0)]
+    device_ordinal: usize,
 }
 
 /// Options for a short builtin self-play league verification run.
@@ -93,6 +99,19 @@ struct LeagueArgs {
     /// Simulator map id, zero or one.
     #[arg(long, default_value_t = 1)]
     map: u16,
+    /// Learner tensor backend; actors and simulation remain on CPU.
+    #[arg(long, value_enum, default_value_t = LearnerDevice::Cpu)]
+    device: LearnerDevice,
+    /// CUDA or Metal device ordinal.
+    #[arg(long, default_value_t = 0)]
+    device_ordinal: usize,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum LearnerDevice {
+    Cpu,
+    Cuda,
+    Metal,
 }
 
 /// Parses command line arguments and plays one match.
@@ -117,17 +136,21 @@ fn run(arguments: Cli) -> std::io::Result<()> {
 
 #[cfg(feature = "builtin")]
 fn run_league(arguments: LeagueArgs) -> std::io::Result<()> {
-    let report = crate::run_league_smoke(crate::LeagueSmokeConfig {
-        updates: arguments.updates,
-        environments: arguments.environments,
-        rollout_decisions: arguments.rollout,
-        epochs: arguments.epochs,
-        minibatch: arguments.minibatch,
-        evaluation_pairs: arguments.evaluation_pairs,
-        evaluation_decisions: arguments.evaluation_decisions,
-        seed: arguments.seed,
-        map: bota_proto::MapId(arguments.map),
-    })
+    let device = arguments.device.policy_device(arguments.device_ordinal)?;
+    let report = crate::run_league_smoke_on(
+        crate::LeagueSmokeConfig {
+            updates: arguments.updates,
+            environments: arguments.environments,
+            rollout_decisions: arguments.rollout,
+            epochs: arguments.epochs,
+            minibatch: arguments.minibatch,
+            evaluation_pairs: arguments.evaluation_pairs,
+            evaluation_decisions: arguments.evaluation_decisions,
+            seed: arguments.seed,
+            map: bota_proto::MapId(arguments.map),
+        },
+        device,
+    )
     .map_err(std::io::Error::other)?;
     println!(
         "league smoke: {} updates, {} transitions, opponents {:?}, {} paired seeds, {} policies, {} promotions, {} rejected evaluation actions",
@@ -151,15 +174,19 @@ fn run_league(_: LeagueArgs) -> std::io::Result<()> {
 
 #[cfg(feature = "builtin")]
 fn run_train(arguments: TrainArgs) -> std::io::Result<()> {
-    let report = crate::run_ppo_smoke(crate::PpoSmokeConfig {
-        updates: arguments.updates,
-        environments: arguments.environments,
-        rollout_decisions: arguments.rollout,
-        epochs: arguments.epochs,
-        minibatch: arguments.minibatch,
-        seed: arguments.seed,
-        map: bota_proto::MapId(arguments.map),
-    })
+    let device = arguments.device.policy_device(arguments.device_ordinal)?;
+    let report = crate::run_ppo_smoke_on(
+        crate::PpoSmokeConfig {
+            updates: arguments.updates,
+            environments: arguments.environments,
+            rollout_decisions: arguments.rollout,
+            epochs: arguments.epochs,
+            minibatch: arguments.minibatch,
+            seed: arguments.seed,
+            map: bota_proto::MapId(arguments.map),
+        },
+        device,
+    )
     .map_err(std::io::Error::other)?;
     println!(
         "PPO smoke: {} updates, {} transitions, optimizer step {}, policy loss {:.6}, value loss {:.6}, entropy {:.6}, KL {:.6}, {} rejected orders, {} arena ticks",
@@ -174,6 +201,48 @@ fn run_train(arguments: TrainArgs) -> std::io::Result<()> {
         report.elapsed_ticks,
     );
     Ok(())
+}
+
+#[cfg(feature = "builtin")]
+impl LearnerDevice {
+    fn policy_device(self, ordinal: usize) -> std::io::Result<crate::PolicyDevice> {
+        match self {
+            Self::Cpu => Ok(crate::PolicyDevice::Cpu),
+            Self::Cuda => cuda_policy_device(ordinal),
+            Self::Metal => metal_policy_device(ordinal),
+        }
+    }
+}
+
+#[cfg(all(
+    feature = "builtin",
+    feature = "cuda",
+    any(target_os = "linux", target_os = "windows")
+))]
+fn cuda_policy_device(ordinal: usize) -> std::io::Result<crate::PolicyDevice> {
+    Ok(crate::PolicyDevice::Cuda { ordinal })
+}
+
+#[cfg(all(
+    feature = "builtin",
+    not(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))
+))]
+fn cuda_policy_device(_: usize) -> std::io::Result<crate::PolicyDevice> {
+    Err(std::io::Error::other(
+        "CUDA learner requires cargo feature `cuda` on Linux or Windows",
+    ))
+}
+
+#[cfg(all(feature = "builtin", feature = "metal", target_os = "macos"))]
+fn metal_policy_device(ordinal: usize) -> std::io::Result<crate::PolicyDevice> {
+    Ok(crate::PolicyDevice::Metal { ordinal })
+}
+
+#[cfg(all(feature = "builtin", not(all(feature = "metal", target_os = "macos"))))]
+fn metal_policy_device(_: usize) -> std::io::Result<crate::PolicyDevice> {
+    Err(std::io::Error::other(
+        "Metal learner requires cargo feature `metal` on macOS",
+    ))
 }
 
 #[cfg(not(feature = "builtin"))]

@@ -613,6 +613,225 @@ impl Default for FeatureFrame {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct IndexedFeatureRow<const FEATURES: usize> {
+    index: u16,
+    values: [f32; FEATURES],
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FeatureRowRange {
+    offset: u32,
+    count: u16,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct RaggedFeatureHeader {
+    provenance: Option<FeatureFrameProvenance>,
+    global: [f32; GLOBAL_FEATURES],
+    history: [[f32; HISTORY_FEATURES]; HISTORY_SAMPLES],
+    policy_history: [[f32; POLICY_HISTORY_FEATURES]; MAX_POLICY_HISTORY],
+    own_units: [[f32; UNIT_FEATURES]; OWN_UNIT_FEATURE_TOKENS],
+    map: [f32; MAP_FEATURES],
+    units: FeatureRowRange,
+    remembered_units: FeatureRowRange,
+    points: FeatureRowRange,
+    abilities: FeatureRowRange,
+    items: FeatureRowRange,
+    projectiles: FeatureRowRange,
+    loot: FeatureRowRange,
+}
+
+#[cfg(test)]
+impl RaggedFeatureHeader {
+    pub(crate) fn corrupt_unit_offset_for_test(&mut self) {
+        self.units.offset = u32::MAX;
+    }
+}
+
+pub(crate) struct RaggedFeatureArena {
+    sample_capacity: usize,
+    units: Vec<IndexedFeatureRow<UNIT_FEATURES>>,
+    remembered_units: Vec<IndexedFeatureRow<UNIT_FEATURES>>,
+    points: Vec<IndexedFeatureRow<POINT_FEATURES>>,
+    abilities: Vec<IndexedFeatureRow<ABILITY_FEATURES>>,
+    items: Vec<IndexedFeatureRow<ITEM_FEATURES>>,
+    projectiles: Vec<IndexedFeatureRow<PROJECTILE_FEATURES>>,
+    loot: Vec<IndexedFeatureRow<LOOT_FEATURES>>,
+}
+
+impl RaggedFeatureArena {
+    pub(crate) fn new(sample_capacity: usize) -> Self {
+        Self {
+            sample_capacity,
+            units: Vec::new(),
+            remembered_units: Vec::new(),
+            points: Vec::new(),
+            abilities: Vec::new(),
+            items: Vec::new(),
+            projectiles: Vec::new(),
+            loot: Vec::new(),
+        }
+    }
+
+    pub(crate) fn push(
+        &mut self,
+        frame: &FeatureFrame,
+    ) -> Result<RaggedFeatureHeader, &'static str> {
+        let units = append_feature_rows(
+            &mut self.units,
+            &frame.units,
+            unit_feature::TOKEN_PRESENT,
+            self.sample_capacity,
+        )?;
+        let remembered_units = append_feature_rows(
+            &mut self.remembered_units,
+            &frame.remembered_units,
+            unit_feature::TOKEN_PRESENT,
+            self.sample_capacity,
+        )?;
+        let points = append_feature_rows(
+            &mut self.points,
+            &frame.points,
+            point_feature::TOKEN_PRESENT,
+            self.sample_capacity,
+        )?;
+        let abilities = append_feature_rows(
+            &mut self.abilities,
+            &frame.abilities,
+            ability_feature::TOKEN_PRESENT,
+            self.sample_capacity,
+        )?;
+        let items = append_feature_rows(
+            &mut self.items,
+            &frame.items,
+            item_feature::TOKEN_PRESENT,
+            self.sample_capacity,
+        )?;
+        let projectiles = append_feature_rows(
+            &mut self.projectiles,
+            &frame.projectiles,
+            projectile_feature::TOKEN_PRESENT,
+            self.sample_capacity,
+        )?;
+        let loot = append_feature_rows(
+            &mut self.loot,
+            &frame.loot,
+            loot_feature::TOKEN_PRESENT,
+            self.sample_capacity,
+        )?;
+        Ok(RaggedFeatureHeader {
+            provenance: frame.provenance,
+            global: frame.global,
+            history: frame.history,
+            policy_history: frame.policy_history,
+            own_units: frame.own_units,
+            map: frame.map,
+            units,
+            remembered_units,
+            points,
+            abilities,
+            items,
+            projectiles,
+            loot,
+        })
+    }
+
+    pub(crate) fn expand(
+        &self,
+        header: &RaggedFeatureHeader,
+    ) -> Result<FeatureFrame, &'static str> {
+        let mut frame = FeatureFrame {
+            provenance: header.provenance,
+            global: header.global,
+            history: header.history,
+            policy_history: header.policy_history,
+            own_units: header.own_units,
+            map: header.map,
+            ..FeatureFrame::new()
+        };
+        restore_feature_rows(&self.units, header.units, &mut frame.units)?;
+        restore_feature_rows(
+            &self.remembered_units,
+            header.remembered_units,
+            &mut frame.remembered_units,
+        )?;
+        restore_feature_rows(&self.points, header.points, &mut frame.points)?;
+        restore_feature_rows(&self.abilities, header.abilities, &mut frame.abilities)?;
+        restore_feature_rows(&self.items, header.items, &mut frame.items)?;
+        restore_feature_rows(
+            &self.projectiles,
+            header.projectiles,
+            &mut frame.projectiles,
+        )?;
+        restore_feature_rows(&self.loot, header.loot, &mut frame.loot)?;
+        Ok(frame)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn stored_rows(&self) -> usize {
+        self.units.len()
+            + self.remembered_units.len()
+            + self.points.len()
+            + self.abilities.len()
+            + self.items.len()
+            + self.projectiles.len()
+            + self.loot.len()
+    }
+}
+
+fn append_feature_rows<const TOKENS: usize, const FEATURES: usize>(
+    arena: &mut Vec<IndexedFeatureRow<FEATURES>>,
+    rows: &[[f32; FEATURES]; TOKENS],
+    presence: usize,
+    sample_capacity: usize,
+) -> Result<FeatureRowRange, &'static str> {
+    let count = rows.iter().filter(|row| row[presence] == 1.0).count();
+    let maximum = sample_capacity
+        .checked_mul(TOKENS)
+        .ok_or("ragged feature arena capacity overflow")?;
+    let end = arena
+        .len()
+        .checked_add(count)
+        .filter(|end| *end <= maximum)
+        .ok_or("ragged feature arena capacity exceeded")?;
+    let offset = u32::try_from(arena.len()).map_err(|_| "ragged feature offset overflow")?;
+    for (index, values) in rows.iter().enumerate() {
+        if values[presence] == 1.0 {
+            arena.push(IndexedFeatureRow {
+                index: u16::try_from(index).map_err(|_| "ragged feature index overflow")?,
+                values: *values,
+            });
+        }
+    }
+    if arena.len() != end {
+        return Err("ragged feature row count mismatch");
+    }
+    Ok(FeatureRowRange {
+        offset,
+        count: u16::try_from(count).map_err(|_| "ragged feature count overflow")?,
+    })
+}
+
+fn restore_feature_rows<const TOKENS: usize, const FEATURES: usize>(
+    arena: &[IndexedFeatureRow<FEATURES>],
+    range: FeatureRowRange,
+    rows: &mut [[f32; FEATURES]; TOKENS],
+) -> Result<(), &'static str> {
+    let offset = range.offset as usize;
+    let end = offset
+        .checked_add(range.count as usize)
+        .filter(|end| *end <= arena.len())
+        .ok_or("ragged feature range is invalid")?;
+    for row in &arena[offset..end] {
+        let target = rows
+            .get_mut(row.index as usize)
+            .ok_or("ragged feature token index is invalid")?;
+        *target = row.values;
+    }
+    Ok(())
+}
+
 /// One local decision retained for policy-history features.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PolicyDecision {

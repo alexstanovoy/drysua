@@ -11,8 +11,8 @@ use crate::{
 
 #[test]
 fn stage_ten_schema_is_stable_and_names_its_safety_contracts() {
-    assert_eq!(LEAGUE_SCHEMA_VERSION, 1);
-    assert_eq!(LEAGUE_SCHEMA_HASH, 8_903_926_055_252_199_993);
+    assert_eq!(LEAGUE_SCHEMA_VERSION, 2);
+    assert_eq!(LEAGUE_SCHEMA_HASH, 5_696_252_806_746_499_783);
     assert!(LEAGUE_SCHEMA_DESCRIPTOR.contains("held_out_seed_disjoint"));
     assert!(LEAGUE_SCHEMA_DESCRIPTOR.contains("training_reward_excluded"));
 }
@@ -293,6 +293,28 @@ fn self_play_smoke_trains_against_scheduled_frozen_opponents_and_pairs_sides() {
     assert_eq!(report.league_policies, 2);
     assert_eq!(report.promotions, 0);
     assert_eq!(report.accepted_after, report.accepted_before);
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn persistent_league_actor_double_buffers_three_policy_generations() {
+    let report = crate::run_league_smoke(crate::LeagueSmokeConfig {
+        updates: 3,
+        environments: 4,
+        rollout_decisions: 2,
+        epochs: 1,
+        minibatch: 8,
+        evaluation_pairs: 1,
+        evaluation_decisions: 2,
+        seed: 8_811,
+        map: bota_proto::MapId(1),
+    })
+    .expect("three-update league pipeline");
+
+    assert_eq!(report.ppo.updates, 3);
+    assert_eq!(report.ppo.transitions, 24);
+    assert_eq!(report.opponent_counts.iter().sum::<u32>(), 12);
+    assert_eq!(report.paired_evaluations, 3);
 }
 
 #[cfg(feature = "builtin")]

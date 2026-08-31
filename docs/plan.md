@@ -746,7 +746,7 @@ nonterminal state. Builtin smoke держит одного learner seat прот
 Текущий model tensor path остаётся CPU-only согласно этапу 7. CUDA actor-learner,
 double buffering и массовое использование RTX относятся к этапу 17; этап 9 не добавляет
 CUDA supply-chain/build complexity и не выдаёт короткий smoke за GPU benchmark.
-Stage-nine contract: PPO schema v1, hash `18117330041678614078`, rules audit v2.
+Current PPO contract: schema v2, hash `2117957042818333378`, rules audit v2.
 
 ## 15. Reward
 
@@ -826,7 +826,7 @@ Truncated matches считаются Draw и не превращаются в п
 промежуточным public statistics. Promotion требует минимум 20 disjoint paired seeds,
 1000 candidate actions, rejection rate ниже 0.1%, отсутствия regression на каждой стороне
 и opaque exploit audit, привязанный к candidate и accepted fingerprints. Stage-ten
-contract: league schema v1, hash `8903926055252199993`, rules audit v2.
+Current league contract: schema v2, hash `5696252806746499783`, rules audit v2.
 
 ## 17. GPU и actor-learner pipeline
 
@@ -867,6 +867,14 @@ policy versions
 ```
 
 Padding выполняется только при сборке minibatch.
+
+Статус: реализованы bounded worker endpoints и два общих владельца rollout buffer,
+атомарная выдача immutable CPU policy lease вместе с generation, отклонение rollout с lag
+больше одной generation и отдельный trusted путь learner update для допустимого lag. CUDA и
+Metal выбираются явно через `PolicyDevice`; параметры, forward, loss и backward находятся на
+выбранном backend. Rollout хранит sparse token rows в typed arenas с проверяемыми offsets,
+bit-packed legal masks и разворачивает fixed padding только для текущего minibatch. Model
+schema v4, hash `9866443454266023146`; PPO schema v2, hash `2117957042818333378`.
 
 ## 18. Checkpoints
 

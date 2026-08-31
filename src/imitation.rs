@@ -14,12 +14,13 @@ use bota_proto::{AbilitySlot, HeroId, ItemSlot, MapId};
 use crate::{
     ACTION_SCHEMA_HASH, ACTION_SCHEMA_VERSION, ActionError, ActionKind, ActionSpace, ActionTarget,
     AdamConfig, AdamState, FEATURE_SCHEMA_HASH, FEATURE_SCHEMA_VERSION, FeatureFrame,
-    ItemReadiness, MODEL_ABILITY_HEAD, MODEL_ENTITY_POINTER_HEAD, MODEL_ITEM_HEAD, MODEL_KIND_HEAD,
-    MODEL_LEARN_HEAD, MODEL_LOOT_HEAD, MODEL_MAX_BATCH, MODEL_PARAMETER_COUNT,
-    MODEL_POINT_POINTER_HEAD, MODEL_SCHEMA_HASH, MODEL_SCHEMA_VERSION, MODEL_SHOP_HEAD,
-    MODEL_SWAP_HEAD, MODEL_UNIT_HEAD, ModelAdamSnapshot, ModelError, ModelUpdateReport,
-    OrderPersistence, PolicyModel, PutPointTarget, SHADOW_FIEND, StateTracker, StructuredAction,
-    Teacher, TrainingAbilitySlot, TrainingItemSlot, TrainingPrefix, TrainingSlot, global_feature,
+    ItemReadiness, MODEL_ABILITY_HEAD, MODEL_BEHAVIORAL_HEADS, MODEL_ENTITY_POINTER_HEAD,
+    MODEL_ITEM_HEAD, MODEL_KIND_HEAD, MODEL_LEARN_HEAD, MODEL_LOOT_HEAD, MODEL_MAX_BATCH,
+    MODEL_PARAMETER_COUNT, MODEL_POINT_POINTER_HEAD, MODEL_SCHEMA_HASH, MODEL_SCHEMA_VERSION,
+    MODEL_SHOP_HEAD, MODEL_SWAP_HEAD, MODEL_UNIT_HEAD, ModelAdamSnapshot, ModelError,
+    ModelUpdateReport, OrderPersistence, PolicyModel, PutPointTarget, SHADOW_FIEND, StateTracker,
+    StructuredAction, Teacher, TrainingAbilitySlot, TrainingItemSlot, TrainingPrefix, TrainingSlot,
+    global_feature,
 };
 
 /// Maximum number of owned samples retained by one imitation pool.
@@ -851,6 +852,112 @@ impl BehavioralTarget {
         .into_iter()
         .map(usize::from)
         .sum()
+    }
+}
+
+const BEHAVIORAL_MASK_BITS: usize = MODEL_KIND_HEAD
+    + MODEL_UNIT_HEAD
+    + MODEL_ABILITY_HEAD
+    + MODEL_ITEM_HEAD
+    + MODEL_SWAP_HEAD
+    + MODEL_LEARN_HEAD
+    + MODEL_SHOP_HEAD
+    + MODEL_LOOT_HEAD
+    + TARGET_MODE_HEAD
+    + PUT_MODE_HEAD
+    + MODEL_ENTITY_POINTER_HEAD
+    + MODEL_POINT_POINTER_HEAD;
+const BEHAVIORAL_MASK_BYTES: usize = BEHAVIORAL_MASK_BITS.div_ceil(8);
+
+#[derive(Clone, Debug)]
+pub(crate) struct PackedBehavioralTarget {
+    active: u16,
+    selected: [u8; MODEL_BEHAVIORAL_HEADS],
+    masks: [u8; BEHAVIORAL_MASK_BYTES],
+    prefix: TrainingPrefix,
+}
+
+impl BehavioralTarget {
+    pub(crate) fn pack(&self) -> PackedBehavioralTarget {
+        let mut packed = PackedBehavioralTarget {
+            active: 0,
+            selected: [0; MODEL_BEHAVIORAL_HEADS],
+            masks: [0; BEHAVIORAL_MASK_BYTES],
+            prefix: self.prefix,
+        };
+        let mut bit = 0usize;
+        pack_head(&self.kind, 0, &mut bit, &mut packed);
+        pack_head(&self.controlled, 1, &mut bit, &mut packed);
+        pack_head(&self.ability, 2, &mut bit, &mut packed);
+        pack_head(&self.item, 3, &mut bit, &mut packed);
+        pack_head(&self.swap, 4, &mut bit, &mut packed);
+        pack_head(&self.learn, 5, &mut bit, &mut packed);
+        pack_head(&self.shop, 6, &mut bit, &mut packed);
+        pack_head(&self.loot, 7, &mut bit, &mut packed);
+        pack_head(&self.target_mode, 8, &mut bit, &mut packed);
+        pack_head(&self.put_mode, 9, &mut bit, &mut packed);
+        pack_head(&self.entity_pointer, 10, &mut bit, &mut packed);
+        pack_head(&self.point_pointer, 11, &mut bit, &mut packed);
+        debug_assert_eq!(bit, BEHAVIORAL_MASK_BITS);
+        packed
+    }
+}
+
+impl PackedBehavioralTarget {
+    pub(crate) fn unpack(&self) -> BehavioralTarget {
+        let mut bit = 0usize;
+        let target = BehavioralTarget {
+            kind: unpack_head(self, 0, &mut bit),
+            controlled: unpack_head(self, 1, &mut bit),
+            ability: unpack_head(self, 2, &mut bit),
+            item: unpack_head(self, 3, &mut bit),
+            swap: unpack_head(self, 4, &mut bit),
+            learn: unpack_head(self, 5, &mut bit),
+            shop: unpack_head(self, 6, &mut bit),
+            loot: unpack_head(self, 7, &mut bit),
+            target_mode: unpack_head(self, 8, &mut bit),
+            put_mode: unpack_head(self, 9, &mut bit),
+            entity_pointer: unpack_head(self, 10, &mut bit),
+            point_pointer: unpack_head(self, 11, &mut bit),
+            prefix: self.prefix,
+        };
+        debug_assert_eq!(bit, BEHAVIORAL_MASK_BITS);
+        target
+    }
+}
+
+fn pack_head<const WIDTH: usize>(
+    head: &HeadTarget<WIDTH>,
+    head_index: usize,
+    bit: &mut usize,
+    packed: &mut PackedBehavioralTarget,
+) {
+    if head.active {
+        packed.active |= 1 << head_index;
+    }
+    packed.selected[head_index] = head.selected as u8;
+    for value in head.mask {
+        if value {
+            packed.masks[*bit / 8] |= 1 << (*bit % 8);
+        }
+        *bit += 1;
+    }
+}
+
+fn unpack_head<const WIDTH: usize>(
+    packed: &PackedBehavioralTarget,
+    head_index: usize,
+    bit: &mut usize,
+) -> HeadTarget<WIDTH> {
+    let mut mask = [false; WIDTH];
+    for value in &mut mask {
+        *value = packed.masks[*bit / 8] & (1 << (*bit % 8)) != 0;
+        *bit += 1;
+    }
+    HeadTarget {
+        active: packed.active & (1 << head_index) != 0,
+        mask,
+        selected: packed.selected[head_index] as usize,
     }
 }
 

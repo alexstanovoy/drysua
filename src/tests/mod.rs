@@ -10,6 +10,7 @@ mod model;
 #[cfg(feature = "builtin")]
 mod parity;
 mod persistence;
+mod pipeline;
 mod ppo;
 mod readiness;
 mod seat;

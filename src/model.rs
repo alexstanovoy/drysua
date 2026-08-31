@@ -25,7 +25,7 @@ use crate::{
 };
 
 /// Version of the fixed policy-model parameter schema.
-pub const MODEL_SCHEMA_VERSION: u32 = 3;
+pub const MODEL_SCHEMA_VERSION: u32 = 4;
 /// Maximum frame count accepted by one public batch call.
 pub const MODEL_MAX_BATCH: usize = 8_192;
 /// Frame count evaluated by one bounded host inference tensor graph.
@@ -76,9 +76,9 @@ static NEXT_OPTIMIZER_LINEAGE: AtomicU64 = AtomicU64::new(1);
 
 /// Canonical model shapes, parameter order, and linked feature schema.
 pub const MODEL_SCHEMA_DESCRIPTOR: &str = concat!(
-    "bota-drysua-model/v3;",
+    "bota-drysua-model/v4;",
     "feature_schema_version=4;feature_schema_hash=508444194896722448;",
-    "dtype=f32;device=cpu_stage7_intentional,accelerator_training_deferred;architecture=deepsets;activations=relu_after_every_encoder_and_trunk_linear;",
+    "dtype=f32;device=cpu_actor,cpu_cuda_or_metal_learner,one_learner_per_device;architecture=deepsets;activations=relu_after_every_encoder_and_trunk_linear;",
     "unit_mlp=69x64,64x128,128x128;",
     "ability_mlp=24x64,64x64;item_mlp=28x64,64x64;",
     "point_mlp=32x64,64x64;projectile_mlp=20x64,64x64;loot_mlp=16x64,64x64;",
@@ -96,7 +96,7 @@ pub const MODEL_SCHEMA_DESCRIPTOR: &str = concat!(
     "nonfinite=finite_parameters_required_on_import,finite_frame_required,all_public_host_outputs_and_every_traversed_decoder_head_checked_with_batch_and_index,error_on_overflow_no_policy_choice,training_output_exposes_optional_graph_preserving_finite_validation;",
     "initialization=splitmix64_state_plus_9e3779b97f4a7c15_then_mix_bf58476d1ce4e5b9_94d049bb133111eb_top24_to_symmetric_closed_interval;linear_weight_scale=sqrt(6/fan_in),linear_bias_zero,embedding_scale=sqrt(3/columns);draw_order=unit_ability_item_point_projectile_loot_trunk_value_kind_kind_embedding_unit_embedding_ability_embedding_item_embedding_controlled_ability_head_item_head_swap_head_learn_head_shop_head_loot_head_target_mode_put_mode_entity_query_point_query;seed_is_not_input_or_parameter;",
     "batch=public_host_limit8192,evaluation_microbatch64_under_one_parameter_read_lock,training_tensor_limit64,larger_effective_training_batches_require_gradient_accumulation;",
-    "runtime_identity=checked_process_local_nonzero_model_lineage_plus_monotonic_parameter_revision,one_internal_optimizer_lineage_bound_to_exact_policy_identity,raw_import_advances_revision_and_unbinds_optimizer,evidence_never_enters_tensors;",
+    "runtime_identity=checked_process_local_nonzero_model_lineage_plus_monotonic_parameter_revision,immutable_cpu_actor_snapshot_preserves_identity_and_forbids_optimizer,one_internal_learner_optimizer_lineage_bound_to_exact_policy_identity,raw_import_advances_revision_and_unbinds_optimizer,evidence_never_enters_tensors;",
     "updates=single_model_rwlock,all_inference_and_export_reads_hold_one_shared_lock,training_output_owns_shared_lock_for_full_forward_loss_backward_lifetime,named_backward_requires_same_model_guarded_output_and_returns62_stable_named_optional_gradient_tensors,no_unlocked_vars_exposed,parameter_import_deep_copies_originals_and_builds_and_replaces_all62_vars_under_one_exclusive_lock_with_exact_rollback_on_failure,readers_observe_complete_old_or_complete_new_parameter_set;",
     "parameter_order=unit_mlp,ability_mlp,item_mlp,point_mlp,projectile_mlp,loot_mlp,trunk,value,kind,kind_embedding,unit_embedding,ability_embedding,item_embedding,unit_head,ability_head,item_head,swap_head,learn_head,shop_head,loot_head,target_mode_head,put_mode_head,entity_query,point_query;"
 );
@@ -265,6 +265,7 @@ pub enum ModelError {
     FrameActionSpaceMismatch,
     TrainingOutputModelMismatch,
     OptimizerAlreadyOwned,
+    ActorOptimizerForbidden,
     OptimizerOwnershipMismatch,
     ModelLineageUnavailable,
     OptimizerLineageUnavailable,
@@ -419,6 +420,9 @@ impl ModelError {
             }
             Self::OptimizerAlreadyOwned => {
                 formatter.write_str("model already has a behavioral optimizer owner")
+            }
+            Self::ActorOptimizerForbidden => {
+                formatter.write_str("immutable actor model cannot own an optimizer")
             }
             Self::OptimizerOwnershipMismatch => {
                 formatter.write_str("model optimizer owner or parameter revision does not match")
@@ -932,15 +936,19 @@ struct Linear {
 }
 
 impl Linear {
-    fn fresh(input: usize, output: usize, generator: &mut Initializer) -> Result<Self, ModelError> {
+    fn fresh(
+        input: usize,
+        output: usize,
+        generator: &mut Initializer,
+        device: &Device,
+    ) -> Result<Self, ModelError> {
         let scale = (6.0f32 / input as f32).sqrt();
         let values = (0..input * output)
             .map(|_| generator.symmetric() * scale)
             .collect::<Vec<_>>();
-        let device = Device::Cpu;
         Ok(Self {
-            weight: Var::from_tensor(&Tensor::from_vec(values, (input, output), &device)?)?,
-            bias: Var::from_tensor(&Tensor::zeros(output, DType::F32, &device)?)?,
+            weight: Var::from_tensor(&Tensor::from_vec(values, (input, output), device)?)?,
+            bias: Var::from_tensor(&Tensor::zeros(output, DType::F32, device)?)?,
         })
     }
 
@@ -971,10 +979,14 @@ struct Mlp {
 }
 
 impl Mlp {
-    fn fresh(shapes: &[(usize, usize)], generator: &mut Initializer) -> Result<Self, ModelError> {
+    fn fresh(
+        shapes: &[(usize, usize)],
+        generator: &mut Initializer,
+        device: &Device,
+    ) -> Result<Self, ModelError> {
         let mut layers = Vec::with_capacity(shapes.len());
         for &(input, output) in shapes {
-            layers.push(Linear::fresh(input, output, generator)?);
+            layers.push(Linear::fresh(input, output, generator, device)?);
         }
         Ok(Self { layers })
     }
@@ -1004,12 +1016,17 @@ struct Embedding {
 }
 
 impl Embedding {
-    fn fresh(rows: usize, columns: usize, generator: &mut Initializer) -> Result<Self, ModelError> {
+    fn fresh(
+        rows: usize,
+        columns: usize,
+        generator: &mut Initializer,
+        device: &Device,
+    ) -> Result<Self, ModelError> {
         let scale = (3.0f32 / columns as f32).sqrt();
         let values = (0..rows * columns)
             .map(|_| generator.symmetric() * scale)
             .collect::<Vec<_>>();
-        let tensor = Tensor::from_vec(values, (rows, columns), &Device::Cpu)?;
+        let tensor = Tensor::from_vec(values, (rows, columns), device)?;
         Ok(Self {
             value: Var::from_tensor(&tensor)?,
         })
@@ -1079,12 +1096,41 @@ fn restore_parameter_tensors(
     Ok(())
 }
 
-/// F32 CPU DeepSets policy with an autoregressive masked decoder.
+/// Backend selected for policy parameters and tensor execution.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PolicyDevice {
+    Cpu,
+    #[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
+    Cuda {
+        ordinal: usize,
+    },
+    #[cfg(all(feature = "metal", target_os = "macos"))]
+    Metal {
+        ordinal: usize,
+    },
+}
+
+impl PolicyDevice {
+    fn candle(self) -> Result<Device, ModelError> {
+        match self {
+            Self::Cpu => Ok(Device::Cpu),
+            #[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
+            Self::Cuda { ordinal } => Device::new_cuda(ordinal).map_err(ModelError::from),
+            #[cfg(all(feature = "metal", target_os = "macos"))]
+            Self::Metal { ordinal } => Device::new_metal(ordinal).map_err(ModelError::from),
+        }
+    }
+}
+
+/// F32 DeepSets policy with an autoregressive masked decoder.
 pub struct PolicyModel {
     parameter_lock: RwLock<()>,
     lineage: NonZeroU64,
     parameter_revision: AtomicU64,
     optimizer_lineage: AtomicU64,
+    optimizer_permitted: bool,
+    device_kind: PolicyDevice,
+    tensor_device: Device,
     unit: Mlp,
     ability: Mlp,
     item: Mlp,
@@ -1111,34 +1157,80 @@ pub struct PolicyModel {
     point_query: Linear,
 }
 
+struct PolicyEncoders {
+    unit: Mlp,
+    ability: Mlp,
+    item: Mlp,
+    point: Mlp,
+    projectile: Mlp,
+    loot: Mlp,
+}
+
 impl PolicyModel {
     /// Constructs fixed parameters from one explicit deterministic seed.
     pub fn fresh(seed: u64) -> Result<Self, ModelError> {
+        Self::fresh_on(seed, PolicyDevice::Cpu)
+    }
+
+    /// Constructs deterministic parameters on one explicitly selected backend.
+    pub fn fresh_on(seed: u64, device: PolicyDevice) -> Result<Self, ModelError> {
+        let tensor_device = device.candle()?;
         let mut generator = Initializer::new(seed);
         let unit = Mlp::fresh(
             &[(UNIT_FEATURES, 64), (64, 128), (128, 128)],
             &mut generator,
+            &tensor_device,
         )?;
-        let ability = Mlp::fresh(&[(ABILITY_FEATURES, 64), (64, 64)], &mut generator)?;
-        let item = Mlp::fresh(&[(ITEM_FEATURES, 64), (64, 64)], &mut generator)?;
-        let point = Mlp::fresh(&[(POINT_FEATURES, 64), (64, 64)], &mut generator)?;
-        let projectile = Mlp::fresh(&[(PROJECTILE_FEATURES, 64), (64, 64)], &mut generator)?;
-        let loot = Mlp::fresh(&[(LOOT_FEATURES, 64), (64, 64)], &mut generator)?;
-        Self::fresh_from_encoders(generator, unit, ability, item, point, projectile, loot)
+        let ability = Mlp::fresh(
+            &[(ABILITY_FEATURES, 64), (64, 64)],
+            &mut generator,
+            &tensor_device,
+        )?;
+        let item = Mlp::fresh(
+            &[(ITEM_FEATURES, 64), (64, 64)],
+            &mut generator,
+            &tensor_device,
+        )?;
+        let point = Mlp::fresh(
+            &[(POINT_FEATURES, 64), (64, 64)],
+            &mut generator,
+            &tensor_device,
+        )?;
+        let projectile = Mlp::fresh(
+            &[(PROJECTILE_FEATURES, 64), (64, 64)],
+            &mut generator,
+            &tensor_device,
+        )?;
+        let loot = Mlp::fresh(
+            &[(LOOT_FEATURES, 64), (64, 64)],
+            &mut generator,
+            &tensor_device,
+        )?;
+        Self::fresh_from_encoders(
+            generator,
+            PolicyEncoders {
+                unit,
+                ability,
+                item,
+                point,
+                projectile,
+                loot,
+            },
+            device,
+            tensor_device,
+        )
     }
 
     fn fresh_from_encoders(
         mut generator: Initializer,
-        unit: Mlp,
-        ability: Mlp,
-        item: Mlp,
-        point: Mlp,
-        projectile: Mlp,
-        loot: Mlp,
+        encoders: PolicyEncoders,
+        device_kind: PolicyDevice,
+        tensor_device: Device,
     ) -> Result<Self, ModelError> {
         let trunk = Mlp::fresh(
             &[(TRUNK_INPUT, 512), (512, 256), (256, 256)],
             &mut generator,
+            &tensor_device,
         )?;
         let lineage = allocate_lineage(&NEXT_MODEL_LINEAGE, ModelError::ModelLineageUnavailable)?;
         Ok(Self {
@@ -1146,31 +1238,43 @@ impl PolicyModel {
             lineage,
             parameter_revision: AtomicU64::new(0),
             optimizer_lineage: AtomicU64::new(0),
-            unit,
-            ability,
-            item,
-            point,
-            projectile,
-            loot,
+            optimizer_permitted: true,
+            device_kind,
+            tensor_device: tensor_device.clone(),
+            unit: encoders.unit,
+            ability: encoders.ability,
+            item: encoders.item,
+            point: encoders.point,
+            projectile: encoders.projectile,
+            loot: encoders.loot,
             trunk,
-            value: Linear::fresh(256, 1, &mut generator)?,
-            kind: Linear::fresh(256, 16, &mut generator)?,
-            kind_embedding: Embedding::fresh(16, 32, &mut generator)?,
-            unit_embedding: Embedding::fresh(2, 32, &mut generator)?,
-            ability_embedding: Embedding::fresh(8, 16, &mut generator)?,
-            item_embedding: Embedding::fresh(15, 16, &mut generator)?,
-            controlled: Linear::fresh(336, 2, &mut generator)?,
-            ability_head: Linear::fresh(336, 8, &mut generator)?,
-            item_head: Linear::fresh(336, 15, &mut generator)?,
-            swap_head: Linear::fresh(336, 15, &mut generator)?,
-            learn_head: Linear::fresh(336, 6, &mut generator)?,
-            shop_head: Linear::fresh(336, 64, &mut generator)?,
-            loot_head: Linear::fresh(336, 16, &mut generator)?,
-            target_mode: Linear::fresh(336, 3, &mut generator)?,
-            put_mode: Linear::fresh(336, 2, &mut generator)?,
-            entity_query: Linear::fresh(336, 128, &mut generator)?,
-            point_query: Linear::fresh(336, 64, &mut generator)?,
+            value: Linear::fresh(256, 1, &mut generator, &tensor_device)?,
+            kind: Linear::fresh(256, 16, &mut generator, &tensor_device)?,
+            kind_embedding: Embedding::fresh(16, 32, &mut generator, &tensor_device)?,
+            unit_embedding: Embedding::fresh(2, 32, &mut generator, &tensor_device)?,
+            ability_embedding: Embedding::fresh(8, 16, &mut generator, &tensor_device)?,
+            item_embedding: Embedding::fresh(15, 16, &mut generator, &tensor_device)?,
+            controlled: Linear::fresh(336, 2, &mut generator, &tensor_device)?,
+            ability_head: Linear::fresh(336, 8, &mut generator, &tensor_device)?,
+            item_head: Linear::fresh(336, 15, &mut generator, &tensor_device)?,
+            swap_head: Linear::fresh(336, 15, &mut generator, &tensor_device)?,
+            learn_head: Linear::fresh(336, 6, &mut generator, &tensor_device)?,
+            shop_head: Linear::fresh(336, 64, &mut generator, &tensor_device)?,
+            loot_head: Linear::fresh(336, 16, &mut generator, &tensor_device)?,
+            target_mode: Linear::fresh(336, 3, &mut generator, &tensor_device)?,
+            put_mode: Linear::fresh(336, 2, &mut generator, &tensor_device)?,
+            entity_query: Linear::fresh(336, 128, &mut generator, &tensor_device)?,
+            point_query: Linear::fresh(336, 64, &mut generator, &tensor_device)?,
         })
+    }
+
+    /// Backend currently owning every parameter tensor.
+    pub const fn device(&self) -> PolicyDevice {
+        self.device_kind
+    }
+
+    fn tensor_device(&self) -> &Device {
+        &self.tensor_device
     }
 
     /// Exact number of scalar F32 parameters.
@@ -1184,6 +1288,22 @@ impl PolicyModel {
         Ok(self.policy_identity_locked())
     }
 
+    /// Captures coherent CPU inference weights with the same process-local identity.
+    pub(crate) fn actor_snapshot(&self) -> Result<Self, ModelError> {
+        let mut snapshot = Self::fresh_on(0, PolicyDevice::Cpu)?;
+        let _guard = self.read_parameter_lock()?;
+        let parameters = self.export_parameters_locked()?;
+        let identity = self.policy_identity_locked();
+        snapshot.import_parameters(&parameters)?;
+        snapshot.lineage = identity.lineage;
+        snapshot
+            .parameter_revision
+            .store(identity.revision, Ordering::Relaxed);
+        snapshot.optimizer_lineage.store(0, Ordering::Relaxed);
+        snapshot.optimizer_permitted = false;
+        Ok(snapshot)
+    }
+
     pub(crate) fn with_policy_identity<T>(
         &self,
         operation: impl FnOnce(PolicyIdentity) -> T,
@@ -1194,6 +1314,9 @@ impl PolicyModel {
 
     pub(crate) fn claim_optimizer(&self, config: AdamConfig) -> Result<AdamState, ModelError> {
         validate_adam_config(config)?;
+        if !self.optimizer_permitted {
+            return Err(ModelError::ActorOptimizerForbidden);
+        }
         let _guard = self.write_parameter_lock()?;
         if self.optimizer_lineage.load(Ordering::Relaxed) != 0 {
             return Err(ModelError::OptimizerAlreadyOwned);
@@ -1435,7 +1558,7 @@ impl PolicyModel {
             tensors.push(Tensor::from_vec(
                 values[offset..offset + count].to_vec(),
                 shape,
-                &Device::Cpu,
+                self.tensor_device(),
             )?);
             offset += count;
         }
@@ -1865,7 +1988,7 @@ impl PolicyModel {
             .iter()
             .map(|prefix| prefix.kind.index() as u32)
             .collect::<Vec<_>>();
-        let kind_indices = Tensor::from_vec(kind_indices, batch, &Device::Cpu)?;
+        let kind_indices = Tensor::from_vec(kind_indices, batch, self.tensor_device())?;
         let kind = self
             .kind_embedding
             .value
@@ -1873,8 +1996,8 @@ impl PolicyModel {
             .index_select(&kind_indices, 0)?;
         let unit = self.training_unit_embeddings(prefixes)?;
         let slot = self.training_slot_embeddings(prefixes)?;
-        let zero_unit = Tensor::zeros(unit.shape(), DType::F32, &Device::Cpu)?;
-        let zero_slot = Tensor::zeros(slot.shape(), DType::F32, &Device::Cpu)?;
+        let zero_unit = Tensor::zeros(unit.shape(), DType::F32, self.tensor_device())?;
+        let zero_slot = Tensor::zeros(slot.shape(), DType::F32, self.tensor_device())?;
         Ok(TrainingContexts {
             kind: Tensor::cat(&[trunk, &kind, &zero_unit, &zero_slot], 1)?,
             unit: Tensor::cat(&[trunk, &kind, &unit, &zero_slot], 1)?,
@@ -1891,8 +2014,8 @@ impl PolicyModel {
             .iter()
             .map(|prefix| prefix.unit.is_some() as u8 as f32)
             .collect::<Vec<_>>();
-        let indices = Tensor::from_vec(indices, prefixes.len(), &Device::Cpu)?;
-        let presence = Tensor::from_vec(presence, (prefixes.len(), 1), &Device::Cpu)?;
+        let indices = Tensor::from_vec(indices, prefixes.len(), self.tensor_device())?;
+        let presence = Tensor::from_vec(presence, (prefixes.len(), 1), self.tensor_device())?;
         Ok(self
             .unit_embedding
             .value
@@ -1904,10 +2027,10 @@ impl PolicyModel {
     fn training_slot_embeddings(&self, prefixes: &[TrainingPrefix]) -> Result<Tensor, ModelError> {
         let ability = training_slot_indices(prefixes, true);
         let item = training_slot_indices(prefixes, false);
-        let ability_indices = Tensor::from_vec(ability.0, prefixes.len(), &Device::Cpu)?;
-        let item_indices = Tensor::from_vec(item.0, prefixes.len(), &Device::Cpu)?;
-        let ability_mask = Tensor::from_vec(ability.1, (prefixes.len(), 1), &Device::Cpu)?;
-        let item_mask = Tensor::from_vec(item.1, (prefixes.len(), 1), &Device::Cpu)?;
+        let ability_indices = Tensor::from_vec(ability.0, prefixes.len(), self.tensor_device())?;
+        let item_indices = Tensor::from_vec(item.0, prefixes.len(), self.tensor_device())?;
+        let ability_mask = Tensor::from_vec(ability.1, (prefixes.len(), 1), self.tensor_device())?;
+        let item_mask = Tensor::from_vec(item.1, (prefixes.len(), 1), self.tensor_device())?;
         let ability = self
             .ability_embedding
             .value
@@ -2006,12 +2129,22 @@ impl PolicyModel {
         let batch = frames.len();
         let units = encode_units(self, frames)?;
         let own_units = encode_own_units(self, frames)?;
-        let abilities = encode_tokens(frames, TokenField::Ability, &self.ability)?;
-        let items = encode_tokens(frames, TokenField::Item, &self.item)?;
-        let points = encode_tokens(frames, TokenField::Point, &self.point)?;
-        let projectiles = encode_tokens(frames, TokenField::Projectile, &self.projectile)?;
-        let loot = encode_tokens(frames, TokenField::Loot, &self.loot)?;
-        let scalars = scalar_tensor(frames)?;
+        let abilities = encode_tokens(
+            frames,
+            TokenField::Ability,
+            &self.ability,
+            self.tensor_device(),
+        )?;
+        let items = encode_tokens(frames, TokenField::Item, &self.item, self.tensor_device())?;
+        let points = encode_tokens(frames, TokenField::Point, &self.point, self.tensor_device())?;
+        let projectiles = encode_tokens(
+            frames,
+            TokenField::Projectile,
+            &self.projectile,
+            self.tensor_device(),
+        )?;
+        let loot = encode_tokens(frames, TokenField::Loot, &self.loot, self.tensor_device())?;
+        let scalars = scalar_tensor(frames, self.tensor_device())?;
         let trunk_input = Tensor::cat(
             &[
                 &scalars,
@@ -2393,6 +2526,7 @@ fn ppo_loss(
     examples: &[&PpoPreparedSample],
     config: PpoConfig,
 ) -> Result<(Tensor, PpoMinibatchReport), ModelError> {
+    let device = output.value.device();
     let negative_log_probability = ppo_negative_log_probability(output, examples)?;
     let new_log_probability = negative_log_probability.neg()?;
     let old_log_probability = Tensor::from_vec(
@@ -2401,7 +2535,7 @@ fn ppo_loss(
             .map(|sample| sample.transition.old_log_probability)
             .collect::<Vec<_>>(),
         examples.len(),
-        &Device::Cpu,
+        device,
     )?;
     let advantages = Tensor::from_vec(
         examples
@@ -2409,7 +2543,7 @@ fn ppo_loss(
             .map(|sample| sample.advantage)
             .collect::<Vec<_>>(),
         examples.len(),
-        &Device::Cpu,
+        device,
     )?;
     let log_ratio = (&new_log_probability - &old_log_probability)?;
     let ratio = log_ratio.exp()?;
@@ -2423,7 +2557,7 @@ fn ppo_loss(
             .map(|sample| sample.return_value)
             .collect::<Vec<_>>(),
         examples.len(),
-        &Device::Cpu,
+        device,
     )?;
     let values = output.value.squeeze(1)?;
     let value_loss = (&values - &returns)?.sqr()?.mean_all()?;
@@ -2534,10 +2668,11 @@ fn masked_loss_from_parts(
     if logits.dims() != [batch, width] {
         return Err(ModelError::InvalidModelState("PPO head shape"));
     }
-    let masks = Tensor::from_vec(masks, (batch, width), &Device::Cpu)?;
-    let labels = Tensor::from_vec(labels, (batch, 1), &Device::Cpu)?;
-    let active = Tensor::from_vec(active, batch, &Device::Cpu)?;
-    let negative = Tensor::full(f32::NEG_INFINITY, logits.shape(), &Device::Cpu)?;
+    let device = logits.device();
+    let masks = Tensor::from_vec(masks, (batch, width), device)?;
+    let labels = Tensor::from_vec(labels, (batch, 1), device)?;
+    let active = Tensor::from_vec(active, batch, device)?;
+    let negative = Tensor::full(f32::NEG_INFINITY, logits.shape(), device)?;
     let legal_logits = masks.where_cond(logits, &negative)?;
     let selected = legal_logits.gather(&labels, 1)?.squeeze(1)?;
     Ok((legal_logits.log_sum_exp(1)? - selected)?.mul(&active)?)
@@ -2583,13 +2718,14 @@ fn masked_ppo_head_entropy<const WIDTH: usize>(
         masks.extend(head.mask.map(u8::from));
         active.push(f32::from(head.active));
     }
-    let masks = Tensor::from_vec(masks, (examples.len(), WIDTH), &Device::Cpu)?;
-    let active = Tensor::from_vec(active, examples.len(), &Device::Cpu)?;
-    let negative = Tensor::full(f32::NEG_INFINITY, logits.shape(), &Device::Cpu)?;
+    let device = logits.device();
+    let masks = Tensor::from_vec(masks, (examples.len(), WIDTH), device)?;
+    let active = Tensor::from_vec(active, examples.len(), device)?;
+    let negative = Tensor::full(f32::NEG_INFINITY, logits.shape(), device)?;
     let legal = masks.where_cond(logits, &negative)?;
     let log_normalizer = legal.log_sum_exp(1)?.unsqueeze(1)?;
     let log_probability = legal.broadcast_sub(&log_normalizer)?;
-    let zeros = Tensor::zeros(logits.shape(), DType::F32, &Device::Cpu)?;
+    let zeros = Tensor::zeros(logits.shape(), DType::F32, device)?;
     let safe_log_probability = masks.where_cond(&log_probability, &zeros)?;
     let probability = masks.where_cond(&safe_log_probability.exp()?, &zeros)?;
     let entropy = probability
@@ -2616,10 +2752,11 @@ fn masked_head_loss<const WIDTH: usize>(
         let head = target(sample.target());
         append_tensor_target(head, name, &mut masks, &mut labels, &mut active)?;
     }
-    let masks = Tensor::from_vec(masks, (examples.len(), WIDTH), &Device::Cpu)?;
-    let labels = Tensor::from_vec(labels, (examples.len(), 1), &Device::Cpu)?;
-    let active = Tensor::from_vec(active, examples.len(), &Device::Cpu)?;
-    let negative = Tensor::full(f32::NEG_INFINITY, logits.shape(), &Device::Cpu)?;
+    let device = logits.device();
+    let masks = Tensor::from_vec(masks, (examples.len(), WIDTH), device)?;
+    let labels = Tensor::from_vec(labels, (examples.len(), 1), device)?;
+    let active = Tensor::from_vec(active, examples.len(), device)?;
+    let negative = Tensor::full(f32::NEG_INFINITY, logits.shape(), device)?;
     let legal_logits = masks.where_cond(logits, &negative)?;
     let selected = legal_logits.gather(&labels, 1)?.squeeze(1)?;
     Ok((legal_logits.log_sum_exp(1)? - selected)?.mul(&active)?)
@@ -3301,7 +3438,11 @@ fn encode_units(model: &PolicyModel, frames: &[FeatureFrame]) -> Result<UnitEnco
         append_unit_rows(&mut values, &mut masks, &frame.units);
         append_unit_rows(&mut values, &mut masks, &frame.remembered_units);
     }
-    let rows = Tensor::from_vec(values, (frames.len() * tokens, UNIT_FEATURES), &Device::Cpu)?;
+    let rows = Tensor::from_vec(
+        values,
+        (frames.len() * tokens, UNIT_FEATURES),
+        model.tensor_device(),
+    )?;
     let encoded = model
         .unit
         .forward(&rows)?
@@ -3309,7 +3450,7 @@ fn encode_units(model: &PolicyModel, frames: &[FeatureFrame]) -> Result<UnitEnco
     let presence = (0..frames.len() * tokens)
         .map(|index| masks.iter().any(|mask| mask[index] == 1.0) as u8 as f32)
         .collect::<Vec<_>>();
-    let presence = Tensor::from_vec(presence, (frames.len(), tokens, 1), &Device::Cpu)?;
+    let presence = Tensor::from_vec(presence, (frames.len(), tokens, 1), model.tensor_device())?;
     let encoded = encoded.broadcast_mul(&presence)?;
     let pooled = pool_groups(&encoded, &masks, frames.len(), tokens, UNIT_EMBEDDING)?;
     let current = encoded.narrow(1, 0, UNIT_FEATURE_TOKENS)?;
@@ -3363,7 +3504,7 @@ fn encode_own_units(
     let rows = Tensor::from_vec(
         values,
         (frames.len() * OWN_UNIT_FEATURE_TOKENS, UNIT_FEATURES),
-        &Device::Cpu,
+        model.tensor_device(),
     )?;
     let encoded = model.unit.forward(&rows)?.reshape((
         frames.len(),
@@ -3373,7 +3514,7 @@ fn encode_own_units(
     let mask = Tensor::from_vec(
         mask,
         (frames.len(), OWN_UNIT_FEATURE_TOKENS, 1),
-        &Device::Cpu,
+        model.tensor_device(),
     )?;
     let fixed = encoded.broadcast_mul(&mask)?.flatten_from(1)?;
     Ok(OwnUnitEncoding { fixed })
@@ -3423,6 +3564,7 @@ fn encode_tokens(
     frames: &[FeatureFrame],
     field: TokenField,
     encoder: &Mlp,
+    device: &Device,
 ) -> Result<TokenEncoding, ModelError> {
     let (tokens, features, presence) = field.shape();
     let mut values = Vec::with_capacity(frames.len() * tokens * features);
@@ -3430,11 +3572,11 @@ fn encode_tokens(
     for frame in frames {
         append_token_field(&mut values, &mut mask, frame, &field, presence);
     }
-    let rows = Tensor::from_vec(values, (frames.len() * tokens, features), &Device::Cpu)?;
+    let rows = Tensor::from_vec(values, (frames.len() * tokens, features), device)?;
     let encoded = encoder
         .forward(&rows)?
         .reshape((frames.len(), tokens, TOKEN_EMBEDDING))?;
-    let presence = Tensor::from_vec(mask.clone(), (frames.len(), tokens, 1), &Device::Cpu)?;
+    let presence = Tensor::from_vec(mask.clone(), (frames.len(), tokens, 1), device)?;
     let encoded = encoded.broadcast_mul(&presence)?;
     let pooled = pool_groups(&encoded, &[mask], frames.len(), tokens, TOKEN_EMBEDDING)?;
     Ok(TokenEncoding { pooled, encoded })
@@ -3481,20 +3623,20 @@ fn pool_groups(
     width: usize,
 ) -> Result<Tensor, ModelError> {
     let mut pools = Vec::with_capacity(masks.len() * 2);
+    let device = encoded.device();
     for values in masks {
-        let mask = Tensor::from_vec(values.clone(), (batch, tokens, 1), &Device::Cpu)?;
+        let mask = Tensor::from_vec(values.clone(), (batch, tokens, 1), device)?;
         let masked = encoded.broadcast_mul(&mask)?;
         let counts = mask.sum(1)?;
         let denominator = counts.clamp(1.0f32, tokens as f32)?;
         let mean = masked.sum(1)?.broadcast_div(&denominator)?;
         let selected = mask.eq(1.0)?.broadcast_as((batch, tokens, width))?;
-        let negative_infinity =
-            Tensor::full(f32::NEG_INFINITY, (batch, tokens, width), &Device::Cpu)?;
+        let negative_infinity = Tensor::full(f32::NEG_INFINITY, (batch, tokens, width), device)?;
         let candidates = selected.where_cond(encoded, &negative_infinity)?;
         let indices = candidates.argmax_keepdim(1)?.contiguous()?;
         let maximum = encoded.gather(&indices, 1)?.squeeze(1)?;
         let present = counts.gt(0.0)?.broadcast_as((batch, width))?;
-        let zeros = Tensor::zeros((batch, width), DType::F32, &Device::Cpu)?;
+        let zeros = Tensor::zeros((batch, width), DType::F32, device)?;
         pools.push(mean);
         pools.push(present.where_cond(&maximum, &zeros)?);
     }
@@ -3559,7 +3701,7 @@ pub(crate) fn pool_max_gradient_for_test(
     Ok(gradient.flatten_all()?.to_vec1()?)
 }
 
-fn scalar_tensor(frames: &[FeatureFrame]) -> Result<Tensor, ModelError> {
+fn scalar_tensor(frames: &[FeatureFrame], device: &Device) -> Result<Tensor, ModelError> {
     const SCALARS: usize = GLOBAL_FEATURES
         + HISTORY_SAMPLES * HISTORY_FEATURES
         + MAX_POLICY_HISTORY * POLICY_HISTORY_FEATURES
@@ -3571,11 +3713,7 @@ fn scalar_tensor(frames: &[FeatureFrame]) -> Result<Tensor, ModelError> {
         values.extend(frame.policy_history.iter().flatten().copied());
         values.extend(frame.map);
     }
-    Ok(Tensor::from_vec(
-        values,
-        (frames.len(), SCALARS),
-        &Device::Cpu,
-    )?)
+    Ok(Tensor::from_vec(values, (frames.len(), SCALARS), device)?)
 }
 
 /// Fixed scripted logits used to verify the real legality decoder.
@@ -4268,12 +4406,12 @@ impl ModelDecoder<'_, '_> {
         let kind = self.model.kind_embedding.row(kind.index())?;
         let unit = match unit {
             Some(unit) => self.model.unit_embedding.row(unit.index())?,
-            None => Tensor::zeros((1, 32), DType::F32, &Device::Cpu)?,
+            None => Tensor::zeros((1, 32), DType::F32, self.model.tensor_device())?,
         };
         let slot = match slot {
             Some(SlotSelection::Ability(index)) => self.model.ability_embedding.row(index)?,
             Some(SlotSelection::Item(index)) => self.model.item_embedding.row(index)?,
-            None => Tensor::zeros((1, 16), DType::F32, &Device::Cpu)?,
+            None => Tensor::zeros((1, 16), DType::F32, self.model.tensor_device())?,
         };
         Ok(Tensor::cat(&[&self.state.trunk, &kind, &unit, &slot], 1)?)
     }

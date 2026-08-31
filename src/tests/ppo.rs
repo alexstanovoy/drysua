@@ -7,10 +7,12 @@ use bota_proto::Team;
 
 use super::feature::{encode, tracker_with_view, world_view};
 use crate::{
-    ActionSpace, BehavioralTarget, ControlledUnit, LocalPolicyState, PPO_RULES_AUDIT_VERSION,
-    PPO_SCHEMA_HASH, PPO_SCHEMA_VERSION, PPO_SHAPING_BUDGET, PPO_TERMINAL_REWARD, PolicyModel,
-    PpoConfig, PpoOutcome, PpoPolicyChoice, PpoRng, PpoRollout, PpoTerminalOutcome, PpoTrainer,
-    RewardTracker, StructuredAction, clipped_surrogate, tick_discount,
+    ABILITY_FEATURE_TOKENS, ActionSpace, BehavioralTarget, ControlledUnit, ITEM_FEATURE_TOKENS,
+    LOOT_FEATURE_TOKENS, LocalPolicyState, POINT_FEATURE_TOKENS, PPO_RULES_AUDIT_VERSION,
+    PPO_SCHEMA_HASH, PPO_SCHEMA_VERSION, PPO_SHAPING_BUDGET, PPO_TERMINAL_REWARD,
+    PROJECTILE_FEATURE_TOKENS, PolicyModel, PpoConfig, PpoOutcome, PpoPolicyChoice, PpoRng,
+    PpoRollout, PpoTerminalOutcome, PpoTrainer, REMEMBERED_UNIT_FEATURE_TOKENS, RewardTracker,
+    StructuredAction, UNIT_FEATURE_TOKENS, clipped_surrogate, tick_discount,
 };
 
 #[test]
@@ -30,10 +32,51 @@ fn ppo_defaults_match_stage_nine_plan() {
 }
 
 #[test]
+fn rollout_compacts_sparse_tokens_and_bit_packs_behavioral_masks_losslessly() {
+    let (frame, space) = frame_and_space();
+    let model = PolicyModel::fresh(100).expect("model");
+    let policy = model.policy_identity().expect("policy");
+    let sampled = choice(&model, &frame, &space, StructuredAction::Continue);
+    let target = sampled.target.clone();
+    let packed = target.pack();
+    let mut rollout = PpoRollout::new(1, policy).expect("rollout");
+    rollout
+        .push(
+            sampled
+                .finish(PpoOutcome {
+                    stream: 0,
+                    decision: 0,
+                    ticks: 3,
+                    next_value: 0.0,
+                    reward: 1.0,
+                    terminal: true,
+                })
+                .expect("transition"),
+        )
+        .expect("push");
+    let padded_rows = UNIT_FEATURE_TOKENS
+        + REMEMBERED_UNIT_FEATURE_TOKENS
+        + POINT_FEATURE_TOKENS
+        + ABILITY_FEATURE_TOKENS
+        + ITEM_FEATURE_TOKENS
+        + PROJECTILE_FEATURE_TOKENS
+        + LOOT_FEATURE_TOKENS;
+
+    assert_eq!(packed.unpack(), target);
+    assert!(
+        std::mem::size_of_val(&packed) < std::mem::size_of::<BehavioralTarget>(),
+        "packed={} fixed={}",
+        std::mem::size_of_val(&packed),
+        std::mem::size_of::<BehavioralTarget>()
+    );
+    assert!(rollout.ragged_rows_for_test() < padded_rows);
+}
+
+#[test]
 fn ppo_schema_and_rules_audit_are_stable() {
-    assert_eq!(PPO_SCHEMA_VERSION, 1);
+    assert_eq!(PPO_SCHEMA_VERSION, 2);
     assert_eq!(PPO_RULES_AUDIT_VERSION, 2);
-    assert_eq!(PPO_SCHEMA_HASH, 18_117_330_041_678_614_078);
+    assert_eq!(PPO_SCHEMA_HASH, 2_117_957_042_818_333_378);
 }
 
 #[test]
@@ -179,8 +222,8 @@ fn gae_uses_tick_discount_and_resets_at_terminal_transition() {
 
     let batch = rollout.finish(config).expect("batch");
 
-    assert!((batch.samples()[0].return_value() - 2.44).abs() < 1.0e-5);
-    assert_eq!(batch.samples()[1].return_value(), 2.0);
+    assert!((batch.sample(0).expect("first").return_value() - 2.44).abs() < 1.0e-5);
+    assert_eq!(batch.sample(1).expect("second").return_value(), 2.0);
 }
 
 #[test]
@@ -244,7 +287,7 @@ fn synthetic_bandit_update_increases_rewarded_action_probability() {
 }
 
 #[test]
-fn stale_rollout_policy_is_rejected_before_optimizer_mutation() {
+fn direct_trainer_rejects_rollout_one_policy_revision_behind() {
     let (frame, space) = frame_and_space();
     let model = PolicyModel::fresh(102).expect("model");
     let policy = model.policy_identity().expect("policy");
@@ -269,6 +312,44 @@ fn stale_rollout_policy_is_rejected_before_optimizer_mutation() {
     let batch = rollout.finish(config).expect("batch");
     let parameters = model.export_parameters().expect("parameters");
     model.import_parameters(&parameters).expect("new revision");
+    let mut trainer = PpoTrainer::new(&model, config, 5).expect("trainer");
+    let before = model.export_parameters().expect("before");
+    let error = trainer
+        .train_update(&model, &batch)
+        .expect_err("direct stale rollout");
+
+    assert_eq!(error.to_string(), "PPO rollout policy identity is stale");
+    assert_eq!(model.export_parameters().expect("after"), before);
+    assert_eq!(trainer.optimizer_step(), 0);
+}
+
+#[test]
+fn rollout_two_policy_revisions_behind_is_rejected_before_optimizer_mutation() {
+    let (frame, space) = frame_and_space();
+    let model = PolicyModel::fresh(102).expect("model");
+    let policy = model.policy_identity().expect("policy");
+    let mut rollout = PpoRollout::new(2, policy).expect("rollout");
+    for stream in 0..2 {
+        rollout
+            .push(
+                choice(&model, &frame, &space, StructuredAction::Continue)
+                    .finish(PpoOutcome {
+                        stream,
+                        decision: 0,
+                        ticks: 3,
+                        next_value: 0.0,
+                        reward: stream as f32,
+                        terminal: true,
+                    })
+                    .expect("transition"),
+            )
+            .expect("push");
+    }
+    let config = smoke_config();
+    let batch = rollout.finish(config).expect("batch");
+    let parameters = model.export_parameters().expect("parameters");
+    model.import_parameters(&parameters).expect("revision one");
+    model.import_parameters(&parameters).expect("revision two");
     let mut trainer = PpoTrainer::new(&model, config, 5).expect("trainer");
     let before = model.export_parameters().expect("before");
 
@@ -315,7 +396,7 @@ fn effective_gradient_is_stable_across_microbatch_partitions() {
     let config = smoke_config();
     let batch = bandit_batch(&first, &frame, &space, config);
     let samples = (0..65)
-        .map(|index| batch.samples()[index % 2].clone())
+        .map(|index| batch.sample(index % 2).expect("sample"))
         .collect::<Vec<_>>();
     let references = samples.iter().collect::<Vec<_>>();
     let mut first_adam = first
@@ -458,4 +539,23 @@ fn builtin_smoke_exercises_real_arena_rollout_and_one_ppo_update() {
     assert!(report.final_value_loss.is_finite());
     assert!(report.final_entropy.is_finite());
     assert!(report.final_kl.is_finite());
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn persistent_actor_refreshes_policy_after_waiting_for_a_recycled_buffer() {
+    let report = crate::run_ppo_smoke(crate::PpoSmokeConfig {
+        updates: 3,
+        environments: 2,
+        rollout_decisions: 2,
+        epochs: 1,
+        minibatch: 4,
+        seed: 17_070,
+        map: bota_proto::MapId(1),
+    })
+    .expect("three-update pipeline");
+
+    assert_eq!(report.updates, 3);
+    assert_eq!(report.transitions, 12);
+    assert_eq!(report.optimizer_step, 3);
 }

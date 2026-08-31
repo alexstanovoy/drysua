@@ -31,16 +31,16 @@ pub const LEAGUE_MIN_EXPLOIT_PAIRS: usize = 2;
 /// Minimum candidate actions required in the exploit-regression namespace.
 pub const LEAGUE_MIN_EXPLOIT_ACTIONS: u64 = 100;
 /// Stage-ten league contract version.
-pub const LEAGUE_SCHEMA_VERSION: u32 = 1;
+pub const LEAGUE_SCHEMA_VERSION: u32 = 2;
 /// Audited simulator rules required by stage-ten league artifacts.
 pub const LEAGUE_RULES_AUDIT_VERSION: u32 = 2;
 /// Canonical stage-ten frozen-policy, scheduling, retention, and promotion contract.
 pub const LEAGUE_SCHEMA_DESCRIPTOR: &str = concat!(
-    "bota-drysua-league/v1;",
+    "bota-drysua-league/v2;",
     "action_schema_version=1;action_schema_hash=17797499074169920257;",
     "feature_schema_version=4;feature_schema_hash=508444194896722448;",
-    "model_schema_version=3;model_schema_hash=6172692684479642043;",
-    "ppo_schema_version=1;ppo_schema_hash=18117330041678614078;rules_audit=2;",
+    "model_schema_version=4;model_schema_hash=9866443454266023146;",
+    "ppo_schema_version=2;ppo_schema_hash=2117957042818333378;rules_audit=2;",
     "opponents=current30,accepted25,historical25,teacher15,weak5,frozen_per_rollout;",
     "league=capacity32,minimum9,protect_anchor_accepted_strongest_recent4,evict_nearest_cross_play_profile;",
     "snapshot=immutable_finite_f32_parameters,stable_parameter_fingerprint,generation;",
@@ -70,10 +70,10 @@ const _: () = assert!(ACTION_SCHEMA_VERSION == 1);
 const _: () = assert!(ACTION_SCHEMA_HASH == 17_797_499_074_169_920_257);
 const _: () = assert!(FEATURE_SCHEMA_VERSION == 4);
 const _: () = assert!(FEATURE_SCHEMA_HASH == 508_444_194_896_722_448);
-const _: () = assert!(MODEL_SCHEMA_VERSION == 3);
-const _: () = assert!(MODEL_SCHEMA_HASH == 6_172_692_684_479_642_043);
-const _: () = assert!(PPO_SCHEMA_VERSION == 1);
-const _: () = assert!(PPO_SCHEMA_HASH == 18_117_330_041_678_614_078);
+const _: () = assert!(MODEL_SCHEMA_VERSION == 4);
+const _: () = assert!(MODEL_SCHEMA_HASH == 9_866_443_454_266_023_146);
+const _: () = assert!(PPO_SCHEMA_VERSION == 2);
+const _: () = assert!(PPO_SCHEMA_HASH == 2_117_957_042_818_333_378);
 
 static NEXT_SNAPSHOT_ID: AtomicU64 = AtomicU64::new(1);
 

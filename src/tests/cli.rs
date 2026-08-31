@@ -30,6 +30,10 @@ fn cli_accepts_bounded_ppo_smoke_parameters() {
         "77",
         "--map",
         "1",
+        "--device",
+        "cuda",
+        "--device-ordinal",
+        "1",
     ])
     .expect("train CLI");
 }
@@ -57,6 +61,10 @@ fn cli_accepts_bounded_self_play_smoke_parameters() {
         "77",
         "--map",
         "1",
+        "--device",
+        "metal",
+        "--device-ordinal",
+        "0",
     ])
     .expect("league CLI");
 }

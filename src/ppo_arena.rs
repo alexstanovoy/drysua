@@ -1,12 +1,15 @@
 use std::sync::Arc;
+use std::sync::mpsc::sync_channel;
+use std::thread;
 
 use bota_proto::{MapId, ServerMsg, SlotId, Team};
 
 use crate::{
-    ActionKind, ActionSpace, Arena, ArenaConfig, ArenaStart, CrossPlayProfile, FeatureEncoder,
-    FeatureFrame, ItemReadiness, LEAGUE_MIN_PROMOTION_ACTIONS, LEAGUE_MIN_PROMOTION_PAIRS, League,
-    LeagueEvaluation, LeagueExploitAudit, LeagueMatchResult, LeagueOpponent, LeagueOpponentKind,
-    LeaguePairedResult, LeaguePromotionDecision, LeagueSampler, LocalPolicyState, OrderPersistence,
+    ACTOR_LEARNER_BUFFERS, ActionKind, ActionSpace, ActorLearnerPipeline, Arena, ArenaConfig,
+    ArenaStart, CrossPlayProfile, FeatureEncoder, FeatureFrame, ItemReadiness,
+    LEAGUE_MIN_PROMOTION_ACTIONS, LEAGUE_MIN_PROMOTION_PAIRS, League, LeagueEvaluation,
+    LeagueExploitAudit, LeagueMatchResult, LeagueOpponent, LeagueOpponentKind, LeaguePairedResult,
+    LeaguePromotionDecision, LeagueSampler, LocalPolicyState, OrderPersistence, PolicyDevice,
     PolicyModel, PolicySnapshot, PpoConfig, PpoError, PpoOutcome, PpoPolicyChoice, PpoRng,
     PpoRollout, PpoTerminalOutcome, PpoTrainer, PpoUpdateReport, Request, RewardTracker,
     StateTracker, Teacher, tick_discount,
@@ -161,120 +164,209 @@ struct EvaluationMatch {
 
 /// Runs real seat-projected arenas, GAE, clipped PPO, value loss, entropy, and Adam briefly.
 pub fn run_ppo_smoke(settings: PpoSmokeConfig) -> Result<PpoSmokeReport, PpoError> {
+    run_ppo_smoke_on(settings, PolicyDevice::Cpu)
+}
+
+/// Runs the complete actor-to-learner path on one selected backend.
+pub fn run_ppo_smoke_on(
+    settings: PpoSmokeConfig,
+    device: PolicyDevice,
+) -> Result<PpoSmokeReport, PpoError> {
     validate_smoke(settings)?;
     let config = smoke_ppo_config(settings).validate()?;
-    let model = PolicyModel::fresh(settings.seed).map_err(model_error)?;
+    let model = PolicyModel::fresh_on(settings.seed, device).map_err(model_error)?;
     let mut trainer = PpoTrainer::new(&model, config, settings.seed ^ 0x51a9)?;
-    let mut sampling = PpoRng::new(settings.seed ^ 0xa17e);
-    let mut environments = build_environments(settings)?;
     let mut smoke = PpoSmokeReport::default();
-    for _ in 0..settings.updates {
-        let policy = model.policy_identity().map_err(model_error)?;
-        let capacity = settings
-            .environments
-            .checked_mul(settings.rollout_decisions)
-            .ok_or(PpoError::InvalidConfig("smoke samples"))?;
-        let mut rollout = PpoRollout::new(capacity, policy)?;
-        collect_update(
-            &model,
-            &mut sampling,
-            &mut environments,
-            config,
-            settings.rollout_decisions,
-            &mut rollout,
-            &mut smoke,
-        )?;
-        let batch = rollout.finish(config)?;
-        let report = trainer.train_update(&model, &batch)?;
-        record_update(&mut smoke, capacity, report)?;
-    }
+    let capacity = settings
+        .environments
+        .checked_mul(settings.rollout_decisions)
+        .ok_or(PpoError::InvalidConfig("smoke samples"))?;
+    let mut pipeline = ActorLearnerPipeline::new(capacity, 1, &model).map_err(pipeline_error)?;
+    let actor = pipeline.take_actor(0).map_err(pipeline_error)?;
+    let (report_sender, report_receiver) = sync_channel(ACTOR_LEARNER_BUFFERS);
+    let worker = thread::spawn(move || -> Result<(), PpoError> {
+        let mut sampling = PpoRng::new(settings.seed ^ 0xa17e);
+        let mut environments = build_environments(settings)?;
+        for _ in 0..settings.updates {
+            let (lease, mut rollout) = actor.wait_rollout().map_err(pipeline_error)?;
+            let mut report = PpoSmokeReport::default();
+            collect_update(
+                lease.policy(),
+                &mut sampling,
+                &mut environments,
+                config,
+                settings.rollout_decisions,
+                &mut rollout,
+                &mut report,
+            )?;
+            lease.try_submit(rollout).map_err(pipeline_error)?;
+            report_sender
+                .send(report)
+                .map_err(|_| PpoError::Model("actor report channel disconnected".to_owned()))?;
+        }
+        Ok(())
+    });
+    let learner_result = (|| -> Result<(), PpoError> {
+        for _ in 0..settings.updates {
+            let batch = pipeline.accept().map_err(pipeline_error)?.finish(config)?;
+            let actor_report = report_receiver
+                .recv()
+                .map_err(|_| PpoError::Model("actor report channel disconnected".to_owned()))?;
+            smoke.rejected_orders = actor_report.rejected_orders;
+            smoke.elapsed_ticks = smoke
+                .elapsed_ticks
+                .checked_add(actor_report.elapsed_ticks)
+                .ok_or(PpoError::CounterOverflow)?;
+            let report = trainer.train_pipeline_update(&model, &batch)?;
+            record_update(&mut smoke, capacity, report)?;
+            pipeline.publish(&model).map_err(pipeline_error)?;
+        }
+        Ok(())
+    })();
+    drop(pipeline);
+    drop(report_receiver);
+    let worker_result = worker
+        .join()
+        .map_err(|_| PpoError::Model("actor worker panicked".to_owned()))?;
+    learner_result?;
+    worker_result?;
     Ok(smoke)
 }
 
 /// Runs bounded self-play PPO, frozen-opponent scheduling, and held-out paired evaluation.
 pub fn run_league_smoke(settings: LeagueSmokeConfig) -> Result<LeagueSmokeReport, PpoError> {
+    run_league_smoke_on(settings, PolicyDevice::Cpu)
+}
+
+/// Runs league training with CPU actors and one selected learner backend.
+pub fn run_league_smoke_on(
+    settings: LeagueSmokeConfig,
+    device: PolicyDevice,
+) -> Result<LeagueSmokeReport, PpoError> {
     validate_league_smoke(settings)?;
     let ppo_settings = league_ppo_settings(settings);
     let config = smoke_ppo_config(ppo_settings).validate()?;
-    let model = PolicyModel::fresh(settings.seed).map_err(model_error)?;
+    let model = PolicyModel::fresh_on(settings.seed, device).map_err(model_error)?;
     let accepted = PolicySnapshot::capture(&model, 0).map_err(league_error)?;
     let accepted_before = accepted.fingerprint();
     let mut league = League::new(32, accepted).map_err(league_error)?;
     let mut scheduler = LeagueSampler::new(settings.seed ^ 0x1ea9);
     let mut opponent_rng = PpoRng::new(settings.seed ^ 0x6f70_706f_6e65_6e74);
     let mut trainer = PpoTrainer::new(&model, config, settings.seed ^ 0x51a9)?;
-    let mut sampling = PpoRng::new(settings.seed ^ 0xa17e);
+    let capacity = settings
+        .environments
+        .checked_mul(settings.rollout_decisions)
+        .ok_or(PpoError::InvalidConfig("league samples"))?;
+    let mut pipeline = ActorLearnerPipeline::new(capacity, 1, &model).map_err(pipeline_error)?;
+    let actor = pipeline.take_actor(0).map_err(pipeline_error)?;
+    let (job_sender, job_receiver) = sync_channel::<Vec<TrainingEnvironment>>(1);
+    let (report_sender, report_receiver) = sync_channel(ACTOR_LEARNER_BUFFERS);
+    let worker = thread::spawn(move || -> Result<(), PpoError> {
+        let mut sampling = PpoRng::new(settings.seed ^ 0xa17e);
+        for _ in 0..settings.updates {
+            let mut environments = job_receiver
+                .recv()
+                .map_err(|_| PpoError::Model("league actor job channel disconnected".to_owned()))?;
+            let (lease, mut rollout) = actor.wait_rollout().map_err(pipeline_error)?;
+            let mut report = PpoSmokeReport::default();
+            collect_update(
+                lease.policy(),
+                &mut sampling,
+                &mut environments,
+                config,
+                settings.rollout_decisions,
+                &mut rollout,
+                &mut report,
+            )?;
+            lease.try_submit(rollout).map_err(pipeline_error)?;
+            report_sender
+                .send(report)
+                .map_err(|_| PpoError::Model("league actor report disconnected".to_owned()))?;
+        }
+        Ok(())
+    });
     let mut training_seeds = Vec::with_capacity(settings.updates as usize * settings.environments);
     let mut report = LeagueSmokeReport {
         accepted_before,
         ..LeagueSmokeReport::default()
     };
-    for update in 0..settings.updates {
-        let current = PolicySnapshot::capture(&model, u64::from(update)).map_err(league_error)?;
-        let mut environments = build_league_environments(
-            settings,
-            update,
-            &current,
-            &league,
-            &mut scheduler,
-            &mut opponent_rng,
-            &mut training_seeds,
-            &mut report,
-        )?;
-        train_league_update(
-            &model,
-            &mut trainer,
-            &mut sampling,
-            &mut environments,
-            config,
-            settings,
-            &mut report.ppo,
-        )?;
-        evaluate_and_retain(
-            &model,
-            settings,
-            update,
-            &training_seeds,
-            &mut league,
-            &mut report,
-        )?;
-    }
+    let initial = PolicySnapshot::capture(&model, 0).map_err(league_error)?;
+    let environments = build_league_environments(
+        settings,
+        0,
+        &initial,
+        &league,
+        &mut scheduler,
+        &mut opponent_rng,
+        &mut training_seeds,
+        &mut report,
+    )?;
+    job_sender
+        .send(environments)
+        .map_err(|_| PpoError::Model("league actor job channel disconnected".to_owned()))?;
+    let learner_result = (|| -> Result<(), PpoError> {
+        for update in 0..settings.updates {
+            let batch = pipeline.accept().map_err(pipeline_error)?.finish(config)?;
+            let actor_report = report_receiver.recv().map_err(|_| {
+                PpoError::Model("league actor report channel disconnected".to_owned())
+            })?;
+            merge_actor_report(&mut report.ppo, actor_report)?;
+            if update + 1 < settings.updates {
+                let next = update + 1;
+                let current =
+                    PolicySnapshot::capture(&model, u64::from(next)).map_err(league_error)?;
+                let environments = build_league_environments(
+                    settings,
+                    next,
+                    &current,
+                    &league,
+                    &mut scheduler,
+                    &mut opponent_rng,
+                    &mut training_seeds,
+                    &mut report,
+                )?;
+                job_sender.send(environments).map_err(|_| {
+                    PpoError::Model("league actor job channel disconnected".to_owned())
+                })?;
+            }
+            let update_report = trainer.train_pipeline_update(&model, &batch)?;
+            record_update(&mut report.ppo, capacity, update_report)?;
+            pipeline.publish(&model).map_err(pipeline_error)?;
+            evaluate_and_retain(
+                &model,
+                settings,
+                update,
+                &training_seeds,
+                &mut league,
+                &mut report,
+            )?;
+        }
+        Ok(())
+    })();
+    drop(job_sender);
+    drop(pipeline);
+    drop(report_receiver);
+    let worker_result = worker
+        .join()
+        .map_err(|_| PpoError::Model("league actor worker panicked".to_owned()))?;
+    learner_result?;
+    worker_result?;
     report.league_policies = league.len();
     report.accepted_after = league.accepted().fingerprint();
     Ok(report)
 }
 
-fn train_league_update(
-    model: &PolicyModel,
-    trainer: &mut PpoTrainer,
-    sampling: &mut PpoRng,
-    environments: &mut [TrainingEnvironment],
-    config: PpoConfig,
-    settings: LeagueSmokeConfig,
-    report: &mut PpoSmokeReport,
+fn merge_actor_report(
+    aggregate: &mut PpoSmokeReport,
+    actor: PpoSmokeReport,
 ) -> Result<(), PpoError> {
-    let capacity = settings
-        .environments
-        .checked_mul(settings.rollout_decisions)
-        .ok_or(PpoError::InvalidConfig("league samples"))?;
-    let policy = model.policy_identity().map_err(model_error)?;
-    let mut rollout = PpoRollout::new(capacity, policy)?;
-    let prior_rejections = report.rejected_orders;
-    collect_update(
-        model,
-        sampling,
-        environments,
-        config,
-        settings.rollout_decisions,
-        &mut rollout,
-        report,
-    )?;
-    let update_rejections = report.rejected_orders;
-    let batch = rollout.finish(config)?;
-    let update = trainer.train_update(model, &batch)?;
-    record_update(report, capacity, update)?;
-    report.rejected_orders = prior_rejections
-        .checked_add(update_rejections)
+    aggregate.rejected_orders = aggregate
+        .rejected_orders
+        .checked_add(actor.rejected_orders)
+        .ok_or(PpoError::CounterOverflow)?;
+    aggregate.elapsed_ticks = aggregate
+        .elapsed_ticks
+        .checked_add(actor.elapsed_ticks)
         .ok_or(PpoError::CounterOverflow)?;
     Ok(())
 }
@@ -1292,6 +1384,10 @@ fn observe_messages(
 
 fn model_error(error: crate::ModelError) -> PpoError {
     PpoError::Model(error.to_string())
+}
+
+fn pipeline_error(error: impl std::fmt::Display) -> PpoError {
+    PpoError::Model(format!("actor-learner pipeline: {error}"))
 }
 
 fn feature_error(error: crate::FeatureError) -> PpoError {

@@ -9,6 +9,7 @@ mod league;
 mod link;
 mod model;
 mod persistence;
+mod pipeline;
 mod ppo;
 #[cfg(feature = "builtin")]
 mod ppo_arena;
@@ -29,6 +30,7 @@ pub use league::*;
 pub use link::*;
 pub use model::*;
 pub use persistence::*;
+pub use pipeline::*;
 pub use ppo::*;
 #[cfg(feature = "builtin")]
 pub use ppo_arena::*;

@@ -9,7 +9,8 @@ use std::fmt;
 use crate::{
     ACTION_SCHEMA_HASH, ACTION_SCHEMA_VERSION, AdamConfig, AdamState, BehavioralTarget,
     FEATURE_SCHEMA_HASH, FEATURE_SCHEMA_VERSION, FeatureFrame, GlobalSummary, MODEL_MAX_BATCH,
-    MODEL_SCHEMA_HASH, MODEL_SCHEMA_VERSION, PolicyIdentity, PolicyModel, StructuredAction,
+    MODEL_SCHEMA_HASH, MODEL_SCHEMA_VERSION, PackedBehavioralTarget, PolicyIdentity, PolicyModel,
+    RaggedFeatureArena, RaggedFeatureHeader, StructuredAction,
 };
 
 /// Maximum concurrently interleaved environment-seat rollout streams.
@@ -21,22 +22,23 @@ pub const PPO_SHAPING_BUDGET: f32 = 100.0;
 /// Terminal reward for winning; losing is its negation.
 pub const PPO_TERMINAL_REWARD: f32 = 1_000.0;
 /// Version of rollout, GAE, objective, optimizer, and reward semantics.
-pub const PPO_SCHEMA_VERSION: u32 = 1;
+pub const PPO_SCHEMA_VERSION: u32 = 2;
 /// Audited simulator rules required by stage-nine rollouts.
 pub const PPO_RULES_AUDIT_VERSION: u32 = 2;
 /// Canonical stage-nine learner contract covered by [`PPO_SCHEMA_HASH`].
 pub const PPO_SCHEMA_DESCRIPTOR: &str = concat!(
-    "bota-drysua-ppo/v1;",
+    "bota-drysua-ppo/v2;",
     "action_schema_version=1;action_schema_hash=17797499074169920257;",
     "feature_schema_version=4;feature_schema_hash=508444194896722448;",
-    "model_schema_version=3;model_schema_hash=6172692684479642043;rules_audit=2;",
+    "model_schema_version=4;model_schema_hash=9866443454266023146;rules_audit=2;",
     "bounds=rollout32768,streams1280,environments128,decisions256,epochs16,minibatch8192,microbatch64;",
     "actor=frozen_exact_policy_identity,legal_masked_gumbel_max_open_f64_uniform,exact_autoregressive_log_probability_and_entropy;",
     "gae=gamma_tick_pow_elapsed_ticks,lambda0.98,terminal_reset,bootstrap_truncation,normalized_advantages;",
     "objective=clipped_surrogate0.2,value_mse0.5,entropy0.01,target_kl0.02;",
     "optimizer=adam_lr3e-4_beta1_0.9_beta2_0.999_epsilon1e-5_global_clip0.5,weighted_host_microbatch_accumulation,transactional_parameters_moments_shuffle;",
     "reward=seat_safe_global_summary,potential_shaping_budget100,terminal_win1000_loss-1000_draw0,separate_breakdown;",
-    "arena=one_learner_seat_against_independent_teacher,snapshot_and_events_every_tick,decision_interval3,batched_bootstrap,restart_on_terminal;"
+    "arena=one_learner_seat_against_independent_teacher,snapshot_and_events_every_tick,decision_interval3,batched_bootstrap,restart_on_terminal;",
+    "pipeline=bounded_cpu_worker_endpoints,persistent_actor_thread_overlaps_learner,immutable_identity_bound_actor_lease,exactly_two_fixed_capacity_buffer_permits,one_generation_lag_allowed,two_generation_lag_rejected,live_generation_read_guard_held_through_optimizer_update,ragged_feature_arenas,bit_packed_behavioral_masks,padding_only_per_minibatch,explicit_cpu_cuda_metal_learner_selection;"
 );
 
 const PPO_FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
@@ -60,8 +62,8 @@ const _: () = assert!(ACTION_SCHEMA_VERSION == 1);
 const _: () = assert!(ACTION_SCHEMA_HASH == 17_797_499_074_169_920_257);
 const _: () = assert!(FEATURE_SCHEMA_VERSION == 4);
 const _: () = assert!(FEATURE_SCHEMA_HASH == 508_444_194_896_722_448);
-const _: () = assert!(MODEL_SCHEMA_VERSION == 3);
-const _: () = assert!(MODEL_SCHEMA_HASH == 6_172_692_684_479_642_043);
+const _: () = assert!(MODEL_SCHEMA_VERSION == 4);
+const _: () = assert!(MODEL_SCHEMA_HASH == 9_866_443_454_266_023_146);
 
 /// Stage-nine PPO hyperparameters and bounded rollout dimensions.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -442,8 +444,24 @@ fn validate_transition(transition: &PpoTransition) -> Result<(), PpoError> {
 pub struct PpoRollout {
     policy: PolicyIdentity,
     capacity: usize,
-    transitions: Vec<PpoTransition>,
+    transitions: Vec<CompactPpoTransition>,
+    frames: RaggedFeatureArena,
     next_decision: [Option<u32>; PPO_MAX_STREAMS],
+}
+
+struct CompactPpoTransition {
+    frame: RaggedFeatureHeader,
+    target: PackedBehavioralTarget,
+    action: StructuredAction,
+    policy: PolicyIdentity,
+    stream: usize,
+    decision: u32,
+    ticks: u32,
+    old_log_probability: f32,
+    old_value: f32,
+    next_value: f32,
+    reward: f32,
+    terminal: bool,
 }
 
 impl PpoRollout {
@@ -455,6 +473,7 @@ impl PpoRollout {
             policy,
             capacity,
             transitions: Vec::with_capacity(capacity),
+            frames: RaggedFeatureArena::new(capacity),
             next_decision: [None; PPO_MAX_STREAMS],
         })
     }
@@ -477,18 +496,38 @@ impl PpoRollout {
                 got: transition.decision,
             });
         }
-        self.next_decision[transition.stream] = Some(
-            transition
-                .decision
-                .checked_add(1)
-                .ok_or(PpoError::CounterOverflow)?,
-        );
-        self.transitions.push(transition);
+        let next_decision = transition
+            .decision
+            .checked_add(1)
+            .ok_or(PpoError::CounterOverflow)?;
+        let frame = self
+            .frames
+            .push(&transition.frame)
+            .map_err(PpoError::InvalidTransition)?;
+        self.next_decision[transition.stream] = Some(next_decision);
+        self.transitions.push(CompactPpoTransition {
+            frame,
+            target: transition.target.pack(),
+            action: transition.action,
+            policy: transition.policy,
+            stream: transition.stream,
+            decision: transition.decision,
+            ticks: transition.ticks,
+            old_log_probability: transition.old_log_probability,
+            old_value: transition.old_value,
+            next_value: transition.next_value,
+            reward: transition.reward,
+            terminal: transition.terminal,
+        });
         Ok(())
     }
 
     pub fn len(&self) -> usize {
         self.transitions.len()
+    }
+
+    pub const fn policy(&self) -> PolicyIdentity {
+        self.policy
     }
 
     pub fn is_empty(&self) -> bool {
@@ -500,7 +539,12 @@ impl PpoRollout {
             return Err(PpoError::EmptyRollout);
         }
         let config = config.validate()?;
-        prepare_batch(self.policy, self.transitions, config)
+        prepare_batch(self.policy, self.transitions, self.frames, config)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ragged_rows_for_test(&self) -> usize {
+        self.frames.stored_rows()
     }
 }
 
@@ -527,7 +571,14 @@ impl PpoPreparedSample {
 /// Immutable normalized update batch from one actor policy revision.
 pub struct PpoBatch {
     policy: PolicyIdentity,
-    samples: Vec<PpoPreparedSample>,
+    samples: Vec<CompactPreparedSample>,
+    frames: RaggedFeatureArena,
+}
+
+struct CompactPreparedSample {
+    transition: CompactPpoTransition,
+    advantage: f32,
+    return_value: f32,
 }
 
 /// One model minibatch result before trainer-level aggregation.
@@ -608,6 +659,67 @@ impl PpoTrainer {
         if current != batch.policy || self.adam.policy_identity() != current {
             return Err(PpoError::PolicyMismatch);
         }
+        self.train_accepted_update(model, batch)
+    }
+
+    /// Trains one pipeline batch accepted at current or one-generation lag.
+    pub fn train_pipeline_update(
+        &mut self,
+        model: &PolicyModel,
+        pipeline: &crate::PipelineBatch,
+    ) -> Result<PpoUpdateReport, PpoError> {
+        let generation = self.lock_pipeline_update(model, pipeline)?;
+        let report = self.train_accepted_update(model, &pipeline.batch);
+        drop(generation);
+        report
+    }
+
+    fn lock_pipeline_update<'pipeline>(
+        &self,
+        model: &PolicyModel,
+        pipeline: &'pipeline crate::PipelineBatch,
+    ) -> Result<crate::PipelineGenerationGuard<'pipeline>, PpoError> {
+        let generation = pipeline
+            .lock_generation()
+            .map_err(|error| PpoError::Model(error.to_string()))?;
+        let current = model
+            .policy_identity()
+            .map_err(|error| PpoError::Model(error.to_string()))?;
+        let rollout = pipeline.batch.policy;
+        let generation_lag = generation
+            .version()
+            .get()
+            .checked_sub(pipeline.rollout_version.get());
+        let accepted_generation = generation_lag.is_some_and(|lag| lag <= 1);
+        let accepted_identity =
+            current.lineage() == rollout.lineage() && current.revision() >= rollout.revision();
+        if !accepted_generation || !accepted_identity || self.adam.policy_identity() != current {
+            return Err(PpoError::PolicyMismatch);
+        }
+        Ok(generation)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn train_pipeline_update_with_barriers_for_test(
+        &mut self,
+        model: &PolicyModel,
+        pipeline: &crate::PipelineBatch,
+        entered: &std::sync::Barrier,
+        release: &std::sync::Barrier,
+    ) -> Result<PpoUpdateReport, PpoError> {
+        let generation = self.lock_pipeline_update(model, pipeline)?;
+        entered.wait();
+        release.wait();
+        let report = self.train_accepted_update(model, &pipeline.batch);
+        drop(generation);
+        report
+    }
+
+    fn train_accepted_update(
+        &mut self,
+        model: &PolicyModel,
+        batch: &PpoBatch,
+    ) -> Result<PpoUpdateReport, PpoError> {
         let snapshot = model
             .coherent_snapshot(&self.adam)
             .map_err(|error| PpoError::Model(error.to_string()))?;
@@ -642,12 +754,10 @@ impl PpoTrainer {
         'epochs: for epoch in 0..self.config.epochs {
             self.shuffle.shuffle(&mut order)?;
             for indices in order.chunks(self.config.minibatch) {
-                let samples = indices
-                    .iter()
-                    .map(|index| &batch.samples[*index])
-                    .collect::<Vec<_>>();
+                let samples = batch.materialize(indices)?;
+                let references = samples.iter().collect::<Vec<_>>();
                 let report = model
-                    .ppo_update(&samples, &mut self.adam, self.config)
+                    .ppo_update(&references, &mut self.adam, self.config)
                     .map_err(|error| PpoError::Model(error.to_string()))?;
                 if !report.applied {
                     aggregate.stopped_for_kl = true;
@@ -709,8 +819,34 @@ impl PpoBatch {
     pub const fn policy(&self) -> PolicyIdentity {
         self.policy
     }
-    pub fn samples(&self) -> &[PpoPreparedSample] {
-        &self.samples
+    pub fn len(&self) -> usize {
+        self.samples.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.samples.is_empty()
+    }
+
+    pub fn sample(&self, index: usize) -> Result<PpoPreparedSample, PpoError> {
+        self.materialize(std::slice::from_ref(&index))?
+            .pop()
+            .ok_or(PpoError::InvalidTransition("PPO sample index"))
+    }
+
+    fn materialize(&self, indices: &[usize]) -> Result<Vec<PpoPreparedSample>, PpoError> {
+        let mut output = Vec::with_capacity(indices.len());
+        for index in indices {
+            let sample = self
+                .samples
+                .get(*index)
+                .ok_or(PpoError::InvalidTransition("PPO sample index"))?;
+            output.push(PpoPreparedSample {
+                transition: expand_transition(&self.frames, &sample.transition)?,
+                advantage: sample.advantage,
+                return_value: sample.return_value,
+            });
+        }
+        Ok(output)
     }
 
     #[cfg(test)]
@@ -721,7 +857,8 @@ impl PpoBatch {
 
 fn prepare_batch(
     policy: PolicyIdentity,
-    transitions: Vec<PpoTransition>,
+    transitions: Vec<CompactPpoTransition>,
+    frames: RaggedFeatureArena,
     config: PpoConfig,
 ) -> Result<PpoBatch, PpoError> {
     let mut next_advantage = [0.0f32; PPO_MAX_STREAMS];
@@ -737,7 +874,7 @@ fn prepare_batch(
             return Err(PpoError::NonFinite("advantage"));
         }
         next_advantage[transition.stream] = advantage;
-        prepared.push(PpoPreparedSample {
+        prepared.push(CompactPreparedSample {
             return_value: transition.old_value + advantage,
             transition,
             advantage,
@@ -748,10 +885,11 @@ fn prepare_batch(
     Ok(PpoBatch {
         policy,
         samples: prepared,
+        frames,
     })
 }
 
-fn normalize_advantages(samples: &mut [PpoPreparedSample]) -> Result<(), PpoError> {
+fn normalize_advantages(samples: &mut [CompactPreparedSample]) -> Result<(), PpoError> {
     let count = samples.len() as f64;
     let mean = samples
         .iter()
@@ -775,6 +913,28 @@ fn normalize_advantages(samples: &mut [PpoPreparedSample]) -> Result<(), PpoErro
         }
     }
     Ok(())
+}
+
+fn expand_transition(
+    frames: &RaggedFeatureArena,
+    compact: &CompactPpoTransition,
+) -> Result<PpoTransition, PpoError> {
+    Ok(PpoTransition {
+        frame: frames
+            .expand(&compact.frame)
+            .map_err(PpoError::InvalidTransition)?,
+        target: compact.target.unpack(),
+        action: compact.action,
+        policy: compact.policy,
+        stream: compact.stream,
+        decision: compact.decision,
+        ticks: compact.ticks,
+        old_log_probability: compact.old_log_probability,
+        old_value: compact.old_value,
+        next_value: compact.next_value,
+        reward: compact.reward,
+        terminal: compact.terminal,
+    })
 }
 
 /// Discount over an exact positive number of elapsed simulation ticks.
