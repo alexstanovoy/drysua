@@ -1,0 +1,21 @@
+[package]
+name = "drysua"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+builtin = ["dep:bota-server"]
+
+[dependencies]
+bota-proto = { path = "../bota/crates/bota-proto", default-features = false }
+bota-server = { path = "../bota/crates/bota-server", default-features = false, optional = true }
+candle-core = { version = "0.11.0", default-features = false }
+clap = { version = "4.6.6", default-features = false, features = ["derive", "error-context", "help", "std", "suggestions", "usage"] }
+
+[[bin]]
+name = "drysua"
+path = "src/main.rs"
+
+[lints.clippy]
+float_arithmetic = "deny"
