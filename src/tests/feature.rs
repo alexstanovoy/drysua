@@ -25,8 +25,8 @@ const ENEMY: EntityId = entity(20, 1);
 
 #[test]
 fn feature_schema_dimensions_and_hash_are_stable() {
-    assert_eq!(FEATURE_SCHEMA_VERSION, 3);
-    assert_eq!(FEATURE_SCHEMA_HASH, 4_481_226_947_978_520_357);
+    assert_eq!(FEATURE_SCHEMA_VERSION, 4);
+    assert_eq!(FEATURE_SCHEMA_HASH, 508_444_194_896_722_448);
     assert_eq!(GLOBAL_FEATURES, 64);
     assert_eq!((HISTORY_SAMPLES, HISTORY_FEATURES), (7, 24));
     assert_eq!((MAX_POLICY_HISTORY, POLICY_HISTORY_FEATURES), (16, 4));
@@ -699,6 +699,7 @@ fn same_tick_event_delivery_order_does_not_change_snapshot_features() {
                 unit: ENEMY,
                 killer: Some(HERO),
                 denied: false,
+                gold: 0,
             }],
         )
         .expect("event");

@@ -21,7 +21,7 @@ use crate::{
 };
 
 /// Version of the append-only policy feature schema.
-pub const FEATURE_SCHEMA_VERSION: u32 = 3;
+pub const FEATURE_SCHEMA_VERSION: u32 = 4;
 /// Number of scalar global features.
 pub const GLOBAL_FEATURES: usize = 64;
 /// Number of scalar features in one global-history sample.
@@ -350,13 +350,13 @@ pub mod loot_feature {
 
 /// Canonical schema text covered by [`FEATURE_SCHEMA_HASH`].
 pub const FEATURE_SCHEMA_DESCRIPTOR: &str = concat!(
-    "bota-drysua-feature/v3;",
+    "bota-drysua-feature/v4;",
     "shapes=global:64,history:7x24,policy_history:16x4,unit:96x69,own_unit:2x69,remembered_unit:32x69,point:48x32,ability:14x24,item:85x28,projectile:32x20,loot:16x16,map:96;",
     "scalar_ranges=presence_and_one_hot:[0,1],unsigned_continuous:[0,1],signed_continuous:[-1,1],category:positive_exact_integer,all_finite;",
     "history_ages=480,240,120,60,30,15,0;",
     "normalizers=tick:3600000,age:4800,history_age:480,gold_asset_item_cost:100000,score:1000,xp:100000,hp:100000,mana:20000,damage:10000,attack_interval:600,speed:2000,armor_raw:6553600,level:30,charges:255,cooldown:36000,structures:64;",
     "coordinates=raw_extent:terrain_cells*64*65536,dire_position:(extent_raw-1)-raw,dire_delta:negated,dire_facing:brads+32768_wrapping,absolute_side:global[4:6];",
-    "categories=unit_kind:Hero1,CreepMelee2,CreepFlagbearer3,CreepRanged4,CreepSiege5,CreepNeutral6,Roshan7,Tower8,Ancient9,Fountain10,Ward11,Courier12;",
+    "categories=unit_kind:Hero1,CreepMelee2,CreepFlagbearer3,CreepRanged4,CreepSiege5,CreepNeutral6,Tower7,Ancient8,Barracks9,Fountain10,Ward11,Courier12;",
     "ability_category=id8:1,id9:2,id10:3,id11:4,id12:5,id13:6,id14:7,id15:8,id16:9,id17:10,id18:11,other:raw+12,range:1..65547;",
     "item_category=raw+1,range:1..65536;aim=Own1,Point2,Unit3,Tree4,Building5;attribute=Strength1,Agility2,Intelligence3;",
     "action_category=Continue1,Stop2,MovePoint3,FollowUnit4,Hold5,AttackMovePoint6,AttackUnit7,Cast8,Use9,PutPoint10,PutUnit11,Take12,Buy13,Sell14,Swap15,Learn16;",
@@ -2893,9 +2893,9 @@ fn unit_kind_token(kind: UnitKind) -> f32 {
         UnitKind::CreepRanged => 3,
         UnitKind::CreepSiege => 4,
         UnitKind::CreepNeutral => 5,
-        UnitKind::Roshan => 6,
-        UnitKind::Tower => 7,
-        UnitKind::Ancient => 8,
+        UnitKind::Tower => 6,
+        UnitKind::Ancient => 7,
+        UnitKind::Barracks => 8,
         UnitKind::Fountain => 9,
         UnitKind::Ward => 10,
         UnitKind::Courier => 11,

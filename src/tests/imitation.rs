@@ -23,7 +23,7 @@ fn action_and_training_schema_identities_are_stable() {
     assert_eq!(ACTION_SCHEMA_VERSION, 1);
     assert_eq!(ACTION_SCHEMA_HASH, 17_797_499_074_169_920_257);
     assert_eq!(crate::IMITATION_OPTIMIZER_VERSION, 2);
-    assert_eq!(crate::IMITATION_RULES_AUDIT_VERSION, 1);
+    assert_eq!(crate::IMITATION_RULES_AUDIT_VERSION, 2);
 }
 
 #[test]

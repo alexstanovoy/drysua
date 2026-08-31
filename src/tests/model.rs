@@ -14,7 +14,7 @@ use super::feature::{encode, reverse_entity_ids_and_generations, tracker_with_vi
 use crate::model::{
     DecoderLogits, adam_step_for_test, decode_with_logits, masked_argmax,
     masked_cross_entropy_for_test, pool_groups_for_test, pool_max_gradient_for_test,
-    select_target_for_test, validate_batch_count,
+    select_target_for_test, unit_group, validate_batch_count,
 };
 use crate::{
     ActionKind, ActionSpace, ActionTarget, AdamConfig, ControlledUnit, FeatureFrame,
@@ -26,6 +26,29 @@ use crate::{
     SeedNamespace, StructuredAction, TrainingAbilitySlot, TrainingItemSlot, TrainingPrefix,
     TrainingSlot, unit_feature,
 };
+
+#[test]
+fn unit_kind_tokens_enter_their_semantic_pool() {
+    let groups = [
+        (1.0, 0),
+        (2.0, 1),
+        (3.0, 1),
+        (4.0, 1),
+        (5.0, 1),
+        (6.0, 3),
+        (7.0, 2),
+        (8.0, 2),
+        (9.0, 2),
+        (10.0, 2),
+        (11.0, 4),
+        (12.0, 4),
+    ];
+    for (token, group) in groups {
+        assert_eq!(unit_group(token), Some(group), "token {token}");
+    }
+    assert_eq!(unit_group(0.0), None);
+    assert_eq!(unit_group(13.0), None);
+}
 
 #[test]
 fn behavioral_update_holds_one_exclusive_guard_against_parameter_import() {
@@ -359,8 +382,8 @@ fn adam_rejects_invalid_config_nonfinite_and_extreme_updates_without_partial_sta
 
 #[test]
 fn model_schema_and_head_dimensions_are_stable() {
-    assert_eq!(MODEL_SCHEMA_VERSION, 2);
-    assert_eq!(MODEL_SCHEMA_HASH, 15_888_684_091_468_496_519);
+    assert_eq!(MODEL_SCHEMA_VERSION, 3);
+    assert_eq!(MODEL_SCHEMA_HASH, 6_172_692_684_479_642_043);
     assert_eq!(MODEL_KIND_HEAD, 16);
     assert_eq!(MODEL_UNIT_HEAD, 2);
     assert_eq!(MODEL_ABILITY_HEAD, 8);

@@ -630,7 +630,10 @@ impl Teacher {
             .filter(|(index, candidate)| {
                 mask.get(*index) == Some(&true)
                     && candidate.relation == EntityRelation::Enemy
-                    && matches!(candidate.kind, UnitKind::Tower | UnitKind::Ancient)
+                    && matches!(
+                        candidate.kind,
+                        UnitKind::Tower | UnitKind::Ancient | UnitKind::Barracks
+                    )
                     && in_attack_reach(hero, candidate.unit())
                     && allied_creep_near(tracker, candidate.position, 700)
             })
@@ -1053,7 +1056,10 @@ fn enemy_objective(tracker: &StateTracker, position: Vec2) -> Option<Vec2> {
         .filter(|unit| {
             unit.team != tracker.team()
                 && unit.hp > 0
-                && matches!(unit.kind, UnitKind::Tower | UnitKind::Ancient)
+                && matches!(
+                    unit.kind,
+                    UnitKind::Tower | UnitKind::Ancient | UnitKind::Barracks
+                )
         })
         .min_by_key(|unit| (position.distance_squared(unit.pos), unit.id))
         .map(|unit| unit.pos)

@@ -978,39 +978,25 @@ random weights запрещён. Save выполняется через temporar
 
 | Проблема | Возможный exploit | Временная защита | Нужный contribution |
 |---|---|---|---|
-| Ancient не защищён до падения T4 | Игнорировать всю игру и делать ранний base rush | Не начинать objective curriculum до исправления | Реализовать Ancient gating и regression test |
-| Destroyed structure продолжает блокировать path cells | Ловушки и неверный pathing после tower death | Rebuild local map по фактической проходимости невозможно | Открывать ground cells при разрушении |
-| Barracks отсутствуют | Lane progression обрезан | Не обучать barracks strategy | Реализовать или явно убрать из ruleset |
-| Super/Mega creeps отсутствуют | Неполная цена lane objectives | Не reward несуществующую механику | Реализовать вместе с barracks |
-| Roshan definition есть, но spawn отсутствует | Policy может игнорировать pit без цены | Не включать Roshan features/reward | Реализовать spawn/respawn/reward либо удалить контракт |
 | Нет общего time limit/draw | Policy может избегать поражения бесконечно | Bounded training limit с честным adjudication | Добавить server rules для timeout/draw |
 
 #### D. Экономика и статистика
 
 | Проблема | Возможный exploit | Временная защита | Нужный contribution |
 |---|---|---|---|
-| Hero не имеет bounty | Combat экономически бессмысленен | Не считать заявленный bounty в reward | Добавить hero bounty |
 | Assists не начисляются | Командная помощь не имеет статистической цены | Не использовать assists reward | Реализовать assist attribution |
-| Gold loss on death отсутствует | Суицид дешевле ожидаемого | Reward по фактическому gold, не документации | Решить balance contract и реализовать |
-| XP рядом с несколькими heroes не делится | 5v5 получает чрезмерный суммарный XP | Первый target только 1v1 | Исправить до team training |
-| Deny полностью убирает XP | Возможный слишком сильный deny | Измерить balance отдельно | Подтвердить или изменить deny rules |
 | `last_hits` включает neutrals и towers | Reward путает разные действия | Классифицировать через cached UnitKind/events | Разделить counters |
 | `net_worth` означает cumulative earned gold | Policy/report может оптимизировать неверную метрику | Считать observable assets самостоятельно | Исправить имя/семантику или добавить новую metric |
 | `hero_damage` и `structure_damage` всегда нули | Evaluation скрывает реальную силу | Считать visible events и structure HP delta | Накапливать authoritative stats |
-| `ItemBought` создаётся, но теряется | Reward/log не видит покупку | Считать inventory/gold delta | Исправить event propagation |
 | `Healed` не производится | Нельзя оценить healing по event | Считать HP delta с оговорками | Производить authoritative event |
-| Crit flag в `Damaged` всегда false | Неверная combat telemetry | Для Shadow Fiend не полагаться на crit | Сохранить crit через damage pipeline |
 
 #### E. Shadow Fiend и combat balance
 
 | Проблема | Возможный exploit | Временная защита | Нужный contribution |
 |---|---|---|---|
 | Generic cast point отсутствует | Shadowraze/Requiem могут быть слишком быстрыми | Teacher/model используют фактические правила | Добавить cast points, если они входят в intended game |
-| Uphill miss объявлен, но не подключён | Игнорировать elevation в ranged combat | Не reward ожидаемый miss | Реализовать deterministic uphill miss |
-| Attack projectile launch tier фиксирован в 0 | Неверные elevation interactions | Не выводить точную projectile physics | Исправить launch tier |
 | Requiem не расходует souls | Повторное использование может быть слишком выгодным | Измерить cooldown/soul economy | Явно решить balance contract |
 | Ability/item event coverage неполна | Нельзя авторитетно связать outcome с cast | Reward по эффекту, не по факту cast | Исправить events |
-| Hero kills не дают заявленную экономику | Harass/farm доминирует над combat | Не запускать full-game promotion до исправления | Исправить bounty и XP |
 
 #### F. Стороны и карта
 

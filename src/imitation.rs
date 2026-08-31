@@ -35,7 +35,7 @@ pub const MIN_PROMOTION_ROLLOUT_ACTIONS: u64 = 1_000;
 /// Current behavioral optimizer ownership schema.
 pub const IMITATION_OPTIMIZER_VERSION: u32 = 2;
 /// Current audited game-rules scope for stage-eight artifacts.
-pub const IMITATION_RULES_AUDIT_VERSION: u32 = 1;
+pub const IMITATION_RULES_AUDIT_VERSION: u32 = 2;
 
 const TARGET_MODE_HEAD: usize = 3;
 const PUT_MODE_HEAD: usize = 2;

@@ -158,6 +158,8 @@ pub struct DeathObservation {
     pub killer: Option<EntityId>,
     /// Whether the death was a deny.
     pub denied: bool,
+    /// Gold paid directly for the death.
+    pub gold: i32,
 }
 
 /// One observed completed ability cast.
@@ -1128,12 +1130,14 @@ impl StateTracker {
                 unit,
                 killer,
                 denied,
+                gold,
             } => {
                 if let Some(entity) = self.entity_mut(unit) {
                     entity.last_death = Some(DeathObservation {
                         tick,
                         killer,
                         denied,
+                        gold,
                     });
                     entity.visible = false;
                 }
@@ -1785,7 +1789,7 @@ const fn opposing(team: Team) -> Team {
 pub(crate) const fn is_structure(kind: UnitKind) -> bool {
     matches!(
         kind,
-        UnitKind::Tower | UnitKind::Ancient | UnitKind::Fountain
+        UnitKind::Tower | UnitKind::Ancient | UnitKind::Barracks | UnitKind::Fountain
     )
 }
 

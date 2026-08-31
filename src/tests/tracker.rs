@@ -5,6 +5,7 @@ use bota_proto::{
     Vec2, WorldView,
 };
 
+use crate::tracker::is_structure;
 use crate::{
     HISTORY_AGES, HISTORY_TICKS, MAX_ABILITY_SLOTS, MAX_EFFECTS_PER_UNIT, MAX_EVENTS_PER_BATCH,
     MAX_HISTORY_SUMMARIES, MAX_LOOT, MAX_OPAQUE_CELLS, MAX_PLANTED_TREES, MAX_PROJECTILES,
@@ -12,6 +13,30 @@ use crate::{
     MAX_TERRAIN_AXIS, MAX_TERRAIN_RUNS, MAX_TRACKED_ENTITIES, OWN_ITEM_SLOTS, SHADOW_FIEND,
     SHADOW_FIEND_ABILITY_SLOTS, StateTracker, UNIT_TOKENS,
 };
+
+#[test]
+fn every_protocol_structure_kind_has_structure_semantics() {
+    for kind in [
+        UnitKind::Tower,
+        UnitKind::Ancient,
+        UnitKind::Barracks,
+        UnitKind::Fountain,
+    ] {
+        assert!(is_structure(kind), "{kind:?}");
+    }
+    for kind in [
+        UnitKind::Hero,
+        UnitKind::CreepMelee,
+        UnitKind::CreepFlagbearer,
+        UnitKind::CreepRanged,
+        UnitKind::CreepSiege,
+        UnitKind::CreepNeutral,
+        UnitKind::Ward,
+        UnitKind::Courier,
+    ] {
+        assert!(!is_structure(kind), "{kind:?}");
+    }
+}
 
 #[test]
 fn tracker_initializes_with_valid_shadow_fiend_match_terms() {
@@ -576,6 +601,7 @@ fn tracker_updates_damage_heal_death_cast_and_possible_attack_observations() {
             unit: target,
             killer: Some(attacker),
             denied: false,
+            gold: 125,
         },
         EventKind::AbilityCast {
             caster: attacker,
@@ -608,6 +634,7 @@ fn tracker_updates_damage_heal_death_cast_and_possible_attack_observations() {
         target_track.last_death.expect("death").killer,
         Some(attacker)
     );
+    assert_eq!(target_track.last_death.expect("death").gold, 125);
     assert!(!target_track.visible);
 }
 
@@ -656,6 +683,7 @@ fn tracker_retains_unknown_event_ids_without_creating_entities() {
                 unit: unknown,
                 killer: None,
                 denied: false,
+                gold: 0,
             }],
         )
         .expect("unknown event");
@@ -668,6 +696,7 @@ fn tracker_retains_unknown_event_ids_without_creating_entities() {
             unit: unknown,
             killer: None,
             denied: false,
+            gold: 0,
         }
     );
 }
