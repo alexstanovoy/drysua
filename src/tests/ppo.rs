@@ -74,9 +74,9 @@ fn rollout_compacts_sparse_tokens_and_bit_packs_behavioral_masks_losslessly() {
 
 #[test]
 fn ppo_schema_and_rules_audit_are_stable() {
-    assert_eq!(PPO_SCHEMA_VERSION, 2);
-    assert_eq!(PPO_RULES_AUDIT_VERSION, 2);
-    assert_eq!(PPO_SCHEMA_HASH, 2_117_957_042_818_333_378);
+    assert_eq!(PPO_SCHEMA_VERSION, 3);
+    assert_eq!(PPO_RULES_AUDIT_VERSION, 3);
+    assert_eq!(PPO_SCHEMA_HASH, 3_564_571_968_222_523_732);
 }
 
 #[test]
@@ -440,6 +440,39 @@ fn reward_shaping_is_bounded_and_terminal_result_dominates() {
     assert!(shaping.abs() <= PPO_SHAPING_BUDGET + 1.0e-5);
     assert_eq!(win.terminal, PPO_TERMINAL_REWARD);
     assert!(win.total >= PPO_TERMINAL_REWARD - 1.0e-5);
+}
+
+#[test]
+fn reward_values_gold_and_experience_not_last_hits_or_denies() {
+    let mut economy = RewardTracker::default();
+    let baseline = crate::GlobalSummary::default();
+    economy.observe(baseline, 1.0, None).expect("baseline");
+    let mut improved = baseline;
+    improved.own_gold = 100;
+    improved.allied.xp = 100;
+    let economy_reward = economy.observe(improved, 1.0, None).expect("economy");
+
+    let mut farm = RewardTracker::default();
+    farm.observe(baseline, 1.0, None).expect("baseline");
+    let mut farmed = baseline;
+    farmed.allied.last_hits = 10;
+    farmed.allied.denies = 10;
+    let farm_reward = farm.observe(farmed, 1.0, None).expect("farm");
+
+    let mut opponent = RewardTracker::default();
+    opponent.observe(baseline, 1.0, None).expect("baseline");
+    let mut opponent_progress = baseline;
+    opponent_progress.enemy.xp = 100;
+    let opponent_reward = opponent
+        .observe(opponent_progress, 1.0, None)
+        .expect("opponent XP");
+
+    assert_eq!(farm_reward.last_hits, 0.0);
+    assert_eq!(farm_reward.denies, 0.0);
+    assert!(economy_reward.wealth > 0.0);
+    assert!(economy_reward.experience > economy_reward.wealth);
+    assert!(opponent_reward.experience < 0.0);
+    assert!(economy_reward.total > farm_reward.total);
 }
 
 fn frame_and_space() -> (crate::FeatureFrame, ActionSpace) {

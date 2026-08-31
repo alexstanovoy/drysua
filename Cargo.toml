@@ -30,5 +30,10 @@ candle-metal-feature = { path = "crates/candle-metal-feature", default-features 
 name = "drysua"
 path = "src/main.rs"
 
+[[bin]]
+name = "drysua-profile"
+path = "src/bin/drysua_profile.rs"
+required-features = ["builtin"]
+
 [lints.clippy]
 float_arithmetic = "deny"

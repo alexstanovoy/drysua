@@ -1122,6 +1122,19 @@ impl PolicyDevice {
     }
 }
 
+/// Probes whether Candle can execute an NVFP4-like F4 matrix operation on CUDA.
+#[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
+pub fn probe_nvfp4(ordinal: usize) -> Result<(), ModelError> {
+    let device = Device::new_cuda(ordinal)?;
+    let left = Tensor::from_vec(vec![1.0f32; 16], (4, 4), &device)?.to_dtype(DType::F4)?;
+    let right = Tensor::from_vec(vec![1.0f32; 16], (4, 4), &device)?.to_dtype(DType::F4)?;
+    let output = left.matmul(&right)?;
+    if output.dims() != [4, 4] {
+        return Err(ModelError::InvalidModelState("NVFP4 probe shape"));
+    }
+    Ok(())
+}
+
 /// F32 DeepSets policy with an autoregressive masked decoder.
 pub struct PolicyModel {
     parameter_lock: RwLock<()>,

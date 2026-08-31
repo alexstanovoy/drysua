@@ -746,7 +746,7 @@ nonterminal state. Builtin smoke держит одного learner seat прот
 Текущий model tensor path остаётся CPU-only согласно этапу 7. CUDA actor-learner,
 double buffering и массовое использование RTX относятся к этапу 17; этап 9 не добавляет
 CUDA supply-chain/build complexity и не выдаёт короткий smoke за GPU benchmark.
-Current PPO contract: schema v2, hash `2117957042818333378`, rules audit v2.
+Current PPO contract: schema v3, hash `3564571968222523732`, rules audit v3.
 
 ## 15. Reward
 
@@ -826,7 +826,7 @@ Truncated matches считаются Draw и не превращаются в п
 промежуточным public statistics. Promotion требует минимум 20 disjoint paired seeds,
 1000 candidate actions, rejection rate ниже 0.1%, отсутствия regression на каждой стороне
 и opaque exploit audit, привязанный к candidate и accepted fingerprints. Stage-ten
-Current league contract: schema v2, hash `5696252806746499783`, rules audit v2.
+Current league contract: schema v3, hash `18193381311490740524`, rules audit v3.
 
 ## 17. GPU и actor-learner pipeline
 
@@ -874,7 +874,7 @@ Padding выполняется только при сборке minibatch.
 Metal выбираются явно через `PolicyDevice`; параметры, forward, loss и backward находятся на
 выбранном backend. Rollout хранит sparse token rows в typed arenas с проверяемыми offsets,
 bit-packed legal masks и разворачивает fixed padding только для текущего minibatch. Model
-schema v4, hash `9866443454266023146`; PPO schema v2, hash `2117957042818333378`.
+schema v4, hash `9866443454266023146`; PPO schema v3, hash `3564571968222523732`.
 
 ## 18. Checkpoints
 
@@ -965,6 +965,29 @@ fallback. Checkpoint schema v1, hash `2133011134179236231`.
 - custom CPU inference kernel;
 - decision intervals;
 - compressed offline storage.
+
+Статус профилирования (release, 16 demo arenas x 2000 ticks, counting allocator): baseline
+Arena `175632 ticks/s`, `96.57 allocations/tick`, `17408 bytes/tick`; после reuse одного
+bounded entity snapshot во всех частых simulator systems — `194524 ticks/s` (+10.8%),
+`53.17 allocations/tick` (-44.9%), `14084 bytes/tick`. Чистый `World::advance` вырос с
+`228126` до `264440 ticks/s` (+15.9%). Изменение включено по умолчанию, так как прошло 10%
+threshold и полную deterministic simulator suite. Profiling harness имеет безопасные defaults
+2 arenas x 500 ticks, максимум 16 arenas, 20000 ticks и 2 updates.
+
+Thin LTO дал только +6.9% поверх оптимизированного simulator и поэтому не включён по умолчанию.
+Workload-specific PGO дал `223996 Arena ticks/s` (+15.1% поверх обычного release); bounded
+`scripts/pgo-build.sh` воспроизводит instrument/merge/build отдельно от portable release.
+NVFP4 probe на RTX 5090/CUDA 13.3 завершился `CUDA_ERROR_NOT_FOUND` для Candle F4 kernel, поэтому
+неподдерживаемый precision не включён; learner остаётся strict F32. На маленьком безопасном batch
+128 transitions CUDA не быстрее CPU (`116` против `119 samples/s`), хотя host allocations bytes
+сократились примерно вдвое; больший batch не запускался после resource-safety stop.
+
+Reward v3 больше не оптимизирует LH/denies: их breakdown остаётся diagnostic и всегда равен нулю.
+Observable own gold имеет weight 0.01, allied-minus-enemy public XP — 0.02. Enemy gold отсутствует
+в seat protocol и намеренно не добавлен, чтобы не нарушать anti-cheat boundary. Demo MapId(1)
+теперь заканчивается при первом падении tower или второй суммарной смерти стороны. Из 37896 строк
+`bota-server` 21123 приходятся на generated terrain/tree tables и tests; исполняемый handwritten
+server — около 16773 строк, поэтому широкое сокращение без найденного профилем дефекта отклонено.
 
 ## 20. Угроза читерства через симулятор
 

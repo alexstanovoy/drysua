@@ -22,21 +22,21 @@ pub const PPO_SHAPING_BUDGET: f32 = 100.0;
 /// Terminal reward for winning; losing is its negation.
 pub const PPO_TERMINAL_REWARD: f32 = 1_000.0;
 /// Version of rollout, GAE, objective, optimizer, and reward semantics.
-pub const PPO_SCHEMA_VERSION: u32 = 2;
+pub const PPO_SCHEMA_VERSION: u32 = 3;
 /// Audited simulator rules required by stage-nine rollouts.
-pub const PPO_RULES_AUDIT_VERSION: u32 = 2;
+pub const PPO_RULES_AUDIT_VERSION: u32 = 3;
 /// Canonical stage-nine learner contract covered by [`PPO_SCHEMA_HASH`].
 pub const PPO_SCHEMA_DESCRIPTOR: &str = concat!(
-    "bota-drysua-ppo/v2;",
+    "bota-drysua-ppo/v3;",
     "action_schema_version=1;action_schema_hash=17797499074169920257;",
     "feature_schema_version=4;feature_schema_hash=508444194896722448;",
-    "model_schema_version=4;model_schema_hash=9866443454266023146;rules_audit=2;",
+    "model_schema_version=4;model_schema_hash=9866443454266023146;rules_audit=3;",
     "bounds=rollout32768,streams1280,environments128,decisions256,epochs16,minibatch8192,microbatch64;",
     "actor=frozen_exact_policy_identity,legal_masked_gumbel_max_open_f64_uniform,exact_autoregressive_log_probability_and_entropy;",
     "gae=gamma_tick_pow_elapsed_ticks,lambda0.98,terminal_reset,bootstrap_truncation,normalized_advantages;",
     "objective=clipped_surrogate0.2,value_mse0.5,entropy0.01,target_kl0.02;",
     "optimizer=adam_lr3e-4_beta1_0.9_beta2_0.999_epsilon1e-5_global_clip0.5,weighted_host_microbatch_accumulation,transactional_parameters_moments_shuffle;",
-    "reward=seat_safe_global_summary,potential_shaping_budget100,terminal_win1000_loss-1000_draw0,separate_breakdown;",
+    "reward=seat_safe_global_summary,potential_shaping_budget100,xp_advantage0.02,own_observable_gold0.01,last_hit_deny_diagnostics_only_zero_reward,enemy_gold_unavailable_by_seat_contract,combat2,structures5,terminal_win1000_loss-1000_draw0,separate_breakdown;",
     "arena=one_learner_seat_against_independent_teacher,snapshot_and_events_every_tick,decision_interval3,batched_bootstrap,restart_on_terminal;",
     "pipeline=bounded_cpu_worker_endpoints,persistent_actor_thread_overlaps_learner,immutable_identity_bound_actor_lease,exactly_two_fixed_capacity_buffer_permits,one_generation_lag_allowed,two_generation_lag_rejected,live_generation_read_guard_held_through_optimizer_update,ragged_feature_arenas,bit_packed_behavioral_masks,padding_only_per_minibatch,explicit_cpu_cuda_metal_learner_selection;"
 );
@@ -1066,12 +1066,12 @@ impl RewardTracker {
 
 fn shaping_delta(previous: GlobalSummary, next: GlobalSummary, discount: f32) -> RewardBreakdown {
     let potential = |next: f32, previous: f32| discount * next - previous;
-    let experience = potential(score_xp(next), score_xp(previous)) * 0.01;
-    let last_hits = potential(score_last_hits(next), score_last_hits(previous)) * 0.2;
-    let denies = potential(score_denies(next), score_denies(previous)) * 0.1;
+    let experience = potential(score_xp(next), score_xp(previous)) * 0.02;
+    let last_hits = 0.0;
+    let denies = 0.0;
     let combat = potential(score_combat(next), score_combat(previous)) * 2.0;
     let structures = potential(score_structures(next), score_structures(previous)) * 5.0;
-    let wealth = potential(next.own_gold as f32, previous.own_gold as f32) * 0.001;
+    let wealth = potential(next.own_gold as f32, previous.own_gold as f32) * 0.01;
     RewardBreakdown {
         experience,
         last_hits,
@@ -1086,14 +1086,6 @@ fn shaping_delta(previous: GlobalSummary, next: GlobalSummary, discount: f32) ->
 
 fn score_xp(summary: GlobalSummary) -> f32 {
     (summary.allied.xp - summary.enemy.xp) as f32
-}
-
-fn score_last_hits(summary: GlobalSummary) -> f32 {
-    (summary.allied.last_hits as i64 - summary.enemy.last_hits as i64) as f32
-}
-
-fn score_denies(summary: GlobalSummary) -> f32 {
-    (summary.allied.denies as i64 - summary.enemy.denies as i64) as f32
 }
 
 fn score_combat(summary: GlobalSummary) -> f32 {
