@@ -926,6 +926,18 @@ random weights запрещён. Save выполняется через temporar
 После изменения правил симулятора старые datasets и checkpoints помечаются несовместимыми,
 пока отдельная evaluation не докажет обратное.
 
+Статус: реализованы deployment-only `drysua.weights.safetensors` и полный training artifact
+`checkpoint.safetensors` + `checkpoint.meta`. Manifest хранит exact action/feature/model/PPO
+schemas, git и simulator commits, Cargo features, hero/map scope, run seed, backend, batch,
+command line, rules audit, scheduler/curriculum/rollout counters, best evaluation, bounded RNG
+states и league references. Training tensors содержат policy/value parameters и оба Adam
+moment vectors; optimizer step, trainer update и shuffle state находятся в manifest. Load
+проверяет bounded file sizes, SHA-256, exact tensor names/shapes/F32, finite/nonnegative state и
+schema до атомарной установки model+optimizer ownership. Save сохраняет immutable SHA-256
+generation, canonical tensor copy и recoverable manifest последним; каждый файл и directory
+fsync-ится. Двухфайловая копия остаётся independently loadable через hash-checked canonical
+fallback. Checkpoint schema v1, hash `2133011134179236231`.
+
 ## 19. Производительность
 
 Обязательные крупные улучшения:

@@ -14,9 +14,14 @@ bota-proto = { path = "../bota/crates/bota-proto", default-features = false }
 bota-server = { path = "../bota/crates/bota-server", default-features = false, optional = true }
 candle-core = { version = "0.11.0", default-features = false }
 clap = { version = "4.6.6", default-features = false, features = ["derive", "error-context", "help", "std", "suggestions", "usage"] }
+safetensors = { version = "0.8.0", default-features = false, features = ["std"] }
+sha2 = { version = "0.11.0", default-features = false }
 
 [target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
 candle-cuda-feature = { path = "crates/candle-cuda-feature", default-features = false, optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", default-features = false, features = ["Win32_Storage_FileSystem"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 candle-metal-feature = { path = "crates/candle-metal-feature", default-features = false, optional = true }

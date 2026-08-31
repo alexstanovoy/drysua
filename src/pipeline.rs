@@ -441,6 +441,16 @@ impl ActorLearnerPipeline {
         workers: usize,
         learner: &PolicyModel,
     ) -> Result<Self, PipelineError> {
+        Self::new_at(sample_capacity, workers, learner, RolloutVersion::new(0))
+    }
+
+    /// Restores a pipeline at one manifest-validated policy generation.
+    pub fn new_at(
+        sample_capacity: usize,
+        workers: usize,
+        learner: &PolicyModel,
+        version: RolloutVersion,
+    ) -> Result<Self, PipelineError> {
         if !(1..=PPO_MAX_SAMPLES).contains(&sample_capacity) {
             return Err(PipelineError::InvalidSampleCapacity {
                 capacity: sample_capacity,
@@ -458,7 +468,7 @@ impl ActorLearnerPipeline {
                 .map_err(|error| PipelineError::Model(error.to_string()))?,
         );
         let published = Arc::new(RwLock::new(PublishedPolicy {
-            version: RolloutVersion::new(0),
+            version,
             learner_lineage: identity.lineage(),
             model,
         }));

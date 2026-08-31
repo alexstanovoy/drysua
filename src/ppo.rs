@@ -261,6 +261,13 @@ impl PpoRng {
         }
     }
 
+    pub(crate) fn from_checkpoint(state: u64, draws: u64) -> Result<Self, PpoError> {
+        if draws > crate::MAX_TRAINING_COUNTER {
+            return Err(PpoError::CounterOverflow);
+        }
+        Ok(Self { state, draws })
+    }
+
     pub fn next_u64(&mut self) -> Result<u64, PpoError> {
         self.draws = self
             .draws
@@ -641,6 +648,44 @@ impl PpoTrainer {
 
     pub const fn optimizer_step(&self) -> u64 {
         self.adam.step()
+    }
+
+    pub const fn updates(&self) -> u64 {
+        self.updates
+    }
+
+    pub const fn rng_checkpoint(&self) -> (u64, u64) {
+        (self.shuffle.state, self.shuffle.draws)
+    }
+
+    pub(crate) fn checkpoint_snapshot(
+        &self,
+        model: &PolicyModel,
+    ) -> Result<crate::ModelAdamSnapshot, PpoError> {
+        model
+            .coherent_snapshot(&self.adam)
+            .map_err(|error| PpoError::Model(error.to_string()))
+    }
+
+    pub(crate) fn restore_checkpoint(
+        config: PpoConfig,
+        adam: AdamState,
+        shuffle: (u64, u64),
+        updates: u64,
+    ) -> Result<Self, PpoError> {
+        let config = config.validate()?;
+        if updates > crate::MAX_TRAINING_COUNTER {
+            return Err(PpoError::CounterOverflow);
+        }
+        if adam.config() != config.adam() {
+            return Err(PpoError::InvalidConfig("checkpoint Adam config"));
+        }
+        Ok(Self {
+            config,
+            adam,
+            shuffle: PpoRng::from_checkpoint(shuffle.0, shuffle.1)?,
+            updates,
+        })
     }
 
     #[cfg(test)]

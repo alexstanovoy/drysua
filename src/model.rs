@@ -1335,6 +1335,49 @@ impl PolicyModel {
         Ok(adam)
     }
 
+    pub(crate) fn install_training_checkpoint(
+        &self,
+        parameters: &[f32],
+        config: AdamConfig,
+        first_moment: Vec<f32>,
+        second_moment: Vec<f32>,
+        step: u64,
+    ) -> Result<AdamState, ModelError> {
+        validate_parameter_values(parameters)?;
+        validate_adam_parts(
+            config,
+            &first_moment,
+            &second_moment,
+            step,
+            MODEL_PARAMETER_COUNT,
+        )?;
+        if !self.optimizer_permitted {
+            return Err(ModelError::ActorOptimizerForbidden);
+        }
+        let _guard = self.write_parameter_lock()?;
+        if self.optimizer_lineage.load(Ordering::Relaxed) != 0 {
+            return Err(ModelError::OptimizerAlreadyOwned);
+        }
+        let policy = self.next_policy_identity_locked()?;
+        let lineage = allocate_lineage(
+            &NEXT_OPTIMIZER_LINEAGE,
+            ModelError::OptimizerLineageUnavailable,
+        )?;
+        let adam = AdamState::from_parts(
+            config,
+            first_moment,
+            second_moment,
+            step,
+            OptimizerBinding { lineage, policy },
+        )?;
+        self.import_parameters_locked(parameters, None)?;
+        self.parameter_revision
+            .store(policy.revision, Ordering::Relaxed);
+        self.optimizer_lineage
+            .store(lineage.get(), Ordering::Relaxed);
+        Ok(adam)
+    }
+
     #[cfg(test)]
     pub(crate) fn claim_adam_for_test(&self, config: AdamConfig) -> Result<AdamState, ModelError> {
         self.claim_optimizer(config)

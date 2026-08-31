@@ -1,6 +1,7 @@
 mod action;
 #[cfg(feature = "builtin")]
 mod arena;
+mod checkpoint;
 mod cli;
 mod feature;
 mod imitation;

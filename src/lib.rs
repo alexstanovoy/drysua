@@ -1,6 +1,7 @@
 mod action;
 #[cfg(feature = "builtin")]
 mod arena;
+mod checkpoint;
 mod cli;
 mod feature;
 mod hero;
@@ -22,6 +23,7 @@ mod wire;
 pub use action::*;
 #[cfg(feature = "builtin")]
 pub use arena::*;
+pub use checkpoint::*;
 pub use cli::*;
 pub use feature::*;
 pub use hero::*;
