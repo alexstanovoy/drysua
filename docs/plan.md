@@ -19,8 +19,8 @@ wire-контракт `bota-proto` и не переносить приватны
 - [x] Этап 6: feature encoder.
 - [x] Этап 7: нейронная policy.
 - [x] Этап 8: behavioral cloning и DAgger.
-- [ ] Этап 9: PPO learner.
-- [ ] Этап 10: self-play league.
+- [x] Этап 9: PPO learner.
+- [x] Этап 10: self-play league.
 - [ ] Этап 11: оптимизация производительности.
 - [ ] Этап 12: release gate первой обученной версии.
 
@@ -720,6 +720,34 @@ Curriculum:
 
 После перехода на новый stage все старые stages продолжают оцениваться.
 
+Статус: learner и короткий реальный actor-to-learner path реализованы. Policy sampling
+использует deterministic Gumbel-Max только поверх legal masks и сохраняет сумму exact
+autoregressive log-probabilities, entropy, value и точную `PolicyIdentity`. Rollout
+ограничен 32768 transitions и 1280 interleaved seat streams; каждый stream проверяет
+монотонный decision index, elapsed ticks, terminal bootstrap и единую frozen actor
+revision. Rollout другой revision отвергается до optimizer mutation.
+
+GAE вычисляет `gamma_tick ^ elapsed_ticks`, обрывается на terminal transition и
+нормализует advantages только после построения lambda returns. Learner реализует clipped
+surrogate, value MSE, entropy bonus, global gradient clipping, Adam `3e-4/0.9/0.999/1e-5`,
+deterministic minibatch shuffle и early stop по non-negative approximate KL. Effective
+minibatch разбивается на autograd microbatches по 64, gradients суммируются на host и
+применяются одной atomic model revision. Ошибка полного update восстанавливает coherent
+parameter/Adam snapshot.
+
+`RewardTracker` читает только `GlobalSummary`, построенный из seat-specific protocol
+state. Potential shaping имеет episode budget 100, компоненты сохраняются раздельно, а
+Win/Loss/Draw представлены отдельным terminal adjudication и не смешиваются с
+nonterminal state. Builtin smoke держит одного learner seat против независимого teacher,
+обрабатывает snapshots/events каждый tick и принимает решения раз в три ticks. Команда
+`drysua train` намеренно ограничена 16 arenas, 64 decisions/environment и 10 updates:
+это safety smoke, а не долгий training job.
+
+Текущий model tensor path остаётся CPU-only согласно этапу 7. CUDA actor-learner,
+double buffering и массовое использование RTX относятся к этапу 17; этап 9 не добавляет
+CUDA supply-chain/build complexity и не выдаёт короткий smoke за GPU benchmark.
+Stage-nine contract: PPO schema v1, hash `18117330041678614078`, rules audit v2.
+
 ## 15. Reward
 
 Terminal reward:
@@ -784,6 +812,21 @@ League bounded, начальный лимит 32 policies. При перепол
 
 Каждый evaluation seed играется с перестановкой сторон. Promotion checkpoint происходит
 только после held-out gate, а не по training reward.
+
+Статус: реализован bounded league на 32 immutable policy snapshots с распределением
+opponents 30/25/25/15/5. Frozen model opponents материализуются отдельно от learner и
+не меняются внутри rollout; actor RNG использует отдельные domain-separated streams и не
+передаёт simulator seed в model inputs. Retention сохраняет anchor, accepted, strongest,
+четыре recent policies и отличающийся трёхосевой cross-play profile; минимальная capacity
+9 гарантирует evictable slot.
+
+`drysua league` выполняет bounded self-play PPO update, paired held-out evaluation,
+teacher/accepted/historical cross-play и отдельный paired exploit-regression namespace.
+Truncated matches считаются Draw и не превращаются в победу по training reward или
+промежуточным public statistics. Promotion требует минимум 20 disjoint paired seeds,
+1000 candidate actions, rejection rate ниже 0.1%, отсутствия regression на каждой стороне
+и opaque exploit audit, привязанный к candidate и accepted fingerprints. Stage-ten
+contract: league schema v1, hash `8903926055252199993`, rules audit v2.
 
 ## 17. GPU и actor-learner pipeline
 
@@ -1203,6 +1246,7 @@ drysua play
 drysua teacher
 drysua imitate
 drysua train
+drysua league
 drysua evaluate
 drysua duel
 drysua benchmark

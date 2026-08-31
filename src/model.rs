@@ -18,10 +18,10 @@ use crate::{
     HeadTarget, ITEM_FEATURE_TOKENS, ITEM_FEATURES, ImitationSample, ImitationSplit,
     LOOT_FEATURE_TOKENS, LOOT_FEATURES, LootIndex, MAP_FEATURES, MAX_POLICY_HISTORY,
     OWN_UNIT_FEATURE_TOKENS, POINT_FEATURE_TOKENS, POINT_FEATURES, POLICY_HISTORY_FEATURES,
-    PROJECTILE_FEATURE_TOKENS, PROJECTILE_FEATURES, PointIndex, PutPointTarget,
-    REMEMBERED_UNIT_FEATURE_TOKENS, ShopIndex, StructuredAction, UNIT_FEATURE_TOKENS,
-    UNIT_FEATURES, ability_feature, item_feature, loot_feature, point_feature, projectile_feature,
-    unit_feature,
+    PROJECTILE_FEATURE_TOKENS, PROJECTILE_FEATURES, PointIndex, PpoConfig, PpoMinibatchReport,
+    PpoPolicyChoice, PpoPreparedSample, PpoRng, PutPointTarget, REMEMBERED_UNIT_FEATURE_TOKENS,
+    ShopIndex, StructuredAction, UNIT_FEATURE_TOKENS, UNIT_FEATURES, ability_feature, item_feature,
+    loot_feature, point_feature, projectile_feature, unit_feature,
 };
 
 /// Version of the fixed policy-model parameter schema.
@@ -1279,7 +1279,12 @@ impl PolicyModel {
                 index: 0,
             });
         }
-        let mut source = ModelDecoder { model: self, state };
+        let mut source = ModelDecoder {
+            model: self,
+            state,
+            rng: None,
+            observed: None,
+        };
         let action = decode_from_source(space, &mut source)?;
         if !space.allows(action) {
             return Err(ModelError::InvalidModelState("illegal decoded action"));
@@ -1288,6 +1293,90 @@ impl PolicyModel {
             .decode(action)
             .map_err(|error| ModelError::Backend(error.to_string()))?;
         Ok(PolicyChoice { action, value })
+    }
+
+    /// Samples one legal autoregressive action and records exact old-policy statistics.
+    pub fn sample(
+        &self,
+        frame: &FeatureFrame,
+        space: &ActionSpace,
+        rng: &mut PpoRng,
+    ) -> Result<PpoPolicyChoice, ModelError> {
+        if !frame.matches_action_space(space) {
+            return Err(ModelError::FrameActionSpaceMismatch);
+        }
+        validate_batch(std::slice::from_ref(frame))?;
+        let _guard = self.read_parameter_lock()?;
+        let state = self.forward_frames(std::slice::from_ref(frame))?;
+        let value = self
+            .value
+            .forward(&state.trunk)?
+            .flatten_all()?
+            .to_vec1::<f32>()?[0];
+        let mut source = ModelDecoder {
+            model: self,
+            state,
+            rng: Some(rng),
+            observed: Some(SampledPathLogits::default()),
+        };
+        let action = decode_from_source(space, &mut source)?;
+        let target = BehavioralTarget::from_action(frame, space, action)
+            .map_err(|error| ModelError::Backend(error.to_string()))?;
+        let (log_probability, entropy) = source
+            .observed
+            .as_ref()
+            .ok_or(ModelError::InvalidModelState("sampled path logits"))?
+            .statistics(&target)?;
+        Ok(PpoPolicyChoice {
+            frame: frame.clone(),
+            target,
+            action,
+            policy: self.policy_identity_locked(),
+            log_probability,
+            entropy,
+            value,
+        })
+    }
+
+    /// Evaluates one exact legal action path without sampling or mutation.
+    pub fn action_statistics(
+        &self,
+        frame: &FeatureFrame,
+        space: &ActionSpace,
+        action: StructuredAction,
+    ) -> Result<(f32, f32, f32), ModelError> {
+        if !frame.matches_action_space(space) {
+            return Err(ModelError::FrameActionSpaceMismatch);
+        }
+        let target = BehavioralTarget::from_action(frame, space, action)
+            .map_err(|error| ModelError::Backend(error.to_string()))?;
+        let _guard = self.read_parameter_lock()?;
+        let statistics = self.policy_path_statistics_locked(frame, &target)?;
+        Ok((
+            statistics.log_probability,
+            statistics.entropy,
+            statistics.value,
+        ))
+    }
+
+    fn policy_path_statistics_locked(
+        &self,
+        frame: &FeatureFrame,
+        target: &BehavioralTarget,
+    ) -> Result<PolicyPathStatistics, ModelError> {
+        let output = self.training_forward_locked(
+            std::slice::from_ref(frame),
+            std::slice::from_ref(&target.prefix()),
+        )?;
+        validate_training_tensors_finite(&output)?;
+        let value = output.value.flatten_all()?.to_vec1::<f32>()?[0];
+        let logits = BehavioralHostLogits::from_tensors(&output)?;
+        let (log_probability, entropy) = logits.statistics(0, target)?;
+        Ok(PolicyPathStatistics {
+            log_probability,
+            entropy,
+            value,
+        })
     }
 
     /// Exports parameters in stable descriptor order.
@@ -1572,6 +1661,88 @@ impl PolicyModel {
             applied_scale: diagnostics.applied_scale,
             sample_count: examples.len(),
             optimizer_step: adam.step,
+        })
+    }
+
+    pub(crate) fn ppo_update(
+        &self,
+        examples: &[&PpoPreparedSample],
+        adam: &mut AdamState,
+        config: PpoConfig,
+    ) -> Result<PpoMinibatchReport, ModelError> {
+        self.ppo_update_with_microbatch(examples, adam, config, MODEL_TRAINING_BATCH)
+    }
+
+    fn ppo_update_with_microbatch(
+        &self,
+        examples: &[&PpoPreparedSample],
+        adam: &mut AdamState,
+        config: PpoConfig,
+        microbatch_size: usize,
+    ) -> Result<PpoMinibatchReport, ModelError> {
+        if examples.is_empty() || examples.len() > MODEL_MAX_BATCH {
+            return Err(ModelError::InvalidModelState("PPO minibatch count"));
+        }
+        if !(1..=MODEL_TRAINING_BATCH).contains(&microbatch_size) {
+            return Err(ModelError::InvalidModelState("PPO microbatch size"));
+        }
+        let _guard = self.write_parameter_lock()?;
+        self.validate_optimizer_binding_locked(adam.binding)?;
+        let mut gradients = vec![0.0f32; MODEL_PARAMETER_COUNT];
+        let mut report = PpoMinibatchReport::default();
+        for microbatch in examples.chunks(microbatch_size) {
+            let mut result = self.ppo_microbatch_locked(microbatch, config)?;
+            scale_gradients(&mut result.gradients, microbatch.len() as f32)?;
+            accumulate_gradients(&mut gradients, &result.gradients)?;
+            accumulate_ppo_report(&mut report, result.report)?;
+        }
+        let divisor = examples.len() as f32;
+        for gradient in &mut gradients {
+            *gradient /= divisor;
+        }
+        average_ppo_report(&mut report, examples.len())?;
+        if report.approximate_kl > f64::from(config.target_kl) {
+            return Ok(report);
+        }
+        let diagnostics = self.apply_adam_locked(adam, &gradients)?;
+        report.gradient_norm = diagnostics.unclipped_norm;
+        report.applied_scale = diagnostics.applied_scale;
+        report.applied = true;
+        Ok(report)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ppo_update_with_microbatch_for_test(
+        &self,
+        examples: &[&PpoPreparedSample],
+        adam: &mut AdamState,
+        config: PpoConfig,
+        microbatch_size: usize,
+    ) -> Result<PpoMinibatchReport, ModelError> {
+        self.ppo_update_with_microbatch(examples, adam, config, microbatch_size)
+    }
+
+    fn ppo_microbatch_locked(
+        &self,
+        examples: &[&PpoPreparedSample],
+        config: PpoConfig,
+    ) -> Result<PpoMicrobatch, ModelError> {
+        let frames = examples
+            .iter()
+            .map(|sample| sample.transition.frame.clone())
+            .collect::<Vec<_>>();
+        let prefixes = examples
+            .iter()
+            .map(|sample| sample.transition.target.prefix())
+            .collect::<Vec<_>>();
+        validate_training_batch(&frames, &prefixes)?;
+        let output = self.training_forward_locked(&frames, &prefixes)?;
+        validate_training_tensors_finite(&output)?;
+        let (loss, report) = ppo_loss(&output, examples, config)?;
+        let named = self.backward_named_locked(&loss)?;
+        Ok(PpoMicrobatch {
+            gradients: collect_host_gradients(named)?,
+            report,
         })
     }
 
@@ -1973,6 +2144,17 @@ struct BehavioralMicrobatch {
     active_head_counts: [usize; MODEL_BEHAVIORAL_HEADS],
 }
 
+struct PpoMicrobatch {
+    gradients: Vec<f32>,
+    report: PpoMinibatchReport,
+}
+
+struct PolicyPathStatistics {
+    log_probability: f32,
+    entropy: f32,
+    value: f32,
+}
+
 struct AdamReplacement {
     parameters: Vec<f32>,
     first_moment: Vec<f32>,
@@ -2060,6 +2242,38 @@ impl BehavioralHostLogits {
         })
     }
 
+    fn statistics(
+        &self,
+        index: usize,
+        target: &BehavioralTarget,
+    ) -> Result<(f32, f32), ModelError> {
+        macro_rules! add_head {
+            ($logp:ident, $entropy:ident, $values:ident, $field:ident) => {
+                let (head_logp, head_entropy) =
+                    host_head_statistics(self.row(&self.$values, index)?, &target.$field)?;
+                $logp += head_logp;
+                $entropy += head_entropy;
+            };
+        }
+        let (mut log_probability, mut entropy) =
+            host_head_statistics(self.row(&self.kind, index)?, &target.kind)?;
+        add_head!(log_probability, entropy, controlled, controlled);
+        add_head!(log_probability, entropy, ability, ability);
+        add_head!(log_probability, entropy, item, item);
+        add_head!(log_probability, entropy, swap, swap);
+        add_head!(log_probability, entropy, learn, learn);
+        add_head!(log_probability, entropy, shop, shop);
+        add_head!(log_probability, entropy, loot, loot);
+        add_head!(log_probability, entropy, target_mode, target_mode);
+        add_head!(log_probability, entropy, put_mode, put_mode);
+        add_head!(log_probability, entropy, entity_pointer, entity_pointer);
+        add_head!(log_probability, entropy, point_pointer, point_pointer);
+        if !log_probability.is_finite() || !entropy.is_finite() || entropy < 0.0 {
+            return Err(ModelError::InvalidModelState("policy path statistics"));
+        }
+        Ok((log_probability, entropy))
+    }
+
     fn row<'a>(&self, values: &'a [Vec<f32>], index: usize) -> Result<&'a [f32], ModelError> {
         values
             .get(index)
@@ -2068,6 +2282,41 @@ impl BehavioralHostLogits {
                 "behavioral output batch shape",
             ))
     }
+}
+
+fn host_head_statistics<const WIDTH: usize>(
+    logits: &[f32],
+    target: &HeadTarget<WIDTH>,
+) -> Result<(f32, f32), ModelError> {
+    if !target.active {
+        return Ok((0.0, 0.0));
+    }
+    if logits.len() != WIDTH || !target.is_selected_legal() {
+        return Err(ModelError::InvalidModelState("policy statistics head"));
+    }
+    let maximum = logits
+        .iter()
+        .zip(target.mask)
+        .filter_map(|(value, legal)| legal.then_some(*value))
+        .reduce(f32::max)
+        .ok_or(ModelError::NoLegalContinuation)?;
+    let sum = logits
+        .iter()
+        .zip(target.mask)
+        .filter_map(|(value, legal)| legal.then_some((*value - maximum).exp()))
+        .sum::<f32>();
+    let log_normalizer = maximum + sum.ln();
+    let log_probability = logits[target.selected] - log_normalizer;
+    let entropy = logits
+        .iter()
+        .zip(target.mask)
+        .filter(|(_, legal)| *legal)
+        .map(|(value, _)| {
+            let log_probability = *value - log_normalizer;
+            -log_probability.exp() * log_probability
+        })
+        .sum();
+    Ok((log_probability, entropy))
 }
 
 fn select_active_head<const WIDTH: usize>(
@@ -2137,6 +2386,218 @@ fn behavioral_loss(
     );
     add_head!(loss, &output.point_pointer, "point pointer", point_pointer);
     Ok((loss.sum_all()?, behavioral_head_counts(examples)))
+}
+
+fn ppo_loss(
+    output: &PolicyTensorTensors,
+    examples: &[&PpoPreparedSample],
+    config: PpoConfig,
+) -> Result<(Tensor, PpoMinibatchReport), ModelError> {
+    let negative_log_probability = ppo_negative_log_probability(output, examples)?;
+    let new_log_probability = negative_log_probability.neg()?;
+    let old_log_probability = Tensor::from_vec(
+        examples
+            .iter()
+            .map(|sample| sample.transition.old_log_probability)
+            .collect::<Vec<_>>(),
+        examples.len(),
+        &Device::Cpu,
+    )?;
+    let advantages = Tensor::from_vec(
+        examples
+            .iter()
+            .map(|sample| sample.advantage)
+            .collect::<Vec<_>>(),
+        examples.len(),
+        &Device::Cpu,
+    )?;
+    let log_ratio = (&new_log_probability - &old_log_probability)?;
+    let ratio = log_ratio.exp()?;
+    let clipped_ratio = ratio.clamp(1.0 - config.clip_epsilon, 1.0 + config.clip_epsilon)?;
+    let unclipped = ratio.mul(&advantages)?;
+    let clipped = clipped_ratio.mul(&advantages)?;
+    let policy_loss = unclipped.minimum(&clipped)?.mean_all()?.neg()?;
+    let returns = Tensor::from_vec(
+        examples
+            .iter()
+            .map(|sample| sample.return_value)
+            .collect::<Vec<_>>(),
+        examples.len(),
+        &Device::Cpu,
+    )?;
+    let values = output.value.squeeze(1)?;
+    let value_loss = (&values - &returns)?.sqr()?.mean_all()?;
+    let entropy = ppo_entropy(output, examples)?.mean_all()?;
+    let loss = (&policy_loss + &value_loss.affine(f64::from(config.value_coefficient), 0.0)?)?;
+    let loss = (&loss - &entropy.affine(f64::from(config.entropy_coefficient), 0.0)?)?;
+    let report = ppo_loss_report(
+        &policy_loss,
+        &value_loss,
+        &entropy,
+        &log_ratio,
+        &ratio,
+        config,
+        examples.len(),
+    )?;
+    Ok((loss, report))
+}
+
+fn ppo_loss_report(
+    policy_loss: &Tensor,
+    value_loss: &Tensor,
+    entropy: &Tensor,
+    log_ratio: &Tensor,
+    ratio: &Tensor,
+    config: PpoConfig,
+    samples: usize,
+) -> Result<PpoMinibatchReport, ModelError> {
+    let approximate_kl = (&ratio.affine(1.0, -1.0)? - log_ratio)?
+        .mean_all()?
+        .to_scalar::<f32>()?;
+    let ratios = ratio.to_vec1::<f32>()?;
+    let clipped = ratios
+        .iter()
+        .filter(|ratio| **ratio < 1.0 - config.clip_epsilon || **ratio > 1.0 + config.clip_epsilon)
+        .count();
+    Ok(PpoMinibatchReport {
+        policy_loss: f64::from(policy_loss.to_scalar::<f32>()?),
+        value_loss: f64::from(value_loss.to_scalar::<f32>()?),
+        entropy: f64::from(entropy.to_scalar::<f32>()?),
+        approximate_kl: f64::from(approximate_kl),
+        clip_fraction: clipped as f64 / samples as f64,
+        gradient_norm: 0.0,
+        applied_scale: 0.0,
+        samples,
+        applied: false,
+    })
+}
+
+fn ppo_negative_log_probability(
+    output: &PolicyTensorTensors,
+    examples: &[&PpoPreparedSample],
+) -> Result<Tensor, ModelError> {
+    macro_rules! add_head {
+        ($loss:ident, $tensor:expr, $name:literal, $field:ident) => {
+            $loss =
+                ($loss + masked_ppo_head_loss($tensor, examples, $name, |target| &target.$field)?)?;
+        };
+    }
+    let mut loss = masked_ppo_head_loss(&output.kind, examples, "kind", |target| &target.kind)?;
+    add_head!(loss, &output.controlled, "controlled", controlled);
+    add_head!(loss, &output.ability, "ability", ability);
+    add_head!(loss, &output.item, "item", item);
+    add_head!(loss, &output.swap, "swap", swap);
+    add_head!(loss, &output.learn, "learn", learn);
+    add_head!(loss, &output.shop, "shop", shop);
+    add_head!(loss, &output.loot, "loot", loot);
+    add_head!(loss, &output.target_mode, "target mode", target_mode);
+    add_head!(loss, &output.put_mode, "put mode", put_mode);
+    add_head!(
+        loss,
+        &output.entity_pointer,
+        "entity pointer",
+        entity_pointer
+    );
+    add_head!(loss, &output.point_pointer, "point pointer", point_pointer);
+    Ok(loss)
+}
+
+fn masked_ppo_head_loss<const WIDTH: usize>(
+    logits: &Tensor,
+    examples: &[&PpoPreparedSample],
+    name: &'static str,
+    target: fn(&BehavioralTarget) -> &HeadTarget<WIDTH>,
+) -> Result<Tensor, ModelError> {
+    let mut masks = Vec::with_capacity(examples.len() * WIDTH);
+    let mut labels = Vec::with_capacity(examples.len());
+    let mut active = Vec::with_capacity(examples.len());
+    for sample in examples {
+        append_tensor_target(
+            target(&sample.transition.target),
+            name,
+            &mut masks,
+            &mut labels,
+            &mut active,
+        )?;
+    }
+    masked_loss_from_parts(logits, examples.len(), WIDTH, masks, labels, active)
+}
+
+fn masked_loss_from_parts(
+    logits: &Tensor,
+    batch: usize,
+    width: usize,
+    masks: Vec<u8>,
+    labels: Vec<u32>,
+    active: Vec<f32>,
+) -> Result<Tensor, ModelError> {
+    if logits.dims() != [batch, width] {
+        return Err(ModelError::InvalidModelState("PPO head shape"));
+    }
+    let masks = Tensor::from_vec(masks, (batch, width), &Device::Cpu)?;
+    let labels = Tensor::from_vec(labels, (batch, 1), &Device::Cpu)?;
+    let active = Tensor::from_vec(active, batch, &Device::Cpu)?;
+    let negative = Tensor::full(f32::NEG_INFINITY, logits.shape(), &Device::Cpu)?;
+    let legal_logits = masks.where_cond(logits, &negative)?;
+    let selected = legal_logits.gather(&labels, 1)?.squeeze(1)?;
+    Ok((legal_logits.log_sum_exp(1)? - selected)?.mul(&active)?)
+}
+
+fn ppo_entropy(
+    output: &PolicyTensorTensors,
+    examples: &[&PpoPreparedSample],
+) -> Result<Tensor, ModelError> {
+    macro_rules! add_head {
+        ($entropy:ident, $tensor:expr, $field:ident) => {
+            $entropy =
+                ($entropy + masked_ppo_head_entropy($tensor, examples, |target| &target.$field)?)?;
+        };
+    }
+    let mut entropy = masked_ppo_head_entropy(&output.kind, examples, |target| &target.kind)?;
+    add_head!(entropy, &output.controlled, controlled);
+    add_head!(entropy, &output.ability, ability);
+    add_head!(entropy, &output.item, item);
+    add_head!(entropy, &output.swap, swap);
+    add_head!(entropy, &output.learn, learn);
+    add_head!(entropy, &output.shop, shop);
+    add_head!(entropy, &output.loot, loot);
+    add_head!(entropy, &output.target_mode, target_mode);
+    add_head!(entropy, &output.put_mode, put_mode);
+    add_head!(entropy, &output.entity_pointer, entity_pointer);
+    add_head!(entropy, &output.point_pointer, point_pointer);
+    Ok(entropy)
+}
+
+fn masked_ppo_head_entropy<const WIDTH: usize>(
+    logits: &Tensor,
+    examples: &[&PpoPreparedSample],
+    target: fn(&BehavioralTarget) -> &HeadTarget<WIDTH>,
+) -> Result<Tensor, ModelError> {
+    if logits.dims() != [examples.len(), WIDTH] {
+        return Err(ModelError::InvalidModelState("PPO entropy head shape"));
+    }
+    let mut masks = Vec::with_capacity(examples.len() * WIDTH);
+    let mut active = Vec::with_capacity(examples.len());
+    for sample in examples {
+        let head = target(&sample.transition.target);
+        masks.extend(head.mask.map(u8::from));
+        active.push(f32::from(head.active));
+    }
+    let masks = Tensor::from_vec(masks, (examples.len(), WIDTH), &Device::Cpu)?;
+    let active = Tensor::from_vec(active, examples.len(), &Device::Cpu)?;
+    let negative = Tensor::full(f32::NEG_INFINITY, logits.shape(), &Device::Cpu)?;
+    let legal = masks.where_cond(logits, &negative)?;
+    let log_normalizer = legal.log_sum_exp(1)?.unsqueeze(1)?;
+    let log_probability = legal.broadcast_sub(&log_normalizer)?;
+    let zeros = Tensor::zeros(logits.shape(), DType::F32, &Device::Cpu)?;
+    let safe_log_probability = masks.where_cond(&log_probability, &zeros)?;
+    let probability = masks.where_cond(&safe_log_probability.exp()?, &zeros)?;
+    let entropy = probability
+        .mul(&safe_log_probability)?
+        .sum(1)?
+        .neg()?
+        .mul(&active)?;
+    Ok(entropy)
 }
 
 fn masked_head_loss<const WIDTH: usize>(
@@ -2248,6 +2709,62 @@ fn accumulate_gradients(total: &mut [f32], addition: &[f32]) -> Result<(), Model
         *total += addition;
         if !total.is_finite() {
             return Err(ModelError::NonFiniteGradient { index });
+        }
+    }
+    Ok(())
+}
+
+fn scale_gradients(gradients: &mut [f32], scale: f32) -> Result<(), ModelError> {
+    if !scale.is_finite() || scale <= 0.0 {
+        return Err(ModelError::InvalidModelState("gradient accumulation scale"));
+    }
+    for (index, gradient) in gradients.iter_mut().enumerate() {
+        *gradient *= scale;
+        if !gradient.is_finite() {
+            return Err(ModelError::NonFiniteGradient { index });
+        }
+    }
+    Ok(())
+}
+
+fn accumulate_ppo_report(
+    total: &mut PpoMinibatchReport,
+    addition: PpoMinibatchReport,
+) -> Result<(), ModelError> {
+    total.policy_loss += addition.policy_loss * addition.samples as f64;
+    total.value_loss += addition.value_loss * addition.samples as f64;
+    total.entropy += addition.entropy * addition.samples as f64;
+    total.approximate_kl += addition.approximate_kl * addition.samples as f64;
+    total.clip_fraction += addition.clip_fraction * addition.samples as f64;
+    total.samples = total
+        .samples
+        .checked_add(addition.samples)
+        .ok_or(ModelError::InvalidModelState("PPO sample count"))?;
+    Ok(())
+}
+
+fn average_ppo_report(
+    report: &mut PpoMinibatchReport,
+    expected_samples: usize,
+) -> Result<(), ModelError> {
+    if report.samples != expected_samples || report.samples == 0 {
+        return Err(ModelError::InvalidModelState("PPO report sample count"));
+    }
+    let divisor = report.samples as f64;
+    report.policy_loss /= divisor;
+    report.value_loss /= divisor;
+    report.entropy /= divisor;
+    report.approximate_kl /= divisor;
+    report.clip_fraction /= divisor;
+    for value in [
+        report.policy_loss,
+        report.value_loss,
+        report.entropy,
+        report.approximate_kl,
+        report.clip_fraction,
+    ] {
+        if !value.is_finite() {
+            return Err(ModelError::InvalidModelState("PPO report finite"));
         }
     }
     Ok(())
@@ -3640,9 +4157,65 @@ impl DecoderSource for ScriptedDecoder<'_> {
     }
 }
 
-struct ModelDecoder<'a> {
-    model: &'a PolicyModel,
+#[derive(Default)]
+struct SampledPathLogits {
+    kind: Option<[f32; MODEL_KIND_HEAD]>,
+    controlled: Option<[f32; MODEL_UNIT_HEAD]>,
+    ability: Option<[f32; MODEL_ABILITY_HEAD]>,
+    item: Option<[f32; MODEL_ITEM_HEAD]>,
+    swap: Option<[f32; MODEL_SWAP_HEAD]>,
+    learn: Option<[f32; MODEL_LEARN_HEAD]>,
+    shop: Option<[f32; MODEL_SHOP_HEAD]>,
+    loot: Option<[f32; MODEL_LOOT_HEAD]>,
+    target_mode: Option<[f32; TARGET_MODE_HEAD]>,
+    put_mode: Option<[f32; PUT_MODE_HEAD]>,
+    entity_pointer: Option<[f32; MODEL_ENTITY_POINTER_HEAD]>,
+    point_pointer: Option<[f32; MODEL_POINT_POINTER_HEAD]>,
+}
+
+impl SampledPathLogits {
+    fn statistics(&self, target: &BehavioralTarget) -> Result<(f32, f32), ModelError> {
+        macro_rules! add_head {
+            ($logp:ident, $entropy:ident, $field:ident) => {
+                let (head_logp, head_entropy) =
+                    sampled_head_statistics(self.$field.as_ref(), &target.$field)?;
+                $logp += head_logp;
+                $entropy += head_entropy;
+            };
+        }
+        let (mut log_probability, mut entropy) =
+            sampled_head_statistics(self.kind.as_ref(), &target.kind)?;
+        add_head!(log_probability, entropy, controlled);
+        add_head!(log_probability, entropy, ability);
+        add_head!(log_probability, entropy, item);
+        add_head!(log_probability, entropy, swap);
+        add_head!(log_probability, entropy, learn);
+        add_head!(log_probability, entropy, shop);
+        add_head!(log_probability, entropy, loot);
+        add_head!(log_probability, entropy, target_mode);
+        add_head!(log_probability, entropy, put_mode);
+        add_head!(log_probability, entropy, entity_pointer);
+        add_head!(log_probability, entropy, point_pointer);
+        Ok((log_probability, entropy))
+    }
+}
+
+fn sampled_head_statistics<const WIDTH: usize>(
+    logits: Option<&[f32; WIDTH]>,
+    target: &HeadTarget<WIDTH>,
+) -> Result<(f32, f32), ModelError> {
+    if !target.active {
+        return Ok((0.0, 0.0));
+    }
+    let logits = logits.ok_or(ModelError::InvalidModelState("missing sampled head"))?;
+    host_head_statistics(logits, target)
+}
+
+struct ModelDecoder<'model, 'rng> {
+    model: &'model PolicyModel,
     state: ForwardState,
+    rng: Option<&'rng mut PpoRng>,
+    observed: Option<SampledPathLogits>,
 }
 
 fn finite_array<const SIZE: usize>(
@@ -3665,7 +4238,27 @@ fn finite_array<const SIZE: usize>(
         .map_err(|_| ModelError::InvalidModelState("decoder head shape"))
 }
 
-impl ModelDecoder<'_> {
+impl ModelDecoder<'_, '_> {
+    fn perturb<const SIZE: usize>(
+        &mut self,
+        mut logits: [f32; SIZE],
+    ) -> Result<[f32; SIZE], ModelError> {
+        let Some(rng) = self.rng.as_deref_mut() else {
+            return Ok(logits);
+        };
+        for logit in &mut logits {
+            let uniform = rng
+                .uniform_open()
+                .map_err(|error| ModelError::Backend(error.to_string()))?;
+            let noise = -(-uniform.ln()).ln();
+            *logit += noise as f32;
+            if !logit.is_finite() {
+                return Err(ModelError::InvalidModelState("sampling noise"));
+            }
+        }
+        Ok(logits)
+    }
+
     fn context(
         &self,
         kind: ActionKind,
@@ -3721,7 +4314,7 @@ impl ModelDecoder<'_> {
     }
 }
 
-impl DecoderSource for ModelDecoder<'_> {
+impl DecoderSource for ModelDecoder<'_, '_> {
     fn kind(&mut self) -> Result<[f32; 16], ModelError> {
         let values = self
             .model
@@ -3729,20 +4322,36 @@ impl DecoderSource for ModelDecoder<'_> {
             .forward(&self.state.trunk)?
             .flatten_all()?
             .to_vec1::<f32>()?;
-        finite_array("kind", values)
+        let logits = finite_array("kind", values)?;
+        if let Some(observed) = &mut self.observed {
+            observed.kind = Some(logits);
+        }
+        self.perturb(logits)
     }
     fn controlled(&mut self, kind: ActionKind) -> Result<[f32; 2], ModelError> {
-        self.head("controlled", &self.model.controlled, kind, None, None)
+        let logits = self.head("controlled", &self.model.controlled, kind, None, None)?;
+        if let Some(observed) = &mut self.observed {
+            observed.controlled = Some(logits);
+        }
+        self.perturb(logits)
     }
     fn ability(
         &mut self,
         kind: ActionKind,
         unit: Option<ControlledUnit>,
     ) -> Result<[f32; 8], ModelError> {
-        self.head("ability", &self.model.ability_head, kind, unit, None)
+        let logits = self.head("ability", &self.model.ability_head, kind, unit, None)?;
+        if let Some(observed) = &mut self.observed {
+            observed.ability = Some(logits);
+        }
+        self.perturb(logits)
     }
     fn item(&mut self, kind: ActionKind, unit: ControlledUnit) -> Result<[f32; 15], ModelError> {
-        self.head("item", &self.model.item_head, kind, Some(unit), None)
+        let logits = self.head("item", &self.model.item_head, kind, Some(unit), None)?;
+        if let Some(observed) = &mut self.observed {
+            observed.item = Some(logits);
+        }
+        self.perturb(logits)
     }
     fn swap(
         &mut self,
@@ -3750,22 +4359,38 @@ impl DecoderSource for ModelDecoder<'_> {
         unit: ControlledUnit,
         slot: usize,
     ) -> Result<[f32; 15], ModelError> {
-        self.head(
+        let logits = self.head(
             "swap",
             &self.model.swap_head,
             kind,
             Some(unit),
             Some(SlotSelection::Item(slot)),
-        )
+        )?;
+        if let Some(observed) = &mut self.observed {
+            observed.swap = Some(logits);
+        }
+        self.perturb(logits)
     }
     fn learn(&mut self, kind: ActionKind) -> Result<[f32; 6], ModelError> {
-        self.head("learn", &self.model.learn_head, kind, None, None)
+        let logits = self.head("learn", &self.model.learn_head, kind, None, None)?;
+        if let Some(observed) = &mut self.observed {
+            observed.learn = Some(logits);
+        }
+        self.perturb(logits)
     }
     fn shop(&mut self, kind: ActionKind, unit: ControlledUnit) -> Result<[f32; 64], ModelError> {
-        self.head("shop", &self.model.shop_head, kind, Some(unit), None)
+        let logits = self.head("shop", &self.model.shop_head, kind, Some(unit), None)?;
+        if let Some(observed) = &mut self.observed {
+            observed.shop = Some(logits);
+        }
+        self.perturb(logits)
     }
     fn loot(&mut self, kind: ActionKind, unit: ControlledUnit) -> Result<[f32; 16], ModelError> {
-        self.head("loot", &self.model.loot_head, kind, Some(unit), None)
+        let logits = self.head("loot", &self.model.loot_head, kind, Some(unit), None)?;
+        if let Some(observed) = &mut self.observed {
+            observed.loot = Some(logits);
+        }
+        self.perturb(logits)
     }
     fn target_mode(
         &mut self,
@@ -3773,13 +4398,17 @@ impl DecoderSource for ModelDecoder<'_> {
         unit: ControlledUnit,
         slot: SlotSelection,
     ) -> Result<[f32; 3], ModelError> {
-        self.head(
+        let logits = self.head(
             "target mode",
             &self.model.target_mode,
             kind,
             Some(unit),
             Some(slot),
-        )
+        )?;
+        if let Some(observed) = &mut self.observed {
+            observed.target_mode = Some(logits);
+        }
+        self.perturb(logits)
     }
     fn put_mode(
         &mut self,
@@ -3787,13 +4416,17 @@ impl DecoderSource for ModelDecoder<'_> {
         unit: ControlledUnit,
         slot: usize,
     ) -> Result<[f32; 2], ModelError> {
-        self.head(
+        let logits = self.head(
             "put mode",
             &self.model.put_mode,
             kind,
             Some(unit),
             Some(SlotSelection::Item(slot)),
-        )
+        )?;
+        if let Some(observed) = &mut self.observed {
+            observed.put_mode = Some(logits);
+        }
+        self.perturb(logits)
     }
     fn entity(
         &mut self,
@@ -3801,14 +4434,18 @@ impl DecoderSource for ModelDecoder<'_> {
         unit: ControlledUnit,
         slot: Option<SlotSelection>,
     ) -> Result<[f32; 96], ModelError> {
-        self.pointer(
+        let logits = self.pointer(
             "entity pointer",
             &self.model.entity_query,
             &self.state.current_units,
             kind,
             unit,
             slot,
-        )
+        )?;
+        if let Some(observed) = &mut self.observed {
+            observed.entity_pointer = Some(logits);
+        }
+        self.perturb(logits)
     }
     fn point(
         &mut self,
@@ -3816,13 +4453,17 @@ impl DecoderSource for ModelDecoder<'_> {
         unit: ControlledUnit,
         slot: Option<SlotSelection>,
     ) -> Result<[f32; 48], ModelError> {
-        self.pointer(
+        let logits = self.pointer(
             "point pointer",
             &self.model.point_query,
             &self.state.points,
             kind,
             unit,
             slot,
-        )
+        )?;
+        if let Some(observed) = &mut self.observed {
+            observed.point_pointer = Some(logits);
+        }
+        self.perturb(logits)
     }
 }

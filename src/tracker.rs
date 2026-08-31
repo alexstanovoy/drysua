@@ -863,6 +863,11 @@ impl StateTracker {
         std::array::from_fn(|index| self.summary_at_age(HISTORY_AGES[index]))
     }
 
+    /// Latest seat-safe summary produced from the current snapshot.
+    pub fn latest_summary(&self) -> Option<GlobalSummary> {
+        self.summaries.back().copied()
+    }
+
     /// Own scoreboard row from the current snapshot.
     pub fn own_player(&self) -> Option<&PlayerView> {
         self.current
