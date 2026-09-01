@@ -3,6 +3,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::sync::mpsc::sync_channel;
 use std::thread;
+use std::time::{Duration, Instant};
 
 use bota_proto::{MapId, ServerMsg, SlotId, Team};
 
@@ -67,11 +68,27 @@ pub struct TrainingJobConfig {
     pub rollout_decisions: usize,
     pub epochs: usize,
     pub minibatch: usize,
-    pub checkpoint_interval: u64,
+    pub checkpoint_cadence: TrainingCheckpointCadence,
+    pub resume_provenance: ResumeProvenance,
     pub seed: u64,
     pub map: MapId,
     pub git_commit: String,
     pub simulator_commit: String,
+}
+
+/// A deterministic test cadence or a production monotonic wall-time cadence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrainingCheckpointCadence {
+    Updates(u64),
+    WallTime(Duration),
+}
+
+/// Strict resume by default, with an explicit one-time Git provenance migration.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ResumeProvenance {
+    #[default]
+    Strict,
+    MigrateGitCommit,
 }
 
 /// Durable progress emitted only after a checkpoint and runtime weights are committed.
@@ -211,6 +228,53 @@ struct TrainingDirectoryLock {
     _file: File,
 }
 
+pub(crate) struct TrainingCheckpointSchedule {
+    cadence: TrainingCheckpointCadence,
+    next_wall_deadline: Option<Duration>,
+}
+
+impl TrainingCheckpointSchedule {
+    pub(crate) fn new(cadence: TrainingCheckpointCadence) -> Result<Self, PpoError> {
+        validate_checkpoint_cadence(cadence)?;
+        let next_wall_deadline = match cadence {
+            TrainingCheckpointCadence::Updates(_) => None,
+            TrainingCheckpointCadence::WallTime(interval) => Some(interval),
+        };
+        Ok(Self {
+            cadence,
+            next_wall_deadline,
+        })
+    }
+
+    pub(crate) fn is_due(&self, completed_updates: u64, elapsed: Duration) -> bool {
+        match self.cadence {
+            TrainingCheckpointCadence::Updates(interval) => {
+                completed_updates.is_multiple_of(interval)
+            }
+            TrainingCheckpointCadence::WallTime(_) => self
+                .next_wall_deadline
+                .is_some_and(|deadline| elapsed >= deadline),
+        }
+    }
+
+    pub(crate) fn mark_committed(&mut self, elapsed: Duration) -> Result<(), PpoError> {
+        let TrainingCheckpointCadence::WallTime(interval) = self.cadence else {
+            return Ok(());
+        };
+        let deadline = self
+            .next_wall_deadline
+            .ok_or(PpoError::InvalidTransition("wall checkpoint deadline"))?;
+        let lag = elapsed.saturating_sub(deadline);
+        let periods = lag.as_nanos() / interval.as_nanos() + 1;
+        let periods = u32::try_from(periods).map_err(|_| PpoError::CounterOverflow)?;
+        let advance = interval
+            .checked_mul(periods)
+            .ok_or(PpoError::CounterOverflow)?;
+        self.next_wall_deadline = deadline.checked_add(advance);
+        Ok(())
+    }
+}
+
 /// Runs real seat-projected arenas, GAE, clipped PPO, value loss, entropy, and Adam briefly.
 pub fn run_ppo_smoke(settings: PpoSmokeConfig) -> Result<PpoSmokeReport, PpoError> {
     run_ppo_smoke_on(settings, PolicyDevice::Cpu)
@@ -319,7 +383,7 @@ where
 {
     validate_training_directory(checkpoint_directory, resume)?;
     let _directory_lock = TrainingDirectoryLock::acquire(checkpoint_directory)?;
-    let config = validate_training_job(&settings)?;
+    let config = validate_training_job(&settings, resume)?;
     let run = training_checkpoint_run(&settings, device, config)?;
     let capacity = settings
         .environments
@@ -334,23 +398,30 @@ where
         run,
         capacity,
     )?;
-    if resume {
-        TrainingArtifact::save_runtime_weights(&session.model, checkpoint_directory)
-            .map_err(checkpoint_error)?;
-    }
     let start = session.completed_updates;
     if start > settings.updates {
         return Err(PpoError::InvalidConfig(
             "training update target precedes checkpoint",
         ));
     }
+    if session.migrated_provenance {
+        let migration = session.checkpoint_report(None);
+        let durable = session.save(checkpoint_directory, migration)?;
+        checkpointed(durable);
+    } else if resume {
+        TrainingArtifact::save_runtime_weights(&session.model, checkpoint_directory)
+            .map_err(checkpoint_error)?;
+    }
+    let started = Instant::now();
+    let mut checkpoint_schedule = TrainingCheckpointSchedule::new(settings.checkpoint_cadence)?;
     for update in start..settings.updates {
         let report = session.train_update(&settings, update, config, capacity)?;
-        if report.completed_updates % settings.checkpoint_interval == 0
-            || report.completed_updates == settings.updates
-        {
+        let elapsed = started.elapsed();
+        let final_update = report.completed_updates == settings.updates;
+        if checkpoint_schedule.is_due(report.completed_updates, elapsed) || final_update {
             let durable = session.save(checkpoint_directory, report)?;
             checkpointed(durable);
+            checkpoint_schedule.mark_committed(started.elapsed())?;
         }
     }
     Ok(session.report())
@@ -366,6 +437,7 @@ struct TrainingSession {
     completed_updates: u64,
     rollout_samples: u64,
     latest: PpoUpdateReport,
+    migrated_provenance: bool,
 }
 
 impl TrainingSession {
@@ -380,13 +452,34 @@ impl TrainingSession {
         capacity: usize,
     ) -> Result<Self, PpoError> {
         let model = PolicyModel::fresh_on(settings.seed, device).map_err(model_error)?;
-        let (trainer, mut pipeline, sampling, completed_updates, rollout_samples) = if resume {
-            restore_training_session(&model, directory, &run, config, capacity)?
+        let (
+            trainer,
+            mut pipeline,
+            sampling,
+            completed_updates,
+            rollout_samples,
+            migrated_provenance,
+        ) = if resume {
+            restore_training_session(
+                &model,
+                directory,
+                &run,
+                config,
+                capacity,
+                settings.resume_provenance,
+            )?
         } else {
             let trainer = PpoTrainer::new(&model, config, settings.seed ^ 0x51a9)?;
             let pipeline =
                 ActorLearnerPipeline::new(capacity, 1, &model).map_err(pipeline_error)?;
-            (trainer, pipeline, PpoRng::new(settings.seed ^ 0xa17e), 0, 0)
+            (
+                trainer,
+                pipeline,
+                PpoRng::new(settings.seed ^ 0xa17e),
+                0,
+                0,
+                false,
+            )
         };
         let actor = pipeline.take_actor(0).map_err(pipeline_error)?;
         Ok(Self {
@@ -399,6 +492,7 @@ impl TrainingSession {
             completed_updates,
             rollout_samples,
             latest: PpoUpdateReport::default(),
+            migrated_provenance,
         })
     }
 
@@ -668,12 +762,18 @@ fn update_kl(update: PpoUpdateReport) -> f64 {
     }
 }
 
-fn validate_training_job(settings: &TrainingJobConfig) -> Result<PpoConfig, PpoError> {
+fn validate_training_job(
+    settings: &TrainingJobConfig,
+    resume: bool,
+) -> Result<PpoConfig, PpoError> {
     if settings.updates == 0 || settings.updates > 1_000_000 {
         return Err(PpoError::InvalidConfig("training updates"));
     }
-    if settings.checkpoint_interval == 0 || settings.checkpoint_interval > 1_000 {
-        return Err(PpoError::InvalidConfig("training checkpoint interval"));
+    validate_checkpoint_cadence(settings.checkpoint_cadence)?;
+    if !resume && settings.resume_provenance != ResumeProvenance::Strict {
+        return Err(PpoError::InvalidConfig(
+            "fresh training provenance migration",
+        ));
     }
     if settings.environments == 0 || settings.environments > 16 {
         return Err(PpoError::InvalidConfig("training environments"));
@@ -693,6 +793,23 @@ fn validate_training_job(settings: &TrainingJobConfig) -> Result<PpoConfig, PpoE
     let config = training_ppo_config(settings).validate()?;
     validate_training_counters(settings, config)?;
     Ok(config)
+}
+
+fn validate_checkpoint_cadence(cadence: TrainingCheckpointCadence) -> Result<(), PpoError> {
+    match cadence {
+        TrainingCheckpointCadence::Updates(interval) if (1..=1_000).contains(&interval) => Ok(()),
+        TrainingCheckpointCadence::WallTime(interval)
+            if (Duration::from_secs(1)..=Duration::from_secs(86_400)).contains(&interval) =>
+        {
+            Ok(())
+        }
+        TrainingCheckpointCadence::Updates(_) => {
+            Err(PpoError::InvalidConfig("training checkpoint updates"))
+        }
+        TrainingCheckpointCadence::WallTime(_) => {
+            Err(PpoError::InvalidConfig("training checkpoint wall time"))
+        }
+    }
 }
 
 fn training_ppo_config(settings: &TrainingJobConfig) -> PpoConfig {
@@ -858,9 +975,24 @@ fn restore_training_session(
     run: &CheckpointRun,
     config: PpoConfig,
     capacity: usize,
-) -> Result<(PpoTrainer, ActorLearnerPipeline, PpoRng, u64, u64), PpoError> {
-    let artifact = TrainingArtifact::load_compatible(directory, run).map_err(checkpoint_error)?;
-    let restored = artifact.restore(model, run).map_err(checkpoint_error)?;
+    provenance: ResumeProvenance,
+) -> Result<(PpoTrainer, ActorLearnerPipeline, PpoRng, u64, u64, bool), PpoError> {
+    let (artifact, restore_run, migrated) = match provenance {
+        ResumeProvenance::Strict => (
+            TrainingArtifact::load_compatible(directory, run).map_err(checkpoint_error)?,
+            run.clone(),
+            false,
+        ),
+        ResumeProvenance::MigrateGitCommit => {
+            let artifact = TrainingArtifact::load(directory).map_err(checkpoint_error)?;
+            let restore_run = artifact.run().clone();
+            validate_provenance_migration(&restore_run, run)?;
+            (artifact, restore_run, true)
+        }
+    };
+    let restored = artifact
+        .restore(model, &restore_run)
+        .map_err(checkpoint_error)?;
     if restored.trainer().config() != config {
         return Err(PpoError::InvalidConfig("training checkpoint PPO config"));
     }
@@ -883,7 +1015,25 @@ fn restore_training_session(
         sampling,
         completed_updates,
         rollout_samples,
+        migrated,
     ))
+}
+
+fn validate_provenance_migration(
+    stored: &CheckpointRun,
+    expected: &CheckpointRun,
+) -> Result<(), PpoError> {
+    if stored.git_commit == expected.git_commit {
+        return Err(PpoError::InvalidConfig(
+            "provenance migration requires a changed Git commit",
+        ));
+    }
+    let mut migrated = stored.clone();
+    migrated.git_commit.clone_from(&expected.git_commit);
+    if &migrated != expected {
+        return Err(PpoError::InvalidConfig("provenance migration scope"));
+    }
+    Ok(())
 }
 
 fn restore_sampling_rng(states: &[RngCheckpoint]) -> Result<PpoRng, PpoError> {

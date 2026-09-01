@@ -605,6 +605,32 @@ fn persistent_actor_refreshes_policy_after_waiting_for_a_recycled_buffer() {
 
 #[cfg(feature = "builtin")]
 #[test]
+fn wall_checkpoint_schedule_uses_fixed_monotonic_deadlines_without_drift() {
+    let cadence = crate::TrainingCheckpointCadence::WallTime(std::time::Duration::from_secs(300));
+    let mut schedule = crate::ppo_arena::TrainingCheckpointSchedule::new(cadence)
+        .expect("wall checkpoint schedule");
+
+    assert!(!schedule.is_due(1, std::time::Duration::from_secs(299)));
+    assert!(schedule.is_due(2, std::time::Duration::from_secs(300)));
+    schedule
+        .mark_committed(std::time::Duration::from_secs(300))
+        .expect("second deadline");
+    assert!(!schedule.is_due(3, std::time::Duration::from_secs(599)));
+    assert!(schedule.is_due(4, std::time::Duration::from_secs(600)));
+    schedule
+        .mark_committed(std::time::Duration::from_secs(600))
+        .expect("third deadline");
+    assert!(!schedule.is_due(5, std::time::Duration::from_secs(899)));
+    assert!(schedule.is_due(6, std::time::Duration::from_secs(900)));
+    schedule
+        .mark_committed(std::time::Duration::from_secs(1_201))
+        .expect("deadline after a delayed commit");
+    assert!(!schedule.is_due(7, std::time::Duration::from_secs(1_499)));
+    assert!(schedule.is_due(8, std::time::Duration::from_secs(1_500)));
+}
+
+#[cfg(feature = "builtin")]
+#[test]
 fn training_job_checkpoints_and_resumes_from_the_next_update() {
     let directory = training_test_directory("resume");
     let mut settings = crate::TrainingJobConfig {
@@ -613,7 +639,8 @@ fn training_job_checkpoints_and_resumes_from_the_next_update() {
         rollout_decisions: 2,
         epochs: 1,
         minibatch: 2,
-        checkpoint_interval: 1,
+        checkpoint_cadence: crate::TrainingCheckpointCadence::Updates(1),
+        resume_provenance: crate::ResumeProvenance::Strict,
         seed: 23_071,
         map: bota_proto::MapId(1),
         git_commit: "test-drysua-commit".to_owned(),
@@ -639,9 +666,14 @@ fn training_job_checkpoints_and_resumes_from_the_next_update() {
     );
 
     settings.updates = 2;
-    let resumed =
-        crate::run_training_job_on(settings, crate::PolicyDevice::Cpu, &directory, true, |_| {})
-            .expect("resumed training update");
+    let resumed = crate::run_training_job_on(
+        settings.clone(),
+        crate::PolicyDevice::Cpu,
+        &directory,
+        true,
+        |_| {},
+    )
+    .expect("resumed training update");
     assert_eq!(resumed.completed_updates, 2);
     assert_eq!(resumed.optimizer_step, 2);
     assert_eq!(
@@ -650,6 +682,55 @@ fn training_job_checkpoints_and_resumes_from_the_next_update() {
             .progress()
             .global_update,
         2
+    );
+
+    settings.updates = 1;
+    settings.git_commit = "test-drysua-next-commit".to_owned();
+    settings.resume_provenance = crate::ResumeProvenance::MigrateGitCommit;
+    let error = crate::run_training_job_on(
+        settings.clone(),
+        crate::PolicyDevice::Cpu,
+        &directory,
+        true,
+        |_| {},
+    )
+    .expect_err("migration target before restored update");
+    assert_eq!(
+        error.to_string(),
+        "invalid PPO config field: training update target precedes checkpoint"
+    );
+    assert_eq!(
+        crate::TrainingArtifact::load(&directory)
+            .expect("checkpoint after rejected migration")
+            .run()
+            .git_commit,
+        "test-drysua-commit"
+    );
+
+    settings.updates = 3;
+    let mut incompatible = settings.clone();
+    incompatible.simulator_commit = "different-bota-commit".to_owned();
+    let error = crate::run_training_job_on(
+        incompatible,
+        crate::PolicyDevice::Cpu,
+        &directory,
+        true,
+        |_| {},
+    )
+    .expect_err("migration with a different simulator commit");
+    assert_eq!(
+        error.to_string(),
+        "invalid PPO config field: provenance migration scope"
+    );
+    let migrated =
+        crate::run_training_job_on(settings, crate::PolicyDevice::Cpu, &directory, true, |_| {})
+            .expect("migrated training update");
+    let migrated_artifact = crate::TrainingArtifact::load(&directory).expect("migrated checkpoint");
+    assert_eq!(migrated.completed_updates, 3);
+    assert_eq!(migrated_artifact.progress().global_update, 3);
+    assert_eq!(
+        migrated_artifact.run().git_commit,
+        "test-drysua-next-commit"
     );
 
     std::fs::remove_dir_all(directory).expect("remove checkpoint directory");
@@ -673,7 +754,8 @@ fn training_job_rejects_a_checkpoint_directory_locked_by_another_writer() {
             rollout_decisions: 2,
             epochs: 1,
             minibatch: 2,
-            checkpoint_interval: 1,
+            checkpoint_cadence: crate::TrainingCheckpointCadence::Updates(1),
+            resume_provenance: crate::ResumeProvenance::Strict,
             seed: 23_072,
             map: bota_proto::MapId(1),
             git_commit: "test-drysua-commit".to_owned(),
@@ -729,7 +811,8 @@ fn training_job_rejects_targets_that_cannot_fit_persisted_rng_counters() {
             rollout_decisions: 64,
             epochs: 1,
             minibatch: 32,
-            checkpoint_interval: 5,
+            checkpoint_cadence: crate::TrainingCheckpointCadence::Updates(5),
+            resume_provenance: crate::ResumeProvenance::Strict,
             seed: 23_073,
             map: bota_proto::MapId(1),
             git_commit: "test-drysua-commit".to_owned(),

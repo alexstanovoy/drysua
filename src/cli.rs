@@ -89,15 +89,18 @@ struct TrainFullArgs {
     /// Effective Adam minibatch.
     #[arg(long, default_value_t = 32)]
     minibatch: usize,
-    /// Updates between durable checkpoints, hard-bounded to 1000.
-    #[arg(long, default_value_t = 5)]
-    checkpoint_interval: u64,
+    /// Monotonic wall-clock seconds between durable checkpoints.
+    #[arg(long, default_value_t = 300)]
+    checkpoint_seconds: u64,
     /// Existing empty directory for a fresh run, or checkpoint directory when resuming.
     #[arg(long)]
     checkpoint_directory: std::path::PathBuf,
     /// Resume strict model, optimizer, counters, pipeline generation, and actor RNG state.
     #[arg(long, default_value_t = false)]
     resume: bool,
+    /// Rebind an otherwise identical checkpoint to this build's Git provenance once.
+    #[arg(long, default_value_t = false, requires = "resume")]
+    migrate_provenance: bool,
     /// Deterministic training seed.
     #[arg(long, default_value_t = 9_001)]
     seed: u64,
@@ -257,7 +260,14 @@ fn run_train_full(arguments: TrainFullArgs) -> std::io::Result<()> {
         rollout_decisions: arguments.rollout,
         epochs: arguments.epochs,
         minibatch: arguments.minibatch,
-        checkpoint_interval: arguments.checkpoint_interval,
+        checkpoint_cadence: crate::TrainingCheckpointCadence::WallTime(
+            std::time::Duration::from_secs(arguments.checkpoint_seconds),
+        ),
+        resume_provenance: if arguments.migrate_provenance {
+            crate::ResumeProvenance::MigrateGitCommit
+        } else {
+            crate::ResumeProvenance::Strict
+        },
         seed: arguments.seed,
         map: bota_proto::MapId(arguments.map),
         git_commit: embedded_commit("DRYSUA_GIT_COMMIT", option_env!("DRYSUA_GIT_COMMIT"))?,

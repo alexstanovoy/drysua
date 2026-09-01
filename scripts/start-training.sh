@@ -3,7 +3,7 @@ set -euo pipefail
 umask 077
 
 if (( $# < 1 || $# > 3 )); then
-    printf 'usage: %s RUN_DIRECTORY [TOTAL_UPDATES] [fresh|resume]\n' "$0" >&2
+    printf 'usage: %s RUN_DIRECTORY [TOTAL_UPDATES] [fresh|resume|migrate]\n' "$0" >&2
     exit 2
 fi
 
@@ -28,19 +28,19 @@ if [[ ! $total_updates =~ ^[0-9]+$ ]] || (( total_updates < 1 || total_updates >
     printf 'TOTAL_UPDATES must be in 1..%s for the fixed checkpoint-safe rollout.\n' "$maximum_updates" >&2
     exit 2
 fi
-if [[ $mode != fresh && $mode != resume ]]; then
-    printf 'mode must be fresh or resume.\n' >&2
+if [[ $mode != fresh && $mode != resume && $mode != migrate ]]; then
+    printf 'mode must be fresh, resume, or migrate.\n' >&2
     exit 2
 fi
 if [[ $mode == fresh && -e $run_directory ]]; then
     printf 'fresh run directory already exists: %s\n' "$run_directory" >&2
     exit 2
 fi
-if [[ $mode == resume && ! -d $checkpoint_directory ]]; then
+if [[ $mode != fresh && ! -d $checkpoint_directory ]]; then
     printf 'resume checkpoint directory does not exist: %s\n' "$checkpoint_directory" >&2
     exit 2
 fi
-if [[ $mode == resume ]]; then
+if [[ $mode != fresh ]]; then
     if [[ -L $run_directory || -L $checkpoint_directory || -L $log_file || -L $pid_file ]]; then
         printf 'resume paths must not be symbolic links.\n' >&2
         exit 2
@@ -178,7 +178,11 @@ if [[ $mode == fresh ]]; then
     mkdir "$checkpoint_directory"
     resume_argument=()
 else
-    resume_argument=(--resume)
+    if [[ $mode == migrate ]]; then
+        resume_argument=(--resume --migrate-provenance)
+    else
+        resume_argument=(--resume)
+    fi
 fi
 
 command=(
@@ -188,7 +192,7 @@ command=(
     --rollout 8
     --epochs 1
     --minibatch 32
-    --checkpoint-interval 100
+    --checkpoint-seconds 300
     --checkpoint-directory "$checkpoint_directory"
     --seed 9001
     --map 1

@@ -84,13 +84,30 @@ fn cli_accepts_resumable_training_job_parameters() {
         "1",
         "--minibatch",
         "32",
-        "--checkpoint-interval",
-        "5",
+        "--checkpoint-seconds",
+        "300",
         "--checkpoint-directory",
         "artifacts/training",
         "--resume",
+        "--migrate-provenance",
         "--device",
         "cuda",
     ])
     .expect("resumable train CLI");
+}
+
+#[test]
+fn cli_rejects_provenance_migration_without_resume() {
+    let error = crate::cli::parse_from([
+        "drysua",
+        "train-full",
+        "--updates",
+        "10000",
+        "--checkpoint-directory",
+        "artifacts/training",
+        "--migrate-provenance",
+    ])
+    .expect_err("migration requires resume");
+
+    assert!(error.to_string().contains("--resume"));
 }
