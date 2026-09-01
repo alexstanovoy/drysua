@@ -4,6 +4,8 @@
 )]
 
 use bota_proto::Team;
+#[cfg(feature = "builtin")]
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::feature::{encode, tracker_with_view, world_view};
 use crate::{
@@ -157,6 +159,14 @@ fn sampled_action_is_legal_and_statistics_match_exactly() {
     assert!(choice.log_probability <= 0.0);
     assert!(choice.entropy >= 0.0);
     assert!(rng.draws() > 0);
+    assert!(rng.draws() <= crate::PPO_MAX_POLICY_SAMPLE_DRAWS);
+}
+
+#[test]
+fn policy_sample_rng_bound_covers_the_longest_decoder_path() {
+    let longest_path = 16 + 2 + 15 + 3 + 96;
+
+    assert_eq!(crate::PPO_MAX_POLICY_SAMPLE_DRAWS, longest_path);
 }
 
 #[test]
@@ -591,4 +601,165 @@ fn persistent_actor_refreshes_policy_after_waiting_for_a_recycled_buffer() {
     assert_eq!(report.updates, 3);
     assert_eq!(report.transitions, 12);
     assert_eq!(report.optimizer_step, 3);
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn training_job_checkpoints_and_resumes_from_the_next_update() {
+    let directory = training_test_directory("resume");
+    let mut settings = crate::TrainingJobConfig {
+        updates: 1,
+        environments: 1,
+        rollout_decisions: 2,
+        epochs: 1,
+        minibatch: 2,
+        checkpoint_interval: 1,
+        seed: 23_071,
+        map: bota_proto::MapId(1),
+        git_commit: "test-drysua-commit".to_owned(),
+        simulator_commit: "test-bota-commit".to_owned(),
+    };
+
+    let first = crate::run_training_job_on(
+        settings.clone(),
+        crate::PolicyDevice::Cpu,
+        &directory,
+        false,
+        |_| {},
+    )
+    .expect("first training update");
+    assert_eq!(first.completed_updates, 1);
+    assert_eq!(first.optimizer_step, 1);
+    assert_eq!(
+        crate::TrainingArtifact::load(&directory)
+            .expect("first checkpoint")
+            .progress()
+            .global_update,
+        1
+    );
+
+    settings.updates = 2;
+    let resumed =
+        crate::run_training_job_on(settings, crate::PolicyDevice::Cpu, &directory, true, |_| {})
+            .expect("resumed training update");
+    assert_eq!(resumed.completed_updates, 2);
+    assert_eq!(resumed.optimizer_step, 2);
+    assert_eq!(
+        crate::TrainingArtifact::load(&directory)
+            .expect("resumed checkpoint")
+            .progress()
+            .global_update,
+        2
+    );
+
+    std::fs::remove_dir_all(directory).expect("remove checkpoint directory");
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn training_job_rejects_a_checkpoint_directory_locked_by_another_writer() {
+    let directory = training_test_directory("locked");
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(directory.join(".training.lock"))
+        .expect("create training lock");
+    lock.lock().expect("hold training lock");
+    let error = crate::run_training_job_on(
+        crate::TrainingJobConfig {
+            updates: 1,
+            environments: 1,
+            rollout_decisions: 2,
+            epochs: 1,
+            minibatch: 2,
+            checkpoint_interval: 1,
+            seed: 23_072,
+            map: bota_proto::MapId(1),
+            git_commit: "test-drysua-commit".to_owned(),
+            simulator_commit: "test-bota-commit".to_owned(),
+        },
+        crate::PolicyDevice::Cpu,
+        &directory,
+        true,
+        |_| {},
+    )
+    .expect_err("second checkpoint writer");
+
+    assert!(error.to_string().contains("checkpoint directory is locked"));
+    drop(lock);
+    std::fs::remove_dir_all(directory).expect("remove checkpoint directory");
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn production_warmup_phases_cover_pregame_and_active_match_ticks() {
+    assert_eq!(crate::training_warmup_decisions(0), 0);
+    assert_eq!(crate::training_warmup_decisions(1), 300);
+    assert!(crate::training_warmup_decisions(2) * 3 > 900);
+    assert_eq!(crate::training_warmup_decisions(7), 2_400);
+    assert_eq!(crate::training_warmup_decisions(8), 0);
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn production_training_alternates_policy_side_for_odd_environment_counts() {
+    assert_eq!(crate::training_policy_seat(0), 0);
+    assert_eq!(crate::training_policy_seat(1), 1);
+    assert_eq!(crate::training_policy_seat(2), 0);
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn production_seed_derivation_accepts_maximum_seed_without_overflow() {
+    let arena = crate::derive_training_seed(u64::MAX, 1_000_000, 1);
+    let opponent = crate::derive_training_seed(u64::MAX, 1_000_000, 2);
+
+    assert_ne!(arena, opponent);
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn training_job_rejects_targets_that_cannot_fit_persisted_rng_counters() {
+    let directory = training_test_directory("counter-bound");
+    let error = crate::run_training_job_on(
+        crate::TrainingJobConfig {
+            updates: 1_000_000,
+            environments: 16,
+            rollout_decisions: 64,
+            epochs: 1,
+            minibatch: 32,
+            checkpoint_interval: 5,
+            seed: 23_073,
+            map: bota_proto::MapId(1),
+            git_commit: "test-drysua-commit".to_owned(),
+            simulator_commit: "test-bota-commit".to_owned(),
+        },
+        crate::PolicyDevice::Cpu,
+        &directory,
+        false,
+        |_| {},
+    )
+    .expect_err("uncheckpointable actor RNG target");
+
+    assert_eq!(
+        error.to_string(),
+        "invalid PPO config field: training actor RNG counter"
+    );
+    std::fs::remove_dir_all(directory).expect("remove checkpoint directory");
+}
+
+#[cfg(feature = "builtin")]
+fn training_test_directory(name: &str) -> std::path::PathBuf {
+    static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(1);
+    let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+    let directory = std::env::temp_dir().join(format!(
+        "drysua-training-job-{name}-{}-{sequence}",
+        std::process::id()
+    ));
+    if directory.exists() {
+        std::fs::remove_dir_all(&directory).expect("remove stale training directory");
+    }
+    std::fs::create_dir(&directory).expect("create checkpoint directory");
+    directory
 }

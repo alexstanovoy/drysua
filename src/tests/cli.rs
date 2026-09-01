@@ -68,3 +68,29 @@ fn cli_accepts_bounded_self_play_smoke_parameters() {
     ])
     .expect("league CLI");
 }
+
+#[test]
+fn cli_accepts_resumable_training_job_parameters() {
+    crate::cli::parse_from([
+        "drysua",
+        "train-full",
+        "--updates",
+        "10000",
+        "--environments",
+        "4",
+        "--rollout",
+        "8",
+        "--epochs",
+        "1",
+        "--minibatch",
+        "32",
+        "--checkpoint-interval",
+        "5",
+        "--checkpoint-directory",
+        "artifacts/training",
+        "--resume",
+        "--device",
+        "cuda",
+    ])
+    .expect("resumable train CLI");
+}

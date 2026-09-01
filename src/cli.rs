@@ -21,6 +21,8 @@ enum Operation {
     Play(PlayArgs),
     /// Run a bounded stage-nine PPO actor-to-learner smoke training.
     Train(TrainArgs),
+    /// Run resumable PPO training with periodic strict checkpoints.
+    TrainFull(TrainFullArgs),
 }
 
 /// Options for one server match.
@@ -55,6 +57,47 @@ struct TrainArgs {
     /// Effective Adam minibatch.
     #[arg(long, default_value_t = 16)]
     minibatch: usize,
+    /// Deterministic training seed.
+    #[arg(long, default_value_t = 9_001)]
+    seed: u64,
+    /// Simulator map id, zero or one.
+    #[arg(long, default_value_t = 1)]
+    map: u16,
+    /// Learner tensor backend; actors and simulation remain on CPU.
+    #[arg(long, value_enum, default_value_t = LearnerDevice::Cpu)]
+    device: LearnerDevice,
+    /// CUDA or Metal device ordinal.
+    #[arg(long, default_value_t = 0)]
+    device_ordinal: usize,
+}
+
+/// Options for bounded resumable PPO training.
+#[derive(Args)]
+struct TrainFullArgs {
+    /// Total PPO update target, including updates restored from a checkpoint.
+    #[arg(long)]
+    updates: u64,
+    /// Independent CPU arenas, hard-bounded to sixteen.
+    #[arg(long, default_value_t = 4)]
+    environments: usize,
+    /// Decisions collected from each arena per update, hard-bounded to 64.
+    #[arg(long, default_value_t = 8)]
+    rollout: usize,
+    /// PPO passes over one rollout.
+    #[arg(long, default_value_t = 1)]
+    epochs: usize,
+    /// Effective Adam minibatch.
+    #[arg(long, default_value_t = 32)]
+    minibatch: usize,
+    /// Updates between durable checkpoints, hard-bounded to 1000.
+    #[arg(long, default_value_t = 5)]
+    checkpoint_interval: u64,
+    /// Existing empty directory for a fresh run, or checkpoint directory when resuming.
+    #[arg(long)]
+    checkpoint_directory: std::path::PathBuf,
+    /// Resume strict model, optimizer, counters, pipeline generation, and actor RNG state.
+    #[arg(long, default_value_t = false)]
+    resume: bool,
     /// Deterministic training seed.
     #[arg(long, default_value_t = 9_001)]
     seed: u64,
@@ -124,6 +167,7 @@ fn run(arguments: Cli) -> std::io::Result<()> {
         Some(Operation::League(league)) => return run_league(league),
         Some(Operation::Play(play)) => play,
         Some(Operation::Train(train)) => return run_train(train),
+        Some(Operation::TrainFull(train)) => return run_train_full(train),
         None => arguments.play,
     };
     let outcome = crate::play(&play.addr, &play.name, play.limit)?;
@@ -204,6 +248,85 @@ fn run_train(arguments: TrainArgs) -> std::io::Result<()> {
 }
 
 #[cfg(feature = "builtin")]
+fn run_train_full(arguments: TrainFullArgs) -> std::io::Result<()> {
+    let device = arguments.device.policy_device(arguments.device_ordinal)?;
+    validate_checkpoint_directory(&arguments.checkpoint_directory, arguments.resume)?;
+    let settings = crate::TrainingJobConfig {
+        updates: arguments.updates,
+        environments: arguments.environments,
+        rollout_decisions: arguments.rollout,
+        epochs: arguments.epochs,
+        minibatch: arguments.minibatch,
+        checkpoint_interval: arguments.checkpoint_interval,
+        seed: arguments.seed,
+        map: bota_proto::MapId(arguments.map),
+        git_commit: embedded_commit("DRYSUA_GIT_COMMIT", option_env!("DRYSUA_GIT_COMMIT"))?,
+        simulator_commit: embedded_commit("BOTA_GIT_COMMIT", option_env!("BOTA_GIT_COMMIT"))?,
+    };
+    let report = crate::run_training_job_on(
+        settings,
+        device,
+        &arguments.checkpoint_directory,
+        arguments.resume,
+        |checkpoint| {
+            println!(
+                "checkpoint: update {}, samples {}, optimizer step {}, policy loss {:.6}, value loss {:.6}, entropy {:.6}, KL {:.6}, KL stop {}",
+                checkpoint.completed_updates,
+                checkpoint.rollout_samples,
+                checkpoint.optimizer_step,
+                checkpoint.policy_loss,
+                checkpoint.value_loss,
+                checkpoint.entropy,
+                checkpoint.approximate_kl,
+                checkpoint.stopped_for_kl,
+            );
+            if let Some(warning) = checkpoint.cleanup_warning {
+                eprintln!("checkpoint cleanup warning: {warning}");
+            }
+        },
+    )
+    .map_err(std::io::Error::other)?;
+    println!(
+        "training complete: {} updates, {} samples, optimizer step {}, policy loss {:.6}, value loss {:.6}, entropy {:.6}, KL {:.6}",
+        report.completed_updates,
+        report.rollout_samples,
+        report.optimizer_step,
+        report.final_policy_loss,
+        report.final_value_loss,
+        report.final_entropy,
+        report.final_kl,
+    );
+    Ok(())
+}
+
+#[cfg(feature = "builtin")]
+fn validate_checkpoint_directory(directory: &std::path::Path, resume: bool) -> std::io::Result<()> {
+    if !directory.is_dir() {
+        return Err(std::io::Error::other(
+            "checkpoint directory must already exist and be a directory",
+        ));
+    }
+    if !resume && directory.read_dir()?.next().is_some() {
+        return Err(std::io::Error::other(
+            "fresh checkpoint directory must be empty; use --resume for an existing run",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "builtin")]
+fn embedded_commit(name: &str, value: Option<&str>) -> std::io::Result<String> {
+    value
+        .filter(|commit| !commit.is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            std::io::Error::other(format!(
+                "production training requires {name} to be set when compiling"
+            ))
+        })
+}
+
+#[cfg(feature = "builtin")]
 impl LearnerDevice {
     fn policy_device(self, ordinal: usize) -> std::io::Result<crate::PolicyDevice> {
         match self {
@@ -247,6 +370,13 @@ fn metal_policy_device(_: usize) -> std::io::Result<crate::PolicyDevice> {
 
 #[cfg(not(feature = "builtin"))]
 fn run_train(_: TrainArgs) -> std::io::Result<()> {
+    Err(std::io::Error::other(
+        "PPO train requires cargo feature `builtin`",
+    ))
+}
+
+#[cfg(not(feature = "builtin"))]
+fn run_train_full(_: TrainFullArgs) -> std::io::Result<()> {
     Err(std::io::Error::other(
         "PPO train requires cargo feature `builtin`",
     ))

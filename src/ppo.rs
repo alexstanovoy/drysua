@@ -17,6 +17,8 @@ use crate::{
 pub const PPO_MAX_STREAMS: usize = 1_280;
 /// Maximum transitions retained for one policy update.
 pub const PPO_MAX_SAMPLES: usize = 32_768;
+/// Maximum random draws made by one autoregressive policy sample.
+pub const PPO_MAX_POLICY_SAMPLE_DRAWS: u64 = 132;
 /// Absolute shaping budget for one episode.
 pub const PPO_SHAPING_BUDGET: f32 = 100.0;
 /// Terminal reward for winning; losing is its negation.
@@ -266,6 +268,10 @@ impl PpoRng {
             return Err(PpoError::CounterOverflow);
         }
         Ok(Self { state, draws })
+    }
+
+    pub const fn checkpoint(&self) -> (u64, u64) {
+        (self.state, self.draws)
     }
 
     pub fn next_u64(&mut self) -> Result<u64, PpoError> {
@@ -609,10 +615,12 @@ pub struct PpoUpdateReport {
     pub value_loss: f64,
     pub entropy: f64,
     pub approximate_kl: f64,
+    pub rejected_kl: f64,
     pub clip_fraction: f64,
     pub gradient_norm: f64,
     pub applied_scale: f64,
     pub samples_optimized: usize,
+    pub samples_rejected: usize,
     pub minibatches: usize,
     pub epochs_completed: usize,
     pub stopped_for_kl: bool,
@@ -806,6 +814,7 @@ impl PpoTrainer {
                     .map_err(|error| PpoError::Model(error.to_string()))?;
                 if !report.applied {
                     aggregate.stopped_for_kl = true;
+                    record_kl_rejection(&mut aggregate, report)?;
                     break 'epochs;
                 }
                 aggregate_minibatch(&mut aggregate, report)?;
@@ -844,8 +853,24 @@ fn aggregate_minibatch(
     Ok(())
 }
 
+fn record_kl_rejection(
+    aggregate: &mut PpoUpdateReport,
+    report: PpoMinibatchReport,
+) -> Result<(), PpoError> {
+    if report.samples == 0 || report.samples > MODEL_MAX_BATCH {
+        return Err(PpoError::InvalidTransition("KL rejection samples"));
+    }
+    aggregate.rejected_kl = report.approximate_kl;
+    aggregate.samples_rejected = report.samples;
+    Ok(())
+}
+
 fn finish_update_report(report: &mut PpoUpdateReport, optimizer_step: u64) -> Result<(), PpoError> {
     if report.samples_optimized == 0 || report.minibatches == 0 {
+        if report.stopped_for_kl && report.samples_rejected > 0 {
+            report.optimizer_step = optimizer_step;
+            return Ok(());
+        }
         return Err(PpoError::InvalidTransition("no PPO minibatch applied"));
     }
     let samples = report.samples_optimized as f64;

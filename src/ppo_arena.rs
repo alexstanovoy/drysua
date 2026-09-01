@@ -1,3 +1,5 @@
+use std::fs::{File, OpenOptions};
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::mpsc::sync_channel;
 use std::thread;
@@ -6,13 +8,15 @@ use bota_proto::{MapId, ServerMsg, SlotId, Team};
 
 use crate::{
     ACTOR_LEARNER_BUFFERS, ActionKind, ActionSpace, ActorLearnerPipeline, Arena, ArenaConfig,
-    ArenaStart, CrossPlayProfile, FeatureEncoder, FeatureFrame, ItemReadiness,
-    LEAGUE_MIN_PROMOTION_ACTIONS, LEAGUE_MIN_PROMOTION_PAIRS, League, LeagueEvaluation,
-    LeagueExploitAudit, LeagueMatchResult, LeagueOpponent, LeagueOpponentKind, LeaguePairedResult,
-    LeaguePromotionDecision, LeagueSampler, LocalPolicyState, OrderPersistence, PolicyDevice,
-    PolicyModel, PolicySnapshot, PpoConfig, PpoError, PpoOutcome, PpoPolicyChoice, PpoRng,
-    PpoRollout, PpoTerminalOutcome, PpoTrainer, PpoUpdateReport, Request, RewardTracker,
-    StateTracker, Teacher, tick_discount,
+    ArenaStart, CheckpointDevice, CheckpointProgress, CheckpointRun, CheckpointSaveOutcome,
+    CrossPlayProfile, FeatureEncoder, FeatureFrame, ItemReadiness, LEAGUE_MIN_PROMOTION_ACTIONS,
+    LEAGUE_MIN_PROMOTION_PAIRS, League, LeagueEvaluation, LeagueExploitAudit, LeagueMatchResult,
+    LeagueOpponent, LeagueOpponentKind, LeaguePairedResult, LeaguePromotionDecision, LeagueSampler,
+    LocalPolicyState, MAX_TRAINING_COUNTER, MODEL_MAX_OPTIMIZER_STEP, OrderPersistence,
+    PPO_MAX_POLICY_SAMPLE_DRAWS, PPO_RULES_AUDIT_VERSION, PolicyDevice, PolicyModel,
+    PolicySnapshot, PpoConfig, PpoError, PpoOutcome, PpoPolicyChoice, PpoRng, PpoRollout,
+    PpoTerminalOutcome, PpoTrainer, PpoUpdateReport, Request, RewardTracker, RngCheckpoint,
+    SHADOW_FIEND, StateTracker, Teacher, TrainingArtifact, compiled_features, tick_discount,
 };
 
 /// Bounded builtin smoke-run settings for the complete actor-to-learner path.
@@ -53,6 +57,47 @@ pub struct PpoSmokeReport {
     pub final_kl: f64,
     pub rejected_orders: u64,
     pub elapsed_ticks: u64,
+}
+
+/// Bounded, resumable production PPO settings.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TrainingJobConfig {
+    pub updates: u64,
+    pub environments: usize,
+    pub rollout_decisions: usize,
+    pub epochs: usize,
+    pub minibatch: usize,
+    pub checkpoint_interval: u64,
+    pub seed: u64,
+    pub map: MapId,
+    pub git_commit: String,
+    pub simulator_commit: String,
+}
+
+/// Durable progress emitted only after a checkpoint and runtime weights are committed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TrainingCheckpointReport {
+    pub completed_updates: u64,
+    pub optimizer_step: u64,
+    pub rollout_samples: u64,
+    pub policy_loss: f64,
+    pub value_loss: f64,
+    pub entropy: f64,
+    pub approximate_kl: f64,
+    pub stopped_for_kl: bool,
+    pub cleanup_warning: Option<String>,
+}
+
+/// Final state of a bounded production training invocation.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct TrainingJobReport {
+    pub completed_updates: u64,
+    pub optimizer_step: u64,
+    pub rollout_samples: u64,
+    pub final_policy_loss: f64,
+    pub final_value_loss: f64,
+    pub final_entropy: f64,
+    pub final_kl: f64,
 }
 
 /// Bounded settings for one complete self-play scheduling and evaluation smoke run.
@@ -162,6 +207,10 @@ struct EvaluationMatch {
     rejections: u64,
 }
 
+struct TrainingDirectoryLock {
+    _file: File,
+}
+
 /// Runs real seat-projected arenas, GAE, clipped PPO, value loss, entropy, and Adam briefly.
 pub fn run_ppo_smoke(settings: PpoSmokeConfig) -> Result<PpoSmokeReport, PpoError> {
     run_ppo_smoke_on(settings, PolicyDevice::Cpu)
@@ -184,28 +233,32 @@ pub fn run_ppo_smoke_on(
     let mut pipeline = ActorLearnerPipeline::new(capacity, 1, &model).map_err(pipeline_error)?;
     let actor = pipeline.take_actor(0).map_err(pipeline_error)?;
     let (report_sender, report_receiver) = sync_channel(ACTOR_LEARNER_BUFFERS);
-    let worker = thread::spawn(move || -> Result<(), PpoError> {
-        let mut sampling = PpoRng::new(settings.seed ^ 0xa17e);
-        let mut environments = build_environments(settings)?;
-        for _ in 0..settings.updates {
-            let (lease, mut rollout) = actor.wait_rollout().map_err(pipeline_error)?;
-            let mut report = PpoSmokeReport::default();
-            collect_update(
-                lease.policy(),
-                &mut sampling,
-                &mut environments,
-                config,
-                settings.rollout_decisions,
-                &mut rollout,
-                &mut report,
-            )?;
-            lease.try_submit(rollout).map_err(pipeline_error)?;
-            report_sender
-                .send(report)
-                .map_err(|_| PpoError::Model("actor report channel disconnected".to_owned()))?;
-        }
-        Ok(())
-    });
+    let worker = thread::Builder::new()
+        .name("drysua-ppo-actor".to_owned())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(move || -> Result<(), PpoError> {
+            let mut sampling = PpoRng::new(settings.seed ^ 0xa17e);
+            let mut environments = build_environments(settings)?;
+            for _ in 0..settings.updates {
+                let (lease, mut rollout) = actor.wait_rollout().map_err(pipeline_error)?;
+                let mut report = PpoSmokeReport::default();
+                collect_update(
+                    lease.policy(),
+                    &mut sampling,
+                    &mut environments,
+                    config,
+                    settings.rollout_decisions,
+                    &mut rollout,
+                    &mut report,
+                )?;
+                lease.try_submit(rollout).map_err(pipeline_error)?;
+                report_sender
+                    .send(report)
+                    .map_err(|_| PpoError::Model("actor report channel disconnected".to_owned()))?;
+            }
+            Ok(())
+        })
+        .map_err(|error| PpoError::Model(format!("actor worker spawn failed: {error}")))?;
     let learner_result = (|| -> Result<(), PpoError> {
         for _ in 0..settings.updates {
             let batch = pipeline.accept().map_err(pipeline_error)?.finish(config)?;
@@ -231,6 +284,217 @@ pub fn run_ppo_smoke_on(
     learner_result?;
     worker_result?;
     Ok(smoke)
+}
+
+/// Runs bounded PPO updates and commits exact, resumable state at fixed intervals.
+pub fn run_training_job_on<F>(
+    settings: TrainingJobConfig,
+    device: PolicyDevice,
+    checkpoint_directory: &Path,
+    resume: bool,
+    checkpointed: F,
+) -> Result<TrainingJobReport, PpoError>
+where
+    F: FnMut(TrainingCheckpointReport) + Send + 'static,
+{
+    let directory = checkpoint_directory.to_path_buf();
+    thread::Builder::new()
+        .name("drysua-training".to_owned())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(move || run_training_job_inner(settings, device, &directory, resume, checkpointed))
+        .map_err(|error| PpoError::Model(format!("training worker spawn failed: {error}")))?
+        .join()
+        .map_err(|_| PpoError::Model("training worker panicked".to_owned()))?
+}
+
+fn run_training_job_inner<F>(
+    settings: TrainingJobConfig,
+    device: PolicyDevice,
+    checkpoint_directory: &Path,
+    resume: bool,
+    mut checkpointed: F,
+) -> Result<TrainingJobReport, PpoError>
+where
+    F: FnMut(TrainingCheckpointReport),
+{
+    validate_training_directory(checkpoint_directory, resume)?;
+    let _directory_lock = TrainingDirectoryLock::acquire(checkpoint_directory)?;
+    let config = validate_training_job(&settings)?;
+    let run = training_checkpoint_run(&settings, device, config)?;
+    let capacity = settings
+        .environments
+        .checked_mul(settings.rollout_decisions)
+        .ok_or(PpoError::InvalidConfig("training samples"))?;
+    let mut session = TrainingSession::initialize(
+        &settings,
+        device,
+        checkpoint_directory,
+        resume,
+        config,
+        run,
+        capacity,
+    )?;
+    if resume {
+        TrainingArtifact::save_runtime_weights(&session.model, checkpoint_directory)
+            .map_err(checkpoint_error)?;
+    }
+    let start = session.completed_updates;
+    if start > settings.updates {
+        return Err(PpoError::InvalidConfig(
+            "training update target precedes checkpoint",
+        ));
+    }
+    for update in start..settings.updates {
+        let report = session.train_update(&settings, update, config, capacity)?;
+        if report.completed_updates % settings.checkpoint_interval == 0
+            || report.completed_updates == settings.updates
+        {
+            let durable = session.save(checkpoint_directory, report)?;
+            checkpointed(durable);
+        }
+    }
+    Ok(session.report())
+}
+
+struct TrainingSession {
+    model: PolicyModel,
+    trainer: PpoTrainer,
+    pipeline: ActorLearnerPipeline,
+    actor: crate::ActorRolloutSender,
+    sampling: PpoRng,
+    run: CheckpointRun,
+    completed_updates: u64,
+    rollout_samples: u64,
+    latest: PpoUpdateReport,
+}
+
+impl TrainingSession {
+    #[allow(clippy::too_many_arguments)]
+    fn initialize(
+        settings: &TrainingJobConfig,
+        device: PolicyDevice,
+        directory: &Path,
+        resume: bool,
+        config: PpoConfig,
+        run: CheckpointRun,
+        capacity: usize,
+    ) -> Result<Self, PpoError> {
+        let model = PolicyModel::fresh_on(settings.seed, device).map_err(model_error)?;
+        let (trainer, mut pipeline, sampling, completed_updates, rollout_samples) = if resume {
+            restore_training_session(&model, directory, &run, config, capacity)?
+        } else {
+            let trainer = PpoTrainer::new(&model, config, settings.seed ^ 0x51a9)?;
+            let pipeline =
+                ActorLearnerPipeline::new(capacity, 1, &model).map_err(pipeline_error)?;
+            (trainer, pipeline, PpoRng::new(settings.seed ^ 0xa17e), 0, 0)
+        };
+        let actor = pipeline.take_actor(0).map_err(pipeline_error)?;
+        Ok(Self {
+            model,
+            trainer,
+            pipeline,
+            actor,
+            sampling,
+            run,
+            completed_updates,
+            rollout_samples,
+            latest: PpoUpdateReport::default(),
+        })
+    }
+
+    fn train_update(
+        &mut self,
+        settings: &TrainingJobConfig,
+        update: u64,
+        config: PpoConfig,
+        capacity: usize,
+    ) -> Result<TrainingCheckpointReport, PpoError> {
+        let mut environments = build_training_environments(settings, update, config)?;
+        let (lease, mut rollout) = self.actor.wait_rollout().map_err(pipeline_error)?;
+        let mut actor_report = PpoSmokeReport::default();
+        collect_update(
+            lease.policy(),
+            &mut self.sampling,
+            &mut environments,
+            config,
+            settings.rollout_decisions,
+            &mut rollout,
+            &mut actor_report,
+        )?;
+        lease.try_submit(rollout).map_err(pipeline_error)?;
+        let batch = self
+            .pipeline
+            .accept()
+            .map_err(pipeline_error)?
+            .finish(config)?;
+        self.latest = self.trainer.train_pipeline_update(&self.model, &batch)?;
+        self.pipeline.publish(&self.model).map_err(pipeline_error)?;
+        self.completed_updates = self.trainer.updates();
+        self.rollout_samples = self
+            .rollout_samples
+            .checked_add(capacity as u64)
+            .ok_or(PpoError::CounterOverflow)?;
+        Ok(self.checkpoint_report(None))
+    }
+
+    fn save(
+        &self,
+        directory: &Path,
+        report: TrainingCheckpointReport,
+    ) -> Result<TrainingCheckpointReport, PpoError> {
+        let (state, draws) = self.sampling.checkpoint();
+        let progress = CheckpointProgress {
+            global_update: self.completed_updates,
+            policy_version: self.pipeline.version().map_err(pipeline_error)?.get(),
+            scheduler_step: self.completed_updates,
+            curriculum_stage: 0,
+            rollout_samples: self.rollout_samples,
+            best_evaluation: None,
+            rng_states: vec![
+                RngCheckpoint::new("ppo_actor_sampling", state, draws).map_err(checkpoint_error)?,
+            ],
+            league_references: Vec::new(),
+        };
+        let artifact =
+            TrainingArtifact::capture(&self.model, &self.trainer, self.run.clone(), progress)
+                .map_err(checkpoint_error)?;
+        let outcome = artifact.save(directory).map_err(checkpoint_error)?;
+        TrainingArtifact::save_runtime_weights(&self.model, directory).map_err(checkpoint_error)?;
+        let cleanup_warning = match outcome {
+            CheckpointSaveOutcome::Committed => None,
+            CheckpointSaveOutcome::CommittedWithCleanupError(message) => Some(message),
+        };
+        Ok(TrainingCheckpointReport {
+            cleanup_warning,
+            ..report
+        })
+    }
+
+    fn checkpoint_report(&self, cleanup_warning: Option<String>) -> TrainingCheckpointReport {
+        TrainingCheckpointReport {
+            completed_updates: self.completed_updates,
+            optimizer_step: self.trainer.optimizer_step(),
+            rollout_samples: self.rollout_samples,
+            policy_loss: self.latest.policy_loss,
+            value_loss: self.latest.value_loss,
+            entropy: self.latest.entropy,
+            approximate_kl: update_kl(self.latest),
+            stopped_for_kl: self.latest.stopped_for_kl,
+            cleanup_warning,
+        }
+    }
+
+    fn report(&self) -> TrainingJobReport {
+        TrainingJobReport {
+            completed_updates: self.completed_updates,
+            optimizer_step: self.trainer.optimizer_step(),
+            rollout_samples: self.rollout_samples,
+            final_policy_loss: self.latest.policy_loss,
+            final_value_loss: self.latest.value_loss,
+            final_entropy: self.latest.entropy,
+            final_kl: update_kl(self.latest),
+        }
+    }
 }
 
 /// Runs bounded self-play PPO, frozen-opponent scheduling, and held-out paired evaluation.
@@ -261,30 +525,34 @@ pub fn run_league_smoke_on(
     let actor = pipeline.take_actor(0).map_err(pipeline_error)?;
     let (job_sender, job_receiver) = sync_channel::<Vec<TrainingEnvironment>>(1);
     let (report_sender, report_receiver) = sync_channel(ACTOR_LEARNER_BUFFERS);
-    let worker = thread::spawn(move || -> Result<(), PpoError> {
-        let mut sampling = PpoRng::new(settings.seed ^ 0xa17e);
-        for _ in 0..settings.updates {
-            let mut environments = job_receiver
-                .recv()
-                .map_err(|_| PpoError::Model("league actor job channel disconnected".to_owned()))?;
-            let (lease, mut rollout) = actor.wait_rollout().map_err(pipeline_error)?;
-            let mut report = PpoSmokeReport::default();
-            collect_update(
-                lease.policy(),
-                &mut sampling,
-                &mut environments,
-                config,
-                settings.rollout_decisions,
-                &mut rollout,
-                &mut report,
-            )?;
-            lease.try_submit(rollout).map_err(pipeline_error)?;
-            report_sender
-                .send(report)
-                .map_err(|_| PpoError::Model("league actor report disconnected".to_owned()))?;
-        }
-        Ok(())
-    });
+    let worker = thread::Builder::new()
+        .name("drysua-league-actor".to_owned())
+        .stack_size(8 * 1024 * 1024)
+        .spawn(move || -> Result<(), PpoError> {
+            let mut sampling = PpoRng::new(settings.seed ^ 0xa17e);
+            for _ in 0..settings.updates {
+                let mut environments = job_receiver.recv().map_err(|_| {
+                    PpoError::Model("league actor job channel disconnected".to_owned())
+                })?;
+                let (lease, mut rollout) = actor.wait_rollout().map_err(pipeline_error)?;
+                let mut report = PpoSmokeReport::default();
+                collect_update(
+                    lease.policy(),
+                    &mut sampling,
+                    &mut environments,
+                    config,
+                    settings.rollout_decisions,
+                    &mut rollout,
+                    &mut report,
+                )?;
+                lease.try_submit(rollout).map_err(pipeline_error)?;
+                report_sender
+                    .send(report)
+                    .map_err(|_| PpoError::Model("league actor report disconnected".to_owned()))?;
+            }
+            Ok(())
+        })
+        .map_err(|error| PpoError::Model(format!("league actor worker spawn failed: {error}")))?;
     let mut training_seeds = Vec::with_capacity(settings.updates as usize * settings.environments);
     let mut report = LeagueSmokeReport {
         accepted_before,
@@ -388,8 +656,249 @@ fn record_update(
     report.final_policy_loss = update.policy_loss;
     report.final_value_loss = update.value_loss;
     report.final_entropy = update.entropy;
-    report.final_kl = update.approximate_kl;
+    report.final_kl = update_kl(update);
     Ok(())
+}
+
+fn update_kl(update: PpoUpdateReport) -> f64 {
+    if update.stopped_for_kl {
+        update.rejected_kl
+    } else {
+        update.approximate_kl
+    }
+}
+
+fn validate_training_job(settings: &TrainingJobConfig) -> Result<PpoConfig, PpoError> {
+    if settings.updates == 0 || settings.updates > 1_000_000 {
+        return Err(PpoError::InvalidConfig("training updates"));
+    }
+    if settings.checkpoint_interval == 0 || settings.checkpoint_interval > 1_000 {
+        return Err(PpoError::InvalidConfig("training checkpoint interval"));
+    }
+    if settings.environments == 0 || settings.environments > 16 {
+        return Err(PpoError::InvalidConfig("training environments"));
+    }
+    if settings.rollout_decisions == 0 || settings.rollout_decisions > 64 {
+        return Err(PpoError::InvalidConfig("training rollout decisions"));
+    }
+    if !matches!(settings.map, MapId(0) | MapId(1)) {
+        return Err(PpoError::InvalidConfig("training map"));
+    }
+    if settings.git_commit.is_empty() || settings.git_commit.len() > 4_096 {
+        return Err(PpoError::InvalidConfig("training git commit"));
+    }
+    if settings.simulator_commit.is_empty() || settings.simulator_commit.len() > 4_096 {
+        return Err(PpoError::InvalidConfig("training simulator commit"));
+    }
+    let config = training_ppo_config(settings).validate()?;
+    validate_training_counters(settings, config)?;
+    Ok(config)
+}
+
+fn training_ppo_config(settings: &TrainingJobConfig) -> PpoConfig {
+    PpoConfig {
+        environments: settings.environments,
+        rollout_decisions: settings.rollout_decisions,
+        epochs: settings.epochs,
+        minibatch: settings.minibatch,
+        ..PpoConfig::default()
+    }
+}
+
+fn validate_training_counters(
+    settings: &TrainingJobConfig,
+    config: PpoConfig,
+) -> Result<(), PpoError> {
+    let samples = (settings.environments as u64)
+        .checked_mul(settings.rollout_decisions as u64)
+        .ok_or(PpoError::InvalidConfig("training sample counter"))?;
+    let actor_draws = settings
+        .updates
+        .checked_mul(samples)
+        .and_then(|count| count.checked_mul(PPO_MAX_POLICY_SAMPLE_DRAWS))
+        .ok_or(PpoError::InvalidConfig("training actor RNG counter"))?;
+    if actor_draws > MAX_TRAINING_COUNTER {
+        return Err(PpoError::InvalidConfig("training actor RNG counter"));
+    }
+    let shuffle_draws = settings
+        .updates
+        .checked_mul(config.epochs as u64)
+        .and_then(|count| count.checked_mul(samples.saturating_sub(1)))
+        .ok_or(PpoError::InvalidConfig("training shuffle RNG counter"))?;
+    if shuffle_draws > MAX_TRAINING_COUNTER {
+        return Err(PpoError::InvalidConfig("training shuffle RNG counter"));
+    }
+    let minibatches = samples.div_ceil(config.minibatch as u64);
+    let optimizer_steps = settings
+        .updates
+        .checked_mul(config.epochs as u64)
+        .and_then(|count| count.checked_mul(minibatches))
+        .ok_or(PpoError::InvalidConfig("training optimizer counter"))?;
+    if optimizer_steps > MODEL_MAX_OPTIMIZER_STEP {
+        return Err(PpoError::InvalidConfig("training optimizer counter"));
+    }
+    Ok(())
+}
+
+fn validate_training_directory(directory: &Path, resume: bool) -> Result<(), PpoError> {
+    let metadata = directory
+        .symlink_metadata()
+        .map_err(|_| PpoError::InvalidConfig("training checkpoint directory"))?;
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(PpoError::InvalidConfig("training checkpoint directory"));
+    }
+    let mut entries = directory
+        .read_dir()
+        .map_err(|error| PpoError::Model(format!("checkpoint directory read failed: {error}")))?;
+    if !resume && entries.next().is_some() {
+        return Err(PpoError::InvalidConfig(
+            "fresh training checkpoint directory",
+        ));
+    }
+    Ok(())
+}
+
+impl TrainingDirectoryLock {
+    fn acquire(directory: &Path) -> Result<Self, PpoError> {
+        let path = directory.join(".training.lock");
+        if path
+            .symlink_metadata()
+            .is_ok_and(|metadata| metadata.file_type().is_symlink() || !metadata.is_file())
+        {
+            return Err(PpoError::InvalidConfig("training lock file"));
+        }
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|error| PpoError::Model(format!("training lock open failed: {error}")))?;
+        validate_open_lock_file(&file, &path)?;
+        file.try_lock().map_err(|error| {
+            PpoError::Model(format!("training checkpoint directory is locked: {error}"))
+        })?;
+        Ok(Self { _file: file })
+    }
+}
+
+#[cfg(unix)]
+fn validate_open_lock_file(file: &File, path: &Path) -> Result<(), PpoError> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let opened = file
+        .metadata()
+        .map_err(|error| PpoError::Model(format!("training lock metadata failed: {error}")))?;
+    let linked = path
+        .symlink_metadata()
+        .map_err(|error| PpoError::Model(format!("training lock metadata failed: {error}")))?;
+    if linked.file_type().is_symlink()
+        || !linked.is_file()
+        || opened.dev() != linked.dev()
+        || opened.ino() != linked.ino()
+    {
+        return Err(PpoError::InvalidConfig("training lock file"));
+    }
+    file.set_permissions(std::fs::Permissions::from_mode(0o600))
+        .map_err(|error| PpoError::Model(format!("training lock permissions failed: {error}")))
+}
+
+#[cfg(not(unix))]
+fn validate_open_lock_file(file: &File, path: &Path) -> Result<(), PpoError> {
+    let opened = file
+        .metadata()
+        .map_err(|error| PpoError::Model(format!("training lock metadata failed: {error}")))?;
+    let linked = path
+        .symlink_metadata()
+        .map_err(|error| PpoError::Model(format!("training lock metadata failed: {error}")))?;
+    if linked.file_type().is_symlink() || !opened.is_file() || !linked.is_file() {
+        return Err(PpoError::InvalidConfig("training lock file"));
+    }
+    Ok(())
+}
+
+fn training_checkpoint_run(
+    settings: &TrainingJobConfig,
+    device: PolicyDevice,
+    config: PpoConfig,
+) -> Result<CheckpointRun, PpoError> {
+    let device_name = match device {
+        PolicyDevice::Cpu => "cpu",
+        #[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
+        PolicyDevice::Cuda { .. } => "cuda",
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        PolicyDevice::Metal { .. } => "metal",
+    };
+    let command_line = format!(
+        "train-full --environments {} --rollout {} --epochs {} --minibatch {} --seed {} --map {} --device {device_name}",
+        settings.environments,
+        settings.rollout_decisions,
+        settings.epochs,
+        settings.minibatch,
+        settings.seed,
+        settings.map.0,
+    );
+    Ok(CheckpointRun {
+        git_commit: settings.git_commit.clone(),
+        simulator_commit: settings.simulator_commit.clone(),
+        enabled_features: compiled_features(),
+        command_line,
+        run_seed: settings.seed,
+        map: settings.map,
+        hero: SHADOW_FIEND,
+        device: CheckpointDevice::from_policy(device).map_err(checkpoint_error)?,
+        batch_size: config.minibatch,
+        rules_audit_version: PPO_RULES_AUDIT_VERSION,
+    })
+}
+
+fn restore_training_session(
+    model: &PolicyModel,
+    directory: &Path,
+    run: &CheckpointRun,
+    config: PpoConfig,
+    capacity: usize,
+) -> Result<(PpoTrainer, ActorLearnerPipeline, PpoRng, u64, u64), PpoError> {
+    let artifact = TrainingArtifact::load_compatible(directory, run).map_err(checkpoint_error)?;
+    let restored = artifact.restore(model, run).map_err(checkpoint_error)?;
+    if restored.trainer().config() != config {
+        return Err(PpoError::InvalidConfig("training checkpoint PPO config"));
+    }
+    let progress = restored.progress();
+    if progress.policy_version != progress.global_update {
+        return Err(PpoError::InvalidConfig(
+            "training checkpoint policy version",
+        ));
+    }
+    let sampling = restore_sampling_rng(&progress.rng_states)?;
+    let completed_updates = progress.global_update;
+    let rollout_samples = progress.rollout_samples;
+    let pipeline = restored
+        .pipeline(capacity, 1, model)
+        .map_err(checkpoint_error)?;
+    let (trainer, _, _) = restored.into_parts();
+    Ok((
+        trainer,
+        pipeline,
+        sampling,
+        completed_updates,
+        rollout_samples,
+    ))
+}
+
+fn restore_sampling_rng(states: &[RngCheckpoint]) -> Result<PpoRng, PpoError> {
+    let mut matching = states
+        .iter()
+        .filter(|checkpoint| checkpoint.name() == "ppo_actor_sampling");
+    let checkpoint = matching
+        .next()
+        .ok_or(PpoError::InvalidConfig("training checkpoint actor RNG"))?;
+    if matching.next().is_some() {
+        return Err(PpoError::InvalidConfig(
+            "training checkpoint duplicate actor RNG",
+        ));
+    }
+    PpoRng::from_checkpoint(checkpoint.state(), checkpoint.draws())
 }
 
 fn validate_smoke(settings: PpoSmokeConfig) -> Result<(), PpoError> {
@@ -468,6 +977,82 @@ fn build_environments(settings: PpoSmokeConfig) -> Result<Vec<TrainingEnvironmen
     Ok(environments)
 }
 
+fn build_training_environments(
+    settings: &TrainingJobConfig,
+    update: u64,
+    config: PpoConfig,
+) -> Result<Vec<TrainingEnvironment>, PpoError> {
+    let decision = update
+        .checked_mul(settings.rollout_decisions as u64)
+        .and_then(|value| u32::try_from(value).ok())
+        .ok_or(PpoError::InvalidConfig("training decision counter"))?;
+    let offset = update
+        .checked_mul(settings.environments as u64)
+        .ok_or(PpoError::CounterOverflow)?;
+    let mut environments = Vec::with_capacity(settings.environments);
+    for index in 0..settings.environments {
+        let stream = offset
+            .checked_add(index as u64)
+            .ok_or(PpoError::CounterOverflow)?;
+        let mut environment = build_environment(
+            derive_training_seed(settings.seed, stream, 0x6172_656e_615f_7365),
+            derive_training_seed(settings.seed, stream, 0x6f70_706f_6e65_6e74),
+            settings.map,
+            training_policy_seat(stream),
+            decision,
+            OpponentSpec::Teacher,
+        )?;
+        warmup_environment(
+            &mut environment,
+            training_warmup_decisions(stream),
+            config.decision_interval_ticks,
+        )?;
+        environments.push(environment);
+    }
+    Ok(environments)
+}
+
+pub(crate) const fn derive_training_seed(base: u64, stream: u64, domain: u64) -> u64 {
+    let mut value = base ^ stream.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ domain;
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
+}
+
+pub(crate) const fn training_policy_seat(stream: u64) -> usize {
+    (stream % 2) as usize
+}
+
+pub(crate) const fn training_warmup_decisions(phase: u64) -> usize {
+    const PHASES: [usize; 8] = [0, 300, 450, 600, 900, 1_200, 1_800, 2_400];
+    PHASES[(phase % PHASES.len() as u64) as usize]
+}
+
+fn warmup_environment(
+    environment: &mut TrainingEnvironment,
+    decisions: usize,
+    decision_interval_ticks: u32,
+) -> Result<(), PpoError> {
+    for _ in 0..decisions {
+        let requests = environment
+            .seats
+            .iter_mut()
+            .map(teacher_request)
+            .collect::<Result<Vec<_>, _>>()?;
+        let advanced = advance_interval(environment, requests, decision_interval_ticks)?;
+        if advanced.winner.is_some() {
+            restart_environment(environment)?;
+        }
+    }
+    environment.reward = RewardTracker::default();
+    let summary = environment.seats[environment.policy_seat]
+        .tracker
+        .latest_summary()
+        .ok_or(PpoError::InvalidTransition("warmup summary"))?;
+    environment.reward.observe(summary, 1.0, None)?;
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn build_league_environments(
     settings: LeagueSmokeConfig,
@@ -529,6 +1114,9 @@ fn evaluate_and_retain(
             .ok_or(PpoError::CounterOverflow)?,
     )?;
     let score = paired_score(&pairs);
+    if league.contains(candidate.fingerprint()) {
+        return Ok(());
+    }
     if pairs.len() < LEAGUE_MIN_PROMOTION_PAIRS
         || actions < LEAGUE_MIN_PROMOTION_ACTIONS
         || rejections.saturating_mul(1_000) >= actions
@@ -655,12 +1243,8 @@ fn build_environment(
         reward,
         decision,
         map,
-        next_seed: seed
-            .checked_add(1u64 << 32)
-            .ok_or(PpoError::CounterOverflow)?,
-        next_opponent_seed: opponent_seed
-            .checked_add(1u64 << 32)
-            .ok_or(PpoError::CounterOverflow)?,
+        next_seed: seed.wrapping_add(1u64 << 32),
+        next_opponent_seed: opponent_seed.wrapping_add(1u64 << 32),
         opponent_spec,
         opponent,
         retired_rejections: 0,
@@ -1383,6 +1967,10 @@ fn observe_messages(
 }
 
 fn model_error(error: crate::ModelError) -> PpoError {
+    PpoError::Model(error.to_string())
+}
+
+fn checkpoint_error(error: crate::CheckpointError) -> PpoError {
     PpoError::Model(error.to_string())
 }
 

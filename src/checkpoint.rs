@@ -468,7 +468,7 @@ impl TrainingArtifact {
 }
 
 impl CheckpointDevice {
-    fn from_policy(device: PolicyDevice) -> Result<Self, CheckpointError> {
+    pub fn from_policy(device: PolicyDevice) -> Result<Self, CheckpointError> {
         match device {
             PolicyDevice::Cpu => Ok(Self::Cpu),
             #[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
