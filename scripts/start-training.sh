@@ -188,7 +188,7 @@ command=(
     --rollout 8
     --epochs 1
     --minibatch 32
-    --checkpoint-interval 5
+    --checkpoint-interval 100
     --checkpoint-directory "$checkpoint_directory"
     --seed 9001
     --map 1
