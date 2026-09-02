@@ -1,6 +1,8 @@
 use bota_proto::{EntityId, ItemId, Order, Target, Vec2};
 
-use crate::{IssuedOrder, OrderPersistence};
+use crate::{
+    ActionKind, ActiveOrderUpdate, IssuedOrder, OrderPersistence, active_order_update_for_sent,
+};
 
 #[test]
 fn persistence_sends_none_for_continue_and_suppresses_animation_safe_exact_repeats() {
@@ -43,6 +45,55 @@ fn persistence_emits_changed_body_and_non_body_does_not_replace_active_body() {
 }
 
 #[test]
+fn active_order_update_preserves_body_across_non_interrupting_order() {
+    let body = issued(Order::Move {
+        target: Target::Pos(Vec2::from_ints(10, 20)),
+    });
+    let buy = issued(Order::Buy { item: ItemId(3) });
+    let mut persistence = OrderPersistence::default();
+    persistence.record_sent(1, body).expect("body");
+    persistence.record_sent(2, buy).expect("buy");
+
+    let update = active_order_update_for_sent(&persistence, None, 2, ActionKind::Buy);
+
+    assert_eq!(update, ActiveOrderUpdate::Preserve);
+}
+
+#[test]
+fn active_order_update_replaces_body_with_new_body_kind() {
+    let body = issued(Order::Move {
+        target: Target::Pos(Vec2::from_ints(10, 20)),
+    });
+    let mut persistence = OrderPersistence::default();
+    persistence.record_sent(1, body).expect("body");
+
+    let update = active_order_update_for_sent(&persistence, None, 1, ActionKind::MovePoint);
+
+    assert_eq!(
+        update,
+        ActiveOrderUpdate::Replace(Some(ActionKind::MovePoint))
+    );
+}
+
+#[test]
+fn active_order_update_clears_body_after_interrupting_order() {
+    let body = issued(Order::Move {
+        target: Target::Pos(Vec2::from_ints(10, 20)),
+    });
+    let use_item = issued(Order::Use {
+        slot: bota_proto::ItemSlot(0),
+        target: Target::None,
+    });
+    let mut persistence = OrderPersistence::default();
+    persistence.record_sent(1, body).expect("body");
+    persistence.record_sent(2, use_item).expect("use");
+
+    let update = active_order_update_for_sent(&persistence, None, 2, ActionKind::Use);
+
+    assert_eq!(update, ActiveOrderUpdate::Replace(None));
+}
+
+#[test]
 fn persistence_suppresses_hero_and_courier_orders_independently() {
     let courier = EntityId {
         idx: 2,
@@ -74,6 +125,36 @@ fn persistence_suppresses_hero_and_courier_orders_independently() {
         persistence.active_body_order_for(Some(courier)),
         Some(courier_order)
     );
+}
+
+#[test]
+fn persistence_clears_one_body_without_discarding_the_other_body_or_sequence() {
+    let courier = EntityId {
+        idx: 2,
+        generation: 1,
+    };
+    let hero_order = issued(Order::Move {
+        target: Target::Pos(Vec2::from_ints(10, 20)),
+    });
+    let courier_order = issued_for(
+        Some(courier),
+        Order::Move {
+            target: Target::Pos(Vec2::from_ints(30, 40)),
+        },
+    );
+    let mut persistence = OrderPersistence::default();
+    persistence.record_sent(1, hero_order).expect("hero order");
+    persistence
+        .record_sent(2, courier_order)
+        .expect("courier order");
+
+    persistence.clear_body_for(None);
+
+    assert_eq!(persistence.should_send(Some(hero_order)), Some(hero_order));
+    assert_eq!(persistence.should_send(Some(courier_order)), None);
+    assert_eq!(persistence.active_body_sequence_for(None), None);
+    assert_eq!(persistence.active_body_sequence_for(Some(courier)), Some(2));
+    assert_eq!(persistence.last_sequence(), Some(2));
 }
 
 #[test]

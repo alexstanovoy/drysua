@@ -3,7 +3,7 @@ use std::fmt;
 
 use bota_proto::{EntityId, Order};
 
-use crate::IssuedOrder;
+use crate::{ActionKind, IssuedOrder};
 
 /// Sequence-link or persistence state error.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -40,6 +40,12 @@ struct BodyRollback {
 struct BodyOrderState {
     current: Option<SentBodyOrder>,
     rollback: Option<BodyRollback>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ActiveOrderUpdate {
+    Preserve,
+    Replace(Option<ActionKind>),
 }
 
 /// Constant-size suppression state for persistent body orders.
@@ -104,6 +110,14 @@ impl OrderPersistence {
         self.bodies = [BodyOrderState::default(); 2];
     }
 
+    /// Clears one controlled body's order after external lifecycle evidence invalidates it.
+    pub fn clear_body_for(&mut self, unit: Option<EntityId>) {
+        let index = body_index(unit);
+        assert!(index < self.bodies.len());
+        self.bodies[index] = BodyOrderState::default();
+        assert!(self.active_body_sequence_for(unit).is_none());
+    }
+
     /// Greatest sequence among the currently suppressed body orders.
     pub const fn active_body_sequence(&self) -> Option<u32> {
         let hero = match self.bodies[0].current {
@@ -152,6 +166,24 @@ impl OrderPersistence {
     fn body_state_mut(&mut self, unit: Option<EntityId>) -> &mut BodyOrderState {
         &mut self.bodies[body_index(unit)]
     }
+}
+
+pub(crate) fn active_order_update_for_sent(
+    persistence: &OrderPersistence,
+    unit: Option<EntityId>,
+    sent_sequence: u32,
+    sent_kind: ActionKind,
+) -> ActiveOrderUpdate {
+    assert_eq!(persistence.last_sequence(), Some(sent_sequence));
+    let Some(active_sequence) = persistence.active_body_sequence_for(unit) else {
+        assert!(persistence.active_body_order_for(unit).is_none());
+        return ActiveOrderUpdate::Replace(None);
+    };
+    assert!(active_sequence <= sent_sequence);
+    if active_sequence == sent_sequence {
+        return ActiveOrderUpdate::Replace(Some(sent_kind));
+    }
+    ActiveOrderUpdate::Preserve
 }
 
 impl BodyOrderState {

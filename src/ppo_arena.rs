@@ -5,19 +5,22 @@ use std::sync::mpsc::sync_channel;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use bota_proto::{MapId, ServerMsg, SlotId, Team};
+use bota_proto::{MapId, RejectReason, ServerMsg, SlotId, Team};
 
 use crate::{
-    ACTOR_LEARNER_BUFFERS, ActionKind, ActionSpace, ActorLearnerPipeline, Arena, ArenaConfig,
-    ArenaStart, CheckpointDevice, CheckpointProgress, CheckpointRun, CheckpointSaveOutcome,
-    CrossPlayProfile, FeatureEncoder, FeatureFrame, ItemReadiness, LEAGUE_MIN_PROMOTION_ACTIONS,
+    ACTOR_LEARNER_BUFFERS, ActionKind, ActionSpace, ActivePolicyOrder, ActorLearnerPipeline,
+    AdamConfig, Arena, ArenaConfig, ArenaStart, BehavioralTrainer, CheckpointDevice,
+    CheckpointProgress, CheckpointRun, CheckpointSaveOutcome, CrossPlayProfile,
+    EarlyStoppingConfig, FeatureEncoder, FeatureFrame, IMITATION_RULES_AUDIT_VERSION,
+    ImitationPool, ImitationSide, ItemReadiness, LEAGUE_MIN_PROMOTION_ACTIONS,
     LEAGUE_MIN_PROMOTION_PAIRS, League, LeagueEvaluation, LeagueExploitAudit, LeagueMatchResult,
     LeagueOpponent, LeagueOpponentKind, LeaguePairedResult, LeaguePromotionDecision, LeagueSampler,
-    LocalPolicyState, MAX_TRAINING_COUNTER, MODEL_MAX_OPTIMIZER_STEP, OrderPersistence,
-    PPO_MAX_POLICY_SAMPLE_DRAWS, PPO_RULES_AUDIT_VERSION, PolicyDevice, PolicyModel,
-    PolicySnapshot, PpoConfig, PpoError, PpoOutcome, PpoPolicyChoice, PpoRng, PpoRollout,
-    PpoTerminalOutcome, PpoTrainer, PpoUpdateReport, Request, RewardTracker, RngCheckpoint,
-    SHADOW_FIEND, StateTracker, Teacher, TrainingArtifact, compiled_features, tick_discount,
+    LocalPolicyState, MAX_TRAINING_COUNTER, MODEL_MAX_OPTIMIZER_STEP, OfflineEvaluation,
+    OrderPersistence, PPO_MAX_POLICY_SAMPLE_DRAWS, PPO_RULES_AUDIT_VERSION, PolicyDevice,
+    PolicyModel, PolicySnapshot, PpoConfig, PpoError, PpoOutcome, PpoPolicyChoice, PpoRng,
+    PpoRollout, PpoTerminalOutcome, PpoTrainer, PpoUpdateReport, Request, RewardTracker,
+    RngCheckpoint, SHADOW_FIEND, SampleIdentity, SeedNamespace, SeedNamespaces, StateTracker,
+    Teacher, TeacherCoverage, TrainingArtifact, TrainingScope, compiled_features, tick_discount,
 };
 
 /// Bounded builtin smoke-run settings for the complete actor-to-learner path.
@@ -58,6 +61,9 @@ pub struct PpoSmokeReport {
     pub final_kl: f64,
     pub rejected_orders: u64,
     pub elapsed_ticks: u64,
+    pub terminal_wins: u64,
+    pub terminal_losses: u64,
+    pub terminal_draws: u64,
 }
 
 /// Bounded, resumable production PPO settings.
@@ -102,12 +108,18 @@ pub struct TrainingCheckpointReport {
     pub entropy: f64,
     pub approximate_kl: f64,
     pub stopped_for_kl: bool,
+    pub terminal_wins: u64,
+    pub terminal_losses: u64,
+    pub terminal_draws: u64,
+    pub rejected_orders: u64,
+    pub elapsed_ticks: u64,
     pub cleanup_warning: Option<String>,
 }
 
 /// Final state of a bounded production training invocation.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct TrainingJobReport {
+    pub starting_policy_fingerprint: u64,
     pub completed_updates: u64,
     pub optimizer_step: u64,
     pub rollout_samples: u64,
@@ -115,6 +127,175 @@ pub struct TrainingJobReport {
     pub final_value_loss: f64,
     pub final_entropy: f64,
     pub final_kl: f64,
+    pub terminal_wins: u64,
+    pub terminal_losses: u64,
+    pub terminal_draws: u64,
+    pub rejected_orders: u64,
+    pub elapsed_ticks: u64,
+}
+
+/// Fixed held-out checkpoint evaluation settings.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CheckpointEvaluationConfig {
+    pub pairs: usize,
+    pub decisions: usize,
+    pub seed: u64,
+}
+
+/// Independent opponent used by one fixed evaluation cohort.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CheckpointEvaluationBaseline {
+    Teacher,
+    Weak,
+}
+
+/// A timeout is distinct from an authoritative simulator result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CheckpointEvaluationOutcome {
+    Win,
+    Loss,
+    Timeout,
+}
+
+/// Seat-visible activity and gameplay result for one deterministic match.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CheckpointEvaluationGame {
+    pub map: MapId,
+    pub baseline: CheckpointEvaluationBaseline,
+    pub seed: u64,
+    pub candidate_team: Team,
+    pub outcome: CheckpointEvaluationOutcome,
+    pub decisions: u32,
+    pub wire_orders: u32,
+    pub rejected_orders: u32,
+    pub baseline_wire_orders: u32,
+    pub baseline_rejected_orders: u32,
+    pub elapsed_ticks: u32,
+    pub action_counts: [u32; ActionKind::COUNT],
+    pub final_summary: crate::GlobalSummary,
+}
+
+/// Complete fixed matrix over both maps, baselines, sides, and paired seeds.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CheckpointEvaluationReport {
+    pub fingerprint: u64,
+    pub games: Vec<CheckpointEvaluationGame>,
+}
+
+/// Hard failures that prevent a checkpoint from continuing to train or ship.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CheckpointEvaluationQuality {
+    pub passed: bool,
+    pub win_games: usize,
+    pub timeout_games: usize,
+    pub idle_games: usize,
+    pub collapsed_games: usize,
+    pub baseline_failure_games: usize,
+    pub weak_loss_games: usize,
+    pub weak_stalled_games: usize,
+    pub rejected_orders: u64,
+}
+
+/// Bounded teacher behavioral-cloning bootstrap settings for both supported maps.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BehavioralPretrainingConfig {
+    pub epochs: u32,
+    pub seed: u64,
+}
+
+/// Dataset, optimizer, agreement, and artifact result from teacher pretraining.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BehavioralPretrainingReport {
+    pub training_samples: usize,
+    pub held_out_samples: usize,
+    pub optimizer_steps: u64,
+    pub final_loss: f64,
+    pub held_out_kind_agreement: f64,
+    pub held_out_full_agreement: f64,
+    pub action_counts: [u64; ActionKind::COUNT],
+    pub gameplay_validation_map_zero_progress: usize,
+    pub gameplay_validation_map_one_wins: usize,
+    pub gameplay_validation_failures: usize,
+    pub fingerprint: u64,
+}
+
+impl CheckpointEvaluationReport {
+    pub fn quality(&self) -> CheckpointEvaluationQuality {
+        let win_games = self
+            .games
+            .iter()
+            .filter(|game| game.outcome == CheckpointEvaluationOutcome::Win)
+            .count();
+        let timeout_games = self
+            .games
+            .iter()
+            .filter(|game| game.outcome == CheckpointEvaluationOutcome::Timeout)
+            .count();
+        let idle_games = self
+            .games
+            .iter()
+            .filter(|game| game.wire_orders == 0)
+            .count();
+        let collapsed_games = self
+            .games
+            .iter()
+            .filter(|game| action_distribution_collapsed(game))
+            .count();
+        let baseline_failure_games = self
+            .games
+            .iter()
+            .filter(|game| {
+                game.baseline == CheckpointEvaluationBaseline::Teacher
+                    && (game.baseline_wire_orders == 0 || game.baseline_rejected_orders > 0)
+            })
+            .count();
+        let weak_loss_games = self
+            .games
+            .iter()
+            .filter(|game| {
+                game.baseline == CheckpointEvaluationBaseline::Weak
+                    && game.outcome == CheckpointEvaluationOutcome::Loss
+            })
+            .count();
+        let weak_stalled_games = self
+            .games
+            .iter()
+            .filter(|game| {
+                game.baseline == CheckpointEvaluationBaseline::Weak
+                    && game.outcome == CheckpointEvaluationOutcome::Timeout
+                    && game.final_summary.enemy_structures_destroyed == 0
+            })
+            .count();
+        let rejected_orders = self
+            .games
+            .iter()
+            .map(|game| u64::from(game.rejected_orders))
+            .sum();
+        CheckpointEvaluationQuality {
+            passed: !self.games.is_empty()
+                && win_games > 0
+                && timeout_games < self.games.len()
+                && idle_games == 0
+                && collapsed_games == 0
+                && baseline_failure_games == 0
+                && weak_loss_games == 0
+                && weak_stalled_games == 0
+                && rejected_orders == 0,
+            win_games,
+            timeout_games,
+            idle_games,
+            collapsed_games,
+            baseline_failure_games,
+            weak_loss_games,
+            weak_stalled_games,
+            rejected_orders,
+        }
+    }
+}
+
+fn action_distribution_collapsed(game: &CheckpointEvaluationGame) -> bool {
+    let maximum = game.action_counts.iter().copied().max().unwrap_or(0);
+    u64::from(maximum).saturating_mul(100) >= u64::from(game.decisions).saturating_mul(95)
 }
 
 /// Bounded settings for one complete self-play scheduling and evaluation smoke run.
@@ -172,6 +353,9 @@ struct ArenaSeatPolicy {
     teacher: Teacher,
     sequence: u32,
     rejections: u64,
+    pending_active: Option<(u32, Option<ActivePolicyOrder>)>,
+    last_issued: Option<(u32, crate::IssuedOrder, ActionKind)>,
+    last_rejection: Option<(u32, RejectReason)>,
 }
 
 struct TrainingEnvironment {
@@ -215,6 +399,7 @@ struct PendingTransition {
     reward: f32,
     ticks: u32,
     terminal: bool,
+    terminal_outcome: Option<PpoTerminalOutcome>,
     next_frame: Option<FeatureFrame>,
 }
 
@@ -273,6 +458,1106 @@ impl TrainingCheckpointSchedule {
         self.next_wall_deadline = deadline.checked_add(advance);
         Ok(())
     }
+}
+
+/// Loads deployment weights and evaluates every map, baseline, side, and paired seed.
+pub fn evaluate_runtime_checkpoint(
+    settings: CheckpointEvaluationConfig,
+    checkpoint_directory: &Path,
+) -> Result<CheckpointEvaluationReport, PpoError> {
+    validate_checkpoint_evaluation(settings)?;
+    let model = PolicyModel::fresh(settings.seed).map_err(model_error)?;
+    TrainingArtifact::load_runtime_weights(&model, checkpoint_directory)
+        .map_err(checkpoint_error)?;
+    let fingerprint = PolicySnapshot::capture(&model, 0)
+        .map_err(league_error)?
+        .fingerprint();
+    let match_count = settings
+        .pairs
+        .checked_mul(8)
+        .ok_or(PpoError::InvalidConfig("checkpoint evaluation matches"))?;
+    let mut games = Vec::with_capacity(match_count);
+    for map in [MapId(0), MapId(1)] {
+        for baseline in [
+            CheckpointEvaluationBaseline::Teacher,
+            CheckpointEvaluationBaseline::Weak,
+        ] {
+            for pair in 0..settings.pairs {
+                let seed = settings
+                    .seed
+                    .checked_add(pair as u64)
+                    .ok_or(PpoError::InvalidConfig("checkpoint evaluation seed"))?;
+                for candidate_seat in 0..2 {
+                    games.push(evaluate_checkpoint_game(
+                        &model,
+                        settings,
+                        map,
+                        baseline,
+                        seed,
+                        candidate_seat,
+                    )?);
+                }
+            }
+        }
+    }
+    Ok(CheckpointEvaluationReport { fingerprint, games })
+}
+
+const PRETRAINING_TRAIN_SEEDS: usize = 4;
+const PRETRAINING_DAGGER_SEEDS: usize = 4;
+const PRETRAINING_HELD_OUT_SEEDS: usize = 3;
+const PRETRAINING_TRAINING_MAP: MapId = MapId(1);
+const PRETRAINING_DECISIONS: usize = 4_096;
+const PRETRAINING_WINDOWS: usize = 4;
+const PRETRAINING_WINDOW_DECISIONS: usize = PRETRAINING_DECISIONS / PRETRAINING_WINDOWS;
+const PRETRAINING_DAGGER_DECISIONS: usize = PRETRAINING_DECISIONS;
+const PRETRAINING_CONTINUE_STRIDE: usize = 128;
+const PRETRAINING_EFFECTIVE_BATCH: usize = 64;
+const PRETRAINING_TRAIN_CONTINUE_WINDOW_CAP: u64 = 48;
+const PRETRAINING_TRAIN_OTHER_WINDOW_CAP: u64 = 6;
+const PRETRAINING_HELD_OUT_CONTINUE_WINDOW_CAP: u64 = 21;
+const PRETRAINING_HELD_OUT_OTHER_WINDOW_CAP: u64 = 4;
+const PRETRAINING_DAGGER_WINDOW_SIDE_KIND_CAP: u64 = 3;
+const PRETRAINING_GAMEPLAY_DECISIONS: usize = 4_096;
+const PRETRAINING_GAMEPLAY_VALIDATION_SEED: u64 = 9_100_001;
+const PRETRAINING_GAMEPLAY_ACCEPTANCE_SEED: u64 = 9_000_001;
+const PRETRAINING_OVERALL_KIND_PERCENT: usize = 60;
+const PRETRAINING_OVERALL_FULL_PERCENT: usize = 55;
+const PRETRAINING_SIDE_KIND_PERCENT: usize = 55;
+const PRETRAINING_SIDE_FULL_PERCENT: usize = 50;
+
+const PRETRAINING_MAX_BASE_TRAIN_SAMPLES: usize = PRETRAINING_TRAIN_SEEDS
+    * 2
+    * PRETRAINING_WINDOWS
+    * (PRETRAINING_TRAIN_CONTINUE_WINDOW_CAP as usize
+        + (ActionKind::COUNT - 1) * PRETRAINING_TRAIN_OTHER_WINDOW_CAP as usize);
+const PRETRAINING_MAX_HELD_OUT_SAMPLES: usize = PRETRAINING_HELD_OUT_SEEDS
+    * 2
+    * PRETRAINING_WINDOWS
+    * (PRETRAINING_HELD_OUT_CONTINUE_WINDOW_CAP as usize
+        + (ActionKind::COUNT - 1) * PRETRAINING_HELD_OUT_OTHER_WINDOW_CAP as usize);
+const PRETRAINING_MAX_DAGGER_SAMPLES: usize = PRETRAINING_DAGGER_SEEDS
+    * 2
+    * PRETRAINING_WINDOWS
+    * ActionKind::COUNT
+    * PRETRAINING_DAGGER_WINDOW_SIDE_KIND_CAP as usize;
+const _: () = assert!(PRETRAINING_DECISIONS.is_multiple_of(PRETRAINING_WINDOWS));
+const PRETRAINING_SAMPLE_CAPACITY: usize = PRETRAINING_MAX_BASE_TRAIN_SAMPLES
+    + PRETRAINING_MAX_HELD_OUT_SAMPLES
+    + PRETRAINING_MAX_DAGGER_SAMPLES;
+const _: () = assert!(PRETRAINING_SAMPLE_CAPACITY <= crate::MAX_IMITATION_SAMPLES);
+
+struct PretrainingCollection {
+    pool: ImitationPool,
+    held_out_coverage: TeacherCoverage,
+    training_action_counts: [u64; ActionKind::COUNT],
+    split_counts: [usize; 2],
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct PretrainingAgreement {
+    kind_matching: usize,
+    kind_total: usize,
+    full_matching: usize,
+    full_total: usize,
+    radiant_kind: crate::AgreementCount,
+    dire_kind: crate::AgreementCount,
+    families: [crate::AgreementCount; ActionKind::COUNT],
+}
+
+struct PretrainingCandidate {
+    agreement: PretrainingAgreement,
+    gameplay: PretrainingGameplayMatrix,
+    parameters: Vec<f32>,
+    optimizer_steps: u64,
+    loss: f64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct PretrainingGameplay {
+    pub(crate) games: usize,
+    pub(crate) failures: usize,
+    pub(crate) wins: usize,
+    pub(crate) structure_progress_games: usize,
+    pub(crate) structures: u64,
+    pub(crate) deaths: u64,
+    pub(crate) rejections: u64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct PretrainingGameplayMatrix {
+    map_zero: PretrainingGameplay,
+    map_one: PretrainingGameplay,
+}
+
+/// Collects paired teacher trajectories, clones behavior, gates agreement, and saves weights.
+pub fn run_behavioral_pretraining_on(
+    settings: BehavioralPretrainingConfig,
+    device: PolicyDevice,
+    output_directory: &Path,
+) -> Result<BehavioralPretrainingReport, PpoError> {
+    validate_behavioral_pretraining(settings)?;
+    validate_training_directory(output_directory, false)?;
+    let _directory_lock = TrainingDirectoryLock::acquire(output_directory)?;
+    let mut collection = collect_pretraining_samples(settings)?;
+    validate_action_diversity(&collection.training_action_counts)?;
+    let model = PolicyModel::fresh_on(settings.seed, device).map_err(model_error)?;
+    let mut trainer = BehavioralTrainer::new(
+        PRETRAINING_EFFECTIVE_BATCH,
+        settings.seed ^ 0x7368_7566_666c_6521,
+        AdamConfig {
+            learning_rate: 1.0e-3,
+            beta1: 0.9,
+            beta2: 0.999,
+            epsilon: 1.0e-8,
+            gradient_clip: 0.5,
+        },
+        EarlyStoppingConfig::default(),
+        &model,
+        &collection.pool,
+    )
+    .map_err(imitation_error)?;
+    let bootstrap_epochs = settings.epochs.div_ceil(2);
+    let mut stage_loss =
+        train_behavioral_epochs(&model, &collection.pool, &mut trainer, bootstrap_epochs)?;
+    let mut held_out = evaluate_pretraining_held_out(&model, &collection)?;
+    let mut agreement_trace = Vec::with_capacity(PRETRAINING_DAGGER_SEEDS + 1);
+    let mut gameplay_trace = Vec::with_capacity(PRETRAINING_DAGGER_SEEDS + 1);
+    let agreement = pretraining_agreement(held_out.metrics());
+    let gameplay = evaluate_pretraining_gameplay(&model, PRETRAINING_GAMEPLAY_VALIDATION_SEED)?;
+    agreement_trace.push(agreement);
+    gameplay_trace.push(gameplay);
+    let mut best = capture_pretraining_candidate(
+        &model,
+        agreement,
+        gameplay,
+        trainer.counters().global_update,
+        stage_loss,
+    )?;
+    let remaining_epochs = settings.epochs - bootstrap_epochs;
+    for dagger_index in 0..PRETRAINING_DAGGER_SEEDS {
+        let dagger_samples = collect_dagger_samples(
+            &model,
+            settings,
+            dagger_index,
+            &mut collection.pool,
+            &mut collection.training_action_counts,
+        )?;
+        collection.split_counts[0] = collection.split_counts[0]
+            .checked_add(dagger_samples)
+            .ok_or(PpoError::CounterOverflow)?;
+        trainer
+            .rebind_pool(&collection.pool)
+            .map_err(imitation_error)?;
+        let phase_epochs = remaining_epochs / PRETRAINING_DAGGER_SEEDS as u32;
+        stage_loss = train_behavioral_epochs(&model, &collection.pool, &mut trainer, phase_epochs)?;
+        held_out = evaluate_pretraining_held_out(&model, &collection)?;
+        let agreement = pretraining_agreement(held_out.metrics());
+        let gameplay = evaluate_pretraining_gameplay(&model, PRETRAINING_GAMEPLAY_VALIDATION_SEED)?;
+        agreement_trace.push(agreement);
+        gameplay_trace.push(gameplay);
+        if pretraining_candidate_better(gameplay, agreement, &best) {
+            best = capture_pretraining_candidate(
+                &model,
+                agreement,
+                gameplay,
+                trainer.counters().global_update,
+                stage_loss,
+            )?;
+        }
+    }
+    model
+        .import_parameters(&best.parameters)
+        .map_err(model_error)?;
+    held_out = evaluate_pretraining_held_out(&model, &collection)?;
+    let restored_agreement = pretraining_agreement(held_out.metrics());
+    assert_eq!(restored_agreement, best.agreement);
+    if let Err(error) = validate_pretraining_agreement(held_out.metrics()) {
+        return Err(PpoError::Model(format!(
+            "{error}; agreement stages={agreement_trace:?}; gameplay stages={gameplay_trace:?}"
+        )));
+    }
+    let acceptance = evaluate_pretraining_gameplay(&model, PRETRAINING_GAMEPLAY_ACCEPTANCE_SEED)?;
+    validate_pretraining_gameplay_acceptance(acceptance, &gameplay_trace)?;
+    TrainingArtifact::save_runtime_weights(&model, output_directory).map_err(checkpoint_error)?;
+    let fingerprint = PolicySnapshot::capture(&model, 0)
+        .map_err(league_error)?
+        .fingerprint();
+    Ok(BehavioralPretrainingReport {
+        training_samples: collection.split_counts[0],
+        held_out_samples: collection.split_counts[1],
+        optimizer_steps: best.optimizer_steps,
+        final_loss: best.loss,
+        held_out_kind_agreement: held_out
+            .metrics()
+            .overall
+            .kind_agreement()
+            .ok_or(PpoError::InvalidTransition("held-out kind agreement"))?,
+        held_out_full_agreement: held_out
+            .metrics()
+            .overall
+            .full_agreement()
+            .ok_or(PpoError::InvalidTransition("held-out full agreement"))?,
+        action_counts: collection.training_action_counts,
+        gameplay_validation_map_zero_progress: best.gameplay.map_zero.structure_progress_games,
+        gameplay_validation_map_one_wins: best.gameplay.map_one.wins,
+        gameplay_validation_failures: best
+            .gameplay
+            .map_zero
+            .failures
+            .checked_add(best.gameplay.map_one.failures)
+            .ok_or(PpoError::CounterOverflow)?,
+        fingerprint,
+    })
+}
+
+fn evaluate_pretraining_held_out(
+    model: &PolicyModel,
+    collection: &PretrainingCollection,
+) -> Result<crate::HeldOutEvaluation, PpoError> {
+    OfflineEvaluation::evaluate_held_out(
+        model,
+        &collection.pool,
+        collection.held_out_coverage.clone(),
+    )
+    .map_err(imitation_error)
+}
+
+fn pretraining_agreement(metrics: &crate::OfflineEvaluation) -> PretrainingAgreement {
+    PretrainingAgreement {
+        kind_matching: metrics.overall.kind.matching,
+        kind_total: metrics.overall.kind.total,
+        full_matching: metrics.overall.full.matching,
+        full_total: metrics.overall.full.total,
+        radiant_kind: metrics.radiant.kind,
+        dire_kind: metrics.dire.kind,
+        families: metrics.overall.families,
+    }
+}
+
+fn capture_pretraining_candidate(
+    model: &PolicyModel,
+    agreement: PretrainingAgreement,
+    gameplay: PretrainingGameplayMatrix,
+    optimizer_steps: u64,
+    loss: f64,
+) -> Result<PretrainingCandidate, PpoError> {
+    if !loss.is_finite() {
+        return Err(PpoError::InvalidTransition("pretraining candidate loss"));
+    }
+    let parameters = model.export_parameters().map_err(model_error)?;
+    assert_eq!(parameters.len(), crate::MODEL_PARAMETER_COUNT);
+    Ok(PretrainingCandidate {
+        agreement,
+        gameplay,
+        parameters,
+        optimizer_steps,
+        loss,
+    })
+}
+
+fn pretraining_candidate_better(
+    gameplay: PretrainingGameplayMatrix,
+    agreement: PretrainingAgreement,
+    current: &PretrainingCandidate,
+) -> bool {
+    pretraining_gameplay_better(gameplay, current.gameplay)
+        || (gameplay == current.gameplay
+            && pretraining_agreement_better(agreement, current.agreement))
+}
+
+const fn pretraining_gameplay_better(
+    candidate: PretrainingGameplayMatrix,
+    current: PretrainingGameplayMatrix,
+) -> bool {
+    let candidate_rejections = candidate
+        .map_zero
+        .rejections
+        .saturating_add(candidate.map_one.rejections);
+    let current_rejections = current
+        .map_zero
+        .rejections
+        .saturating_add(current.map_one.rejections);
+    if candidate_rejections != current_rejections {
+        return candidate_rejections < current_rejections;
+    }
+    if candidate.map_one.failures != current.map_one.failures {
+        return candidate.map_one.failures < current.map_one.failures;
+    }
+    if candidate.map_one.wins != current.map_one.wins {
+        return candidate.map_one.wins > current.map_one.wins;
+    }
+    if candidate.map_zero.failures != current.map_zero.failures {
+        return candidate.map_zero.failures < current.map_zero.failures;
+    }
+    if candidate.map_zero.structure_progress_games != current.map_zero.structure_progress_games {
+        return candidate.map_zero.structure_progress_games
+            > current.map_zero.structure_progress_games;
+    }
+    if candidate.map_zero.structures != current.map_zero.structures {
+        return candidate.map_zero.structures > current.map_zero.structures;
+    }
+    if candidate.map_one.structures != current.map_one.structures {
+        return candidate.map_one.structures > current.map_one.structures;
+    }
+    candidate
+        .map_zero
+        .deaths
+        .saturating_add(candidate.map_one.deaths)
+        < current
+            .map_zero
+            .deaths
+            .saturating_add(current.map_one.deaths)
+}
+
+const fn pretraining_agreement_better(
+    candidate: PretrainingAgreement,
+    current: PretrainingAgreement,
+) -> bool {
+    candidate.full_matching > current.full_matching
+        || (candidate.full_matching == current.full_matching
+            && candidate.kind_matching > current.kind_matching)
+}
+
+#[cfg(test)]
+pub(crate) fn pretraining_best_stage_for_test(agreements: &[(usize, usize)]) -> usize {
+    assert!(!agreements.is_empty());
+    assert!(agreements.len() <= PRETRAINING_DAGGER_SEEDS + 1);
+    let mut selected = 0usize;
+    for index in 1..agreements.len() {
+        let candidate = agreements[index];
+        let current = agreements[selected];
+        if candidate.1 > current.1 || (candidate.1 == current.1 && candidate.0 > current.0) {
+            selected = index;
+        }
+    }
+    selected
+}
+
+#[cfg(test)]
+pub(crate) fn pretraining_gameplay_stage_for_test(stages: &[[PretrainingGameplay; 2]]) -> usize {
+    assert!(!stages.is_empty());
+    assert!(stages.len() <= PRETRAINING_DAGGER_SEEDS + 1);
+    let gameplay = |stage: [PretrainingGameplay; 2]| PretrainingGameplayMatrix {
+        map_zero: stage[0],
+        map_one: stage[1],
+    };
+    let mut selected = 0usize;
+    for index in 1..stages.len() {
+        if pretraining_gameplay_better(gameplay(stages[index]), gameplay(stages[selected])) {
+            selected = index;
+        }
+    }
+    selected
+}
+
+fn evaluate_pretraining_gameplay(
+    model: &PolicyModel,
+    seed: u64,
+) -> Result<PretrainingGameplayMatrix, PpoError> {
+    Ok(PretrainingGameplayMatrix {
+        map_zero: evaluate_pretraining_map_gameplay(model, MapId(0), seed)?,
+        map_one: evaluate_pretraining_map_gameplay(model, MapId(1), seed)?,
+    })
+}
+
+fn evaluate_pretraining_map_gameplay(
+    model: &PolicyModel,
+    map: MapId,
+    seed: u64,
+) -> Result<PretrainingGameplay, PpoError> {
+    let settings = CheckpointEvaluationConfig {
+        pairs: 1,
+        decisions: PRETRAINING_GAMEPLAY_DECISIONS,
+        seed,
+    };
+    let mut output = PretrainingGameplay::default();
+    for candidate_seat in 0..2 {
+        let game = evaluate_checkpoint_game(
+            model,
+            settings,
+            map,
+            CheckpointEvaluationBaseline::Weak,
+            seed,
+            candidate_seat,
+        )?;
+        if game.baseline_wire_orders != 0 || game.baseline_rejected_orders != 0 {
+            return Err(PpoError::InvalidTransition(
+                "pretraining weak baseline activity",
+            ));
+        }
+        if !game.final_summary.destroyed_structures_present {
+            return Err(PpoError::InvalidTransition(
+                "pretraining structure baseline incomplete",
+            ));
+        }
+        output.games = output
+            .games
+            .checked_add(1)
+            .ok_or(PpoError::CounterOverflow)?;
+        output.rejections = output
+            .rejections
+            .checked_add(u64::from(game.rejected_orders))
+            .ok_or(PpoError::CounterOverflow)?;
+        output.structures = output
+            .structures
+            .checked_add(u64::from(game.final_summary.enemy_structures_destroyed))
+            .ok_or(PpoError::CounterOverflow)?;
+        if game.final_summary.enemy_structures_destroyed > 0 {
+            output.structure_progress_games = output
+                .structure_progress_games
+                .checked_add(1)
+                .ok_or(PpoError::CounterOverflow)?;
+        }
+        output.deaths = output
+            .deaths
+            .checked_add(game.final_summary.allied.deaths)
+            .ok_or(PpoError::CounterOverflow)?;
+        match game.outcome {
+            CheckpointEvaluationOutcome::Win => output.wins += 1,
+            CheckpointEvaluationOutcome::Loss => output.failures += 1,
+            CheckpointEvaluationOutcome::Timeout
+                if game.final_summary.enemy_structures_destroyed == 0 =>
+            {
+                output.failures += 1;
+            }
+            CheckpointEvaluationOutcome::Timeout => {}
+        }
+    }
+    Ok(output)
+}
+
+fn validate_pretraining_gameplay_acceptance(
+    gameplay: PretrainingGameplayMatrix,
+    stages: &[PretrainingGameplayMatrix],
+) -> Result<(), PpoError> {
+    let map_zero = gameplay.map_zero;
+    let map_one = gameplay.map_one;
+    if map_zero.games == 2
+        && map_zero.failures == 0
+        && map_zero.structure_progress_games == 2
+        && map_zero.structures >= 2
+        && map_zero.rejections == 0
+        && map_one.games == 2
+        && map_one.failures == 0
+        && map_one.wins == 2
+        && map_one.structures >= 2
+        && map_one.rejections == 0
+    {
+        return Ok(());
+    }
+    Err(PpoError::Model(format!(
+        "pretraining gameplay acceptance failed: {gameplay:?}; validation stages={stages:?}"
+    )))
+}
+
+#[cfg(test)]
+pub(crate) fn validate_pretraining_gameplay_acceptance_for_test(
+    map_zero: PretrainingGameplay,
+    map_one: PretrainingGameplay,
+) -> Result<(), PpoError> {
+    validate_pretraining_gameplay_acceptance(PretrainingGameplayMatrix { map_zero, map_one }, &[])
+}
+
+fn validate_behavioral_pretraining(settings: BehavioralPretrainingConfig) -> Result<(), PpoError> {
+    if !(8..=32).contains(&settings.epochs) || !settings.epochs.is_multiple_of(8) {
+        return Err(PpoError::InvalidConfig("pretraining epochs"));
+    }
+    settings
+        .seed
+        .checked_add(
+            (PRETRAINING_TRAIN_SEEDS + PRETRAINING_DAGGER_SEEDS + PRETRAINING_HELD_OUT_SEEDS)
+                as u64,
+        )
+        .ok_or(PpoError::InvalidConfig("pretraining seed"))?;
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn validate_behavioral_pretraining_for_test(
+    settings: BehavioralPretrainingConfig,
+) -> Result<(), PpoError> {
+    validate_behavioral_pretraining(settings)
+}
+
+fn collect_pretraining_samples(
+    settings: BehavioralPretrainingConfig,
+) -> Result<PretrainingCollection, PpoError> {
+    let training = (0..PRETRAINING_TRAIN_SEEDS)
+        .map(|offset| settings.seed + offset as u64)
+        .collect::<Vec<_>>();
+    let dagger = (0..PRETRAINING_DAGGER_SEEDS)
+        .map(|offset| settings.seed + PRETRAINING_TRAIN_SEEDS as u64 + offset as u64)
+        .collect::<Vec<_>>();
+    let promotion = (0..PRETRAINING_HELD_OUT_SEEDS)
+        .map(|offset| {
+            settings.seed
+                + (PRETRAINING_TRAIN_SEEDS + PRETRAINING_DAGGER_SEEDS) as u64
+                + offset as u64
+        })
+        .collect::<Vec<_>>();
+    let mut optimization_seeds = training.clone();
+    optimization_seeds.extend_from_slice(&dagger);
+    let namespaces = SeedNamespaces::new(optimization_seeds, Vec::new(), promotion.clone())
+        .map_err(imitation_error)?;
+    let scope = TrainingScope::new(PRETRAINING_TRAINING_MAP, IMITATION_RULES_AUDIT_VERSION)
+        .map_err(imitation_error)?;
+    let capacity = PRETRAINING_SAMPLE_CAPACITY;
+    let mut pool = ImitationPool::new(capacity, settings.seed | 1, namespaces, scope)
+        .map_err(imitation_error)?;
+    let mut training_coverage = TeacherCoverage::new();
+    let mut held_out_coverage = TeacherCoverage::new();
+    let mut training_action_counts = [0u64; ActionKind::COUNT];
+    let mut held_out_action_counts = [0u64; ActionKind::COUNT];
+    let mut side_counts = [0usize; 2];
+    let mut split_counts = [0usize; 2];
+    for seed in training {
+        collect_pretraining_seed(
+            PRETRAINING_TRAINING_MAP,
+            seed,
+            SeedNamespace::Training,
+            &mut pool,
+            &mut training_coverage,
+            &mut training_action_counts,
+            &mut side_counts,
+            &mut split_counts,
+        )?;
+    }
+    for seed in promotion {
+        collect_pretraining_seed(
+            PRETRAINING_TRAINING_MAP,
+            seed,
+            SeedNamespace::Promotion,
+            &mut pool,
+            &mut held_out_coverage,
+            &mut held_out_action_counts,
+            &mut side_counts,
+            &mut split_counts,
+        )?;
+    }
+    let counted_splits = [
+        usize::try_from(training_action_counts.iter().copied().sum::<u64>())
+            .map_err(|_| PpoError::CounterOverflow)?,
+        usize::try_from(held_out_action_counts.iter().copied().sum::<u64>())
+            .map_err(|_| PpoError::CounterOverflow)?,
+    ];
+    if pool.is_empty()
+        || pool.len() != split_counts[0].saturating_add(split_counts[1])
+        || counted_splits != split_counts
+        || training_coverage.attempted() != training_coverage.represented()
+        || held_out_coverage.attempted() != held_out_coverage.represented()
+        || side_counts[0].abs_diff(side_counts[1]).saturating_mul(100)
+            > pool.len().saturating_mul(5)
+    {
+        return Err(PpoError::Model(format!(
+            "pretraining collection coverage failed: pool={}, splits={split_counts:?}, sides={side_counts:?}, train={}/{}, held_out={}/{}",
+            pool.len(),
+            training_coverage.represented(),
+            training_coverage.attempted(),
+            held_out_coverage.represented(),
+            held_out_coverage.attempted(),
+        )));
+    }
+    Ok(PretrainingCollection {
+        pool,
+        held_out_coverage,
+        training_action_counts,
+        split_counts,
+    })
+}
+
+fn train_behavioral_epochs(
+    model: &PolicyModel,
+    pool: &ImitationPool,
+    trainer: &mut BehavioralTrainer,
+    epochs: u32,
+) -> Result<f64, PpoError> {
+    let mut final_loss = 0.0;
+    for _ in 0..epochs {
+        final_loss = trainer
+            .train_epoch(model, pool)
+            .map_err(imitation_error)?
+            .average_loss;
+    }
+    Ok(final_loss)
+}
+
+fn collect_dagger_samples(
+    model: &PolicyModel,
+    settings: BehavioralPretrainingConfig,
+    dagger_index: usize,
+    pool: &mut ImitationPool,
+    training_action_counts: &mut [u64; ActionKind::COUNT],
+) -> Result<usize, PpoError> {
+    let mut retained = 0usize;
+    let seed = settings.seed + PRETRAINING_TRAIN_SEEDS as u64 + dagger_index as u64;
+    let baseline = pretraining_dagger_baseline(dagger_index);
+    let mut window_counts = [[[0u64; ActionKind::COUNT]; PRETRAINING_WINDOWS]; 2];
+    for policy_seat in 0..2 {
+        let side_retained = collect_dagger_side(
+            model,
+            PRETRAINING_TRAINING_MAP,
+            seed,
+            baseline,
+            policy_seat,
+            pool,
+            training_action_counts,
+            &mut window_counts,
+        )?;
+        retained = retained
+            .checked_add(side_retained)
+            .ok_or(PpoError::CounterOverflow)?;
+    }
+    Ok(retained)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_dagger_side(
+    model: &PolicyModel,
+    map: MapId,
+    seed: u64,
+    baseline: CheckpointEvaluationBaseline,
+    policy_seat: usize,
+    pool: &mut ImitationPool,
+    training_action_counts: &mut [u64; ActionKind::COUNT],
+    dagger_window_counts: &mut [[[u64; ActionKind::COUNT]; PRETRAINING_WINDOWS]; 2],
+) -> Result<usize, PpoError> {
+    let opponent = match baseline {
+        CheckpointEvaluationBaseline::Teacher => OpponentSpec::Teacher,
+        CheckpointEvaluationBaseline::Weak => OpponentSpec::Weak,
+    };
+    let mut environment = build_environment(
+        seed,
+        derive_training_seed(seed, policy_seat as u64, baseline_domain(baseline)),
+        map,
+        policy_seat,
+        0,
+        opponent,
+    )?;
+    assert_eq!(environment.policy_seat, policy_seat);
+    warmup_checkpoint_evaluation(&mut environment)?;
+    let mut retained = 0usize;
+    let mut trajectory = 0u64;
+    for decision in 0..PRETRAINING_DAGGER_DECISIONS {
+        let retained_sample = dagger_decision(
+            &mut environment.seats[policy_seat],
+            model,
+            seed,
+            trajectory,
+            decision,
+            pool,
+            training_action_counts,
+            dagger_window_counts,
+        )?;
+        retained = retained
+            .checked_add(retained_sample)
+            .ok_or(PpoError::CounterOverflow)?;
+        let mut learner_request =
+            dagger_learner_request(&mut environment.seats[policy_seat], model)?;
+        let mut requests = Vec::with_capacity(environment.seats.len());
+        for index in 0..environment.seats.len() {
+            let request = if index == policy_seat {
+                learner_request.take()
+            } else {
+                opponent_request(&mut environment.seats[index], &mut environment.opponent)?
+            };
+            requests.push(request);
+        }
+        let advanced = advance_interval(&mut environment, requests, 3)?;
+        if advanced.winner.is_some() {
+            trajectory = trajectory.checked_add(1).ok_or(PpoError::CounterOverflow)?;
+            restart_environment(&mut environment)?;
+            warmup_checkpoint_evaluation(&mut environment)?;
+        }
+    }
+    Ok(retained)
+}
+
+const fn pretraining_dagger_baseline(index: usize) -> CheckpointEvaluationBaseline {
+    assert!(index < PRETRAINING_DAGGER_SEEDS);
+    CheckpointEvaluationBaseline::Weak
+}
+
+#[cfg(test)]
+pub(crate) const fn pretraining_dagger_baseline_for_test(
+    index: usize,
+) -> CheckpointEvaluationBaseline {
+    pretraining_dagger_baseline(index)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dagger_decision(
+    seat: &mut ArenaSeatPolicy,
+    model: &PolicyModel,
+    seed: u64,
+    trajectory: u64,
+    decision: usize,
+    pool: &mut ImitationPool,
+    training_action_counts: &mut [u64; ActionKind::COUNT],
+    dagger_window_counts: &mut [[[u64; ActionKind::COUNT]; PRETRAINING_WINDOWS]; 2],
+) -> Result<usize, PpoError> {
+    let space = ActionSpace::from_tracker_with_readiness(&seat.tracker, &seat.readiness)
+        .map_err(|error| PpoError::Model(error.to_string()))?;
+    let mut frame = FeatureFrame::new();
+    seat.encoder
+        .encode(
+            &seat.tracker,
+            &space,
+            &seat.readiness,
+            &seat.local,
+            &mut frame,
+        )
+        .map_err(feature_error)?;
+    let learner = model.choose(&frame, &space).map_err(model_error)?.action;
+    let (teacher, _) = seat
+        .teacher
+        .decide(&seat.tracker, &seat.persistence, &seat.readiness)
+        .map_err(|error| PpoError::Model(error.to_string()))?;
+    let learner = if deployment_uses_teacher(seat.tracker.metadata().map) {
+        teacher
+    } else {
+        seat.teacher
+            .safety_action(&seat.tracker, &space)
+            .unwrap_or(learner)
+    };
+    let side = imitation_side_index(seat.tracker.team())?;
+    let window = decision / PRETRAINING_WINDOW_DECISIONS;
+    if dagger_window_counts[side][window][teacher.kind().index()]
+        >= PRETRAINING_DAGGER_WINDOW_SIDE_KIND_CAP
+    {
+        return Ok(0);
+    }
+    if learner == teacher && !(decision + 1).is_multiple_of(PRETRAINING_CONTINUE_STRIDE) {
+        return Ok(0);
+    }
+    let identity = SampleIdentity::from_frame(
+        SeedNamespace::Training,
+        seed,
+        trajectory,
+        space.tick(),
+        &frame,
+    )
+    .map_err(imitation_error)?;
+    let sample = crate::ImitationSample::dagger(frame, &space, learner, teacher, identity)
+        .map_err(imitation_error)?;
+    if pool.push(sample).map_err(imitation_error)?.is_some() {
+        return Err(PpoError::InvalidTransition("DAgger pool eviction"));
+    }
+    training_action_counts[teacher.kind().index()] = training_action_counts[teacher.kind().index()]
+        .checked_add(1)
+        .ok_or(PpoError::CounterOverflow)?;
+    dagger_window_counts[side][window][teacher.kind().index()] = dagger_window_counts[side][window]
+        [teacher.kind().index()]
+    .checked_add(1)
+    .ok_or(PpoError::CounterOverflow)?;
+    Ok(1)
+}
+
+fn dagger_learner_request(
+    seat: &mut ArenaSeatPolicy,
+    model: &PolicyModel,
+) -> Result<Option<Request>, PpoError> {
+    if deployment_uses_teacher(seat.tracker.metadata().map) {
+        return teacher_request(seat);
+    }
+    let space = ActionSpace::from_tracker_with_readiness(&seat.tracker, &seat.readiness)
+        .map_err(|error| PpoError::Model(error.to_string()))?;
+    let mut frame = FeatureFrame::new();
+    seat.encoder
+        .encode(
+            &seat.tracker,
+            &space,
+            &seat.readiness,
+            &seat.local,
+            &mut frame,
+        )
+        .map_err(feature_error)?;
+    let action = model.choose(&frame, &space).map_err(model_error)?.action;
+    let action = seat
+        .teacher
+        .safety_action(&seat.tracker, &space)
+        .unwrap_or(action);
+    seat.local
+        .note_decision(space.tick(), action.kind())
+        .map_err(|error| PpoError::Model(error.to_string()))?;
+    let issued = space
+        .decode(action)
+        .map_err(|error| PpoError::Model(error.to_string()))?;
+    issue_request(seat, issued, &space, action.kind(), true)
+}
+
+#[cfg(test)]
+type PretrainingSummary = (usize, [[u64; ActionKind::COUNT]; 2], [usize; 2]);
+
+#[cfg(test)]
+pub(crate) fn collect_pretraining_summary_for_test(
+    seed: u64,
+) -> Result<PretrainingSummary, PpoError> {
+    let collection = collect_pretraining_samples(BehavioralPretrainingConfig { epochs: 1, seed })?;
+    summarize_pretraining_map(&collection.pool, PRETRAINING_TRAINING_MAP)
+}
+
+#[cfg(test)]
+fn summarize_pretraining_map(
+    pool: &ImitationPool,
+    map: MapId,
+) -> Result<PretrainingSummary, PpoError> {
+    assert_eq!(map, PRETRAINING_TRAINING_MAP);
+    let mut split_actions = [[0u64; ActionKind::COUNT]; 2];
+    let mut split_counts = [0usize; 2];
+    for index in 0..pool.len() {
+        let sample = pool
+            .get(index)
+            .ok_or(PpoError::InvalidTransition("pretraining test sample"))?;
+        if sample.identity().map() != map {
+            continue;
+        }
+        let split = match sample.split() {
+            crate::ImitationSplit::Train => 0,
+            crate::ImitationSplit::HeldOut => 1,
+            crate::ImitationSplit::Validation => {
+                return Err(PpoError::InvalidTransition(
+                    "pretraining test validation split",
+                ));
+            }
+        };
+        split_actions[split][sample.teacher_action().kind().index()] += 1;
+        split_counts[split] += 1;
+    }
+    let samples = split_counts.iter().sum();
+    Ok((samples, split_actions, split_counts))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_pretraining_seed(
+    map: MapId,
+    seed: u64,
+    namespace: SeedNamespace,
+    pool: &mut ImitationPool,
+    coverage: &mut TeacherCoverage,
+    action_counts: &mut [u64; ActionKind::COUNT],
+    side_counts: &mut [usize; 2],
+    split_counts: &mut [usize; 2],
+) -> Result<(), PpoError> {
+    let mut environment = build_environment(
+        seed,
+        derive_training_seed(seed, 0, 0x7072_6574_7261_696e),
+        map,
+        0,
+        0,
+        OpponentSpec::Teacher,
+    )?;
+    let mut trajectory = 0u64;
+    let mut window_counts = [[[0u64; ActionKind::COUNT]; PRETRAINING_WINDOWS]; 2];
+    for decision in 0..PRETRAINING_DECISIONS {
+        let mut requests = Vec::with_capacity(environment.seats.len());
+        for seat in &mut environment.seats {
+            let (action, space, sample) = pretraining_teacher_action(
+                seat,
+                namespace,
+                seed,
+                trajectory,
+                decision,
+                &window_counts,
+                coverage,
+            )?;
+            seat.local
+                .note_decision(space.tick(), action.kind())
+                .map_err(|error| PpoError::Model(error.to_string()))?;
+            let issued = space
+                .decode(action)
+                .map_err(|error| PpoError::Model(error.to_string()))?;
+            requests.push(issue_request(seat, issued, &space, action.kind(), true)?);
+            if let Some(sample) = sample {
+                let side = match sample.side() {
+                    ImitationSide::Radiant => 0,
+                    ImitationSide::Dire => 1,
+                };
+                if pool.push(sample).map_err(imitation_error)?.is_some() {
+                    return Err(PpoError::InvalidTransition("pretraining pool eviction"));
+                }
+                action_counts[action.kind().index()] = action_counts[action.kind().index()]
+                    .checked_add(1)
+                    .ok_or(PpoError::CounterOverflow)?;
+                let window = decision / PRETRAINING_WINDOW_DECISIONS;
+                window_counts[side][window][action.kind().index()] = window_counts[side][window]
+                    [action.kind().index()]
+                .checked_add(1)
+                .ok_or(PpoError::CounterOverflow)?;
+                side_counts[side] = side_counts[side]
+                    .checked_add(1)
+                    .ok_or(PpoError::CounterOverflow)?;
+                let split = match namespace {
+                    SeedNamespace::Training => 0,
+                    SeedNamespace::Promotion => 1,
+                    SeedNamespace::Validation => {
+                        return Err(PpoError::InvalidTransition(
+                            "pretraining validation namespace",
+                        ));
+                    }
+                };
+                split_counts[split] = split_counts[split]
+                    .checked_add(1)
+                    .ok_or(PpoError::CounterOverflow)?;
+            }
+        }
+        let advanced = advance_interval(&mut environment, requests, 3)?;
+        if environment.seats.iter().any(|seat| seat.rejections != 0) {
+            return Err(PpoError::InvalidTransition("pretraining order rejection"));
+        }
+        if advanced.winner.is_some() {
+            trajectory = trajectory.checked_add(1).ok_or(PpoError::CounterOverflow)?;
+            restart_environment(&mut environment)?;
+        }
+    }
+    Ok(())
+}
+
+fn pretraining_teacher_action(
+    seat: &mut ArenaSeatPolicy,
+    namespace: SeedNamespace,
+    seed: u64,
+    trajectory: u64,
+    decision: usize,
+    window_counts: &[[[u64; ActionKind::COUNT]; PRETRAINING_WINDOWS]; 2],
+    coverage: &mut TeacherCoverage,
+) -> Result<
+    (
+        crate::StructuredAction,
+        ActionSpace,
+        Option<crate::ImitationSample>,
+    ),
+    PpoError,
+> {
+    let (action, space) = seat
+        .teacher
+        .decide(&seat.tracker, &seat.persistence, &seat.readiness)
+        .map_err(|error| PpoError::Model(error.to_string()))?;
+    let side = imitation_side_index(seat.tracker.team())?;
+    let window = decision / PRETRAINING_WINDOW_DECISIONS;
+    let cap = pretraining_base_window_cap(namespace, action.kind())?;
+    if window_counts[side][window][action.kind().index()] >= cap {
+        return Ok((action, space, None));
+    }
+    let mut frame = FeatureFrame::new();
+    seat.encoder
+        .encode(
+            &seat.tracker,
+            &space,
+            &seat.readiness,
+            &seat.local,
+            &mut frame,
+        )
+        .map_err(feature_error)?;
+    let identity = SampleIdentity::from_frame(namespace, seed, trajectory, space.tick(), &frame)
+        .map_err(imitation_error)?;
+    let sample = crate::ImitationSample::teacher(frame, &space, action, identity)
+        .map_err(imitation_error)?;
+    coverage
+        .record_represented_for(&sample)
+        .map_err(imitation_error)?;
+    Ok((action, space, Some(sample)))
+}
+
+fn pretraining_base_window_cap(
+    namespace: SeedNamespace,
+    kind: ActionKind,
+) -> Result<u64, PpoError> {
+    match (namespace, kind) {
+        (SeedNamespace::Training, ActionKind::Continue) => {
+            Ok(PRETRAINING_TRAIN_CONTINUE_WINDOW_CAP)
+        }
+        (SeedNamespace::Training, _) => Ok(PRETRAINING_TRAIN_OTHER_WINDOW_CAP),
+        (SeedNamespace::Promotion, ActionKind::Continue) => {
+            Ok(PRETRAINING_HELD_OUT_CONTINUE_WINDOW_CAP)
+        }
+        (SeedNamespace::Promotion, _) => Ok(PRETRAINING_HELD_OUT_OTHER_WINDOW_CAP),
+        (SeedNamespace::Validation, _) => Err(PpoError::InvalidTransition(
+            "pretraining validation namespace",
+        )),
+    }
+}
+
+fn imitation_side_index(team: Team) -> Result<usize, PpoError> {
+    match team {
+        Team::Radiant => Ok(0),
+        Team::Dire => Ok(1),
+        Team::Neutral => Err(PpoError::InvalidTransition("pretraining neutral seat")),
+    }
+}
+
+fn validate_action_diversity(counts: &[u64; ActionKind::COUNT]) -> Result<(), PpoError> {
+    let total = counts.iter().copied().sum::<u64>();
+    let families = counts.iter().filter(|count| **count != 0).count();
+    let maximum = counts.iter().copied().max().unwrap_or(0);
+    if total == 0 || families < 2 || maximum.saturating_mul(100) >= total.saturating_mul(95) {
+        return Err(PpoError::InvalidTransition(
+            "pretraining teacher action diversity",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_pretraining_agreement(metrics: &crate::OfflineEvaluation) -> Result<(), PpoError> {
+    let requirements = [
+        (
+            "overall",
+            &metrics.overall,
+            PRETRAINING_OVERALL_KIND_PERCENT,
+            PRETRAINING_OVERALL_FULL_PERCENT,
+        ),
+        (
+            "radiant",
+            &metrics.radiant,
+            PRETRAINING_SIDE_KIND_PERCENT,
+            PRETRAINING_SIDE_FULL_PERCENT,
+        ),
+        (
+            "dire",
+            &metrics.dire,
+            PRETRAINING_SIDE_KIND_PERCENT,
+            PRETRAINING_SIDE_FULL_PERCENT,
+        ),
+    ];
+    for (scope, aggregate, kind_percent, full_percent) in requirements {
+        if aggregate.kind.total == 0
+            || aggregate.full.total == 0
+            || aggregate.kind.matching.saturating_mul(100)
+                < aggregate.kind.total.saturating_mul(kind_percent)
+            || aggregate.full.matching.saturating_mul(100)
+                < aggregate.full.total.saturating_mul(full_percent)
+        {
+            return Err(PpoError::Model(format!(
+                "pretraining held-out {scope} agreement failed: kind={}/{}, full={}/{}",
+                aggregate.kind.matching,
+                aggregate.kind.total,
+                aggregate.full.matching,
+                aggregate.full.total,
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn validate_pretraining_agreement_for_test(
+    metrics: &crate::OfflineEvaluation,
+) -> Result<(), PpoError> {
+    validate_pretraining_agreement(metrics)
+}
+
+fn validate_checkpoint_evaluation(settings: CheckpointEvaluationConfig) -> Result<(), PpoError> {
+    if !(1..=8).contains(&settings.pairs) {
+        return Err(PpoError::InvalidConfig("checkpoint evaluation pairs"));
+    }
+    if !(1..=4_096).contains(&settings.decisions) {
+        return Err(PpoError::InvalidConfig("checkpoint evaluation decisions"));
+    }
+    settings
+        .seed
+        .checked_add(settings.pairs as u64)
+        .ok_or(PpoError::InvalidConfig("checkpoint evaluation seed"))?;
+    Ok(())
 }
 
 /// Runs real seat-projected arenas, GAE, clipped PPO, value loss, entropy, and Adam briefly.
@@ -361,11 +1646,43 @@ pub fn run_training_job_on<F>(
 where
     F: FnMut(TrainingCheckpointReport) + Send + 'static,
 {
+    run_training_job_on_with_initial_weights(
+        settings,
+        device,
+        checkpoint_directory,
+        resume,
+        None,
+        checkpointed,
+    )
+}
+
+/// Runs bounded PPO after optionally loading deployment weights for a fresh run.
+pub fn run_training_job_on_with_initial_weights<F>(
+    settings: TrainingJobConfig,
+    device: PolicyDevice,
+    checkpoint_directory: &Path,
+    resume: bool,
+    initial_weights_directory: Option<&Path>,
+    checkpointed: F,
+) -> Result<TrainingJobReport, PpoError>
+where
+    F: FnMut(TrainingCheckpointReport) + Send + 'static,
+{
     let directory = checkpoint_directory.to_path_buf();
+    let initial_weights = initial_weights_directory.map(Path::to_path_buf);
     thread::Builder::new()
         .name("drysua-training".to_owned())
         .stack_size(8 * 1024 * 1024)
-        .spawn(move || run_training_job_inner(settings, device, &directory, resume, checkpointed))
+        .spawn(move || {
+            run_training_job_inner(
+                settings,
+                device,
+                &directory,
+                resume,
+                initial_weights.as_deref(),
+                checkpointed,
+            )
+        })
         .map_err(|error| PpoError::Model(format!("training worker spawn failed: {error}")))?
         .join()
         .map_err(|_| PpoError::Model("training worker panicked".to_owned()))?
@@ -376,11 +1693,13 @@ fn run_training_job_inner<F>(
     device: PolicyDevice,
     checkpoint_directory: &Path,
     resume: bool,
+    initial_weights_directory: Option<&Path>,
     mut checkpointed: F,
 ) -> Result<TrainingJobReport, PpoError>
 where
     F: FnMut(TrainingCheckpointReport),
 {
+    validate_initial_weights_directory(checkpoint_directory, resume, initial_weights_directory)?;
     validate_training_directory(checkpoint_directory, resume)?;
     let _directory_lock = TrainingDirectoryLock::acquire(checkpoint_directory)?;
     let config = validate_training_job(&settings, resume)?;
@@ -394,6 +1713,7 @@ where
         device,
         checkpoint_directory,
         resume,
+        initial_weights_directory,
         config,
         run,
         capacity,
@@ -438,6 +1758,12 @@ struct TrainingSession {
     rollout_samples: u64,
     latest: PpoUpdateReport,
     migrated_provenance: bool,
+    starting_policy_fingerprint: u64,
+    terminal_wins: u64,
+    terminal_losses: u64,
+    terminal_draws: u64,
+    rejected_orders: u64,
+    elapsed_ticks: u64,
 }
 
 impl TrainingSession {
@@ -447,11 +1773,16 @@ impl TrainingSession {
         device: PolicyDevice,
         directory: &Path,
         resume: bool,
+        initial_weights_directory: Option<&Path>,
         config: PpoConfig,
         run: CheckpointRun,
         capacity: usize,
     ) -> Result<Self, PpoError> {
         let model = PolicyModel::fresh_on(settings.seed, device).map_err(model_error)?;
+        if !resume && let Some(initial_weights_directory) = initial_weights_directory {
+            TrainingArtifact::load_runtime_weights(&model, initial_weights_directory)
+                .map_err(checkpoint_error)?;
+        }
         let (
             trainer,
             mut pipeline,
@@ -481,6 +1812,9 @@ impl TrainingSession {
                 false,
             )
         };
+        let starting_policy_fingerprint = PolicySnapshot::capture(&model, completed_updates)
+            .map_err(league_error)?
+            .fingerprint();
         let actor = pipeline.take_actor(0).map_err(pipeline_error)?;
         Ok(Self {
             model,
@@ -493,6 +1827,12 @@ impl TrainingSession {
             rollout_samples,
             latest: PpoUpdateReport::default(),
             migrated_provenance,
+            starting_policy_fingerprint,
+            terminal_wins: 0,
+            terminal_losses: 0,
+            terminal_draws: 0,
+            rejected_orders: 0,
+            elapsed_ticks: 0,
         })
     }
 
@@ -503,8 +1843,9 @@ impl TrainingSession {
         config: PpoConfig,
         capacity: usize,
     ) -> Result<TrainingCheckpointReport, PpoError> {
-        let mut environments = build_training_environments(settings, update, config)?;
         let (lease, mut rollout) = self.actor.wait_rollout().map_err(pipeline_error)?;
+        let mut environments =
+            build_training_environments(settings, update, config, lease.policy())?;
         let mut actor_report = PpoSmokeReport::default();
         collect_update(
             lease.policy(),
@@ -515,6 +1856,26 @@ impl TrainingSession {
             &mut rollout,
             &mut actor_report,
         )?;
+        self.terminal_wins = self
+            .terminal_wins
+            .checked_add(actor_report.terminal_wins)
+            .ok_or(PpoError::CounterOverflow)?;
+        self.terminal_losses = self
+            .terminal_losses
+            .checked_add(actor_report.terminal_losses)
+            .ok_or(PpoError::CounterOverflow)?;
+        self.terminal_draws = self
+            .terminal_draws
+            .checked_add(actor_report.terminal_draws)
+            .ok_or(PpoError::CounterOverflow)?;
+        self.rejected_orders = self
+            .rejected_orders
+            .checked_add(actor_report.rejected_orders)
+            .ok_or(PpoError::CounterOverflow)?;
+        self.elapsed_ticks = self
+            .elapsed_ticks
+            .checked_add(actor_report.elapsed_ticks)
+            .ok_or(PpoError::CounterOverflow)?;
         lease.try_submit(rollout).map_err(pipeline_error)?;
         let batch = self
             .pipeline
@@ -574,12 +1935,18 @@ impl TrainingSession {
             entropy: self.latest.entropy,
             approximate_kl: update_kl(self.latest),
             stopped_for_kl: self.latest.stopped_for_kl,
+            terminal_wins: self.terminal_wins,
+            terminal_losses: self.terminal_losses,
+            terminal_draws: self.terminal_draws,
+            rejected_orders: self.rejected_orders,
+            elapsed_ticks: self.elapsed_ticks,
             cleanup_warning,
         }
     }
 
     fn report(&self) -> TrainingJobReport {
         TrainingJobReport {
+            starting_policy_fingerprint: self.starting_policy_fingerprint,
             completed_updates: self.completed_updates,
             optimizer_step: self.trainer.optimizer_step(),
             rollout_samples: self.rollout_samples,
@@ -587,6 +1954,11 @@ impl TrainingSession {
             final_value_loss: self.latest.value_loss,
             final_entropy: self.latest.entropy,
             final_kl: update_kl(self.latest),
+            terminal_wins: self.terminal_wins,
+            terminal_losses: self.terminal_losses,
+            terminal_draws: self.terminal_draws,
+            rejected_orders: self.rejected_orders,
+            elapsed_ticks: self.elapsed_ticks,
         }
     }
 }
@@ -778,7 +2150,7 @@ fn validate_training_job(
     if settings.environments == 0 || settings.environments > 16 {
         return Err(PpoError::InvalidConfig("training environments"));
     }
-    if settings.rollout_decisions == 0 || settings.rollout_decisions > 64 {
+    if settings.rollout_decisions == 0 || settings.rollout_decisions > 256 {
         return Err(PpoError::InvalidConfig("training rollout decisions"));
     }
     if !matches!(settings.map, MapId(0) | MapId(1)) {
@@ -793,6 +2165,22 @@ fn validate_training_job(
     let config = training_ppo_config(settings).validate()?;
     validate_training_counters(settings, config)?;
     Ok(config)
+}
+
+fn validate_initial_weights_directory(
+    checkpoint_directory: &Path,
+    resume: bool,
+    initial_weights_directory: Option<&Path>,
+) -> Result<(), PpoError> {
+    if resume && initial_weights_directory.is_some() {
+        return Err(PpoError::InvalidConfig("resume initial weights"));
+    }
+    if initial_weights_directory.is_some_and(|initial| initial == checkpoint_directory) {
+        return Err(PpoError::InvalidConfig(
+            "training initial weights directory",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_checkpoint_cadence(cadence: TrainingCheckpointCadence) -> Result<(), PpoError> {
@@ -1131,6 +2519,7 @@ fn build_training_environments(
     settings: &TrainingJobConfig,
     update: u64,
     config: PpoConfig,
+    model: &PolicyModel,
 ) -> Result<Vec<TrainingEnvironment>, PpoError> {
     let decision = update
         .checked_mul(settings.rollout_decisions as u64)
@@ -1144,17 +2533,23 @@ fn build_training_environments(
         let stream = offset
             .checked_add(index as u64)
             .ok_or(PpoError::CounterOverflow)?;
+        let pair = training_pair_index(stream);
+        let opponent = match training_opponent_baseline(pair) {
+            CheckpointEvaluationBaseline::Weak => OpponentSpec::Weak,
+            CheckpointEvaluationBaseline::Teacher => OpponentSpec::Teacher,
+        };
         let mut environment = build_environment(
-            derive_training_seed(settings.seed, stream, 0x6172_656e_615f_7365),
-            derive_training_seed(settings.seed, stream, 0x6f70_706f_6e65_6e74),
+            derive_training_seed(settings.seed, pair, 0x6172_656e_615f_7365),
+            derive_training_seed(settings.seed, pair, 0x6f70_706f_6e65_6e74),
             settings.map,
             training_policy_seat(stream),
             decision,
-            OpponentSpec::Teacher,
+            opponent,
         )?;
-        warmup_environment(
+        warmup_environment_with_policy(
             &mut environment,
-            training_warmup_decisions(stream),
+            model,
+            training_warmup_decisions(pair),
             config.decision_interval_ticks,
         )?;
         environments.push(environment);
@@ -1173,33 +2568,139 @@ pub(crate) const fn training_policy_seat(stream: u64) -> usize {
     (stream % 2) as usize
 }
 
+pub(crate) const fn training_pair_index(stream: u64) -> u64 {
+    stream / 2
+}
+
+const fn training_opponent_baseline(pair: u64) -> CheckpointEvaluationBaseline {
+    if (pair / 8).is_multiple_of(2) {
+        CheckpointEvaluationBaseline::Weak
+    } else {
+        CheckpointEvaluationBaseline::Teacher
+    }
+}
+
+#[cfg(test)]
+pub(crate) const fn training_opponent_baseline_for_test(pair: u64) -> CheckpointEvaluationBaseline {
+    training_opponent_baseline(pair)
+}
+
+#[cfg(test)]
+pub(crate) const fn training_warmup_phase_index(stream: u64) -> usize {
+    (training_pair_index(stream) % 8) as usize
+}
+
 pub(crate) const fn training_warmup_decisions(phase: u64) -> usize {
     const PHASES: [usize; 8] = [0, 300, 450, 600, 900, 1_200, 1_800, 2_400];
     PHASES[(phase % PHASES.len() as u64) as usize]
 }
 
-fn warmup_environment(
+fn warmup_environment_with_policy(
     environment: &mut TrainingEnvironment,
+    model: &PolicyModel,
     decisions: usize,
     decision_interval_ticks: u32,
 ) -> Result<(), PpoError> {
     for _ in 0..decisions {
-        let requests = environment
-            .seats
-            .iter_mut()
-            .map(teacher_request)
-            .collect::<Result<Vec<_>, _>>()?;
+        let (requests, _) = requests_for_greedy_decision(environment, model)?;
         let advanced = advance_interval(environment, requests, decision_interval_ticks)?;
+        reject_production_rejection(environment, "production warmup")?;
         if advanced.winner.is_some() {
             restart_environment(environment)?;
         }
     }
+    clear_warmup_orders(environment, decision_interval_ticks)?;
     environment.reward = RewardTracker::default();
     let summary = environment.seats[environment.policy_seat]
         .tracker
         .latest_summary()
         .ok_or(PpoError::InvalidTransition("warmup summary"))?;
     environment.reward.observe(summary, 1.0, None)?;
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn production_warmup_order_counts_for_test(
+    model: &PolicyModel,
+    decisions: usize,
+) -> Result<[u32; 2], PpoError> {
+    let mut environment = build_environment(23_078, 23_079, MapId(1), 0, 0, OpponentSpec::Weak)?;
+    warmup_environment_with_policy(&mut environment, model, decisions, 3)?;
+    assert_eq!(environment.policy_seat, 0);
+    Ok([environment.seats[0].sequence, environment.seats[1].sequence])
+}
+
+#[cfg(test)]
+pub(crate) fn production_warmup_cleanup_preserves_readiness_for_test() -> Result<bool, PpoError> {
+    let mut environment = build_environment(23_080, 23_081, MapId(1), 0, 0, OpponentSpec::Weak)?;
+    for seat in &mut environment.seats {
+        seat.readiness
+            .note_shared_wait_for_test(crate::ControlledUnit::Hero, 7, 2_100);
+    }
+    let before = environment
+        .seats
+        .iter()
+        .map(|seat| seat.readiness)
+        .collect::<Vec<_>>();
+    clear_warmup_orders(&mut environment, 3)?;
+    Ok(environment
+        .seats
+        .iter()
+        .zip(before)
+        .all(|(seat, readiness)| seat.readiness == readiness))
+}
+
+fn clear_warmup_orders(
+    environment: &mut TrainingEnvironment,
+    decision_interval_ticks: u32,
+) -> Result<(), PpoError> {
+    for unit in [crate::ControlledUnit::Hero, crate::ControlledUnit::Courier] {
+        stop_warmup_unit(environment, decision_interval_ticks, unit)?;
+    }
+    for seat in &mut environment.seats {
+        seat.persistence.clear_body();
+        seat.teacher = Teacher::new();
+        let tick = seat
+            .tracker
+            .current()
+            .ok_or(PpoError::InvalidTransition("warmup boundary snapshot"))?
+            .tick;
+        seat.local = LocalPolicyState::new(tick);
+        assert!(seat.persistence.active_body_sequence().is_none());
+    }
+    Ok(())
+}
+
+fn stop_warmup_unit(
+    environment: &mut TrainingEnvironment,
+    decision_interval_ticks: u32,
+    unit: crate::ControlledUnit,
+) -> Result<(), PpoError> {
+    let mut requests = Vec::with_capacity(environment.seats.len());
+    for seat in &mut environment.seats {
+        let space = ActionSpace::from_tracker_with_readiness(&seat.tracker, &seat.readiness)
+            .map_err(|error| PpoError::Model(error.to_string()))?;
+        let action = crate::StructuredAction::Stop { unit };
+        let issued = if space.allows(action) {
+            space
+                .decode(action)
+                .map_err(|error| PpoError::Model(error.to_string()))?
+        } else {
+            None
+        };
+        requests.push(issue_request(
+            seat,
+            issued,
+            &space,
+            ActionKind::Stop,
+            false,
+        )?);
+    }
+    let advanced = advance_interval(environment, requests, decision_interval_ticks)?;
+    reject_production_rejection(environment, "production warmup cleanup")?;
+    if advanced.winner.is_some() {
+        restart_environment(environment)?;
+    }
     Ok(())
 }
 
@@ -1267,6 +2768,11 @@ fn evaluate_and_retain(
     if league.contains(candidate.fingerprint()) {
         return Ok(());
     }
+    if pairs.iter().any(pair_timed_out) {
+        return league
+            .insert_historical(candidate, score, profile)
+            .map_err(league_error);
+    }
     if pairs.len() < LEAGUE_MIN_PROMOTION_PAIRS
         || actions < LEAGUE_MIN_PROMOTION_ACTIONS
         || rejections.saturating_mul(1_000) >= actions
@@ -1313,6 +2819,11 @@ fn evaluate_and_retain(
             .ok_or(PpoError::CounterOverflow)?;
     }
     Ok(())
+}
+
+const fn pair_timed_out(pair: &LeaguePairedResult) -> bool {
+    matches!(pair.candidate_radiant, LeagueMatchResult::Timeout)
+        || matches!(pair.candidate_dire, LeagueMatchResult::Timeout)
 }
 
 fn record_evaluation(
@@ -1547,9 +3058,11 @@ fn evaluate_exploit_audit(
         evaluated.1,
     ) {
         Ok(audit) => Some(audit),
-        Err(crate::LeagueError::ExploitRegression | crate::LeagueError::InvalidRejectionRate) => {
-            None
-        }
+        Err(
+            crate::LeagueError::ExploitRegression
+            | crate::LeagueError::InvalidRejectionRate
+            | crate::LeagueError::EvaluationTimeout,
+        ) => None,
         Err(error) => return Err(league_error(error)),
     };
     Ok((audit, evaluated.1, evaluated.2))
@@ -1673,6 +3186,211 @@ fn evaluate_match(
     })
 }
 
+fn evaluate_checkpoint_game(
+    candidate: &PolicyModel,
+    settings: CheckpointEvaluationConfig,
+    map: MapId,
+    baseline: CheckpointEvaluationBaseline,
+    seed: u64,
+    candidate_seat: usize,
+) -> Result<CheckpointEvaluationGame, PpoError> {
+    let opponent = match baseline {
+        CheckpointEvaluationBaseline::Teacher => OpponentSpec::Teacher,
+        CheckpointEvaluationBaseline::Weak => OpponentSpec::Weak,
+    };
+    let opponent_seed = derive_training_seed(seed, map.0 as u64, baseline_domain(baseline));
+    let mut environment = build_environment(seed, opponent_seed, map, candidate_seat, 0, opponent)?;
+    warmup_checkpoint_evaluation(&mut environment)?;
+    let candidate_team = environment.seats[candidate_seat].tracker.team();
+    let mut action_counts = [0u32; ActionKind::COUNT];
+    let mut decisions = 0u32;
+    let mut elapsed_ticks = 0u32;
+    let mut winner = None;
+    for _ in 0..settings.decisions {
+        let (requests, action) = requests_for_greedy_decision(&mut environment, candidate)?;
+        let advanced = advance_interval(&mut environment, requests, 3)?;
+        action_counts[action.index()] = action_counts[action.index()]
+            .checked_add(1)
+            .ok_or(PpoError::CounterOverflow)?;
+        decisions = decisions.checked_add(1).ok_or(PpoError::CounterOverflow)?;
+        elapsed_ticks = elapsed_ticks
+            .checked_add(advanced.ticks)
+            .ok_or(PpoError::CounterOverflow)?;
+        if advanced.winner.is_some() {
+            winner = advanced.winner;
+            break;
+        }
+    }
+    let seat = &environment.seats[candidate_seat];
+    let baseline_seat = &environment.seats[1 - candidate_seat];
+    let rejected_orders = u32::try_from(seat.rejections)
+        .map_err(|_| PpoError::InvalidTransition("evaluation rejection count"))?;
+    let final_summary = seat
+        .tracker
+        .latest_summary()
+        .ok_or(PpoError::InvalidTransition("evaluation final summary"))?;
+    Ok(CheckpointEvaluationGame {
+        map,
+        baseline,
+        seed,
+        candidate_team,
+        outcome: checkpoint_evaluation_outcome(candidate_team, winner),
+        decisions,
+        wire_orders: seat.sequence,
+        rejected_orders,
+        baseline_wire_orders: baseline_seat.sequence,
+        baseline_rejected_orders: u32::try_from(baseline_seat.rejections)
+            .map_err(|_| PpoError::InvalidTransition("baseline rejection count"))?,
+        elapsed_ticks,
+        action_counts,
+        final_summary,
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn evaluate_teacher_against_weak_for_test(
+    seed: u64,
+    decisions: usize,
+) -> Result<Vec<CheckpointEvaluationGame>, PpoError> {
+    validate_checkpoint_evaluation(CheckpointEvaluationConfig {
+        pairs: 1,
+        decisions,
+        seed,
+    })?;
+    let mut games = Vec::with_capacity(4);
+    for map in [MapId(0), MapId(1)] {
+        for teacher_seat in 0..2 {
+            games.push(evaluate_teacher_against_weak_game(
+                seed,
+                decisions,
+                map,
+                teacher_seat,
+            )?);
+        }
+    }
+    Ok(games)
+}
+
+#[cfg(test)]
+fn evaluate_teacher_against_weak_game(
+    seed: u64,
+    decision_limit: usize,
+    map: MapId,
+    teacher_seat: usize,
+) -> Result<CheckpointEvaluationGame, PpoError> {
+    let opponent_seed = derive_training_seed(
+        seed,
+        map.0 as u64,
+        baseline_domain(CheckpointEvaluationBaseline::Weak),
+    );
+    let mut environment = build_environment(
+        seed,
+        opponent_seed,
+        map,
+        teacher_seat,
+        0,
+        OpponentSpec::Weak,
+    )?;
+    warmup_checkpoint_evaluation(&mut environment)?;
+    let teacher_team = environment.seats[teacher_seat].tracker.team();
+    let mut action_counts = [0u32; ActionKind::COUNT];
+    let mut decisions = 0u32;
+    let mut elapsed_ticks = 0u32;
+    let mut winner = None;
+    for _ in 0..decision_limit {
+        let (requests, action) = requests_for_teacher_decision(&mut environment)?;
+        let advanced = advance_interval(&mut environment, requests, 3)?;
+        action_counts[action.index()] = action_counts[action.index()]
+            .checked_add(1)
+            .ok_or(PpoError::CounterOverflow)?;
+        decisions = decisions.checked_add(1).ok_or(PpoError::CounterOverflow)?;
+        elapsed_ticks = elapsed_ticks
+            .checked_add(advanced.ticks)
+            .ok_or(PpoError::CounterOverflow)?;
+        if advanced.winner.is_some() {
+            winner = advanced.winner;
+            break;
+        }
+    }
+    teacher_weak_game_report(
+        &environment,
+        map,
+        seed,
+        teacher_team,
+        winner,
+        decisions,
+        elapsed_ticks,
+        action_counts,
+    )
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn teacher_weak_game_report(
+    environment: &TrainingEnvironment,
+    map: MapId,
+    seed: u64,
+    teacher_team: Team,
+    winner: Option<Team>,
+    decisions: u32,
+    elapsed_ticks: u32,
+    action_counts: [u32; ActionKind::COUNT],
+) -> Result<CheckpointEvaluationGame, PpoError> {
+    let teacher = &environment.seats[environment.policy_seat];
+    let weak = &environment.seats[1 - environment.policy_seat];
+    Ok(CheckpointEvaluationGame {
+        map,
+        baseline: CheckpointEvaluationBaseline::Weak,
+        seed,
+        candidate_team: teacher_team,
+        outcome: checkpoint_evaluation_outcome(teacher_team, winner),
+        decisions,
+        wire_orders: teacher.sequence,
+        rejected_orders: u32::try_from(teacher.rejections)
+            .map_err(|_| PpoError::InvalidTransition("teacher rejection count"))?,
+        baseline_wire_orders: weak.sequence,
+        baseline_rejected_orders: u32::try_from(weak.rejections)
+            .map_err(|_| PpoError::InvalidTransition("weak rejection count"))?,
+        elapsed_ticks,
+        action_counts,
+        final_summary: teacher
+            .tracker
+            .latest_summary()
+            .ok_or(PpoError::InvalidTransition("teacher final summary"))?,
+    })
+}
+
+const fn baseline_domain(baseline: CheckpointEvaluationBaseline) -> u64 {
+    match baseline {
+        CheckpointEvaluationBaseline::Teacher => 0x7465_6163_6865_7221,
+        CheckpointEvaluationBaseline::Weak => 0x7765_616b_5f5f_5f5f,
+    }
+}
+
+fn warmup_checkpoint_evaluation(environment: &mut TrainingEnvironment) -> Result<(), PpoError> {
+    for _ in 0..300 {
+        let requests = vec![None; environment.seats.len()];
+        let advanced = advance_interval(environment, requests, 3)?;
+        if advanced.winner.is_some() {
+            return Err(PpoError::InvalidTransition(
+                "checkpoint evaluation warmup terminated",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn checkpoint_evaluation_outcome(
+    candidate: Team,
+    winner: Option<Team>,
+) -> CheckpointEvaluationOutcome {
+    match winner {
+        Some(winner) if winner == candidate => CheckpointEvaluationOutcome::Win,
+        Some(_) => CheckpointEvaluationOutcome::Loss,
+        None => CheckpointEvaluationOutcome::Timeout,
+    }
+}
+
 fn evaluation_result(
     environment: &TrainingEnvironment,
     winner: Option<Team>,
@@ -1685,7 +3403,7 @@ fn evaluation_result(
             LeagueMatchResult::Loss
         });
     }
-    Ok(LeagueMatchResult::Draw)
+    Ok(LeagueMatchResult::Timeout)
 }
 
 #[allow(
@@ -1705,6 +3423,7 @@ const fn pair_score(result: LeagueMatchResult) -> i32 {
         LeagueMatchResult::Win => 1,
         LeagueMatchResult::Draw => 0,
         LeagueMatchResult::Loss => -1,
+        LeagueMatchResult::Timeout => -1,
     }
 }
 
@@ -1744,6 +3463,9 @@ fn setup_seat(index: usize, messages: &[ServerMsg]) -> Result<ArenaSeatPolicy, P
         teacher: Teacher::new(),
         sequence: 0,
         rejections: 0,
+        pending_active: None,
+        last_issued: None,
+        last_rejection: None,
     })
 }
 
@@ -1787,6 +3509,7 @@ fn collect_round(
         let choice = sample_policy(model, sampling, environment)?;
         let requests = requests_for_decision(environment, &choice)?;
         let advanced = advance_interval(environment, requests, config.decision_interval_ticks)?;
+        reject_production_rejection(environment, "production rollout")?;
         let terminal = advanced.winner.is_some();
         let outcome = terminal_outcome(environment, advanced.winner);
         let summary = environment.seats[environment.policy_seat]
@@ -1806,6 +3529,7 @@ fn collect_round(
             reward,
             ticks: advanced.ticks,
             terminal,
+            terminal_outcome: outcome,
             next_frame,
         });
     }
@@ -1869,6 +3593,27 @@ fn commit_round(
         .zip(bootstrap)
         .enumerate()
     {
+        match pending.terminal_outcome {
+            Some(PpoTerminalOutcome::Win) => {
+                smoke.terminal_wins = smoke
+                    .terminal_wins
+                    .checked_add(1)
+                    .ok_or(PpoError::CounterOverflow)?;
+            }
+            Some(PpoTerminalOutcome::Loss) => {
+                smoke.terminal_losses = smoke
+                    .terminal_losses
+                    .checked_add(1)
+                    .ok_or(PpoError::CounterOverflow)?;
+            }
+            Some(PpoTerminalOutcome::Draw) => {
+                smoke.terminal_draws = smoke
+                    .terminal_draws
+                    .checked_add(1)
+                    .ok_or(PpoError::CounterOverflow)?;
+            }
+            None => {}
+        }
         rollout.push(pending.choice.finish(PpoOutcome {
             stream,
             decision: environment.decision,
@@ -1946,6 +3691,78 @@ fn requests_for_decision(
     Ok(requests)
 }
 
+fn requests_for_greedy_decision(
+    environment: &mut TrainingEnvironment,
+    model: &PolicyModel,
+) -> Result<(Vec<Option<Request>>, ActionKind), PpoError> {
+    let policy_seat = environment.policy_seat;
+    let (action, mut candidate_request) =
+        greedy_policy_request(&mut environment.seats[policy_seat], model)?;
+    let mut requests = Vec::with_capacity(environment.seats.len());
+    for index in 0..environment.seats.len() {
+        let request = if index == policy_seat {
+            candidate_request.take()
+        } else {
+            opponent_request(&mut environment.seats[index], &mut environment.opponent)?
+        };
+        requests.push(request);
+    }
+    Ok((requests, action))
+}
+
+#[cfg(test)]
+fn requests_for_teacher_decision(
+    environment: &mut TrainingEnvironment,
+) -> Result<(Vec<Option<Request>>, ActionKind), PpoError> {
+    let teacher_seat = environment.policy_seat;
+    let (action, mut teacher_request) =
+        teacher_request_with_action(&mut environment.seats[teacher_seat])?;
+    let mut requests = Vec::with_capacity(environment.seats.len());
+    for index in 0..environment.seats.len() {
+        let request = if index == teacher_seat {
+            teacher_request.take()
+        } else {
+            opponent_request(&mut environment.seats[index], &mut environment.opponent)?
+        };
+        requests.push(request);
+    }
+    Ok((requests, action))
+}
+
+fn greedy_policy_request(
+    seat: &mut ArenaSeatPolicy,
+    model: &PolicyModel,
+) -> Result<(ActionKind, Option<Request>), PpoError> {
+    if deployment_uses_teacher(seat.tracker.metadata().map) {
+        return teacher_request_with_action(seat);
+    }
+    let space = ActionSpace::from_tracker_with_readiness(&seat.tracker, &seat.readiness)
+        .map_err(|error| PpoError::Model(error.to_string()))?;
+    let mut frame = FeatureFrame::new();
+    seat.encoder
+        .encode(
+            &seat.tracker,
+            &space,
+            &seat.readiness,
+            &seat.local,
+            &mut frame,
+        )
+        .map_err(feature_error)?;
+    let action = model.choose(&frame, &space).map_err(model_error)?.action;
+    let action = seat
+        .teacher
+        .deployment_action(&seat.tracker, &space)
+        .unwrap_or(action);
+    seat.local
+        .note_decision(space.tick(), action.kind())
+        .map_err(|error| PpoError::Model(error.to_string()))?;
+    let issued = space
+        .decode(action)
+        .map_err(|error| PpoError::Model(error.to_string()))?;
+    let request = issue_request(seat, issued, &space, action.kind(), true)?;
+    Ok((action.kind(), request))
+}
+
 fn opponent_request(
     seat: &mut ArenaSeatPolicy,
     opponent: &mut OpponentRuntime,
@@ -1994,29 +3811,51 @@ fn policy_request(
     let issued = space
         .decode(choice.action)
         .map_err(|error| PpoError::Model(error.to_string()))?;
-    issue_request(seat, issued, &space, None)
+    issue_request(seat, issued, &space, choice.action.kind(), false)
 }
 
 fn teacher_request(seat: &mut ArenaSeatPolicy) -> Result<Option<Request>, PpoError> {
+    teacher_request_with_action(seat).map(|(_, request)| request)
+}
+
+fn teacher_request_with_action(
+    seat: &mut ArenaSeatPolicy,
+) -> Result<(ActionKind, Option<Request>), PpoError> {
     let (action, space) = seat
         .teacher
         .decide(&seat.tracker, &seat.persistence, &seat.readiness)
         .map_err(|error| PpoError::Model(error.to_string()))?;
+    let action_kind = action.kind();
+    seat.local
+        .note_decision(space.tick(), action_kind)
+        .map_err(|error| PpoError::Model(error.to_string()))?;
     let issued = space
         .decode(action)
         .map_err(|error| PpoError::Model(error.to_string()))?;
-    issue_request(seat, issued, &space, Some(action.kind()))
+    let request = issue_request(seat, issued, &space, action_kind, true)?;
+    Ok((action_kind, request))
+}
+
+const fn deployment_uses_teacher(map: MapId) -> bool {
+    matches!(map, MapId(0))
+}
+
+#[cfg(test)]
+pub(crate) const fn deployment_uses_teacher_for_test(map: MapId) -> bool {
+    deployment_uses_teacher(map)
 }
 
 fn issue_request(
     seat: &mut ArenaSeatPolicy,
     issued: Option<crate::IssuedOrder>,
     space: &ActionSpace,
-    teacher_kind: Option<ActionKind>,
+    action_kind: ActionKind,
+    synchronize_teacher: bool,
 ) -> Result<Option<Request>, PpoError> {
     let Some(issued) = seat.persistence.should_send(issued) else {
         return Ok(None);
     };
+    let previous = seat.local.active_order();
     seat.sequence = seat
         .sequence
         .checked_add(1)
@@ -2025,9 +3864,32 @@ fn issue_request(
         .record_sent(seat.sequence, issued)
         .map_err(|error| PpoError::Model(error.to_string()))?;
     seat.readiness.note_sent(seat.sequence, issued, space);
-    if teacher_kind.is_some() {
+    let update = crate::active_order_update_for_sent(
+        &seat.persistence,
+        issued.unit,
+        seat.sequence,
+        action_kind,
+    );
+    seat.pending_active = match update {
+        crate::ActiveOrderUpdate::Preserve => None,
+        crate::ActiveOrderUpdate::Replace(None) if previous.is_none() => None,
+        crate::ActiveOrderUpdate::Replace(None) => {
+            seat.local
+                .set_active_order(space.tick(), None)
+                .map_err(|error| PpoError::Model(error.to_string()))?;
+            Some((seat.sequence, previous))
+        }
+        crate::ActiveOrderUpdate::Replace(Some(kind)) => {
+            seat.local
+                .set_active_order_from_issued(space.tick(), kind, issued)
+                .map_err(|error| PpoError::Model(error.to_string()))?;
+            Some((seat.sequence, previous))
+        }
+    };
+    if synchronize_teacher {
         seat.teacher.note_sent(seat.sequence, issued, space.tick());
     }
+    seat.last_issued = Some((seat.sequence, issued, action_kind));
     Ok(Some(Request {
         seq: seat.sequence,
         unit: issued.unit,
@@ -2062,6 +3924,21 @@ fn advance_interval(
     })
 }
 
+fn reject_production_rejection(
+    environment: &TrainingEnvironment,
+    context: &'static str,
+) -> Result<(), PpoError> {
+    for (index, seat) in environment.seats.iter().enumerate() {
+        if let Some((sequence, reason)) = seat.last_rejection {
+            return Err(PpoError::Model(format!(
+                "{context} seat {index} sequence {sequence} rejected as {reason:?}; last issued {:?}",
+                seat.last_issued
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn restart_environment(environment: &mut TrainingEnvironment) -> Result<(), PpoError> {
     let retired = environment
         .retired_rejections
@@ -2087,19 +3964,32 @@ fn observe_messages(
     let mut winner = None;
     for message in messages {
         match message {
-            ServerMsg::OrderRejected { seq, .. } => {
+            ServerMsg::OrderRejected { seq, reason } => {
                 seat.persistence.observe_rejection(*seq);
                 seat.readiness.note_rejected(*seq);
                 seat.teacher.note_rejected(*seq);
+                if let Some((pending, previous)) = seat.pending_active
+                    && pending == *seq
+                {
+                    let tick = seat
+                        .tracker
+                        .current()
+                        .ok_or(PpoError::InvalidTransition(
+                            "rejection before arena snapshot",
+                        ))?
+                        .tick;
+                    seat.local
+                        .restore_active_order(tick, previous)
+                        .map_err(|error| PpoError::Model(error.to_string()))?;
+                    seat.pending_active = None;
+                }
                 seat.rejections = seat
                     .rejections
                     .checked_add(1)
                     .ok_or(PpoError::CounterOverflow)?;
+                seat.last_rejection = Some((*seq, *reason));
             }
-            ServerMsg::Snapshot { view } => seat
-                .tracker
-                .observe_snapshot(view)
-                .map_err(|error| PpoError::Model(error.to_string()))?,
+            ServerMsg::Snapshot { view } => observe_arena_snapshot(seat, view)?,
             ServerMsg::Events { tick, events } => seat
                 .tracker
                 .observe_events(*tick, events)
@@ -2116,11 +4006,36 @@ fn observe_messages(
     Ok(winner)
 }
 
+fn observe_arena_snapshot(
+    seat: &mut ArenaSeatPolicy,
+    view: &bota_proto::WorldView,
+) -> Result<(), PpoError> {
+    let previous = seat.tracker.own_hero().map(|hero| hero.id);
+    seat.tracker
+        .observe_snapshot(view)
+        .map_err(|error| PpoError::Model(error.to_string()))?;
+    let current = seat.tracker.own_hero().map(|hero| hero.id);
+    if previous != current {
+        seat.persistence.clear_body_for(None);
+        seat.local
+            .set_active_order(view.tick, None)
+            .map_err(|error| PpoError::Model(error.to_string()))?;
+        seat.pending_active = None;
+        assert!(seat.persistence.active_body_sequence_for(None).is_none());
+        assert!(seat.local.active_order().is_none());
+    }
+    Ok(())
+}
+
 fn model_error(error: crate::ModelError) -> PpoError {
     PpoError::Model(error.to_string())
 }
 
 fn checkpoint_error(error: crate::CheckpointError) -> PpoError {
+    PpoError::Model(error.to_string())
+}
+
+fn imitation_error(error: crate::ImitationError) -> PpoError {
     PpoError::Model(error.to_string())
 }
 

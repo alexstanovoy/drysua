@@ -31,21 +31,21 @@ pub const LEAGUE_MIN_EXPLOIT_PAIRS: usize = 2;
 /// Minimum candidate actions required in the exploit-regression namespace.
 pub const LEAGUE_MIN_EXPLOIT_ACTIONS: u64 = 100;
 /// Stage-ten league contract version.
-pub const LEAGUE_SCHEMA_VERSION: u32 = 3;
+pub const LEAGUE_SCHEMA_VERSION: u32 = 9;
 /// Audited simulator rules required by stage-ten league artifacts.
-pub const LEAGUE_RULES_AUDIT_VERSION: u32 = 3;
+pub const LEAGUE_RULES_AUDIT_VERSION: u32 = 8;
 /// Canonical stage-ten frozen-policy, scheduling, retention, and promotion contract.
 pub const LEAGUE_SCHEMA_DESCRIPTOR: &str = concat!(
-    "bota-drysua-league/v3;",
+    "bota-drysua-league/v9;",
     "action_schema_version=1;action_schema_hash=17797499074169920257;",
-    "feature_schema_version=4;feature_schema_hash=508444194896722448;",
-    "model_schema_version=4;model_schema_hash=9866443454266023146;",
-    "ppo_schema_version=3;ppo_schema_hash=3564571968222523732;rules_audit=3;",
+    "feature_schema_version=5;feature_schema_hash=915600107964374298;",
+    "model_schema_version=5;model_schema_hash=4131398326042480440;",
+    "ppo_schema_version=8;ppo_schema_hash=5799284812594397948;rules_audit=8;",
     "opponents=current30,accepted25,historical25,teacher15,weak5,frozen_per_rollout;",
     "league=capacity32,minimum9,protect_anchor_accepted_strongest_recent4,evict_nearest_cross_play_profile;",
     "snapshot=immutable_finite_f32_parameters,stable_parameter_fingerprint,generation;",
-    "evaluation=held_out_seed_disjoint,paired_radiant_and_dire,min20,max512,horizon_max1024,truncation_draw,min_actions1000,rejections_below0.001;",
-    "exploit_audit=separate_seed_namespace,min2_pairs,min100_actions,nonnegative_each_side,rejections_below0.001;",
+    "evaluation=held_out_seed_disjoint,paired_radiant_and_dire,min20,max512,horizon_max1024,timeout_rejected,min_actions1000,rejections_below0.001,weak_loss_and_stall_rejected,authoritative_win_required;",
+    "exploit_audit=separate_seed_namespace,min2_pairs,min100_actions,timeout_rejected,nonnegative_each_side,rejections_below0.001;",
     "promotion=opaque_paired_evidence_and_exploit_audit,positive_combined_score,nonnegative_each_side,training_reward_excluded;"
 );
 
@@ -68,12 +68,12 @@ pub const LEAGUE_SCHEMA_HASH: u64 = league_fnv1a(LEAGUE_SCHEMA_DESCRIPTOR.as_byt
 
 const _: () = assert!(ACTION_SCHEMA_VERSION == 1);
 const _: () = assert!(ACTION_SCHEMA_HASH == 17_797_499_074_169_920_257);
-const _: () = assert!(FEATURE_SCHEMA_VERSION == 4);
-const _: () = assert!(FEATURE_SCHEMA_HASH == 508_444_194_896_722_448);
-const _: () = assert!(MODEL_SCHEMA_VERSION == 4);
-const _: () = assert!(MODEL_SCHEMA_HASH == 9_866_443_454_266_023_146);
-const _: () = assert!(PPO_SCHEMA_VERSION == 3);
-const _: () = assert!(PPO_SCHEMA_HASH == 3_564_571_968_222_523_732);
+const _: () = assert!(FEATURE_SCHEMA_VERSION == 5);
+const _: () = assert!(FEATURE_SCHEMA_HASH == 915_600_107_964_374_298);
+const _: () = assert!(MODEL_SCHEMA_VERSION == 5);
+const _: () = assert!(MODEL_SCHEMA_HASH == 4_131_398_326_042_480_440);
+const _: () = assert!(PPO_SCHEMA_VERSION == 8);
+const _: () = assert!(PPO_SCHEMA_HASH == 5_799_284_812_594_397_948);
 
 static NEXT_SNAPSHOT_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -316,6 +316,7 @@ pub enum LeagueMatchResult {
     Win,
     Loss,
     Draw,
+    Timeout,
 }
 
 impl LeagueMatchResult {
@@ -325,6 +326,7 @@ impl LeagueMatchResult {
             Self::Win => 1,
             Self::Loss => -1,
             Self::Draw => 0,
+            Self::Timeout => -1,
         }
     }
 }
@@ -457,6 +459,7 @@ fn validate_exploit_counts(
     {
         return Err(LeagueError::InvalidRejectionRate);
     }
+    validate_no_timeouts(pairs)?;
     Ok(())
 }
 
@@ -474,6 +477,18 @@ fn validate_evaluation_counts(
         || rejected_actions.saturating_mul(1_000) >= total_actions
     {
         return Err(LeagueError::InvalidRejectionRate);
+    }
+    validate_no_timeouts(pairs)?;
+    Ok(())
+}
+
+#[cfg(any(feature = "builtin", test))]
+fn validate_no_timeouts(pairs: &[LeaguePairedResult]) -> Result<(), LeagueError> {
+    if pairs.iter().any(|pair| {
+        pair.candidate_radiant == LeagueMatchResult::Timeout
+            || pair.candidate_dire == LeagueMatchResult::Timeout
+    }) {
+        return Err(LeagueError::EvaluationTimeout);
     }
     Ok(())
 }
@@ -763,6 +778,7 @@ pub enum LeagueError {
     OpponentBucket { bucket: u8 },
     PromotionPairCount { count: usize },
     InvalidRejectionRate,
+    EvaluationTimeout,
     ExploitPairCount { count: usize },
     ExploitRegression,
     ExploitIdentityMismatch,
@@ -808,6 +824,9 @@ impl fmt::Display for LeagueError {
             ),
             Self::InvalidRejectionRate => {
                 formatter.write_str("promotion rejection rate is invalid")
+            }
+            Self::EvaluationTimeout => {
+                formatter.write_str("evaluation contains a nonterminal timeout")
             }
             Self::ExploitPairCount { count } => {
                 write!(

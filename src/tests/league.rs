@@ -3,6 +3,10 @@
     reason = "league evaluation tests use floating-point scores"
 )]
 
+#[cfg(feature = "builtin")]
+use crate::{
+    ActionKind, CheckpointEvaluationBaseline, CheckpointEvaluationConfig, TrainingArtifact,
+};
 use crate::{
     CrossPlayProfile, LEAGUE_SCHEMA_DESCRIPTOR, LEAGUE_SCHEMA_HASH, LEAGUE_SCHEMA_VERSION, League,
     LeagueEvaluation, LeagueExploitAudit, LeagueMatchResult, LeaguePairedResult,
@@ -11,10 +15,11 @@ use crate::{
 
 #[test]
 fn stage_ten_schema_is_stable_and_names_its_safety_contracts() {
-    assert_eq!(LEAGUE_SCHEMA_VERSION, 3);
-    assert_eq!(LEAGUE_SCHEMA_HASH, 18_193_381_311_490_740_524);
+    assert_eq!(LEAGUE_SCHEMA_VERSION, 9);
+    assert_eq!(LEAGUE_SCHEMA_HASH, 13_472_481_283_297_382_630);
     assert!(LEAGUE_SCHEMA_DESCRIPTOR.contains("held_out_seed_disjoint"));
     assert!(LEAGUE_SCHEMA_DESCRIPTOR.contains("training_reward_excluded"));
+    assert!(LEAGUE_SCHEMA_DESCRIPTOR.contains("timeout_rejected"));
 }
 
 #[test]
@@ -30,6 +35,39 @@ fn opponent_distribution_has_exact_stage_ten_bucket_weights() {
     }
 
     assert_eq!(counts, [30, 25, 25, 15, 5]);
+}
+
+#[test]
+fn timeout_evidence_cannot_pass_the_exploit_or_promotion_gate() {
+    let model = PolicyModel::fresh(701).expect("model");
+    let accepted = PolicySnapshot::capture(&model, 0).expect("accepted");
+    let candidate = distinct_snapshot(&model, 1);
+    let timeouts = vec![
+        LeaguePairedResult {
+            seed: 100,
+            candidate_radiant: LeagueMatchResult::Win,
+            candidate_dire: LeagueMatchResult::Timeout,
+        },
+        LeaguePairedResult {
+            seed: 101,
+            candidate_radiant: LeagueMatchResult::Timeout,
+            candidate_dire: LeagueMatchResult::Timeout,
+        },
+    ];
+
+    let Err(error) = LeagueExploitAudit::new(
+        candidate.fingerprint(),
+        accepted.fingerprint(),
+        &timeouts,
+        &[1, 2],
+        &[3, 4],
+        0,
+        100,
+    ) else {
+        panic!("timeouts are not exploit evidence");
+    };
+
+    assert_eq!(error, crate::LeagueError::EvaluationTimeout);
 }
 
 #[test]
@@ -319,7 +357,171 @@ fn persistent_league_actor_double_buffers_three_policy_generations() {
 
 #[cfg(feature = "builtin")]
 #[test]
-fn promotion_gate_treats_nonterminal_evaluation_horizons_as_draws() {
+fn runtime_checkpoint_evaluation_is_deterministic_and_covers_the_fixed_matrix() {
+    let directory = evaluation_directory();
+    let model = PolicyModel::fresh(88_301).expect("evaluation model");
+    TrainingArtifact::save_runtime_weights(&model, &directory).expect("runtime weights");
+    let settings = CheckpointEvaluationConfig {
+        pairs: 1,
+        decisions: 2,
+        seed: 88_302,
+    };
+
+    let first = crate::evaluate_runtime_checkpoint(settings, &directory).expect("first report");
+    let second = crate::evaluate_runtime_checkpoint(settings, &directory).expect("second report");
+
+    assert_eq!(first, second);
+    assert_eq!(first.games.len(), 8);
+    assert_eq!(
+        first.fingerprint,
+        PolicySnapshot::capture(&model, 0)
+            .expect("snapshot")
+            .fingerprint()
+    );
+    for map in [bota_proto::MapId(0), bota_proto::MapId(1)] {
+        for baseline in [
+            CheckpointEvaluationBaseline::Teacher,
+            CheckpointEvaluationBaseline::Weak,
+        ] {
+            for team in [bota_proto::Team::Radiant, bota_proto::Team::Dire] {
+                assert!(first.games.iter().any(|game| game.map == map
+                    && game.baseline == baseline
+                    && game.candidate_team == team));
+            }
+        }
+    }
+    for game in &first.games {
+        assert_eq!(game.decisions, 2);
+        assert_eq!(game.action_counts.iter().sum::<u32>(), game.decisions);
+        assert!(game.wire_orders <= game.decisions);
+        assert!(game.rejected_orders <= game.wire_orders);
+        assert!(game.baseline_rejected_orders <= game.baseline_wire_orders);
+        assert!(game.elapsed_ticks <= game.decisions * 3);
+        assert_eq!(game.action_counts.len(), ActionKind::COUNT);
+    }
+    let mut collapsed = first.clone();
+    for game in &mut collapsed.games {
+        game.outcome = crate::CheckpointEvaluationOutcome::Timeout;
+        game.action_counts = [0; ActionKind::COUNT];
+        game.action_counts[crate::ActionKind::MovePoint.index()] = game.decisions;
+    }
+    let quality = collapsed.quality();
+    assert!(!quality.passed);
+    assert_eq!(quality.timeout_games, collapsed.games.len());
+    assert_eq!(quality.collapsed_games, collapsed.games.len());
+
+    std::fs::remove_dir_all(directory).expect("remove evaluation directory");
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn checkpoint_quality_rejects_a_loss_to_the_weak_baseline() {
+    let report = quality_report([
+        quality_game(
+            CheckpointEvaluationBaseline::Weak,
+            crate::CheckpointEvaluationOutcome::Loss,
+            1,
+        ),
+        quality_game(
+            CheckpointEvaluationBaseline::Teacher,
+            crate::CheckpointEvaluationOutcome::Win,
+            0,
+        ),
+    ]);
+
+    let quality = report.quality();
+
+    assert!(!quality.passed);
+    assert_eq!(quality.weak_loss_games, 1);
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn checkpoint_quality_rejects_a_stalled_weak_baseline_game() {
+    let report = quality_report([
+        quality_game(
+            CheckpointEvaluationBaseline::Weak,
+            crate::CheckpointEvaluationOutcome::Timeout,
+            0,
+        ),
+        quality_game(
+            CheckpointEvaluationBaseline::Teacher,
+            crate::CheckpointEvaluationOutcome::Win,
+            0,
+        ),
+    ]);
+
+    let quality = report.quality();
+
+    assert!(!quality.passed);
+    assert_eq!(quality.weak_stalled_games, 1);
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn checkpoint_quality_requires_an_authoritative_win() {
+    let report = quality_report([
+        quality_game(
+            CheckpointEvaluationBaseline::Weak,
+            crate::CheckpointEvaluationOutcome::Timeout,
+            1,
+        ),
+        quality_game(
+            CheckpointEvaluationBaseline::Teacher,
+            crate::CheckpointEvaluationOutcome::Loss,
+            0,
+        ),
+    ]);
+
+    let quality = report.quality();
+
+    assert!(!quality.passed);
+    assert_eq!(quality.win_games, 0);
+}
+
+#[cfg(feature = "builtin")]
+fn quality_report(
+    games: [crate::CheckpointEvaluationGame; 2],
+) -> crate::CheckpointEvaluationReport {
+    crate::CheckpointEvaluationReport {
+        fingerprint: 1,
+        games: games.into(),
+    }
+}
+
+#[cfg(feature = "builtin")]
+fn quality_game(
+    baseline: CheckpointEvaluationBaseline,
+    outcome: crate::CheckpointEvaluationOutcome,
+    structures: u32,
+) -> crate::CheckpointEvaluationGame {
+    let mut actions = [0u32; ActionKind::COUNT];
+    actions[ActionKind::Continue.index()] = 50;
+    actions[ActionKind::MovePoint.index()] = 50;
+    let summary = crate::GlobalSummary {
+        enemy_structures_destroyed: structures,
+        ..crate::GlobalSummary::default()
+    };
+    crate::CheckpointEvaluationGame {
+        map: bota_proto::MapId(1),
+        baseline,
+        seed: 1,
+        candidate_team: bota_proto::Team::Radiant,
+        outcome,
+        decisions: 100,
+        wire_orders: 1,
+        rejected_orders: 0,
+        baseline_wire_orders: usize::from(baseline == CheckpointEvaluationBaseline::Teacher) as u32,
+        baseline_rejected_orders: 0,
+        elapsed_ticks: 300,
+        action_counts: actions,
+        final_summary: summary,
+    }
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn promotion_gate_rejects_nonterminal_evaluation_horizons_as_timeouts() {
     let report = crate::run_league_smoke(crate::LeagueSmokeConfig {
         updates: 1,
         environments: 1,
@@ -333,9 +535,9 @@ fn promotion_gate_treats_nonterminal_evaluation_horizons_as_draws() {
     })
     .expect("promotion-gate smoke");
 
-    assert_eq!(report.evaluation_actions, 1_300);
+    assert_eq!(report.evaluation_actions, 1_200);
     assert_eq!(report.profile_evaluations, 4);
-    assert_eq!(report.exploit_evaluations, 2);
+    assert_eq!(report.exploit_evaluations, 0);
     assert_eq!(report.promotions, 0);
     assert_eq!(report.accepted_after, report.accepted_before);
 }
@@ -390,4 +592,21 @@ fn passing_evidence(
         .expect("exploit audit"),
     )
     .expect("promotion evidence")
+}
+
+#[cfg(feature = "builtin")]
+fn evaluation_directory() -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(1);
+    let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+    let directory = std::env::temp_dir().join(format!(
+        "drysua-evaluation-{}-{sequence}",
+        std::process::id()
+    ));
+    if directory.exists() {
+        std::fs::remove_dir_all(&directory).expect("remove stale evaluation directory");
+    }
+    std::fs::create_dir(&directory).expect("create evaluation directory");
+    directory
 }

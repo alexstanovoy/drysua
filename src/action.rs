@@ -2094,8 +2094,10 @@ fn fill_body_masks(
     masks: &mut ControlledMasks,
 ) {
     for (index, point) in space.points.iter().enumerate() {
-        masks.move_points[index] = movement_enabled && point.walkable;
-        masks.attack_move_points[index] = attack_enabled && point.walkable;
+        let body_navigation_target =
+            point.walkable && !matches!(point.source, PointSource::BuildingLanding(_));
+        masks.move_points[index] = movement_enabled && body_navigation_target;
+        masks.attack_move_points[index] = attack_enabled && body_navigation_target;
     }
     for (index, target) in space.entities.iter().enumerate() {
         let other = target.id != state.id;
@@ -2107,7 +2109,8 @@ fn fill_body_masks(
 
 fn fill_cast_masks(space: &ActionSpace, state: &ControlledState, masks: &mut ControlledMasks) {
     let disabled = has_status(&state.unit, StatusFlags::STUNNED)
-        || has_status(&state.unit, StatusFlags::SILENCED);
+        || has_status(&state.unit, StatusFlags::SILENCED)
+        || has_status(&state.unit, StatusFlags::CHANNELLING);
     masks.casts.reserve(state.unit.abilities.len());
     for ability in state.unit.abilities.iter().take(MAX_ABILITY_SLOTS) {
         let ready = !disabled
@@ -2143,6 +2146,7 @@ fn fill_use_masks(
             && item.charges != Some(0)
             && state.unit.mana >= item.mana_cost
             && !has_status(&state.unit, StatusFlags::STUNNED)
+            && !has_status(&state.unit, StatusFlags::CHANNELLING)
             && !space
                 .readiness
                 .inventory_muted(unit, ItemSlot(slot as u8), space.tick)

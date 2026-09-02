@@ -22,24 +22,27 @@ pub const PPO_MAX_POLICY_SAMPLE_DRAWS: u64 = 132;
 /// Absolute shaping budget for one episode.
 pub const PPO_SHAPING_BUDGET: f32 = 100.0;
 /// Terminal reward for winning; losing is its negation.
-pub const PPO_TERMINAL_REWARD: f32 = 1_000.0;
+pub const PPO_TERMINAL_REWARD: f32 = 100.0;
 /// Version of rollout, GAE, objective, optimizer, and reward semantics.
-pub const PPO_SCHEMA_VERSION: u32 = 3;
+pub const PPO_SCHEMA_VERSION: u32 = 8;
 /// Audited simulator rules required by stage-nine rollouts.
-pub const PPO_RULES_AUDIT_VERSION: u32 = 3;
+pub const PPO_RULES_AUDIT_VERSION: u32 = 8;
 /// Canonical stage-nine learner contract covered by [`PPO_SCHEMA_HASH`].
 pub const PPO_SCHEMA_DESCRIPTOR: &str = concat!(
-    "bota-drysua-ppo/v3;",
+    "bota-drysua-ppo/v8;",
     "action_schema_version=1;action_schema_hash=17797499074169920257;",
-    "feature_schema_version=4;feature_schema_hash=508444194896722448;",
-    "model_schema_version=4;model_schema_hash=9866443454266023146;rules_audit=3;",
+    "feature_schema_version=5;feature_schema_hash=915600107964374298;",
+    "model_schema_version=5;model_schema_hash=4131398326042480440;rules_audit=8;",
     "bounds=rollout32768,streams1280,environments128,decisions256,epochs16,minibatch8192,microbatch64;",
     "actor=frozen_exact_policy_identity,legal_masked_gumbel_max_open_f64_uniform,exact_autoregressive_log_probability_and_entropy;",
     "gae=gamma_tick_pow_elapsed_ticks,lambda0.98,terminal_reset,bootstrap_truncation,normalized_advantages;",
     "objective=clipped_surrogate0.2,value_mse0.5,entropy0.01,target_kl0.02;",
     "optimizer=adam_lr3e-4_beta1_0.9_beta2_0.999_epsilon1e-5_global_clip0.5,weighted_host_microbatch_accumulation,transactional_parameters_moments_shuffle;",
-    "reward=seat_safe_global_summary,potential_shaping_budget100,xp_advantage0.02,own_observable_gold0.01,last_hit_deny_diagnostics_only_zero_reward,enemy_gold_unavailable_by_seat_contract,combat2,structures5,terminal_win1000_loss-1000_draw0,separate_breakdown;",
-    "arena=one_learner_seat_against_independent_teacher,snapshot_and_events_every_tick,decision_interval3,batched_bootstrap,restart_on_terminal;",
+    "reward=seat_safe_global_summary,potential_shaping_budget100,xp_advantage0.02,own_observable_gold0.01,last_hit_deny_diagnostics_only_zero_reward,enemy_gold_unavailable_by_seat_contract,combat2,structures5,terminal_win100_loss-100_draw0,separate_breakdown;",
+    "arena=one_learner_seat_against_independent_opponent,snapshot_and_events_every_tick,decision_interval3,batched_bootstrap,restart_on_terminal,paired_side_seed_and_warmup_phase,on_policy_greedy_burn_in,eight_phase_blocks_alternate_weak_teacher,clear_hero_and_courier_warmup_orders,hero_identity_change_invalidates_local_body_order;",
+    "navigation=building_landing_points_reserved_for_teleport_targets,seat_visible_channel_masks_cast_and_use;",
+    "deployment=audited_seat_visible_teacher_on_map0,model_with_channel_preservation_sustain_emergency_retreat_and_safe_in_range_structure_attack_on_map1,dagger_uses_safety_shield_without_objective_override,raw_ppo_sampling_remains_on_policy;",
+    "pretraining=bounded_map1_teacher_and_dagger_corpus,map_qualified_sample_identity,map1_paired_win_acceptance,map0_teacher_paired_structure_progress_acceptance;",
     "pipeline=bounded_cpu_worker_endpoints,persistent_actor_thread_overlaps_learner,immutable_identity_bound_actor_lease,exactly_two_fixed_capacity_buffer_permits,one_generation_lag_allowed,two_generation_lag_rejected,live_generation_read_guard_held_through_optimizer_update,ragged_feature_arenas,bit_packed_behavioral_masks,padding_only_per_minibatch,explicit_cpu_cuda_metal_learner_selection;"
 );
 
@@ -62,10 +65,10 @@ pub const PPO_SCHEMA_HASH: u64 = ppo_fnv1a(PPO_SCHEMA_DESCRIPTOR.as_bytes());
 
 const _: () = assert!(ACTION_SCHEMA_VERSION == 1);
 const _: () = assert!(ACTION_SCHEMA_HASH == 17_797_499_074_169_920_257);
-const _: () = assert!(FEATURE_SCHEMA_VERSION == 4);
-const _: () = assert!(FEATURE_SCHEMA_HASH == 508_444_194_896_722_448);
-const _: () = assert!(MODEL_SCHEMA_VERSION == 4);
-const _: () = assert!(MODEL_SCHEMA_HASH == 9_866_443_454_266_023_146);
+const _: () = assert!(FEATURE_SCHEMA_VERSION == 5);
+const _: () = assert!(FEATURE_SCHEMA_HASH == 915_600_107_964_374_298);
+const _: () = assert!(MODEL_SCHEMA_VERSION == 5);
+const _: () = assert!(MODEL_SCHEMA_HASH == 4_131_398_326_042_480_440);
 
 /// Stage-nine PPO hyperparameters and bounded rollout dimensions.
 #[derive(Clone, Copy, Debug, PartialEq)]

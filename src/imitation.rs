@@ -36,7 +36,7 @@ pub const MIN_PROMOTION_ROLLOUT_ACTIONS: u64 = 1_000;
 /// Current behavioral optimizer ownership schema.
 pub const IMITATION_OPTIMIZER_VERSION: u32 = 2;
 /// Current audited game-rules scope for stage-eight artifacts.
-pub const IMITATION_RULES_AUDIT_VERSION: u32 = 3;
+pub const IMITATION_RULES_AUDIT_VERSION: u32 = 8;
 
 const TARGET_MODE_HEAD: usize = 3;
 const PUT_MODE_HEAD: usize = 2;
@@ -75,6 +75,9 @@ pub enum ImitationError {
     InvalidFrameSide,
     InvalidFrameMap,
     SampleIdentityMismatch(&'static str),
+    SampleMapOutsideScope {
+        map: MapId,
+    },
     DaggerSplit,
     SeedMembership {
         namespace: &'static str,
@@ -150,6 +153,7 @@ impl fmt::Display for ImitationError {
             | Self::InvalidFrameSide
             | Self::InvalidFrameMap
             | Self::SampleIdentityMismatch(_)
+            | Self::SampleMapOutsideScope { .. }
             | Self::DaggerSplit => self.fmt_target(formatter),
             _ => self.fmt_training(formatter),
         }
@@ -197,6 +201,11 @@ impl ImitationError {
             Self::SampleIdentityMismatch(field) => write!(
                 formatter,
                 "imitation sample identity {field} does not match its frame or action space"
+            ),
+            Self::SampleMapOutsideScope { map } => write!(
+                formatter,
+                "imitation sample map MapId({}) is outside its training scope",
+                map.0
             ),
             Self::DaggerSplit => {
                 formatter.write_str("imitation DAgger sample must belong to Train")
@@ -1009,7 +1018,7 @@ impl SeedNamespace {
     }
 }
 
-/// Seed, trajectory, tick, side, and namespace identity kept outside model tensors.
+/// Map, seed, trajectory, tick, side, and namespace identity kept outside model tensors.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct SampleIdentity {
     namespace: SeedNamespace,
@@ -1017,6 +1026,7 @@ pub struct SampleIdentity {
     trajectory: u64,
     tick: u32,
     side: ImitationSide,
+    map: MapId,
 }
 
 impl SampleIdentity {
@@ -1028,12 +1038,15 @@ impl SampleIdentity {
         tick: u32,
         frame: &FeatureFrame,
     ) -> Result<Self, ImitationError> {
+        let side = frame_side(frame)?;
+        let map = frame_map(frame)?;
         Ok(Self {
             namespace,
             seed,
             trajectory,
             tick,
-            side: frame_side(frame)?,
+            side,
+            map,
         })
     }
 
@@ -1052,29 +1065,71 @@ impl SampleIdentity {
     pub const fn side(self) -> ImitationSide {
         self.side
     }
+    pub const fn map(self) -> MapId {
+        self.map
+    }
 }
 
-/// Fixed hero, map, and audited-rules identity for one pool and checkpoint.
+/// Explicit supported map set for one training pool and checkpoint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrainingMapScope {
+    Zero,
+    One,
+    ZeroAndOne,
+}
+
+impl TrainingMapScope {
+    fn single(map: MapId) -> Result<Self, ImitationError> {
+        match map {
+            MapId(0) => Ok(Self::Zero),
+            MapId(1) => Ok(Self::One),
+            _ => Err(ImitationError::InvalidFrameMap),
+        }
+    }
+
+    pub const fn contains(self, map: MapId) -> bool {
+        matches!(
+            (self, map),
+            (Self::Zero | Self::ZeroAndOne, MapId(0)) | (Self::One | Self::ZeroAndOne, MapId(1))
+        )
+    }
+}
+
+/// Fixed hero, map scope, and audited-rules identity for one pool and checkpoint.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TrainingScope {
     pub hero: HeroId,
-    pub map: MapId,
+    pub map_scope: TrainingMapScope,
     pub rules_audit_version: u32,
 }
 
 impl TrainingScope {
     pub fn new(map: MapId, rules_audit_version: u32) -> Result<Self, ImitationError> {
-        if !matches!(map, MapId(0) | MapId(1)) {
-            return Err(ImitationError::InvalidFrameMap);
-        }
+        let map_scope = TrainingMapScope::single(map)?;
+        Self::from_map_scope(map_scope, rules_audit_version)
+    }
+
+    /// Creates a scope containing both MapId(0) and MapId(1).
+    pub fn both_maps(rules_audit_version: u32) -> Result<Self, ImitationError> {
+        Self::from_map_scope(TrainingMapScope::ZeroAndOne, rules_audit_version)
+    }
+
+    fn from_map_scope(
+        map_scope: TrainingMapScope,
+        rules_audit_version: u32,
+    ) -> Result<Self, ImitationError> {
         if rules_audit_version != IMITATION_RULES_AUDIT_VERSION {
             return Err(ImitationError::CheckpointState("rules audit version"));
         }
         Ok(Self {
             hero: SHADOW_FIEND,
-            map,
+            map_scope,
             rules_audit_version,
         })
+    }
+
+    pub const fn contains_map(self, map: MapId) -> bool {
+        self.map_scope.contains(map)
     }
 }
 
@@ -1214,12 +1269,7 @@ impl ImitationPool {
         seeds: SeedNamespaces,
         scope: TrainingScope,
     ) -> Result<Self, ImitationError> {
-        if !(1..=MAX_IMITATION_SAMPLES).contains(&capacity) {
-            return Err(ImitationError::Capacity {
-                value: capacity,
-                maximum: MAX_IMITATION_SAMPLES,
-            });
-        }
+        validate_imitation_pool_capacity(capacity)?;
         validate_scope(scope)?;
         if lineage == 0 {
             return Err(ImitationError::CheckpointState("pool lineage"));
@@ -1302,8 +1352,12 @@ impl ImitationPool {
                 seed: identity.seed,
             });
         }
-        if frame_map(&sample.frame)? != self.binding.scope.map {
+        let sample_map = frame_map(&sample.frame)?;
+        if sample_map != identity.map {
             return Err(ImitationError::SampleIdentityMismatch("map"));
+        }
+        if !self.binding.scope.contains_map(sample_map) {
+            return Err(ImitationError::SampleMapOutsideScope { map: sample_map });
         }
         if sample.source == ImitationSource::Dagger && sample.split != ImitationSplit::Train {
             return Err(ImitationError::DaggerSplit);
@@ -1460,6 +1514,9 @@ fn validate_identity(
 ) -> Result<(), ImitationError> {
     if frame_side(frame)? != identity.side {
         return Err(ImitationError::SampleIdentityMismatch("side"));
+    }
+    if frame_map(frame)? != identity.map {
+        return Err(ImitationError::SampleIdentityMismatch("map"));
     }
     if space.tick() != identity.tick {
         return Err(ImitationError::SampleIdentityMismatch("tick"));
@@ -1702,8 +1759,7 @@ impl TeacherCoverage {
     }
 
     /// Records a successful teacher label for one exact sample identity.
-    #[cfg(test)]
-    pub(crate) fn record_represented_for(
+    pub fn record_represented_for(
         &mut self,
         sample: &ImitationSample,
     ) -> Result<(), ImitationError> {
@@ -3478,11 +3534,18 @@ fn build_best_state(
 }
 
 fn validate_scope(scope: TrainingScope) -> Result<(), ImitationError> {
-    if scope.hero != SHADOW_FIEND
-        || !matches!(scope.map, MapId(0) | MapId(1))
-        || scope.rules_audit_version != IMITATION_RULES_AUDIT_VERSION
-    {
+    if scope.hero != SHADOW_FIEND || scope.rules_audit_version != IMITATION_RULES_AUDIT_VERSION {
         return Err(ImitationError::CheckpointState("training scope"));
+    }
+    Ok(())
+}
+
+fn validate_imitation_pool_capacity(capacity: usize) -> Result<(), ImitationError> {
+    if !(1..=MAX_IMITATION_SAMPLES).contains(&capacity) {
+        return Err(ImitationError::Capacity {
+            value: capacity,
+            maximum: MAX_IMITATION_SAMPLES,
+        });
     }
     Ok(())
 }

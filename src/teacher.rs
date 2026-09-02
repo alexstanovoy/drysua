@@ -112,6 +112,29 @@ impl Teacher {
         Ok((action, space))
     }
 
+    /// Selects only channel preservation, observable sustain, or emergency retreat work.
+    pub fn safety_action(
+        &self,
+        tracker: &StateTracker,
+        space: &ActionSpace,
+    ) -> Option<StructuredAction> {
+        if self.protects_channel(tracker, space) {
+            return Some(StructuredAction::Continue);
+        }
+        self.sustain(tracker, space)
+            .or_else(|| self.retreat(tracker, space))
+    }
+
+    /// Selects a high-confidence seat-visible action that deployment must not miss.
+    pub fn deployment_action(
+        &self,
+        tracker: &StateTracker,
+        space: &ActionSpace,
+    ) -> Option<StructuredAction> {
+        self.safety_action(tracker, space)
+            .or_else(|| self.attack_structure(tracker, space))
+    }
+
     /// Records a sent order and the snapshot tick of the space that decoded it.
     pub fn note_sent(&mut self, sequence: u32, issued: IssuedOrder, tick: u32) {
         if is_notable_order(issued.order) {
@@ -158,7 +181,7 @@ impl Teacher {
         persistence: &OrderPersistence,
         space: &ActionSpace,
     ) -> StructuredAction {
-        if self.protects_channel(space) {
+        if self.protects_channel(tracker, space) {
             return StructuredAction::Continue;
         }
         if let Some(action) = self
@@ -166,22 +189,29 @@ impl Teacher {
             .or_else(|| self.buy(tracker, space))
             .or_else(|| self.courier(tracker, space))
             .or_else(|| self.sustain(tracker, space))
+            .or_else(|| self.retreat(tracker, space))
         {
             return action;
         }
-        if self.protects_useful_persistent_order(tracker, persistence, space) {
+        if self.protects_active_unit_attack(tracker, persistence, space) {
             return StructuredAction::Continue;
         }
-        self.retreat(tracker, space)
-            .or_else(|| self.attack_last_hit(tracker, space))
+        if let Some(action) = self
+            .attack_last_hit(tracker, space)
             .or_else(|| self.raze_last_hit(tracker, space))
             .or_else(|| self.deny(tracker, space))
             .or_else(|| self.raze_hero(tracker, space))
             .or_else(|| self.requiem(tracker, space))
             .or_else(|| self.harass(tracker, space))
             .or_else(|| self.attack_structure(tracker, space))
+        {
+            return action;
+        }
+        if self.protects_useful_navigation(tracker, persistence) {
+            return StructuredAction::Continue;
+        }
+        self.safe_objective(tracker, space)
             .or_else(|| self.hold_lane(tracker, space))
-            .or_else(|| self.safe_objective(tracker, space))
             .unwrap_or(StructuredAction::Continue)
     }
 
@@ -219,7 +249,13 @@ impl Teacher {
         }
     }
 
-    fn protects_channel(&self, space: &ActionSpace) -> bool {
+    fn protects_channel(&self, tracker: &StateTracker, space: &ActionSpace) -> bool {
+        if tracker
+            .own_hero()
+            .is_some_and(|hero| hero.statuses.bits & bota_proto::StatusFlags::CHANNELLING != 0)
+        {
+            return true;
+        }
         if let Some(note) = self.latest_note(None) {
             let elapsed = space.tick().saturating_sub(note.tick);
             if let Order::Use { slot, .. } = note.issued.order
@@ -234,11 +270,28 @@ impl Teacher {
         false
     }
 
-    fn protects_useful_persistent_order(
+    fn protects_active_unit_attack(
         &self,
         tracker: &StateTracker,
         persistence: &OrderPersistence,
         space: &ActionSpace,
+    ) -> bool {
+        let Some(note) = self.active_note(persistence, None) else {
+            return false;
+        };
+        if let Order::Attack {
+            target: Target::Unit(target),
+        } = note.issued.order
+        {
+            return self.continue_attack(tracker, space, target);
+        }
+        false
+    }
+
+    fn protects_useful_navigation(
+        &self,
+        tracker: &StateTracker,
+        persistence: &OrderPersistence,
     ) -> bool {
         let Some(note) = self.active_note(persistence, None) else {
             return false;
@@ -250,12 +303,6 @@ impl Teacher {
             | Order::Attack {
                 target: Target::Pos(target),
             } => useful_walk(tracker, target),
-            Order::Attack {
-                target: Target::None,
-            } => useful_hold(tracker),
-            Order::Attack {
-                target: Target::Unit(target),
-            } => self.continue_attack(tracker, space, target),
             _ => false,
         }
     }
@@ -721,15 +768,6 @@ fn useful_walk(tracker: &StateTracker, target: Vec2) -> bool {
         && !enemy_tower_danger(tracker, target, hero.radius)
 }
 
-fn useful_hold(tracker: &StateTracker) -> bool {
-    let Some(hero) = tracker.own_hero() else {
-        return false;
-    };
-    !ratio_at_most(hero.hp, hero.max_hp, 25)
-        && visible_pressure(tracker, hero) < hero.hp.max(0)
-        && !enemy_tower_danger(tracker, hero.pos, hero.radius)
-}
-
 fn courier_threatened(tracker: &StateTracker, courier: &UnitView) -> bool {
     tracker.current().is_some_and(|view| {
         view.units.iter().any(|unit| {
@@ -1033,7 +1071,8 @@ fn best_safe_point(
         .filter(|(index, point)| {
             mask.get(*index) == Some(&true)
                 && (!require_progress || point.position.distance_squared(wanted) < current)
-                && !enemy_tower_danger(tracker, point.position, hero.radius)
+                && (!enemy_tower_danger(tracker, point.position, hero.radius)
+                    || allied_creep_near(tracker, point.position, 750))
         })
         .min_by_key(|(_, point)| point.position.distance_squared(wanted))
         .map(|(index, _)| PointIndex(index))

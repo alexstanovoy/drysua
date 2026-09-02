@@ -116,6 +116,55 @@ fn teacher_retreats_toward_own_fountain_at_critical_health() {
 }
 
 #[test]
+fn teacher_safety_action_retreats_from_an_uncovered_enemy_tower() {
+    let mut view = base_view();
+    own_hero_mut(&mut view).pos = Vec2::from_ints(5_500, 6_000);
+    let tracker = tracker(view);
+    let space = crate::ActionSpace::from_tracker(&tracker).expect("action space");
+
+    let action = Teacher::new()
+        .safety_action(&tracker, &space)
+        .expect("tower retreat");
+
+    let StructuredAction::MovePoint { point, .. } = action else {
+        panic!("uncovered tower danger must force a retreat");
+    };
+    assert!(
+        space.point_candidates()[point.0]
+            .position
+            .distance_squared(Vec2::from_ints(1_000, 1_000))
+            < Vec2::from_ints(5_500, 6_000).distance_squared(Vec2::from_ints(1_000, 1_000))
+    );
+    assert!(space.allows(action));
+}
+
+#[test]
+fn teacher_deployment_action_attacks_a_safe_in_range_enemy_structure() {
+    let mut view = base_view();
+    own_hero_mut(&mut view).pos = Vec2::from_ints(5_500, 6_000);
+    view.units.push(unit(
+        CREEP_ID,
+        UnitKind::CreepMelee,
+        Team::Radiant,
+        5_700,
+        6_000,
+    ));
+    sort_units(&mut view);
+    let tracker = tracker(view);
+    let space = crate::ActionSpace::from_tracker(&tracker).expect("action space");
+
+    let action = Teacher::new()
+        .deployment_action(&tracker, &space)
+        .expect("safe structure attack");
+
+    let StructuredAction::AttackUnit { target, .. } = action else {
+        panic!("in-range enemy structure must be attacked");
+    };
+    assert_eq!(space.entity_candidates()[target.0].kind, UnitKind::Tower);
+    assert!(space.allows(action));
+}
+
+#[test]
 fn teacher_attacks_an_enemy_creep_killable_at_projectile_landing() {
     let mut view = base_view();
     let mut creep = unit(CREEP_ID, UnitKind::CreepMelee, Team::Dire, 3_300, 3_000);
@@ -131,6 +180,23 @@ fn teacher_attacks_an_enemy_creep_killable_at_projectile_landing() {
         panic!("killable enemy creep must be attacked");
     };
     assert_eq!(space.entity_candidates()[target.0].unit().id, CREEP_ID);
+    assert!(space.allows(action));
+}
+
+#[test]
+fn teacher_preserves_a_seat_visible_channel_instead_of_issuing_a_body_order() {
+    let mut view = base_view();
+    own_hero_mut(&mut view).statuses.bits = StatusFlags::CHANNELLING;
+    let mut creep = unit(CREEP_ID, UnitKind::CreepMelee, Team::Dire, 3_300, 3_000);
+    creep.hp = 40;
+    creep.max_hp = 550;
+    view.units.push(creep);
+    sort_units(&mut view);
+    let tracker = tracker(view);
+
+    let (action, space) = decide(&tracker);
+
+    assert_eq!(action, StructuredAction::Continue);
     assert!(space.allows(action));
 }
 
@@ -410,6 +476,59 @@ fn teacher_continues_an_old_attack_inside_server_windup_leeway() {
 }
 
 #[test]
+fn teacher_preempts_a_persistent_hold_to_last_hit_a_killable_creep() {
+    let mut view = base_view();
+    let mut creep = unit(CREEP_ID, UnitKind::CreepMelee, Team::Dire, 3_300, 3_000);
+    creep.hp = 40;
+    creep.max_hp = 550;
+    view.units.push(creep);
+    sort_units(&mut view);
+    let tracker = tracker(view);
+    let issued = IssuedOrder {
+        unit: None,
+        order: Order::Attack {
+            target: Target::None,
+        },
+    };
+    let mut persistence = OrderPersistence::default();
+    persistence.record_sent(7, issued).expect("hold recorded");
+    let mut teacher = Teacher::new();
+    teacher.note_sent(7, issued, 1);
+
+    let (action, space) = teacher
+        .decide(&tracker, &persistence, &ItemReadiness::new())
+        .expect("teacher decision");
+
+    let StructuredAction::AttackUnit { target, .. } = action else {
+        panic!("killable enemy creep must preempt a persistent hold");
+    };
+    assert_eq!(space.entity_candidates()[target.0].unit().id, CREEP_ID);
+    assert!(space.allows(action));
+}
+
+#[test]
+fn teacher_releases_a_persistent_hold_to_resume_objective_progress() {
+    let tracker = tracker(base_view());
+    let issued = IssuedOrder {
+        unit: None,
+        order: Order::Attack {
+            target: Target::None,
+        },
+    };
+    let mut persistence = OrderPersistence::default();
+    persistence.record_sent(7, issued).expect("hold recorded");
+    let mut teacher = Teacher::new();
+    teacher.note_sent(7, issued, 1);
+
+    let (action, space) = teacher
+        .decide(&tracker, &persistence, &ItemReadiness::new())
+        .expect("teacher decision");
+
+    assert!(matches!(action, StructuredAction::AttackMovePoint { .. }));
+    assert!(space.allows(action));
+}
+
+#[test]
 fn teacher_spends_a_skill_point_without_cancelling_a_useful_move() {
     let mut view = base_view();
     own_hero_mut(&mut view).abilities[5].can_level = true;
@@ -489,6 +608,30 @@ fn teacher_attack_moves_toward_a_safe_visible_objective_without_a_wave() {
     let (action, space) = decide(&tracker);
 
     assert!(matches!(action, StructuredAction::AttackMovePoint { .. }));
+    assert!(space.allows(action));
+}
+
+#[test]
+fn teacher_follows_an_allied_wave_into_enemy_tower_range() {
+    let mut view = base_view();
+    own_hero_mut(&mut view).pos = Vec2::from_ints(5_300, 6_000);
+    view.units.push(unit(
+        CREEP_ID,
+        UnitKind::CreepMelee,
+        Team::Radiant,
+        5_700,
+        6_000,
+    ));
+    sort_units(&mut view);
+    let tracker = tracker(view);
+
+    let (action, space) = decide(&tracker);
+
+    let StructuredAction::AttackMovePoint { point, .. } = action else {
+        panic!("allied tower cover must permit an objective-directed move");
+    };
+    let destination = space.point_candidates()[point.0].position;
+    assert!(destination.within(Vec2::from_ints(6_000, 6_000), Fixed::from_int(750)));
     assert!(space.allows(action));
 }
 

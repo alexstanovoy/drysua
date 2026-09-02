@@ -111,3 +111,100 @@ fn cli_rejects_provenance_migration_without_resume() {
 
     assert!(error.to_string().contains("--resume"));
 }
+
+#[test]
+fn cli_accepts_initial_weights_for_fresh_training() {
+    crate::cli::parse_from([
+        "drysua",
+        "train-full",
+        "--updates",
+        "8",
+        "--checkpoint-directory",
+        "training/ppo-v1",
+        "--initial-weights",
+        "training/pretrain-v1",
+    ])
+    .expect("fresh initialized training CLI");
+}
+
+#[test]
+fn cli_rejects_initial_weights_when_resuming() {
+    let error = crate::cli::parse_from([
+        "drysua",
+        "train-full",
+        "--updates",
+        "8",
+        "--checkpoint-directory",
+        "training/ppo-v1",
+        "--initial-weights",
+        "training/pretrain-v1",
+        "--resume",
+    ])
+    .expect_err("resume already restores exact model state");
+
+    assert!(error.to_string().contains("cannot be used with '--resume'"));
+}
+
+#[test]
+fn cli_accepts_fixed_checkpoint_evaluation_matrix() {
+    crate::cli::parse_from([
+        "drysua",
+        "evaluate",
+        "--checkpoint-directory",
+        "training/run/checkpoint",
+        "--pairs",
+        "2",
+        "--decisions",
+        "1024",
+        "--seed",
+        "77",
+    ])
+    .expect("evaluate CLI");
+}
+
+#[test]
+fn cli_rejects_partial_checkpoint_evaluation_matrix() {
+    let error = crate::cli::parse_from([
+        "drysua",
+        "evaluate",
+        "--checkpoint-directory",
+        "training/run/checkpoint",
+        "--map",
+        "1",
+    ])
+    .expect_err("evaluation matrix must include both maps");
+
+    assert!(error.to_string().contains("unexpected argument '--map'"));
+}
+
+#[test]
+fn cli_accepts_bounded_teacher_pretraining() {
+    crate::cli::parse_from([
+        "drysua",
+        "pretrain",
+        "--output-directory",
+        "training/pretrain-maps",
+        "--epochs",
+        "8",
+        "--seed",
+        "50001",
+        "--device",
+        "cuda",
+    ])
+    .expect("pretrain CLI");
+}
+
+#[test]
+fn cli_rejects_partial_map_teacher_pretraining() {
+    let error = crate::cli::parse_from([
+        "drysua",
+        "pretrain",
+        "--output-directory",
+        "training/pretrain-map1",
+        "--map",
+        "1",
+    ])
+    .expect_err("pretraining must cover both maps");
+
+    assert!(error.to_string().contains("unexpected argument '--map'"));
+}

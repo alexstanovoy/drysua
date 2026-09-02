@@ -1,8 +1,8 @@
 use bota_proto::{
     AbilityId, AbilityView, Aim, Angle, Attribute, Attributes, DamageKind, EntityId, EventKind,
     Fixed, ItemId, ItemSlot, ItemView, LootView, MapId, MatchInfo, Order, Pick, PlayerView,
-    ProjectileView, ShopEntry, SlotId, StatusFlags, Team, TickMode, UnitKind, UnitView, Vec2,
-    WorldView,
+    ProjectileView, ShopEntry, SlotId, StatusFlags, Target, Team, TickMode, UnitKind, UnitView,
+    Vec2, WorldView,
 };
 
 use crate::feature::RaggedFeatureArena;
@@ -26,8 +26,8 @@ const ENEMY: EntityId = entity(20, 1);
 
 #[test]
 fn feature_schema_dimensions_and_hash_are_stable() {
-    assert_eq!(FEATURE_SCHEMA_VERSION, 4);
-    assert_eq!(FEATURE_SCHEMA_HASH, 508_444_194_896_722_448);
+    assert_eq!(FEATURE_SCHEMA_VERSION, 5);
+    assert_eq!(FEATURE_SCHEMA_HASH, 915_600_107_964_374_298);
     assert_eq!(GLOBAL_FEATURES, 64);
     assert_eq!((HISTORY_SAMPLES, HISTORY_FEATURES), (7, 24));
     assert_eq!((MAX_POLICY_HISTORY, POLICY_HISTORY_FEATURES), (16, 4));
@@ -801,6 +801,60 @@ fn local_policy_history_is_bounded_and_rollback_reset_are_deterministic() {
 }
 
 #[test]
+fn active_body_point_target_is_encoded_relative_to_the_controlled_hero() {
+    let tracker = tracker_with_view(Team::Radiant, world_view(Team::Radiant, 10));
+    let mut local = LocalPolicyState::new(0);
+    local
+        .set_active_order_from_issued(
+            5,
+            ActionKind::MovePoint,
+            IssuedOrder {
+                unit: None,
+                order: Order::Move {
+                    target: Target::Pos(Vec2::from_ints(3_000, 2_000)),
+                },
+            },
+        )
+        .expect("active point target");
+
+    let frame = encode(&tracker, &local);
+
+    assert_eq!(frame.global[global_feature::ACTIVE_TARGET_PRESENT], 1.0);
+    assert_eq!(frame.global[global_feature::ACTIVE_TARGET_POINT], 1.0);
+    assert_eq!(frame.global[global_feature::ACTIVE_TARGET_UNIT], 0.0);
+    assert!(frame.global[global_feature::ACTIVE_TARGET_RELATIVE_X] > 0.0);
+    assert_eq!(frame.global[global_feature::ACTIVE_TARGET_RELATIVE_Y], 0.0);
+    assert!(frame.global[global_feature::ACTIVE_TARGET_DISTANCE] > 0.0);
+}
+
+#[test]
+fn active_body_unit_target_is_encoded_without_exposing_its_entity_id() {
+    let tracker = tracker_with_view(Team::Radiant, world_view(Team::Radiant, 10));
+    let mut local = LocalPolicyState::new(0);
+    local
+        .set_active_order_from_issued(
+            5,
+            ActionKind::AttackUnit,
+            IssuedOrder {
+                unit: None,
+                order: Order::Attack {
+                    target: Target::Unit(ENEMY),
+                },
+            },
+        )
+        .expect("active unit target");
+
+    let frame = encode(&tracker, &local);
+
+    assert_eq!(frame.global[global_feature::ACTIVE_TARGET_PRESENT], 1.0);
+    assert_eq!(frame.global[global_feature::ACTIVE_TARGET_POINT], 0.0);
+    assert_eq!(frame.global[global_feature::ACTIVE_TARGET_UNIT], 1.0);
+    assert_eq!(frame.global[global_feature::ACTIVE_TARGET_VISIBLE], 1.0);
+    assert_eq!(frame.global[global_feature::ACTIVE_TARGET_ENEMY], 1.0);
+    assert!(frame.global[global_feature::ACTIVE_TARGET_KIND_TOKEN] > 0.0);
+}
+
+#[test]
 fn local_policy_state_rejects_time_regression_with_exact_error() {
     let mut local = LocalPolicyState::new(10);
     local
@@ -858,6 +912,7 @@ fn local_policy_rollback_restores_replaced_order_and_assignment() {
         Some(crate::ActivePolicyOrder {
             started_tick: 2,
             kind: ActionKind::MovePoint,
+            target: crate::ActivePolicyTarget::None,
         })
     );
     let tracker = tracker_with_view(Team::Radiant, world_view(Team::Radiant, 5));

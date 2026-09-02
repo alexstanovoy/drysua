@@ -385,8 +385,8 @@ fn adam_rejects_invalid_config_nonfinite_and_extreme_updates_without_partial_sta
 
 #[test]
 fn model_schema_and_head_dimensions_are_stable() {
-    assert_eq!(MODEL_SCHEMA_VERSION, 4);
-    assert_eq!(MODEL_SCHEMA_HASH, 9_866_443_454_266_023_146);
+    assert_eq!(MODEL_SCHEMA_VERSION, 5);
+    assert_eq!(MODEL_SCHEMA_HASH, 4_131_398_326_042_480_440);
     assert_eq!(MODEL_KIND_HEAD, 16);
     assert_eq!(MODEL_UNIT_HEAD, 2);
     assert_eq!(MODEL_ABILITY_HEAD, 8);

@@ -3,7 +3,7 @@
     reason = "behavioral-training reference checks use floating-point arithmetic"
 )]
 
-use bota_proto::{Aim, MapId, SlotId, Team, UnitKind};
+use bota_proto::{Aim, MapId, MatchInfo, Pick, SlotId, Team, UnitKind};
 
 use super::feature::{encode, tracker_with_view, world_view};
 use crate::model::{DecoderLogits, decode_with_logits};
@@ -14,8 +14,8 @@ use crate::{
     LearnerMatchOutcome, LearnerTeacherResult, LocalPolicyState, MAX_IMITATION_SAMPLES,
     MAX_SEED_NAMESPACE, MAX_TRAINING_COUNTER, MODEL_PARAMETER_COUNT, OfflineEvaluation,
     OrderPersistence, PairedGameplayReport, PairedSeedResult, PolicyModel, PromotionGateInput,
-    RolloutAudit, SampleIdentity, SeedNamespace, SeedNamespaces, ShuffleState, StructuredAction,
-    Teacher, TeacherCoverage, TrainingCheckpoint, TrainingScope,
+    RolloutAudit, SampleIdentity, SeedNamespace, SeedNamespaces, ShuffleState, StateTracker,
+    StructuredAction, Teacher, TeacherCoverage, TrainingCheckpoint, TrainingScope,
 };
 
 #[test]
@@ -23,7 +23,7 @@ fn action_and_training_schema_identities_are_stable() {
     assert_eq!(ACTION_SCHEMA_VERSION, 1);
     assert_eq!(ACTION_SCHEMA_HASH, 17_797_499_074_169_920_257);
     assert_eq!(crate::IMITATION_OPTIMIZER_VERSION, 2);
-    assert_eq!(crate::IMITATION_RULES_AUDIT_VERSION, 3);
+    assert_eq!(crate::IMITATION_RULES_AUDIT_VERSION, 8);
 }
 
 #[test]
@@ -303,6 +303,69 @@ fn pool_enforces_seed_identity_revision_and_protected_eviction() {
         .to_string(),
         "imitation pool is full and has no evictable Train sample"
     );
+}
+
+#[test]
+fn dual_map_scope_accepts_same_provenance_once_per_distinct_map() {
+    let (map_zero_frame, map_zero_space) = complete_fixture_for_map(MapId(0));
+    let (map_one_frame, map_one_space) = complete_fixture_for_map(MapId(1));
+    let mut pool = ImitationPool::new(
+        2,
+        120,
+        seeds(),
+        TrainingScope::both_maps(crate::IMITATION_RULES_AUDIT_VERSION).expect("dual-map scope"),
+    )
+    .expect("dual-map pool");
+    let map_zero = map_sample(map_zero_frame, &map_zero_space);
+    let map_one = map_sample(map_one_frame, &map_one_space);
+
+    assert!(pool.binding().scope.contains_map(MapId(0)));
+    assert!(pool.binding().scope.contains_map(MapId(1)));
+    assert!(!pool.binding().scope.contains_map(MapId(2)));
+    assert_eq!(map_zero.identity().map(), MapId(0));
+    assert_eq!(map_one.identity().map(), MapId(1));
+    assert_eq!(map_zero.identity().seed(), map_one.identity().seed());
+    assert_eq!(
+        map_zero.identity().trajectory(),
+        map_one.identity().trajectory()
+    );
+    assert_eq!(map_zero.identity().tick(), map_one.identity().tick());
+    assert_eq!(map_zero.identity().side(), map_one.identity().side());
+    pool.push(map_zero).expect("MapId(0) sample");
+    pool.push(map_one).expect("MapId(1) sample");
+    assert_eq!(pool.len(), 2);
+}
+
+#[test]
+fn dual_map_scope_rejects_a_true_same_map_duplicate() {
+    let (frame, space) = complete_fixture_for_map(MapId(0));
+    let mut pool = ImitationPool::new(
+        2,
+        121,
+        seeds(),
+        TrainingScope::both_maps(crate::IMITATION_RULES_AUDIT_VERSION).expect("dual-map scope"),
+    )
+    .expect("dual-map pool");
+    let sample = map_sample(frame, &space);
+    let duplicate = sample.clone();
+    pool.push(sample).expect("first MapId(0) sample");
+
+    let error = pool.push(duplicate).expect_err("same-map duplicate");
+    assert_eq!(error.to_string(), "imitation sample identity is duplicated");
+}
+
+#[test]
+fn single_map_scope_rejects_a_sample_from_the_other_map() {
+    let (frame, space) = complete_fixture_for_map(MapId(1));
+    let mut pool = ImitationPool::new(1, 122, seeds(), scope()).expect("MapId(0) pool");
+    let map_one = map_sample(frame, &space);
+
+    let error = pool.push(map_one).expect_err("MapId(1) sample");
+    assert_eq!(
+        error.to_string(),
+        "imitation sample map MapId(1) is outside its training scope"
+    );
+    assert!(pool.is_empty());
 }
 
 #[test]
@@ -1317,6 +1380,59 @@ fn identity(frame: &FeatureFrame, split: ImitationSplit, trajectory: u64) -> Sam
         ImitationSplit::HeldOut => (SeedNamespace::Promotion, 3),
     };
     SampleIdentity::from_frame(namespace, seed, trajectory, 10, frame).expect("identity")
+}
+
+fn map_sample(frame: FeatureFrame, space: &ActionSpace) -> ImitationSample {
+    let identity = SampleIdentity::from_frame(SeedNamespace::Training, 1, 7, 10, &frame)
+        .expect("map-qualified identity");
+    ImitationSample::teacher(frame, space, StructuredAction::Continue, identity)
+        .expect("map-qualified sample")
+}
+
+fn complete_fixture_for_map(map: MapId) -> (FeatureFrame, ActionSpace) {
+    let mut view = world_view(Team::Radiant, 10);
+    view.units
+        .iter_mut()
+        .find(|unit| unit.kind == UnitKind::Hero && unit.owner == Some(SlotId(0)))
+        .expect("hero")
+        .abilities[0]
+        .can_level = true;
+    view.players
+        .iter_mut()
+        .find(|player| player.slot == SlotId(0))
+        .expect("player")
+        .stash = Some(vec![None; 6]);
+    let template = tracker_with_view(Team::Radiant, view.clone());
+    let metadata = template.metadata();
+    let info = MatchInfo {
+        match_id: 99,
+        map,
+        tick_rate: metadata.tick_rate,
+        pregame_ticks: metadata.pregame_ticks,
+        trees: template.static_trees().to_vec(),
+        terrain_cells: metadata.terrain_cells,
+        terrain_rle: template.terrain_rle().to_vec(),
+        opaque_cells: template.opaque_cells().to_vec(),
+        mode: metadata.mode,
+        picks: vec![
+            Pick {
+                slot: SlotId(0),
+                team: Team::Radiant,
+                hero: crate::SHADOW_FIEND,
+            },
+            Pick {
+                slot: SlotId(1),
+                team: Team::Dire,
+                hero: crate::SHADOW_FIEND,
+            },
+        ],
+        shop: template.shop().to_vec(),
+    };
+    let mut tracker = StateTracker::new(SlotId(0), &info).expect("map tracker");
+    tracker.observe_snapshot(&view).expect("map snapshot");
+    let space = ActionSpace::from_tracker(&tracker).expect("map space");
+    let frame = encode(&tracker, &LocalPolicyState::new(0));
+    (frame, space)
 }
 
 fn zero_model(seed: u64) -> PolicyModel {

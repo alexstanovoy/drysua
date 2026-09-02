@@ -8,20 +8,21 @@ use std::fmt;
 use std::num::NonZeroU64;
 
 use bota_proto::{
-    AbilityId, AbilityView, Aim, Angle, Attribute, DamageKind, EventKind, Fixed, ItemId, ItemSlot,
-    ItemView, PlayerView, ProjectileView, ShopEntry, StatusFlags, Team, UnitKind, UnitView, Vec2,
+    AbilityId, AbilityView, Aim, Angle, Attribute, DamageKind, EntityId, EventKind, Fixed, ItemId,
+    ItemSlot, ItemView, Order, PlayerView, ProjectileView, ShopEntry, StatusFlags, Target, Team,
+    UnitKind, UnitView, Vec2,
 };
 
 use crate::tracker::{StaticTrackerProvenance, TrackerProvenance};
 use crate::{
-    ActionKind, ActionSpace, ControlledUnit, EntityRelation, HISTORY_AGES, ItemReadiness,
-    LandmarkRelation, MAX_LOOT, MAX_POINT_CANDIDATES, MAX_PROJECTILES, MAX_SHOP_ITEMS,
-    OWN_ITEM_SLOTS, PointCandidate, PointDirection, PointSource, SHADOW_FIEND_ABILITY_SLOTS,
-    StateTracker, TERRAIN_CELL_SIZE, UNIT_TOKENS,
+    ActionKind, ActionSpace, ControlledUnit, EntityRelation, HISTORY_AGES, IssuedOrder,
+    ItemReadiness, LandmarkRelation, MAX_LOOT, MAX_POINT_CANDIDATES, MAX_PROJECTILES,
+    MAX_SHOP_ITEMS, OWN_ITEM_SLOTS, PointCandidate, PointDirection, PointSource,
+    SHADOW_FIEND_ABILITY_SLOTS, StateTracker, TERRAIN_CELL_SIZE, UNIT_TOKENS,
 };
 
 /// Version of the append-only policy feature schema.
-pub const FEATURE_SCHEMA_VERSION: u32 = 4;
+pub const FEATURE_SCHEMA_VERSION: u32 = 5;
 /// Number of scalar global features.
 pub const GLOBAL_FEATURES: usize = 64;
 /// Number of scalar features in one global-history sample.
@@ -143,6 +144,17 @@ pub mod global_feature {
     pub const VISIBLE_ALLIED_UNITS: usize = 45;
     pub const VISIBLE_ENEMY_UNITS: usize = 46;
     pub const ENEMY_SCOREBOARD_ENABLED: usize = 47;
+    pub const ACTIVE_TARGET_PRESENT: usize = 48;
+    pub const ACTIVE_TARGET_POINT: usize = 49;
+    pub const ACTIVE_TARGET_UNIT: usize = 50;
+    pub const ACTIVE_TARGET_VISIBLE: usize = 51;
+    pub const ACTIVE_TARGET_RELATIVE_X: usize = 52;
+    pub const ACTIVE_TARGET_RELATIVE_Y: usize = 53;
+    pub const ACTIVE_TARGET_DISTANCE: usize = 54;
+    pub const ACTIVE_TARGET_KIND_TOKEN: usize = 55;
+    pub const ACTIVE_TARGET_ALLIED: usize = 56;
+    pub const ACTIVE_TARGET_ENEMY: usize = 57;
+    pub const ACTIVE_TARGET_NEUTRAL: usize = 58;
 }
 
 /// Stable indices in each unit token.
@@ -350,7 +362,7 @@ pub mod loot_feature {
 
 /// Canonical schema text covered by [`FEATURE_SCHEMA_HASH`].
 pub const FEATURE_SCHEMA_DESCRIPTOR: &str = concat!(
-    "bota-drysua-feature/v4;",
+    "bota-drysua-feature/v5;",
     "shapes=global:64,history:7x24,policy_history:16x4,unit:96x69,own_unit:2x69,remembered_unit:32x69,point:48x32,ability:14x24,item:85x28,projectile:32x20,loot:16x16,map:96;",
     "scalar_ranges=presence_and_one_hot:[0,1],unsigned_continuous:[0,1],signed_continuous:[-1,1],category:positive_exact_integer,all_finite;",
     "history_ages=480,240,120,60,30,15,0;",
@@ -379,6 +391,7 @@ pub const FEATURE_SCHEMA_DESCRIPTOR: &str = concat!(
     "events=input_batch_cap:payload_len_div_2:2097152_reject_before_mutation,snapshot_event_journal_cap64,only_ticks_strictly_before_snapshot,same_tick_delivery_cannot_overwrite_or_evict_prior_snapshot_features,ability_cast_age_per_caster_and_ability,combat_phase_for_any_tracked_source;",
     "readiness=backpack_mute:180_from_apply_tick,teleport_shared_wait:2100_from_apply_tick,hero_inventory_journals6,body_shared_journals2,recent_request_cap8,effective_evicted_base_retained,rejection_exact_for_retained_sequences,evicted_sequence_rejection_unsupported,retained_rejections_restore_base;",
     "local_rollback=active_assignment_transition_cap16,evicted_effective_base_retained,earliest_supported_tick_tracked,rollback_before_horizon_exact_error_and_atomic,decision_eviction_advances_horizon_to_incoming_tick;",
+    "active_target=opaque_local_point_or_full_generation_unit_key_never_encoded_as_identifier,canonical_relative_position_distance,point_or_unit,visibility,unit_kind_and_relation;",
     "own_payloads=live_body_current,hero_scoreboard_kit_current_with_source_bit,absent_courier_ability_and_item_payloads_missing,no_remembered_body_payload_fallback;",
     "provenance=private_nonzero_checked_tracker_lineage_clone_gets_fresh_lineage_move_preserves_lineage,action_space_exact_bounded_lineage_slot_static_snapshot_tracker_comparison,readiness_exact_bounded_comparison,observation_exact_bounded_lineage_slot_static_snapshot_tracker_comparison,encoder_static_exact_bounded_comparison,no_correctness_claim_for_fnv_schema_hash;",
     "audit=enemy_scoreboard_disabled_by_default,global47_and_history23_presence,disabled_zeros_enemy_alive_and_score_xp_level_kda_last_hit_deny_advantages;",
@@ -848,6 +861,16 @@ pub struct ActivePolicyOrder {
     pub started_tick: u32,
     /// Selected top-level action family.
     pub kind: ActionKind,
+    /// Identifier-free target semantics retained outside model tensors.
+    pub target: ActivePolicyTarget,
+}
+
+/// Target of one locally active persistent body order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActivePolicyTarget {
+    None,
+    Point(Vec2),
+    Unit(EntityId),
 }
 
 /// Local strategic role supplied by the policy configuration.
@@ -878,7 +901,7 @@ struct PolicyAssignment {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ActivePolicyTransition {
     tick: u32,
-    kind: Option<ActionKind>,
+    order: Option<ActivePolicyOrder>,
 }
 
 /// Invalid chronology or unsupported rollback supplied to [`LocalPolicyState`].
@@ -990,7 +1013,50 @@ impl LocalPolicyState {
         kind: Option<ActionKind>,
     ) -> Result<(), LocalPolicyError> {
         self.check_tick(tick)?;
-        self.push_active_transition(ActivePolicyTransition { tick, kind });
+        let order = kind.map(|kind| ActivePolicyOrder {
+            started_tick: tick,
+            kind,
+            target: ActivePolicyTarget::None,
+        });
+        self.push_active_transition(ActivePolicyTransition { tick, order });
+        self.latest_tick = tick;
+        Ok(())
+    }
+
+    /// Replaces the active order while retaining its opaque local target semantics.
+    pub fn set_active_order_from_issued(
+        &mut self,
+        tick: u32,
+        kind: ActionKind,
+        issued: IssuedOrder,
+    ) -> Result<(), LocalPolicyError> {
+        self.check_tick(tick)?;
+        let target = match issued.order {
+            Order::Move { target } | Order::Attack { target } => match target {
+                Target::None => ActivePolicyTarget::None,
+                Target::Pos(position) => ActivePolicyTarget::Point(position),
+                Target::Unit(unit) => ActivePolicyTarget::Unit(unit),
+            },
+            _ => ActivePolicyTarget::None,
+        };
+        let order = Some(ActivePolicyOrder {
+            started_tick: tick,
+            kind,
+            target,
+        });
+        self.push_active_transition(ActivePolicyTransition { tick, order });
+        self.latest_tick = tick;
+        Ok(())
+    }
+
+    /// Restores a previously captured active order at one rejection-observation tick.
+    pub fn restore_active_order(
+        &mut self,
+        tick: u32,
+        order: Option<ActivePolicyOrder>,
+    ) -> Result<(), LocalPolicyError> {
+        self.check_tick(tick)?;
+        self.push_active_transition(ActivePolicyTransition { tick, order });
         self.latest_tick = tick;
         Ok(())
     }
@@ -1021,13 +1087,7 @@ impl LocalPolicyState {
         let mut index = 0usize;
         while index < self.active_transition_count {
             if let Some(transition) = self.active_transitions[index] {
-                active = match transition.kind {
-                    Some(kind) => Some(ActivePolicyOrder {
-                        started_tick: transition.tick,
-                        kind,
-                    }),
-                    None => None,
-                };
+                active = transition.order;
             }
             index += 1;
         }
@@ -1098,13 +1158,7 @@ const fn apply_active_transition(
     _active: Option<ActivePolicyOrder>,
     transition: ActivePolicyTransition,
 ) -> Option<ActivePolicyOrder> {
-    match transition.kind {
-        Some(kind) => Some(ActivePolicyOrder {
-            started_tick: transition.tick,
-            kind,
-        }),
-        None => None,
-    }
+    transition.order
 }
 
 /// Feature construction failure.
@@ -1516,7 +1570,7 @@ impl FeatureEncoder {
             .saturating_add(summary.enemy_structures_destroyed);
         output.global[index::DESTROYED_STRUCTURES] =
             ratio(i64::from(destroyed), 0, MAX_STRUCTURE_COUNT);
-        encode_local_global(current.tick, local, &mut output.global);
+        encode_local_global(self, tracker, current.tick, local, &mut output.global);
         encode_own_score(own, &mut output.global);
         output.global[index::VISIBLE_ALLIED_UNITS] =
             ratio(i64::from(summary.visible_allied_units), 0, 256);
@@ -2283,18 +2337,67 @@ fn encode_assignment(local: &LocalPolicyState, global: &mut [f32; GLOBAL_FEATURE
     }
 }
 
-fn encode_local_global(tick: u32, local: &LocalPolicyState, global: &mut [f32; GLOBAL_FEATURES]) {
+fn encode_local_global(
+    encoder: &FeatureEncoder,
+    tracker: &StateTracker,
+    tick: u32,
+    local: &LocalPolicyState,
+    global: &mut [f32; GLOBAL_FEATURES],
+) {
     use global_feature as index;
     if let Some(active) = local.active_order() {
         global[index::ACTIVE_ORDER_PRESENT] = 1.0;
         global[index::ACTIVE_ORDER_KIND] = category_token(active.kind.index());
         global[index::ACTIVE_ORDER_AGE] =
             unit_ratio(tick.saturating_sub(active.started_tick), MAX_AGE);
+        encode_active_target(encoder, tracker, active.target, global);
     }
     if let Some(decision) = local.decisions().next_back() {
         global[index::LAST_DECISION_PRESENT] = 1.0;
         global[index::TICKS_SINCE_DECISION] =
             unit_ratio(tick.saturating_sub(decision.tick), MAX_AGE);
+    }
+}
+
+fn encode_active_target(
+    encoder: &FeatureEncoder,
+    tracker: &StateTracker,
+    target: ActivePolicyTarget,
+    global: &mut [f32; GLOBAL_FEATURES],
+) {
+    use global_feature as index;
+    let (position, visible, unit) = match target {
+        ActivePolicyTarget::None => return,
+        ActivePolicyTarget::Point(position) => (position, true, None),
+        ActivePolicyTarget::Unit(id) => {
+            let Some(entity) = tracker.entity(id) else {
+                global[index::ACTIVE_TARGET_PRESENT] = 1.0;
+                global[index::ACTIVE_TARGET_UNIT] = 1.0;
+                return;
+            };
+            (entity.unit.pos, entity.visible, Some(&entity.unit))
+        }
+    };
+    global[index::ACTIVE_TARGET_PRESENT] = 1.0;
+    global[index::ACTIVE_TARGET_POINT] = bool_feature(unit.is_none());
+    global[index::ACTIVE_TARGET_UNIT] = bool_feature(unit.is_some());
+    global[index::ACTIVE_TARGET_VISIBLE] = bool_feature(visible);
+    if let Some(hero) = tracker.own_hero() {
+        let delta = encoder.canonical_delta(tracker.team(), position, hero.pos);
+        global[index::ACTIVE_TARGET_RELATIVE_X] = signed_raw_ratio(delta.0, encoder.extent_raw);
+        global[index::ACTIVE_TARGET_RELATIVE_Y] = signed_raw_ratio(delta.1, encoder.extent_raw);
+        global[index::ACTIVE_TARGET_DISTANCE] =
+            raw_distance_ratio_i64(delta.0.abs().max(delta.1.abs()), encoder.extent_raw);
+    }
+    if let Some(unit) = unit {
+        global[index::ACTIVE_TARGET_KIND_TOKEN] = unit_kind_token(unit.kind);
+        if unit.team == Team::Neutral {
+            global[index::ACTIVE_TARGET_NEUTRAL] = 1.0;
+        } else if unit.team == tracker.team() {
+            global[index::ACTIVE_TARGET_ALLIED] = 1.0;
+        } else {
+            global[index::ACTIVE_TARGET_ENEMY] = 1.0;
+        }
     }
 }
 

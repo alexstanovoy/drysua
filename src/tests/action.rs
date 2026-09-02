@@ -350,7 +350,7 @@ fn remote_tree_deltas_leave_candidates_and_masks_invariant_until_visibility_is_p
 }
 
 #[test]
-fn town_portal_targets_walkable_landings_by_building_range_not_user_range() {
+fn town_portal_landings_are_not_body_navigation_targets() {
     let mut view = world_view(1);
     let hero_index = hero_index(&view);
     view.units[hero_index].pos = Vec2::from_ints(6_000, 6_000);
@@ -373,6 +373,10 @@ fn town_portal_targets_walkable_landings_by_building_range_not_user_range() {
         assert!(candidate.walkable);
         assert!(candidate.allied_building);
         assert!(matches!(candidate.source, PointSource::BuildingLanding(_)));
+        for unit in [ControlledUnit::Hero, ControlledUnit::Courier] {
+            assert!(!space.move_point_mask(unit)[index]);
+            assert!(!space.attack_move_point_mask(unit)[index]);
+        }
         assert!(
             !candidate
                 .position
@@ -544,6 +548,35 @@ fn item_masks_cover_all_aims_and_reject_backpack_cooldown_charges_mana_and_range
     assert!(!blocked.item_slot_mask(ControlledUnit::Hero)[0]);
     assert!(!blocked.item_slot_mask(ControlledUnit::Hero)[1]);
     assert!(!blocked.item_slot_mask(ControlledUnit::Hero)[2]);
+}
+
+#[test]
+fn channelling_masks_casts_and_items_but_keeps_interrupting_movement_legal() {
+    let mut view = world_view(1);
+    let hero_index = hero_index(&view);
+    view.units[hero_index].abilities = vec![ability(Aim::Own, 0)];
+    view.units[hero_index].items = action_items();
+    view.units[hero_index].statuses.bits = StatusFlags::CHANNELLING;
+
+    let space = ActionSpace::from_tracker(&tracker_with_view(view)).expect("channel space");
+
+    assert!(
+        space
+            .ability_slot_mask(ControlledUnit::Hero)
+            .iter()
+            .all(|allowed| !allowed)
+    );
+    assert!(
+        space
+            .item_slot_mask(ControlledUnit::Hero)
+            .iter()
+            .all(|allowed| !allowed)
+    );
+    assert!(
+        space
+            .controlled_unit_mask(ActionKind::MovePoint)
+            .allows(ControlledUnit::Hero)
+    );
 }
 
 #[test]

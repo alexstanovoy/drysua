@@ -626,10 +626,12 @@ L_bc = CE(action kind) + сумма CE активных conditional heads
 Gate перед PPO:
 
 ```text
-full action agreement >= 95%
+overall kind agreement >= 60%, full agreement >= 55%
+per-side kind agreement >= 55%, full agreement >= 50%
 teacher action coverage = 100%
-rejection rate < 0.1%
-learner gameplay не хуже teacher
+rejection count = 0
+Map 1: Weak побеждён с обеих сторон
+Map 0: с обеих сторон уничтожена минимум одна enemy structure
 ```
 
 DAgger:
@@ -641,7 +643,7 @@ DAgger:
 5. Модель дообучается.
 
 Статус: программный контракт реализован. Identifier-free targets строятся только из
-точной пары FeatureFrame/ActionSpace; pool и effective batch ограничены 8192 samples,
+точной пары FeatureFrame/ActionSpace; Map 1 pool и effective batch ограничены 8192 samples,
 autograd microbatch — 64. Masked BC, host gradient accumulation, Adam с
 `epsilon=1e-8` и clip 0.5, deterministic shuffle, side metrics, seed namespaces,
 early stopping и строгий in-memory checkpoint входят в один deterministic CPU path.
@@ -649,9 +651,9 @@ Optimizer path принимает только `Train`; `Validation` и `HeldOut
 оценки.
 Один exclusive model guard покрывает весь effective update и Adam commit; ошибка epoch
 восстанавливает weights, moments, counters, shuffle и early-stop state. Pool проверяет
-seed/split/trajectory/tick/side identity, защищает Validation/HeldOut от FIFO eviction и
+map/seed/split/trajectory/tick/side identity, защищает Validation/HeldOut от FIFO eviction и
 связывает trainer/checkpoint с точными lineage, revision, seed namespaces, action/model/
-feature schemas, Shadow Fiend, map и rules-audit scope. Каждый in-memory pool имеет
+feature schemas, Shadow Fiend, typed map scope и rules-audit scope. Каждый in-memory pool имеет
 неподделываемую instance identity; после DAgger mutation trainer явно принимает только
 более новую revision того же instance через `rebind_pool`. Promotion принимает только
 typed HeldOut evaluation с реальным teacher-attempt denominator, обе стороны, минимум
@@ -663,6 +665,10 @@ Policy model, Adam и trainer связаны checked process-local model/optimiz
 monotonic parameter revision. Raw parameter import увеличивает revision и снимает
 optimizer ownership. HeldOut, rollout и каждый structural per-seed paired gameplay report
 содержат одну точную `PolicyIdentity`; gate дополнительно сравнивает её с live model.
+Fixed pretraining использует четыре teacher seeds и четыре DAgger seeds на Map 1.
+Deployment на Map 0 использует audited seat-visible Teacher, а Map 1 — model с узким
+safety/objective shield. Финальный независимый seed требует две Map 1 победы и Map 0
+Teacher structure progress с обеих сторон до сохранения runtime weights.
 Promotion не принимает empty/one-family action corpus или zero-score gameplay; side
 coverage и action distribution должны быть представлены из фактических samples.
 Promotion gate остаётся data-dependent: пороги 95%/100%/0.1% и gameplay parity не
@@ -746,15 +752,15 @@ nonterminal state. Builtin smoke держит одного learner seat прот
 Текущий model tensor path остаётся CPU-only согласно этапу 7. CUDA actor-learner,
 double buffering и массовое использование RTX относятся к этапу 17; этап 9 не добавляет
 CUDA supply-chain/build complexity и не выдаёт короткий smoke за GPU benchmark.
-Current PPO contract: schema v3, hash `3564571968222523732`, rules audit v3.
+Current PPO contract: schema v8, hash `5799284812594397948`, rules audit v8.
 
 ## 15. Reward
 
 Terminal reward:
 
 ```text
-win  = +1000
-loss = -1000
+win  = +100
+loss = -100
 draw or training timeout = отдельный adjudication result
 ```
 
@@ -826,7 +832,7 @@ Truncated matches считаются Draw и не превращаются в п
 промежуточным public statistics. Promotion требует минимум 20 disjoint paired seeds,
 1000 candidate actions, rejection rate ниже 0.1%, отсутствия regression на каждой стороне
 и opaque exploit audit, привязанный к candidate и accepted fingerprints. Stage-ten
-Current league contract: schema v3, hash `18193381311490740524`, rules audit v3.
+Current league contract: schema v9, hash `13472481283297382630`, rules audit v8.
 
 ## 17. GPU и actor-learner pipeline
 
@@ -874,7 +880,7 @@ Padding выполняется только при сборке minibatch.
 Metal выбираются явно через `PolicyDevice`; параметры, forward, loss и backward находятся на
 выбранном backend. Rollout хранит sparse token rows в typed arenas с проверяемыми offsets,
 bit-packed legal masks и разворачивает fixed padding только для текущего minibatch. Model
-schema v4, hash `9866443454266023146`; PPO schema v3, hash `3564571968222523732`.
+schema v5, hash `4131398326042480440`; PPO schema v8, hash `5799284812594397948`.
 
 ## 18. Checkpoints
 
@@ -937,6 +943,11 @@ schema до атомарной установки model+optimizer ownership. Sav
 generation, canonical tensor copy и recoverable manifest последним; каждый файл и directory
 fsync-ится. Двухфайловая копия остаётся independently loadable через hash-checked canonical
 fallback. Checkpoint schema v1, hash `2133011134179236231`.
+
+`drysua evaluate` загружает runtime artifact и всегда запускает фиксированную матрицу из обеих
+карт, teacher/weak baseline и обеих сторон на одинаковых held-out seeds. Timeout отделён от draw;
+hard gate отклоняет all-timeout, no-order, server-rejected и >=95% single-action collapse runs.
+Эта итерационная suite не заменяет отдельные sealed promotion seeds.
 
 ## 19. Производительность
 

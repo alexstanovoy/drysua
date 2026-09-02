@@ -122,6 +122,19 @@ impl ItemReadiness {
         removed
     }
 
+    #[cfg(all(test, feature = "builtin"))]
+    pub(crate) fn note_shared_wait_for_test(
+        &mut self,
+        unit: ControlledUnit,
+        sequence: u32,
+        ready_tick: u32,
+    ) {
+        self.shared_waits[unit.index()].push(ReadinessTimer {
+            sequence,
+            ready_tick,
+        });
+    }
+
     /// Whether an inventory slot is still muted at a snapshot tick.
     pub fn inventory_muted(&self, unit: ControlledUnit, slot: ItemSlot, tick: u32) -> bool {
         self.inventory_mute_left(unit, slot, tick)

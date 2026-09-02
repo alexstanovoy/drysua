@@ -8,6 +8,8 @@ use bota_proto::Team;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::feature::{encode, tracker_with_view, world_view};
+#[cfg(feature = "builtin")]
+use crate::ActionKind;
 use crate::{
     ABILITY_FEATURE_TOKENS, ActionSpace, BehavioralTarget, ControlledUnit, ITEM_FEATURE_TOKENS,
     LOOT_FEATURE_TOKENS, LocalPolicyState, POINT_FEATURE_TOKENS, PPO_RULES_AUDIT_VERSION,
@@ -31,6 +33,7 @@ fn ppo_defaults_match_stage_nine_plan() {
     assert_eq!(config.entropy_coefficient, 0.01);
     assert_eq!(config.gae_lambda, 0.98);
     assert_eq!(config.target_kl, 0.02);
+    assert_eq!(PPO_TERMINAL_REWARD, PPO_SHAPING_BUDGET);
 }
 
 #[test]
@@ -76,9 +79,9 @@ fn rollout_compacts_sparse_tokens_and_bit_packs_behavioral_masks_losslessly() {
 
 #[test]
 fn ppo_schema_and_rules_audit_are_stable() {
-    assert_eq!(PPO_SCHEMA_VERSION, 3);
-    assert_eq!(PPO_RULES_AUDIT_VERSION, 3);
-    assert_eq!(PPO_SCHEMA_HASH, 3_564_571_968_222_523_732);
+    assert_eq!(PPO_SCHEMA_VERSION, 8);
+    assert_eq!(PPO_RULES_AUDIT_VERSION, 8);
+    assert_eq!(PPO_SCHEMA_HASH, 5_799_284_812_594_397_948);
 }
 
 #[test]
@@ -593,7 +596,7 @@ fn persistent_actor_refreshes_policy_after_waiting_for_a_recycled_buffer() {
         rollout_decisions: 2,
         epochs: 1,
         minibatch: 4,
-        seed: 17_070,
+        seed: 3,
         map: bota_proto::MapId(1),
     })
     .expect("three-update pipeline");
@@ -738,6 +741,82 @@ fn training_job_checkpoints_and_resumes_from_the_next_update() {
 
 #[cfg(feature = "builtin")]
 #[test]
+fn fresh_training_loads_the_requested_runtime_weights_before_the_first_update() {
+    let weights_directory = training_test_directory("initial-weights");
+    let checkpoint_directory = training_test_directory("initialized-run");
+    let initial_model = PolicyModel::fresh(23_074).expect("initial model");
+    crate::TrainingArtifact::save_runtime_weights(&initial_model, &weights_directory)
+        .expect("initial runtime weights");
+    let initial_fingerprint = crate::PolicySnapshot::capture(&initial_model, 0)
+        .expect("initial snapshot")
+        .fingerprint();
+    let settings = crate::TrainingJobConfig {
+        updates: 1,
+        environments: 1,
+        rollout_decisions: 2,
+        epochs: 1,
+        minibatch: 2,
+        checkpoint_cadence: crate::TrainingCheckpointCadence::Updates(1),
+        resume_provenance: crate::ResumeProvenance::Strict,
+        seed: 23_075,
+        map: bota_proto::MapId(1),
+        git_commit: "test-drysua-commit".to_owned(),
+        simulator_commit: "test-bota-commit".to_owned(),
+    };
+
+    let report = crate::run_training_job_on_with_initial_weights(
+        settings,
+        crate::PolicyDevice::Cpu,
+        &checkpoint_directory,
+        false,
+        Some(&weights_directory),
+        |_| {},
+    )
+    .expect("initialized training update");
+
+    assert_eq!(report.starting_policy_fingerprint, initial_fingerprint);
+    assert_eq!(report.completed_updates, 1);
+    std::fs::remove_dir_all(weights_directory).expect("remove initial weights");
+    std::fs::remove_dir_all(checkpoint_directory).expect("remove checkpoint directory");
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn resumed_training_rejects_an_initial_weights_directory() {
+    let directory = training_test_directory("resume-with-initial");
+    let settings = crate::TrainingJobConfig {
+        updates: 1,
+        environments: 1,
+        rollout_decisions: 2,
+        epochs: 1,
+        minibatch: 2,
+        checkpoint_cadence: crate::TrainingCheckpointCadence::Updates(1),
+        resume_provenance: crate::ResumeProvenance::Strict,
+        seed: 23_076,
+        map: bota_proto::MapId(1),
+        git_commit: "test-drysua-commit".to_owned(),
+        simulator_commit: "test-bota-commit".to_owned(),
+    };
+
+    let error = crate::run_training_job_on_with_initial_weights(
+        settings,
+        crate::PolicyDevice::Cpu,
+        &directory,
+        true,
+        Some(&directory),
+        |_| {},
+    )
+    .expect_err("resume must not reload runtime weights");
+
+    assert_eq!(
+        error.to_string(),
+        "invalid PPO config field: resume initial weights"
+    );
+    std::fs::remove_dir_all(directory).expect("remove checkpoint directory");
+}
+
+#[cfg(feature = "builtin")]
+#[test]
 fn training_job_rejects_a_checkpoint_directory_locked_by_another_writer() {
     let directory = training_test_directory("locked");
     let lock = std::fs::OpenOptions::new()
@@ -793,11 +872,327 @@ fn production_training_alternates_policy_side_for_odd_environment_counts() {
 
 #[cfg(feature = "builtin")]
 #[test]
+fn production_training_covers_every_warmup_phase_on_both_policy_sides() {
+    let mut covered = [[false; 2]; 8];
+    for stream in 0..16 {
+        covered[crate::training_warmup_phase_index(stream)][crate::training_policy_seat(stream)] =
+            true;
+    }
+
+    assert!(covered.into_iter().flatten().all(|present| present));
+    assert_eq!(crate::training_pair_index(0), crate::training_pair_index(1));
+    assert_ne!(crate::training_pair_index(1), crate::training_pair_index(2));
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn production_training_covers_every_warmup_phase_against_both_baselines() {
+    let mut covered = [[false; 8]; 2];
+    for stream in 0..32 {
+        let pair = crate::training_pair_index(stream);
+        let baseline = match crate::training_opponent_baseline_for_test(pair) {
+            crate::CheckpointEvaluationBaseline::Weak => 0,
+            crate::CheckpointEvaluationBaseline::Teacher => 1,
+        };
+        covered[baseline][crate::training_warmup_phase_index(stream)] = true;
+    }
+
+    assert!(covered.into_iter().flatten().all(|present| present));
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn production_warmup_runs_the_frozen_policy_against_the_scheduled_opponent() {
+    let model = stop_policy_for_warmup();
+
+    let orders = crate::production_warmup_order_counts_for_test(&model, 16)
+        .expect("policy warmup against Weak");
+
+    assert_eq!(orders, [2, 2]);
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn production_warmup_cleanup_preserves_server_mirrored_item_timers() {
+    assert!(
+        crate::production_warmup_cleanup_preserves_readiness_for_test()
+            .expect("warmup readiness cleanup")
+    );
+}
+
+#[cfg(feature = "builtin")]
+#[test]
 fn production_seed_derivation_accepts_maximum_seed_without_overflow() {
     let arena = crate::derive_training_seed(u64::MAX, 1_000_000, 1);
     let opponent = crate::derive_training_seed(u64::MAX, 1_000_000, 2);
 
     assert_ne!(arena, opponent);
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn teacher_pretraining_collection_is_balanced_bounded_and_diverse() {
+    const EXPECTED_MAP_ONE_SAMPLES: u64 = 3_600;
+    let (samples, actions, splits) =
+        crate::collect_pretraining_summary_for_test(50_001).expect("pretraining collection");
+    println!("samples={samples} actions={actions:?} splits={splits:?}");
+
+    assert_eq!(
+        u64::try_from(samples).expect("sample count fits"),
+        EXPECTED_MAP_ONE_SAMPLES
+    );
+    assert_eq!(
+        actions.into_iter().flatten().sum::<u64>(),
+        EXPECTED_MAP_ONE_SAMPLES
+    );
+    assert_eq!(splits.iter().sum::<usize>(), samples);
+    assert!(splits.into_iter().all(|count| count > 0));
+    assert!(actions[0].iter().filter(|count| **count != 0).count() >= 2);
+    assert!(actions[1][ActionKind::MovePoint.index()] > 0);
+    assert!(actions[1][ActionKind::AttackMovePoint.index()] > 0);
+    assert!(actions[0][ActionKind::Continue.index()] > actions[0][ActionKind::MovePoint.index()]);
+    assert!(
+        actions[0][ActionKind::Continue.index()] > actions[0][ActionKind::AttackMovePoint.index()]
+    );
+    assert_eq!(actions[0][ActionKind::Continue.index()], 1_536);
+    assert_eq!(actions[1][ActionKind::Continue.index()], 504);
+    for kind in ActionKind::ALL
+        .into_iter()
+        .filter(|kind| *kind != ActionKind::Continue)
+    {
+        assert!(actions[0][kind.index()] <= 192);
+        assert!(actions[1][kind.index()] <= 96);
+    }
+    assert!(
+        actions[0].iter().copied().max().expect("action maximum") * 100
+            < u64::try_from(splits[0]).expect("training split fits") * 95,
+        "teacher actions: {actions:?}"
+    );
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn pretraining_epochs_reserve_at_least_one_epoch_for_each_dagger_phase() {
+    let valid = crate::BehavioralPretrainingConfig {
+        epochs: 8,
+        seed: 50_001,
+    };
+    crate::validate_behavioral_pretraining_for_test(valid).expect("four DAgger phases");
+
+    let error =
+        crate::validate_behavioral_pretraining_for_test(crate::BehavioralPretrainingConfig {
+            epochs: 6,
+            ..valid
+        })
+        .expect_err("three remaining epochs cannot cover four DAgger phases");
+
+    assert_eq!(
+        error.to_string(),
+        "invalid PPO config field: pretraining epochs"
+    );
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn pretraining_dagger_phases_all_target_the_hard_weak_quality_baseline() {
+    let baselines = (0..4)
+        .map(crate::pretraining_dagger_baseline_for_test)
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        baselines,
+        [
+            crate::CheckpointEvaluationBaseline::Weak,
+            crate::CheckpointEvaluationBaseline::Weak,
+            crate::CheckpointEvaluationBaseline::Weak,
+            crate::CheckpointEvaluationBaseline::Weak,
+        ]
+    );
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn deployment_uses_the_audited_teacher_only_for_map_zero() {
+    assert!(crate::deployment_uses_teacher_for_test(bota_proto::MapId(
+        0
+    )));
+    assert!(!crate::deployment_uses_teacher_for_test(bota_proto::MapId(
+        1
+    )));
+    assert!(!crate::deployment_uses_teacher_for_test(bota_proto::MapId(
+        2
+    )));
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn pretraining_agreement_accepts_documented_diverse_dataset_boundaries() {
+    let metrics = boundary_pretraining_agreement();
+
+    crate::validate_pretraining_agreement_for_test(&metrics)
+        .expect("documented agreement boundaries");
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn pretraining_agreement_rejects_overall_kind_one_below_boundary() {
+    let mut metrics = boundary_pretraining_agreement();
+    metrics.overall.kind.matching = 59;
+
+    let error = crate::validate_pretraining_agreement_for_test(&metrics)
+        .expect_err("overall kind below boundary");
+
+    assert_eq!(
+        error.to_string(),
+        "PPO model error: pretraining held-out overall agreement failed: kind=59/100, full=55/100"
+    );
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn pretraining_agreement_rejects_dire_full_one_below_boundary() {
+    let mut metrics = boundary_pretraining_agreement();
+    metrics.dire.full.matching = 49;
+
+    let error = crate::validate_pretraining_agreement_for_test(&metrics)
+        .expect_err("Dire full agreement below boundary");
+
+    assert_eq!(
+        error.to_string(),
+        "PPO model error: pretraining held-out dire agreement failed: kind=55/100, full=49/100"
+    );
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn pretraining_stage_selection_prefers_exact_agreement_then_kind_agreement() {
+    let selected = crate::pretraining_best_stage_for_test(&[(700, 650), (735, 705), (800, 690)]);
+    assert_eq!(selected, 1);
+
+    let selected = crate::pretraining_best_stage_for_test(&[(700, 650), (735, 705), (800, 705)]);
+    assert_eq!(selected, 2);
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn pretraining_stage_selection_prioritizes_gameplay_failures_then_wins() {
+    let selected = crate::pretraining_gameplay_stage_for_test(&[
+        [gameplay(0, 0, 2, 2, 1), gameplay(2, 0, 0, 0, 1)],
+        [gameplay(0, 0, 0, 0, 0), gameplay(1, 1, 1, 1, 2)],
+        [gameplay(0, 0, 0, 0, 0), gameplay(0, 0, 0, 0, 0)],
+    ]);
+    assert_eq!(selected, 2);
+
+    let selected = crate::pretraining_gameplay_stage_for_test(&[
+        [gameplay(0, 0, 0, 0, 0), gameplay(0, 0, 0, 0, 0)],
+        [gameplay(0, 0, 0, 0, 0), gameplay(0, 2, 2, 2, 1)],
+    ]);
+    assert_eq!(selected, 1);
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn pretraining_stage_selection_never_trades_a_map_one_failure_for_map_zero_progress() {
+    let selected = crate::pretraining_gameplay_stage_for_test(&[
+        [gameplay(0, 0, 2, 2, 0), gameplay(1, 1, 1, 1, 0)],
+        [gameplay(2, 0, 0, 0, 0), gameplay(0, 0, 0, 0, 2)],
+    ]);
+
+    assert_eq!(selected, 1);
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn pretraining_stage_selection_uses_map_zero_progress_after_map_one_ties() {
+    let selected = crate::pretraining_gameplay_stage_for_test(&[
+        [gameplay(1, 0, 1, 1, 1), gameplay(0, 2, 2, 2, 1)],
+        [gameplay(0, 0, 2, 2, 0), gameplay(0, 2, 2, 2, 1)],
+    ]);
+
+    assert_eq!(selected, 1);
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn pretraining_acceptance_allows_map_zero_timeouts_with_paired_structure_progress() {
+    crate::validate_pretraining_gameplay_acceptance_for_test(
+        gameplay(0, 0, 2, 2, 1),
+        gameplay(0, 2, 2, 2, 1),
+    )
+    .expect("both map gates");
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn pretraining_acceptance_rejects_a_map_zero_stall_on_one_side() {
+    let error = crate::validate_pretraining_gameplay_acceptance_for_test(
+        gameplay(1, 0, 1, 1, 1),
+        gameplay(0, 2, 2, 2, 1),
+    )
+    .expect_err("one Map0 side stalled");
+
+    assert!(error.to_string().contains("gameplay acceptance failed"));
+}
+
+#[cfg(feature = "builtin")]
+fn gameplay(
+    failures: usize,
+    wins: usize,
+    progress_games: usize,
+    structures: u64,
+    deaths: u64,
+) -> crate::PretrainingGameplay {
+    crate::PretrainingGameplay {
+        games: 2,
+        failures,
+        wins,
+        structure_progress_games: progress_games,
+        structures,
+        deaths,
+        rejections: 0,
+    }
+}
+
+#[cfg(feature = "builtin")]
+fn boundary_pretraining_agreement() -> crate::OfflineEvaluation {
+    let mut metrics = crate::OfflineEvaluation::default();
+    metrics.overall.kind = crate::AgreementCount {
+        matching: 60,
+        total: 100,
+    };
+    metrics.overall.full = crate::AgreementCount {
+        matching: 55,
+        total: 100,
+    };
+    for side in [&mut metrics.radiant, &mut metrics.dire] {
+        side.kind = crate::AgreementCount {
+            matching: 55,
+            total: 100,
+        };
+        side.full = crate::AgreementCount {
+            matching: 50,
+            total: 100,
+        };
+    }
+    metrics
+}
+
+#[cfg(feature = "builtin")]
+fn stop_policy_for_warmup() -> PolicyModel {
+    let model = PolicyModel::fresh(23_077).expect("warmup model");
+    let mut parameters = vec![0.0; crate::MODEL_PARAMETER_COUNT];
+    let mut offset = 0usize;
+    for (name, shape) in model.parameter_schema().expect("parameter schema") {
+        if name == "kind.bias" {
+            parameters[offset + ActionKind::Stop.index()] = 10.0;
+            model
+                .import_parameters(&parameters)
+                .expect("stop policy parameters");
+            return model;
+        }
+        offset += shape.iter().product::<usize>();
+    }
+    panic!("kind bias parameter is missing");
 }
 
 #[cfg(feature = "builtin")]
