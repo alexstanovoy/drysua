@@ -121,9 +121,9 @@ fn rollout_compacts_sparse_tokens_and_bit_packs_behavioral_masks_losslessly() {
 
 #[test]
 fn ppo_schema_and_rules_audit_are_stable() {
-    assert_eq!(PPO_SCHEMA_VERSION, 9);
-    assert_eq!(PPO_RULES_AUDIT_VERSION, 9);
-    assert_eq!(PPO_SCHEMA_HASH, 3_472_679_473_598_337_579);
+    assert_eq!(PPO_SCHEMA_VERSION, 10);
+    assert_eq!(PPO_RULES_AUDIT_VERSION, 10);
+    assert_eq!(PPO_SCHEMA_HASH, 1_423_514_112_555_257_812);
 }
 
 #[test]
@@ -1176,6 +1176,15 @@ fn pretraining_stage_selection_prioritizes_gameplay_failures_then_wins() {
         [gameplay(0, 0, 0, 0, 0), gameplay(0, 2, 2, 2, 1)],
     ]);
     assert_eq!(selected, 1);
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn pretraining_stage_selection_uses_three_fixed_gameplay_validation_seeds() {
+    assert_eq!(
+        crate::pretraining_gameplay_validation_seeds_for_test(),
+        [9_100_001, 9_100_002, 9_100_003]
+    );
 }
 
 #[cfg(feature = "builtin")]

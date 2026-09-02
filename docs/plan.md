@@ -666,7 +666,8 @@ monotonic parameter revision. Raw parameter import увеличивает revisi
 optimizer ownership. HeldOut, rollout и каждый structural per-seed paired gameplay report
 содержат одну точную `PolicyIdentity`; gate дополнительно сравнивает её с live model.
 Fixed pretraining использует четыре teacher seeds и четыре DAgger seeds на Map 1,
-два отдельных Validation seeds для stage selection и два ни разу не просмотренных
+два отдельных offline Validation seeds и три gameplay validation seeds для stage
+selection, а также два ни разу не просмотренных
 HeldOut seeds для финального agreement gate.
 Deployment на Map 0 использует audited seat-visible Teacher, а Map 1 — model с узким
 safety/objective shield. Финальный независимый seed требует две Map 1 победы и Map 0
@@ -757,7 +758,7 @@ CUDA supply-chain/build complexity и не выдаёт короткий smoke �
 Arena принимает policy decision после Snapshot, но до Events того же tick, как network
 deployment, и не принимает решений до первого tick после pregame. Production arenas
 образуют полные frozen-policy side pairs.
-Current PPO contract: schema v9, hash `3472679473598337579`, rules audit v9.
+Current PPO contract: schema v10, hash `1423514112555257812`, rules audit v10.
 
 ## 15. Reward
 
@@ -837,7 +838,7 @@ Truncated matches считаются Draw и не превращаются в п
 промежуточным public statistics. Promotion требует минимум 20 disjoint paired seeds,
 1000 candidate actions, rejection rate ниже 0.1%, отсутствия regression на каждой стороне
 и opaque exploit audit, привязанный к candidate и accepted fingerprints. Stage-ten
-Current league contract: schema v10, hash `5375326685330706958`, rules audit v9.
+Current league contract: schema v11, hash `17113056026028864297`, rules audit v10.
 
 ## 17. GPU и actor-learner pipeline
 
@@ -885,7 +886,7 @@ Padding выполняется только при сборке minibatch.
 Metal выбираются явно через `PolicyDevice`; параметры, forward, loss и backward находятся на
 выбранном backend. Rollout хранит sparse token rows в typed arenas с проверяемыми offsets,
 bit-packed legal masks и разворачивает fixed padding только для текущего minibatch. Model
-schema v6, hash `50716688465199424`; PPO schema v9, hash `3472679473598337579`.
+schema v6, hash `50716688465199424`; PPO schema v10, hash `1423514112555257812`.
 
 ## 18. Checkpoints
 

@@ -522,7 +522,7 @@ const PRETRAINING_HELD_OUT_CONTINUE_WINDOW_CAP: u64 = 21;
 const PRETRAINING_HELD_OUT_OTHER_WINDOW_CAP: u64 = 4;
 const PRETRAINING_DAGGER_WINDOW_SIDE_KIND_CAP: u64 = 3;
 const PRETRAINING_GAMEPLAY_DECISIONS: usize = 4_096;
-const PRETRAINING_GAMEPLAY_VALIDATION_SEED: u64 = 9_100_001;
+const PRETRAINING_GAMEPLAY_VALIDATION_SEEDS: [u64; 3] = [9_100_001, 9_100_002, 9_100_003];
 const PRETRAINING_GAMEPLAY_ACCEPTANCE_SEED: u64 = 9_000_001;
 const PRETRAINING_OVERALL_KIND_PERCENT: usize = 60;
 const PRETRAINING_OVERALL_FULL_PERCENT: usize = 55;
@@ -634,7 +634,7 @@ pub fn run_behavioral_pretraining_on(
     let mut agreement_trace = Vec::with_capacity(PRETRAINING_DAGGER_SEEDS + 1);
     let mut gameplay_trace = Vec::with_capacity(PRETRAINING_DAGGER_SEEDS + 1);
     let agreement = pretraining_agreement(validation.metrics());
-    let gameplay = evaluate_pretraining_gameplay(&model, PRETRAINING_GAMEPLAY_VALIDATION_SEED)?;
+    let gameplay = evaluate_pretraining_gameplay_validation(&model)?;
     agreement_trace.push(agreement);
     gameplay_trace.push(gameplay);
     let mut best = capture_pretraining_candidate(
@@ -663,7 +663,7 @@ pub fn run_behavioral_pretraining_on(
         stage_loss = train_behavioral_epochs(&model, &collection.pool, &mut trainer, phase_epochs)?;
         validation = evaluate_pretraining_validation(&model, &collection)?;
         let agreement = pretraining_agreement(validation.metrics());
-        let gameplay = evaluate_pretraining_gameplay(&model, PRETRAINING_GAMEPLAY_VALIDATION_SEED)?;
+        let gameplay = evaluate_pretraining_gameplay_validation(&model)?;
         agreement_trace.push(agreement);
         gameplay_trace.push(gameplay);
         if pretraining_candidate_better(gameplay, agreement, &best) {
@@ -883,6 +883,62 @@ fn evaluate_pretraining_gameplay(
         map_zero: evaluate_pretraining_map_gameplay(model, MapId(0), seed)?,
         map_one: evaluate_pretraining_map_gameplay(model, MapId(1), seed)?,
     })
+}
+
+fn evaluate_pretraining_gameplay_validation(
+    model: &PolicyModel,
+) -> Result<PretrainingGameplayMatrix, PpoError> {
+    let mut output = PretrainingGameplayMatrix::default();
+    for seed in PRETRAINING_GAMEPLAY_VALIDATION_SEEDS {
+        output.merge(evaluate_pretraining_gameplay(model, seed)?)?;
+    }
+    Ok(output)
+}
+
+impl PretrainingGameplayMatrix {
+    fn merge(&mut self, other: Self) -> Result<(), PpoError> {
+        self.map_zero.merge(other.map_zero)?;
+        self.map_one.merge(other.map_one)
+    }
+}
+
+impl PretrainingGameplay {
+    fn merge(&mut self, other: Self) -> Result<(), PpoError> {
+        self.games = self
+            .games
+            .checked_add(other.games)
+            .ok_or(PpoError::CounterOverflow)?;
+        self.failures = self
+            .failures
+            .checked_add(other.failures)
+            .ok_or(PpoError::CounterOverflow)?;
+        self.wins = self
+            .wins
+            .checked_add(other.wins)
+            .ok_or(PpoError::CounterOverflow)?;
+        self.structure_progress_games = self
+            .structure_progress_games
+            .checked_add(other.structure_progress_games)
+            .ok_or(PpoError::CounterOverflow)?;
+        self.structures = self
+            .structures
+            .checked_add(other.structures)
+            .ok_or(PpoError::CounterOverflow)?;
+        self.deaths = self
+            .deaths
+            .checked_add(other.deaths)
+            .ok_or(PpoError::CounterOverflow)?;
+        self.rejections = self
+            .rejections
+            .checked_add(other.rejections)
+            .ok_or(PpoError::CounterOverflow)?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+pub(crate) const fn pretraining_gameplay_validation_seeds_for_test() -> [u64; 3] {
+    PRETRAINING_GAMEPLAY_VALIDATION_SEEDS
 }
 
 fn evaluate_pretraining_map_gameplay(
