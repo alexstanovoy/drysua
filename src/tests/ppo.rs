@@ -121,9 +121,9 @@ fn rollout_compacts_sparse_tokens_and_bit_packs_behavioral_masks_losslessly() {
 
 #[test]
 fn ppo_schema_and_rules_audit_are_stable() {
-    assert_eq!(PPO_SCHEMA_VERSION, 10);
-    assert_eq!(PPO_RULES_AUDIT_VERSION, 10);
-    assert_eq!(PPO_SCHEMA_HASH, 1_423_514_112_555_257_812);
+    assert_eq!(PPO_SCHEMA_VERSION, 11);
+    assert_eq!(PPO_RULES_AUDIT_VERSION, 11);
+    assert_eq!(PPO_SCHEMA_HASH, 14_036_018_647_835_121_198);
 }
 
 #[test]
@@ -1101,15 +1101,6 @@ fn deployment_uses_the_audited_teacher_only_for_map_zero() {
     assert!(!crate::deployment_uses_teacher_for_test(bota_proto::MapId(
         2
     )));
-}
-
-#[cfg(feature = "builtin")]
-#[test]
-fn arena_defers_current_snapshot_events_until_after_the_policy_decision() {
-    assert!(
-        crate::arena_current_tick_events_are_deferred_for_test()
-            .expect("arena event decision boundary")
-    );
 }
 
 #[cfg(feature = "builtin")]

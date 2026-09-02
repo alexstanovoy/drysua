@@ -13,6 +13,19 @@ fn arena_starts_with_match_start_then_snapshot_tick_one() {
             messages[1],
             ServerMsg::Snapshot { ref view } if view.tick == 1
         ));
+        assert!(matches!(messages[2], ServerMsg::Events { tick: 1, .. }));
+    }
+}
+
+#[test]
+fn arena_emits_an_event_batch_as_the_end_of_every_visible_tick() {
+    let (mut arena, _) = new_arena(17);
+
+    let step = arena.step(&[None, None]).expect("arena step");
+
+    for messages in step.messages {
+        assert!(matches!(messages[0], ServerMsg::Snapshot { .. }));
+        assert!(matches!(messages[1], ServerMsg::Events { tick: 2, .. }));
     }
 }
 

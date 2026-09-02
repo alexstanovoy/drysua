@@ -15,8 +15,8 @@ use crate::{
 
 #[test]
 fn stage_ten_schema_is_stable_and_names_its_safety_contracts() {
-    assert_eq!(LEAGUE_SCHEMA_VERSION, 11);
-    assert_eq!(LEAGUE_SCHEMA_HASH, 17_113_056_026_028_864_297);
+    assert_eq!(LEAGUE_SCHEMA_VERSION, 12);
+    assert_eq!(LEAGUE_SCHEMA_HASH, 16_404_031_783_910_159_806);
     assert!(LEAGUE_SCHEMA_DESCRIPTOR.contains("held_out_seed_disjoint"));
     assert!(LEAGUE_SCHEMA_DESCRIPTOR.contains("training_reward_excluded"));
     assert!(LEAGUE_SCHEMA_DESCRIPTOR.contains("timeout_rejected"));

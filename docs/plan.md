@@ -755,10 +755,11 @@ nonterminal state. Builtin smoke держит одного learner seat прот
 Текущий model tensor path остаётся CPU-only согласно этапу 7. CUDA actor-learner,
 double buffering и массовое использование RTX относятся к этапу 17; этап 9 не добавляет
 CUDA supply-chain/build complexity и не выдаёт короткий smoke за GPU benchmark.
-Arena принимает policy decision после Snapshot, но до Events того же tick, как network
-deployment, и не принимает решений до первого tick после pregame. Production arenas
+Server и builtin Arena завершают каждый Snapshot явным Events batch, включая пустой.
+Policy принимает решение только после этой tick-complete границы и не принимает решений
+до первого tick после pregame. Production arenas
 образуют полные frozen-policy side pairs.
-Current PPO contract: schema v10, hash `1423514112555257812`, rules audit v10.
+Current PPO contract: schema v11, hash `14036018647835121198`, rules audit v11.
 
 ## 15. Reward
 
@@ -838,7 +839,7 @@ Truncated matches считаются Draw и не превращаются в п
 промежуточным public statistics. Promotion требует минимум 20 disjoint paired seeds,
 1000 candidate actions, rejection rate ниже 0.1%, отсутствия regression на каждой стороне
 и opaque exploit audit, привязанный к candidate и accepted fingerprints. Stage-ten
-Current league contract: schema v11, hash `17113056026028864297`, rules audit v10.
+Current league contract: schema v12, hash `16404031783910159806`, rules audit v11.
 
 ## 17. GPU и actor-learner pipeline
 
@@ -886,7 +887,7 @@ Padding выполняется только при сборке minibatch.
 Metal выбираются явно через `PolicyDevice`; параметры, forward, loss и backward находятся на
 выбранном backend. Rollout хранит sparse token rows в typed arenas с проверяемыми offsets,
 bit-packed legal masks и разворачивает fixed padding только для текущего minibatch. Model
-schema v6, hash `50716688465199424`; PPO schema v10, hash `1423514112555257812`.
+schema v6, hash `50716688465199424`; PPO schema v11, hash `14036018647835121198`.
 
 ## 18. Checkpoints
 

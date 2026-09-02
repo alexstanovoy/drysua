@@ -40,6 +40,7 @@ struct LivePolicy {
     readiness: ItemReadiness,
     teacher: Teacher,
     last_decision_tick: Option<u32>,
+    pending_snapshot_tick: Option<u32>,
     pending_active: Option<(u32, Option<ActivePolicyOrder>)>,
 }
 
@@ -105,7 +106,7 @@ fn handle_policy_message(
     match message {
         ServerMsg::MatchStart { info } => start_policy_match(seated, outcome, policy, &info)?,
         ServerMsg::Snapshot { view } => {
-            return handle_policy_snapshot(wire, seated, limit, model, outcome, policy, view);
+            return handle_policy_snapshot(wire, seated, limit, outcome, policy, view);
         }
         ServerMsg::OrderRejected { seq, reason } => {
             record_rejection(outcome, reason)?;
@@ -119,17 +120,19 @@ fn handle_policy_message(
                     "server sent MatchOver before MatchStart",
                 ));
             }
+            if policy
+                .as_ref()
+                .is_some_and(|policy| policy.pending_snapshot_tick.is_some())
+            {
+                return Err(std::io::Error::other(
+                    "server ended the match before completing the snapshot tick",
+                ));
+            }
             outcome.winner = Some(winner);
             return Ok(true);
         }
         ServerMsg::Events { tick, events } => {
-            let policy = policy
-                .as_mut()
-                .ok_or_else(|| std::io::Error::other("server sent Events before MatchStart"))?;
-            policy
-                .tracker
-                .observe_events(tick, &events)
-                .map_err(std::io::Error::other)?;
+            handle_policy_events(wire, seated, model, outcome, policy, tick, &events)?;
         }
         ServerMsg::Welcome { .. }
         | ServerMsg::LobbyState { .. }
@@ -158,7 +161,6 @@ fn handle_policy_snapshot(
     wire: &mut impl Wire,
     seated: Seated,
     limit: Option<u32>,
-    model: &PolicyModel,
     outcome: &mut Outcome,
     policy: &mut Option<LivePolicy>,
     view: bota_proto::WorldView,
@@ -170,13 +172,33 @@ fn handle_policy_snapshot(
     outcome.ticks = view.tick;
     policy.observe_snapshot(&view)?;
     let finished = limit.is_some_and(|last_tick| view.tick >= last_tick);
-    if !finished && policy.should_decide(view.tick)? {
-        policy.decide(wire, model, outcome)?;
-    }
-    if seated.mode == TickMode::Lockstep {
+    if finished && seated.mode == TickMode::Lockstep {
         wire.acknowledge(view.tick)?;
     }
+    if !finished {
+        policy.begin_snapshot_tick(view.tick)?;
+    }
     Ok(finished)
+}
+
+fn handle_policy_events(
+    wire: &mut impl Wire,
+    seated: Seated,
+    model: &PolicyModel,
+    outcome: &mut Outcome,
+    policy: &mut Option<LivePolicy>,
+    tick: u32,
+    events: &[bota_proto::EventKind],
+) -> std::io::Result<()> {
+    let policy = policy
+        .as_mut()
+        .ok_or_else(|| std::io::Error::other("server sent Events before MatchStart"))?;
+    policy.observe_events(tick, events)?;
+    policy.complete_snapshot_tick(wire, model, outcome, tick)?;
+    if seated.mode == TickMode::Lockstep {
+        wire.acknowledge(tick)?;
+    }
+    Ok(())
 }
 
 fn record_rejection(outcome: &mut Outcome, reason: RejectReason) -> std::io::Result<()> {
@@ -289,6 +311,7 @@ impl LivePolicy {
             readiness: ItemReadiness::new(),
             teacher: Teacher::new(),
             last_decision_tick: None,
+            pending_snapshot_tick: None,
             pending_active: None,
         })
     }
@@ -306,6 +329,43 @@ impl LivePolicy {
         Ok(elapsed >= 3)
     }
 
+    fn begin_snapshot_tick(&mut self, tick: u32) -> std::io::Result<()> {
+        if self.pending_snapshot_tick.is_some() {
+            return Err(std::io::Error::other(
+                "server sent Snapshot before completing the previous tick",
+            ));
+        }
+        let current_tick = self
+            .tracker
+            .current()
+            .ok_or_else(|| std::io::Error::other("policy snapshot is missing"))?
+            .tick;
+        if tick != current_tick {
+            return Err(std::io::Error::other("policy snapshot tick mismatch"));
+        }
+        self.pending_snapshot_tick = Some(tick);
+        Ok(())
+    }
+
+    fn complete_snapshot_tick(
+        &mut self,
+        wire: &mut impl Wire,
+        model: &PolicyModel,
+        outcome: &mut Outcome,
+        tick: u32,
+    ) -> std::io::Result<()> {
+        if self.pending_snapshot_tick != Some(tick) {
+            return Err(std::io::Error::other(
+                "server Events did not complete the pending snapshot tick",
+            ));
+        }
+        self.pending_snapshot_tick = None;
+        if self.should_decide(tick)? {
+            self.decide(wire, model, outcome)?;
+        }
+        Ok(())
+    }
+
     fn observe_snapshot(&mut self, view: &bota_proto::WorldView) -> std::io::Result<()> {
         let previous = self.tracker.own_hero().map(|hero| hero.id);
         self.tracker
@@ -321,6 +381,17 @@ impl LivePolicy {
             assert!(self.persistence.active_body_sequence_for(None).is_none());
             assert!(self.local.active_order().is_none());
         }
+        Ok(())
+    }
+
+    fn observe_events(
+        &mut self,
+        tick: u32,
+        events: &[bota_proto::EventKind],
+    ) -> std::io::Result<()> {
+        self.tracker
+            .observe_events(tick, events)
+            .map_err(std::io::Error::other)?;
         self.encoder
             .observe(&self.tracker)
             .map_err(std::io::Error::other)

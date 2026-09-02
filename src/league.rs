@@ -31,16 +31,16 @@ pub const LEAGUE_MIN_EXPLOIT_PAIRS: usize = 2;
 /// Minimum candidate actions required in the exploit-regression namespace.
 pub const LEAGUE_MIN_EXPLOIT_ACTIONS: u64 = 100;
 /// Stage-ten league contract version.
-pub const LEAGUE_SCHEMA_VERSION: u32 = 11;
+pub const LEAGUE_SCHEMA_VERSION: u32 = 12;
 /// Audited simulator rules required by stage-ten league artifacts.
-pub const LEAGUE_RULES_AUDIT_VERSION: u32 = 10;
+pub const LEAGUE_RULES_AUDIT_VERSION: u32 = 11;
 /// Canonical stage-ten frozen-policy, scheduling, retention, and promotion contract.
 pub const LEAGUE_SCHEMA_DESCRIPTOR: &str = concat!(
-    "bota-drysua-league/v11;",
+    "bota-drysua-league/v12;",
     "action_schema_version=1;action_schema_hash=17797499074169920257;",
     "feature_schema_version=6;feature_schema_hash=7342404552083153243;",
     "model_schema_version=6;model_schema_hash=50716688465199424;",
-    "ppo_schema_version=10;ppo_schema_hash=1423514112555257812;rules_audit=10;",
+    "ppo_schema_version=11;ppo_schema_hash=14036018647835121198;rules_audit=11;",
     "opponents=current30,accepted25,historical25,teacher15,weak5,frozen_per_rollout;",
     "league=capacity32,minimum9,protect_anchor_accepted_strongest_recent4,evict_nearest_cross_play_profile;",
     "snapshot=immutable_finite_f32_parameters,stable_parameter_fingerprint,generation;",
@@ -72,8 +72,8 @@ const _: () = assert!(FEATURE_SCHEMA_VERSION == 6);
 const _: () = assert!(FEATURE_SCHEMA_HASH == 7_342_404_552_083_153_243);
 const _: () = assert!(MODEL_SCHEMA_VERSION == 6);
 const _: () = assert!(MODEL_SCHEMA_HASH == 50_716_688_465_199_424);
-const _: () = assert!(PPO_SCHEMA_VERSION == 10);
-const _: () = assert!(PPO_SCHEMA_HASH == 1_423_514_112_555_257_812);
+const _: () = assert!(PPO_SCHEMA_VERSION == 11);
+const _: () = assert!(PPO_SCHEMA_HASH == 14_036_018_647_835_121_198);
 
 static NEXT_SNAPSHOT_ID: AtomicU64 = AtomicU64::new(1);
 

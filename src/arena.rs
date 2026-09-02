@@ -174,12 +174,10 @@ impl Arena {
                 view: self.world.view(pick.team),
             });
             let visible = visible_events(events, pick.team);
-            if !visible.is_empty() {
-                stream.push(ServerMsg::Events {
-                    tick: self.world.tick,
-                    events: visible,
-                });
-            }
+            stream.push(ServerMsg::Events {
+                tick: self.world.tick,
+                events: visible,
+            });
         }
         if let Some(winner) = self.world.victor() {
             let over = ServerMsg::MatchOver {

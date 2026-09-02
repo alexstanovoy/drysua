@@ -355,7 +355,6 @@ struct ArenaSeatPolicy {
     sequence: u32,
     rejections: u64,
     pending_active: Option<(u32, Option<ActivePolicyOrder>)>,
-    pending_events: Option<(u32, Vec<EventKind>)>,
     last_issued: Option<(u32, crate::IssuedOrder, ActionKind)>,
     last_rejection: Option<(u32, RejectReason)>,
 }
@@ -3584,6 +3583,21 @@ fn setup_seat(index: usize, messages: &[ServerMsg]) -> Result<ArenaSeatPolicy, P
     tracker
         .observe_snapshot(snapshot.ok_or(PpoError::InvalidTransition("initial snapshot"))?)
         .map_err(|error| PpoError::Model(error.to_string()))?;
+    let mut event_batches = messages.iter().filter_map(|message| match message {
+        ServerMsg::Events { tick, events } => Some((*tick, events)),
+        _ => None,
+    });
+    let (event_tick, events) = event_batches
+        .next()
+        .ok_or(PpoError::InvalidTransition("initial events"))?;
+    if event_batches.next().is_some() {
+        return Err(PpoError::InvalidTransition(
+            "multiple initial event batches",
+        ));
+    }
+    tracker
+        .observe_events(event_tick, events)
+        .map_err(|error| PpoError::Model(error.to_string()))?;
     let mut encoder = FeatureEncoder::new(&tracker);
     encoder.observe(&tracker).map_err(feature_error)?;
     Ok(ArenaSeatPolicy {
@@ -3596,7 +3610,6 @@ fn setup_seat(index: usize, messages: &[ServerMsg]) -> Result<ArenaSeatPolicy, P
         sequence: 0,
         rejections: 0,
         pending_active: None,
-        pending_events: initial_pending_events(messages)?,
         last_issued: None,
         last_rejection: None,
     })
@@ -4053,7 +4066,6 @@ fn advance_interval(
     requests: Vec<Option<Request>>,
     ticks: u32,
 ) -> Result<ArenaAdvance, PpoError> {
-    flush_pending_events(&mut environment.seats)?;
     let mut winner = None;
     let mut elapsed = 0u32;
     for tick in 0..ticks {
@@ -4063,9 +4075,8 @@ fn advance_interval(
             .step(if tick == 0 { &requests } else { &empty })
             .map_err(|error| PpoError::Model(error.to_string()))?;
         elapsed = elapsed.checked_add(1).ok_or(PpoError::CounterOverflow)?;
-        let final_tick = tick + 1 == ticks;
         for (seat, messages) in environment.seats.iter_mut().zip(step.messages) {
-            winner = observe_messages(seat, &messages, final_tick)?.or(winner);
+            winner = observe_messages(seat, &messages)?.or(winner);
         }
         if winner.is_some() {
             break;
@@ -4113,7 +4124,6 @@ fn restart_environment(environment: &mut TrainingEnvironment) -> Result<(), PpoE
 fn observe_messages(
     seat: &mut ArenaSeatPolicy,
     messages: &[ServerMsg],
-    defer_events: bool,
 ) -> Result<Option<Team>, PpoError> {
     let mut winner = None;
     for message in messages {
@@ -4144,9 +4154,6 @@ fn observe_messages(
                 seat.last_rejection = Some((*seq, *reason));
             }
             ServerMsg::Snapshot { view } => observe_arena_snapshot(seat, view)?,
-            ServerMsg::Events { tick, events } if defer_events => {
-                defer_arena_events(seat, *tick, events.clone())?;
-            }
             ServerMsg::Events { tick, events } => observe_arena_events(seat, *tick, events)?,
             ServerMsg::MatchOver { winner: result, .. } => winner = Some(*result),
             ServerMsg::MatchStart { .. }
@@ -4160,43 +4167,6 @@ fn observe_messages(
     Ok(winner)
 }
 
-fn initial_pending_events(
-    messages: &[ServerMsg],
-) -> Result<Option<(u32, Vec<EventKind>)>, PpoError> {
-    let mut batches = messages.iter().filter_map(|message| match message {
-        ServerMsg::Events { tick, events } => Some((*tick, events.clone())),
-        _ => None,
-    });
-    let pending = batches.next();
-    if batches.next().is_some() {
-        return Err(PpoError::InvalidTransition(
-            "multiple initial event batches",
-        ));
-    }
-    Ok(pending)
-}
-
-fn defer_arena_events(
-    seat: &mut ArenaSeatPolicy,
-    tick: u32,
-    events: Vec<EventKind>,
-) -> Result<(), PpoError> {
-    if events.is_empty() || seat.pending_events.is_some() {
-        return Err(PpoError::InvalidTransition("arena pending events"));
-    }
-    seat.pending_events = Some((tick, events));
-    Ok(())
-}
-
-fn flush_pending_events(seats: &mut [ArenaSeatPolicy]) -> Result<(), PpoError> {
-    for seat in seats {
-        if let Some((tick, events)) = seat.pending_events.take() {
-            observe_arena_events(seat, tick, &events)?;
-        }
-    }
-    Ok(())
-}
-
 fn observe_arena_events(
     seat: &mut ArenaSeatPolicy,
     tick: u32,
@@ -4205,35 +4175,6 @@ fn observe_arena_events(
     seat.tracker
         .observe_events(tick, events)
         .map_err(|error| PpoError::Model(error.to_string()))
-}
-
-#[cfg(test)]
-pub(crate) fn arena_current_tick_events_are_deferred_for_test() -> Result<bool, PpoError> {
-    let (_, start) = Arena::new(ArenaConfig {
-        seats: 2,
-        map: MapId(1),
-        seed: 91_001,
-    })
-    .map_err(|error| PpoError::Model(error.to_string()))?;
-    let mut seat = setup_seat(0, &start.messages[0])?;
-    flush_pending_events(std::slice::from_mut(&mut seat))?;
-    let before = seat.tracker.recent_events().len();
-    let tick = seat
-        .tracker
-        .current()
-        .ok_or(PpoError::InvalidTransition("arena test snapshot"))?
-        .tick;
-    defer_arena_events(
-        &mut seat,
-        tick,
-        vec![EventKind::ItemBought {
-            slot: SlotId(0),
-            item: bota_proto::ItemId(1),
-        }],
-    )?;
-    let deferred = seat.tracker.recent_events().len() == before && seat.pending_events.is_some();
-    flush_pending_events(std::slice::from_mut(&mut seat))?;
-    Ok(deferred && seat.tracker.recent_events().len() == before + 1)
 }
 
 fn observe_arena_snapshot(

@@ -179,6 +179,43 @@ fn deployment_waits_until_the_first_tick_after_pregame() {
 
 #[cfg(feature = "builtin")]
 #[test]
+fn deployment_rejects_a_new_snapshot_before_the_tick_complete_events() {
+    let (mut arena, start) = crate::Arena::new(crate::ArenaConfig {
+        seats: 2,
+        map: MapId(1),
+        seed: 70_002,
+    })
+    .expect("arena");
+    let next = arena.step(&[None, None]).expect("next arena tick");
+    let mut messages = start.messages[0]
+        .iter()
+        .filter(|message| !matches!(message, ServerMsg::Events { .. }))
+        .cloned()
+        .collect::<Vec<_>>();
+    messages.extend(
+        next.messages[0]
+            .iter()
+            .filter(|message| matches!(message, ServerMsg::Snapshot { .. }))
+            .cloned(),
+    );
+    set_pregame_ticks(&mut messages, 0);
+    let mut wire = MockWire {
+        messages: messages.into(),
+        acknowledgements: Vec::new(),
+        orders: Vec::new(),
+    };
+
+    let error = crate::play_policy_on(&mut wire, seated(TickMode::Lockstep), None, &stop_policy())
+        .expect_err("tick completion is mandatory");
+
+    assert_eq!(
+        error.to_string(),
+        "server sent Snapshot before completing the previous tick"
+    );
+}
+
+#[cfg(feature = "builtin")]
+#[test]
 fn deployment_seat_resends_a_body_order_after_hero_identity_changes() {
     let (_arena, start) = crate::Arena::new(crate::ArenaConfig {
         seats: 2,
@@ -200,7 +237,12 @@ fn deployment_seat_resends_a_body_order_after_hero_identity_changes() {
     replace_owned_hero_generation(&mut respawned);
     let mut finished = respawned.clone();
     finished.tick = respawned.tick.checked_add(1).expect("finish tick");
+    let respawned_tick = respawned.tick;
     messages.push(ServerMsg::Snapshot { view: respawned });
+    messages.push(ServerMsg::Events {
+        tick: respawned_tick,
+        events: Vec::new(),
+    });
     messages.push(ServerMsg::Snapshot {
         view: finished.clone(),
     });
