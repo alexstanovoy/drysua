@@ -114,6 +114,23 @@ fn seat_loop_rejects_non_shadow_fiend_match_pick() {
     );
 }
 
+#[test]
+fn seat_loop_rejects_an_unbounded_message_stream_without_snapshots() {
+    let mut wire = MockWire {
+        messages: std::iter::repeat_n(ServerMsg::LobbyState { slots: Vec::new() }, 4_097).collect(),
+        acknowledgements: Vec::new(),
+        orders: Vec::new(),
+    };
+
+    let error = play_idle_on(&mut wire, seated(TickMode::Lockstep), None)
+        .expect_err("message stream must make snapshot progress");
+
+    assert_eq!(
+        error.to_string(),
+        "server sent too many messages without a snapshot"
+    );
+}
+
 #[cfg(feature = "builtin")]
 #[test]
 fn deployment_seat_runs_loaded_policy_and_emits_an_order() {
@@ -126,6 +143,7 @@ fn deployment_seat_runs_loaded_policy_and_emits_an_order() {
     let next = arena.step(&[None, None]).expect("next arena tick");
     let mut messages = start.messages[0].clone();
     messages.extend(next.messages[0].clone());
+    set_pregame_ticks(&mut messages, 0);
     let mut wire = MockWire {
         messages: messages.into(),
         acknowledgements: Vec::new(),
@@ -151,6 +169,14 @@ fn deployment_seat_runs_loaded_policy_and_emits_an_order() {
     assert_eq!(wire.orders.len(), 1);
 }
 
+#[test]
+fn deployment_waits_until_the_first_tick_after_pregame() {
+    assert!(!crate::deployment_tick_is_active_for_test(1, 900));
+    assert!(!crate::deployment_tick_is_active_for_test(900, 900));
+    assert!(crate::deployment_tick_is_active_for_test(901, 900));
+    assert!(crate::deployment_tick_is_active_for_test(1, 0));
+}
+
 #[cfg(feature = "builtin")]
 #[test]
 fn deployment_seat_resends_a_body_order_after_hero_identity_changes() {
@@ -161,6 +187,7 @@ fn deployment_seat_resends_a_body_order_after_hero_identity_changes() {
     })
     .expect("arena");
     let mut messages = start.messages[0].clone();
+    set_pregame_ticks(&mut messages, 0);
     let first = messages
         .iter()
         .find_map(|message| match message {
@@ -204,6 +231,18 @@ fn deployment_seat_resends_a_body_order_after_hero_identity_changes() {
 
 fn mock_wire() -> MockWire {
     mock_wire_with_mode(TickMode::Lockstep)
+}
+
+#[cfg(feature = "builtin")]
+fn set_pregame_ticks(messages: &mut [ServerMsg], pregame_ticks: u32) {
+    let info = messages
+        .iter_mut()
+        .find_map(|message| match message {
+            ServerMsg::MatchStart { info } => Some(info),
+            _ => None,
+        })
+        .expect("arena MatchStart");
+    info.pregame_ticks = pregame_ticks;
 }
 
 fn mock_wire_with_mode(mode: TickMode) -> MockWire {

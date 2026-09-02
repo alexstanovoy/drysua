@@ -24,7 +24,7 @@ use crate::{
 };
 
 /// Maximum number of owned samples retained by one imitation pool.
-pub const MAX_IMITATION_SAMPLES: usize = 8_192;
+pub const MAX_IMITATION_SAMPLES: usize = 9_216;
 /// Maximum seed count in each training, validation, or promotion namespace.
 pub const MAX_SEED_NAMESPACE: usize = 8_192;
 /// Maximum epoch, optimizer-step, and global-update counter value.
@@ -36,7 +36,7 @@ pub const MIN_PROMOTION_ROLLOUT_ACTIONS: u64 = 1_000;
 /// Current behavioral optimizer ownership schema.
 pub const IMITATION_OPTIMIZER_VERSION: u32 = 2;
 /// Current audited game-rules scope for stage-eight artifacts.
-pub const IMITATION_RULES_AUDIT_VERSION: u32 = 8;
+pub const IMITATION_RULES_AUDIT_VERSION: u32 = 9;
 
 const TARGET_MODE_HEAD: usize = 3;
 const PUT_MODE_HEAD: usize = 2;
@@ -1401,11 +1401,18 @@ impl ImitationPool {
         Ok(order)
     }
 
-    fn held_out(&self) -> Result<Vec<&ImitationSample>, ImitationError> {
+    fn evaluation_samples(
+        &self,
+        split: ImitationSplit,
+    ) -> Result<Vec<&ImitationSample>, ImitationError> {
+        assert!(matches!(
+            split,
+            ImitationSplit::Validation | ImitationSplit::HeldOut
+        ));
         let output = self
             .samples
             .iter()
-            .filter(|sample| sample.split == ImitationSplit::HeldOut)
+            .filter(|sample| sample.split == split)
             .collect::<Vec<_>>();
         if output
             .iter()
@@ -1942,8 +1949,8 @@ impl TeacherCoverage {
         Ok(())
     }
 
-    fn matches_samples(&self, samples: &[&ImitationSample]) -> bool {
-        if self.namespace != Some(SeedNamespace::Promotion) {
+    fn matches_samples(&self, samples: &[&ImitationSample], namespace: SeedNamespace) -> bool {
+        if self.namespace != Some(namespace) {
             return false;
         }
         let mut expected = samples
@@ -2062,7 +2069,31 @@ pub struct HeldOutEvaluation {
     candidate: crate::PolicyIdentity,
 }
 
+/// Typed stage-selection evaluation tied to one exact pool revision and validation coverage.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ValidationEvaluation {
+    metrics: OfflineEvaluation,
+    coverage: TeacherCoverage,
+    pool: PoolBinding,
+    candidate: crate::PolicyIdentity,
+}
+
 impl HeldOutEvaluation {
+    pub const fn metrics(&self) -> &OfflineEvaluation {
+        &self.metrics
+    }
+    pub const fn coverage(&self) -> &TeacherCoverage {
+        &self.coverage
+    }
+    pub const fn pool(&self) -> &PoolBinding {
+        &self.pool
+    }
+    pub const fn candidate(&self) -> crate::PolicyIdentity {
+        self.candidate
+    }
+}
+
+impl ValidationEvaluation {
     pub const fn metrics(&self) -> &OfflineEvaluation {
         &self.metrics
     }
@@ -2084,8 +2115,30 @@ impl OfflineEvaluation {
         pool: &ImitationPool,
         coverage: TeacherCoverage,
     ) -> Result<HeldOutEvaluation, ImitationError> {
-        let samples = pool.held_out()?;
+        let samples = pool.evaluation_samples(ImitationSplit::HeldOut)?;
         Self::evaluate_held_out_samples(model, pool, &samples, coverage)
+    }
+
+    /// Evaluates only stage-selection samples that cannot enter optimization or promotion.
+    pub fn evaluate_validation(
+        model: &PolicyModel,
+        pool: &ImitationPool,
+        coverage: TeacherCoverage,
+    ) -> Result<ValidationEvaluation, ImitationError> {
+        let samples = pool.evaluation_samples(ImitationSplit::Validation)?;
+        let (metrics, candidate) = Self::evaluate_samples(
+            model,
+            pool,
+            &samples,
+            coverage.clone(),
+            ImitationSplit::Validation,
+        )?;
+        Ok(ValidationEvaluation {
+            metrics,
+            coverage,
+            pool: pool.binding.clone(),
+            candidate,
+        })
     }
 
     /// Evaluates a caller-selected set only when every sample is clean HeldOut data.
@@ -2101,15 +2154,13 @@ impl OfflineEvaluation {
                 maximum: MODEL_MAX_BATCH,
             });
         }
-        for sample in samples {
-            if sample.split != ImitationSplit::HeldOut || sample.source == ImitationSource::Dagger {
-                return Err(ImitationError::HeldOutContamination);
-            }
-            if !pool.samples.iter().any(|held| std::ptr::eq(held, *sample)) {
-                return Err(ImitationError::HeldOutSampleNotInPool);
-            }
-        }
-        let (metrics, candidate) = Self::evaluate_samples(model, samples, &coverage)?;
+        let (metrics, candidate) = Self::evaluate_samples(
+            model,
+            pool,
+            samples,
+            coverage.clone(),
+            ImitationSplit::HeldOut,
+        )?;
         Ok(HeldOutEvaluation {
             metrics,
             coverage,
@@ -2120,24 +2171,41 @@ impl OfflineEvaluation {
 
     fn evaluate_samples(
         model: &PolicyModel,
+        pool: &ImitationPool,
         samples: &[&ImitationSample],
-        coverage: &TeacherCoverage,
+        coverage: TeacherCoverage,
+        expected_split: ImitationSplit,
     ) -> Result<(Self, crate::PolicyIdentity), ImitationError> {
-        coverage.validate()?;
+        assert!(matches!(
+            expected_split,
+            ImitationSplit::Validation | ImitationSplit::HeldOut
+        ));
         if samples.len() > MODEL_MAX_BATCH {
             return Err(ImitationError::EffectiveBatch {
                 value: samples.len(),
                 maximum: MODEL_MAX_BATCH,
             });
         }
+        for sample in samples {
+            if sample.split != expected_split || sample.source == ImitationSource::Dagger {
+                return Err(ImitationError::HeldOutContamination);
+            }
+            if !pool.samples.iter().any(|held| std::ptr::eq(held, *sample)) {
+                return Err(ImitationError::HeldOutSampleNotInPool);
+            }
+            sample.target.validate()?;
+        }
+        coverage.validate()?;
         if coverage.represented != samples.len() {
             return Err(ImitationError::InvalidTeacherCoverage);
         }
-        if !coverage.matches_samples(samples) {
+        let expected_namespace = match expected_split {
+            ImitationSplit::Validation => SeedNamespace::Validation,
+            ImitationSplit::HeldOut => SeedNamespace::Promotion,
+            ImitationSplit::Train => unreachable!("evaluation split was asserted"),
+        };
+        if !coverage.matches_samples(samples, expected_namespace) {
             return Err(ImitationError::InvalidTeacherCoverage);
-        }
-        for sample in samples {
-            sample.target.validate()?;
         }
         let (predictions, candidate) = model.behavioral_predictions_with_identity(samples)?;
         if predictions.len() != samples.len() {
@@ -2145,9 +2213,6 @@ impl OfflineEvaluation {
         }
         let mut output = Self::default();
         for (sample, prediction) in samples.iter().zip(predictions) {
-            if sample.split != ImitationSplit::HeldOut || sample.source == ImitationSource::Dagger {
-                return Err(ImitationError::HeldOutContamination);
-            }
             output.overall.note(sample, prediction);
             match sample.side {
                 ImitationSide::Radiant => output.radiant.note(sample, prediction),
@@ -2156,8 +2221,8 @@ impl OfflineEvaluation {
         }
         output.overall.teacher_covered = coverage.represented;
         output.overall.teacher_attempted = coverage.attempted;
-        set_side_coverage(&mut output.radiant, coverage, ImitationSide::Radiant);
-        set_side_coverage(&mut output.dire, coverage, ImitationSide::Dire);
+        set_side_coverage(&mut output.radiant, &coverage, ImitationSide::Radiant);
+        set_side_coverage(&mut output.dire, &coverage, ImitationSide::Dire);
         Ok((output, candidate))
     }
 }

@@ -16,8 +16,8 @@ static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(1);
 
 #[test]
 fn checkpoint_schema_hash_is_stable() {
-    assert_eq!(crate::CHECKPOINT_SCHEMA_VERSION, 1);
-    assert_eq!(crate::CHECKPOINT_SCHEMA_HASH, 2_133_011_134_179_236_231);
+    assert_eq!(crate::CHECKPOINT_SCHEMA_VERSION, 2);
+    assert_eq!(crate::CHECKPOINT_SCHEMA_HASH, 4_581_258_024_746_721_724);
 }
 
 #[test]
@@ -172,6 +172,18 @@ fn runtime_weights_reject_unknown_tensor_name_before_model_mutation() {
             "model_schema_hash".to_owned(),
             crate::MODEL_SCHEMA_HASH.to_string(),
         ),
+        (
+            "ppo_rules_audit_version".to_owned(),
+            crate::PPO_RULES_AUDIT_VERSION.to_string(),
+        ),
+        (
+            "ppo_schema_hash".to_owned(),
+            crate::PPO_SCHEMA_HASH.to_string(),
+        ),
+        (
+            "ppo_schema_version".to_owned(),
+            crate::PPO_SCHEMA_VERSION.to_string(),
+        ),
     ]);
     let bytes = serialize([("unknown", view)], Some(metadata)).expect("malformed runtime file");
     fs::write(directory.join("drysua.weights.safetensors"), bytes).expect("write malformed");
@@ -180,6 +192,39 @@ fn runtime_weights_reject_unknown_tensor_name_before_model_mutation() {
         .expect_err("unknown tensor name");
 
     assert_eq!(error, CheckpointError::TensorContract("names"));
+    assert_eq!(model.export_parameters().expect("after"), before);
+    fs::remove_dir_all(directory).expect("remove test directory");
+}
+
+#[test]
+fn runtime_weights_reject_metadata_without_the_deployment_schema() {
+    let directory = test_directory("runtime-deployment-schema");
+    let model = PolicyModel::fresh(18_045).expect("model");
+    let before = model.export_parameters().expect("before");
+    let data = 0.0f32.to_le_bytes();
+    let view = TensorView::new(Dtype::F32, vec![1], &data).expect("view");
+    let metadata = std::collections::HashMap::from([
+        (
+            "action_schema_hash".to_owned(),
+            crate::ACTION_SCHEMA_HASH.to_string(),
+        ),
+        (
+            "feature_schema_hash".to_owned(),
+            crate::FEATURE_SCHEMA_HASH.to_string(),
+        ),
+        (
+            "model_schema_hash".to_owned(),
+            crate::MODEL_SCHEMA_HASH.to_string(),
+        ),
+    ]);
+    let bytes =
+        serialize([("model.parameters", view)], Some(metadata)).expect("old runtime metadata");
+    fs::write(directory.join("drysua.weights.safetensors"), bytes).expect("write malformed");
+
+    let error = TrainingArtifact::load_runtime_weights(&model, &directory)
+        .expect_err("deployment schema is mandatory");
+
+    assert_eq!(error, CheckpointError::SchemaMismatch);
     assert_eq!(model.export_parameters().expect("after"), before);
     fs::remove_dir_all(directory).expect("remove test directory");
 }

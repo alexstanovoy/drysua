@@ -23,7 +23,7 @@ fn action_and_training_schema_identities_are_stable() {
     assert_eq!(ACTION_SCHEMA_VERSION, 1);
     assert_eq!(ACTION_SCHEMA_HASH, 17_797_499_074_169_920_257);
     assert_eq!(crate::IMITATION_OPTIMIZER_VERSION, 2);
-    assert_eq!(crate::IMITATION_RULES_AUDIT_VERSION, 8);
+    assert_eq!(crate::IMITATION_RULES_AUDIT_VERSION, 9);
 }
 
 #[test]
@@ -139,6 +139,37 @@ fn side_is_derived_from_actual_frame_and_metrics_are_authentic() {
     assert_eq!(evaluation.metrics().dire.samples, 1);
     assert_eq!(evaluation.metrics().radiant.teacher_coverage(), Some(1.0));
     assert_eq!(evaluation.metrics().dire.teacher_coverage(), Some(1.0));
+}
+
+#[test]
+fn validation_evaluation_uses_only_the_stage_selection_namespace() {
+    let validation = sample(
+        ImitationSplit::Validation,
+        ImitationSide::Radiant,
+        ActionKind::Continue,
+        1,
+    );
+    let validation_dire = sample(
+        ImitationSplit::Validation,
+        ImitationSide::Dire,
+        ActionKind::Continue,
+        2,
+    );
+    let mut pool = pool(2, 101);
+    pool.push(validation).expect("validation sample");
+    pool.push(validation_dire).expect("Dire validation sample");
+    let mut coverage = TeacherCoverage::new();
+    record_split_coverage(&mut coverage, &pool, ImitationSplit::Validation);
+    let model = zero_model(2);
+
+    let evaluation = OfflineEvaluation::evaluate_validation(&model, &pool, coverage)
+        .expect("validation evaluation");
+
+    assert_eq!(evaluation.metrics().overall.samples, 2);
+    assert_eq!(
+        evaluation.candidate(),
+        model.policy_identity().expect("identity")
+    );
 }
 
 #[test]
@@ -1342,13 +1373,21 @@ fn gate_sample(side: ImitationSide, kind: ActionKind, ordinal: u64) -> Imitation
 }
 
 fn record_held_out_coverage(coverage: &mut TeacherCoverage, pool: &ImitationPool) {
+    record_split_coverage(coverage, pool, ImitationSplit::HeldOut);
+}
+
+fn record_split_coverage(
+    coverage: &mut TeacherCoverage,
+    pool: &ImitationPool,
+    split: ImitationSplit,
+) {
     for index in 0..pool.len() {
         if let Some(sample) = pool.get(index)
-            && sample.split() == ImitationSplit::HeldOut
+            && sample.split() == split
         {
             coverage
                 .record_represented_for(sample)
-                .expect("held-out coverage");
+                .expect("evaluation coverage");
         }
     }
 }

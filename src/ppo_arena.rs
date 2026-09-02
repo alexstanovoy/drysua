@@ -5,7 +5,7 @@ use std::sync::mpsc::sync_channel;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use bota_proto::{MapId, RejectReason, ServerMsg, SlotId, Team};
+use bota_proto::{EventKind, MapId, RejectReason, ServerMsg, SlotId, Team};
 
 use crate::{
     ACTOR_LEARNER_BUFFERS, ActionKind, ActionSpace, ActivePolicyOrder, ActorLearnerPipeline,
@@ -97,7 +97,7 @@ pub enum ResumeProvenance {
     MigrateGitCommit,
 }
 
-/// Durable progress emitted only after a checkpoint and runtime weights are committed.
+/// Durable progress plus invocation-local gameplay telemetry emitted after a committed checkpoint.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TrainingCheckpointReport {
     pub completed_updates: u64,
@@ -116,7 +116,7 @@ pub struct TrainingCheckpointReport {
     pub cleanup_warning: Option<String>,
 }
 
-/// Final state of a bounded production training invocation.
+/// Final durable progress and gameplay telemetry from the current bounded invocation.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct TrainingJobReport {
     pub starting_policy_fingerprint: u64,
@@ -207,6 +207,7 @@ pub struct BehavioralPretrainingConfig {
 #[derive(Clone, Debug, PartialEq)]
 pub struct BehavioralPretrainingReport {
     pub training_samples: usize,
+    pub validation_samples: usize,
     pub held_out_samples: usize,
     pub optimizer_steps: u64,
     pub final_loss: f64,
@@ -354,6 +355,7 @@ struct ArenaSeatPolicy {
     sequence: u32,
     rejections: u64,
     pending_active: Option<(u32, Option<ActivePolicyOrder>)>,
+    pending_events: Option<(u32, Vec<EventKind>)>,
     last_issued: Option<(u32, crate::IssuedOrder, ActionKind)>,
     last_rejection: Option<(u32, RejectReason)>,
 }
@@ -505,7 +507,8 @@ pub fn evaluate_runtime_checkpoint(
 
 const PRETRAINING_TRAIN_SEEDS: usize = 4;
 const PRETRAINING_DAGGER_SEEDS: usize = 4;
-const PRETRAINING_HELD_OUT_SEEDS: usize = 3;
+const PRETRAINING_VALIDATION_SEEDS: usize = 2;
+const PRETRAINING_HELD_OUT_SEEDS: usize = 2;
 const PRETRAINING_TRAINING_MAP: MapId = MapId(1);
 const PRETRAINING_DECISIONS: usize = 4_096;
 const PRETRAINING_WINDOWS: usize = 4;
@@ -536,6 +539,11 @@ const PRETRAINING_MAX_HELD_OUT_SAMPLES: usize = PRETRAINING_HELD_OUT_SEEDS
     * PRETRAINING_WINDOWS
     * (PRETRAINING_HELD_OUT_CONTINUE_WINDOW_CAP as usize
         + (ActionKind::COUNT - 1) * PRETRAINING_HELD_OUT_OTHER_WINDOW_CAP as usize);
+const PRETRAINING_MAX_VALIDATION_SAMPLES: usize = PRETRAINING_VALIDATION_SEEDS
+    * 2
+    * PRETRAINING_WINDOWS
+    * (PRETRAINING_HELD_OUT_CONTINUE_WINDOW_CAP as usize
+        + (ActionKind::COUNT - 1) * PRETRAINING_HELD_OUT_OTHER_WINDOW_CAP as usize);
 const PRETRAINING_MAX_DAGGER_SAMPLES: usize = PRETRAINING_DAGGER_SEEDS
     * 2
     * PRETRAINING_WINDOWS
@@ -543,15 +551,17 @@ const PRETRAINING_MAX_DAGGER_SAMPLES: usize = PRETRAINING_DAGGER_SEEDS
     * PRETRAINING_DAGGER_WINDOW_SIDE_KIND_CAP as usize;
 const _: () = assert!(PRETRAINING_DECISIONS.is_multiple_of(PRETRAINING_WINDOWS));
 const PRETRAINING_SAMPLE_CAPACITY: usize = PRETRAINING_MAX_BASE_TRAIN_SAMPLES
+    + PRETRAINING_MAX_VALIDATION_SAMPLES
     + PRETRAINING_MAX_HELD_OUT_SAMPLES
     + PRETRAINING_MAX_DAGGER_SAMPLES;
 const _: () = assert!(PRETRAINING_SAMPLE_CAPACITY <= crate::MAX_IMITATION_SAMPLES);
 
 struct PretrainingCollection {
     pool: ImitationPool,
+    validation_coverage: TeacherCoverage,
     held_out_coverage: TeacherCoverage,
     training_action_counts: [u64; ActionKind::COUNT],
-    split_counts: [usize; 2],
+    split_counts: [usize; 3],
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -620,10 +630,10 @@ pub fn run_behavioral_pretraining_on(
     let bootstrap_epochs = settings.epochs.div_ceil(2);
     let mut stage_loss =
         train_behavioral_epochs(&model, &collection.pool, &mut trainer, bootstrap_epochs)?;
-    let mut held_out = evaluate_pretraining_held_out(&model, &collection)?;
+    let mut validation = evaluate_pretraining_validation(&model, &collection)?;
     let mut agreement_trace = Vec::with_capacity(PRETRAINING_DAGGER_SEEDS + 1);
     let mut gameplay_trace = Vec::with_capacity(PRETRAINING_DAGGER_SEEDS + 1);
-    let agreement = pretraining_agreement(held_out.metrics());
+    let agreement = pretraining_agreement(validation.metrics());
     let gameplay = evaluate_pretraining_gameplay(&model, PRETRAINING_GAMEPLAY_VALIDATION_SEED)?;
     agreement_trace.push(agreement);
     gameplay_trace.push(gameplay);
@@ -651,8 +661,8 @@ pub fn run_behavioral_pretraining_on(
             .map_err(imitation_error)?;
         let phase_epochs = remaining_epochs / PRETRAINING_DAGGER_SEEDS as u32;
         stage_loss = train_behavioral_epochs(&model, &collection.pool, &mut trainer, phase_epochs)?;
-        held_out = evaluate_pretraining_held_out(&model, &collection)?;
-        let agreement = pretraining_agreement(held_out.metrics());
+        validation = evaluate_pretraining_validation(&model, &collection)?;
+        let agreement = pretraining_agreement(validation.metrics());
         let gameplay = evaluate_pretraining_gameplay(&model, PRETRAINING_GAMEPLAY_VALIDATION_SEED)?;
         agreement_trace.push(agreement);
         gameplay_trace.push(gameplay);
@@ -669,9 +679,10 @@ pub fn run_behavioral_pretraining_on(
     model
         .import_parameters(&best.parameters)
         .map_err(model_error)?;
-    held_out = evaluate_pretraining_held_out(&model, &collection)?;
-    let restored_agreement = pretraining_agreement(held_out.metrics());
+    validation = evaluate_pretraining_validation(&model, &collection)?;
+    let restored_agreement = pretraining_agreement(validation.metrics());
     assert_eq!(restored_agreement, best.agreement);
+    let held_out = evaluate_pretraining_held_out(&model, &collection)?;
     if let Err(error) = validate_pretraining_agreement(held_out.metrics()) {
         return Err(PpoError::Model(format!(
             "{error}; agreement stages={agreement_trace:?}; gameplay stages={gameplay_trace:?}"
@@ -685,7 +696,8 @@ pub fn run_behavioral_pretraining_on(
         .fingerprint();
     Ok(BehavioralPretrainingReport {
         training_samples: collection.split_counts[0],
-        held_out_samples: collection.split_counts[1],
+        validation_samples: collection.split_counts[1],
+        held_out_samples: collection.split_counts[2],
         optimizer_steps: best.optimizer_steps,
         final_loss: best.loss,
         held_out_kind_agreement: held_out
@@ -709,6 +721,18 @@ pub fn run_behavioral_pretraining_on(
             .ok_or(PpoError::CounterOverflow)?,
         fingerprint,
     })
+}
+
+fn evaluate_pretraining_validation(
+    model: &PolicyModel,
+    collection: &PretrainingCollection,
+) -> Result<crate::ValidationEvaluation, PpoError> {
+    OfflineEvaluation::evaluate_validation(
+        model,
+        &collection.pool,
+        collection.validation_coverage.clone(),
+    )
+    .map_err(imitation_error)
 }
 
 fn evaluate_pretraining_held_out(
@@ -966,8 +990,10 @@ fn validate_behavioral_pretraining(settings: BehavioralPretrainingConfig) -> Res
     settings
         .seed
         .checked_add(
-            (PRETRAINING_TRAIN_SEEDS + PRETRAINING_DAGGER_SEEDS + PRETRAINING_HELD_OUT_SEEDS)
-                as u64,
+            (PRETRAINING_TRAIN_SEEDS
+                + PRETRAINING_DAGGER_SEEDS
+                + PRETRAINING_VALIDATION_SEEDS
+                + PRETRAINING_HELD_OUT_SEEDS) as u64,
         )
         .ok_or(PpoError::InvalidConfig("pretraining seed"))?;
     Ok(())
@@ -989,16 +1015,25 @@ fn collect_pretraining_samples(
     let dagger = (0..PRETRAINING_DAGGER_SEEDS)
         .map(|offset| settings.seed + PRETRAINING_TRAIN_SEEDS as u64 + offset as u64)
         .collect::<Vec<_>>();
-    let promotion = (0..PRETRAINING_HELD_OUT_SEEDS)
+    let validation = (0..PRETRAINING_VALIDATION_SEEDS)
         .map(|offset| {
             settings.seed
                 + (PRETRAINING_TRAIN_SEEDS + PRETRAINING_DAGGER_SEEDS) as u64
                 + offset as u64
         })
         .collect::<Vec<_>>();
+    let promotion = (0..PRETRAINING_HELD_OUT_SEEDS)
+        .map(|offset| {
+            settings.seed
+                + (PRETRAINING_TRAIN_SEEDS
+                    + PRETRAINING_DAGGER_SEEDS
+                    + PRETRAINING_VALIDATION_SEEDS) as u64
+                + offset as u64
+        })
+        .collect::<Vec<_>>();
     let mut optimization_seeds = training.clone();
     optimization_seeds.extend_from_slice(&dagger);
-    let namespaces = SeedNamespaces::new(optimization_seeds, Vec::new(), promotion.clone())
+    let namespaces = SeedNamespaces::new(optimization_seeds, validation.clone(), promotion.clone())
         .map_err(imitation_error)?;
     let scope = TrainingScope::new(PRETRAINING_TRAINING_MAP, IMITATION_RULES_AUDIT_VERSION)
         .map_err(imitation_error)?;
@@ -1006,11 +1041,13 @@ fn collect_pretraining_samples(
     let mut pool = ImitationPool::new(capacity, settings.seed | 1, namespaces, scope)
         .map_err(imitation_error)?;
     let mut training_coverage = TeacherCoverage::new();
+    let mut validation_coverage = TeacherCoverage::new();
     let mut held_out_coverage = TeacherCoverage::new();
     let mut training_action_counts = [0u64; ActionKind::COUNT];
+    let mut validation_action_counts = [0u64; ActionKind::COUNT];
     let mut held_out_action_counts = [0u64; ActionKind::COUNT];
     let mut side_counts = [0usize; 2];
-    let mut split_counts = [0usize; 2];
+    let mut split_counts = [0usize; 3];
     for seed in training {
         collect_pretraining_seed(
             PRETRAINING_TRAINING_MAP,
@@ -1019,6 +1056,18 @@ fn collect_pretraining_samples(
             &mut pool,
             &mut training_coverage,
             &mut training_action_counts,
+            &mut side_counts,
+            &mut split_counts,
+        )?;
+    }
+    for seed in validation {
+        collect_pretraining_seed(
+            PRETRAINING_TRAINING_MAP,
+            seed,
+            SeedNamespace::Validation,
+            &mut pool,
+            &mut validation_coverage,
+            &mut validation_action_counts,
             &mut side_counts,
             &mut split_counts,
         )?;
@@ -1038,28 +1087,34 @@ fn collect_pretraining_samples(
     let counted_splits = [
         usize::try_from(training_action_counts.iter().copied().sum::<u64>())
             .map_err(|_| PpoError::CounterOverflow)?,
+        usize::try_from(validation_action_counts.iter().copied().sum::<u64>())
+            .map_err(|_| PpoError::CounterOverflow)?,
         usize::try_from(held_out_action_counts.iter().copied().sum::<u64>())
             .map_err(|_| PpoError::CounterOverflow)?,
     ];
     if pool.is_empty()
-        || pool.len() != split_counts[0].saturating_add(split_counts[1])
+        || pool.len() != split_counts.iter().copied().sum::<usize>()
         || counted_splits != split_counts
         || training_coverage.attempted() != training_coverage.represented()
+        || validation_coverage.attempted() != validation_coverage.represented()
         || held_out_coverage.attempted() != held_out_coverage.represented()
         || side_counts[0].abs_diff(side_counts[1]).saturating_mul(100)
             > pool.len().saturating_mul(5)
     {
         return Err(PpoError::Model(format!(
-            "pretraining collection coverage failed: pool={}, splits={split_counts:?}, sides={side_counts:?}, train={}/{}, held_out={}/{}",
+            "pretraining collection coverage failed: pool={}, splits={split_counts:?}, sides={side_counts:?}, train={}/{}, validation={}/{}, held_out={}/{}",
             pool.len(),
             training_coverage.represented(),
             training_coverage.attempted(),
+            validation_coverage.represented(),
+            validation_coverage.attempted(),
             held_out_coverage.represented(),
             held_out_coverage.attempted(),
         )));
     }
     Ok(PretrainingCollection {
         pool,
+        validation_coverage,
         held_out_coverage,
         training_action_counts,
         split_counts,
@@ -1164,6 +1219,7 @@ fn collect_dagger_side(
             requests.push(request);
         }
         let advanced = advance_interval(&mut environment, requests, 3)?;
+        reject_production_rejection(&environment, "DAgger collection")?;
         if advanced.winner.is_some() {
             trajectory = trajectory.checked_add(1).ok_or(PpoError::CounterOverflow)?;
             restart_environment(&mut environment)?;
@@ -1287,7 +1343,7 @@ fn dagger_learner_request(
 }
 
 #[cfg(test)]
-type PretrainingSummary = (usize, [[u64; ActionKind::COUNT]; 2], [usize; 2]);
+type PretrainingSummary = (usize, [[u64; ActionKind::COUNT]; 3], [usize; 3]);
 
 #[cfg(test)]
 pub(crate) fn collect_pretraining_summary_for_test(
@@ -1303,8 +1359,8 @@ fn summarize_pretraining_map(
     map: MapId,
 ) -> Result<PretrainingSummary, PpoError> {
     assert_eq!(map, PRETRAINING_TRAINING_MAP);
-    let mut split_actions = [[0u64; ActionKind::COUNT]; 2];
-    let mut split_counts = [0usize; 2];
+    let mut split_actions = [[0u64; ActionKind::COUNT]; 3];
+    let mut split_counts = [0usize; 3];
     for index in 0..pool.len() {
         let sample = pool
             .get(index)
@@ -1314,12 +1370,8 @@ fn summarize_pretraining_map(
         }
         let split = match sample.split() {
             crate::ImitationSplit::Train => 0,
-            crate::ImitationSplit::HeldOut => 1,
-            crate::ImitationSplit::Validation => {
-                return Err(PpoError::InvalidTransition(
-                    "pretraining test validation split",
-                ));
-            }
+            crate::ImitationSplit::Validation => 1,
+            crate::ImitationSplit::HeldOut => 2,
         };
         split_actions[split][sample.teacher_action().kind().index()] += 1;
         split_counts[split] += 1;
@@ -1337,7 +1389,7 @@ fn collect_pretraining_seed(
     coverage: &mut TeacherCoverage,
     action_counts: &mut [u64; ActionKind::COUNT],
     side_counts: &mut [usize; 2],
-    split_counts: &mut [usize; 2],
+    split_counts: &mut [usize; 3],
 ) -> Result<(), PpoError> {
     let mut environment = build_environment(
         seed,
@@ -1389,12 +1441,8 @@ fn collect_pretraining_seed(
                     .ok_or(PpoError::CounterOverflow)?;
                 let split = match namespace {
                     SeedNamespace::Training => 0,
-                    SeedNamespace::Promotion => 1,
-                    SeedNamespace::Validation => {
-                        return Err(PpoError::InvalidTransition(
-                            "pretraining validation namespace",
-                        ));
-                    }
+                    SeedNamespace::Validation => 1,
+                    SeedNamespace::Promotion => 2,
                 };
                 split_counts[split] = split_counts[split]
                     .checked_add(1)
@@ -1468,13 +1516,12 @@ fn pretraining_base_window_cap(
             Ok(PRETRAINING_TRAIN_CONTINUE_WINDOW_CAP)
         }
         (SeedNamespace::Training, _) => Ok(PRETRAINING_TRAIN_OTHER_WINDOW_CAP),
-        (SeedNamespace::Promotion, ActionKind::Continue) => {
+        (SeedNamespace::Validation | SeedNamespace::Promotion, ActionKind::Continue) => {
             Ok(PRETRAINING_HELD_OUT_CONTINUE_WINDOW_CAP)
         }
-        (SeedNamespace::Promotion, _) => Ok(PRETRAINING_HELD_OUT_OTHER_WINDOW_CAP),
-        (SeedNamespace::Validation, _) => Err(PpoError::InvalidTransition(
-            "pretraining validation namespace",
-        )),
+        (SeedNamespace::Validation | SeedNamespace::Promotion, _) => {
+            Ok(PRETRAINING_HELD_OUT_OTHER_WINDOW_CAP)
+        }
     }
 }
 
@@ -1614,11 +1661,7 @@ pub fn run_ppo_smoke_on(
             let actor_report = report_receiver
                 .recv()
                 .map_err(|_| PpoError::Model("actor report channel disconnected".to_owned()))?;
-            smoke.rejected_orders = actor_report.rejected_orders;
-            smoke.elapsed_ticks = smoke
-                .elapsed_ticks
-                .checked_add(actor_report.elapsed_ticks)
-                .ok_or(PpoError::CounterOverflow)?;
+            merge_actor_report(&mut smoke, actor_report)?;
             let report = trainer.train_pipeline_update(&model, &batch)?;
             record_update(&mut smoke, capacity, report)?;
             pipeline.publish(&model).map_err(pipeline_error)?;
@@ -2102,7 +2145,27 @@ fn merge_actor_report(
         .elapsed_ticks
         .checked_add(actor.elapsed_ticks)
         .ok_or(PpoError::CounterOverflow)?;
+    aggregate.terminal_wins = aggregate
+        .terminal_wins
+        .checked_add(actor.terminal_wins)
+        .ok_or(PpoError::CounterOverflow)?;
+    aggregate.terminal_losses = aggregate
+        .terminal_losses
+        .checked_add(actor.terminal_losses)
+        .ok_or(PpoError::CounterOverflow)?;
+    aggregate.terminal_draws = aggregate
+        .terminal_draws
+        .checked_add(actor.terminal_draws)
+        .ok_or(PpoError::CounterOverflow)?;
     Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn merge_actor_report_for_test(
+    aggregate: &mut PpoSmokeReport,
+    actor: PpoSmokeReport,
+) -> Result<(), PpoError> {
+    merge_actor_report(aggregate, actor)
 }
 
 fn record_update(
@@ -2147,7 +2210,10 @@ fn validate_training_job(
             "fresh training provenance migration",
         ));
     }
-    if settings.environments == 0 || settings.environments > 16 {
+    if settings.environments == 0
+        || settings.environments > 16
+        || !settings.environments.is_multiple_of(2)
+    {
         return Err(PpoError::InvalidConfig("training environments"));
     }
     if settings.rollout_decisions == 0 || settings.rollout_decisions > 256 {
@@ -2601,14 +2667,7 @@ fn warmup_environment_with_policy(
     decisions: usize,
     decision_interval_ticks: u32,
 ) -> Result<(), PpoError> {
-    for _ in 0..decisions {
-        let (requests, _) = requests_for_greedy_decision(environment, model)?;
-        let advanced = advance_interval(environment, requests, decision_interval_ticks)?;
-        reject_production_rejection(environment, "production warmup")?;
-        if advanced.winner.is_some() {
-            restart_environment(environment)?;
-        }
-    }
+    run_warmup_decisions(environment, model, decisions, decision_interval_ticks)?;
     clear_warmup_orders(environment, decision_interval_ticks)?;
     environment.reward = RewardTracker::default();
     let summary = environment.seats[environment.policy_seat]
@@ -2619,13 +2678,30 @@ fn warmup_environment_with_policy(
     Ok(())
 }
 
+fn run_warmup_decisions(
+    environment: &mut TrainingEnvironment,
+    model: &PolicyModel,
+    decisions: usize,
+    decision_interval_ticks: u32,
+) -> Result<(), PpoError> {
+    for _ in 0..decisions {
+        let (requests, _) = requests_for_greedy_decision(environment, model)?;
+        let advanced = advance_interval(environment, requests, decision_interval_ticks)?;
+        reject_production_rejection(environment, "production warmup")?;
+        if advanced.winner.is_some() {
+            restart_environment(environment)?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 pub(crate) fn production_warmup_order_counts_for_test(
     model: &PolicyModel,
     decisions: usize,
 ) -> Result<[u32; 2], PpoError> {
     let mut environment = build_environment(23_078, 23_079, MapId(1), 0, 0, OpponentSpec::Weak)?;
-    warmup_environment_with_policy(&mut environment, model, decisions, 3)?;
+    run_warmup_decisions(&mut environment, model, decisions, 3)?;
     assert_eq!(environment.policy_seat, 0);
     Ok([environment.seats[0].sequence, environment.seats[1].sequence])
 }
@@ -3464,6 +3540,7 @@ fn setup_seat(index: usize, messages: &[ServerMsg]) -> Result<ArenaSeatPolicy, P
         sequence: 0,
         rejections: 0,
         pending_active: None,
+        pending_events: initial_pending_events(messages)?,
         last_issued: None,
         last_rejection: None,
     })
@@ -3479,23 +3556,41 @@ fn collect_update(
     rollout: &mut PpoRollout,
     smoke: &mut PpoSmokeReport,
 ) -> Result<(), PpoError> {
+    let rejections_before = environment_rejections(environments)?;
     for _ in 0..decisions {
         let pending = collect_round(model, sampling, environments, config)?;
         let bootstrap = bootstrap_values(model, &pending)?;
         commit_round(environments, pending, bootstrap, rollout, smoke)?;
     }
-    smoke.rejected_orders = environments
-        .iter()
-        .map(|environment| {
-            environment.retired_rejections
-                + environment
-                    .seats
-                    .iter()
-                    .map(|seat| seat.rejections)
-                    .sum::<u64>()
-        })
-        .sum();
+    smoke.rejected_orders =
+        rejection_delta(rejections_before, environment_rejections(environments)?)?;
     Ok(())
+}
+
+fn environment_rejections(environments: &[TrainingEnvironment]) -> Result<u64, PpoError> {
+    let mut total = 0u64;
+    for environment in environments {
+        total = total
+            .checked_add(environment.retired_rejections)
+            .ok_or(PpoError::CounterOverflow)?;
+        for seat in &environment.seats {
+            total = total
+                .checked_add(seat.rejections)
+                .ok_or(PpoError::CounterOverflow)?;
+        }
+    }
+    Ok(total)
+}
+
+fn rejection_delta(before: u64, after: u64) -> Result<u64, PpoError> {
+    after.checked_sub(before).ok_or(PpoError::InvalidTransition(
+        "arena rejection counter regressed",
+    ))
+}
+
+#[cfg(test)]
+pub(crate) fn rejection_delta_for_test(before: u64, after: u64) -> Result<u64, PpoError> {
+    rejection_delta(before, after)
 }
 
 fn collect_round(
@@ -3871,7 +3966,7 @@ fn issue_request(
         action_kind,
     );
     seat.pending_active = match update {
-        crate::ActiveOrderUpdate::Preserve => None,
+        crate::ActiveOrderUpdate::Preserve => seat.pending_active,
         crate::ActiveOrderUpdate::Replace(None) if previous.is_none() => None,
         crate::ActiveOrderUpdate::Replace(None) => {
             seat.local
@@ -3902,6 +3997,7 @@ fn advance_interval(
     requests: Vec<Option<Request>>,
     ticks: u32,
 ) -> Result<ArenaAdvance, PpoError> {
+    flush_pending_events(&mut environment.seats)?;
     let mut winner = None;
     let mut elapsed = 0u32;
     for tick in 0..ticks {
@@ -3911,8 +4007,9 @@ fn advance_interval(
             .step(if tick == 0 { &requests } else { &empty })
             .map_err(|error| PpoError::Model(error.to_string()))?;
         elapsed = elapsed.checked_add(1).ok_or(PpoError::CounterOverflow)?;
+        let final_tick = tick + 1 == ticks;
         for (seat, messages) in environment.seats.iter_mut().zip(step.messages) {
-            winner = observe_messages(seat, &messages)?.or(winner);
+            winner = observe_messages(seat, &messages, final_tick)?.or(winner);
         }
         if winner.is_some() {
             break;
@@ -3960,6 +4057,7 @@ fn restart_environment(environment: &mut TrainingEnvironment) -> Result<(), PpoE
 fn observe_messages(
     seat: &mut ArenaSeatPolicy,
     messages: &[ServerMsg],
+    defer_events: bool,
 ) -> Result<Option<Team>, PpoError> {
     let mut winner = None;
     for message in messages {
@@ -3990,10 +4088,10 @@ fn observe_messages(
                 seat.last_rejection = Some((*seq, *reason));
             }
             ServerMsg::Snapshot { view } => observe_arena_snapshot(seat, view)?,
-            ServerMsg::Events { tick, events } => seat
-                .tracker
-                .observe_events(*tick, events)
-                .map_err(|error| PpoError::Model(error.to_string()))?,
+            ServerMsg::Events { tick, events } if defer_events => {
+                defer_arena_events(seat, *tick, events.clone())?;
+            }
+            ServerMsg::Events { tick, events } => observe_arena_events(seat, *tick, events)?,
             ServerMsg::MatchOver { winner: result, .. } => winner = Some(*result),
             ServerMsg::MatchStart { .. }
             | ServerMsg::Welcome { .. }
@@ -4004,6 +4102,82 @@ fn observe_messages(
     }
     seat.encoder.observe(&seat.tracker).map_err(feature_error)?;
     Ok(winner)
+}
+
+fn initial_pending_events(
+    messages: &[ServerMsg],
+) -> Result<Option<(u32, Vec<EventKind>)>, PpoError> {
+    let mut batches = messages.iter().filter_map(|message| match message {
+        ServerMsg::Events { tick, events } => Some((*tick, events.clone())),
+        _ => None,
+    });
+    let pending = batches.next();
+    if batches.next().is_some() {
+        return Err(PpoError::InvalidTransition(
+            "multiple initial event batches",
+        ));
+    }
+    Ok(pending)
+}
+
+fn defer_arena_events(
+    seat: &mut ArenaSeatPolicy,
+    tick: u32,
+    events: Vec<EventKind>,
+) -> Result<(), PpoError> {
+    if events.is_empty() || seat.pending_events.is_some() {
+        return Err(PpoError::InvalidTransition("arena pending events"));
+    }
+    seat.pending_events = Some((tick, events));
+    Ok(())
+}
+
+fn flush_pending_events(seats: &mut [ArenaSeatPolicy]) -> Result<(), PpoError> {
+    for seat in seats {
+        if let Some((tick, events)) = seat.pending_events.take() {
+            observe_arena_events(seat, tick, &events)?;
+        }
+    }
+    Ok(())
+}
+
+fn observe_arena_events(
+    seat: &mut ArenaSeatPolicy,
+    tick: u32,
+    events: &[EventKind],
+) -> Result<(), PpoError> {
+    seat.tracker
+        .observe_events(tick, events)
+        .map_err(|error| PpoError::Model(error.to_string()))
+}
+
+#[cfg(test)]
+pub(crate) fn arena_current_tick_events_are_deferred_for_test() -> Result<bool, PpoError> {
+    let (_, start) = Arena::new(ArenaConfig {
+        seats: 2,
+        map: MapId(1),
+        seed: 91_001,
+    })
+    .map_err(|error| PpoError::Model(error.to_string()))?;
+    let mut seat = setup_seat(0, &start.messages[0])?;
+    flush_pending_events(std::slice::from_mut(&mut seat))?;
+    let before = seat.tracker.recent_events().len();
+    let tick = seat
+        .tracker
+        .current()
+        .ok_or(PpoError::InvalidTransition("arena test snapshot"))?
+        .tick;
+    defer_arena_events(
+        &mut seat,
+        tick,
+        vec![EventKind::ItemBought {
+            slot: SlotId(0),
+            item: bota_proto::ItemId(1),
+        }],
+    )?;
+    let deferred = seat.tracker.recent_events().len() == before && seat.pending_events.is_some();
+    flush_pending_events(std::slice::from_mut(&mut seat))?;
+    Ok(deferred && seat.tracker.recent_events().len() == before + 1)
 }
 
 fn observe_arena_snapshot(

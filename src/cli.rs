@@ -249,8 +249,9 @@ fn run_pretrain(arguments: PretrainArgs) -> std::io::Result<()> {
     )
     .map_err(std::io::Error::other)?;
     println!(
-        "pretraining: samples={} held_out={} optimizer_steps={} loss={:.6} kind_agreement={:.6} full_agreement={:.6} map0_validation_progress={} map1_validation_wins={} gameplay_validation_failures={} fingerprint={:016x} actions={:?}",
+        "pretraining: samples={} validation={} held_out={} optimizer_steps={} loss={:.6} kind_agreement={:.6} full_agreement={:.6} map0_validation_progress={} map1_validation_wins={} gameplay_validation_failures={} fingerprint={:016x} actions={:?}",
         report.training_samples,
+        report.validation_samples,
         report.held_out_samples,
         report.optimizer_steps,
         report.final_loss,
@@ -401,7 +402,7 @@ fn run_train(arguments: TrainArgs) -> std::io::Result<()> {
     )
     .map_err(std::io::Error::other)?;
     println!(
-        "PPO smoke: {} updates, {} transitions, optimizer step {}, policy loss {:.6}, value loss {:.6}, entropy {:.6}, KL {:.6}, {} rejected orders, {} arena ticks",
+        "PPO smoke: {} updates, {} transitions, optimizer step {}, policy loss {:.6}, value loss {:.6}, entropy {:.6}, KL {:.6}, terminal wins {}, terminal losses {}, terminal draws {}, {} rejected orders, {} arena ticks",
         report.updates,
         report.transitions,
         report.optimizer_step,
@@ -409,6 +410,9 @@ fn run_train(arguments: TrainArgs) -> std::io::Result<()> {
         report.final_value_loss,
         report.final_entropy,
         report.final_kl,
+        report.terminal_wins,
+        report.terminal_losses,
+        report.terminal_draws,
         report.rejected_orders,
         report.elapsed_ticks,
     );
@@ -446,7 +450,7 @@ fn run_train_full(arguments: TrainFullArgs) -> std::io::Result<()> {
         arguments.initial_weights.as_deref(),
         |checkpoint| {
             println!(
-                "checkpoint: update {}, samples {}, optimizer step {}, policy loss {:.6}, value loss {:.6}, entropy {:.6}, KL {:.6}, KL stop {}, terminal wins {}, terminal losses {}, terminal draws {}, rejected {}, ticks {}",
+                "checkpoint: update {}, samples {}, optimizer step {}, policy loss {:.6}, value loss {:.6}, entropy {:.6}, KL {:.6}, KL stop {}, session terminal wins {}, session terminal losses {}, session terminal draws {}, session rejected {}, session ticks {}",
                 checkpoint.completed_updates,
                 checkpoint.rollout_samples,
                 checkpoint.optimizer_step,
@@ -468,7 +472,7 @@ fn run_train_full(arguments: TrainFullArgs) -> std::io::Result<()> {
     )
     .map_err(std::io::Error::other)?;
     println!(
-        "training complete: starting fingerprint {:016x}, {} updates, {} samples, optimizer step {}, policy loss {:.6}, value loss {:.6}, entropy {:.6}, KL {:.6}, terminal wins {}, terminal losses {}, terminal draws {}, rejected {}, ticks {}",
+        "training complete: starting fingerprint {:016x}, {} updates, {} samples, optimizer step {}, policy loss {:.6}, value loss {:.6}, entropy {:.6}, KL {:.6}, session terminal wins {}, session terminal losses {}, session terminal draws {}, session rejected {}, session ticks {}",
         report.starting_policy_fingerprint,
         report.completed_updates,
         report.rollout_samples,

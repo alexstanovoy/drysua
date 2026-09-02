@@ -7,10 +7,10 @@ use bota_proto::{
 
 use crate::feature::RaggedFeatureArena;
 use crate::{
-    ABILITY_FEATURE_TOKENS, ABILITY_FEATURES, ActionKind, ActionSpace, FEATURE_SCHEMA_HASH,
-    FEATURE_SCHEMA_VERSION, FeatureAuditConfig, FeatureEncoder, FeatureFrame, GLOBAL_FEATURES,
-    HISTORY_FEATURES, HISTORY_SAMPLES, ITEM_FEATURE_TOKENS, ITEM_FEATURES, IssuedOrder,
-    ItemReadiness, LOOT_FEATURE_TOKENS, LOOT_FEATURES, LocalPolicyState, MAP_FEATURES,
+    ABILITY_FEATURE_TOKENS, ABILITY_FEATURES, ActionKind, ActionSpace, FEATURE_SCHEMA_DESCRIPTOR,
+    FEATURE_SCHEMA_HASH, FEATURE_SCHEMA_VERSION, FeatureAuditConfig, FeatureEncoder, FeatureFrame,
+    GLOBAL_FEATURES, HISTORY_FEATURES, HISTORY_SAMPLES, ITEM_FEATURE_TOKENS, ITEM_FEATURES,
+    IssuedOrder, ItemReadiness, LOOT_FEATURE_TOKENS, LOOT_FEATURES, LocalPolicyState, MAP_FEATURES,
     MAX_POLICY_HISTORY, OWN_UNIT_FEATURE_TOKENS, POINT_FEATURE_TOKENS, POINT_FEATURES,
     POLICY_HISTORY_FEATURES, PROJECTILE_FEATURE_TOKENS, PROJECTILE_FEATURES, PolicyLane,
     PolicyRole, REMEMBERED_UNIT_FEATURE_TOKENS, SHADOW_FIEND, StateTracker, UNIT_FEATURE_TOKENS,
@@ -26,8 +26,8 @@ const ENEMY: EntityId = entity(20, 1);
 
 #[test]
 fn feature_schema_dimensions_and_hash_are_stable() {
-    assert_eq!(FEATURE_SCHEMA_VERSION, 5);
-    assert_eq!(FEATURE_SCHEMA_HASH, 915_600_107_964_374_298);
+    assert_eq!(FEATURE_SCHEMA_VERSION, 6);
+    assert_eq!(FEATURE_SCHEMA_HASH, 7_342_404_552_083_153_243);
     assert_eq!(GLOBAL_FEATURES, 64);
     assert_eq!((HISTORY_SAMPLES, HISTORY_FEATURES), (7, 24));
     assert_eq!((MAX_POLICY_HISTORY, POLICY_HISTORY_FEATURES), (16, 4));
@@ -40,6 +40,9 @@ fn feature_schema_dimensions_and_hash_are_stable() {
     assert_eq!((PROJECTILE_FEATURE_TOKENS, PROJECTILE_FEATURES), (32, 20));
     assert_eq!((LOOT_FEATURE_TOKENS, LOOT_FEATURES), (16, 16));
     assert_eq!(MAP_FEATURES, 96);
+    assert!(FEATURE_SCHEMA_DESCRIPTOR.contains("48:active_target_present"));
+    assert!(FEATURE_SCHEMA_DESCRIPTOR.contains("59-63:reserved"));
+    assert!(!FEATURE_SCHEMA_DESCRIPTOR.contains("48-63:reserved"));
 }
 
 #[test]

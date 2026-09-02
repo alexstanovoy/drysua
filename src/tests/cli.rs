@@ -87,7 +87,7 @@ fn cli_accepts_resumable_training_job_parameters() {
         "--checkpoint-seconds",
         "300",
         "--checkpoint-directory",
-        "artifacts/training",
+        "artifacts/temp/training",
         "--resume",
         "--migrate-provenance",
         "--device",
@@ -104,7 +104,7 @@ fn cli_rejects_provenance_migration_without_resume() {
         "--updates",
         "10000",
         "--checkpoint-directory",
-        "artifacts/training",
+        "artifacts/temp/training",
         "--migrate-provenance",
     ])
     .expect_err("migration requires resume");
@@ -122,7 +122,7 @@ fn cli_accepts_initial_weights_for_fresh_training() {
         "--checkpoint-directory",
         "training/ppo-v1",
         "--initial-weights",
-        "training/pretrain-v1",
+        "artifacts/temp/pretrain-v1",
     ])
     .expect("fresh initialized training CLI");
 }
@@ -137,7 +137,7 @@ fn cli_rejects_initial_weights_when_resuming() {
         "--checkpoint-directory",
         "training/ppo-v1",
         "--initial-weights",
-        "training/pretrain-v1",
+        "artifacts/temp/pretrain-v1",
         "--resume",
     ])
     .expect_err("resume already restores exact model state");
@@ -183,7 +183,7 @@ fn cli_accepts_bounded_teacher_pretraining() {
         "drysua",
         "pretrain",
         "--output-directory",
-        "training/pretrain-maps",
+        "artifacts/temp/pretrain-maps",
         "--epochs",
         "8",
         "--seed",
@@ -200,7 +200,7 @@ fn cli_rejects_partial_map_teacher_pretraining() {
         "drysua",
         "pretrain",
         "--output-directory",
-        "training/pretrain-map1",
+        "artifacts/temp/pretrain-map1",
         "--map",
         "1",
     ])

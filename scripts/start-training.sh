@@ -9,6 +9,16 @@ fi
 
 repository=$(realpath "$(dirname "$0")/..")
 simulator_repository=$(realpath "$repository/../bota")
+if [[ -L $repository/artifacts || ! -d $repository/artifacts ]]; then
+    printf 'artifact root must be a real directory below the repository.\n' >&2
+    exit 2
+fi
+mkdir -p "$repository/artifacts/temp"
+if [[ -L $repository/artifacts/temp ]]; then
+    printf 'temporary artifact root must not be a symbolic link.\n' >&2
+    exit 2
+fi
+temporary_artifacts=$(realpath "$repository/artifacts/temp")
 run_directory=$(realpath -m "$1")
 total_updates=${2:-50000}
 mode=${3:-fresh}
@@ -17,9 +27,8 @@ log_file="$run_directory/training.log"
 pid_file="$run_directory/training.pid"
 binary="$repository/target/release/drysua"
 
-if [[ $run_directory == "$repository" || $run_directory == "$repository/"* \
-    || $run_directory == "$simulator_repository" || $run_directory == "$simulator_repository/"* ]]; then
-    printf 'RUN_DIRECTORY must be outside the source repository.\n' >&2
+if [[ $run_directory != "$temporary_artifacts/"* ]]; then
+    printf 'RUN_DIRECTORY must be below %s.\n' "$temporary_artifacts" >&2
     exit 2
 fi
 

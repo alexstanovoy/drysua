@@ -33,7 +33,49 @@ fn ppo_defaults_match_stage_nine_plan() {
     assert_eq!(config.entropy_coefficient, 0.01);
     assert_eq!(config.gae_lambda, 0.98);
     assert_eq!(config.target_kl, 0.02);
-    assert_eq!(PPO_TERMINAL_REWARD, PPO_SHAPING_BUDGET);
+    assert_eq!(PPO_TERMINAL_REWARD, 101.0);
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn actor_report_merge_retains_all_terminal_telemetry() {
+    let mut aggregate = crate::PpoSmokeReport {
+        terminal_wins: 1,
+        terminal_losses: 2,
+        terminal_draws: 3,
+        rejected_orders: 4,
+        elapsed_ticks: 5,
+        ..crate::PpoSmokeReport::default()
+    };
+    let actor = crate::PpoSmokeReport {
+        terminal_wins: 6,
+        terminal_losses: 7,
+        terminal_draws: 8,
+        rejected_orders: 9,
+        elapsed_ticks: 10,
+        ..crate::PpoSmokeReport::default()
+    };
+
+    crate::merge_actor_report_for_test(&mut aggregate, actor).expect("merge actor report");
+
+    assert_eq!(aggregate.terminal_wins, 7);
+    assert_eq!(aggregate.terminal_losses, 9);
+    assert_eq!(aggregate.terminal_draws, 11);
+    assert_eq!(aggregate.rejected_orders, 13);
+    assert_eq!(aggregate.elapsed_ticks, 15);
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn actor_report_rejection_delta_does_not_recount_prior_updates() {
+    assert_eq!(crate::rejection_delta_for_test(1, 1).expect("no delta"), 0);
+    assert_eq!(crate::rejection_delta_for_test(1, 2).expect("one delta"), 1);
+    assert_eq!(
+        crate::rejection_delta_for_test(2, 1)
+            .expect_err("counter regression")
+            .to_string(),
+        "invalid PPO transition: arena rejection counter regressed"
+    );
 }
 
 #[test]
@@ -79,9 +121,9 @@ fn rollout_compacts_sparse_tokens_and_bit_packs_behavioral_masks_losslessly() {
 
 #[test]
 fn ppo_schema_and_rules_audit_are_stable() {
-    assert_eq!(PPO_SCHEMA_VERSION, 8);
-    assert_eq!(PPO_RULES_AUDIT_VERSION, 8);
-    assert_eq!(PPO_SCHEMA_HASH, 5_799_284_812_594_397_948);
+    assert_eq!(PPO_SCHEMA_VERSION, 9);
+    assert_eq!(PPO_RULES_AUDIT_VERSION, 9);
+    assert_eq!(PPO_SCHEMA_HASH, 3_472_679_473_598_337_579);
 }
 
 #[test]
@@ -453,6 +495,7 @@ fn reward_shaping_is_bounded_and_terminal_result_dominates() {
     assert!(shaping.abs() <= PPO_SHAPING_BUDGET + 1.0e-5);
     assert_eq!(win.terminal, PPO_TERMINAL_REWARD);
     assert!(win.total >= PPO_TERMINAL_REWARD - 1.0e-5);
+    assert_eq!(PPO_TERMINAL_REWARD - PPO_SHAPING_BUDGET, 1.0);
 }
 
 #[test]
@@ -638,7 +681,7 @@ fn training_job_checkpoints_and_resumes_from_the_next_update() {
     let directory = training_test_directory("resume");
     let mut settings = crate::TrainingJobConfig {
         updates: 1,
-        environments: 1,
+        environments: 2,
         rollout_decisions: 2,
         epochs: 1,
         minibatch: 2,
@@ -752,7 +795,7 @@ fn fresh_training_loads_the_requested_runtime_weights_before_the_first_update() 
         .fingerprint();
     let settings = crate::TrainingJobConfig {
         updates: 1,
-        environments: 1,
+        environments: 2,
         rollout_decisions: 2,
         epochs: 1,
         minibatch: 2,
@@ -778,6 +821,38 @@ fn fresh_training_loads_the_requested_runtime_weights_before_the_first_update() 
     assert_eq!(report.completed_updates, 1);
     std::fs::remove_dir_all(weights_directory).expect("remove initial weights");
     std::fs::remove_dir_all(checkpoint_directory).expect("remove checkpoint directory");
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn production_training_rejects_an_unpaired_environment_count() {
+    let directory = training_test_directory("odd-environments");
+    let error = crate::run_training_job_on(
+        crate::TrainingJobConfig {
+            updates: 1,
+            environments: 1,
+            rollout_decisions: 2,
+            epochs: 1,
+            minibatch: 2,
+            checkpoint_cadence: crate::TrainingCheckpointCadence::Updates(1),
+            resume_provenance: crate::ResumeProvenance::Strict,
+            seed: 23_079,
+            map: bota_proto::MapId(1),
+            git_commit: "test-drysua-commit".to_owned(),
+            simulator_commit: "test-bota-commit".to_owned(),
+        },
+        crate::PolicyDevice::Cpu,
+        &directory,
+        false,
+        |_| {},
+    )
+    .expect_err("production arenas require complete side pairs");
+
+    assert_eq!(
+        error.to_string(),
+        "invalid PPO config field: training environments"
+    );
+    std::fs::remove_dir_all(directory).expect("remove checkpoint directory");
 }
 
 #[cfg(feature = "builtin")]
@@ -908,7 +983,7 @@ fn production_warmup_runs_the_frozen_policy_against_the_scheduled_opponent() {
     let orders = crate::production_warmup_order_counts_for_test(&model, 16)
         .expect("policy warmup against Weak");
 
-    assert_eq!(orders, [2, 2]);
+    assert_eq!(orders, [1, 0]);
 }
 
 #[cfg(feature = "builtin")]
@@ -932,7 +1007,7 @@ fn production_seed_derivation_accepts_maximum_seed_without_overflow() {
 #[cfg(feature = "builtin")]
 #[test]
 fn teacher_pretraining_collection_is_balanced_bounded_and_diverse() {
-    const EXPECTED_MAP_ONE_SAMPLES: u64 = 3_600;
+    const EXPECTED_MAP_ONE_SAMPLES: u64 = 3_939;
     let (samples, actions, splits) =
         crate::collect_pretraining_summary_for_test(50_001).expect("pretraining collection");
     println!("samples={samples} actions={actions:?} splits={splits:?}");
@@ -950,18 +1025,22 @@ fn teacher_pretraining_collection_is_balanced_bounded_and_diverse() {
     assert!(actions[0].iter().filter(|count| **count != 0).count() >= 2);
     assert!(actions[1][ActionKind::MovePoint.index()] > 0);
     assert!(actions[1][ActionKind::AttackMovePoint.index()] > 0);
+    assert!(actions[2][ActionKind::MovePoint.index()] > 0);
+    assert!(actions[2][ActionKind::AttackMovePoint.index()] > 0);
     assert!(actions[0][ActionKind::Continue.index()] > actions[0][ActionKind::MovePoint.index()]);
     assert!(
         actions[0][ActionKind::Continue.index()] > actions[0][ActionKind::AttackMovePoint.index()]
     );
     assert_eq!(actions[0][ActionKind::Continue.index()], 1_536);
-    assert_eq!(actions[1][ActionKind::Continue.index()], 504);
+    assert_eq!(actions[1][ActionKind::Continue.index()], 336);
+    assert_eq!(actions[2][ActionKind::Continue.index()], 336);
     for kind in ActionKind::ALL
         .into_iter()
         .filter(|kind| *kind != ActionKind::Continue)
     {
         assert!(actions[0][kind.index()] <= 192);
-        assert!(actions[1][kind.index()] <= 96);
+        assert!(actions[1][kind.index()] <= 64);
+        assert!(actions[2][kind.index()] <= 64);
     }
     assert!(
         actions[0].iter().copied().max().expect("action maximum") * 100
@@ -1022,6 +1101,15 @@ fn deployment_uses_the_audited_teacher_only_for_map_zero() {
     assert!(!crate::deployment_uses_teacher_for_test(bota_proto::MapId(
         2
     )));
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn arena_defers_current_snapshot_events_until_after_the_policy_decision() {
+    assert!(
+        crate::arena_current_tick_events_are_deferred_for_test()
+            .expect("arena event decision boundary")
+    );
 }
 
 #[cfg(feature = "builtin")]

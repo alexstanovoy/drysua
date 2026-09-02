@@ -643,7 +643,7 @@ DAgger:
 5. Модель дообучается.
 
 Статус: программный контракт реализован. Identifier-free targets строятся только из
-точной пары FeatureFrame/ActionSpace; Map 1 pool и effective batch ограничены 8192 samples,
+точной пары FeatureFrame/ActionSpace; Map 1 pool ограничен 9216 samples, effective batch — 8192,
 autograd microbatch — 64. Masked BC, host gradient accumulation, Adam с
 `epsilon=1e-8` и clip 0.5, deterministic shuffle, side metrics, seed namespaces,
 early stopping и строгий in-memory checkpoint входят в один deterministic CPU path.
@@ -665,13 +665,15 @@ Policy model, Adam и trainer связаны checked process-local model/optimiz
 monotonic parameter revision. Raw parameter import увеличивает revision и снимает
 optimizer ownership. HeldOut, rollout и каждый structural per-seed paired gameplay report
 содержат одну точную `PolicyIdentity`; gate дополнительно сравнивает её с live model.
-Fixed pretraining использует четыре teacher seeds и четыре DAgger seeds на Map 1.
+Fixed pretraining использует четыре teacher seeds и четыре DAgger seeds на Map 1,
+два отдельных Validation seeds для stage selection и два ни разу не просмотренных
+HeldOut seeds для финального agreement gate.
 Deployment на Map 0 использует audited seat-visible Teacher, а Map 1 — model с узким
 safety/objective shield. Финальный независимый seed требует две Map 1 победы и Map 0
 Teacher structure progress с обеих сторон до сохранения runtime weights.
 Promotion не принимает empty/one-family action corpus или zero-score gameplay; side
 coverage и action distribution должны быть представлены из фактических samples.
-Promotion gate остаётся data-dependent: пороги 95%/100%/0.1% и gameplay parity не
+Promotion gate остаётся data-dependent: agreement, полное coverage и gameplay gates не
 считаются достигнутыми без отдельного обученного match corpus.
 Файловая serialization, content hash и atomic rename остаются отложены до этапа 18;
 этап 8 хранит и строго восстанавливает checkpoint только в памяти.
@@ -752,15 +754,18 @@ nonterminal state. Builtin smoke держит одного learner seat прот
 Текущий model tensor path остаётся CPU-only согласно этапу 7. CUDA actor-learner,
 double buffering и массовое использование RTX относятся к этапу 17; этап 9 не добавляет
 CUDA supply-chain/build complexity и не выдаёт короткий smoke за GPU benchmark.
-Current PPO contract: schema v8, hash `5799284812594397948`, rules audit v8.
+Arena принимает policy decision после Snapshot, но до Events того же tick, как network
+deployment, и не принимает решений до первого tick после pregame. Production arenas
+образуют полные frozen-policy side pairs.
+Current PPO contract: schema v9, hash `3472679473598337579`, rules audit v9.
 
 ## 15. Reward
 
 Terminal reward:
 
 ```text
-win  = +100
-loss = -100
+win  = +101
+loss = -101
 draw or training timeout = отдельный adjudication result
 ```
 
@@ -832,7 +837,7 @@ Truncated matches считаются Draw и не превращаются в п
 промежуточным public statistics. Promotion требует минимум 20 disjoint paired seeds,
 1000 candidate actions, rejection rate ниже 0.1%, отсутствия regression на каждой стороне
 и opaque exploit audit, привязанный к candidate и accepted fingerprints. Stage-ten
-Current league contract: schema v9, hash `13472481283297382630`, rules audit v8.
+Current league contract: schema v10, hash `5375326685330706958`, rules audit v9.
 
 ## 17. GPU и actor-learner pipeline
 
@@ -880,7 +885,7 @@ Padding выполняется только при сборке minibatch.
 Metal выбираются явно через `PolicyDevice`; параметры, forward, loss и backward находятся на
 выбранном backend. Rollout хранит sparse token rows в typed arenas с проверяемыми offsets,
 bit-packed legal masks и разворачивает fixed padding только для текущего minibatch. Model
-schema v5, hash `4131398326042480440`; PPO schema v8, hash `5799284812594397948`.
+schema v6, hash `50716688465199424`; PPO schema v9, hash `3472679473598337579`.
 
 ## 18. Checkpoints
 
@@ -942,7 +947,8 @@ moment vectors; optimizer step, trainer update и shuffle state находятс
 schema до атомарной установки model+optimizer ownership. Save сохраняет immutable SHA-256
 generation, canonical tensor copy и recoverable manifest последним; каждый файл и directory
 fsync-ится. Двухфайловая копия остаётся independently loadable через hash-checked canonical
-fallback. Checkpoint schema v1, hash `2133011134179236231`.
+fallback. Runtime weights additionally bind PPO schema/version and rules audit metadata.
+Checkpoint schema v2, hash `4581258024746721724`.
 
 `drysua evaluate` загружает runtime artifact и всегда запускает фиксированную матрицу из обеих
 карт, teacher/weak baseline и обеих сторон на одинаковых held-out seeds. Timeout отделён от draw;

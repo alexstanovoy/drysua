@@ -175,6 +175,9 @@ pub(crate) fn active_order_update_for_sent(
     sent_kind: ActionKind,
 ) -> ActiveOrderUpdate {
     assert_eq!(persistence.last_sequence(), Some(sent_sequence));
+    if unit.is_some() {
+        return ActiveOrderUpdate::Preserve;
+    }
     let Some(active_sequence) = persistence.active_body_sequence_for(unit) else {
         assert!(persistence.active_body_order_for(unit).is_none());
         return ActiveOrderUpdate::Replace(None);

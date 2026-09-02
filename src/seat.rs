@@ -8,6 +8,9 @@ use crate::{
     StructuredAction, Teacher, TrainingArtifact, Wire, active_order_update_for_sent,
 };
 
+const MAX_MATCH_MESSAGES: usize = 16_777_216;
+const MAX_MESSAGES_WITHOUT_SNAPSHOT: usize = 4_096;
+
 /// The result observed by drysua for one match.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Outcome {
@@ -66,7 +69,14 @@ pub fn play_policy_on(
         ..Outcome::default()
     };
     let mut policy = None;
-    while let Some(message) = wire.hear()? {
+    let mut progress = MessageProgress::new();
+    for _ in 0..MAX_MATCH_MESSAGES {
+        let Some(message) = wire.hear()? else {
+            return Err(std::io::Error::other(
+                "server closed the connection before MatchOver",
+            ));
+        };
+        progress.observe(&message)?;
         if handle_policy_message(
             wire,
             seated,
@@ -79,9 +89,7 @@ pub fn play_policy_on(
             return Ok(outcome);
         }
     }
-    Err(std::io::Error::other(
-        "server closed the connection before MatchOver",
-    ))
+    Err(std::io::Error::other("server match message limit exceeded"))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -190,7 +198,14 @@ pub fn play_idle_on(
         slot: Some(seated.slot),
         ..Outcome::default()
     };
-    while let Some(message) = wire.hear()? {
+    let mut progress = MessageProgress::new();
+    for _ in 0..MAX_MATCH_MESSAGES {
+        let Some(message) = wire.hear()? else {
+            return Err(std::io::Error::other(
+                "server closed the connection before MatchOver",
+            ));
+        };
+        progress.observe(&message)?;
         match message {
             ServerMsg::MatchStart { info } => {
                 validate_match_terms(info.tick_rate, info.mode, seated)?;
@@ -229,9 +244,37 @@ pub fn play_idle_on(
             | ServerMsg::ParticipantLeft { .. } => {}
         }
     }
-    Err(std::io::Error::other(
-        "server closed the connection before MatchOver",
-    ))
+    Err(std::io::Error::other("server match message limit exceeded"))
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct MessageProgress {
+    without_snapshot: usize,
+}
+
+impl MessageProgress {
+    const fn new() -> Self {
+        Self {
+            without_snapshot: 0,
+        }
+    }
+
+    fn observe(&mut self, message: &ServerMsg) -> std::io::Result<()> {
+        if matches!(message, ServerMsg::Snapshot { .. }) {
+            self.without_snapshot = 0;
+            return Ok(());
+        }
+        self.without_snapshot = self
+            .without_snapshot
+            .checked_add(1)
+            .ok_or_else(|| std::io::Error::other("server no-snapshot counter overflowed"))?;
+        if self.without_snapshot > MAX_MESSAGES_WITHOUT_SNAPSHOT {
+            return Err(std::io::Error::other(
+                "server sent too many messages without a snapshot",
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl LivePolicy {
@@ -251,6 +294,9 @@ impl LivePolicy {
     }
 
     fn should_decide(&self, tick: u32) -> std::io::Result<bool> {
+        if !deployment_tick_is_active(tick, self.tracker.metadata().pregame_ticks) {
+            return Ok(false);
+        }
         let Some(previous) = self.last_decision_tick else {
             return Ok(true);
         };
@@ -309,7 +355,7 @@ impl LivePolicy {
         let update =
             active_order_update_for_sent(&self.persistence, issued.unit, sequence, action.kind());
         self.pending_active = match update {
-            ActiveOrderUpdate::Preserve => None,
+            ActiveOrderUpdate::Preserve => self.pending_active,
             ActiveOrderUpdate::Replace(None) if previous.is_none() => None,
             ActiveOrderUpdate::Replace(None) => {
                 self.local
@@ -383,6 +429,15 @@ impl LivePolicy {
         }
         Ok(())
     }
+}
+
+const fn deployment_tick_is_active(tick: u32, pregame_ticks: u32) -> bool {
+    tick > pregame_ticks
+}
+
+#[cfg(test)]
+pub(crate) const fn deployment_tick_is_active_for_test(tick: u32, pregame_ticks: u32) -> bool {
+    deployment_tick_is_active(tick, pregame_ticks)
 }
 
 fn validate_snapshot(outcome: &Outcome, viewer: Option<Team>, tick: u32) -> std::io::Result<()> {

@@ -60,6 +60,29 @@ fn active_order_update_preserves_body_across_non_interrupting_order() {
 }
 
 #[test]
+fn active_order_update_preserves_hero_feature_across_courier_body_order() {
+    let courier = EntityId {
+        idx: 9,
+        generation: 1,
+    };
+    let courier_move = issued_for(
+        Some(courier),
+        Order::Move {
+            target: Target::Pos(Vec2::from_ints(1_000, 1_000)),
+        },
+    );
+    let mut persistence = OrderPersistence::default();
+    persistence
+        .record_sent(1, courier_move)
+        .expect("courier move");
+
+    let update =
+        active_order_update_for_sent(&persistence, Some(courier), 1, ActionKind::MovePoint);
+
+    assert_eq!(update, ActiveOrderUpdate::Preserve);
+}
+
+#[test]
 fn active_order_update_replaces_body_with_new_body_kind() {
     let body = issued(Order::Move {
         target: Target::Pos(Vec2::from_ints(10, 20)),

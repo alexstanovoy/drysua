@@ -19,9 +19,9 @@ use crate::{
 
 const CHECKPOINT_MAGIC: &[u8; 8] = b"DRYCKP18";
 /// Version of the strict on-disk tensor and manifest contract.
-pub const CHECKPOINT_SCHEMA_VERSION: u32 = 1;
+pub const CHECKPOINT_SCHEMA_VERSION: u32 = 2;
 /// Canonical strict checkpoint contract descriptor.
-pub const CHECKPOINT_SCHEMA_DESCRIPTOR: &str = "bota-drysua-checkpoint/v1;files=checkpoint.safetensors,checkpoint.meta,drysua.weights.safetensors,immutable_sha256_tensor_generation;tensors=model.parameters,adam.first_moment,adam.second_moment;dtype=f32;load=exact_names_shapes_dtype_finite_schema_sha256,canonical_tensor_fallback;manifest=git_simulator_features_scope_seed_device_batch_command_rules_progress_rng_curriculum_league;save=immutable_generation,canonical_copy,recoverable_manifest_commit_last,file_and_directory_fsync;";
+pub const CHECKPOINT_SCHEMA_DESCRIPTOR: &str = "bota-drysua-checkpoint/v2;files=checkpoint.safetensors,checkpoint.meta,drysua.weights.safetensors,immutable_sha256_tensor_generation;tensors=model.parameters,adam.first_moment,adam.second_moment;dtype=f32;runtime_metadata=action_feature_model_ppo_schema_hashes,ppo_schema_version,ppo_rules_audit_version;load=exact_names_shapes_dtype_finite_schema_sha256,canonical_tensor_fallback;manifest=git_simulator_features_scope_seed_device_batch_command_rules_progress_rng_curriculum_league;save=immutable_generation,canonical_copy,recoverable_manifest_commit_last,file_and_directory_fsync;";
 /// Stable FNV-1a hash of [`CHECKPOINT_SCHEMA_DESCRIPTOR`].
 pub const CHECKPOINT_SCHEMA_HASH: u64 = checkpoint_fnv1a(CHECKPOINT_SCHEMA_DESCRIPTOR.as_bytes());
 const CHECKPOINT_TENSOR_FILE: &str = "checkpoint.safetensors";
@@ -609,7 +609,14 @@ fn serialize_training_tensors(artifact: &TrainingArtifact) -> Result<Vec<u8>, Ch
 }
 
 fn serialize_runtime_tensor(parameters: &[f32]) -> Result<Vec<u8>, CheckpointError> {
-    let metadata = HashMap::from([
+    serialize_named_tensors(
+        &[("model.parameters", parameters)],
+        Some(runtime_tensor_metadata()),
+    )
+}
+
+fn runtime_tensor_metadata() -> HashMap<String, String> {
+    HashMap::from([
         (
             "action_schema_hash".to_owned(),
             ACTION_SCHEMA_HASH.to_string(),
@@ -622,8 +629,16 @@ fn serialize_runtime_tensor(parameters: &[f32]) -> Result<Vec<u8>, CheckpointErr
             "model_schema_hash".to_owned(),
             MODEL_SCHEMA_HASH.to_string(),
         ),
-    ]);
-    serialize_named_tensors(&[("model.parameters", parameters)], Some(metadata))
+        (
+            "ppo_rules_audit_version".to_owned(),
+            PPO_RULES_AUDIT_VERSION.to_string(),
+        ),
+        ("ppo_schema_hash".to_owned(), PPO_SCHEMA_HASH.to_string()),
+        (
+            "ppo_schema_version".to_owned(),
+            PPO_SCHEMA_VERSION.to_string(),
+        ),
+    ])
 }
 
 fn serialize_named_tensors(
@@ -667,20 +682,7 @@ fn decode_training_tensors(bytes: &[u8]) -> Result<DecodedTensors, CheckpointErr
 fn decode_runtime_tensor(bytes: &[u8]) -> Result<Vec<f32>, CheckpointError> {
     let (_, metadata) = SafeTensors::read_metadata(bytes)
         .map_err(|error| CheckpointError::Backend(error.to_string()))?;
-    let expected = HashMap::from([
-        (
-            "action_schema_hash".to_owned(),
-            ACTION_SCHEMA_HASH.to_string(),
-        ),
-        (
-            "feature_schema_hash".to_owned(),
-            FEATURE_SCHEMA_HASH.to_string(),
-        ),
-        (
-            "model_schema_hash".to_owned(),
-            MODEL_SCHEMA_HASH.to_string(),
-        ),
-    ]);
+    let expected = runtime_tensor_metadata();
     if metadata.metadata().as_ref() != Some(&expected) {
         return Err(CheckpointError::SchemaMismatch);
     }

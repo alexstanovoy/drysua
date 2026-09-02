@@ -22,7 +22,7 @@ use crate::{
 };
 
 /// Version of the append-only policy feature schema.
-pub const FEATURE_SCHEMA_VERSION: u32 = 5;
+pub const FEATURE_SCHEMA_VERSION: u32 = 6;
 /// Number of scalar global features.
 pub const GLOBAL_FEATURES: usize = 64;
 /// Number of scalar features in one global-history sample.
@@ -362,7 +362,7 @@ pub mod loot_feature {
 
 /// Canonical schema text covered by [`FEATURE_SCHEMA_HASH`].
 pub const FEATURE_SCHEMA_DESCRIPTOR: &str = concat!(
-    "bota-drysua-feature/v5;",
+    "bota-drysua-feature/v6;",
     "shapes=global:64,history:7x24,policy_history:16x4,unit:96x69,own_unit:2x69,remembered_unit:32x69,point:48x32,ability:14x24,item:85x28,projectile:32x20,loot:16x16,map:96;",
     "scalar_ranges=presence_and_one_hot:[0,1],unsigned_continuous:[0,1],signed_continuous:[-1,1],category:positive_exact_integer,all_finite;",
     "history_ages=480,240,120,60,30,15,0;",
@@ -396,7 +396,7 @@ pub const FEATURE_SCHEMA_DESCRIPTOR: &str = concat!(
     "provenance=private_nonzero_checked_tracker_lineage_clone_gets_fresh_lineage_move_preserves_lineage,action_space_exact_bounded_lineage_slot_static_snapshot_tracker_comparison,readiness_exact_bounded_comparison,observation_exact_bounded_lineage_slot_static_snapshot_tracker_comparison,encoder_static_exact_bounded_comparison,no_correctness_claim_for_fnv_schema_hash;",
     "audit=enemy_scoreboard_disabled_by_default,global47_and_history23_presence,disabled_zeros_enemy_alive_and_score_xp_level_kda_last_hit_deny_advantages;",
     "ids=entity_match_seed_tracker_lineage_excluded_from_frame,entity_full_handle_only_memory_key_and_final_identical_tie,ability_and_item_semantic_categories_visible;",
-    "global_indices=0:tick,1:pregame,2:wave,3:jungle,4:radiant,5:dire,6:map0,7:map1,8:seats,9:role_present,10:role,11:lane_present,12:lane,13:kill_adv,14:death_adv,15:assist_adv,16:xp_adv,17:level_adv,18:lh_adv,19:deny_adv,20:gold,21:assets,22:respawn_present,23:respawn,24:alive,25:allied_alive,26:enemy_alive,27:allied_structure_hp,28:enemy_structure_hp,29:destroyed_present,30:destroyed,31:order_present,32:order,33:order_age,34:decision_present,35:decision_age,36:damage_dealt,37:damage_taken,38:level,39:xp,40:kills,41:deaths,42:assists,43:lh,44:denies,45:allied_visible,46:enemy_visible,47:enemy_scoreboard_enabled,48-63:reserved;",
+    "global_indices=0:tick,1:pregame,2:wave,3:jungle,4:radiant,5:dire,6:map0,7:map1,8:seats,9:role_present,10:role,11:lane_present,12:lane,13:kill_adv,14:death_adv,15:assist_adv,16:xp_adv,17:level_adv,18:lh_adv,19:deny_adv,20:gold,21:assets,22:respawn_present,23:respawn,24:alive,25:allied_alive,26:enemy_alive,27:allied_structure_hp,28:enemy_structure_hp,29:destroyed_present,30:destroyed,31:order_present,32:order,33:order_age,34:decision_present,35:decision_age,36:damage_dealt,37:damage_taken,38:level,39:xp,40:kills,41:deaths,42:assists,43:lh,44:denies,45:allied_visible,46:enemy_visible,47:enemy_scoreboard_enabled,48:active_target_present,49:active_target_point,50:active_target_unit,51:active_target_visible,52:active_target_relative_x,53:active_target_relative_y,54:active_target_distance,55:active_target_kind,56:active_target_allied,57:active_target_enemy,58:active_target_neutral,59-63:reserved;",
     "history_indices=0:present,1:age,2:hp_present,3:hp,4:mana_present,5:mana,6:level,7:gold,8:alive,9:respawn,10:allied_visible,11:enemy_visible,12:xp_adv,13:level_adv,14:kill_adv,15:death_adv,16:assist_adv,17:lh_adv,18:deny_adv,19:allied_structure_hp,20:enemy_structure_hp,21:destroyed_present,22:destroyed,23:enemy_scoreboard_enabled;",
     "policy_history_indices=0:present,1:age,2:kind_present,3:kind;",
     "unit_indices=0:present,1-4:relation,5:kind,6-8:owner_relation,9:owner_present,10:observation,11:visible,12:remembered,13:origin_present,14:age,15-16:position,17-18:relative,19:distance,20-21:direction,22:facing,23:radius,24:velocity_present,25-26:velocity,27:hp_present,28:elevation,29:walkable,30:hp,31:mana_present,32:mana,33:hp_delta_present,34:hp_delta,35:mana_delta_present,36:mana_delta,37:attack_damage,38:attack_range,39:attack_interval,40:attack_speed,41:move_speed,42:armor,43:magic_resistance,44:vision,45:true_sight,46:attacks_present,47:attacks,48:reach_present,49:reach,50-51:mutual_range,52-60:statuses,61:damage_taken,62:damage_dealt_present,63:damage_dealt,64:attack_phase_present,65:attack_phase,66:item_slot_count,67:free_item_slots,68:item_capacity_available;",
@@ -406,7 +406,7 @@ pub const FEATURE_SCHEMA_DESCRIPTOR: &str = concat!(
     "projectile_indices=0:present,1-4:relation,5:ability_present,6:ability,7-8:relative,9:facing,10:velocity_present,11-12:velocity,13:age_present,14:age,15:approach_present,16:approach,17:origin_present,18-19:reserved;",
     "loot_indices=0:present,1:item,2:charges_present,3:charges,4-5:relative,6:direct_distance,7:path_present,8:path,9:age_present,10:age,11:origin_present,12-15:reserved;",
     "map_indices=0:present,1:walkable,2:water,3:elevation,4:opaque,5:tree,6-13:landmark_presence_distance_pairs,14-15:reserved,16-95:eight_rays_each_four_presence_distance_pairs_plus_endpoint_elevation_walkable;",
-    "global_scalars=normalizers:tick3600000_pregame_ticks_wave30s_jungle60s_seats10_score1000_xp100000_gold100000_age4800_damage10000_hp100000_structures64_visible256_level30,categories:role1..5_lane1..3_action1..16_map_onehot_side_onehot,reserved:48..63;",
+    "global_scalars=normalizers:tick3600000_pregame_ticks_wave30s_jungle60s_seats10_score1000_xp100000_gold100000_age4800_damage10000_hp100000_structures64_visible256_level30_active_target_relative_extent_distance_extent,categories:role1..5_lane1..3_action1..16_map_onehot_side_onehot_active_target_kind1..12_relation_onehot3,reserved:59..63;",
     "history_scalars=normalizers:age480_hp_ratio_mana_ratio_level30_gold100000_visible256_score1000_xp100000_hp100000_structures64,categories:none,reserved:none;",
     "policy_history_scalars=normalizers:age4800,categories:action1..16,reserved:none;",
     "unit_scalars=normalizers:age480_position_extent_delta_extent_distance_extent_facing65535_radius_extent_hp_ratio_mana_ratio_damage10000_attack_range_fixed_max_attack_interval600_attack_speed2000_move_speed2000_armor_raw6553600_magic_resistance_fixed_max_vision_fixed_max_attacks100_reach4800_item_slots9,categories:relation_onehot4_kind1..12_owner_relation_onehot3_status_bits9,reserved:none;",
@@ -432,7 +432,7 @@ const fn fnv1a(bytes: &[u8]) -> u64 {
     hash
 }
 
-/// Stable FNV-1a hash of the complete version-three schema descriptor.
+/// Stable FNV-1a hash of the complete feature schema descriptor.
 pub const FEATURE_SCHEMA_HASH: u64 = fnv1a(FEATURE_SCHEMA_DESCRIPTOR.as_bytes());
 
 /// One fixed-shape policy input frame owned by its caller.
