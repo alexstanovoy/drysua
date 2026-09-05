@@ -26,7 +26,7 @@ pub struct Outcome {
     pub rejections: u32,
     /// The latest rejection reason, or no reason when none was rejected.
     pub last_rejection: Option<RejectReason>,
-    /// Greedy model decisions completed at policy ticks.
+    /// Controller decisions completed at policy ticks.
     pub decisions: u32,
     /// Orders written to the connection after local deduplication.
     pub orders: u32,
@@ -42,6 +42,27 @@ struct LivePolicy {
     last_decision_tick: Option<u32>,
     pending_snapshot_tick: Option<u32>,
     pending_active: Option<(u32, Option<ActivePolicyOrder>)>,
+}
+
+#[derive(Clone, Copy)]
+enum LiveController<'model> {
+    Hybrid(&'model PolicyModel),
+    Teacher,
+}
+
+/// Connects and runs the deterministic Teacher on any supported map without weights.
+pub fn play_teacher(address: &str, name: &str, limit: Option<u32>) -> std::io::Result<Outcome> {
+    let (mut link, seated) = Link::join(address, name)?;
+    play_teacher_on(&mut link, seated, limit)
+}
+
+/// Runs the deterministic Teacher on an assigned match connection without a model.
+pub fn play_teacher_on(
+    wire: &mut impl Wire,
+    seated: Seated,
+    limit: Option<u32>,
+) -> std::io::Result<Outcome> {
+    play_controller_on(wire, seated, limit, LiveController::Teacher)
 }
 
 /// Loads deployment weights, connects, and runs greedy policy inference for one match.
@@ -65,6 +86,15 @@ pub fn play_policy_on(
     limit: Option<u32>,
     model: &PolicyModel,
 ) -> std::io::Result<Outcome> {
+    play_controller_on(wire, seated, limit, LiveController::Hybrid(model))
+}
+
+fn play_controller_on(
+    wire: &mut impl Wire,
+    seated: Seated,
+    limit: Option<u32>,
+    controller: LiveController<'_>,
+) -> std::io::Result<Outcome> {
     let mut outcome = Outcome {
         slot: Some(seated.slot),
         ..Outcome::default()
@@ -82,7 +112,7 @@ pub fn play_policy_on(
             wire,
             seated,
             limit,
-            model,
+            controller,
             &mut outcome,
             &mut policy,
             message,
@@ -98,7 +128,7 @@ fn handle_policy_message(
     wire: &mut impl Wire,
     seated: Seated,
     limit: Option<u32>,
-    model: &PolicyModel,
+    controller: LiveController<'_>,
     outcome: &mut Outcome,
     policy: &mut Option<LivePolicy>,
     message: ServerMsg,
@@ -132,7 +162,7 @@ fn handle_policy_message(
             return Ok(true);
         }
         ServerMsg::Events { tick, events } => {
-            handle_policy_events(wire, seated, model, outcome, policy, tick, &events)?;
+            handle_policy_events(wire, seated, controller, outcome, policy, tick, &events)?;
         }
         ServerMsg::Welcome { .. }
         | ServerMsg::LobbyState { .. }
@@ -184,7 +214,7 @@ fn handle_policy_snapshot(
 fn handle_policy_events(
     wire: &mut impl Wire,
     seated: Seated,
-    model: &PolicyModel,
+    controller: LiveController<'_>,
     outcome: &mut Outcome,
     policy: &mut Option<LivePolicy>,
     tick: u32,
@@ -194,7 +224,7 @@ fn handle_policy_events(
         .as_mut()
         .ok_or_else(|| std::io::Error::other("server sent Events before MatchStart"))?;
     policy.observe_events(tick, events)?;
-    policy.complete_snapshot_tick(wire, model, outcome, tick)?;
+    policy.complete_snapshot_tick(wire, controller, outcome, tick)?;
     if seated.mode == TickMode::Lockstep {
         wire.acknowledge(tick)?;
     }
@@ -350,7 +380,7 @@ impl LivePolicy {
     fn complete_snapshot_tick(
         &mut self,
         wire: &mut impl Wire,
-        model: &PolicyModel,
+        controller: LiveController<'_>,
         outcome: &mut Outcome,
         tick: u32,
     ) -> std::io::Result<()> {
@@ -361,7 +391,7 @@ impl LivePolicy {
         }
         self.pending_snapshot_tick = None;
         if self.should_decide(tick)? {
-            self.decide(wire, model, outcome)?;
+            self.decide(wire, controller, outcome)?;
         }
         Ok(())
     }
@@ -400,10 +430,10 @@ impl LivePolicy {
     fn decide(
         &mut self,
         wire: &mut impl Wire,
-        model: &PolicyModel,
+        controller: LiveController<'_>,
         outcome: &mut Outcome,
     ) -> std::io::Result<()> {
-        let (action, space) = self.select_action(model)?;
+        let (action, space) = self.select_action(controller)?;
         self.local
             .note_decision(space.tick(), action.kind())
             .map_err(std::io::Error::other)?;
@@ -450,14 +480,21 @@ impl LivePolicy {
 
     fn select_action(
         &mut self,
-        model: &PolicyModel,
+        controller: LiveController<'_>,
     ) -> std::io::Result<(StructuredAction, ActionSpace)> {
-        if self.tracker.metadata().map == bota_proto::MapId(0) {
-            return self
-                .teacher
-                .decide(&self.tracker, &self.persistence, &self.readiness)
-                .map_err(std::io::Error::other);
-        }
+        let model = match controller {
+            LiveController::Hybrid(model)
+                if self.tracker.metadata().map != bota_proto::MapId(0) =>
+            {
+                model
+            }
+            LiveController::Hybrid(_) | LiveController::Teacher => {
+                return self
+                    .teacher
+                    .decide(&self.tracker, &self.persistence, &self.readiness)
+                    .map_err(std::io::Error::other);
+            }
+        };
         let space = ActionSpace::from_tracker_with_readiness(&self.tracker, &self.readiness)
             .map_err(std::io::Error::other)?;
         let mut frame = FeatureFrame::new();

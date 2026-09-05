@@ -133,6 +133,117 @@ fn seat_loop_rejects_an_unbounded_message_stream_without_snapshots() {
 
 #[cfg(feature = "builtin")]
 #[test]
+fn teacher_seat_on_map_one_learns_without_a_model_and_acknowledges_ticks() {
+    let (mut arena, start) = crate::Arena::new(crate::ArenaConfig {
+        seats: 2,
+        map: MapId(1),
+        seed: 70_004,
+    })
+    .expect("arena");
+    let next = arena.step(&[None, None]).expect("next tick");
+    let mut messages = start.messages[0].clone();
+    messages.extend(next.messages[0].clone());
+    set_pregame_ticks(&mut messages, 0);
+    let mut wire = MockWire {
+        messages: messages.into(),
+        acknowledgements: Vec::new(),
+        orders: Vec::new(),
+    };
+
+    let outcome = crate::play_teacher_on(&mut wire, seated(TickMode::Lockstep), Some(2))
+        .expect("model-free Teacher seat");
+
+    assert_eq!(outcome.decisions, 1);
+    assert_eq!(outcome.orders, 1);
+    assert!(matches!(wire.orders[0].1, Order::Learn { .. }));
+    assert_eq!(wire.acknowledgements, [1, 2]);
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn teacher_seat_rejects_incomplete_snapshot_ticks() {
+    let (mut arena, start) = crate::Arena::new(crate::ArenaConfig {
+        seats: 2,
+        map: MapId(1),
+        seed: 70_005,
+    })
+    .expect("arena");
+    let next = arena.step(&[None, None]).expect("next tick");
+    let mut messages = start.messages[0].clone();
+    messages.extend(next.messages[0].clone());
+    messages.retain(|message| !matches!(message, ServerMsg::Events { .. }));
+    let mut wire = MockWire {
+        messages: messages.into(),
+        acknowledgements: Vec::new(),
+        orders: Vec::new(),
+    };
+
+    let error = crate::play_teacher_on(&mut wire, seated(TickMode::Lockstep), None)
+        .expect_err("tick completion is mandatory for Teacher too");
+
+    assert_eq!(
+        error.to_string(),
+        "server sent Snapshot before completing the previous tick"
+    );
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn teacher_tcp_cli_plays_map_one_without_weights() {
+    use std::{net::TcpListener, sync::mpsc, thread, time::Duration};
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind real server");
+    let address = listener.local_addr().expect("server address").to_string();
+    let (finished, completion) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let result = bota_server::game_loop::run(
+            listener,
+            bota_server::game_loop::ServerOpts {
+                mode: TickMode::Lockstep,
+                tick_rate: 30,
+                players: 2,
+                replay: None,
+                seed: 70_006,
+                map: MapId(1),
+                ack_timeout_ticks: 150,
+            },
+        );
+        finished.send(result).expect("server completion receiver");
+    });
+    let (mut idle, idle_seat) =
+        crate::Link::join_with_timeout(&address, "idle", Duration::from_secs(5))
+            .expect("idle Radiant seat");
+    assert_eq!(idle_seat.slot, SlotId(0));
+    let opponent = thread::spawn(move || play_idle_on(&mut idle, idle_seat, Some(1_010)));
+
+    crate::cli::run_from_for_test([
+        "drysua",
+        "play",
+        "--policy",
+        "teacher",
+        "--addr",
+        &address,
+        "--limit",
+        "1000",
+        "--weights-directory",
+        "artifacts/temp/nonexistent-teacher-weights",
+    ])
+    .expect("weights-free CLI plays real Map1 TCP match");
+
+    let opponent = opponent
+        .join()
+        .expect("opponent thread")
+        .expect("opponent result");
+    assert!(opponent.ticks >= 1_000);
+    assert_eq!(opponent.orders, 0);
+    completion
+        .recv_timeout(Duration::from_secs(5))
+        .expect("server exits within bound")
+        .expect("server result");
+}
+
+#[cfg(feature = "builtin")]
+#[test]
 fn deployment_seat_runs_loaded_policy_and_emits_an_order() {
     let (mut arena, start) = crate::Arena::new(crate::ArenaConfig {
         seats: 2,
@@ -167,6 +278,7 @@ fn deployment_seat_runs_loaded_policy_and_emits_an_order() {
     assert_eq!(outcome.decisions, 1);
     assert_eq!(outcome.orders, 1);
     assert_eq!(wire.orders.len(), 1);
+    assert!(matches!(wire.orders[0].1, Order::Move { .. }));
 }
 
 #[test]

@@ -69,6 +69,9 @@ struct EvaluateArgs {
 /// Options for one server match.
 #[derive(Args)]
 struct PlayArgs {
+    /// Hybrid deployment (requires weights), or the deterministic weights-free Teacher.
+    #[arg(long, value_enum, default_value_t = PlayPolicy::Hybrid)]
+    policy: PlayPolicy,
     /// Server socket address.
     #[arg(long, default_value = "127.0.0.1:4455")]
     addr: String,
@@ -78,9 +81,15 @@ struct PlayArgs {
     /// Leave after receiving this snapshot tick.
     #[arg(long, value_name = "TICKS")]
     limit: Option<u32>,
-    /// Directory containing drysua.weights.safetensors.
+    /// Directory containing drysua.weights.safetensors; ignored by Teacher.
     #[arg(long, default_value = ".")]
     weights_directory: std::path::PathBuf,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub(crate) enum PlayPolicy {
+    Hybrid,
+    Teacher,
 }
 
 /// Options for a short builtin PPO verification run.
@@ -222,7 +231,12 @@ fn run(arguments: Cli) -> std::io::Result<()> {
         Some(Operation::TrainFull(train)) => return run_train_full(train),
         None => arguments.play,
     };
-    let outcome = crate::play(&play.addr, &play.name, play.limit, &play.weights_directory)?;
+    let outcome = match play.policy {
+        PlayPolicy::Hybrid => {
+            crate::play(&play.addr, &play.name, play.limit, &play.weights_directory)?
+        }
+        PlayPolicy::Teacher => crate::play_teacher(&play.addr, &play.name, play.limit)?,
+    };
     println!(
         "played {} ticks as {:?}; winner {:?}; {} decisions, {} orders, {} rejected orders",
         outcome.ticks,
@@ -580,4 +594,28 @@ where
     T: Into<std::ffi::OsString> + Clone,
 {
     Cli::try_parse_from(arguments).map(|_| ())
+}
+
+#[cfg(test)]
+pub(crate) fn play_policy_for_test<I, T>(arguments: I) -> Result<PlayPolicy, clap::Error>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString> + Clone,
+{
+    let cli = Cli::try_parse_from(arguments)?;
+    let play = match cli.operation {
+        Some(Operation::Play(play)) => play,
+        None => cli.play,
+        _ => panic!("expected play arguments"),
+    };
+    Ok(play.policy)
+}
+
+#[cfg(test)]
+pub(crate) fn run_from_for_test<I, T>(arguments: I) -> std::io::Result<()>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString> + Clone,
+{
+    run(Cli::try_parse_from(arguments).map_err(std::io::Error::other)?)
 }

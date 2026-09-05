@@ -39,6 +39,24 @@ fn ppo_defaults_match_stage_nine_plan() {
 
 #[cfg(feature = "builtin")]
 #[test]
+#[ignore = "Bounded release evidence for the v0.0.1 Teacher fallback."]
+fn teacher_release_evaluation_reports_three_seeds_on_both_sides() {
+    for seed in [9_000_001, 9_000_002, 9_000_003] {
+        let games = crate::evaluate_teacher_against_weak_for_test(seed, 4_096)
+            .expect("bounded Teacher versus Weak evaluation");
+
+        assert_eq!(games.len(), 4);
+        for game in games {
+            println!("teacher_release {game:?}");
+            assert_eq!(game.seed, seed);
+            assert!((1..=4_096).contains(&game.decisions));
+            assert_eq!(game.action_counts.iter().sum::<u32>(), game.decisions);
+        }
+    }
+}
+
+#[cfg(feature = "builtin")]
+#[test]
 fn actor_report_merge_retains_all_terminal_telemetry() {
     let mut aggregate = crate::PpoSmokeReport {
         terminal_wins: 1,

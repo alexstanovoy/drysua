@@ -1,4 +1,47 @@
 #[test]
+fn cli_defaults_to_hybrid_for_implicit_and_explicit_play() {
+    for arguments in [vec!["drysua"], vec!["drysua", "play"]] {
+        assert_eq!(
+            crate::cli::play_policy_for_test(arguments).expect("play policy"),
+            crate::cli::PlayPolicy::Hybrid
+        );
+    }
+}
+
+#[test]
+fn cli_teacher_reaches_connection_validation_without_loading_weights() {
+    let error = crate::cli::run_from_for_test([
+        "drysua",
+        "play",
+        "--policy",
+        "teacher",
+        "--name",
+        "",
+        "--weights-directory",
+        "artifacts/temp/nonexistent-teacher-weights",
+    ])
+    .expect_err("empty name must fail before connecting");
+
+    assert_eq!(error.to_string(), "bot name must not be empty");
+}
+
+#[test]
+fn cli_accepts_teacher_for_implicit_play_and_rejects_unknown_policy() {
+    assert_eq!(
+        crate::cli::play_policy_for_test(["drysua", "--policy", "teacher"])
+            .expect("teacher policy"),
+        crate::cli::PlayPolicy::Teacher
+    );
+    let error = crate::cli::parse_from(["drysua", "play", "--policy", "idle"])
+        .expect_err("unsupported policy");
+    assert!(
+        error
+            .to_string()
+            .contains("invalid value 'idle' for '--policy <POLICY>'")
+    );
+}
+
+#[test]
 fn cli_rejects_hero_selector() {
     let error = crate::cli::parse_from(["drysua", "--hero", "2"])
         .expect_err("drysua must not accept a hero selector");
