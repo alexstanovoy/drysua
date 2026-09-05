@@ -2022,6 +2022,27 @@ impl PolicyModel {
         })
     }
 
+    #[cfg(test)]
+    pub(crate) fn ppo_likelihood_for_test(
+        &self,
+        examples: &[&PpoPreparedSample],
+    ) -> Result<(Vec<f32>, PpoMinibatchReport), ModelError> {
+        let frames = examples
+            .iter()
+            .map(|sample| sample.transition.frame.clone())
+            .collect::<Vec<_>>();
+        let prefixes = examples
+            .iter()
+            .map(|sample| sample.transition.target.prefix())
+            .collect::<Vec<_>>();
+        validate_training_batch(&frames, &prefixes)?;
+        let _guard = self.read_parameter_lock()?;
+        let output = self.training_forward_locked(&frames, &prefixes)?;
+        let log_probability = ppo_negative_log_probability(&output, examples)?.neg()?;
+        let (_, report) = ppo_loss(&output, examples, PpoConfig::default())?;
+        Ok((log_probability.to_vec1()?, report))
+    }
+
     fn behavioral_microbatch_locked(
         &self,
         examples: &[&ImitationSample],
@@ -2959,6 +2980,20 @@ fn masked_ppo_head_entropy<const WIDTH: usize>(
     examples: &[&PpoPreparedSample],
     target: fn(&BehavioralTarget) -> &HeadTarget<WIDTH>,
 ) -> Result<Tensor, ModelError> {
+    Ok(masked_ppo_head_entropy_tensors(logits, examples, target)?.entropy)
+}
+
+struct MaskedPpoEntropy {
+    entropy: Tensor,
+    #[cfg(test)]
+    log_normalizer: Tensor,
+}
+
+fn masked_ppo_head_entropy_tensors<const WIDTH: usize>(
+    logits: &Tensor,
+    examples: &[&PpoPreparedSample],
+    target: fn(&BehavioralTarget) -> &HeadTarget<WIDTH>,
+) -> Result<MaskedPpoEntropy, ModelError> {
     if logits.dims() != [examples.len(), WIDTH] {
         return Err(ModelError::InvalidModelState("PPO entropy head shape"));
     }
@@ -2966,7 +3001,13 @@ fn masked_ppo_head_entropy<const WIDTH: usize>(
     let mut active = Vec::with_capacity(examples.len());
     for sample in examples {
         let head = target(&sample.transition.target);
-        masks.extend(head.mask.map(u8::from));
+        // An inactive head needs a singleton distribution, not an all-infinite normalizer.
+        let mask = if head.active {
+            head.mask
+        } else {
+            std::array::from_fn(|index| index == 0)
+        };
+        masks.extend(mask.map(u8::from));
         active.push(f32::from(head.active));
     }
     let device = logits.device();
@@ -2984,7 +3025,46 @@ fn masked_ppo_head_entropy<const WIDTH: usize>(
         .sum(1)?
         .neg()?
         .mul(&active)?;
-    Ok(entropy)
+    Ok(MaskedPpoEntropy {
+        entropy,
+        #[cfg(test)]
+        log_normalizer,
+    })
+}
+
+#[cfg(test)]
+pub(crate) struct PpoEntropyProbe {
+    pub entropy: Vec<f32>,
+    pub gradients: Vec<Vec<f32>>,
+    pub log_normalizer: Vec<f32>,
+}
+
+#[cfg(test)]
+pub(crate) fn masked_ppo_entropy_for_test(
+    logits: &[[f32; MODEL_KIND_HEAD]],
+    examples: &[&PpoPreparedSample],
+    device: PolicyDevice,
+) -> Result<PpoEntropyProbe, ModelError> {
+    assert!(!examples.is_empty());
+    assert!(examples.len() <= MODEL_TRAINING_BATCH);
+    let device = device.candle()?;
+    let tensor = Tensor::from_vec(
+        logits.iter().flatten().copied().collect::<Vec<_>>(),
+        (logits.len(), MODEL_KIND_HEAD),
+        &device,
+    )?;
+    let variable = Var::from_tensor(&tensor)?;
+    let output =
+        masked_ppo_head_entropy_tensors(variable.as_tensor(), examples, |target| &target.kind)?;
+    let gradients = output.entropy.sum_all()?.backward()?;
+    let gradient = gradients
+        .get(variable.as_tensor())
+        .ok_or(ModelError::InvalidModelState("PPO entropy gradient"))?;
+    Ok(PpoEntropyProbe {
+        entropy: output.entropy.to_vec1()?,
+        gradients: gradient.to_vec2()?,
+        log_normalizer: output.log_normalizer.flatten_all()?.to_vec1()?,
+    })
 }
 
 fn masked_head_loss<const WIDTH: usize>(

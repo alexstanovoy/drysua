@@ -13,22 +13,239 @@ use bota_proto::{Aim, SlotId, Team, UnitKind};
 use super::feature::{encode, reverse_entity_ids_and_generations, tracker_with_view, world_view};
 use crate::model::{
     DecoderLogits, adam_step_for_test, decode_with_logits, masked_argmax,
-    masked_cross_entropy_for_test, pool_groups_for_test, pool_max_gradient_for_test,
-    select_target_for_test, unit_group, validate_batch_count,
+    masked_cross_entropy_for_test, masked_ppo_entropy_for_test, pool_groups_for_test,
+    pool_max_gradient_for_test, select_target_for_test, unit_group, validate_batch_count,
 };
 use crate::{
-    ActionKind, ActionSpace, ActionTarget, AdamConfig, ControlledUnit, FeatureFrame,
+    ActionKind, ActionSpace, ActionTarget, AdamConfig, ControlledUnit, FeatureFrame, HeadTarget,
     ImitationSample, LocalPolicyState, MODEL_ABILITY_HEAD, MODEL_ENTITY_POINTER_HEAD,
     MODEL_EVALUATION_MICROBATCH, MODEL_ITEM_HEAD, MODEL_KIND_HEAD, MODEL_LEARN_HEAD,
     MODEL_LOOT_HEAD, MODEL_MAX_BATCH, MODEL_PARAMETER_COUNT, MODEL_POINT_POINTER_HEAD,
     MODEL_SCHEMA_HASH, MODEL_SCHEMA_VERSION, MODEL_SHOP_HEAD, MODEL_SWAP_HEAD,
-    MODEL_TRAINING_BATCH, MODEL_UNIT_HEAD, ModelError, PolicyModel, PutPointTarget, SampleIdentity,
-    SeedNamespace, StructuredAction, TrainingAbilitySlot, TrainingItemSlot, TrainingPrefix,
-    TrainingSlot, unit_feature,
+    MODEL_TRAINING_BATCH, MODEL_UNIT_HEAD, ModelError, PolicyDevice, PolicyModel, PpoOutcome,
+    PpoPreparedSample, PpoRng, PutPointTarget, SampleIdentity, SeedNamespace, StructuredAction,
+    TrainingAbilitySlot, TrainingItemSlot, TrainingPrefix, TrainingSlot, unit_feature,
 };
 
+#[test]
+fn ppo_inactive_entropy_normalizers_and_gradients_are_finite() {
+    assert_ppo_entropy(PolicyDevice::Cpu);
+}
+
 #[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
-use crate::PolicyDevice;
+#[test]
+#[ignore = "requires a CUDA device"]
+fn cuda_ppo_inactive_entropy_normalizers_and_gradients_are_finite() {
+    assert_ppo_entropy(PolicyDevice::Cuda { ordinal: 0 });
+}
+
+fn assert_ppo_entropy(device: PolicyDevice) {
+    let (samples, logits) = ppo_entropy_inputs();
+    let references = samples.iter().collect::<Vec<_>>();
+
+    let probe = masked_ppo_entropy_for_test(&logits, &references, device).expect("entropy probe");
+    let inactive = masked_ppo_entropy_for_test(&logits[..1], &references[..1], device)
+        .expect("all-inactive batch");
+
+    assert!(
+        probe.log_normalizer.iter().all(|value| value.is_finite()),
+        "{:?}",
+        probe.log_normalizer
+    );
+    assert!(probe.entropy.iter().all(|value| value.is_finite()));
+    assert!(
+        probe
+            .gradients
+            .iter()
+            .flatten()
+            .all(|value| value.is_finite())
+    );
+    assert_eq!(probe.entropy[0], 0.0);
+    assert_eq!(probe.gradients[0], vec![0.0; MODEL_KIND_HEAD]);
+    assert_eq!(inactive.log_normalizer, probe.log_normalizer[..1]);
+    assert_eq!(inactive.entropy, probe.entropy[..1]);
+    assert_eq!(inactive.gradients, probe.gradients[..1]);
+    assert_eq!(probe.entropy[1], 0.0);
+    assert_eq!(probe.gradients[1], vec![0.0; MODEL_KIND_HEAD]);
+    assert_active_ppo_entropy(&probe);
+}
+
+fn ppo_entropy_inputs() -> (Vec<PpoPreparedSample>, [[f32; MODEL_KIND_HEAD]; 4]) {
+    let model = PolicyModel::fresh(9_101).expect("fixture model");
+    let mut samples = sampled_ppo_examples(&model, 4, false);
+    let mut logits = [[1.0e30; MODEL_KIND_HEAD]; 4];
+    for (index, sample) in samples.iter_mut().enumerate() {
+        sample.transition.target.kind = HeadTarget {
+            active: index != 0,
+            mask: std::array::from_fn(|column| match index {
+                1 => column == 1,
+                2 => column < 2,
+                3 => column < 3,
+                _ => false,
+            }),
+            selected: usize::from(index == 1),
+        };
+    }
+    logits[0][0] = -1.0e30;
+    logits[1][1] = -9.0;
+    logits[2][0] = 0.0;
+    logits[2][1] = 1.0;
+    logits[3][..3].fill(-1000.0);
+    (samples, logits)
+}
+
+fn assert_active_ppo_entropy(probe: &crate::model::PpoEntropyProbe) {
+    let probability = 1.0f64 / (1.0 + 1.0f64.exp());
+    let entropy = -probability * probability.ln() - (1.0 - probability) * (1.0 - probability).ln();
+    assert!((f64::from(probe.entropy[2]) - entropy).abs() < 1.0e-6);
+    assert!((f64::from(probe.gradients[2][0]) - probability * (1.0 - probability)).abs() < 1.0e-6);
+    assert!((f64::from(probe.gradients[2][1]) + probability * (1.0 - probability)).abs() < 1.0e-6);
+    assert_eq!(&probe.gradients[2][2..], &[0.0; MODEL_KIND_HEAD - 2]);
+    assert!((probe.entropy[3] - 3.0f32.ln()).abs() < 1.0e-4);
+    assert!(
+        probe.gradients[3][..3]
+            .iter()
+            .all(|gradient| gradient.abs() < 1.0e-4)
+    );
+    assert_eq!(&probe.gradients[3][3..], &[0.0; MODEL_KIND_HEAD - 3]);
+}
+
+#[test]
+fn ppo_entropy_rejects_mismatched_logit_batch_shape() {
+    let (samples, logits) = ppo_entropy_inputs();
+    let references = samples.iter().collect::<Vec<_>>();
+
+    let error = masked_ppo_entropy_for_test(&logits[..1], &references, PolicyDevice::Cpu)
+        .err()
+        .expect("batch shape error");
+
+    assert_eq!(
+        error.to_string(),
+        "model produced invalid PPO entropy head shape"
+    );
+}
+
+#[test]
+fn ppo_sampled_actor_log_probability_matches_tensor_likelihood_before_update() {
+    assert_ppo_likelihood(PolicyDevice::Cpu);
+}
+
+#[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
+#[test]
+#[ignore = "requires a CUDA device"]
+fn cuda_ppo_sampled_actor_log_probability_matches_tensor_likelihood_before_update() {
+    assert_ppo_likelihood(PolicyDevice::Cuda { ordinal: 0 });
+}
+
+fn assert_ppo_likelihood(device: PolicyDevice) {
+    let model = PolicyModel::fresh_on(9_101, device).expect("model");
+    let identity = model.policy_identity().expect("identity");
+    for batched in [false, true] {
+        let samples = sampled_ppo_examples(&model, MODEL_TRAINING_BATCH, batched);
+        assert!(
+            samples
+                .iter()
+                .any(|sample| sample.transition.target.point_pointer.active)
+        );
+        assert!(
+            samples
+                .iter()
+                .any(|sample| sample.transition.target.entity_pointer.active)
+        );
+        assert!(
+            samples
+                .iter()
+                .any(|sample| sample.transition.target.item.active
+                    || sample.transition.target.ability.active)
+        );
+        for batch_size in [1, 16, MODEL_TRAINING_BATCH] {
+            for microbatch in samples.chunks(batch_size) {
+                let references = microbatch.iter().collect::<Vec<_>>();
+
+                let (likelihood, report) = model
+                    .ppo_likelihood_for_test(&references)
+                    .expect("tensor PPO likelihood");
+
+                for (current, sample) in likelihood.iter().zip(microbatch) {
+                    let old = sample.transition.old_log_probability;
+                    assert!(
+                        (current - old).abs() < 1.0e-4,
+                        "batch={batch_size}, batched={batched}, action={:?}: {old} -> {current}",
+                        sample.action()
+                    );
+                    assert!(((current - old).exp() - 1.0).abs() < 1.0e-4);
+                }
+                assert!(report.approximate_kl.abs() < 1.0e-6, "{report:?}");
+                assert_eq!(report.clip_fraction, 0.0);
+                assert!(report.entropy.is_finite());
+            }
+        }
+    }
+    assert_eq!(
+        model.policy_identity().expect("unchanged identity"),
+        identity
+    );
+}
+
+fn sampled_ppo_examples(
+    model: &PolicyModel,
+    count: usize,
+    batched: bool,
+) -> Vec<PpoPreparedSample> {
+    assert!(count > 0);
+    assert!(count <= MODEL_TRAINING_BATCH);
+    let mut frames = Vec::with_capacity(count);
+    let mut spaces = Vec::with_capacity(count);
+    let mut random = Vec::with_capacity(count);
+    for index in 0..count {
+        let team = if index.is_multiple_of(2) {
+            Team::Radiant
+        } else {
+            Team::Dire
+        };
+        let tracker = tracker_with_view(team, world_view(team, 10 + index as u32));
+        spaces.push(ActionSpace::from_tracker(&tracker).expect("space"));
+        let mut frame = encode(&tracker, &LocalPolicyState::new(0));
+        frame.global[63] = index as f32 / MODEL_TRAINING_BATCH as f32;
+        frames.push(frame);
+        random.push(PpoRng::new(17 + index as u64 * 97));
+    }
+    let choices = if batched {
+        model
+            .sample_batch(&frames, &spaces, &mut random)
+            .expect("batch samples")
+    } else {
+        frames
+            .iter()
+            .zip(&spaces)
+            .zip(&mut random)
+            .map(|((frame, space), random)| {
+                model.sample(frame, space, random).expect("scalar sample")
+            })
+            .collect()
+    };
+    choices
+        .into_iter()
+        .enumerate()
+        .map(|(index, choice)| {
+            assert!(spaces[index].allows(choice.action()));
+            PpoPreparedSample {
+                return_value: choice.value(),
+                advantage: 1.0,
+                transition: choice
+                    .finish(PpoOutcome {
+                        stream: index,
+                        decision: 0,
+                        ticks: 3,
+                        next_value: 0.0,
+                        reward: 0.0,
+                        terminal: true,
+                    })
+                    .expect("transition"),
+            }
+        })
+        .collect()
+}
 
 #[test]
 fn unit_kind_tokens_enter_their_semantic_pool() {
