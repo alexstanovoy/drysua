@@ -34,3 +34,8 @@ These are reused release seeds, not held-out evidence or a human-strength claim.
 Local evidence: `artifacts/temp/teacher-v003-final-complete/report.json` and
 `artifacts/temp/v003-evidence.md`. Release identity is the annotated tag and
 `releases.json`; the final post-commit gate summary is recorded separately.
+
+Clean release commit `6b241bbd357f7657b90a5931d2541767be489ae5` was rebuilt and
+passed the full 40-game schedule again before tagging, with identical scores.
+Final summary: `gate.json`. Complete local evidence:
+`artifacts/temp/v0.0.3-final-clean/report.json`.

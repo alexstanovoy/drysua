@@ -21,6 +21,13 @@
       "policy": "teacher",
       "simulator_commit": "18db0f62d9a2b94e755c43fd29a959db204cc20b",
       "map": 1
+    },
+    {
+      "tag": "v0.0.3",
+      "commit": "6b241bbd357f7657b90a5931d2541767be489ae5",
+      "policy": "teacher",
+      "simulator_commit": "18db0f62d9a2b94e755c43fd29a959db204cc20b",
+      "map": 1
     }
   ]
 }

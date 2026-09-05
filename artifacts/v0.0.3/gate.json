@@ -1,0 +1,33 @@
+{
+  "candidate_tag": "v0.0.3",
+  "candidate_commit": "6b241bbd357f7657b90a5931d2541767be489ae5",
+  "simulator_commit": "18db0f62d9a2b94e755c43fd29a959db204cc20b",
+  "map": 1,
+  "policy": "teacher",
+  "seeds": [9000001, 9000002, 9000003, 9000004, 9000005, 9000006, 9000007, 9000008, 9000009, 9000010],
+  "sides_per_seed": 2,
+  "passed": true,
+  "opponents": {
+    "v0.0.1": {
+      "commit": "2cd104c8b8f0c5d1bed9988dfad4ddf4defd23f6",
+      "games": 20,
+      "wins": 20,
+      "losses": 0,
+      "draws_or_timeouts": 0,
+      "rejections": 0,
+      "passed": true
+    },
+    "v0.0.2": {
+      "commit": "7862f34d1fa8b6c728fee274d51bc6c164ea69dc",
+      "games": 20,
+      "wins": 18,
+      "losses": 2,
+      "draws_or_timeouts": 0,
+      "rejections": 0,
+      "passed": true
+    }
+  },
+  "errors": [],
+  "local_full_report": "artifacts/temp/v0.0.3-final-clean/report.json",
+  "limitations": "Reused fixed release seeds, not held-out evidence. Unchanged pinned simulator including existing tower-raze discrepancy from Dota 2."
+}
