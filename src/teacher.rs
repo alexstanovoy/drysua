@@ -31,14 +31,17 @@ const WRAITH_BAND: ItemId = ItemId(33);
 const MAGIC_STICK: ItemId = ItemId(35);
 const MAGIC_WAND: ItemId = ItemId(36);
 const POWER_TREADS: ItemId = ItemId(29);
-const BUILD_PLAN: [ItemId; 7] = [
-    TANGO,
-    HEALING_SALVE,
-    CLARITY,
-    TOWN_PORTAL_SCROLL,
+const RING_OF_REGEN: ItemId = ItemId(25);
+const SAGES_MASK: ItemId = ItemId(26);
+const CHAINMAIL: ItemId = ItemId(24);
+// Spend the six active slots on sustained combat rather than unused consumables.
+const BUILD_PLAN: [ItemId; 6] = [
+    MAGIC_WAND,
+    RING_OF_REGEN,
+    SAGES_MASK,
     WRAITH_BAND,
     POWER_TREADS,
-    MAGIC_WAND,
+    CHAINMAIL,
 ];
 const ATTACK_POINT_TICKS: u32 = 15;
 const ATTACK_PROJECTILE_UNITS_PER_TICK: i32 = 40;
@@ -51,6 +54,9 @@ const ARMOR_SCALE: i64 = 6;
 const TELEPORT_CHANNEL_TICKS: u32 = 90;
 const COURIER_ERRAND_LIMIT_TICKS: u32 = 1_800;
 const ORDER_NOTE_LIMIT: usize = 4;
+const FOUNTAIN_RECOVERY_RADIUS: i32 = 1_200;
+const FOUNTAIN_RECOVERY_PERCENT: i32 = 95;
+const RETREAT_HEALTH_PERCENT: i32 = 40;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct OrderNote {
@@ -522,13 +528,25 @@ impl Teacher {
 
     fn retreat(&self, tracker: &StateTracker, space: &ActionSpace) -> Option<StructuredAction> {
         let hero = tracker.own_hero()?;
-        let critical = ratio_at_most(hero.hp, hero.max_hp, 25);
+        let fountain = own_fountain(tracker)?;
+        // Fountain recovery is fast; do not let combat or navigation pull us out half full.
+        if hero
+            .pos
+            .within(fountain, Fixed::from_int(FOUNTAIN_RECOVERY_RADIUS))
+            && (ratio_below(hero.hp, hero.max_hp, FOUNTAIN_RECOVERY_PERCENT)
+                || ratio_below(hero.mana, hero.max_mana, FOUNTAIN_RECOVERY_PERCENT))
+        {
+            let action = StructuredAction::Hold {
+                unit: ControlledUnit::Hero,
+            };
+            return space.allows(action).then_some(action);
+        }
+        let critical = ratio_at_most(hero.hp, hero.max_hp, RETREAT_HEALTH_PERCENT);
         let lethal = visible_pressure(tracker, hero) >= hero.hp.max(0);
         let tower = unsafe_tower_without_wave(tracker, hero);
         if !critical && !lethal && !tower {
             return None;
         }
-        let fountain = own_fountain(tracker)?;
         let point = best_safe_point(
             space,
             tracker,

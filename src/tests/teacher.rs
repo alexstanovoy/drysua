@@ -33,7 +33,7 @@ fn teacher_learns_requiem_before_other_legal_skills() {
 }
 
 #[test]
-fn teacher_buys_starting_sustain_before_equipment() {
+fn teacher_buys_wand_before_unused_consumables() {
     let mut view = base_view();
     view.players[0].gold = Some(600);
     let tracker = tracker(view);
@@ -41,8 +41,45 @@ fn teacher_buys_starting_sustain_before_equipment() {
     let (action, space) = decide(&tracker);
 
     assert!(
-        matches!(action, StructuredAction::Buy { unit: ControlledUnit::Hero, item } if space.shop_candidates()[item.0].item == ItemId(7))
+        matches!(action, StructuredAction::Buy { unit: ControlledUnit::Hero, item } if space.shop_candidates()[item.0].item == ItemId(36))
     );
+    assert!(space.allows(action));
+}
+
+#[test]
+fn teacher_builds_six_active_combat_items_in_order_without_duplicates() {
+    let plan = [36, 25, 26, 33, 29, 24];
+    for count in 0..=plan.len() {
+        let mut view = base_view();
+        view.players[0].gold = Some(5_000);
+        for (slot, id) in plan.iter().copied().take(count).enumerate() {
+            own_hero_mut(&mut view).items[slot] = Some(item(ItemId(id), None, 0, None));
+        }
+        let tracker = tracker(view);
+
+        let (action, space) = decide(&tracker);
+
+        if let Some(expected) = plan.get(count) {
+            let StructuredAction::Buy { item, .. } = action else {
+                panic!("missing planned purchase after {count} items");
+            };
+            assert_eq!(space.shop_candidates()[item.0].item, ItemId(*expected));
+        } else {
+            assert!(!matches!(action, StructuredAction::Buy { .. }));
+        }
+        assert!(space.allows(action));
+    }
+}
+
+#[test]
+fn teacher_does_not_skip_unaffordable_wand_for_unused_consumables() {
+    let mut view = base_view();
+    view.players[0].gold = Some(449);
+    let tracker = tracker(view);
+
+    let (action, space) = decide(&tracker);
+
+    assert!(!matches!(action, StructuredAction::Buy { .. }));
     assert!(space.allows(action));
 }
 
@@ -69,7 +106,7 @@ fn teacher_rolls_back_a_rejected_purchase_by_sequence() {
         .expect("retried purchase");
 
     assert!(
-        matches!(retried, StructuredAction::Buy { item, .. } if space.shop_candidates()[item.0].item == ItemId(7))
+        matches!(retried, StructuredAction::Buy { item, .. } if space.shop_candidates()[item.0].item == ItemId(36))
     );
     assert!(space.allows(retried));
 }
@@ -112,6 +149,75 @@ fn teacher_retreats_toward_own_fountain_at_critical_health() {
             .distance_squared(Vec2::from_ints(1_000, 1_000))
             < Vec2::from_ints(3_000, 3_000).distance_squared(Vec2::from_ints(1_000, 1_000))
     );
+    assert!(space.allows(action));
+}
+
+#[test]
+fn teacher_retreats_before_entering_raze_burst_lethal_health() {
+    for hp in [350, 400, 401] {
+        let mut view = base_view();
+        own_hero_mut(&mut view).hp = hp;
+        let tracker = tracker(view);
+
+        let (action, space) = decide(&tracker);
+
+        assert_eq!(
+            matches!(action, StructuredAction::MovePoint { .. }),
+            hp <= 400
+        );
+        assert!(space.allows(action));
+    }
+}
+
+#[test]
+fn teacher_finishes_fountain_recovery_instead_of_leaving_half_full() {
+    for (hp, mana) in [(600, 250), (949, 500), (1_000, 474)] {
+        let mut view = base_view();
+        let hero = own_hero_mut(&mut view);
+        hero.pos = Vec2::from_ints(2_200, 1_000);
+        hero.hp = hp;
+        hero.mana = mana;
+        let tracker = tracker(view);
+
+        let (action, space) = decide(&tracker);
+
+        assert_eq!(
+            action,
+            StructuredAction::Hold {
+                unit: ControlledUnit::Hero
+            }
+        );
+        assert!(space.allows(action));
+    }
+}
+
+#[test]
+fn teacher_does_not_wait_for_fountain_recovery_outside_its_radius() {
+    let mut view = base_view();
+    let hero = own_hero_mut(&mut view);
+    hero.pos = Vec2::from_ints(2_201, 1_000);
+    hero.hp = 600;
+    hero.mana = 250;
+    let tracker = tracker(view);
+
+    let (action, space) = decide(&tracker);
+
+    assert!(matches!(action, StructuredAction::AttackMovePoint { .. }));
+    assert!(space.allows(action));
+}
+
+#[test]
+fn teacher_leaves_fountain_when_both_pools_are_recovered() {
+    let mut view = base_view();
+    let hero = own_hero_mut(&mut view);
+    hero.pos = Vec2::from_ints(1_500, 1_500);
+    hero.hp = 950;
+    hero.mana = 475;
+    let tracker = tracker(view);
+
+    let (action, space) = decide(&tracker);
+
+    assert!(matches!(action, StructuredAction::AttackMovePoint { .. }));
     assert!(space.allows(action));
 }
 
@@ -198,6 +304,44 @@ fn teacher_preserves_a_seat_visible_channel_instead_of_issuing_a_body_order() {
 
     assert_eq!(action, StructuredAction::Continue);
     assert!(space.allows(action));
+}
+
+#[test]
+fn teacher_preserves_a_channel_before_low_health_and_mana_fountain_recovery() {
+    let mut view = base_view();
+    let hero = own_hero_mut(&mut view);
+    hero.pos = Vec2::from_ints(1_500, 1_500);
+    hero.hp = 350;
+    hero.mana = 100;
+    hero.statuses.bits = StatusFlags::CHANNELLING;
+    let tracker = tracker(view);
+
+    let (action, space) = decide(&tracker);
+
+    assert_eq!(action, StructuredAction::Continue);
+    assert!(space.allows(action));
+    assert_eq!(
+        Teacher::new().safety_action(&tracker, &space),
+        Some(StructuredAction::Continue)
+    );
+}
+
+#[test]
+fn teacher_preserves_a_channel_before_forty_percent_retreat_outside_fountain() {
+    let mut view = base_view();
+    let hero = own_hero_mut(&mut view);
+    hero.hp = 400;
+    hero.statuses.bits = StatusFlags::CHANNELLING;
+    let tracker = tracker(view);
+
+    let (action, space) = decide(&tracker);
+
+    assert_eq!(action, StructuredAction::Continue);
+    assert!(space.allows(action));
+    assert_eq!(
+        Teacher::new().safety_action(&tracker, &space),
+        Some(StructuredAction::Continue)
+    );
 }
 
 #[test]
@@ -811,6 +955,9 @@ fn match_info() -> MatchInfo {
             (2, 110),
             (7, 90),
             (8, 100),
+            (24, 550),
+            (25, 175),
+            (26, 175),
             (29, 1_400),
             (33, 505),
             (35, 200),
