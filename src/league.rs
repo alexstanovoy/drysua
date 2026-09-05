@@ -31,16 +31,16 @@ pub const LEAGUE_MIN_EXPLOIT_PAIRS: usize = 2;
 /// Minimum candidate actions required in the exploit-regression namespace.
 pub const LEAGUE_MIN_EXPLOIT_ACTIONS: u64 = 100;
 /// Stage-ten league contract version.
-pub const LEAGUE_SCHEMA_VERSION: u32 = 14;
-/// Audited simulator rules required by stage-ten league artifacts.
-pub const LEAGUE_RULES_AUDIT_VERSION: u32 = 12;
+pub const LEAGUE_SCHEMA_VERSION: u32 = 16;
+/// Audited simulator and learner rules required by stage-ten league artifacts.
+pub const LEAGUE_RULES_AUDIT_VERSION: u32 = 14;
 /// Canonical stage-ten frozen-policy, scheduling, retention, and promotion contract.
 pub const LEAGUE_SCHEMA_DESCRIPTOR: &str = concat!(
-    "bota-drysua-league/v14;",
+    "bota-drysua-league/v16;",
     "action_schema_version=2;action_schema_hash=1018254919734743331;",
     "feature_schema_version=7;feature_schema_hash=13875648161437731669;",
     "model_schema_version=7;model_schema_hash=10644717168650027237;",
-    "ppo_schema_version=13;ppo_schema_hash=11103744726312279053;rules_audit=12;",
+    "ppo_schema_version=15;ppo_schema_hash=13893101989595893928;rules_audit=14;",
     "opponents=current30,accepted25,historical25,teacher15,weak5,frozen_per_rollout;",
     "league=capacity32,minimum9,protect_anchor_accepted_strongest_recent4,evict_nearest_cross_play_profile;",
     "snapshot=immutable_finite_f32_parameters,stable_parameter_fingerprint,generation;",
@@ -72,8 +72,9 @@ const _: () = assert!(FEATURE_SCHEMA_VERSION == 7);
 const _: () = assert!(FEATURE_SCHEMA_HASH == 13_875_648_161_437_731_669);
 const _: () = assert!(MODEL_SCHEMA_VERSION == 7);
 const _: () = assert!(MODEL_SCHEMA_HASH == 10_644_717_168_650_027_237);
-const _: () = assert!(PPO_SCHEMA_VERSION == 13);
-const _: () = assert!(PPO_SCHEMA_HASH == 11_103_744_726_312_279_053);
+const _: () = assert!(PPO_SCHEMA_VERSION == 15);
+const _: () = assert!(PPO_SCHEMA_HASH == 13_893_101_989_595_893_928);
+const _: () = assert!(LEAGUE_RULES_AUDIT_VERSION == crate::PPO_RULES_AUDIT_VERSION);
 
 static NEXT_SNAPSHOT_ID: AtomicU64 = AtomicU64::new(1);
 

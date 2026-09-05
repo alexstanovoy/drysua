@@ -21,27 +21,30 @@ pub const PPO_MAX_SAMPLES: usize = 32_768;
 pub const PPO_MAX_ROLLOUT_DECISIONS: usize = 2_048;
 /// Maximum random draws made by one autoregressive policy sample.
 pub const PPO_MAX_POLICY_SAMPLE_DRAWS: u64 = 132;
-/// Absolute shaping budget for one episode.
-pub const PPO_SHAPING_BUDGET: f32 = 100.0;
+const PPO_REWARD_SCALE: f32 = 101.0;
+/// Episode budget for the sum of absolute emitted shaping components.
+pub const PPO_SHAPING_BUDGET: f32 = 100.0 / PPO_REWARD_SCALE;
 /// Terminal reward for winning; losing is its negation.
-pub const PPO_TERMINAL_REWARD: f32 = 101.0;
+pub const PPO_TERMINAL_REWARD: f32 = 1.0;
 const _: () = assert!(PPO_TERMINAL_REWARD > PPO_SHAPING_BUDGET);
 /// Version of rollout, GAE, objective, optimizer, and reward semantics.
-pub const PPO_SCHEMA_VERSION: u32 = 13;
-/// Audited simulator rules required by stage-nine rollouts.
-pub const PPO_RULES_AUDIT_VERSION: u32 = 12;
+pub const PPO_SCHEMA_VERSION: u32 = 15;
+/// Audited simulator and learner rules required by stage-nine rollouts.
+pub const PPO_RULES_AUDIT_VERSION: u32 = 14;
 /// Canonical stage-nine learner contract covered by [`PPO_SCHEMA_HASH`].
 pub const PPO_SCHEMA_DESCRIPTOR: &str = concat!(
-    "bota-drysua-ppo/v13;",
+    "bota-drysua-ppo/v15;",
     "action_schema_version=2;action_schema_hash=1018254919734743331;",
     "feature_schema_version=7;feature_schema_hash=13875648161437731669;",
-    "model_schema_version=7;model_schema_hash=10644717168650027237;rules_audit=12;",
+    "model_schema_version=7;model_schema_hash=10644717168650027237;rules_audit=14;",
     "bounds=rollout32768,streams1280,environments128,decisions2048,epochs16,minibatch8192,microbatch64;",
     "actor=frozen_exact_policy_identity,batch_max64_single_shared_trunk_forward,independent_per_environment_rng_seeded_from_checkpointed_master,transactional_batch_rng,legal_masked_gumbel_max_open_f64_uniform,exact_autoregressive_log_probability_and_entropy;",
-    "gae=gamma_tick_pow_elapsed_ticks,lambda0.98,terminal_reset,bootstrap_truncation,normalized_advantages;",
+    "gae=gamma_tick0.9966555_pow_elapsed_ticks,lambda0.98,terminal_reset,bootstrap_truncation,normalized_advantages;",
     "objective=clipped_surrogate0.2,value_mse0.5,entropy0.01,target_kl0.02;",
-    "optimizer=adam_lr3e-4_beta1_0.9_beta2_0.999_epsilon1e-5_global_clip0.5,weighted_host_microbatch_accumulation,transactional_parameters_moments_shuffle;",
-    "reward=seat_safe_global_summary,potential_shaping_budget100,xp_advantage0.02,own_observable_gold0.01,last_hit_deny_diagnostics_only_zero_reward,enemy_gold_unavailable_by_seat_contract,combat2,structures5,terminal_win101_loss-101_draw0,separate_breakdown;",
+    "critic=ppo_only_detached_value_head_input,value_head_only_regression,bc_and_public_training_forward_unchanged;",
+    "optimizer=adam_lr3e-6_beta1_0.9_beta2_0.999_epsilon1e-5_global_clip0.5,weighted_host_microbatch_accumulation,transactional_parameters_moments_shuffle;",
+    "kl_guard=pre_step_rejection,post_step_sample_weighted_complete_effective_minibatch_rollout_policy_kl,candidate_exceeds_target_or_evaluation_error_restores_exact_parameters_adam_moments_step_policy_revision_under_exclusive_parameter_lock,applied_report_post_step_kl,rejected_report_candidate_kl;",
+    "reward=seat_safe_global_summary,all_components_normalized_by101,episode_sum_absolute_emitted_shaping_components_budget100_over101_nonreplenishing_f64_expenditure,terminal_next_potential_zero,xp_advantage0.02_over101,cash_wealth_last_hit_deny_zero_reward,enemy_gold_unavailable_by_seat_contract,combat2_over101,structures5_over101,terminal_win1_loss-1_draw0,separate_consistently_scaled_breakdown,wide_public_score_subtraction_before_f32_conversion;",
     "arena=one_learner_seat_against_independent_opponent,snapshot_then_explicit_events_including_empty_complete_every_visible_tick,decision_after_tick_complete,decision_interval3,suppress_deployment_decisions_through_pregame,batched_bootstrap,restart_on_terminal,complete_frozen_side_pairs_require_even_production_environments,paired_side_seed_and_warmup_phase,on_policy_greedy_burn_in,eight_phase_blocks_alternate_weak_teacher,clear_hero_and_courier_warmup_orders,hero_identity_change_invalidates_local_body_order,hero_active_order_feature_ignores_courier_orders;",
     "navigation=building_landing_points_reserved_for_teleport_targets,seat_visible_channel_masks_cast_and_use,seat_visible_item_mute_masks_use,put_point_underfoot_only;",
     "deployment=audited_seat_visible_teacher_on_map0,model_with_channel_preservation_sustain_emergency_retreat_and_safe_in_range_structure_attack_on_map1,dagger_uses_safety_shield_without_objective_override,raw_ppo_sampling_remains_on_policy;",
@@ -105,7 +108,7 @@ impl Default for PpoConfig {
             clip_epsilon: 0.2,
             value_coefficient: 0.5,
             entropy_coefficient: 0.01,
-            learning_rate: 3.0e-4,
+            learning_rate: 3.0e-6,
             adam_beta1: 0.9,
             adam_beta2: 0.999,
             adam_epsilon: 1.0e-5,
@@ -1059,7 +1062,7 @@ pub enum PpoTerminalOutcome {
 #[derive(Clone, Debug, Default)]
 pub struct RewardTracker {
     previous: Option<GlobalSummary>,
-    shaping_total: f32,
+    shaping_spent: f64,
 }
 
 impl RewardTracker {
@@ -1075,14 +1078,19 @@ impl RewardTracker {
         let mut reward = self
             .previous
             .map_or_else(RewardBreakdown::default, |previous| {
-                shaping_delta(previous, next, discount)
+                shaping_delta(
+                    previous,
+                    next,
+                    if outcome.is_some() { 0.0 } else { discount },
+                )
             });
-        let proposed = reward.total;
-        let allowed = (self.shaping_total + proposed)
-            .clamp(-PPO_SHAPING_BUDGET, PPO_SHAPING_BUDGET)
-            - self.shaping_total;
+        let proposed = shaping_expenditure(&reward);
+        let remaining = (f64::from(PPO_SHAPING_BUDGET) - self.shaping_spent).max(0.0);
+        let allowed = proposed.min(remaining);
         scale_shaping(&mut reward, proposed, allowed);
-        self.shaping_total += allowed;
+        self.shaping_spent += allowed;
+        assert!(self.shaping_spent <= f64::from(PPO_SHAPING_BUDGET));
+        assert!(reward.total.abs() <= PPO_SHAPING_BUDGET + 1.0e-6);
         reward.terminal = outcome.map_or(0.0, |outcome| match outcome {
             PpoTerminalOutcome::Win => PPO_TERMINAL_REWARD,
             PpoTerminalOutcome::Loss => -PPO_TERMINAL_REWARD,
@@ -1096,12 +1104,14 @@ impl RewardTracker {
 
 fn shaping_delta(previous: GlobalSummary, next: GlobalSummary, discount: f32) -> RewardBreakdown {
     let potential = |next: f32, previous: f32| discount * next - previous;
-    let experience = potential(score_xp(next), score_xp(previous)) * 0.02;
+    let experience = potential(score_xp(next), score_xp(previous)) * (0.02 / PPO_REWARD_SCALE);
     let last_hits = 0.0;
     let denies = 0.0;
-    let combat = potential(score_combat(next), score_combat(previous)) * 2.0;
-    let structures = potential(score_structures(next), score_structures(previous)) * 5.0;
-    let wealth = potential(next.own_gold as f32, previous.own_gold as f32) * 0.01;
+    let combat = potential(score_combat(next), score_combat(previous)) * (2.0 / PPO_REWARD_SCALE);
+    let structures =
+        potential(score_structures(next), score_structures(previous)) * (5.0 / PPO_REWARD_SCALE);
+    // Cash is not wealth: spending on useful equipment must not incur a shaping penalty.
+    let wealth = 0.0;
     RewardBreakdown {
         experience,
         last_hits,
@@ -1115,12 +1125,12 @@ fn shaping_delta(previous: GlobalSummary, next: GlobalSummary, discount: f32) ->
 }
 
 fn score_xp(summary: GlobalSummary) -> f32 {
-    (summary.allied.xp - summary.enemy.xp) as f32
+    (summary.allied.xp as f64 - summary.enemy.xp as f64) as f32
 }
 
 fn score_combat(summary: GlobalSummary) -> f32 {
-    let allied = summary.allied.kills as i64 - summary.allied.deaths as i64;
-    let enemy = summary.enemy.kills as i64 - summary.enemy.deaths as i64;
+    let allied = summary.allied.kills as f64 - summary.allied.deaths as f64;
+    let enemy = summary.enemy.kills as f64 - summary.enemy.deaths as f64;
     (allied - enemy) as f32
 }
 
@@ -1129,17 +1139,24 @@ fn score_structures(summary: GlobalSummary) -> f32 {
         as f32
 }
 
-fn scale_shaping(reward: &mut RewardBreakdown, proposed: f32, allowed: f32) {
+fn shaping_expenditure(reward: &RewardBreakdown) -> f64 {
+    f64::from(reward.experience).abs()
+        + f64::from(reward.combat).abs()
+        + f64::from(reward.structures).abs()
+}
+
+fn scale_shaping(reward: &mut RewardBreakdown, proposed: f64, allowed: f64) {
+    assert!(proposed.is_finite());
+    assert!(allowed >= 0.0);
     if proposed == 0.0 || proposed == allowed {
-        reward.total = allowed;
         return;
     }
-    let scale = allowed / proposed;
+    let scale = (allowed / proposed) as f32;
     reward.experience *= scale;
     reward.last_hits *= scale;
     reward.denies *= scale;
     reward.combat *= scale;
     reward.structures *= scale;
     reward.wealth *= scale;
-    reward.total = allowed;
+    reward.total = reward.experience + reward.combat + reward.structures;
 }

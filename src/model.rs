@@ -1208,6 +1208,13 @@ struct PolicyEncoders {
     loot: Mlp,
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Default)]
+struct PpoTestFaults {
+    candidate_evaluation: bool,
+    rollback_import: bool,
+}
+
 impl PolicyModel {
     /// Constructs fixed parameters from one explicit deterministic seed.
     pub fn fresh(seed: u64) -> Result<Self, ModelError> {
@@ -1828,12 +1835,27 @@ impl PolicyModel {
         frames: &[FeatureFrame],
         prefixes: &[TrainingPrefix],
     ) -> Result<PolicyTensorTensors, ModelError> {
+        self.training_forward_value_gradient_locked(frames, prefixes, true)
+    }
+
+    fn training_forward_value_gradient_locked(
+        &self,
+        frames: &[FeatureFrame],
+        prefixes: &[TrainingPrefix],
+        value_trunk_gradient: bool,
+    ) -> Result<PolicyTensorTensors, ModelError> {
         let state = self.forward_frames(frames)?;
+        // PPO deliberately isolates critic fitting to preserve transferred actor features.
+        let value_input = if value_trunk_gradient {
+            state.trunk.clone()
+        } else {
+            state.trunk.detach()
+        };
         let contexts = self.training_contexts(&state.trunk, prefixes)?;
         let entity_query = self.entity_query.forward(&contexts.slot)?.unsqueeze(1)?;
         let point_query = self.point_query.forward(&contexts.slot)?.unsqueeze(1)?;
         Ok(PolicyTensorTensors {
-            value: self.value.forward(&state.trunk)?,
+            value: self.value.forward(&value_input)?,
             kind: self.kind.forward(&state.trunk)?,
             controlled: self.controlled.forward(&contexts.kind)?,
             ability: self.ability_head.forward(&contexts.unit)?,
@@ -1946,7 +1968,14 @@ impl PolicyModel {
         adam: &mut AdamState,
         config: PpoConfig,
     ) -> Result<PpoMinibatchReport, ModelError> {
-        self.ppo_update_with_microbatch(examples, adam, config, MODEL_TRAINING_BATCH)
+        self.ppo_update_with_microbatch(
+            examples,
+            adam,
+            config,
+            MODEL_TRAINING_BATCH,
+            #[cfg(test)]
+            PpoTestFaults::default(),
+        )
     }
 
     fn ppo_update_with_microbatch(
@@ -1955,6 +1984,7 @@ impl PolicyModel {
         adam: &mut AdamState,
         config: PpoConfig,
         microbatch_size: usize,
+        #[cfg(test)] faults: PpoTestFaults,
     ) -> Result<PpoMinibatchReport, ModelError> {
         if examples.is_empty() || examples.len() > MODEL_MAX_BATCH {
             return Err(ModelError::InvalidModelState("PPO minibatch count"));
@@ -1980,11 +2010,100 @@ impl PolicyModel {
         if report.approximate_kl > f64::from(config.target_kl) {
             return Ok(report);
         }
+        let original = self.export_parameters_locked()?;
+        let original_adam = adam.clone();
         let diagnostics = self.apply_adam_locked(adam, &gradients)?;
+        let candidate_kl = self.ppo_candidate_kl_locked(
+            examples,
+            config,
+            microbatch_size,
+            #[cfg(test)]
+            faults.candidate_evaluation,
+        );
+        if !candidate_kl
+            .as_ref()
+            .is_ok_and(|kl| *kl <= f64::from(config.target_kl))
+        {
+            self.rollback_ppo_candidate_locked(
+                &original,
+                original_adam,
+                adam,
+                &candidate_kl,
+                #[cfg(test)]
+                faults.rollback_import,
+            )?;
+            report.approximate_kl = candidate_kl?;
+            return Ok(report);
+        }
+        report.approximate_kl = candidate_kl?;
         report.gradient_norm = diagnostics.unclipped_norm;
         report.applied_scale = diagnostics.applied_scale;
         report.applied = true;
         Ok(report)
+    }
+
+    fn rollback_ppo_candidate_locked(
+        &self,
+        original: &[f32],
+        original_adam: AdamState,
+        adam: &mut AdamState,
+        candidate_kl: &Result<f64, ModelError>,
+        #[cfg(test)] inject_failure: bool,
+    ) -> Result<(), ModelError> {
+        assert_eq!(adam.binding.lineage, original_adam.binding.lineage);
+        assert_eq!(adam.step(), original_adam.step() + 1);
+        #[cfg(not(test))]
+        let fail_after = None;
+        #[cfg(test)]
+        let fail_after = inject_failure.then_some(0);
+        self.import_parameters_locked(original, fail_after)
+            .map_err(|rollback| {
+                let cause = match candidate_kl {
+                    Ok(kl) => format!("sampled KL {kl} exceeds target"),
+                    Err(error) => error.to_string(),
+                };
+                ModelError::Backend(format!(
+                    "PPO candidate rejected ({cause}); parameter rollback failed ({rollback})"
+                ))
+            })?;
+        self.parameter_revision
+            .store(original_adam.binding.policy.revision, Ordering::Relaxed);
+        *adam = original_adam;
+        Ok(())
+    }
+
+    fn ppo_candidate_kl_locked(
+        &self,
+        examples: &[&PpoPreparedSample],
+        config: PpoConfig,
+        microbatch_size: usize,
+        #[cfg(test)] inject_failure: bool,
+    ) -> Result<f64, ModelError> {
+        assert!(!examples.is_empty());
+        assert!((1..=MODEL_TRAINING_BATCH).contains(&microbatch_size));
+        let mut kl = 0.0;
+        for chunk in examples.chunks(microbatch_size) {
+            let frames = chunk
+                .iter()
+                .map(|sample| sample.transition.frame.clone())
+                .collect::<Vec<_>>();
+            let prefixes = chunk
+                .iter()
+                .map(|sample| sample.transition.target.prefix())
+                .collect::<Vec<_>>();
+            let output = self.training_forward_locked(&frames, &prefixes)?;
+            validate_training_tensors_finite(&output)?;
+            let (_, report) = ppo_loss(&output, chunk, config)?;
+            kl += report.approximate_kl * chunk.len() as f64;
+            #[cfg(test)]
+            if inject_failure {
+                return Err(ModelError::Backend(format!(
+                    "injected PPO candidate evaluation failure after {} rows",
+                    chunk.len()
+                )));
+            }
+        }
+        Ok(kl / examples.len() as f64)
     }
 
     #[cfg(test)]
@@ -1995,7 +2114,33 @@ impl PolicyModel {
         config: PpoConfig,
         microbatch_size: usize,
     ) -> Result<PpoMinibatchReport, ModelError> {
-        self.ppo_update_with_microbatch(examples, adam, config, microbatch_size)
+        self.ppo_update_with_microbatch(
+            examples,
+            adam,
+            config,
+            microbatch_size,
+            PpoTestFaults::default(),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ppo_update_with_faults_for_test(
+        &self,
+        examples: &[&PpoPreparedSample],
+        adam: &mut AdamState,
+        config: PpoConfig,
+        rollback_import: bool,
+    ) -> Result<PpoMinibatchReport, ModelError> {
+        self.ppo_update_with_microbatch(
+            examples,
+            adam,
+            config,
+            MODEL_TRAINING_BATCH,
+            PpoTestFaults {
+                candidate_evaluation: true,
+                rollback_import,
+            },
+        )
     }
 
     fn ppo_microbatch_locked(
@@ -2012,7 +2157,7 @@ impl PolicyModel {
             .map(|sample| sample.transition.target.prefix())
             .collect::<Vec<_>>();
         validate_training_batch(&frames, &prefixes)?;
-        let output = self.training_forward_locked(&frames, &prefixes)?;
+        let output = self.training_forward_value_gradient_locked(&frames, &prefixes, false)?;
         validate_training_tensors_finite(&output)?;
         let (loss, report) = ppo_loss(&output, examples, config)?;
         let named = self.backward_named_locked(&loss)?;

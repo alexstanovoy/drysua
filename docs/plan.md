@@ -699,7 +699,7 @@ runtime evidence между процессами и не входит в feature
 | Clip epsilon | 0.2 |
 | Value coefficient | 0.5 |
 | Entropy coefficient | 0.01 |
-| Learning rate | `3e-4` |
+| Learning rate | `3e-6` |
 | Adam beta1 | 0.9 |
 | Adam beta2 | 0.999 |
 | Adam epsilon | `1e-5` |
@@ -738,14 +738,15 @@ revision. Rollout другой revision отвергается до optimizer mu
 
 GAE вычисляет `gamma_tick ^ elapsed_ticks`, обрывается на terminal transition и
 нормализует advantages только после построения lambda returns. Learner реализует clipped
-surrogate, value MSE, entropy bonus, global gradient clipping, Adam `3e-4/0.9/0.999/1e-5`,
+surrogate, value MSE, entropy bonus, global gradient clipping, Adam `3e-6/0.9/0.999/1e-5`,
 deterministic minibatch shuffle и early stop по non-negative approximate KL. Effective
 minibatch разбивается на autograd microbatches по 64, gradients суммируются на host и
-применяются одной atomic model revision. Ошибка полного update восстанавливает coherent
-parameter/Adam snapshot.
+применяются одной atomic model revision. При ошибке полного update выполняется rollback
+coherent parameter/Adam snapshot; восстановление гарантируется только при успешном rollback.
 
 `RewardTracker` читает только `GlobalSummary`, построенный из seat-specific protocol
-state. Potential shaping имеет episode budget 100, компоненты сохраняются раздельно, а
+state. Potential shaping имеет non-replenishing absolute-component episode budget
+`100/101 < 1`, все компоненты нормализованы одной шкалой 101 и сохраняются раздельно, а
 Win/Loss/Draw представлены отдельным terminal adjudication и не смешиваются с
 nonterminal state. Builtin smoke держит одного learner seat против независимого teacher,
 обрабатывает snapshots/events каждый tick и принимает решения раз в три ticks. Команда
@@ -759,44 +760,55 @@ Server и builtin Arena завершают каждый Snapshot явным Even
 Policy принимает решение только после этой tick-complete границы и не принимает решений
 до первого tick после pregame. Production arenas
 образуют полные frozen-policy side pairs.
-Current PPO contract: schema v13, hash `11103744726312279053`, rules audit v12.
+Current PPO contract: schema v15, hash `13893101989595893928`, rules audit v14.
+PPO value regression detaches the value-head input and trains only that head, not shared
+actor features; BC, public training forward, inference, parameter order and model schema
+are unchanged. KL is checked before and after the candidate optimizer step. Post-step KL
+is sample-weighted over the complete effective minibatch against the rollout policy.
+Overshoot or candidate-evaluation error restores exact parameters, Adam moments/step and
+policy revision under the exclusive parameter lock when rollback succeeds. If the backend
+fails during rollback import, the error retains both causes; atomic restoration is not
+guaranteed. Applied reports contain post-step KL;
+post-step rejection reports contain candidate KL. This is not full-distribution KL or an
+anchor-wide multi-update drift guarantee. Permanent critic isolation, LR `3e-6`, and reward
+normalization are conservative design/tuning decisions, not evidence that standard shared
+actor/critic gradients are incorrect or that learned strength improved. GAE is unchanged;
+the v15 reward contract is below. See [PPO v15 migration](ppo-v15-migration.md).
 
 ## 15. Reward
 
 Terminal reward:
 
 ```text
-win  = +101
-loss = -101
-draw or training timeout = отдельный adjudication result
+win  = +1
+loss = -1
+draw = 0
+truncation without terminal adjudication = bootstrap, not a terminal draw
 ```
 
-Episode shaping budget ограничен 100 по абсолютной величине. Shaping не должен менять
-предпочтение победы поражению.
+Episode shaping budget ограничен `100/101` для суммы абсолютных emitted components;
+смена знака и взаимная компенсация компонентов не восполняют budget. Expenditure хранится
+в f64, emitted rewards — f32 (tolerance `1e-6` для rounding). Все shaping components
+масштабируются пропорционально оставшемуся budget. Terminal dominance относится к
+undiscounted episode budget, не к произвольно далёким discounted outcomes. Clipped
+potential shaping не даёт общей гарантии policy invariance.
 
-Компоненты:
+Текущие компоненты v15:
 
-- XP advantage;
-- last hits;
-- denies;
-- Shadow Fiend souls;
-- hero damage dealt/taken;
-- kills and deaths;
-- structure HP advantage;
-- structure destruction;
-- observable wealth;
-- spending versus hoarding;
-- progress to objective;
-- lane position;
-- survival outside fountain;
-- courier death;
-- rejected order только как малый диагностический penalty.
+- XP advantage: `.02/101`;
+- kills/deaths combat advantage: `2/101`;
+- structure destruction advantage: `5/101`;
+- cash wealth, last hits и denies: zero reward; покупки не штрафуются за расход cash.
 
-Position, resources and progress используют potential shaping:
+Остальные перечислявшиеся ранее сигналы не являются текущими reward components.
+Потенциал рассчитывается как:
 
 ```text
 gamma * Phi(next_state) - Phi(current_state)
 ```
+
+При любом terminal outcome `Phi(next_state) = 0`; финальный snapshot не влияет на
+terminal shaping до применения budget. Truncation сохраняет discounted next potential.
 
 Reward считается только из `MatchInfo`, seat-specific `WorldView`, visible `Events` и
 `MatchOver`. Reward code не читает полный `World`.
@@ -839,7 +851,7 @@ Truncated matches считаются Draw и не превращаются в п
 промежуточным public statistics. Promotion требует минимум 20 disjoint paired seeds,
 1000 candidate actions, rejection rate ниже 0.1%, отсутствия regression на каждой стороне
 и opaque exploit audit, привязанный к candidate и accepted fingerprints. Stage-ten
-Current league contract: schema v14, hash `17777936678124847825`, rules audit v12.
+Current league contract: schema v16, hash `1035319045739487525`, rules audit v14.
 
 ## 17. GPU и actor-learner pipeline
 
@@ -887,7 +899,7 @@ Padding выполняется только при сборке minibatch.
 Metal выбираются явно через `PolicyDevice`; параметры, forward, loss и backward находятся на
 выбранном backend. Rollout хранит sparse token rows в typed arenas с проверяемыми offsets,
 bit-packed legal masks и разворачивает fixed padding только для текущего minibatch. Model
-schema v7, hash `10644717168650027237`; PPO schema v13, hash `11103744726312279053`.
+schema v7, hash `10644717168650027237`; PPO schema v15, hash `13893101989595893928`.
 
 ## 18. Checkpoints
 
@@ -950,6 +962,14 @@ schema до атомарной установки model+optimizer ownership. Sav
 generation, canonical tensor copy и recoverable manifest последним; каждый файл и directory
 fsync-ится. Двухфайловая копия остаётся independently loadable через hash-checked canonical
 fallback. Runtime weights additionally bind PPO schema/version and rules audit metadata.
+Training resume is strictly current-schema: v13 and v14 training manifests are rejected, including
+the pre-migration conservative probes. Runtime reads alone also accept the exact audited
+prior metadata map: action hash `1018254919734743331`, feature hash `13875648161437731669`,
+model hash `10644717168650027237`, PPO version `13`, PPO hash `11103744726312279053`, rules
+audit `12`. Missing/extra fields, wrong hashes and older deployment contracts are rejected.
+This inference-only whitelist preserves accepted BC anchor `e63f0bdb478ebb8b` without
+rewriting any metadata; names, shapes, F32 and finite checks remain mandatory. New runtime
+writes use current metadata. The checkpoint wire layout itself is unchanged.
 Checkpoint schema v2, hash `4581258024746721724`.
 
 `drysua evaluate` загружает runtime artifact и всегда запускает фиксированную матрицу из обеих

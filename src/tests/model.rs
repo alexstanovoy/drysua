@@ -187,6 +187,235 @@ fn assert_ppo_likelihood(device: PolicyDevice) {
     );
 }
 
+#[test]
+fn ppo_critic_only_step_preserves_actor_and_trains_value() {
+    assert_critic_transfer(&PolicyModel::fresh(9_101).expect("model"));
+}
+
+#[test]
+fn ppo_overshooting_step_restores_parameters_moments_and_identity() {
+    let model = PolicyModel::fresh(9_101).expect("model");
+    let samples = sampled_ppo_examples(&model, 16, true);
+    let references = samples.iter().collect::<Vec<_>>();
+    let config = crate::PpoConfig {
+        learning_rate: 0.01,
+        ..crate::PpoConfig::default()
+    };
+    let mut adam = model.claim_adam_for_test(config.adam()).expect("optimizer");
+    let before = model.coherent_snapshot(&adam).expect("snapshot");
+
+    let report = model
+        .ppo_update(&references, &mut adam, config)
+        .expect("guarded update");
+
+    assert!(!report.applied);
+    assert!(report.approximate_kl > f64::from(config.target_kl));
+    assert_eq!(model.coherent_snapshot(&adam).expect("snapshot"), before);
+}
+
+#[test]
+fn ppo_uneven_microbatch_overshoot_restores_nonzero_optimizer_state() {
+    for count in [65, 81] {
+        let (model, mut adam, samples, config) = ppo_rollback_fixture(count);
+        let references = samples.iter().collect::<Vec<_>>();
+        let before = model.coherent_snapshot(&adam).expect("snapshot");
+        let identity = model.policy_identity().expect("identity");
+
+        let report = model
+            .ppo_update(&references, &mut adam, config)
+            .expect("guarded update");
+
+        assert!(!report.applied);
+        assert_eq!(report.samples, count);
+        assert!(report.approximate_kl > f64::from(config.target_kl));
+        let expected_kl = uneven_candidate_weighted_kl(count);
+        assert!((report.approximate_kl - expected_kl).abs() < 1.0e-6);
+        assert_eq!(model.coherent_snapshot(&adam).expect("snapshot"), before);
+        assert_eq!(model.policy_identity().expect("identity"), identity);
+    }
+}
+
+fn uneven_candidate_weighted_kl(count: usize) -> f64 {
+    let (model, mut adam, samples, config) = ppo_rollback_fixture(count);
+    let references = samples.iter().collect::<Vec<_>>();
+    let report = model
+        .ppo_update(
+            &references,
+            &mut adam,
+            crate::PpoConfig {
+                target_kl: 1.0e10,
+                ..config
+            },
+        )
+        .expect("retain identical candidate for independent likelihood measurement");
+    assert!(report.applied);
+    let mut weighted_kl = 0.0;
+    let mut chunk_kls = Vec::new();
+    for chunk in references.chunks(MODEL_TRAINING_BATCH) {
+        let (_, report) = model
+            .ppo_likelihood_for_test(chunk)
+            .expect("candidate likelihood");
+        weighted_kl += report.approximate_kl * chunk.len() as f64;
+        chunk_kls.push(report.approximate_kl);
+    }
+    let expected = weighted_kl / count as f64;
+    let unweighted = chunk_kls.iter().sum::<f64>() / chunk_kls.len() as f64;
+    assert!(
+        (expected - unweighted).abs() > 1.0e-6,
+        "fixture must distinguish row weighting from chunk weighting"
+    );
+    expected
+}
+
+#[test]
+fn ppo_candidate_evaluation_error_after_first_microbatch_restores_exact_state() {
+    let (model, mut adam, samples, config) = ppo_rollback_fixture(81);
+    let references = samples.iter().collect::<Vec<_>>();
+    let before = model.coherent_snapshot(&adam).expect("snapshot");
+    let identity = model.policy_identity().expect("identity");
+
+    let error = model
+        .ppo_update_with_faults_for_test(&references, &mut adam, config, false)
+        .expect_err("candidate evaluation failure");
+
+    assert_eq!(
+        error.to_string(),
+        "model tensor operation failed: injected PPO candidate evaluation failure after 64 rows"
+    );
+    assert_eq!(model.coherent_snapshot(&adam).expect("snapshot"), before);
+    assert_eq!(model.policy_identity().expect("identity"), identity);
+}
+
+#[test]
+fn ppo_rollback_import_failure_preserves_candidate_evaluation_error_context() {
+    let (model, mut adam, samples, config) = ppo_rollback_fixture(65);
+    let references = samples.iter().collect::<Vec<_>>();
+
+    let error = model
+        .ppo_update_with_faults_for_test(&references, &mut adam, config, true)
+        .expect_err("rollback import failure");
+
+    assert_eq!(
+        error.to_string(),
+        "model tensor operation failed: PPO candidate rejected (model tensor operation failed: injected PPO candidate evaluation failure after 64 rows); parameter rollback failed (model injected parameter replacement failure after tensor 0)"
+    );
+}
+
+fn ppo_rollback_fixture(
+    count: usize,
+) -> (
+    PolicyModel,
+    crate::AdamState,
+    Vec<PpoPreparedSample>,
+    crate::PpoConfig,
+) {
+    assert!([65, 81].contains(&count));
+    let model = PolicyModel::fresh(9_101).expect("model");
+    let base = sampled_ppo_examples(&model, MODEL_TRAINING_BATCH, true);
+    let samples = (0..count)
+        .map(|index| base[index % base.len()].clone())
+        .collect::<Vec<_>>();
+    let config = crate::PpoConfig {
+        learning_rate: 0.01,
+        ..crate::PpoConfig::default()
+    };
+    let mut adam = model.claim_adam_for_test(config.adam()).expect("optimizer");
+    let mut warmup = samples.clone();
+    for sample in &mut warmup {
+        sample.advantage = 0.0;
+        sample.return_value = sample.transition.old_value + 1.0;
+    }
+    let references = warmup.iter().collect::<Vec<_>>();
+    let report = model
+        .ppo_update(
+            &references,
+            &mut adam,
+            crate::PpoConfig {
+                entropy_coefficient: 0.0,
+                ..config
+            },
+        )
+        .expect("value-only fixture step");
+    assert!(report.applied);
+    assert_eq!(adam.step(), 1);
+    assert!(adam.moments().0.iter().any(|value| *value != 0.0));
+    (model, adam, samples, config)
+}
+
+#[test]
+#[ignore = "requires the accepted local BC artifact"]
+fn bc_anchor_critic_only_step_preserves_actor_and_trains_value() {
+    assert_bc_anchor_transfer(PolicyDevice::Cpu);
+}
+
+#[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
+#[test]
+#[ignore = "requires CUDA and the accepted local BC artifact"]
+fn cuda_bc_anchor_critic_only_step_preserves_actor_and_trains_value() {
+    assert_bc_anchor_transfer(PolicyDevice::Cuda { ordinal: 0 });
+}
+
+fn assert_bc_anchor_transfer(device: PolicyDevice) {
+    let model = PolicyModel::fresh_on(9_101, device).expect("model");
+    crate::TrainingArtifact::load_runtime_weights(
+        &model,
+        std::path::Path::new("artifacts/temp/neural-v004-default-e8"),
+    )
+    .expect("validated accepted BC weights");
+    assert_eq!(
+        crate::PolicySnapshot::capture(&model, 0)
+            .expect("snapshot")
+            .fingerprint(),
+        0xe63f_0bdb_478e_bb8b
+    );
+    assert_critic_transfer(&model);
+}
+
+fn assert_critic_transfer(model: &PolicyModel) {
+    let mut samples = sampled_ppo_examples(model, 16, true);
+    for sample in &mut samples {
+        sample.advantage = 0.0;
+        sample.return_value = sample.transition.old_value + 10.0;
+    }
+    let references = samples.iter().collect::<Vec<_>>();
+    let config = crate::PpoConfig {
+        learning_rate: 3.0e-4,
+        entropy_coefficient: 0.0,
+        ..crate::PpoConfig::default()
+    };
+    let mut adam = model.claim_adam_for_test(config.adam()).expect("optimizer");
+    let before = model.export_parameters().expect("parameters");
+    let report = model
+        .ppo_update(&references, &mut adam, config)
+        .expect("critic update");
+    let (_, after) = model
+        .ppo_likelihood_for_test(&references)
+        .expect("likelihood");
+    eprintln!(
+        "critic transfer {:?}: gradient={} post_kl={} value_loss={} -> {}",
+        model.device(),
+        report.gradient_norm,
+        after.approximate_kl,
+        report.value_loss,
+        after.value_loss
+    );
+    assert!(report.applied);
+    assert!(after.value_loss < report.value_loss);
+    let parameters = model.export_parameters().expect("parameters");
+    let mut offset = 0;
+    for (name, shape) in model.parameter_schema().expect("shapes") {
+        let end = offset + shape.iter().product::<usize>();
+        if !name.starts_with("value.") {
+            assert!(
+                before[offset..end] == parameters[offset..end],
+                "critic changed {name}"
+            );
+        }
+        offset = end;
+    }
+    assert!(after.approximate_kl.abs() < 1.0e-6);
+}
+
 fn sampled_ppo_examples(
     model: &PolicyModel,
     count: usize,

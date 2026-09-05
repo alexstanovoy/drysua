@@ -34,7 +34,7 @@ fn ppo_defaults_match_stage_nine_plan() {
     assert_eq!(config.entropy_coefficient, 0.01);
     assert_eq!(config.gae_lambda, 0.98);
     assert_eq!(config.target_kl, 0.02);
-    assert_eq!(PPO_TERMINAL_REWARD, 101.0);
+    assert_eq!(PPO_TERMINAL_REWARD, 1.0);
 }
 
 #[cfg(feature = "builtin")]
@@ -140,9 +140,10 @@ fn rollout_compacts_sparse_tokens_and_bit_packs_behavioral_masks_losslessly() {
 
 #[test]
 fn ppo_schema_and_rules_audit_are_stable() {
-    assert_eq!(PPO_SCHEMA_VERSION, 13);
-    assert_eq!(PPO_RULES_AUDIT_VERSION, 12);
-    assert_eq!(PPO_SCHEMA_HASH, 11_103_744_726_312_279_053);
+    assert_eq!(PPO_SCHEMA_VERSION, 15);
+    assert_eq!(PPO_RULES_AUDIT_VERSION, 14);
+    assert_eq!(PPO_SCHEMA_HASH, 13_893_101_989_595_893_928);
+    assert_eq!(PpoConfig::default().learning_rate, 3.0e-6);
 }
 
 #[test]
@@ -762,11 +763,11 @@ fn reward_shaping_is_bounded_and_terminal_result_dominates() {
     assert!(shaping.abs() <= PPO_SHAPING_BUDGET + 1.0e-5);
     assert_eq!(win.terminal, PPO_TERMINAL_REWARD);
     assert!(win.total >= PPO_TERMINAL_REWARD - 1.0e-5);
-    assert_eq!(PPO_TERMINAL_REWARD - PPO_SHAPING_BUDGET, 1.0);
+    assert!((PPO_TERMINAL_REWARD - PPO_SHAPING_BUDGET - 1.0 / 101.0).abs() < 1.0e-7);
 }
 
 #[test]
-fn reward_values_gold_and_experience_not_last_hits_or_denies() {
+fn reward_values_experience_not_cash_last_hits_or_denies() {
     let mut economy = RewardTracker::default();
     let baseline = crate::GlobalSummary::default();
     economy.observe(baseline, 1.0, None).expect("baseline");
@@ -792,10 +793,142 @@ fn reward_values_gold_and_experience_not_last_hits_or_denies() {
 
     assert_eq!(farm_reward.last_hits, 0.0);
     assert_eq!(farm_reward.denies, 0.0);
-    assert!(economy_reward.wealth > 0.0);
+    assert_eq!(economy_reward.wealth, 0.0);
     assert!(economy_reward.experience > economy_reward.wealth);
     assert!(opponent_reward.experience < 0.0);
     assert!(economy_reward.total > farm_reward.total);
+}
+
+#[test]
+fn reward_cash_spending_is_neutral() {
+    let mut tracker = RewardTracker::default();
+    let mut summary = crate::GlobalSummary {
+        own_gold: 1_000,
+        ..Default::default()
+    };
+    tracker.observe(summary, 0.99, None).expect("baseline");
+    summary.own_gold = 0;
+
+    let reward = tracker.observe(summary, 0.99, None).expect("purchase");
+
+    assert_eq!(reward.wealth, 0.0);
+    assert_eq!(reward.total, 0.0);
+}
+
+#[test]
+fn reward_extreme_public_totals_emit_finite_bounded_components() {
+    let mut tracker = RewardTracker::default();
+    let mut summary = crate::GlobalSummary::default();
+    summary.allied.xp = i64::MIN;
+    summary.enemy.xp = i64::MAX;
+    summary.allied.kills = u64::MAX;
+    tracker.observe(summary, 1.0, None).expect("baseline");
+    summary.allied.xp = i64::MAX;
+    summary.enemy.xp = i64::MIN;
+    summary.allied.kills = 0;
+    summary.enemy.kills = u64::MAX;
+
+    let reward = tracker
+        .observe(summary, 1.0, Some(PpoTerminalOutcome::Loss))
+        .expect("terminal");
+
+    let components = [
+        reward.experience,
+        reward.combat,
+        reward.structures,
+        reward.wealth,
+    ];
+    for value in components {
+        assert!(value.is_finite());
+        assert!(value.abs() <= PPO_SHAPING_BUDGET);
+    }
+    assert!(components.iter().map(|value| value.abs()).sum::<f32>() <= PPO_SHAPING_BUDGET + 1.0e-6);
+    assert!(reward.total.is_finite());
+    assert!(reward.total.abs() <= 1.0 + PPO_SHAPING_BUDGET);
+}
+
+#[test]
+fn reward_terminal_uses_zero_next_potential_independent_of_final_summary() {
+    let previous = crate::GlobalSummary::default();
+    let mut rich = previous;
+    rich.allied.xp = 1_000;
+    rich.enemy_structures_destroyed = 2;
+    for outcome in [
+        PpoTerminalOutcome::Win,
+        PpoTerminalOutcome::Loss,
+        PpoTerminalOutcome::Draw,
+    ] {
+        let mut left = RewardTracker::default();
+        let mut right = RewardTracker::default();
+        left.observe(previous, 0.99, None).expect("baseline");
+        right.observe(previous, 0.99, None).expect("baseline");
+
+        let reward = left
+            .observe(previous, 0.99, Some(outcome))
+            .expect("terminal");
+        let alternate = right.observe(rich, 0.99, Some(outcome)).expect("terminal");
+
+        assert_eq!(reward, alternate);
+        assert!(reward.total.abs() <= 1.0);
+    }
+}
+
+#[test]
+fn reward_terminal_removes_previous_potential_at_the_same_normalized_scale() {
+    let mut tracker = RewardTracker::default();
+    let mut previous = crate::GlobalSummary::default();
+    previous.allied.xp = 100;
+    tracker.observe(previous, 0.99, None).expect("baseline");
+
+    let reward = tracker
+        .observe(previous, 0.99, Some(PpoTerminalOutcome::Win))
+        .expect("terminal");
+
+    assert_eq!(reward.terminal, 1.0);
+    assert!((reward.experience + 2.0 / 101.0).abs() < 1.0e-7);
+    assert!((reward.total - (1.0 - 2.0 / 101.0)).abs() < 1.0e-7);
+}
+
+#[test]
+fn reward_alternating_potential_exhausts_absolute_budget_without_replenishing() {
+    let mut tracker = RewardTracker::default();
+    let mut summary = crate::GlobalSummary::default();
+    tracker.observe(summary, 1.0, None).expect("baseline");
+    let mut expenditure = 0.0;
+    for index in 0..64 {
+        summary.enemy_structures_destroyed = if index % 2 == 0 { 100 } else { 0 };
+        let reward = tracker
+            .observe(summary, 1.0, None)
+            .expect("alternating shaping");
+        expenditure += reward.total.abs();
+        assert!(reward.total.is_finite());
+        assert!(expenditure <= PPO_SHAPING_BUDGET + 1.0e-6);
+        if index > 0 {
+            assert_eq!(reward.total, 0.0);
+        }
+    }
+    assert!(expenditure < 1.0);
+}
+
+#[test]
+fn reward_rejects_invalid_discount_without_consuming_budget_or_previous_state() {
+    let mut tracker = RewardTracker::default();
+    let baseline = crate::GlobalSummary::default();
+    tracker.observe(baseline, 1.0, None).expect("baseline");
+    let improved = crate::GlobalSummary {
+        enemy_structures_destroyed: 1,
+        ..baseline
+    };
+    for discount in [f32::NAN, f32::INFINITY, -0.01, 1.01] {
+        let error = tracker
+            .observe(improved, discount, None)
+            .expect_err("invalid discount");
+        assert_eq!(error, crate::PpoError::InvalidDiscount);
+        assert_eq!(error.to_string(), "invalid tick discount");
+    }
+    let reward = tracker.observe(improved, 1.0, None).expect("valid shaping");
+    assert_eq!(reward.structures, 5.0 / 101.0);
+    assert_eq!(reward.total, reward.structures);
 }
 
 fn frame_and_space() -> (crate::FeatureFrame, ActionSpace) {
@@ -1108,7 +1241,7 @@ fn training_job_checkpoints_and_resumes_from_the_next_update() {
     )
     .expect("first training update");
     assert_eq!(first.completed_updates, 1);
-    assert_eq!(first.optimizer_step, 1);
+    assert_eq!(first.optimizer_step, 2);
     assert_eq!(
         crate::TrainingArtifact::load(&directory)
             .expect("first checkpoint")
@@ -1127,7 +1260,7 @@ fn training_job_checkpoints_and_resumes_from_the_next_update() {
     )
     .expect("resumed training update");
     assert_eq!(resumed.completed_updates, 2);
-    assert_eq!(resumed.optimizer_step, 2);
+    assert_eq!(resumed.optimizer_step, 4);
     assert_eq!(
         crate::TrainingArtifact::load(&directory)
             .expect("resumed checkpoint")

@@ -14,6 +14,256 @@ use crate::{
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(1);
 
+fn prior_runtime_metadata() -> std::collections::HashMap<String, String> {
+    std::collections::HashMap::from([
+        (
+            "action_schema_hash".to_owned(),
+            "1018254919734743331".to_owned(),
+        ),
+        (
+            "feature_schema_hash".to_owned(),
+            "13875648161437731669".to_owned(),
+        ),
+        (
+            "model_schema_hash".to_owned(),
+            "10644717168650027237".to_owned(),
+        ),
+        ("ppo_schema_version".to_owned(), "13".to_owned()),
+        (
+            "ppo_schema_hash".to_owned(),
+            "11103744726312279053".to_owned(),
+        ),
+        ("ppo_rules_audit_version".to_owned(), "12".to_owned()),
+    ])
+}
+
+#[test]
+fn audited_v13_runtime_loads_without_rewriting_metadata() {
+    let directory = test_directory("v13-runtime");
+    let source = PolicyModel::fresh(18_100).expect("source");
+    let parameters = source.export_parameters().expect("parameters");
+    let data: Vec<_> = parameters
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect();
+    let view = TensorView::new(Dtype::F32, vec![parameters.len()], &data).expect("view");
+    let bytes = serialize([("model.parameters", view)], Some(prior_runtime_metadata()))
+        .expect("prior runtime");
+    let path = directory.join("drysua.weights.safetensors");
+    fs::write(&path, &bytes).expect("fixture");
+    let target = PolicyModel::fresh(18_101).expect("target");
+
+    TrainingArtifact::load_runtime_weights(&target, &directory).expect("audited runtime load");
+
+    assert_eq!(
+        target.export_parameters().expect("loaded parameters"),
+        parameters
+    );
+    assert_eq!(fs::read(path).expect("unchanged file"), bytes);
+    fs::remove_dir_all(directory).expect("cleanup");
+}
+
+#[test]
+fn runtime_rejects_every_wrong_prior_tuple_field_before_mutation() {
+    let directory = test_directory("wrong-prior-tuple");
+    let model = PolicyModel::fresh(18_102).expect("model");
+    let before = model.policy_identity().expect("identity");
+    let parameters = model.export_parameters().expect("parameters");
+    for (field, value) in [
+        ("action_schema_hash", "0"),
+        ("feature_schema_hash", "0"),
+        ("model_schema_hash", "0"),
+        ("ppo_schema_version", "12"),
+        ("ppo_schema_version", "14"),
+        ("ppo_schema_hash", "11103744726312279052"),
+        ("ppo_rules_audit_version", "11"),
+        ("ppo_rules_audit_version", "13"),
+        ("unexpected", "13"),
+        ("ppo_schema_hash", ""),
+    ] {
+        let mut metadata = prior_runtime_metadata();
+        if value.is_empty() {
+            metadata.remove(field);
+        } else {
+            metadata.insert(field.to_owned(), value.to_owned());
+        }
+        let data = 0.0f32.to_le_bytes();
+        let view = TensorView::new(Dtype::F32, vec![1], &data).expect("view");
+        let bytes = serialize([("model.parameters", view)], Some(metadata)).expect("fixture");
+        fs::write(directory.join("drysua.weights.safetensors"), bytes).expect("write");
+
+        let error = TrainingArtifact::load_runtime_weights(&model, &directory)
+            .expect_err("wrong prior tuple");
+
+        assert_eq!(error, CheckpointError::SchemaMismatch, "{field}={value}");
+        assert_eq!(
+            error.to_string(),
+            "checkpoint schema does not match this build"
+        );
+        assert_eq!(model.policy_identity().expect("identity"), before);
+        assert_eq!(model.export_parameters().expect("parameters"), parameters);
+    }
+    fs::remove_dir_all(directory).expect("cleanup");
+}
+
+#[test]
+fn prior_training_resume_rejects_v13_and_v14_before_model_mutation() {
+    let directory = test_directory("v13-training");
+    let model = PolicyModel::fresh(18_103).expect("model");
+    let trainer = PpoTrainer::new(&model, checkpoint_config(), 18_104).expect("trainer");
+    TrainingArtifact::capture(&model, &trainer, run_metadata(), progress_metadata(0))
+        .expect("capture")
+        .save(&directory)
+        .expect("save");
+    let path = directory.join("checkpoint.meta");
+    let current = fs::read(&path).expect("manifest");
+    let before = model.policy_identity().expect("identity");
+    let parameters = model.export_parameters().expect("parameters");
+    // The fixed header precedes three action/feature/model version-hash pairs.
+    let ppo_offset = 8 + 4 + 8 + 3 * (4 + 8);
+    for (version, hash) in [
+        (13, 11_103_744_726_312_279_053),
+        (14, 15_610_409_340_106_916_160),
+        (14, crate::PPO_SCHEMA_HASH),
+        (crate::PPO_SCHEMA_VERSION, 15_610_409_340_106_916_160),
+        (13, crate::PPO_SCHEMA_HASH),
+        (crate::PPO_SCHEMA_VERSION, 11_103_744_726_312_279_053),
+    ] {
+        let mut bytes = current.clone();
+        bytes[ppo_offset..ppo_offset + 4].copy_from_slice(&version.to_le_bytes());
+        bytes[ppo_offset + 4..ppo_offset + 12].copy_from_slice(&hash.to_le_bytes());
+        fs::write(&path, bytes).expect("prior manifest fixture");
+
+        for result in [
+            TrainingArtifact::load(&directory),
+            TrainingArtifact::load_compatible(&directory, &run_metadata()),
+        ] {
+            let Err(error) = result else {
+                panic!("old training must not resume");
+            };
+            assert_eq!(error, CheckpointError::SchemaMismatch);
+            assert_eq!(
+                error.to_string(),
+                "checkpoint schema does not match this build"
+            );
+        }
+        assert_eq!(model.policy_identity().expect("identity"), before);
+        assert_eq!(model.export_parameters().expect("parameters"), parameters);
+        assert_eq!(trainer.optimizer_step(), 0);
+    }
+    fs::remove_dir_all(directory).expect("cleanup");
+}
+
+#[test]
+fn prior_runtime_metadata_does_not_bypass_tensor_validation() {
+    let directory = test_directory("prior-tensor-contract");
+    let model = PolicyModel::fresh(18_105).expect("model");
+    let before = model.policy_identity().expect("identity");
+    let parameters = model.export_parameters().expect("parameters");
+    for (name, dtype, count, value, expected) in [
+        (
+            "unknown",
+            Dtype::F32,
+            1,
+            0.0f32,
+            CheckpointError::TensorContract("names"),
+        ),
+        (
+            "model.parameters",
+            Dtype::F32,
+            1,
+            0.0,
+            CheckpointError::TensorContract("dtype or shape"),
+        ),
+        (
+            "model.parameters",
+            Dtype::I32,
+            crate::MODEL_PARAMETER_COUNT,
+            0.0,
+            CheckpointError::TensorContract("dtype or shape"),
+        ),
+        (
+            "model.parameters",
+            Dtype::F32,
+            crate::MODEL_PARAMETER_COUNT,
+            f32::NAN,
+            CheckpointError::NonFiniteTensor {
+                name: "model.parameters",
+                index: 0,
+            },
+        ),
+    ] {
+        let data = value.to_le_bytes().repeat(count);
+        let view = TensorView::new(dtype, vec![count], &data).expect("view");
+        let bytes = serialize([(name, view)], Some(prior_runtime_metadata())).expect("fixture");
+        fs::write(directory.join("drysua.weights.safetensors"), bytes).expect("write");
+
+        let error = TrainingArtifact::load_runtime_weights(&model, &directory)
+            .expect_err("invalid prior tensor");
+
+        assert_eq!(error, expected);
+        assert_eq!(error.to_string(), expected.to_string());
+        assert_eq!(model.policy_identity().expect("identity"), before);
+        assert_eq!(model.export_parameters().expect("parameters"), parameters);
+    }
+    fs::remove_dir_all(directory).expect("cleanup");
+}
+
+#[test]
+fn training_capture_rejects_prior_rules_audit() {
+    let model = PolicyModel::fresh(18_106).expect("model");
+    let trainer = PpoTrainer::new(&model, checkpoint_config(), 18_107).expect("trainer");
+    let mut run = run_metadata();
+    run.rules_audit_version = 12;
+
+    let error = TrainingArtifact::capture(&model, &trainer, run, progress_metadata(0))
+        .expect_err("prior rules audit");
+
+    assert_eq!(
+        error,
+        CheckpointError::InvalidManifest("rules audit or batch size")
+    );
+    assert_eq!(
+        error.to_string(),
+        "checkpoint manifest has invalid rules audit or batch size"
+    );
+}
+
+#[test]
+#[ignore = "requires the accepted local BC anchor and preserved pre-migration probes"]
+fn accepted_anchor_runtime_loads_but_pre_migration_probe_training_rejects() {
+    let directory = std::path::Path::new("artifacts/temp/neural-v004-default-e8");
+    let path = directory.join("drysua.weights.safetensors");
+    let bytes = fs::read(&path).expect("accepted anchor");
+    let (_, metadata) = safetensors::SafeTensors::read_metadata(&bytes).expect("metadata");
+    assert_eq!(
+        metadata.metadata().as_ref(),
+        Some(&prior_runtime_metadata())
+    );
+    let model = PolicyModel::fresh(18_108).expect("model");
+
+    TrainingArtifact::load_runtime_weights(&model, directory).expect("accepted anchor runtime");
+
+    assert_eq!(
+        crate::PolicySnapshot::capture(&model, 0)
+            .expect("snapshot")
+            .fingerprint(),
+        0xe63f_0bdb_478e_bb8b
+    );
+    let before = model.policy_identity().expect("identity");
+    for probe in ["neural-v004-conservative-u1", "neural-v004-conservative-u8"] {
+        let path = std::path::Path::new("artifacts/temp").join(probe);
+        let error = TrainingArtifact::load(&path).expect_err("old probe cannot resume");
+        assert_eq!(error, CheckpointError::SchemaMismatch);
+        assert_eq!(
+            error.to_string(),
+            "checkpoint schema does not match this build"
+        );
+        assert_eq!(model.policy_identity().expect("identity"), before);
+    }
+    assert_eq!(fs::read(path).expect("unchanged anchor"), bytes);
+}
+
 #[test]
 fn checkpoint_schema_hash_is_stable() {
     assert_eq!(crate::CHECKPOINT_SCHEMA_VERSION, 2);
@@ -137,10 +387,24 @@ fn truncated_manifest_is_rejected_with_exact_error() {
 }
 
 #[test]
-fn runtime_weights_reject_unknown_or_missing_tensor_contract() {
+fn current_runtime_weights_roundtrip_with_current_metadata() {
     let directory = test_directory("runtime");
     let model = PolicyModel::fresh(18_030).expect("model");
     TrainingArtifact::save_runtime_weights(&model, &directory).expect("runtime save");
+    let bytes = fs::read(directory.join("drysua.weights.safetensors")).expect("runtime bytes");
+    let (_, metadata) = safetensors::SafeTensors::read_metadata(&bytes).expect("metadata");
+    let mut expected = prior_runtime_metadata();
+    for (key, value) in [
+        ("ppo_schema_version", crate::PPO_SCHEMA_VERSION.to_string()),
+        ("ppo_schema_hash", crate::PPO_SCHEMA_HASH.to_string()),
+        (
+            "ppo_rules_audit_version",
+            crate::PPO_RULES_AUDIT_VERSION.to_string(),
+        ),
+    ] {
+        expected.insert(key.to_owned(), value);
+    }
+    assert_eq!(metadata.metadata().as_ref(), Some(&expected));
     let restored = PolicyModel::fresh(18_031).expect("restored");
 
     TrainingArtifact::load_runtime_weights(&restored, &directory).expect("runtime load");
