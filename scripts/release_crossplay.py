@@ -11,7 +11,7 @@ import subprocess
 import sys
 import time
 
-from release_build import digest, prepare, read_registry, snapshot_weights, WEIGHTS_NAME
+from release_build import digest, prepare, read_registry, snapshot_weights, weights_name
 from release_wire import Relay
 
 SIDES = ("Radiant", "Dire")
@@ -93,27 +93,27 @@ def validate_game(clients, server_exit, timed_out, tick_limit):
 
 
 def add_candidate_arguments(parser):
-    parser.add_argument("--candidate-policy", choices=("teacher", "hybrid"), default="teacher")
+    parser.add_argument("--candidate-policy", choices=("teacher", "hybrid", "tactical"), default="teacher")
     parser.add_argument("--candidate-weights", type=Path,
-                        help="Directory containing drysua.weights.safetensors (hybrid only)")
+                        help="Directory containing drysua.weights.safetensors (hybrid) or drysua.tactical.bin (tactical)")
 
 
 def validate_candidate_arguments(args):
-    if args.candidate_policy == "hybrid" and args.candidate_weights is None:
-        raise ValueError("hybrid requires --candidate-weights")
+    if args.candidate_policy in ("hybrid", "tactical") and args.candidate_weights is None:
+        raise ValueError(f"{args.candidate_policy} requires --candidate-weights")
     if args.candidate_policy == "teacher" and args.candidate_weights is not None:
         raise ValueError("teacher forbids --candidate-weights")
 
 
 def bot_command(bot, address, index, tick_limit):
     policy = bot["policy"]
-    if policy not in ("teacher", "hybrid") or ("weights" in bot) != (policy == "hybrid"):
+    if policy not in ("teacher", "hybrid", "tactical") or ("weights" in bot) != (policy != "teacher"):
         raise ValueError("bot policy/weights contract mismatch")
     assert index in (0, 1)
     assert 1 <= tick_limit <= 100000
     command = [str(bot["binary"]), "play", "--policy", policy, "--addr", address,
                "--name", f"release-seat-{index}", "--limit", str(tick_limit)]
-    if policy == "hybrid":
+    if policy != "teacher":
         command.extend(["--weights-directory", str(bot["weights"])])
     return command
 
@@ -228,10 +228,10 @@ def run(args, root, output):
     if digest(candidate) != source_hash or digest(args.candidate_binary) != source_hash:
         raise ValueError("candidate changed while being snapshotted; retry after build completes")
     candidate_bot = dict(binary=candidate, policy=args.candidate_policy)
-    if args.candidate_policy == "hybrid":
+    if args.candidate_policy in ("hybrid", "tactical"):
         candidate_bot["weights"] = output / "candidate-weights"
         candidate_bot["weights_metadata"] = snapshot_weights(
-            args.candidate_weights, candidate_bot["weights"])
+            args.candidate_weights, candidate_bot["weights"], policy=args.candidate_policy)
     harness = output / "harness"
     harness.mkdir()
     for name in ("release_build.py", "release_crossplay.py", "release_wire.py"):
@@ -265,7 +265,7 @@ def run(args, root, output):
     report["gate"] = evaluate_gate(report["games"], list(opponents), registry["seeds"])
     identities = [(candidate, source_hash), (server, report["server_sha256"])]
     identities.extend((bot["binary"], report["opponent_sha256"][tag]) for tag, bot in opponents.items())
-    identities.extend((bot["weights"] / WEIGHTS_NAME, bot["weights_metadata"]["sha256"])
+    identities.extend((bot["weights"] / weights_name(bot["policy"]), bot["weights_metadata"]["sha256"])
                       for bot in [candidate_bot, *opponents.values()] if "weights" in bot)
     if any(digest(binary) != expected for binary, expected in identities):
         report["gate"]["passed"] = False

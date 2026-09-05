@@ -121,6 +121,72 @@ The top-level registry `policy: teacher` remains the legacy registry contract,
 not an override of explicit per-release or candidate policy. No registry entries
 or tags are added by this implementation.
 
+### Compact Tactical deployment
+
+The canonical Tactical artifact is **`drysua.tactical.bin`**. Trainers must write
+`TacticalPolicy::to_bytes()` to that filename; it is not a SafeTensors file and
+does not use the Hybrid/PPO schema. The file starts with the exact UTF-8
+`TACTICAL_SCHEMA_DESCRIPTOR`, followed by 172 little-endian F32 parameters in
+`W1[8,16], b1[8], W2[4,8], b2[4]` order. The live loader reads at most
+`TACTICAL_FILE_BYTES + 1` bytes, then validates exact length, schema, and finite
+parameters in `[-4, 4]` through `TacticalPolicy::from_bytes`. Missing files, links,
+directories, extra/truncated bytes, and invalid values are errors before connecting.
+There is no default-file or Teacher/Hybrid fallback.
+
+```sh
+cargo build --release --locked --quiet --bin drysua --no-default-features \
+  --target-dir artifacts/temp/tactical-live-target
+
+artifacts/temp/tactical-live-target/release/drysua play \
+  --policy tactical --weights-directory artifacts/temp/tactical-default \
+  --addr 127.0.0.1:4455 --limit 30000
+```
+
+`--weights-directory` is explicitly required for Tactical, including implicit
+play without the `play` subcommand. Hybrid retains its existing `.` default and
+Teacher remains weights-free. The library APIs are
+`play_tactical(address, name, limit, weights_directory)` and
+`play_tactical_on(wire, seated, limit, &TacticalPolicy)`; the filename is exported
+as `TACTICAL_FILE_NAME`. Tactical uses the existing live ACK, snapshot/event,
+decision cadence, order persistence, readiness, and rejection state machine,
+calling `Teacher::decide_tactical` on both maps. It never constructs `PolicyModel`
+or initializes Candle. FeatureEncoder observation is unchanged for now, including
+Hybrid's Map0 path. `TacticalPolicy::default()` selects Teacher behavior; it is a
+parity baseline, not evidence of learned strength.
+
+The release runner accepts `--candidate-policy tactical` with required
+`--candidate-weights DIRECTORY`, snapshots **only** `drysua.tactical.bin`, and
+binds/checks its SHA-256 exactly as for Hybrid. The runner bounds Tactical files
+to 1..16,384 bytes; the executing binary enforces its exact schema/length. If both
+artifact types are present, the explicit policy selects exactly one and the other
+is not copied. Historical Teachers still have no weight arguments. Future
+`"policy": "tactical"` registry entries use the same `weights.path: artifacts/<tag>`
+and lowercase `weights.sha256` contract described above, but hash the canonical
+Tactical file from that immutable tagged archive.
+
+After trained weights are ready, the **unchanged full release gate** command is:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/release_crossplay.py \
+  --candidate-binary artifacts/temp/tactical-live-target/release/drysua \
+  --candidate-policy tactical \
+  --candidate-weights artifacts/temp/TACTICAL_TRAINED_OUTPUT \
+  --candidate-metadata 'EXACT BUILD COMMAND, SOURCE COMMIT, DIRTY PATCH AND TRAINING PROVENANCE' \
+  --run-name tactical-trained-crossplay-001
+```
+
+Replace the output/provenance placeholders and use a new run name. A two-sided
+baseline TCP smoke is not this 60-game gate and cannot approve a release.
+
+Default Tactical parity evidence is retained at
+`artifacts/temp/tactical-default-tcp-001/evidence.md`. At seed 9,200,003 versus
+the archived `v0.0.3` Teacher, both TCP matches ended with Dire winning at tick
+8,890 (candidate Radiant loss, candidate Dire win), without rejections, errors,
+or timeouts. Builtin inference matched every accepted order/application tick and
+the complete terminal stats against each TCP replay. The default artifact is
+`artifacts/temp/tactical-default/drysua.tactical.bin`; this is not trained weight
+evidence and no full Tactical gate has been run.
+
 Exit codes: `0` approved, `1` failed gate, `2` setup/build/registry failure. An
 interrupted or incomplete report is not approval. No selected-opponent, early-win,
 pooled-score, or reduced-seed release mode is provided.

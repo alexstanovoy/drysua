@@ -350,6 +350,389 @@ fn remote_tree_deltas_leave_candidates_and_masks_invariant_until_visibility_is_p
 }
 
 #[test]
+fn tree_selection_matches_full_sort_at_zero_eight_nine_and_maximum_counts() {
+    for team in [Team::Radiant, Team::Dire] {
+        for count in [0, 1, 7, 8, 9, 31, 184, crate::MAX_STATIC_TREES] {
+            let mut info = match_info();
+            info.trees = (0..count)
+                .rev()
+                .map(|index| Vec2::from_ints(2_001 + index as i32, 2_001))
+                .collect();
+            let tracker = tree_tracker(info, world_view(1), team);
+
+            let actual = crate::action::tree_points_for_test(&tracker, Vec::new());
+
+            assert_eq!(actual, reference_tree_points(&tracker, Vec::new()));
+            assert_eq!(actual.len(), count.min(8));
+        }
+    }
+}
+
+#[test]
+fn tree_selection_preserves_canonical_distance_ties_on_both_sides() {
+    let ring = [
+        (0, 5),
+        (3, 4),
+        (4, 3),
+        (5, 0),
+        (4, -3),
+        (3, -4),
+        (0, -5),
+        (-3, -4),
+        (-4, -3),
+        (-5, 0),
+        (-4, 3),
+        (-3, 4),
+    ];
+    for team in [Team::Radiant, Team::Dire] {
+        let mut info = match_info();
+        info.trees = ring
+            .iter()
+            .map(|(x, y)| Vec2::from_ints(2_000 + x, 2_000 + y))
+            .collect();
+        let tracker = tree_tracker(info, world_view(1), team);
+
+        let actual = crate::action::tree_points_for_test(&tracker, Vec::new());
+
+        assert_eq!(actual, reference_tree_points(&tracker, Vec::new()));
+        assert_eq!(actual.len(), 8);
+        let first_x = if team == Team::Radiant { 1_995 } else { 2_005 };
+        assert_eq!(actual[0].position, Vec2::from_ints(first_x, 2_000));
+    }
+}
+
+#[test]
+fn tree_selection_counts_duplicates_before_deduplication_and_keeps_static_source() {
+    for team in [Team::Radiant, Team::Dire] {
+        let mut info = match_info();
+        let duplicate = Vec2::from_ints(2_001, 2_000);
+        info.trees = vec![duplicate; 7];
+        info.trees.push(Vec2::from_ints(2_002, 2_000));
+        let mut view = world_view(1);
+        view.felled_trees.clear();
+        view.planted_trees = vec![duplicate; 9];
+        let tracker = tree_tracker_with_deltas(info, view, team);
+
+        let actual = crate::action::tree_points_for_test(&tracker, Vec::new());
+
+        assert_eq!(actual, reference_tree_points(&tracker, Vec::new()));
+        assert_eq!(actual, [tree_candidate(duplicate, PointSource::StaticTree)]);
+    }
+}
+
+#[test]
+fn tree_selection_accepts_only_locally_proven_deltas_at_cell_boundaries() {
+    let positions = [
+        Vec2::from_ints(2_001, 2_001),
+        Vec2::from_ints(2_111, 2_000),
+        Vec2::from_ints(2_112, 2_000),
+        Vec2::from_ints(7_000, 7_000),
+    ];
+    for team in [Team::Radiant, Team::Dire] {
+        let mut info = match_info();
+        info.trees = positions.to_vec();
+        let mut view = world_view(1);
+        view.felled_trees = vec![3, 0, 2, 1, 0];
+        view.planted_trees = positions.to_vec();
+        let tracker = tree_tracker_with_deltas(info, view, team);
+
+        let actual = crate::action::tree_points_for_test(&tracker, Vec::new());
+
+        assert_eq!(actual, reference_tree_points(&tracker, Vec::new()));
+        assert_eq!(
+            actual,
+            [
+                tree_candidate(positions[0], PointSource::PlantedTree),
+                tree_candidate(positions[1], PointSource::PlantedTree),
+                tree_candidate(positions[2], PointSource::StaticTree),
+                tree_candidate(positions[3], PointSource::StaticTree),
+            ]
+        );
+    }
+}
+
+#[test]
+fn tree_selection_does_not_accept_deltas_from_dead_or_enemy_bodies() {
+    for (team, hp, statuses) in [
+        (Team::Dire, 1_000, 0),
+        (Team::Radiant, 0, 0),
+        (Team::Radiant, 1_000, StatusFlags::DEAD),
+    ] {
+        let position = Vec2::from_ints(7_000, 7_000);
+        let mut info = match_info();
+        info.trees = vec![position];
+        let mut view = world_view(1);
+        view.units.retain(|unit| unit.id == HERO_ID);
+        let mut observer = unit(ENEMY_ID, UnitKind::CreepMelee, team, 7_000, 7_000);
+        observer.hp = hp;
+        observer.statuses.bits = statuses;
+        view.units.push(observer);
+        view.felled_trees = vec![0];
+        view.planted_trees = vec![position];
+        let tracker = tracker_with_info_and_view(&info, view);
+
+        let actual = crate::action::tree_points_for_test(&tracker, Vec::new());
+
+        assert_eq!(actual, reference_tree_points(&tracker, Vec::new()));
+        assert_eq!(actual, [tree_candidate(position, PointSource::StaticTree)]);
+    }
+}
+
+#[test]
+fn tree_selection_preserves_point_capacity_and_merges_only_until_the_original_cutoff() {
+    for count in [0, 40, 46, 47, 48] {
+        let mut info = match_info();
+        info.trees = (1..=12)
+            .map(|index| Vec2::from_ints(2_000 + index, 2_000))
+            .collect();
+        let tracker = tree_tracker(info, world_view(1), Team::Radiant);
+        let mut prefix: Vec<_> = (0..count)
+            .map(|index| crate::PointCandidate {
+                position: Vec2::from_ints(2_001 + index, 2_000),
+                source: PointSource::Tactical {
+                    direction: PointDirection::East,
+                    radius: 200,
+                },
+                walkable: true,
+                standing_tree: false,
+                allied_building: true,
+            })
+            .collect();
+        if count == 47 {
+            prefix[1].position = Vec2::from_ints(6_000, 6_000);
+        }
+
+        let actual = crate::action::tree_points_for_test(&tracker, prefix.clone());
+
+        assert_eq!(actual, reference_tree_points(&tracker, prefix));
+        assert!(actual.len() <= MAX_POINT_CANDIDATES);
+        if count == 48 {
+            assert!(actual[0].standing_tree);
+            assert!(!actual[0].walkable);
+            assert!(actual[0].allied_building);
+            assert!(!actual[1].standing_tree);
+        }
+        if count == 47 {
+            assert_eq!(actual.len(), 48);
+            assert!(!actual[2].standing_tree);
+        }
+    }
+}
+
+#[test]
+fn tree_selection_matches_full_sort_for_bounded_generated_tree_and_delta_combinations() {
+    for case in 0..64usize {
+        let mut info = match_info();
+        info.map = MapId((case % 2) as u16);
+        info.trees = (0..case * 3)
+            .map(|index| {
+                Vec2::from_ints(
+                    1_900 + ((index * 37 + case * 13) % 257) as i32,
+                    1_900 + ((index * 17 + case * 31) % 257) as i32,
+                )
+            })
+            .collect();
+        let mut view = world_view(1);
+        view.felled_trees = (0..info.trees.len())
+            .filter(|index| (index + case) % 3 == 0)
+            .map(|index| index as u32)
+            .collect();
+        view.planted_trees = info.trees.iter().copied().step_by(2).collect();
+        for team in [Team::Radiant, Team::Dire] {
+            let tracker = tree_tracker_with_deltas(info.clone(), view.clone(), team);
+
+            let actual = crate::action::tree_points_for_test(&tracker, Vec::new());
+
+            assert_eq!(
+                actual,
+                reference_tree_points(&tracker, Vec::new()),
+                "case {case}, {team:?}"
+            );
+            assert!(actual.len() <= 8);
+        }
+    }
+}
+
+#[test]
+fn tree_selection_handles_maximum_combined_static_and_planted_counts() {
+    let mut info = match_info();
+    let duplicate = Vec2::from_ints(2_001, 2_001);
+    info.trees = vec![duplicate; crate::MAX_STATIC_TREES];
+    let mut view = world_view(1);
+    view.felled_trees.clear();
+    view.planted_trees = vec![duplicate; crate::MAX_PLANTED_TREES];
+    let tracker = tree_tracker_with_deltas(info, view, Team::Radiant);
+
+    let actual = crate::action::tree_points_for_test(&tracker, Vec::new());
+
+    assert_eq!(actual, reference_tree_points(&tracker, Vec::new()));
+    assert_eq!(actual, [tree_candidate(duplicate, PointSource::StaticTree)]);
+}
+
+#[test]
+fn tree_selection_at_full_point_capacity_does_not_merge_a_later_duplicate() {
+    let mut info = match_info();
+    info.trees = vec![Vec2::from_ints(2_001, 2_000), Vec2::from_ints(2_002, 2_000)];
+    let tracker = tree_tracker(info, world_view(1), Team::Radiant);
+    let prefix: Vec<_> = (0..MAX_POINT_CANDIDATES)
+        .map(|index| crate::PointCandidate {
+            position: Vec2::from_ints(2_002 + index as i32, 2_000),
+            source: PointSource::Fountain(LandmarkRelation::Own),
+            walkable: true,
+            standing_tree: false,
+            allied_building: false,
+        })
+        .collect();
+
+    let actual = crate::action::tree_points_for_test(&tracker, prefix.clone());
+
+    assert_eq!(actual, reference_tree_points(&tracker, prefix.clone()));
+    assert_eq!(actual, prefix);
+}
+
+#[test]
+fn tree_selection_preserves_full_point_order_tree_legality_and_decoded_targets() {
+    for team in [Team::Radiant, Team::Dire] {
+        let mut info = match_info();
+        info.trees = vec![Vec2::from_ints(2_200, 2_000); 3];
+        info.trees
+            .extend((1..=9).map(|index| Vec2::from_ints(2_200, 2_000 + index)));
+        let tracker = tree_tracker(info, world_view(1), team);
+        let space = ActionSpace::from_tracker(&tracker).expect("tree action space");
+        let tactical_prefix = space.point_candidates()[..24]
+            .iter()
+            .map(|point| crate::PointCandidate {
+                standing_tree: false,
+                ..*point
+            })
+            .collect();
+        let expected = reference_tree_points(&tracker, tactical_prefix);
+
+        assert_eq!(space.point_candidates(), expected);
+        assert_eq!(
+            space.move_point_mask(ControlledUnit::Hero),
+            expected
+                .iter()
+                .map(|point| point.walkable)
+                .collect::<Vec<_>>()
+        );
+        for (index, point) in expected.iter().enumerate() {
+            let action = StructuredAction::Cast {
+                unit: ControlledUnit::Hero,
+                slot: AbilitySlot(3),
+                target: ActionTarget::Point(PointIndex(index)),
+            };
+            let allowed = point.standing_tree
+                && point
+                    .position
+                    .within(Vec2::from_ints(2_000, 2_000), Fixed::from_int(1_200));
+            assert_eq!(space.allows(action), allowed);
+            if allowed {
+                assert_order(
+                    &space,
+                    action,
+                    None,
+                    Order::Cast {
+                        slot: AbilitySlot(3),
+                        target: Target::Pos(point.position),
+                    },
+                );
+            } else {
+                assert_eq!(
+                    space
+                        .decode(action)
+                        .expect_err("non-tree target")
+                        .to_string(),
+                    "action Cast is masked by the current action space"
+                );
+            }
+        }
+    }
+}
+
+fn tree_tracker(info: MatchInfo, mut view: WorldView, team: Team) -> StateTracker {
+    view.felled_trees.clear();
+    view.planted_trees.clear();
+    tree_tracker_with_deltas(info, view, team)
+}
+
+fn tree_tracker_with_deltas(mut info: MatchInfo, mut view: WorldView, team: Team) -> StateTracker {
+    let enemy = if team == Team::Radiant {
+        Team::Dire
+    } else {
+        Team::Radiant
+    };
+    info.picks[0].team = team;
+    info.picks[1].team = enemy;
+    view.viewer = Some(team);
+    view.players[0].team = team;
+    view.players[1].team = enemy;
+    view.units.retain(|unit| unit.id == HERO_ID);
+    view.units[0].team = team;
+    tracker_with_info_and_view(&info, view)
+}
+
+fn tree_candidate(position: Vec2, source: PointSource) -> crate::PointCandidate {
+    crate::PointCandidate {
+        position,
+        source,
+        walkable: false,
+        standing_tree: true,
+        allied_building: false,
+    }
+}
+
+fn reference_tree_points(
+    tracker: &StateTracker,
+    mut points: Vec<crate::PointCandidate>,
+) -> Vec<crate::PointCandidate> {
+    let current = tracker.current().expect("tree snapshot");
+    let center = tracker.own_hero().expect("tree hero").pos;
+    let mut trees = Vec::with_capacity(tracker.static_trees().len() + current.planted_trees.len());
+    for (index, position) in tracker.static_trees().iter().copied().enumerate() {
+        let observable = tracker.position_locally_observable_to_own_seat(position);
+        if !current.felled_trees.contains(&(index as u32)) || !observable {
+            trees.push((center.distance_squared(position), position, false));
+        }
+    }
+    for position in current.planted_trees.iter().copied() {
+        if tracker.position_locally_observable_to_own_seat(position) {
+            trees.push((center.distance_squared(position), position, true));
+        }
+    }
+    trees.sort_by_key(|(distance, position, planted)| {
+        let sign = if tracker.team() == Team::Dire {
+            -1i64
+        } else {
+            1
+        };
+        (
+            *distance,
+            sign * i64::from(position.x.raw),
+            sign * i64::from(position.y.raw),
+            *planted,
+        )
+    });
+    for (_, position, planted) in trees.into_iter().take(8) {
+        if let Some(existing) = points.iter_mut().find(|point| point.position == position) {
+            existing.walkable = false;
+            existing.standing_tree = true;
+        } else if points.len() < MAX_POINT_CANDIDATES {
+            let source = if planted {
+                PointSource::PlantedTree
+            } else {
+                PointSource::StaticTree
+            };
+            points.push(tree_candidate(position, source));
+        }
+        if points.len() == MAX_POINT_CANDIDATES {
+            break;
+        }
+    }
+    points
+}
+
+#[test]
 fn town_portal_landings_are_not_body_navigation_targets() {
     let mut view = world_view(1);
     let hero_index = hero_index(&view);

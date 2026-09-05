@@ -16,6 +16,9 @@ mod ppo;
 mod ppo_arena;
 mod readiness;
 mod seat;
+mod tactical;
+#[cfg(feature = "builtin")]
+mod tactical_training;
 mod teacher;
 mod tracker;
 mod wire;
@@ -38,6 +41,9 @@ pub use ppo::*;
 pub use ppo_arena::*;
 pub use readiness::*;
 pub use seat::*;
+pub use tactical::*;
+#[cfg(feature = "builtin")]
+pub use tactical_training::*;
 pub use teacher::*;
 pub use tracker::*;
 pub use wire::*;

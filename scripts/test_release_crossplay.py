@@ -20,6 +20,58 @@ import release_build as release_build
 
 
 class CandidateTests(unittest.TestCase):
+    def test_tactical_cli_requires_weights_and_emits_explicit_tactical_command(self):
+        parser = argparse.ArgumentParser()
+        crossplay.add_candidate_arguments(parser)
+        args = parser.parse_args(["--candidate-policy", "tactical"])
+        with self.assertRaisesRegex(ValueError, "tactical requires --candidate-weights"):
+            crossplay.validate_candidate_arguments(args)
+        args.candidate_weights = Path("/weights")
+        crossplay.validate_candidate_arguments(args)
+        bot = dict(binary=Path("/bot"), policy="tactical", weights=args.candidate_weights)
+        command = crossplay.bot_command(bot, "127.0.0.1:1", 0, 30000)
+        self.assertEqual(command[2:4], ["--policy", "tactical"])
+        self.assertEqual(command[-2:], ["--weights-directory", "/weights"])
+
+    def test_tactical_snapshot_selects_canonical_file_and_isolates_it(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary)
+            weights = source / "drysua.tactical.bin"
+            weights.write_bytes(b"tactical deployment")
+            (source / release_build.WEIGHTS_NAME).write_bytes(b"unrelated hybrid weights")
+            metadata = release_build.snapshot_weights(source, source / "snapshot", policy="tactical")
+            self.assertEqual(metadata["sha256"], crossplay.digest(weights))
+            self.assertEqual(Path(metadata["snapshot"]).name, "drysua.tactical.bin")
+            weights.write_bytes(b"trained replacement")
+            self.assertEqual(Path(metadata["snapshot"]).read_bytes(), b"tactical deployment")
+            self.assertFalse((source / "snapshot" / release_build.WEIGHTS_NAME).exists())
+
+    def test_tactical_snapshot_rejects_missing_empty_link_and_large_artifact(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary)
+            weights = source / "drysua.tactical.bin"
+            (source / release_build.WEIGHTS_NAME).write_bytes(b"not a tactical fallback")
+            with self.assertRaisesRegex(ValueError, "regular non-symlink"):
+                release_build.snapshot_weights(source, source / "missing", policy="tactical")
+            for value in (b"", bytes(16385)):
+                weights.write_bytes(value)
+                with self.assertRaisesRegex(ValueError, "weights size"):
+                    release_build.snapshot_weights(source, source / "invalid", policy="tactical")
+            weights.unlink()
+            weights.symlink_to(source / release_build.WEIGHTS_NAME)
+            with self.assertRaisesRegex(ValueError, "regular non-symlink"):
+                release_build.snapshot_weights(source, source / "link", policy="tactical")
+
+    def test_tactical_registry_requires_version_bound_sha_weights(self):
+        release = dict(tag="v0.0.4", policy="tactical")
+        with self.assertRaisesRegex(ValueError, "tactical requires weights"):
+            release_build.validate_release_weights(release)
+        release["weights"] = dict(path="artifacts/v0.0.4", sha256="a" * 64)
+        release_build.validate_release_weights(release)
+        release["weights"]["path"] = "artifacts/v0.0.4/../temp"
+        with self.assertRaisesRegex(ValueError, "weights path"):
+            release_build.validate_release_weights(release)
+
     def test_cli_defaults_teacher_and_requires_explicit_hybrid_weights(self):
         parser = argparse.ArgumentParser()
         crossplay.add_candidate_arguments(parser)
@@ -82,14 +134,20 @@ class CandidateTests(unittest.TestCase):
                     release_build.snapshot_weights(source, source / "race")
 
     def test_run_wires_snapshot_metadata_and_does_not_change_gate(self):
+        self.run_wires_snapshot("hybrid", release_build.WEIGHTS_NAME)
+
+    def test_tactical_run_binds_canonical_snapshot_and_keeps_complete_schedule(self):
+        self.run_wires_snapshot("tactical", "drysua.tactical.bin")
+
+    def run_wires_snapshot(self, policy, filename):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(__file__).resolve().parents[1]
             output = Path(temporary)
             binary = output / "input-binary"
             binary.write_bytes(b"binary")
-            weights = output / release_build.WEIGHTS_NAME
+            weights = output / filename
             weights.write_bytes(b"weights")
-            args = argparse.Namespace(candidate_policy="hybrid", candidate_weights=output,
+            args = argparse.Namespace(candidate_policy=policy, candidate_weights=output,
                 candidate_binary=binary, candidate_metadata="test provenance", bota_repository=root)
             registry = dict(seeds=list(range(10)))
             teacher = dict(binary=binary, policy="teacher")
@@ -102,12 +160,12 @@ class CandidateTests(unittest.TestCase):
             self.assertEqual(execute.call_count, 20)
             for call in execute.call_args_list:
                 bots = call.args[2]
-                candidate = next(bot for bot in bots if bot["policy"] == "hybrid")
+                candidate = next(bot for bot in bots if bot["policy"] == policy)
                 self.assertEqual(candidate["weights"], output / "candidate-weights")
                 self.assertIn(teacher, bots)
             report = json.loads((output / "report.json").read_text())
             self.assertEqual(report["candidate"]["weights"]["sha256"], crossplay.digest(weights))
-            self.assertEqual(report["candidate"]["policy"], "hybrid")
+            self.assertEqual(report["candidate"]["policy"], policy)
             self.assertEqual(report["gate"]["opponents"]["v0.0.1"]["games"], 20)
 
     def test_commands_keep_hybrid_weights_and_teacher_separate_in_either_seat(self):
@@ -356,17 +414,23 @@ class RegistryTests(unittest.TestCase):
             self.assertEqual(read_registry(path, Path("bot"), Path("simulator")), registry)
 
     def test_hybrid_prepare_uses_weights_from_immutable_tag_archive(self):
+        self.prepare_uses_archived_weights("hybrid")
+
+    def test_tactical_prepare_uses_weights_from_immutable_tag_archive(self):
+        self.prepare_uses_archived_weights("tactical")
+
+    def prepare_uses_archived_weights(self, policy):
         registry = json.loads(self.registry_path().read_text())
         release = registry["releases"][0]
-        release.update(policy="hybrid", weights=dict(path="artifacts/v0.0.1", sha256="a" * 64))
+        release.update(policy=policy, weights=dict(path="artifacts/v0.0.1", sha256="a" * 64))
         with patch.object(release_build, "archive") as archive, \
                 patch.object(release_build, "build"), \
                 patch.object(release_build, "snapshot_weights", return_value={}) as snapshot:
             _, opponents = release_build.prepare(Path("bot"), Path("simulator"), Path("run"), registry)
         archive.assert_any_call(Path("bot"), release["commit"], Path("run/sources/v0.0.1"), Path("run"))
         snapshot.assert_called_once_with(Path("run/sources/v0.0.1/artifacts/v0.0.1"),
-                                         Path("run/weights-v0.0.1"), "a" * 64)
-        self.assertEqual(opponents["v0.0.1"]["policy"], "hybrid")
+                                         Path("run/weights-v0.0.1"), "a" * 64, policy=policy)
+        self.assertEqual(opponents["v0.0.1"]["policy"], policy)
 
     def test_unregistered_release_lightweight_tag_or_moved_tag_fails(self):
         registry_path = self.registry_path()

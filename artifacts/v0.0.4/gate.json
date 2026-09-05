@@ -1,0 +1,95 @@
+{
+  "candidate_tag": "v0.0.4",
+  "phase": "pre-commit frozen-source gate",
+  "candidate": {
+    "source": "/home/alexstanovoy/Workspace/bots/drysua/artifacts/temp/tactical-v1-champion-001-provenance/target-cpu/release/drysua",
+    "sha256": "278950359a4e03815759f4a6964ebee5f0586c147224c789f20995563efd2705",
+    "policy": "tactical",
+    "weights": {
+      "source": "/home/alexstanovoy/Workspace/bots/drysua/artifacts/temp/tactical-v1-champion-001-provenance/champion-weights/drysua.tactical.bin",
+      "snapshot": "/home/alexstanovoy/Workspace/bots/drysua/artifacts/temp/tactical-v1-champion-crossplay-001/candidate-weights/drysua.tactical.bin",
+      "sha256": "bfa19eb4ec2f11fd852f6f6fd6284be84aa0c0dc1b597a52fc00352d64ed5bd1"
+    },
+    "command_metadata": "Frozen v1 source=/home/alexstanovoy/Workspace/bots/drysua/artifacts/temp/tactical-v1-champion-001-provenance/sources/drysua; HEAD/status/exact patch/file hashes in /home/alexstanovoy/Workspace/bots/drysua/artifacts/temp/tactical-v1-champion-001-provenance; Teacher unchanged from v1 parity patch; reproduced all 32 archived selection game order fingerprints; cargo build --release --locked --quiet --bin drysua --no-default-features; CARGO_TARGET_DIR=/home/alexstanovoy/Workspace/bots/drysua/artifacts/temp/tactical-v1-champion-001-provenance/target-cpu; candidate-build.json records toolchain; champion original=artifacts/temp/tactical-search-001/selection-017-1; no training"
+  },
+  "source": {
+    "head": "76e83ed2fa249cc252e5d6dbdf9b6ed18954e675",
+    "patch_sha256": "198436b4d9b7473b33ab25281f99e675a969d2464818c44dccefd3c606d4ee1c",
+    "dirty": true,
+    "simulator_commit": "18db0f62d9a2b94e755c43fd29a959db204cc20b",
+    "source": "/home/alexstanovoy/Workspace/bots/drysua/artifacts/temp/tactical-v1-champion-001-provenance/sources/drysua"
+  },
+  "weights": {
+    "path": "artifacts/v0.0.4",
+    "file": "drysua.tactical.bin",
+    "sha256": "bfa19eb4ec2f11fd852f6f6fd6284be84aa0c0dc1b597a52fc00352d64ed5bd1"
+  },
+  "registry": {
+    "schema_version": 1,
+    "gate": "candidate_wins * 2 > all_scheduled_games_per_opponent",
+    "simulator_commit": "18db0f62d9a2b94e755c43fd29a959db204cc20b",
+    "map": 1,
+    "policy": "teacher",
+    "tick_limit": 30000,
+    "process_timeout_seconds": 90,
+    "seeds": [
+      9000001,
+      9000002,
+      9000003,
+      9000004,
+      9000005,
+      9000006,
+      9000007,
+      9000008,
+      9000009,
+      9000010
+    ],
+    "releases": [
+      {
+        "tag": "v0.0.1",
+        "commit": "2cd104c8b8f0c5d1bed9988dfad4ddf4defd23f6",
+        "policy": "teacher",
+        "simulator_commit": "18db0f62d9a2b94e755c43fd29a959db204cc20b",
+        "map": 1
+      },
+      {
+        "tag": "v0.0.2",
+        "commit": "7862f34d1fa8b6c728fee274d51bc6c164ea69dc",
+        "policy": "teacher",
+        "simulator_commit": "18db0f62d9a2b94e755c43fd29a959db204cc20b",
+        "map": 1
+      },
+      {
+        "tag": "v0.0.3",
+        "commit": "6b241bbd357f7657b90a5931d2541767be489ae5",
+        "policy": "teacher",
+        "simulator_commit": "18db0f62d9a2b94e755c43fd29a959db204cc20b",
+        "map": 1
+      }
+    ]
+  },
+  "gate": {
+    "passed": true,
+    "opponents": {
+      "v0.0.1": {
+        "games": 20,
+        "wins": 19,
+        "passed": true
+      },
+      "v0.0.2": {
+        "games": 20,
+        "wins": 18,
+        "passed": true
+      },
+      "v0.0.3": {
+        "games": 20,
+        "wins": 14,
+        "passed": true
+      }
+    },
+    "errors": []
+  },
+  "full_report": "artifacts/temp/tactical-v1-champion-crossplay-001/report.json",
+  "full_report_sha256": "efec7b3ea4d614fa2c36386167458c48e25df766cb80cd9e710e98d97a95e7b0",
+  "limitations": "Strict-majority approved, not 80% against every opponent; reused release seeds."
+}

@@ -915,6 +915,510 @@ fn teacher_requires_a_snapshot_with_exact_action_error() {
     );
 }
 
+#[test]
+fn tactical_default_and_zero_weights_match_teacher_actions_and_memory() {
+    let policies = [
+        crate::TacticalPolicy::default(),
+        crate::TacticalPolicy::from_parameters(&[0.0; crate::TACTICAL_PARAMETERS])
+            .expect("zero policy"),
+    ];
+    for policy in policies {
+        for scenario in 0..9 {
+            let mut view = tactical_view(500, 100);
+            match scenario {
+                0 => own_hero_mut(&mut view).mana = 500,
+                1 => own_hero_mut(&mut view).hp = 300,
+                2 => own_hero_mut(&mut view).statuses.bits = StatusFlags::CHANNELLING,
+                3 => view.players[0].gold = Some(600),
+                4 => own_hero_mut(&mut view).abilities[5].can_level = true,
+                5 => own_hero_mut(&mut view).pos = Vec2::from_ints(1_500, 1_500),
+                6 => own_hero_mut(&mut view).hp = 0,
+                7 => view.units.retain(|unit| unit.id != ENEMY_HERO_ID),
+                _ => {}
+            }
+            let tracker = tracker(view);
+            let mut baseline = Teacher::new();
+            let mut tactical = baseline.clone();
+            let mut persistence = OrderPersistence::default();
+            for sequence in 1..=3 {
+                let (expected, expected_space) = baseline
+                    .decide(&tracker, &persistence, &ItemReadiness::new())
+                    .expect("baseline");
+                let (actual, space) = tactical
+                    .decide_tactical(&tracker, &persistence, &ItemReadiness::new(), &policy)
+                    .expect("tactical");
+                assert_eq!(actual, expected, "scenario {scenario}");
+                assert_eq!(space.decode(actual), expected_space.decode(expected));
+                assert_eq!(baseline, tactical);
+                assert!(space.allows(actual));
+                if let Some(issued) = space.decode(actual).expect("decode") {
+                    baseline.note_sent(sequence, issued, space.tick());
+                    tactical.note_sent(sequence, issued, space.tick());
+                    persistence.record_sent(sequence, issued).expect("record");
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn tactical_fight_pursues_a_burst_kill_outside_current_attack_range() {
+    let tracker = tracker(tactical_view(800, 100));
+    let policy = tactical_policy(crate::TacticalMode::Fight);
+
+    let (baseline, _) = decide(&tracker);
+    let (action, space) = Teacher::new()
+        .decide_tactical(
+            &tracker,
+            &OrderPersistence::default(),
+            &ItemReadiness::new(),
+            &policy,
+        )
+        .expect("fight");
+
+    assert_ne!(action, baseline);
+    let StructuredAction::AttackUnit { target, .. } = action else {
+        panic!("pursuit must target hero");
+    };
+    assert_eq!(space.entity_candidates()[target.0].id(), ENEMY_HERO_ID);
+    assert!(space.allows(action));
+}
+
+#[test]
+fn tactical_fight_does_not_pursue_nonlethal_or_distant_targets() {
+    for (distance, hp) in [(800, 1_000), (1_201, 100)] {
+        let tracker = tracker(tactical_view(distance, hp));
+
+        let (baseline, _) = decide(&tracker);
+        let (action, space) = Teacher::new()
+            .decide_tactical(
+                &tracker,
+                &OrderPersistence::default(),
+                &ItemReadiness::new(),
+                &tactical_policy(crate::TacticalMode::Fight),
+            )
+            .expect("bounded fight");
+
+        assert_eq!(action, baseline);
+        assert!(space.allows(action));
+    }
+}
+
+#[test]
+fn tactical_neural_health_feature_changes_real_combat_decisions() {
+    let mut parameters = [0.0; crate::TACTICAL_PARAMETERS];
+    parameters[0] = 1.0;
+    parameters[(crate::TACTICAL_FEATURES + 2) * crate::TACTICAL_HIDDEN] = 1.0;
+    parameters[crate::TACTICAL_OUTPUT_BIAS_OFFSET] = 0.8;
+    let policy = crate::TacticalPolicy::from_parameters(&parameters).expect("health neuron");
+    for hp in [600, 1_000] {
+        let mut view = tactical_view(800, 100);
+        own_hero_mut(&mut view).hp = hp;
+        let tracker = tracker(view);
+
+        let (baseline, _) = decide(&tracker);
+        let (action, space) = Teacher::new()
+            .decide_tactical(
+                &tracker,
+                &OrderPersistence::default(),
+                &ItemReadiness::new(),
+                &policy,
+            )
+            .expect("conditional combat");
+
+        assert_eq!(action == baseline, hp == 600);
+        assert_eq!(
+            matches!(action, StructuredAction::AttackUnit { .. }),
+            hp == 1_000
+        );
+        assert!(space.allows(action));
+    }
+}
+
+#[test]
+fn tactical_fight_requires_ready_mana_affordable_burst_for_pursuit() {
+    for (mana, cooldown) in [(74, 0), (75, 1), (75, 0)] {
+        let mut view = tactical_view(1_000, 200);
+        let hero = own_hero_mut(&mut view);
+        hero.mana = mana;
+        for ability in &mut hero.abilities[..3] {
+            ability.cooldown_left = cooldown;
+        }
+        let tracker = tracker(view);
+
+        let (baseline, _) = decide(&tracker);
+        let (action, space) = Teacher::new()
+            .decide_tactical(
+                &tracker,
+                &OrderPersistence::default(),
+                &ItemReadiness::new(),
+                &tactical_policy(crate::TacticalMode::Fight),
+            )
+            .expect("burst pursuit");
+
+        let burst_available = mana == 75 && cooldown == 0;
+        assert_eq!(action != baseline, burst_available);
+        assert_eq!(
+            matches!(action, StructuredAction::AttackUnit { .. }),
+            burst_available
+        );
+        assert!(space.allows(action));
+    }
+}
+
+#[test]
+fn tactical_fight_does_not_chase_a_kill_into_enemy_tower_cover() {
+    let mut view = tactical_view(800, 100);
+    own_hero_mut(&mut view).pos = Vec2::from_ints(5_100, 6_000);
+    view.units
+        .iter_mut()
+        .find(|unit| unit.id == ENEMY_HERO_ID)
+        .expect("enemy")
+        .pos = Vec2::from_ints(5_900, 6_000);
+    let tracker = tracker(view);
+
+    let (baseline, _) = decide(&tracker);
+    let (action, space) = Teacher::new()
+        .decide_tactical(
+            &tracker,
+            &OrderPersistence::default(),
+            &ItemReadiness::new(),
+            &tactical_policy(crate::TacticalMode::Fight),
+        )
+        .expect("tower guard");
+
+    assert_eq!(action, baseline);
+    assert!(!matches!(action, StructuredAction::AttackUnit { .. }));
+    assert!(space.allows(action));
+}
+
+#[test]
+fn tactical_fight_does_not_cross_tower_range_between_two_safe_endpoints() {
+    let mut view = tactical_view(800, 100);
+    own_hero_mut(&mut view).pos = Vec2::from_ints(5_300, 5_700);
+    view.units
+        .iter_mut()
+        .find(|unit| unit.id == ENEMY_HERO_ID)
+        .expect("enemy")
+        .pos = Vec2::from_ints(6_400, 5_300);
+    let tracker = tracker(view);
+
+    let (baseline, _) = decide(&tracker);
+    let (action, space) = Teacher::new()
+        .decide_tactical(
+            &tracker,
+            &OrderPersistence::default(),
+            &ItemReadiness::new(),
+            &tactical_policy(crate::TacticalMode::Fight),
+        )
+        .expect("corridor guard");
+
+    assert_eq!(action, baseline);
+    assert!(!matches!(action, StructuredAction::AttackUnit { .. }));
+    assert!(space.allows(action));
+}
+
+#[test]
+fn tactical_fight_preserves_a_valuable_ready_requiem() {
+    let mut view = tactical_view(-300, 300);
+    let hero = own_hero_mut(&mut view);
+    hero.mana = 500;
+    hero.effects.push(EffectView {
+        id: EffectId(11),
+        ticks_left: None,
+        stacks: Some(12),
+    });
+    let tracker = tracker(view);
+
+    let (action, space) = Teacher::new()
+        .decide_tactical(
+            &tracker,
+            &OrderPersistence::default(),
+            &ItemReadiness::new(),
+            &tactical_policy(crate::TacticalMode::Fight),
+        )
+        .expect("fight ultimate");
+
+    assert_eq!(action, cast(ControlledUnit::Hero, 5));
+    assert!(space.allows(action));
+}
+
+#[test]
+fn tactical_recover_disengages_above_teachers_emergency_threshold() {
+    let mut view = tactical_view(500, 800);
+    own_hero_mut(&mut view).hp = 600;
+    let tracker = tracker(view);
+
+    let (baseline, _) = decide(&tracker);
+    let (action, space) = Teacher::new()
+        .decide_tactical(
+            &tracker,
+            &OrderPersistence::default(),
+            &ItemReadiness::new(),
+            &tactical_policy(crate::TacticalMode::Recover),
+        )
+        .expect("recover");
+
+    assert_ne!(action, baseline);
+    let StructuredAction::MovePoint { point, .. } = action else {
+        panic!("recovery must move");
+    };
+    assert!(
+        space.point_candidates()[point.0]
+            .position
+            .distance_squared(Vec2::from_ints(1_000, 1_000))
+            < Vec2::from_ints(3_000, 3_000).distance_squared(Vec2::from_ints(1_000, 1_000))
+    );
+    assert!(space.allows(action));
+}
+
+#[test]
+fn tactical_farm_takes_last_hit_instead_of_spending_mana_on_harassment() {
+    let mut view = tactical_view(400, 1_000);
+    own_hero_mut(&mut view).mana = 500;
+    let mut creep = unit(CREEP_ID, UnitKind::CreepMelee, Team::Dire, 3_300, 3_000);
+    creep.hp = 40;
+    view.units.push(creep);
+    sort_units(&mut view);
+    let tracker = tracker(view);
+
+    let (baseline, _) = decide(&tracker);
+    let (action, space) = Teacher::new()
+        .decide_tactical(
+            &tracker,
+            &OrderPersistence::default(),
+            &ItemReadiness::new(),
+            &tactical_policy(crate::TacticalMode::Farm),
+        )
+        .expect("farm");
+
+    assert!(matches!(baseline, StructuredAction::Cast { .. }));
+    let StructuredAction::AttackUnit { target, .. } = action else {
+        panic!("last hit must attack creep");
+    };
+    assert_eq!(space.entity_candidates()[target.0].id(), CREEP_ID);
+    assert!(space.allows(action));
+}
+
+#[test]
+fn tactical_modes_preserve_channels_sustain_economy_and_emergency_retreat() {
+    for mode in [
+        crate::TacticalMode::Fight,
+        crate::TacticalMode::Recover,
+        crate::TacticalMode::Farm,
+    ] {
+        for scenario in 0..8 {
+            let mut view = tactical_view(500, 100);
+            match scenario {
+                0 => own_hero_mut(&mut view).statuses.bits = StatusFlags::CHANNELLING,
+                1 => own_hero_mut(&mut view).hp = 400,
+                2 => view.players[0].gold = Some(600),
+                3 => own_hero_mut(&mut view).abilities[5].can_level = true,
+                4 => {
+                    own_hero_mut(&mut view).hp = 300;
+                    own_hero_mut(&mut view).items[0] =
+                        Some(item(ItemId(36), Some(Aim::Own), 0, Some(10)));
+                }
+                5 => {
+                    view.players[0].stash.as_mut().expect("stash")[0] =
+                        Some(item(ItemId(7), Some(Aim::Tree), 165, Some(3)))
+                }
+                6 => own_hero_mut(&mut view).pos = Vec2::from_ints(5_500, 6_000),
+                _ => own_hero_mut(&mut view).pos = Vec2::from_ints(1_500, 1_500),
+            }
+            let tracker = tracker(view);
+
+            let (baseline, _) = decide(&tracker);
+            let (action, space) = Teacher::new()
+                .decide_tactical(
+                    &tracker,
+                    &OrderPersistence::default(),
+                    &ItemReadiness::new(),
+                    &tactical_policy(mode),
+                )
+                .expect("protected work");
+
+            assert_eq!(action, baseline, "scenario {scenario}, mode {mode:?}");
+            assert!(space.allows(action));
+        }
+    }
+}
+
+#[test]
+fn tactical_pursuit_is_suppressed_when_its_body_order_is_already_active() {
+    let tracker = tracker(tactical_view(800, 100));
+    let mut teacher = Teacher::new();
+    let mut persistence = OrderPersistence::default();
+    let policy = tactical_policy(crate::TacticalMode::Fight);
+    let (first, space) = teacher
+        .decide_tactical(&tracker, &persistence, &ItemReadiness::new(), &policy)
+        .expect("first");
+    let issued = space.decode(first).expect("decode").expect("pursuit");
+    persistence.record_sent(1, issued).expect("record");
+    teacher.note_sent(1, issued, space.tick());
+
+    let (action, space) = teacher
+        .decide_tactical(&tracker, &persistence, &ItemReadiness::new(), &policy)
+        .expect("repeat");
+
+    assert_eq!(action, StructuredAction::Continue);
+    assert!(space.allows(action));
+    assert_eq!(persistence.active_body_order_for(None), Some(issued));
+}
+
+#[test]
+fn tactical_fight_preserves_an_active_creep_attack_in_windup_leeway() {
+    let mut view = tactical_view(800, 100);
+    view.units.push(unit(
+        CREEP_ID,
+        UnitKind::CreepMelee,
+        Team::Dire,
+        3_600,
+        3_000,
+    ));
+    sort_units(&mut view);
+    let tracker = tracker(view);
+    let issued = IssuedOrder {
+        unit: None,
+        order: Order::Attack {
+            target: Target::Unit(CREEP_ID),
+        },
+    };
+    let mut persistence = OrderPersistence::default();
+    persistence.record_sent(1, issued).expect("record");
+    let mut teacher = Teacher::new();
+    teacher.note_sent(1, issued, 1);
+
+    let (action, space) = teacher
+        .decide_tactical(
+            &tracker,
+            &persistence,
+            &ItemReadiness::new(),
+            &tactical_policy(crate::TacticalMode::Fight),
+        )
+        .expect("persistent attack");
+
+    assert_eq!(action, StructuredAction::Continue);
+    assert!(space.allows(action));
+}
+
+#[test]
+fn tactical_ignores_remembered_enemy_health_when_enemy_is_no_longer_visible() {
+    let mut current = base_view();
+    current.tick = 2;
+    let mut trackers = [
+        tracker(tactical_view(800, 100)),
+        tracker(tactical_view(800, 1_000)),
+    ];
+    for tracker in &mut trackers {
+        tracker.observe_snapshot(&current).expect("hidden enemy");
+    }
+    let policy = tactical_policy(crate::TacticalMode::Fight);
+
+    let (first, first_space) = Teacher::new()
+        .decide_tactical(
+            &trackers[0],
+            &OrderPersistence::default(),
+            &ItemReadiness::new(),
+            &policy,
+        )
+        .expect("first history");
+    let (second, second_space) = Teacher::new()
+        .decide_tactical(
+            &trackers[1],
+            &OrderPersistence::default(),
+            &ItemReadiness::new(),
+            &policy,
+        )
+        .expect("other history");
+
+    assert_eq!(first_space.decode(first), second_space.decode(second));
+    assert!(first_space.entity_index(ENEMY_HERO_ID).is_none());
+}
+
+#[test]
+fn tactical_pursuit_releases_body_order_when_target_leaves_visibility() {
+    let mut tracker = tracker(tactical_view(800, 100));
+    let mut teacher = Teacher::new();
+    let mut persistence = OrderPersistence::default();
+    let policy = tactical_policy(crate::TacticalMode::Fight);
+    let (first, space) = teacher
+        .decide_tactical(&tracker, &persistence, &ItemReadiness::new(), &policy)
+        .expect("pursuit");
+    let issued = space.decode(first).expect("decode").expect("body order");
+    persistence.record_sent(1, issued).expect("record");
+    teacher.note_sent(1, issued, space.tick());
+    let mut hidden = base_view();
+    hidden.tick = 2;
+    tracker.observe_snapshot(&hidden).expect("visibility lost");
+
+    let (action, space) = teacher
+        .decide_tactical(&tracker, &persistence, &ItemReadiness::new(), &policy)
+        .expect("release pursuit");
+
+    assert_ne!(action, StructuredAction::Continue);
+    assert!(matches!(action, StructuredAction::AttackMovePoint { .. }));
+    assert!(space.allows(action));
+}
+
+#[test]
+fn tactical_mutated_policies_produce_only_legal_actions_under_disabling_statuses() {
+    for seed in 0..8 {
+        let policy = crate::TacticalPolicy::default()
+            .mutated(seed, 1.0)
+            .expect("mutation");
+        for status in [
+            0,
+            StatusFlags::STUNNED,
+            StatusFlags::ROOTED,
+            StatusFlags::DISARMED,
+            StatusFlags::SILENCED,
+            StatusFlags::CHANNELLING,
+        ] {
+            let mut view = tactical_view(500, 200);
+            let hero = own_hero_mut(&mut view);
+            hero.hp = 600;
+            hero.mana = 200;
+            hero.statuses.bits = status;
+            let tracker = tracker(view);
+
+            let (action, space) = Teacher::new()
+                .decide_tactical(
+                    &tracker,
+                    &OrderPersistence::default(),
+                    &ItemReadiness::new(),
+                    &policy,
+                )
+                .expect("masked decision");
+
+            assert!(space.allows(action), "seed {seed}, status {status}");
+            assert!(space.decode(action).is_ok(), "seed {seed}, status {status}");
+        }
+    }
+}
+
+fn tactical_policy(mode: crate::TacticalMode) -> crate::TacticalPolicy {
+    let mut parameters = [0.0; crate::TACTICAL_PARAMETERS];
+    parameters[crate::TACTICAL_OUTPUT_BIAS_OFFSET + mode.index()] = 1.0;
+    crate::TacticalPolicy::from_parameters(&parameters).expect("forced macro")
+}
+
+fn tactical_view(distance: i32, hp: i32) -> WorldView {
+    let mut view = base_view();
+    let mut enemy = unit(
+        ENEMY_HERO_ID,
+        UnitKind::Hero,
+        Team::Dire,
+        3_000 + distance,
+        3_000,
+    );
+    enemy.hp = hp;
+    view.units.push(enemy);
+    view.players[1].unit = Some(ENEMY_HERO_ID);
+    sort_units(&mut view);
+    view
+}
+
 fn decide(tracker: &StateTracker) -> (StructuredAction, crate::ActionSpace) {
     Teacher::new()
         .decide(tracker, &OrderPersistence::default(), &ItemReadiness::new())

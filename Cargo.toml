@@ -35,5 +35,10 @@ name = "drysua-profile"
 path = "src/bin/drysua_profile.rs"
 required-features = ["builtin"]
 
+[[bin]]
+name = "train_tactical"
+path = "src/bin/train_tactical.rs"
+required-features = ["builtin"]
+
 [lints.clippy]
 float_arithmetic = "deny"

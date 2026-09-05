@@ -32,6 +32,196 @@ impl Wire for MockWire {
 }
 
 #[test]
+fn tactical_loader_rejects_wrong_length_schema_and_nonfinite_parameters() {
+    let directory = tactical_directory("invalid");
+    let valid = crate::TacticalPolicy::default().to_bytes();
+    let mut schema = valid.clone();
+    schema[0] ^= 1;
+    let mut nonfinite = valid.clone();
+    let offset = crate::TACTICAL_SCHEMA_DESCRIPTOR.len();
+    nonfinite[offset..offset + 4].copy_from_slice(&f32::NAN.to_le_bytes());
+    let mut oversized = valid.clone();
+    oversized.extend_from_slice(&[0; 32]);
+    for (bytes, message) in [
+        (
+            valid[..valid.len() - 1].to_vec(),
+            format!(
+                "tactical file has {} bytes; expected {}",
+                valid.len() - 1,
+                valid.len()
+            ),
+        ),
+        (
+            oversized,
+            format!(
+                "tactical file has {} bytes; expected {}",
+                valid.len() + 1,
+                valid.len()
+            ),
+        ),
+        (
+            schema,
+            "tactical file schema does not match this architecture and feature order".to_owned(),
+        ),
+        (
+            nonfinite,
+            "tactical parameter 0 must be finite and in [-4, 4]".to_owned(),
+        ),
+    ] {
+        std::fs::write(directory.join("drysua.tactical.bin"), bytes).expect("invalid weights");
+        let error = crate::seat::play_tactical("unused", "", None, &directory)
+            .expect_err("invalid artifact cannot connect");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().ends_with(&message), "{error}");
+    }
+    std::fs::remove_dir_all(directory).expect("remove weights");
+}
+
+#[cfg(unix)]
+#[test]
+fn tactical_loader_rejects_symlink_instead_of_loading_another_artifact() {
+    let directory = tactical_directory("symlink");
+    std::os::unix::fs::symlink("missing", directory.join("drysua.tactical.bin")).expect("symlink");
+    let error = crate::seat::play_tactical("unused", "", None, &directory).expect_err("no links");
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+    assert!(
+        error
+            .to_string()
+            .ends_with("expected a regular non-symlink file")
+    );
+    std::fs::remove_dir_all(directory).expect("remove link");
+}
+
+pub(super) fn tactical_directory(name: &str) -> std::path::PathBuf {
+    let directory = std::env::temp_dir().join(format!(
+        "drysua-tactical-live-{}-{name}",
+        std::process::id()
+    ));
+    std::fs::create_dir(&directory).expect("unique test directory");
+    directory
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn tactical_seat_matches_direct_policy_orders_and_default_teacher_on_both_maps() {
+    for map in [MapId(0), MapId(1)] {
+        let (info, view) = tactical_combat_fixture(map);
+        let mut parameters = [0.0; crate::TACTICAL_PARAMETERS];
+        parameters[crate::TACTICAL_OUTPUT_BIAS_OFFSET + crate::TacticalMode::Fight.index()] = 1.0;
+        let fight = crate::TacticalPolicy::from_parameters(&parameters).expect("fight policy");
+        let mut tracker = crate::StateTracker::new(SlotId(0), &info).expect("tracker");
+        tracker.observe_snapshot(&view).expect("snapshot");
+        let (baseline, _) = crate::Teacher::new()
+            .decide(
+                &tracker,
+                &crate::OrderPersistence::default(),
+                &crate::ItemReadiness::new(),
+            )
+            .expect("baseline");
+        for policy in [crate::TacticalPolicy::default(), fight] {
+            let (action, space) = crate::Teacher::new()
+                .decide_tactical(
+                    &tracker,
+                    &crate::OrderPersistence::default(),
+                    &crate::ItemReadiness::new(),
+                    &policy,
+                )
+                .expect("direct tactical");
+            assert_eq!(
+                action == baseline,
+                policy == crate::TacticalPolicy::default()
+            );
+            let expected: Vec<_> = space
+                .decode(action)
+                .expect("decode")
+                .into_iter()
+                .map(|issued| (issued.unit, issued.order))
+                .collect();
+            let mut finished = view.clone();
+            finished.tick += 1;
+            let mut wire = MockWire {
+                messages: VecDeque::from([
+                    ServerMsg::MatchStart { info: info.clone() },
+                    ServerMsg::Snapshot { view: view.clone() },
+                    ServerMsg::Events {
+                        tick: view.tick,
+                        events: Vec::new(),
+                    },
+                    ServerMsg::Snapshot { view: finished },
+                ]),
+                acknowledgements: Vec::new(),
+                orders: Vec::new(),
+            };
+            let outcome = crate::seat::play_tactical_on(
+                &mut wire,
+                seated(TickMode::Lockstep),
+                Some(view.tick + 1),
+                &policy,
+            )
+            .expect("tactical live state machine");
+            assert_eq!(wire.orders, expected);
+            assert_eq!(outcome.decisions, 1);
+            assert_eq!(wire.acknowledgements, [view.tick, view.tick + 1]);
+        }
+    }
+}
+
+#[cfg(feature = "builtin")]
+fn tactical_combat_fixture(map: MapId) -> (MatchInfo, WorldView) {
+    let (_, start) = crate::Arena::new(crate::ArenaConfig {
+        seats: 2,
+        map,
+        seed: 70_007,
+    })
+    .expect("arena");
+    let mut info = start.messages[0]
+        .iter()
+        .find_map(|message| match message {
+            ServerMsg::MatchStart { info } => Some(info.clone()),
+            _ => None,
+        })
+        .expect("match info");
+    info.pregame_ticks = 0;
+    info.terrain_cells = 128;
+    info.terrain_rle = vec![(16384, 0x80)];
+    info.trees.clear();
+    info.opaque_cells.clear();
+    let mut view = start.messages[0]
+        .iter()
+        .find_map(|message| match message {
+            ServerMsg::Snapshot { view } => Some(view.clone()),
+            _ => None,
+        })
+        .expect("snapshot");
+    let own = view.players[0].unit.expect("hero identity");
+    let mut hero = view
+        .units
+        .iter()
+        .find(|unit| unit.id == own)
+        .expect("hero")
+        .clone();
+    hero.pos = bota_proto::Vec2::from_ints(3000, 3000);
+    hero.hp = hero.max_hp;
+    hero.mana = hero.max_mana;
+    for ability in &mut hero.abilities {
+        ability.can_level = false;
+    }
+    let mut enemy = hero.clone();
+    enemy.id = EntityId {
+        idx: own.idx + 1000,
+        generation: 1,
+    };
+    enemy.team = Team::Dire;
+    enemy.owner = Some(SlotId(1));
+    enemy.pos = bota_proto::Vec2::from_ints(3800, 3000);
+    enemy.hp = 1;
+    view.players[0].gold = Some(0);
+    view.players[1].unit = Some(enemy.id);
+    view.units = vec![hero, enemy];
+    (info, view)
+}
+
+#[test]
 fn seat_loop_acknowledges_first_lockstep_snapshot_and_sends_no_order() {
     let mut wire = mock_wire();
     let outcome = play_idle_on(&mut wire, seated(TickMode::Lockstep), Some(1)).expect("seat plays");

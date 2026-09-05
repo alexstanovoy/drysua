@@ -10,6 +10,7 @@ import tarfile
 
 SIMULATOR = "18db0f62d9a2b94e755c43fd29a959db204cc20b"
 WEIGHTS_NAME = "drysua.weights.safetensors"
+TACTICAL_WEIGHTS_NAME = "drysua.tactical.bin"
 MAX_WEIGHTS_BYTES = 256 * 1024 * 1024
 
 
@@ -18,17 +19,26 @@ def digest(path):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
-def snapshot_weights(source, target, expected=None):
-    weights = source / WEIGHTS_NAME
+def weights_name(policy):
+    if policy == "hybrid":
+        return WEIGHTS_NAME
+    if policy == "tactical":
+        return TACTICAL_WEIGHTS_NAME
+    raise ValueError("weights require hybrid or tactical policy")
+
+
+def snapshot_weights(source, target, expected=None, policy="hybrid"):
+    weights = source / weights_name(policy)
     if source.is_symlink() or not source.is_dir() or weights.is_symlink() or not weights.is_file():
         raise ValueError("weights must be a regular non-symlink file in a directory")
-    if not 1 <= weights.stat().st_size <= MAX_WEIGHTS_BYTES:
-        raise ValueError("weights size must be 1..256 MiB")
+    maximum = 16384 if policy == "tactical" else MAX_WEIGHTS_BYTES
+    if not 1 <= weights.stat().st_size <= maximum:
+        raise ValueError(f"weights size must be 1..{maximum} bytes for {policy}")
     identity = digest(weights)
     if expected is not None and identity != expected:
         raise ValueError("release weights SHA256 mismatch")
     target.mkdir()
-    snapshot = target / WEIGHTS_NAME
+    snapshot = target / weights_name(policy)
     shutil.copyfile(weights, snapshot)
     snapshot.chmod(0o400)
     if digest(snapshot) != identity or digest(weights) != identity:
@@ -42,11 +52,11 @@ def validate_release_weights(release):
         if "weights" in release:
             raise ValueError("teacher forbids weights")
         return
-    if policy != "hybrid":
+    if policy not in ("hybrid", "tactical"):
         raise ValueError("unsupported release policy")
     weights = release.get("weights")
     if not isinstance(weights, dict):
-        raise ValueError("hybrid requires weights path and SHA256")
+        raise ValueError(f"{policy} requires weights path and SHA256")
     if weights.get("path") != f"artifacts/{release['tag']}":
         raise ValueError("release weights path must be artifacts/<tag>")
     if not isinstance(weights.get("sha256"), str) or not re.fullmatch(r"[0-9a-f]{64}", weights["sha256"]):
@@ -145,9 +155,10 @@ def prepare(repository, simulator_repository, output, registry):
         target = output / f"target-{tag}"
         build(source / tag, target, ["--bin", "drysua", "--no-default-features"], output, tag)
         bot = dict(binary=target / "release" / "drysua", policy=release["policy"])
-        if release["policy"] == "hybrid":
+        if release["policy"] in ("hybrid", "tactical"):
             bot["weights"] = output / f"weights-{tag}"
             bot["weights_metadata"] = snapshot_weights(
-                source / tag / release["weights"]["path"], bot["weights"], release["weights"]["sha256"])
+                source / tag / release["weights"]["path"], bot["weights"], release["weights"]["sha256"],
+                policy=release["policy"])
         opponents[tag] = bot
     return output / "target-server" / "release" / "bota-server", opponents

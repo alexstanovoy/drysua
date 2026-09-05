@@ -69,7 +69,7 @@ struct EvaluateArgs {
 /// Options for one server match.
 #[derive(Args)]
 struct PlayArgs {
-    /// Hybrid deployment (requires weights), or the deterministic weights-free Teacher.
+    /// Hybrid, compact Tactical deployment, or the deterministic weights-free Teacher.
     #[arg(long, value_enum, default_value_t = PlayPolicy::Hybrid)]
     policy: PlayPolicy,
     /// Server socket address.
@@ -81,14 +81,15 @@ struct PlayArgs {
     /// Leave after receiving this snapshot tick.
     #[arg(long, value_name = "TICKS")]
     limit: Option<u32>,
-    /// Directory containing drysua.weights.safetensors; ignored by Teacher.
-    #[arg(long, default_value = ".")]
-    weights_directory: std::path::PathBuf,
+    /// Weights directory: Tactical requires it; Hybrid defaults to .; Teacher ignores it.
+    #[arg(long, required_if_eq("policy", "tactical"))]
+    weights_directory: Option<std::path::PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub(crate) enum PlayPolicy {
     Hybrid,
+    Tactical,
     Teacher,
 }
 
@@ -232,8 +233,22 @@ fn run(arguments: Cli) -> std::io::Result<()> {
         None => arguments.play,
     };
     let outcome = match play.policy {
-        PlayPolicy::Hybrid => {
-            crate::play(&play.addr, &play.name, play.limit, &play.weights_directory)?
+        PlayPolicy::Hybrid => crate::play(
+            &play.addr,
+            &play.name,
+            play.limit,
+            play.weights_directory
+                .as_deref()
+                .unwrap_or(std::path::Path::new(".")),
+        )?,
+        PlayPolicy::Tactical => {
+            let directory = play.weights_directory.as_deref().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "tactical requires --weights-directory",
+                )
+            })?;
+            crate::seat::play_tactical(&play.addr, &play.name, play.limit, directory)?
         }
         PlayPolicy::Teacher => crate::play_teacher(&play.addr, &play.name, play.limit)?,
     };

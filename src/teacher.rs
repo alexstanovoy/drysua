@@ -6,7 +6,7 @@ use bota_proto::{
 use crate::{
     ActionError, ActionSpace, ActionTarget, ControlledUnit, EntityIndex, EntityRelation,
     IssuedOrder, ItemReadiness, OrderPersistence, PointIndex, PointSource, StateTracker,
-    StructuredAction, TOWN_PORTAL_SCROLL,
+    StructuredAction, TOWN_PORTAL_SCROLL, TacticalFeatures, TacticalPolicy,
 };
 
 const SHADOWRAZES: [(AbilityId, i32); 3] = [
@@ -102,10 +102,32 @@ impl Teacher {
         persistence: &OrderPersistence,
         readiness: &ItemReadiness,
     ) -> Result<(StructuredAction, ActionSpace), ActionError> {
+        self.decide_with_policy(tracker, persistence, readiness, None)
+    }
+
+    /// Applies a trained, seat-visible tactical residual without replacing economy or safety.
+    /// Call `note_sent` / `note_rejected` and maintain persistence exactly as for `decide`.
+    pub fn decide_tactical(
+        &mut self,
+        tracker: &StateTracker,
+        persistence: &OrderPersistence,
+        readiness: &ItemReadiness,
+        policy: &TacticalPolicy,
+    ) -> Result<(StructuredAction, ActionSpace), ActionError> {
+        self.decide_with_policy(tracker, persistence, readiness, Some(policy))
+    }
+
+    fn decide_with_policy(
+        &mut self,
+        tracker: &StateTracker,
+        persistence: &OrderPersistence,
+        readiness: &ItemReadiness,
+        policy: Option<&TacticalPolicy>,
+    ) -> Result<(StructuredAction, ActionSpace), ActionError> {
         let space = ActionSpace::from_tracker_with_readiness(tracker, readiness)?;
         self.sync_purchases(tracker);
         self.sync_order_notes(tracker);
-        let selected = self.priority_action(tracker, persistence, &space);
+        let selected = self.priority_action(tracker, persistence, &space, policy);
         if !space.allows(selected) {
             return Err(ActionError::InvalidSchema("teacher selected masked action"));
         }
@@ -186,6 +208,7 @@ impl Teacher {
         tracker: &StateTracker,
         persistence: &OrderPersistence,
         space: &ActionSpace,
+        policy: Option<&TacticalPolicy>,
     ) -> StructuredAction {
         if self.protects_channel(tracker, space) {
             return StructuredAction::Continue;
@@ -196,6 +219,9 @@ impl Teacher {
             .or_else(|| self.courier(tracker, space))
             .or_else(|| self.sustain(tracker, space))
             .or_else(|| self.retreat(tracker, space))
+            .or_else(|| {
+                policy.and_then(|policy| self.tactical_action(tracker, persistence, space, policy))
+            })
             .or_else(|| self.raze_enemy(tracker, space, UnitKind::Hero))
             .or_else(|| self.requiem(tracker, space))
             .or_else(|| self.raze_enemy(tracker, space, UnitKind::Tower))
@@ -220,6 +246,103 @@ impl Teacher {
         self.safe_objective(tracker, space)
             .or_else(|| self.hold_lane(tracker, space))
             .unwrap_or(StructuredAction::Continue)
+    }
+
+    fn tactical_action(
+        &self,
+        tracker: &StateTracker,
+        persistence: &OrderPersistence,
+        space: &ActionSpace,
+        policy: &TacticalPolicy,
+    ) -> Option<StructuredAction> {
+        let hero = tracker.own_hero().filter(|hero| hero.hp > 0)?;
+        let (target, enemy) = space
+            .entity_candidates()
+            .iter()
+            .enumerate()
+            .filter(|(_, candidate)| {
+                candidate.relation == EntityRelation::Enemy
+                    && candidate.kind == UnitKind::Hero
+                    && candidate.unit().hp > 0
+                    && hero.pos.within(candidate.position, Fixed::from_int(1_200))
+            })
+            .min_by_key(|(_, candidate)| {
+                (
+                    hero.pos.distance_squared(candidate.position),
+                    candidate.id(),
+                )
+            })
+            .map(|(index, candidate)| (EntityIndex(index), candidate.unit()))?;
+        let last_hit = self.attack_last_hit(tracker, space);
+        let features = tactical_features(tracker, space, hero, enemy, last_hit.is_some())?;
+        let active_attack = self.protects_active_unit_attack(tracker, persistence, space);
+        let fight = if active_attack {
+            None
+        } else {
+            self.tactical_fight(tracker, space, hero, enemy, target, last_hit.is_some())
+        };
+        let farm = if active_attack {
+            Some(StructuredAction::Continue)
+        } else {
+            last_hit
+                .or_else(|| self.raze_last_hit(tracker, space))
+                .or_else(|| self.deny(tracker, space))
+        };
+        let recover = (ratio_at_most(hero.hp, hero.max_hp, 80)
+            || ratio_at_most(hero.mana, hero.max_mana, 25))
+        .then(|| {
+            best_safe_point(
+                space,
+                tracker,
+                space.move_point_mask(ControlledUnit::Hero),
+                own_fountain(tracker)?,
+                true,
+            )
+        })
+        .flatten()
+        .map(|point| StructuredAction::MovePoint {
+            unit: ControlledUnit::Hero,
+            point,
+        });
+        let alternatives = [None, fight, recover, farm];
+        let mode = policy.choose(&features, alternatives.map(|action| action.is_some()));
+        let action = alternatives[mode.index()];
+        assert!(action.is_none_or(|action| space.allows(action)));
+        action
+    }
+
+    fn tactical_fight(
+        &self,
+        tracker: &StateTracker,
+        space: &ActionSpace,
+        hero: &UnitView,
+        enemy: &UnitView,
+        target: EntityIndex,
+        last_hit: bool,
+    ) -> Option<StructuredAction> {
+        let lethal = tactical_burst(hero, enemy, Some(space)) >= enemy.hp;
+        if !tactical_chase_safe(tracker, hero, enemy.pos)
+            || (!lethal && (last_hit || !in_attack_reach(hero, enemy)))
+            || (!in_attack_reach(hero, enemy) && hero.move_speed < enemy.move_speed)
+        {
+            return None;
+        }
+        for (slot, ability) in hero.abilities.iter().enumerate() {
+            if let Some(reach) = raze_reach(ability.id)
+                && space.allows(cast_none(slot))
+                && magical_damage(raze_damage(ability.level), enemy.magic_resist) > 0
+                && raze_center(hero.pos, hero.facing.brads, reach)
+                    .within(enemy.pos, Fixed::from_int(SHADOWRAZE_RADIUS))
+            {
+                return Some(cast_none(slot));
+            }
+        }
+        let action = StructuredAction::AttackUnit {
+            unit: ControlledUnit::Hero,
+            target,
+        };
+        self.requiem(tracker, space)
+            .or_else(|| space.allows(action).then_some(action))
     }
 
     fn sync_purchases(&mut self, tracker: &StateTracker) {
@@ -764,6 +887,119 @@ impl Teacher {
             point,
         })
     }
+}
+
+#[allow(
+    clippy::float_arithmetic,
+    reason = "normalized seat-visible neural features"
+)]
+fn tactical_features(
+    tracker: &StateTracker,
+    space: &ActionSpace,
+    hero: &UnitView,
+    enemy: &UnitView,
+    last_hit: bool,
+) -> Option<TacticalFeatures> {
+    let ready = hero
+        .abilities
+        .iter()
+        .enumerate()
+        .filter(|(slot, ability)| {
+            raze_reach(ability.id).is_some() && space.allows(cast_none(*slot))
+        })
+        .count();
+    let distance =
+        isqrt(hero.pos.distance_squared(enemy.pos) as u64) as f32 / Fixed::ONE.raw as f32 / 1_200.0;
+    TacticalFeatures::from_values([
+        tactical_ratio(hero.hp, hero.max_hp),
+        tactical_ratio(enemy.hp, enemy.max_hp),
+        tactical_ratio(hero.mana, hero.max_mana),
+        tactical_ratio(enemy.mana, enemy.max_mana),
+        tactical_ratio(
+            physical_damage(hero.attack_damage.max(0), enemy.armor),
+            enemy.hp,
+        ),
+        tactical_ratio(
+            physical_damage(enemy.attack_damage.max(0), hero.armor),
+            hero.hp,
+        ),
+        distance.clamp(0.0, 1.0),
+        ready.min(3) as f32 / 3.0,
+        tactical_ratio(tactical_burst(hero, enemy, Some(space)), enemy.hp),
+        tactical_ratio(tactical_burst(enemy, hero, None), hero.hp),
+        f32::from(enemy_tower_danger(tracker, hero.pos, hero.radius)),
+        f32::from(enemy_tower_danger(tracker, enemy.pos, hero.radius)),
+        tactical_ratio(visible_pressure(tracker, hero), hero.hp),
+        f32::from(allied_creep_near(tracker, hero.pos, 750)),
+        f32::from(last_hit),
+        f32::from(in_attack_reach(hero, enemy)),
+    ])
+    .ok()
+}
+
+#[allow(
+    clippy::float_arithmetic,
+    reason = "bounded normalization with a nonzero denominator"
+)]
+fn tactical_ratio(value: i32, maximum: i32) -> f32 {
+    let ratio = value.max(0) as f32 / maximum.max(1) as f32;
+    assert!(ratio.is_finite());
+    ratio.clamp(0.0, 1.0)
+}
+
+fn tactical_chase_safe(tracker: &StateTracker, hero: &UnitView, target: Vec2) -> bool {
+    let horizontal = i128::from(target.x.raw) - i128::from(hero.pos.x.raw);
+    let vertical = i128::from(target.y.raw) - i128::from(hero.pos.y.raw);
+    let squared = horizontal * horizontal + vertical * vertical;
+    tracker.current().is_some_and(|view| {
+        view.units
+            .iter()
+            .filter(|unit| {
+                unit.kind == UnitKind::Tower && unit.team != tracker.team() && unit.hp > 0
+            })
+            .all(|tower| {
+                // Endpoints alone miss a chase corridor that cuts through tower range.
+                let projection = ((i128::from(tower.pos.x.raw) - i128::from(hero.pos.x.raw))
+                    * horizontal
+                    + (i128::from(tower.pos.y.raw) - i128::from(hero.pos.y.raw)) * vertical)
+                    .clamp(0, squared);
+                let closest = Vec2 {
+                    x: Fixed {
+                        raw: (i128::from(hero.pos.x.raw) + horizontal * projection / squared.max(1))
+                            as i32,
+                    },
+                    y: Fixed {
+                        raw: (i128::from(hero.pos.y.raw) + vertical * projection / squared.max(1))
+                            as i32,
+                    },
+                };
+                !closest.within(tower.pos, Fixed::from_int(701) + hero.radius + tower.radius)
+            })
+    })
+}
+
+fn tactical_burst(source: &UnitView, target: &UnitView, space: Option<&ActionSpace>) -> i32 {
+    let disabled = source.statuses.bits
+        & (bota_proto::StatusFlags::STUNNED | bota_proto::StatusFlags::SILENCED)
+        != 0;
+    let raze = source
+        .abilities
+        .iter()
+        .enumerate()
+        .filter(|(slot, ability)| {
+            !disabled
+                && raze_reach(ability.id).is_some()
+                && ability.level > 0
+                && ability.cooldown_left == 0
+                && ability.mana_cost <= source.mana
+                && space.is_none_or(|space| space.allows(cast_none(*slot)))
+        })
+        .map(|(_, ability)| magical_damage(raze_damage(ability.level), target.magic_resist))
+        .max()
+        .unwrap_or(0);
+    physical_damage(source.attack_damage.max(0), target.armor)
+        .saturating_mul(2)
+        .saturating_add(raze)
 }
 
 fn courier_cast(

@@ -1632,11 +1632,13 @@ fn add_tree_points(
     center: Vec2,
     points: &mut Vec<PointCandidate>,
 ) -> Result<(), ActionError> {
+    assert!(points.len() <= MAX_POINT_CANDIDATES);
     let mut trees = Vec::with_capacity(tracker.static_trees().len() + current.planted_trees.len());
     for (index, position) in tracker.static_trees().iter().copied().enumerate() {
         let index = u32::try_from(index).map_err(|_| ActionError::Arithmetic("tree index"))?;
-        let locally_observable = tracker.position_locally_observable_to_own_seat(position);
-        if !current.felled_trees.contains(&index) || !locally_observable {
+        let locally_felled = current.felled_trees.contains(&index)
+            && tracker.position_locally_observable_to_own_seat(position);
+        if !locally_felled {
             trees.push((center.distance_squared(position), position, false));
         }
     }
@@ -1645,13 +1647,16 @@ fn add_tree_points(
             trees.push((center.distance_squared(position), position, true));
         }
     }
-    trees.sort_by_key(|(distance, position, planted)| {
-        (
-            *distance,
-            canonical_position_key(tracker, *position),
-            *planted,
-        )
-    });
+    let key = |&(distance, position, planted): &(i64, Vec2, bool)| {
+        (distance, canonical_position_key(tracker, position), planted)
+    };
+    if trees.len() > NEARBY_TREE_POINTS {
+        // Equal keys describe identical tree candidates, including their source.
+        trees.select_nth_unstable_by_key(NEARBY_TREE_POINTS, key);
+        trees.truncate(NEARBY_TREE_POINTS);
+    }
+    assert!(trees.len() <= NEARBY_TREE_POINTS);
+    trees.sort_by_key(key);
     for (_, position, planted) in trees.into_iter().take(NEARBY_TREE_POINTS) {
         let position = clamp_position(tracker, position)?;
         push_point(
@@ -1673,6 +1678,20 @@ fn add_tree_points(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn tree_points_for_test(
+    tracker: &StateTracker,
+    mut points: Vec<PointCandidate>,
+) -> Vec<PointCandidate> {
+    assert!(points.len() <= MAX_POINT_CANDIDATES);
+    let current = tracker.current().expect("tree test snapshot");
+    let passability = reconstruct_static_passability(tracker, current).expect("tree passability");
+    let center = tracker.own_hero().expect("tree test hero").pos;
+    add_tree_points(tracker, current, &passability, center, &mut points).expect("tree points");
+    assert!(points.len() <= MAX_POINT_CANDIDATES);
+    points
 }
 
 fn add_landmark_points(

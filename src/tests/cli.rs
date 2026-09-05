@@ -1,4 +1,67 @@
 #[test]
+fn cli_tactical_requires_explicit_weights_directory_for_both_play_forms() {
+    for arguments in [
+        vec!["drysua", "--policy", "tactical"],
+        vec!["drysua", "play", "--policy", "tactical"],
+    ] {
+        let error = crate::cli::parse_from(arguments).expect_err("tactical needs weights");
+        assert!(
+            error
+                .to_string()
+                .contains("--weights-directory <WEIGHTS_DIRECTORY>")
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("required arguments were not provided")
+        );
+    }
+}
+
+#[test]
+fn cli_tactical_missing_file_fails_before_connecting_without_teacher_fallback() {
+    let directory = super::seat::tactical_directory("cli-missing");
+    let error = crate::cli::run_from_for_test([
+        "drysua",
+        "play",
+        "--policy",
+        "tactical",
+        "--name",
+        "",
+        "--weights-directory",
+        directory.to_str().expect("UTF-8 directory"),
+    ])
+    .expect_err("missing tactical weights must fail before name validation");
+    assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+    assert!(error.to_string().contains("drysua.tactical.bin"));
+    std::fs::remove_dir(directory).expect("remove empty directory");
+}
+
+#[test]
+fn cli_tactical_loads_canonical_file_without_safetensors() {
+    let directory = super::seat::tactical_directory("cli-valid");
+    std::fs::write(
+        directory.join("drysua.tactical.bin"),
+        crate::TacticalPolicy::default().to_bytes(),
+    )
+    .expect("canonical tactical weights");
+    let error = crate::cli::run_from_for_test([
+        "drysua",
+        "play",
+        "--policy",
+        "tactical",
+        "--name",
+        "",
+        "--weights-directory",
+        directory.to_str().expect("UTF-8 directory"),
+    ])
+    .expect_err("valid tactical weights reach name validation");
+    assert_eq!(error.to_string(), "bot name must not be empty");
+    assert!(!directory.join("drysua.weights.safetensors").exists());
+    std::fs::remove_dir_all(directory).expect("remove weights");
+}
+
+#[test]
 fn cli_defaults_to_hybrid_for_implicit_and_explicit_play() {
     for arguments in [vec!["drysua"], vec!["drysua", "play"]] {
         assert_eq!(

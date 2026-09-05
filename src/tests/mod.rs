@@ -15,6 +15,7 @@ mod pipeline;
 mod ppo;
 mod readiness;
 mod seat;
+mod tactical;
 mod teacher;
 #[cfg(feature = "builtin")]
 mod teacher_arena;

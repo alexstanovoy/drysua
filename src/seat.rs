@@ -1,15 +1,19 @@
-use std::path::Path;
+use std::{io::Read, path::Path};
 
 use bota_proto::{MatchInfo, RejectReason, ServerMsg, SlotId, Team, TickMode};
 
 use crate::{
     ActionSpace, ActiveOrderUpdate, ActivePolicyOrder, FeatureEncoder, FeatureFrame, ItemReadiness,
     Link, LocalPolicyState, OrderPersistence, PolicyModel, SHADOW_FIEND, Seated, StateTracker,
-    StructuredAction, Teacher, TrainingArtifact, Wire, active_order_update_for_sent,
+    StructuredAction, TACTICAL_FILE_BYTES, TacticalPolicy, Teacher, TrainingArtifact, Wire,
+    active_order_update_for_sent,
 };
 
 const MAX_MATCH_MESSAGES: usize = 16_777_216;
 const MAX_MESSAGES_WITHOUT_SNAPSHOT: usize = 4_096;
+
+/// Canonical deployment artifact for [`play_tactical`], distinct from Hybrid SafeTensors.
+pub const TACTICAL_FILE_NAME: &str = "drysua.tactical.bin";
 
 /// The result observed by drysua for one match.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -47,7 +51,58 @@ struct LivePolicy {
 #[derive(Clone, Copy)]
 enum LiveController<'model> {
     Hybrid(&'model PolicyModel),
+    Tactical(&'model TacticalPolicy),
     Teacher,
+}
+
+/// Loads bounded tactical weights before connecting, without constructing a tensor model.
+pub fn play_tactical(
+    address: &str,
+    name: &str,
+    limit: Option<u32>,
+    weights_directory: &Path,
+) -> std::io::Result<Outcome> {
+    let policy = load_tactical_policy(weights_directory)?;
+    let (mut link, seated) = Link::join(address, name)?;
+    play_tactical_on(&mut link, seated, limit, &policy)
+}
+
+/// Runs a checked tactical policy through the same live order/ACK state machine as Teacher.
+pub fn play_tactical_on(
+    wire: &mut impl Wire,
+    seated: Seated,
+    limit: Option<u32>,
+    policy: &TacticalPolicy,
+) -> std::io::Result<Outcome> {
+    play_controller_on(wire, seated, limit, LiveController::Tactical(policy))
+}
+
+fn load_tactical_policy(directory: &Path) -> std::io::Result<TacticalPolicy> {
+    let path = directory.join(TACTICAL_FILE_NAME);
+    let context = |error: std::io::Error| {
+        std::io::Error::new(
+            error.kind(),
+            format!("tactical weights {}: {error}", path.display()),
+        )
+    };
+    let metadata = std::fs::symlink_metadata(&path).map_err(context)?;
+    if !metadata.file_type().is_file() {
+        return Err(context(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "expected a regular non-symlink file",
+        )));
+    }
+    let mut bytes = Vec::with_capacity(TACTICAL_FILE_BYTES + 1);
+    std::fs::File::open(&path)
+        .map_err(context)?
+        .take((TACTICAL_FILE_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(context)?;
+    assert!(bytes.len() <= TACTICAL_FILE_BYTES + 1);
+    let policy = TacticalPolicy::from_bytes(&bytes)
+        .map_err(|error| context(std::io::Error::new(std::io::ErrorKind::InvalidData, error)))?;
+    assert_eq!(bytes.len(), TACTICAL_FILE_BYTES);
+    Ok(policy)
 }
 
 /// Connects and runs the deterministic Teacher on any supported map without weights.
@@ -483,6 +538,12 @@ impl LivePolicy {
         controller: LiveController<'_>,
     ) -> std::io::Result<(StructuredAction, ActionSpace)> {
         let model = match controller {
+            LiveController::Tactical(policy) => {
+                return self
+                    .teacher
+                    .decide_tactical(&self.tracker, &self.persistence, &self.readiness, policy)
+                    .map_err(std::io::Error::other);
+            }
             LiveController::Hybrid(model)
                 if self.tracker.metadata().map != bota_proto::MapId(0) =>
             {
