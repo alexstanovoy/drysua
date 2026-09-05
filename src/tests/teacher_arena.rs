@@ -116,6 +116,7 @@ fn run_teacher_match(map: MapId) {
         .map(|seat| seat.tracker.own_hero().map(|hero| hero.pos))
         .collect();
     let mut counts = GateCounts::default();
+    let mut moved = vec![false; seats.len()];
 
     for _ in 0..MATCH_TICKS {
         let requests: Vec<Option<Request>> = seats
@@ -131,6 +132,11 @@ fn run_teacher_match(map: MapId) {
         for (seat, messages) in seats.iter_mut().zip(step.messages) {
             observe_messages(seat, &messages, &mut counts);
         }
+        for (index, seat) in seats.iter().enumerate() {
+            if let Some(hero) = seat.tracker.own_hero() {
+                moved[index] |= Some(hero.pos) != initial_hero_positions[index];
+            }
+        }
         if finished {
             break;
         }
@@ -142,10 +148,11 @@ fn run_teacher_match(map: MapId) {
         counts.suppressions, 0,
         "teacher must return Continue instead of a suppressed wire order"
     );
-    for (seat, initial) in seats.iter().zip(initial_hero_positions) {
-        let current = seat.tracker.own_hero().map(|hero| hero.pos);
-        assert_ne!(current, initial, "teacher orders must move each hero");
-    }
+    // A hero can move, die, and respawn at its initial position before the final snapshot.
+    assert!(
+        moved.into_iter().all(|moved| moved),
+        "teacher orders must move each hero"
+    );
     assert!(
         counts.rejections.saturating_mul(1_000) < counts.requests,
         "teacher rejection rate must be below 0.1%: {}/{}",

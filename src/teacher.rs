@@ -190,6 +190,9 @@ impl Teacher {
             .or_else(|| self.courier(tracker, space))
             .or_else(|| self.sustain(tracker, space))
             .or_else(|| self.retreat(tracker, space))
+            .or_else(|| self.raze_enemy(tracker, space, UnitKind::Hero))
+            .or_else(|| self.requiem(tracker, space))
+            .or_else(|| self.raze_enemy(tracker, space, UnitKind::Tower))
         {
             return action;
         }
@@ -200,8 +203,6 @@ impl Teacher {
             .attack_last_hit(tracker, space)
             .or_else(|| self.raze_last_hit(tracker, space))
             .or_else(|| self.deny(tracker, space))
-            .or_else(|| self.raze_hero(tracker, space))
-            .or_else(|| self.requiem(tracker, space))
             .or_else(|| self.harass(tracker, space))
             .or_else(|| self.attack_structure(tracker, space))
         {
@@ -589,20 +590,31 @@ impl Teacher {
         })
     }
 
-    fn raze_hero(&self, tracker: &StateTracker, space: &ActionSpace) -> Option<StructuredAction> {
+    fn raze_enemy(
+        &self,
+        tracker: &StateTracker,
+        space: &ActionSpace,
+        kind: UnitKind,
+    ) -> Option<StructuredAction> {
         let hero = tracker.own_hero()?;
+        let view = tracker.current()?;
         for (slot, ability) in hero.abilities.iter().enumerate() {
             let Some(reach) = raze_reach(ability.id) else {
                 continue;
             };
             let action = cast_none(slot);
-            if !space.allows(action) || hero.mana < ability.mana_cost.saturating_add(100) {
+            if !space.allows(action) {
                 continue;
             }
             let center = raze_center(hero.pos, hero.facing.brads, reach);
-            if enemy_heroes(tracker)
-                .any(|hero| center.within(hero.pos, Fixed::from_int(SHADOWRAZE_RADIUS)))
-            {
+            if view.units.iter().any(|enemy| {
+                enemy.kind == kind
+                    && enemy.team != tracker.team()
+                    && enemy.team != Team::Neutral
+                    && enemy.hp > 0
+                    && magical_damage(raze_damage(ability.level), enemy.magic_resist) > 0
+                    && center.within(enemy.pos, Fixed::from_int(SHADOWRAZE_RADIUS))
+            }) {
                 return Some(action);
             }
         }

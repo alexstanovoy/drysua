@@ -1,0 +1,19 @@
+{
+  "schema_version": 1,
+  "gate": "candidate_wins * 2 > all_scheduled_games_per_opponent",
+  "simulator_commit": "18db0f62d9a2b94e755c43fd29a959db204cc20b",
+  "map": 1,
+  "policy": "teacher",
+  "tick_limit": 30000,
+  "process_timeout_seconds": 90,
+  "seeds": [9000001, 9000002, 9000003, 9000004, 9000005, 9000006, 9000007, 9000008, 9000009, 9000010],
+  "releases": [
+    {
+      "tag": "v0.0.1",
+      "commit": "2cd104c8b8f0c5d1bed9988dfad4ddf4defd23f6",
+      "policy": "teacher",
+      "simulator_commit": "18db0f62d9a2b94e755c43fd29a959db204cc20b",
+      "map": 1
+    }
+  ]
+}

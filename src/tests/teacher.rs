@@ -201,6 +201,108 @@ fn teacher_preserves_a_seat_visible_channel_instead_of_issuing_a_body_order() {
 }
 
 #[test]
+fn teacher_razes_an_enemy_tower_from_outside_its_attack_range() {
+    for distance in [900, 951] {
+        let mut view = base_view();
+        let hero = own_hero_mut(&mut view);
+        hero.pos = Vec2::from_ints(6_000 - distance, 6_000);
+        hero.mana = 75;
+        let tracker = tracker(view);
+
+        let (action, space) = decide(&tracker);
+
+        if distance == 900 {
+            assert_eq!(action, cast(ControlledUnit::Hero, 2));
+        } else {
+            assert!(!matches!(action, StructuredAction::Cast { .. }));
+        }
+        assert!(space.allows(action));
+    }
+}
+
+#[test]
+fn teacher_does_not_raze_a_tower_behind_it_or_on_cooldown() {
+    for facing in [0, 32_768] {
+        let mut view = base_view();
+        let hero = own_hero_mut(&mut view);
+        hero.pos = Vec2::from_ints(5_100, 6_000);
+        hero.mana = 75;
+        hero.facing.brads = facing;
+        if facing == 0 {
+            hero.abilities[2].cooldown_left = 1;
+        }
+        let tracker = tracker(view);
+
+        let (action, space) = decide(&tracker);
+
+        assert!(!matches!(action, StructuredAction::Cast { .. }));
+        assert!(space.allows(action));
+    }
+}
+
+#[test]
+fn teacher_ready_hero_raze_preempts_a_persistent_attack() {
+    let mut view = base_view();
+    own_hero_mut(&mut view).mana = 500;
+    view.units.push(unit(
+        ENEMY_HERO_ID,
+        UnitKind::Hero,
+        Team::Dire,
+        3_400,
+        3_000,
+    ));
+    view.players[1].unit = Some(ENEMY_HERO_ID);
+    sort_units(&mut view);
+    let tracker = tracker(view);
+    let issued = IssuedOrder {
+        unit: None,
+        order: Order::Attack {
+            target: Target::Unit(ENEMY_HERO_ID),
+        },
+    };
+    let mut persistence = OrderPersistence::default();
+    persistence.record_sent(7, issued).expect("attack recorded");
+    let mut teacher = Teacher::new();
+    teacher.note_sent(7, issued, 1);
+
+    let (action, space) = teacher
+        .decide(&tracker, &persistence, &ItemReadiness::new())
+        .expect("combat decision");
+
+    assert_eq!(action, cast(ControlledUnit::Hero, 0));
+    assert!(space.allows(action));
+}
+
+#[test]
+fn teacher_hero_raze_uses_last_available_mana_but_respects_cooldowns() {
+    for mana in [74, 75] {
+        let mut view = base_view();
+        let hero = own_hero_mut(&mut view);
+        hero.mana = mana;
+        hero.abilities[0].cooldown_left = 30;
+        view.units.push(unit(
+            ENEMY_HERO_ID,
+            UnitKind::Hero,
+            Team::Dire,
+            3_400,
+            3_000,
+        ));
+        view.players[1].unit = Some(ENEMY_HERO_ID);
+        sort_units(&mut view);
+        let tracker = tracker(view);
+
+        let (action, space) = decide(&tracker);
+
+        if mana == 75 {
+            assert_eq!(action, cast(ControlledUnit::Hero, 1));
+        } else {
+            assert!(matches!(action, StructuredAction::AttackUnit { .. }));
+        }
+        assert!(space.allows(action));
+    }
+}
+
+#[test]
 fn teacher_casts_only_the_raze_whose_facing_circle_contains_enemy_hero() {
     let mut view = base_view();
     let hero = own_hero_mut(&mut view);
