@@ -26,6 +26,11 @@ Evaluated development binary SHA-256:
 `bc24e7e5307799d9a9b543a149e9f0eae7b961804639827876da64dfdd2e3245`.
 Source release identity is recorded by the annotated tag and release registry.
 
+The clean committed source `7862f34d1fa8b6c728fee274d51bc6c164ea69dc` was rebuilt
+and independently rerun through the same schedule before tagging: again 12/20,
+zero validation errors. Final summary: `gate.json`; full local evidence:
+`artifacts/temp/v0.0.2-final-clean/report.json`.
+
 ## Rules caveat
 
 Simulator commit: `18db0f62d9a2b94e755c43fd29a959db204cc20b`.

@@ -1,5 +1,6 @@
 """Release gate regression tests (stdlib only)."""
 
+import json
 import unittest
 from unittest.mock import Mock, patch
 import socket
@@ -171,15 +172,24 @@ class WireTests(unittest.TestCase):
 
 
 class RegistryTests(unittest.TestCase):
+    def registry_path(self):
+        release = dict(tag="v0.0.1", commit="2cd104c8b8f0c5d1bed9988dfad4ddf4defd23f6",
+                       policy="teacher", simulator_commit=SIMULATOR, map=1)
+        registry = dict(schema_version=1, simulator_commit=SIMULATOR, map=1,
+                        policy="teacher", tick_limit=30000, process_timeout_seconds=90,
+                        gate="candidate_wins * 2 > all_scheduled_games_per_opponent",
+                        seeds=list(range(10)), releases=[release])
+        return Mock(read_text=Mock(return_value=json.dumps(registry)))
+
     def test_registered_annotated_tag_identity_is_required(self):
-        registry_path = Path(__file__).resolve().parents[1] / "releases.json"
+        registry_path = self.registry_path()
         commit = "2cd104c8b8f0c5d1bed9988dfad4ddf4defd23f6"
         with patch("release_build.git", side_effect=["v0.0.1", "tag", commit, SIMULATOR]):
             registry = read_registry(registry_path, Path("bot"), Path("simulator"))
         self.assertEqual(registry["releases"][0]["commit"], commit)
 
     def test_unregistered_release_lightweight_tag_or_moved_tag_fails(self):
-        registry_path = Path(__file__).resolve().parents[1] / "releases.json"
+        registry_path = self.registry_path()
         for replies, message in ((["v0.0.1\nv0.0.2"], "release tags and registry differ"),
                                  (["v0.0.1", "commit"], "must be an annotated tag"),
                                  (["v0.0.1", "tag", "0" * 40], "commit identity mismatch")):
