@@ -11,18 +11,17 @@ use bota_proto::{EventKind, MapId, RejectReason, ServerMsg, SlotId, Team};
 use crate::{
     ACTOR_LEARNER_BUFFERS, ActionKind, ActionSpace, ActivePolicyOrder, ActorLearnerPipeline,
     AdamConfig, Arena, ArenaConfig, ArenaStart, BehavioralTrainer, CheckpointDevice,
-    CheckpointProgress, CheckpointRun, CheckpointSaveOutcome, CrossPlayProfile,
-    EarlyStoppingConfig, FeatureEncoder, FeatureFrame, IMITATION_RULES_AUDIT_VERSION,
-    ImitationPool, ImitationSide, ItemReadiness, LEAGUE_MIN_PROMOTION_ACTIONS,
-    LEAGUE_MIN_PROMOTION_PAIRS, League, LeagueEvaluation, LeagueExploitAudit, LeagueMatchResult,
-    LeagueOpponent, LeagueOpponentKind, LeaguePairedResult, LeaguePromotionDecision, LeagueSampler,
-    LocalPolicyState, MAX_TRAINING_COUNTER, MODEL_MAX_OPTIMIZER_STEP, OfflineEvaluation,
-    OrderPersistence, PPO_MAX_POLICY_SAMPLE_DRAWS, PPO_MAX_ROLLOUT_DECISIONS,
-    PPO_RULES_AUDIT_VERSION, PolicyDevice, PolicyModel, PolicySnapshot, PpoConfig, PpoError,
-    PpoOutcome, PpoPolicyChoice, PpoRng, PpoRollout, PpoTerminalOutcome, PpoTrainer,
-    PpoUpdateReport, Request, RewardTracker, RngCheckpoint, SHADOW_FIEND, SampleIdentity,
-    SeedNamespace, SeedNamespaces, StateTracker, Teacher, TeacherCoverage, TrainingArtifact,
-    TrainingScope, compiled_features, tick_discount,
+    CheckpointProgress, CheckpointRun, CheckpointSaveOutcome, CrossPlayProfile, FeatureEncoder,
+    FeatureFrame, IMITATION_RULES_AUDIT_VERSION, ImitationPool, ImitationSide, ItemReadiness,
+    LEAGUE_MIN_PROMOTION_ACTIONS, LEAGUE_MIN_PROMOTION_PAIRS, League, LeagueEvaluation,
+    LeagueExploitAudit, LeagueMatchResult, LeagueOpponent, LeagueOpponentKind, LeaguePairedResult,
+    LeaguePromotionDecision, LeagueSampler, LocalPolicyState, MAX_TRAINING_COUNTER,
+    MODEL_MAX_OPTIMIZER_STEP, OfflineEvaluation, OrderPersistence, PPO_MAX_POLICY_SAMPLE_DRAWS,
+    PPO_MAX_ROLLOUT_DECISIONS, PPO_RULES_AUDIT_VERSION, PolicyDevice, PolicyModel, PolicySnapshot,
+    PpoConfig, PpoError, PpoOutcome, PpoPolicyChoice, PpoRng, PpoRollout, PpoTerminalOutcome,
+    PpoTrainer, PpoUpdateReport, Request, RewardTracker, RngCheckpoint, SHADOW_FIEND,
+    SampleIdentity, SeedNamespace, SeedNamespaces, StateTracker, Teacher, TeacherCoverage,
+    TrainingArtifact, TrainingScope, compiled_features, tick_discount,
 };
 
 const TRAINING_MAX_ENVIRONMENTS: usize = 16;
@@ -629,7 +628,6 @@ pub fn run_behavioral_pretraining_on(
             epsilon: 1.0e-8,
             gradient_clip: 0.5,
         },
-        EarlyStoppingConfig::default(),
         &model,
         &collection.pool,
     )

@@ -611,7 +611,7 @@ L_bc = CE(action kind) + сумма CE активных conditional heads
 - global gradient norm clip 0.5;
 - deterministic shuffle;
 - отдельные held-out seeds;
-- early stopping по gameplay evaluation.
+- выбор лучшего training stage по gameplay evaluation.
 
 Метрики:
 
@@ -645,14 +645,15 @@ DAgger:
 Статус: программный контракт реализован. Identifier-free targets строятся только из
 точной пары FeatureFrame/ActionSpace; Map 1 pool ограничен 9216 samples, effective batch — 8192,
 autograd microbatch — 64. Masked BC, host gradient accumulation, Adam с
-`epsilon=1e-8` и clip 0.5, deterministic shuffle, side metrics, seed namespaces,
-early stopping и строгий in-memory checkpoint входят в один deterministic CPU path.
+`epsilon=1e-8` и clip 0.5, deterministic shuffle, side metrics и seed namespaces
+используются в behavioral training. Модель выбирает один gameplay stage selector;
+отдельного imitation checkpoint/early-stopping механизма нет.
 Optimizer path принимает только `Train`; `Validation` и `HeldOut` доступны только для
 оценки.
 Один exclusive model guard покрывает весь effective update и Adam commit; ошибка epoch
-восстанавливает weights, moments, counters, shuffle и early-stop state. Pool проверяет
+восстанавливает weights, moments, counters и shuffle. Pool проверяет
 map/seed/split/trajectory/tick/side identity, защищает Validation/HeldOut от FIFO eviction и
-связывает trainer/checkpoint с точными lineage, revision, seed namespaces, action/model/
+связывает trainer с точными lineage, revision, seed namespaces, action/model/
 feature schemas, Shadow Fiend, typed map scope и rules-audit scope. Каждый in-memory pool имеет
 неподделываемую instance identity; после DAgger mutation trainer явно принимает только
 более новую revision того же instance через `rebind_pool`. Promotion принимает только
@@ -676,8 +677,7 @@ Promotion не принимает empty/one-family action corpus или zero-sco
 coverage и action distribution должны быть представлены из фактических samples.
 Promotion gate остаётся data-dependent: agreement, полное coverage и gameplay gates не
 считаются достигнутыми без отдельного обученного match corpus.
-Файловая serialization, content hash и atomic rename остаются отложены до этапа 18;
-этап 8 хранит и строго восстанавливает checkpoint только в памяти.
+Для возобновляемого PPO используется файловый `TrainingArtifact` из этапа 18.
 После restore promotion evidence собирается заново; process-local identity не переносит
 runtime evidence между процессами и не входит в feature/model tensors.
 

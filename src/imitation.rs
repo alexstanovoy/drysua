@@ -12,15 +12,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use bota_proto::{AbilitySlot, HeroId, ItemSlot, MapId};
 
 use crate::{
-    ACTION_SCHEMA_HASH, ACTION_SCHEMA_VERSION, ActionError, ActionKind, ActionSpace, ActionTarget,
-    AdamConfig, AdamState, FEATURE_SCHEMA_HASH, FEATURE_SCHEMA_VERSION, FeatureFrame,
+    ActionError, ActionKind, ActionSpace, ActionTarget, AdamConfig, AdamState, FeatureFrame,
     ItemReadiness, MODEL_ABILITY_HEAD, MODEL_BEHAVIORAL_HEADS, MODEL_ENTITY_POINTER_HEAD,
     MODEL_ITEM_HEAD, MODEL_KIND_HEAD, MODEL_LEARN_HEAD, MODEL_LOOT_HEAD, MODEL_MAX_BATCH,
-    MODEL_PARAMETER_COUNT, MODEL_POINT_POINTER_HEAD, MODEL_SCHEMA_HASH, MODEL_SCHEMA_VERSION,
-    MODEL_SHOP_HEAD, MODEL_SWAP_HEAD, MODEL_UNIT_HEAD, ModelAdamSnapshot, ModelError,
-    ModelUpdateReport, OrderPersistence, PolicyModel, PutPointTarget, SHADOW_FIEND, StateTracker,
-    StructuredAction, Teacher, TrainingAbilitySlot, TrainingItemSlot, TrainingPrefix, TrainingSlot,
-    global_feature,
+    MODEL_POINT_POINTER_HEAD, MODEL_SHOP_HEAD, MODEL_SWAP_HEAD, MODEL_UNIT_HEAD, ModelAdamSnapshot,
+    ModelError, ModelUpdateReport, OrderPersistence, PolicyModel, PutPointTarget, SHADOW_FIEND,
+    StateTracker, StructuredAction, Teacher, TrainingAbilitySlot, TrainingItemSlot, TrainingPrefix,
+    TrainingSlot, global_feature,
 };
 
 /// Maximum number of owned samples retained by one imitation pool.
@@ -29,12 +27,8 @@ pub const MAX_IMITATION_SAMPLES: usize = 9_216;
 pub const MAX_SEED_NAMESPACE: usize = 8_192;
 /// Maximum epoch, optimizer-step, and global-update counter value.
 pub const MAX_TRAINING_COUNTER: u64 = 1_000_000_000;
-/// Maximum early-stopping patience in gameplay evaluations.
-pub const MAX_EARLY_STOPPING_PATIENCE: u32 = 1_000_000;
 /// Minimum rollout action count accepted by the promotion gate.
 pub const MIN_PROMOTION_ROLLOUT_ACTIONS: u64 = 1_000;
-/// Current behavioral optimizer ownership schema.
-pub const IMITATION_OPTIMIZER_VERSION: u32 = 2;
 /// Current audited game-rules scope for stage-eight artifacts.
 pub const IMITATION_RULES_AUDIT_VERSION: u32 = 12;
 
@@ -115,18 +109,12 @@ pub enum ImitationError {
         second: &'static str,
         seed: u64,
     },
-    InvalidEarlyStopping(&'static str),
-    EvaluationEpochOrder {
-        epoch: u64,
-        previous: u64,
-    },
     NonFiniteEvaluation,
     InvalidEvaluationCounts,
     InvalidRolloutCounts,
     InvalidGameplayReport(&'static str),
     PolicyIdentityMismatch,
     InvalidTeacherCoverage,
-    CheckpointSchema,
     CheckpointState(&'static str),
     Rollback {
         cause: String,
@@ -271,13 +259,6 @@ impl ImitationError {
 
     fn fmt_training_state(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidEarlyStopping(field) => {
-                write!(formatter, "imitation early-stopping {field} is invalid")
-            }
-            Self::EvaluationEpochOrder { epoch, previous } => write!(
-                formatter,
-                "imitation evaluation epoch {epoch} is not strictly increasing after {previous}"
-            ),
             Self::NonFiniteEvaluation => {
                 formatter.write_str("imitation evaluation value is non-finite")
             }
@@ -294,9 +275,6 @@ impl ImitationError {
                 .write_str("imitation promotion evidence policy identity does not match candidate"),
             Self::InvalidTeacherCoverage => {
                 formatter.write_str("imitation teacher coverage counts are inconsistent")
-            }
-            Self::CheckpointSchema => {
-                formatter.write_str("imitation checkpoint schema does not match this build")
             }
             Self::CheckpointState(field) => {
                 write!(formatter, "imitation checkpoint has invalid {field}")
@@ -2776,34 +2754,6 @@ fn head_matches<const WIDTH: usize>(target: &HeadTarget<WIDTH>, prediction: Opti
     !target.active || prediction == Some(target.selected)
 }
 
-/// Gameplay early-stopping configuration.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct EarlyStoppingConfig {
-    pub minimum_improvement: f64,
-    pub patience: u32,
-}
-
-impl Default for EarlyStoppingConfig {
-    fn default() -> Self {
-        Self {
-            minimum_improvement: 0.0,
-            patience: 10,
-        }
-    }
-}
-
-/// Bounded best gameplay snapshot and no-improvement state.
-#[derive(Clone, Debug, PartialEq)]
-pub struct EarlyStopper {
-    config: EarlyStoppingConfig,
-    best_epoch: Option<u64>,
-    best_score: Option<f64>,
-    best_state: Option<CompleteTrainingState>,
-    stale_evaluations: u32,
-    last_evaluation_epoch: Option<u64>,
-    stopped: bool,
-}
-
 #[derive(Clone, Debug, PartialEq)]
 struct CompleteTrainingState {
     model: ModelAdamSnapshot,
@@ -2811,83 +2761,7 @@ struct CompleteTrainingState {
     shuffle: ShuffleState,
 }
 
-impl EarlyStopper {
-    pub fn new(config: EarlyStoppingConfig) -> Result<Self, ImitationError> {
-        validate_early_config(config)?;
-        Ok(Self {
-            config,
-            best_epoch: None,
-            best_score: None,
-            best_state: None,
-            stale_evaluations: 0,
-            last_evaluation_epoch: None,
-            stopped: false,
-        })
-    }
-
-    /// Records finite gameplay score and returns whether patience is exhausted.
-    fn observe(
-        &mut self,
-        epoch: u64,
-        score: f64,
-        state: CompleteTrainingState,
-    ) -> Result<bool, ImitationError> {
-        if self.stopped {
-            return Ok(true);
-        }
-        if !score.is_finite() {
-            return Err(ImitationError::NonFiniteEvaluation);
-        }
-        if epoch > MAX_TRAINING_COUNTER {
-            return Err(ImitationError::CounterOverflow {
-                counter: "epoch",
-                maximum: MAX_TRAINING_COUNTER,
-            });
-        }
-        if let Some(previous) = self.last_evaluation_epoch
-            && epoch <= previous
-        {
-            return Err(ImitationError::EvaluationEpochOrder { epoch, previous });
-        }
-        let improved = self
-            .best_score
-            .is_none_or(|best| score > best + self.config.minimum_improvement);
-        if improved {
-            self.best_epoch = Some(epoch);
-            self.best_score = Some(score);
-            self.best_state = Some(state);
-            self.stale_evaluations = 0;
-            self.last_evaluation_epoch = Some(epoch);
-            return Ok(false);
-        }
-        self.stale_evaluations =
-            self.stale_evaluations
-                .checked_add(1)
-                .ok_or(ImitationError::CounterOverflow {
-                    counter: "early-stopping patience",
-                    maximum: u64::from(MAX_EARLY_STOPPING_PATIENCE),
-                })?;
-        self.last_evaluation_epoch = Some(epoch);
-        self.stopped = self.stale_evaluations >= self.config.patience;
-        Ok(self.stopped)
-    }
-
-    pub const fn best_epoch(&self) -> Option<u64> {
-        self.best_epoch
-    }
-}
-
-fn validate_early_config(config: EarlyStoppingConfig) -> Result<(), ImitationError> {
-    if !config.minimum_improvement.is_finite() || config.minimum_improvement < 0.0 {
-        return Err(ImitationError::InvalidEarlyStopping("minimum improvement"));
-    }
-    if !(1..=MAX_EARLY_STOPPING_PATIENCE).contains(&config.patience) {
-        return Err(ImitationError::InvalidEarlyStopping("patience"));
-    }
-    Ok(())
-}
-
-/// Trainer counters persisted in strict checkpoints.
+/// Completed epochs and optimizer updates owned by a behavioral trainer.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TrainerCounters {
     pub epoch: u64,
@@ -2909,7 +2783,6 @@ pub struct BehavioralTrainer {
     shuffle: ShuffleState,
     counters: TrainerCounters,
     adam: AdamState,
-    early_stopper: EarlyStopper,
     pool: PoolBinding,
     model_identity: crate::PolicyIdentity,
 }
@@ -2919,12 +2792,10 @@ impl BehavioralTrainer {
         effective_batch: usize,
         shuffle_seed: u64,
         adam: AdamConfig,
-        early_stopping: EarlyStoppingConfig,
         model: &PolicyModel,
         pool: &ImitationPool,
     ) -> Result<Self, ImitationError> {
         validate_effective_batch(effective_batch)?;
-        let early_stopper = EarlyStopper::new(early_stopping)?;
         let adam = model.claim_optimizer(adam)?;
         let model_identity = adam.binding().policy;
         Ok(Self {
@@ -2932,7 +2803,6 @@ impl BehavioralTrainer {
             shuffle: ShuffleState::new(shuffle_seed),
             counters: TrainerCounters::default(),
             adam,
-            early_stopper,
             pool: pool.binding.clone(),
             model_identity,
         })
@@ -2977,11 +2847,10 @@ impl BehavioralTrainer {
         self.validate_pool(pool)?;
         validate_trainer_counters(self)?;
         let rollback = self.complete_state(model)?;
-        let early = self.early_stopper.clone();
         match self.train_epoch_inner(model, pool, fail_update) {
             Ok(report) => Ok(report),
             Err(cause) => {
-                let restored = self.rollback(model, rollback, early, rollback_failure);
+                let restored = self.rollback(model, rollback, rollback_failure);
                 match restored {
                     Ok(()) => Err(cause),
                     Err(rollback) => Err(ImitationError::Rollback {
@@ -3045,7 +2914,6 @@ impl BehavioralTrainer {
         &mut self,
         model: &PolicyModel,
         state: CompleteTrainingState,
-        early: EarlyStopper,
         rollback_failure: bool,
     ) -> Result<(), ImitationError> {
         #[cfg(test)]
@@ -3064,7 +2932,6 @@ impl BehavioralTrainer {
         }
         self.counters = state.counters;
         self.shuffle = state.shuffle;
-        self.early_stopper = early;
         Ok(())
     }
 
@@ -3088,42 +2955,6 @@ impl BehavioralTrainer {
         self.shuffle.draws
     }
 
-    /// Records gameplay evaluation at the current completed epoch.
-    pub fn observe_gameplay(
-        &mut self,
-        score: f64,
-        model: &PolicyModel,
-    ) -> Result<bool, ImitationError> {
-        if !score.is_finite() {
-            return Err(ImitationError::NonFiniteEvaluation);
-        }
-        if self.early_stopper.stopped {
-            return Ok(true);
-        }
-        validate_trainer_counters(self)?;
-        let state = self.complete_state(model)?;
-        self.early_stopper
-            .observe(self.counters.epoch, score, state)
-    }
-
-    /// Atomically restores the best gameplay-evaluated model parameters.
-    pub fn restore_best(&mut self, model: &PolicyModel) -> Result<(), ImitationError> {
-        let state = self
-            .early_stopper
-            .best_state
-            .clone()
-            .ok_or(ImitationError::CheckpointState("best training snapshot"))?;
-        let expected = self.adam.binding();
-        let binding = model.restore_snapshot(&state.model, &mut self.adam, expected)?;
-        self.model_identity = binding.policy;
-        self.counters = state.counters;
-        self.shuffle = state.shuffle;
-        self.early_stopper.stale_evaluations = 0;
-        self.early_stopper.last_evaluation_epoch = self.early_stopper.best_epoch;
-        self.early_stopper.stopped = false;
-        Ok(())
-    }
-
     #[cfg(test)]
     pub(crate) fn train_epoch_with_failure(
         &mut self,
@@ -3133,6 +2964,11 @@ impl BehavioralTrainer {
         rollback_failure: bool,
     ) -> Result<TrainingEpochReport, ImitationError> {
         self.train_epoch_atomic(model, pool, Some(update), rollback_failure)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn orchestration_state_for_test(&self) -> (ShuffleState, PoolBinding) {
+        (self.shuffle, self.pool.clone())
     }
 
     #[cfg(test)]
@@ -3196,192 +3032,6 @@ fn validate_counter_increment(
     Ok(())
 }
 
-/// Complete strict in-memory behavioral-training checkpoint.
-#[derive(Clone, Debug, PartialEq)]
-pub struct TrainingCheckpoint {
-    pub action_schema_version: u32,
-    pub action_schema_hash: u64,
-    pub model_schema_version: u32,
-    pub model_schema_hash: u64,
-    pub feature_schema_version: u32,
-    pub feature_schema_hash: u64,
-    pub pool: PoolBinding,
-    pub optimizer_version: u32,
-    pub model_identity: crate::PolicyIdentity,
-    pub optimizer_lineage: u64,
-    pub parameters: Vec<f32>,
-    pub adam_config: AdamConfig,
-    pub first_moment: Vec<f32>,
-    pub second_moment: Vec<f32>,
-    pub adam_step: u64,
-    pub effective_batch: usize,
-    pub epoch: u64,
-    pub global_update: u64,
-    pub shuffle_state: u64,
-    pub shuffle_draws: u64,
-    pub early_stopping_config: EarlyStoppingConfig,
-    pub best_epoch: Option<u64>,
-    pub best_score: Option<f64>,
-    pub best_model_identity: Option<crate::PolicyIdentity>,
-    pub best_optimizer_lineage: Option<u64>,
-    pub best_parameters: Option<Vec<f32>>,
-    pub best_first_moment: Option<Vec<f32>>,
-    pub best_second_moment: Option<Vec<f32>>,
-    pub best_adam_step: Option<u64>,
-    pub best_counters: Option<TrainerCounters>,
-    pub best_shuffle_state: Option<u64>,
-    pub best_shuffle_draws: Option<u64>,
-    pub stale_evaluations: u32,
-    pub last_evaluation_epoch: Option<u64>,
-    pub stopped: bool,
-}
-
-impl TrainingCheckpoint {
-    pub fn capture(
-        model: &PolicyModel,
-        trainer: &BehavioralTrainer,
-        pool: &ImitationPool,
-    ) -> Result<Self, ImitationError> {
-        trainer.validate_pool(pool)?;
-        validate_trainer_counters(trainer)?;
-        let current = model.coherent_snapshot(&trainer.adam)?;
-        let (first_moment, second_moment) = current.adam.moments();
-        let best = trainer.early_stopper.best_state.as_ref();
-        Ok(Self {
-            action_schema_version: ACTION_SCHEMA_VERSION,
-            action_schema_hash: ACTION_SCHEMA_HASH,
-            model_schema_version: MODEL_SCHEMA_VERSION,
-            model_schema_hash: MODEL_SCHEMA_HASH,
-            feature_schema_version: FEATURE_SCHEMA_VERSION,
-            feature_schema_hash: FEATURE_SCHEMA_HASH,
-            pool: trainer.pool.clone(),
-            optimizer_version: IMITATION_OPTIMIZER_VERSION,
-            model_identity: current.adam.binding().policy,
-            optimizer_lineage: current.adam.binding().lineage.get(),
-            parameters: current.parameters,
-            adam_config: current.adam.config(),
-            first_moment: first_moment.to_vec(),
-            second_moment: second_moment.to_vec(),
-            adam_step: current.adam.step(),
-            effective_batch: trainer.effective_batch,
-            epoch: trainer.counters.epoch,
-            global_update: trainer.counters.global_update,
-            shuffle_state: trainer.shuffle.state(),
-            shuffle_draws: trainer.shuffle.draws(),
-            early_stopping_config: trainer.early_stopper.config,
-            best_epoch: trainer.early_stopper.best_epoch,
-            best_score: trainer.early_stopper.best_score,
-            best_model_identity: best.map(|state| state.model.adam.binding().policy),
-            best_optimizer_lineage: best.map(|state| state.model.adam.binding().lineage.get()),
-            best_parameters: best.map(|state| state.model.parameters.clone()),
-            best_first_moment: best.map(|state| state.model.adam.moments().0.to_vec()),
-            best_second_moment: best.map(|state| state.model.adam.moments().1.to_vec()),
-            best_adam_step: best.map(|state| state.model.adam.step()),
-            best_counters: best.map(|state| state.counters),
-            best_shuffle_state: best.map(|state| state.shuffle.state()),
-            best_shuffle_draws: best.map(|state| state.shuffle.draws()),
-            stale_evaluations: trainer.early_stopper.stale_evaluations,
-            last_evaluation_epoch: trainer.early_stopper.last_evaluation_epoch,
-            stopped: trainer.early_stopper.stopped,
-        })
-    }
-
-    /// Strictly validates all state before atomically replacing model and trainer state.
-    pub fn restore(
-        &self,
-        model: &PolicyModel,
-        trainer: &mut BehavioralTrainer,
-        pool: &ImitationPool,
-    ) -> Result<(), ImitationError> {
-        let candidate = self.validate(trainer, pool)?;
-        let mut adam = candidate.current.adam.clone();
-        let expected = trainer.adam.binding();
-        let binding = model.restore_snapshot(&candidate.current, &mut adam, expected)?;
-        trainer.effective_batch = self.effective_batch;
-        trainer.shuffle = candidate.shuffle;
-        trainer.counters = candidate.counters;
-        trainer.adam = adam;
-        trainer.early_stopper = candidate.early;
-        trainer.pool = self.pool.clone();
-        trainer.model_identity = binding.policy;
-        Ok(())
-    }
-
-    fn validate(
-        &self,
-        trainer: &BehavioralTrainer,
-        pool: &ImitationPool,
-    ) -> Result<CheckpointCandidate, ImitationError> {
-        self.precheck_lengths()?;
-        if self.action_schema_version != ACTION_SCHEMA_VERSION
-            || self.action_schema_hash != ACTION_SCHEMA_HASH
-            || self.model_schema_version != MODEL_SCHEMA_VERSION
-            || self.model_schema_hash != MODEL_SCHEMA_HASH
-            || self.feature_schema_version != FEATURE_SCHEMA_VERSION
-            || self.feature_schema_hash != FEATURE_SCHEMA_HASH
-        {
-            return Err(ImitationError::CheckpointSchema);
-        }
-        if self.optimizer_version != IMITATION_OPTIMIZER_VERSION {
-            return Err(ImitationError::CheckpointState(
-                "optimizer ownership or version",
-            ));
-        }
-        if self.pool != pool.binding || self.pool != trainer.pool {
-            return Err(ImitationError::PoolBindingMismatch);
-        }
-        validate_pool_binding(&self.pool)?;
-        validate_scope(self.pool.scope)?;
-        validate_parameter_vector(&self.parameters, "parameters")?;
-        validate_effective_batch(self.effective_batch)?;
-        validate_checkpoint_counters(self)?;
-        let optimizer_lineage = NonZeroU64::new(self.optimizer_lineage)
-            .ok_or(ImitationError::CheckpointState("optimizer lineage"))?;
-        let adam = AdamState::from_parts(
-            self.adam_config,
-            self.first_moment.clone(),
-            self.second_moment.clone(),
-            self.adam_step,
-            crate::OptimizerBinding {
-                lineage: optimizer_lineage,
-                policy: self.model_identity,
-            },
-        )?;
-        let early = validate_checkpoint_early(self)?;
-        Ok(CheckpointCandidate {
-            current: ModelAdamSnapshot {
-                parameters: self.parameters.clone(),
-                adam,
-            },
-            counters: TrainerCounters {
-                epoch: self.epoch,
-                global_update: self.global_update,
-            },
-            shuffle: ShuffleState {
-                state: self.shuffle_state,
-                draws: self.shuffle_draws,
-            },
-            early,
-        })
-    }
-
-    fn precheck_lengths(&self) -> Result<(), ImitationError> {
-        precheck_vector_length(&self.parameters, "parameters")?;
-        precheck_vector_length(&self.first_moment, "first moment")?;
-        precheck_vector_length(&self.second_moment, "second moment")?;
-        for (values, field) in [
-            (&self.best_parameters, "best parameters"),
-            (&self.best_first_moment, "best first moment"),
-            (&self.best_second_moment, "best second moment"),
-        ] {
-            if let Some(values) = values {
-                precheck_vector_length(values, field)?;
-            }
-        }
-        Ok(())
-    }
-}
-
 fn validate_pool_binding(binding: &PoolBinding) -> Result<(), ImitationError> {
     if !(1..=MAX_IMITATION_SAMPLES).contains(&binding.capacity)
         || binding.provenance.lineage == 0
@@ -3425,179 +3075,6 @@ fn validate_trainer_counters(trainer: &BehavioralTrainer) -> Result<(), Imitatio
     Ok(())
 }
 
-struct CheckpointCandidate {
-    current: ModelAdamSnapshot,
-    counters: TrainerCounters,
-    shuffle: ShuffleState,
-    early: EarlyStopper,
-}
-
-fn validate_checkpoint_counters(checkpoint: &TrainingCheckpoint) -> Result<(), ImitationError> {
-    if checkpoint.epoch > MAX_TRAINING_COUNTER || checkpoint.global_update > MAX_TRAINING_COUNTER {
-        return Err(ImitationError::CheckpointState("training counters"));
-    }
-    if checkpoint.shuffle_draws > MAX_TRAINING_COUNTER {
-        return Err(ImitationError::CheckpointState("shuffle draw counter"));
-    }
-    if checkpoint.adam_step != checkpoint.global_update
-        || checkpoint.epoch > checkpoint.global_update
-    {
-        return Err(ImitationError::CheckpointState(
-            "optimizer counter relationship",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_checkpoint_early(
-    checkpoint: &TrainingCheckpoint,
-) -> Result<EarlyStopper, ImitationError> {
-    validate_early_config(checkpoint.early_stopping_config)?;
-    if checkpoint.stale_evaluations > checkpoint.early_stopping_config.patience
-        || checkpoint.stopped
-            != (checkpoint.stale_evaluations >= checkpoint.early_stopping_config.patience)
-    {
-        return Err(ImitationError::CheckpointState("early-stopping patience"));
-    }
-    validate_checkpoint_evaluation_history(checkpoint)?;
-    let best_state = build_best_state(checkpoint)?;
-    Ok(EarlyStopper {
-        config: checkpoint.early_stopping_config,
-        best_epoch: checkpoint.best_epoch,
-        best_score: checkpoint.best_score,
-        best_state,
-        stale_evaluations: checkpoint.stale_evaluations,
-        last_evaluation_epoch: checkpoint.last_evaluation_epoch,
-        stopped: checkpoint.stopped,
-    })
-}
-
-fn validate_checkpoint_evaluation_history(
-    checkpoint: &TrainingCheckpoint,
-) -> Result<(), ImitationError> {
-    let states_present = [
-        checkpoint.best_epoch.is_some(),
-        checkpoint.best_score.is_some(),
-        checkpoint.best_model_identity.is_some(),
-        checkpoint.best_optimizer_lineage.is_some(),
-        checkpoint.best_parameters.is_some(),
-        checkpoint.best_first_moment.is_some(),
-        checkpoint.best_second_moment.is_some(),
-        checkpoint.best_adam_step.is_some(),
-        checkpoint.best_counters.is_some(),
-        checkpoint.best_shuffle_state.is_some(),
-        checkpoint.best_shuffle_draws.is_some(),
-    ];
-    if states_present.iter().any(|value| *value) && !states_present.iter().all(|value| *value) {
-        return Err(ImitationError::CheckpointState("best evaluation snapshot"));
-    }
-    if checkpoint
-        .best_score
-        .is_some_and(|score| !score.is_finite())
-    {
-        return Err(ImitationError::CheckpointState("best score"));
-    }
-    match (checkpoint.best_epoch, checkpoint.last_evaluation_epoch) {
-        (None, None) if checkpoint.stale_evaluations == 0 => Ok(()),
-        (Some(best), Some(last)) => {
-            let stale = u64::from(checkpoint.stale_evaluations);
-            let epochs_valid = best <= last
-                && last <= checkpoint.epoch
-                && last <= MAX_TRAINING_COUNTER
-                && if stale == 0 {
-                    best == last
-                } else {
-                    last.checked_sub(best)
-                        .is_some_and(|elapsed| elapsed >= stale)
-                };
-            if epochs_valid {
-                Ok(())
-            } else {
-                Err(ImitationError::CheckpointState(
-                    "evaluation epoch relationship",
-                ))
-            }
-        }
-        _ => Err(ImitationError::CheckpointState("best evaluation state")),
-    }
-}
-
-fn build_best_state(
-    checkpoint: &TrainingCheckpoint,
-) -> Result<Option<CompleteTrainingState>, ImitationError> {
-    let Some(parameters) = &checkpoint.best_parameters else {
-        return Ok(None);
-    };
-    validate_parameter_vector(parameters, "best parameters")?;
-    let optimizer_lineage = checkpoint
-        .best_optimizer_lineage
-        .and_then(NonZeroU64::new)
-        .ok_or(ImitationError::CheckpointState("best optimizer lineage"))?;
-    let policy = checkpoint
-        .best_model_identity
-        .ok_or(ImitationError::CheckpointState("best model identity"))?;
-    let adam = AdamState::from_parts(
-        checkpoint.adam_config,
-        checkpoint
-            .best_first_moment
-            .clone()
-            .ok_or(ImitationError::CheckpointState("best first moment"))?,
-        checkpoint
-            .best_second_moment
-            .clone()
-            .ok_or(ImitationError::CheckpointState("best second moment"))?,
-        checkpoint
-            .best_adam_step
-            .ok_or(ImitationError::CheckpointState("best Adam step"))?,
-        crate::OptimizerBinding {
-            lineage: optimizer_lineage,
-            policy,
-        },
-    )?;
-    let counters = checkpoint
-        .best_counters
-        .ok_or(ImitationError::CheckpointState("best counters"))?;
-    if counters.epoch > MAX_TRAINING_COUNTER
-        || counters.global_update > MAX_TRAINING_COUNTER
-        || adam.step() != counters.global_update
-        || counters.epoch > counters.global_update
-        || counters.epoch > checkpoint.epoch
-        || counters.global_update > checkpoint.global_update
-        || adam.step() > checkpoint.adam_step
-    {
-        return Err(ImitationError::CheckpointState("best counter relationship"));
-    }
-    if checkpoint.best_epoch != Some(counters.epoch) {
-        return Err(ImitationError::CheckpointState(
-            "best epoch snapshot relationship",
-        ));
-    }
-    let shuffle = ShuffleState {
-        state: checkpoint
-            .best_shuffle_state
-            .ok_or(ImitationError::CheckpointState("best shuffle state"))?,
-        draws: checkpoint
-            .best_shuffle_draws
-            .ok_or(ImitationError::CheckpointState("best shuffle draws"))?,
-    };
-    if shuffle.draws > MAX_TRAINING_COUNTER {
-        return Err(ImitationError::CheckpointState("best shuffle draw counter"));
-    }
-    if shuffle.draws > checkpoint.shuffle_draws {
-        return Err(ImitationError::CheckpointState(
-            "best shuffle draw relationship",
-        ));
-    }
-    Ok(Some(CompleteTrainingState {
-        model: ModelAdamSnapshot {
-            parameters: parameters.clone(),
-            adam,
-        },
-        counters,
-        shuffle,
-    }))
-}
-
 fn validate_scope(scope: TrainingScope) -> Result<(), ImitationError> {
     if scope.hero != SHADOW_FIEND || scope.rules_audit_version != IMITATION_RULES_AUDIT_VERSION {
         return Err(ImitationError::CheckpointState("training scope"));
@@ -3611,20 +3088,6 @@ fn validate_imitation_pool_capacity(capacity: usize) -> Result<(), ImitationErro
             value: capacity,
             maximum: MAX_IMITATION_SAMPLES,
         });
-    }
-    Ok(())
-}
-
-fn precheck_vector_length(values: &[f32], field: &'static str) -> Result<(), ImitationError> {
-    if values.len() != MODEL_PARAMETER_COUNT {
-        return Err(ImitationError::CheckpointState(field));
-    }
-    Ok(())
-}
-
-fn validate_parameter_vector(values: &[f32], field: &'static str) -> Result<(), ImitationError> {
-    if values.len() != MODEL_PARAMETER_COUNT || values.iter().any(|value| !value.is_finite()) {
-        return Err(ImitationError::CheckpointState(field));
     }
     Ok(())
 }

@@ -9,20 +9,19 @@ use super::feature::{encode, tracker_with_view, world_view};
 use crate::model::{DecoderLogits, decode_with_logits};
 use crate::{
     ACTION_SCHEMA_HASH, ACTION_SCHEMA_VERSION, ActionKind, ActionSpace, AdamConfig,
-    BehavioralTarget, BehavioralTrainer, DaggerStatistics, EarlyStoppingConfig, FeatureFrame,
-    ImitationPool, ImitationSample, ImitationSide, ImitationSplit, ItemReadiness,
-    LearnerMatchOutcome, LearnerTeacherResult, LocalPolicyState, MAX_IMITATION_SAMPLES,
-    MAX_SEED_NAMESPACE, MAX_TRAINING_COUNTER, MODEL_PARAMETER_COUNT, OfflineEvaluation,
-    OrderPersistence, PairedGameplayReport, PairedSeedResult, PolicyModel, PromotionGateInput,
-    RolloutAudit, SampleIdentity, SeedNamespace, SeedNamespaces, ShuffleState, StateTracker,
-    StructuredAction, Teacher, TeacherCoverage, TrainingCheckpoint, TrainingScope,
+    BehavioralTarget, BehavioralTrainer, DaggerStatistics, FeatureFrame, ImitationPool,
+    ImitationSample, ImitationSide, ImitationSplit, ItemReadiness, LearnerMatchOutcome,
+    LearnerTeacherResult, LocalPolicyState, MAX_IMITATION_SAMPLES, MAX_SEED_NAMESPACE,
+    MAX_TRAINING_COUNTER, MODEL_PARAMETER_COUNT, OfflineEvaluation, OrderPersistence,
+    PairedGameplayReport, PairedSeedResult, PolicyModel, PromotionGateInput, RolloutAudit,
+    SampleIdentity, SeedNamespace, SeedNamespaces, ShuffleState, StateTracker, StructuredAction,
+    Teacher, TeacherCoverage, TrainingScope,
 };
 
 #[test]
 fn action_and_training_schema_identities_are_stable() {
     assert_eq!(ACTION_SCHEMA_VERSION, 2);
     assert_eq!(ACTION_SCHEMA_HASH, 1_018_254_919_734_743_331);
-    assert_eq!(crate::IMITATION_OPTIMIZER_VERSION, 2);
     assert_eq!(crate::IMITATION_RULES_AUDIT_VERSION, 12);
 }
 
@@ -478,15 +477,11 @@ fn trainer_rebinds_after_same_lineage_pool_revision_without_resetting_state() {
         ))
         .expect("first sample");
     let model = PolicyModel::fresh(16).expect("model");
-    let mut trainer = make_trainer(2, 17, &model, 2, &imitation_pool);
+    let mut trainer = make_trainer(2, 17, &model, &imitation_pool);
     trainer
         .train_epoch(&model, &imitation_pool)
         .expect("initial epoch");
-    trainer.observe_gameplay(1.0, &model).expect("best state");
-    let old_checkpoint =
-        TrainingCheckpoint::capture(&model, &trainer, &imitation_pool).expect("old checkpoint");
-    let counters = trainer.counters();
-    let adam = trainer.adam().clone();
+    let before = observe_trainer(&model, &trainer);
     imitation_pool
         .push(sample(
             ImitationSplit::Train,
@@ -502,30 +497,17 @@ fn trainer_rebinds_after_same_lineage_pool_revision_without_resetting_state() {
             .to_string(),
         "imitation trainer pool lineage, revision, scope, or seeds do not match"
     );
+    assert_eq!(observe_trainer(&model, &trainer), before);
     trainer
         .rebind_pool(&imitation_pool)
         .expect("same lineage rebind");
-    assert_eq!(trainer.counters(), counters);
-    assert_eq!(trainer.adam(), &adam);
-    let before_old_restore =
-        TrainingCheckpoint::capture(&model, &trainer, &imitation_pool).expect("before old restore");
-    assert!(
-        old_checkpoint
-            .restore(&model, &mut trainer, &imitation_pool)
-            .is_err()
-    );
-    assert_eq!(
-        TrainingCheckpoint::capture(&model, &trainer, &imitation_pool).expect("after old restore"),
-        before_old_restore
-    );
+    let mut expected = before;
+    expected.orchestration.1 = imitation_pool.binding().clone();
+    assert_eq!(observe_trainer(&model, &trainer), expected);
     let report = trainer
         .train_epoch(&model, &imitation_pool)
         .expect("rebound epoch");
     assert_eq!(report.order.len(), 2);
-    trainer.restore_best(&model).expect("best after rebind");
-    assert_eq!(trainer.counters(), counters);
-    TrainingCheckpoint::capture(&model, &trainer, &imitation_pool)
-        .expect("best state keeps current pool binding");
 
     let mut duplicate_lineage = pool(2, 116);
     duplicate_lineage
@@ -536,16 +518,20 @@ fn trainer_rebinds_after_same_lineage_pool_revision_without_resetting_state() {
             3,
         ))
         .expect("duplicate-lineage sample");
-    let before_rejected_rebind = TrainingCheckpoint::capture(&model, &trainer, &imitation_pool)
-        .expect("before rejected rebind");
-    assert!(trainer.rebind_pool(&duplicate_lineage).is_err());
-    let other = pool(2, 117);
-    assert!(trainer.rebind_pool(&other).is_err());
+    let before_rejected_rebind = observe_trainer(&model, &trainer);
     assert_eq!(
-        TrainingCheckpoint::capture(&model, &trainer, &imitation_pool)
-            .expect("after rejected rebind"),
-        before_rejected_rebind
+        trainer
+            .rebind_pool(&duplicate_lineage)
+            .unwrap_err()
+            .to_string(),
+        "imitation trainer pool lineage, revision, scope, or seeds do not match"
     );
+    let other = pool(2, 117);
+    assert_eq!(
+        trainer.rebind_pool(&other).unwrap_err().to_string(),
+        "imitation trainer pool lineage, revision, scope, or seeds do not match"
+    );
+    assert_eq!(observe_trainer(&model, &trainer), before_rejected_rebind);
 }
 
 #[test]
@@ -560,23 +546,10 @@ fn second_trainer_owner_is_rejected_and_raw_import_invalidates_first_owner() {
         ))
         .expect("sample");
     let model = PolicyModel::fresh(18).expect("model");
-    let mut first = make_trainer(1, 1, &model, 2, &imitation_pool);
+    let mut first = make_trainer(1, 1, &model, &imitation_pool);
     let identity = model.policy_identity().expect("identity");
     let parameters_before_second = model.export_parameters().expect("before second owner");
-    assert!(
-        BehavioralTrainer::new(
-            1,
-            2,
-            AdamConfig::default(),
-            EarlyStoppingConfig {
-                minimum_improvement: 0.0,
-                patience: 2,
-            },
-            &model,
-            &imitation_pool,
-        )
-        .is_err()
-    );
+    assert!(BehavioralTrainer::new(1, 2, AdamConfig::default(), &model, &imitation_pool).is_err());
     assert_eq!(
         model.policy_identity().expect("after second owner"),
         identity
@@ -597,7 +570,7 @@ fn second_trainer_owner_is_rejected_and_raw_import_invalidates_first_owner() {
     );
     assert_eq!(first.adam(), &adam_before);
     assert_eq!(first.counters(), counters_before);
-    make_trainer(1, 3, &model, 2, &imitation_pool);
+    make_trainer(1, 3, &model, &imitation_pool);
 }
 
 #[test]
@@ -881,7 +854,7 @@ fn promotion_rejects_different_and_stale_policy_evidence() {
             1,
         ))
         .expect("training sample");
-    let mut trainer = make_trainer(1, 4, &model, 2, &training_pool);
+    let mut trainer = make_trainer(1, 4, &model, &training_pool);
     trainer
         .train_epoch(&model, &training_pool)
         .expect("model update");
@@ -896,7 +869,7 @@ fn promotion_rejects_different_and_stale_policy_evidence() {
 }
 
 #[test]
-fn later_batch_failure_rolls_back_model_adam_counters_shuffle_and_early_state() {
+fn later_batch_failure_rolls_back_model_adam_counters_shuffle_and_pool() {
     let mut pool = pool(3, 103);
     for ordinal in 0..3 {
         pool.push(sample(
@@ -907,16 +880,36 @@ fn later_batch_failure_rolls_back_model_adam_counters_shuffle_and_early_state() 
         ))
         .expect("sample");
     }
-    let model = PolicyModel::fresh(4).expect("model");
-    let mut trainer = make_trainer(2, 9, &model, 2, &pool);
-    let before = TrainingCheckpoint::capture(&model, &trainer, &pool).expect("before");
-    assert!(
+    let model = zero_model(4);
+    let mut trainer = make_trainer(2, 9, &model, &pool);
+    trainer.train_epoch(&model, &pool).expect("warmup");
+    let baseline_model = zero_model(5);
+    let mut baseline = make_trainer(2, 9, &baseline_model, &pool);
+    baseline
+        .train_epoch(&baseline_model, &pool)
+        .expect("baseline warmup");
+    let before = observe_trainer(&model, &trainer);
+    assert_eq!(
         trainer
             .train_epoch_with_failure(&model, &pool, 1, false)
-            .is_err()
+            .unwrap_err()
+            .to_string(),
+        "imitation injected epoch failure before update 1"
     );
-    let after = TrainingCheckpoint::capture(&model, &trainer, &pool).expect("after");
-    assert_checkpoint_state_eq_after_reinstall(&after, &before);
+    let after = observe_trainer(&model, &trainer);
+    assert_trainer_state_eq_after_rollback(&after, &before);
+    let retry = trainer.train_epoch(&model, &pool).expect("retry");
+    let uninterrupted = baseline
+        .train_epoch(&baseline_model, &pool)
+        .expect("uninterrupted");
+    assert_eq!(retry, uninterrupted);
+    assert_adam_values_eq(trainer.adam(), baseline.adam());
+    assert_eq!(
+        model.export_parameters().expect("retry parameters"),
+        baseline_model
+            .export_parameters()
+            .expect("baseline parameters")
+    );
 }
 
 #[test]
@@ -932,13 +925,15 @@ fn rollback_failure_returns_combined_exact_error() {
         .expect("sample");
     }
     let model = PolicyModel::fresh(5).expect("model");
-    let mut trainer = make_trainer(1, 10, &model, 2, &pool);
+    let mut trainer = make_trainer(1, 10, &model, &pool);
     let error = trainer
         .train_epoch_with_failure(&model, &pool, 1, true)
         .unwrap_err()
         .to_string();
-    assert!(error.contains("imitation epoch failed"));
-    assert!(error.contains("rollback failed"));
+    assert_eq!(
+        error,
+        "imitation epoch failed (imitation injected epoch failure before update 1); rollback failed (imitation model operation failed: model injected parameter replacement failure after tensor 0)"
+    );
 }
 
 #[test]
@@ -954,12 +949,15 @@ fn shuffle_overflow_and_pool_revision_mismatch_are_failure_atomic() {
         .expect("sample");
     }
     let model = PolicyModel::fresh(6).expect("model");
-    let mut trainer = make_trainer(2, 11, &model, 2, &pool);
+    let mut trainer = make_trainer(2, 11, &model, &pool);
     trainer.set_shuffle_draws_for_test(MAX_TRAINING_COUNTER);
-    let before = TrainingCheckpoint::capture(&model, &trainer, &pool).expect("before");
-    assert!(trainer.train_epoch(&model, &pool).is_err());
-    let after = TrainingCheckpoint::capture(&model, &trainer, &pool).expect("after");
-    assert_checkpoint_state_eq_after_reinstall(&after, &before);
+    let before = observe_trainer(&model, &trainer);
+    assert_eq!(
+        trainer.train_epoch(&model, &pool).unwrap_err().to_string(),
+        "imitation shuffle draw counter exceeds maximum 1000000000"
+    );
+    let after = observe_trainer(&model, &trainer);
+    assert_trainer_state_eq_after_rollback(&after, &before);
     pool.push(sample(
         ImitationSplit::Train,
         ImitationSide::Dire,
@@ -971,6 +969,7 @@ fn shuffle_overflow_and_pool_revision_mismatch_are_failure_atomic() {
         trainer.train_epoch(&model, &pool).unwrap_err().to_string(),
         "imitation trainer pool lineage, revision, scope, or seeds do not match"
     );
+    assert_eq!(observe_trainer(&model, &trainer), after);
 }
 
 #[test]
@@ -984,178 +983,20 @@ fn epoch_and_global_update_counter_overflow_rolls_back_exactly() {
     ))
     .expect("sample");
     let model = PolicyModel::fresh(60).expect("model");
-    let mut trainer = make_trainer(1, 1, &model, 2, &pool);
+    let mut trainer = make_trainer(1, 1, &model, &pool);
     trainer
         .set_counters_for_test(crate::TrainerCounters {
             epoch: MAX_TRAINING_COUNTER,
             global_update: MAX_TRAINING_COUNTER,
         })
         .expect("counters");
-    let before = TrainingCheckpoint::capture(&model, &trainer, &pool).expect("before");
-    assert!(trainer.train_epoch(&model, &pool).is_err());
-    let after = TrainingCheckpoint::capture(&model, &trainer, &pool).expect("after");
-    assert_checkpoint_state_eq_after_reinstall(&after, &before);
-}
-
-#[test]
-fn early_stopping_is_monotonic_sticky_and_restores_complete_state() {
-    let mut pool = pool(1, 106);
-    pool.push(sample(
-        ImitationSplit::Train,
-        ImitationSide::Radiant,
-        ActionKind::Continue,
-        1,
-    ))
-    .expect("sample");
-    let model = PolicyModel::fresh(7).expect("model");
-    let mut trainer = make_trainer(1, 12, &model, 1, &pool);
-    trainer.train_epoch(&model, &pool).expect("epoch one");
-    trainer.observe_gameplay(2.0, &model).expect("best");
-    let best_checkpoint = TrainingCheckpoint::capture(&model, &trainer, &pool).expect("best");
-    let mut invalid_best = best_checkpoint.clone();
-    invalid_best
-        .best_second_moment
-        .as_mut()
-        .expect("best moment")[0] = f32::NAN;
-    assert_checkpoint_rejected_unchanged(&invalid_best, &pool);
-    let mut invalid_best_owner = best_checkpoint.clone();
-    invalid_best_owner.best_optimizer_lineage = Some(0);
-    assert_checkpoint_rejected_unchanged(&invalid_best_owner, &pool);
-    let mut future_best = best_checkpoint.clone();
-    future_best.best_adam_step = Some(2);
-    future_best.best_counters = Some(crate::TrainerCounters {
-        epoch: 1,
-        global_update: 2,
-    });
-    assert_checkpoint_rejected_unchanged(&future_best, &pool);
-    assert!(trainer.observe_gameplay(1.0, &model).is_err());
-    trainer.train_epoch(&model, &pool).expect("epoch two");
-    assert!(trainer.observe_gameplay(1.0, &model).expect("stop"));
-    let stopped = TrainingCheckpoint::capture(&model, &trainer, &pool).expect("stopped");
-    let mut invalid_history = stopped.clone();
-    invalid_history.last_evaluation_epoch = invalid_history.best_epoch;
-    assert_checkpoint_rejected_unchanged(&invalid_history, &pool);
-    let mut future_shuffle = best_checkpoint.clone();
-    future_shuffle.best_shuffle_draws = Some(future_shuffle.shuffle_draws + 1);
-    assert_checkpoint_rejected_unchanged(&future_shuffle, &pool);
-    assert!(trainer.observe_gameplay(3.0, &model).expect("sticky"));
+    let before = observe_trainer(&model, &trainer);
     assert_eq!(
-        TrainingCheckpoint::capture(&model, &trainer, &pool).expect("same"),
-        stopped
+        trainer.train_epoch(&model, &pool).unwrap_err().to_string(),
+        "imitation global update counter exceeds maximum 1000000000"
     );
-    trainer.restore_best(&model).expect("restore");
-    assert_eq!(trainer.counters().epoch, 1);
-    assert_eq!(trainer.adam().step(), 1);
-    assert_eq!(
-        trainer.model_identity(),
-        model.policy_identity().expect("restored identity")
-    );
-    assert_eq!(trainer.adam().policy_identity(), trainer.model_identity());
-    let baseline_model = PolicyModel::fresh(70).expect("baseline model");
-    let mut baseline = make_trainer(1, 1, &baseline_model, 1, &pool);
-    best_checkpoint
-        .restore(&baseline_model, &mut baseline, &pool)
-        .expect("baseline restore");
-    let restored_report = trainer
-        .train_epoch(&model, &pool)
-        .expect("restored continuation");
-    let baseline_report = baseline
-        .train_epoch(&baseline_model, &pool)
-        .expect("baseline continuation");
-    assert_eq!(restored_report, baseline_report);
-    assert_adam_values_eq(trainer.adam(), baseline.adam());
-    assert_eq!(
-        model.export_parameters().expect("restored parameters"),
-        baseline_model
-            .export_parameters()
-            .expect("baseline parameters")
-    );
-}
-
-#[test]
-fn checkpoint_resume_and_best_restore_continue_byte_exactly() {
-    let mut pool = pool(2, 107);
-    for ordinal in 0..2 {
-        pool.push(sample(
-            ImitationSplit::Train,
-            ImitationSide::Radiant,
-            ActionKind::Continue,
-            ordinal,
-        ))
-        .expect("sample");
-    }
-    let model = zero_model(8);
-    let mut source_trainer = make_trainer(2, 13, &model, 3, &pool);
-    source_trainer.train_epoch(&model, &pool).expect("warmup");
-    source_trainer.observe_gameplay(1.0, &model).expect("best");
-    let checkpoint =
-        TrainingCheckpoint::capture(&model, &source_trainer, &pool).expect("checkpoint");
-    let expected = source_trainer.train_epoch(&model, &pool).expect("expected");
-    let restored_model = PolicyModel::fresh(999).expect("restored model");
-    let mut restored = make_trainer(1, 1, &restored_model, 3, &pool);
-    let identity_before_restore = restored_model.policy_identity().expect("before restore");
-    checkpoint
-        .restore(&restored_model, &mut restored, &pool)
-        .expect("restore");
-    let identity_after_restore = restored_model.policy_identity().expect("after restore");
-    assert_eq!(
-        identity_after_restore.lineage(),
-        identity_before_restore.lineage()
-    );
-    assert!(identity_after_restore.revision() > identity_before_restore.revision());
-    assert_ne!(identity_after_restore, checkpoint.model_identity);
-    assert_eq!(restored.model_identity(), identity_after_restore);
-    assert_eq!(restored.adam().policy_identity(), identity_after_restore);
-    let actual = restored
-        .train_epoch(&restored_model, &pool)
-        .expect("actual");
-    assert_eq!(actual, expected);
-    assert_adam_values_eq(restored.adam(), source_trainer.adam());
-    assert_eq!(
-        restored_model
-            .export_parameters()
-            .expect("actual parameters"),
-        model.export_parameters().expect("expected parameters")
-    );
-}
-
-#[test]
-fn checkpoint_matrix_rejects_schema_nan_moment_counter_and_pool_without_mutation() {
-    let mut source_pool = pool(1, 108);
-    source_pool
-        .push(sample(
-            ImitationSplit::Train,
-            ImitationSide::Radiant,
-            ActionKind::Continue,
-            1,
-        ))
-        .expect("sample");
-    let source = PolicyModel::fresh(9).expect("source");
-    let source_trainer = make_trainer(1, 14, &source, 2, &source_pool);
-    let checkpoint =
-        TrainingCheckpoint::capture(&source, &source_trainer, &source_pool).expect("checkpoint");
-    for mutation in 0..12 {
-        let mut invalid = checkpoint.clone();
-        match mutation {
-            0 => invalid.action_schema_hash ^= 1,
-            1 => invalid.parameters[0] = f32::NAN,
-            2 => invalid.first_moment[0] = f32::NAN,
-            3 => {
-                invalid.first_moment.pop();
-            }
-            4 => invalid.global_update = 1,
-            5 => invalid.second_moment[0] = f32::NAN,
-            6 => invalid.last_evaluation_epoch = Some(0),
-            7 => invalid.stopped = true,
-            8 => invalid.model_schema_version ^= 1,
-            9 => invalid.feature_schema_version ^= 1,
-            10 => invalid.optimizer_version ^= 1,
-            _ => invalid.optimizer_lineage = 0,
-        }
-        assert_checkpoint_rejected_unchanged(&invalid, &source_pool);
-    }
-    let other = pool(1, 109);
-    assert_checkpoint_rejected_unchanged(&checkpoint, &other);
+    let after = observe_trainer(&model, &trainer);
+    assert_trainer_state_eq_after_rollback(&after, &before);
 }
 
 #[test]
@@ -1192,7 +1033,7 @@ fn tiny_repeated_bc_batch_reduces_loss_and_tracks_dagger_counts() {
         }
     );
     let model = zero_model(10);
-    let mut trainer = make_trainer(2, 15, &model, 3, &pool);
+    let mut trainer = make_trainer(2, 15, &model, &pool);
     let first = trainer.train_epoch(&model, &pool).expect("first");
     let second = trainer.train_epoch(&model, &pool).expect("second");
     assert!(second.average_loss < first.average_loss);
@@ -1293,29 +1134,39 @@ fn paired_results(
         .collect()
 }
 
-fn assert_checkpoint_rejected_unchanged(checkpoint: &TrainingCheckpoint, pool: &ImitationPool) {
-    let model = PolicyModel::fresh(300).expect("model");
-    let mut trainer = make_trainer(1, 1, &model, 2, pool);
-    let before = TrainingCheckpoint::capture(&model, &trainer, pool).expect("before");
-    assert!(checkpoint.restore(&model, &mut trainer, pool).is_err());
-    assert_eq!(
-        TrainingCheckpoint::capture(&model, &trainer, pool).expect("after"),
-        before
-    );
+#[derive(Debug, PartialEq)]
+struct TrainerObservation {
+    parameters: Vec<f32>,
+    adam: crate::AdamState,
+    counters: crate::TrainerCounters,
+    model_identity: crate::PolicyIdentity,
+    orchestration: (ShuffleState, crate::PoolBinding),
 }
 
-fn assert_checkpoint_state_eq_after_reinstall(
-    after: &TrainingCheckpoint,
-    before: &TrainingCheckpoint,
-) {
+fn observe_trainer(model: &PolicyModel, trainer: &BehavioralTrainer) -> TrainerObservation {
+    let model_identity = model.policy_identity().expect("identity");
+    assert_eq!(trainer.model_identity(), model_identity);
+    assert_eq!(trainer.adam().policy_identity(), model_identity);
+    TrainerObservation {
+        parameters: model.export_parameters().expect("parameters"),
+        adam: trainer.adam().clone(),
+        counters: trainer.counters(),
+        model_identity,
+        orchestration: trainer.orchestration_state_for_test(),
+    }
+}
+
+fn assert_trainer_state_eq_after_rollback(after: &TrainerObservation, before: &TrainerObservation) {
     assert_eq!(
         after.model_identity.lineage(),
         before.model_identity.lineage()
     );
     assert!(after.model_identity.revision() > before.model_identity.revision());
-    let mut normalized = after.clone();
-    normalized.model_identity = before.model_identity;
-    assert_eq!(&normalized, before);
+    assert_eq!(after.parameters, before.parameters);
+    assert_adam_values_eq(&after.adam, &before.adam);
+    assert_eq!(after.adam.binding().lineage, before.adam.binding().lineage);
+    assert_eq!(after.counters, before.counters);
+    assert_eq!(after.orchestration, before.orchestration);
 }
 
 fn assert_adam_values_eq(left: &crate::AdamState, right: &crate::AdamState) {
@@ -1328,21 +1179,9 @@ fn make_trainer(
     batch: usize,
     shuffle: u64,
     model: &PolicyModel,
-    patience: u32,
     pool: &ImitationPool,
 ) -> BehavioralTrainer {
-    BehavioralTrainer::new(
-        batch,
-        shuffle,
-        AdamConfig::default(),
-        EarlyStoppingConfig {
-            minimum_improvement: 0.0,
-            patience,
-        },
-        model,
-        pool,
-    )
-    .expect("trainer")
+    BehavioralTrainer::new(batch, shuffle, AdamConfig::default(), model, pool).expect("trainer")
 }
 
 fn pool(capacity: usize, lineage: u64) -> ImitationPool {
