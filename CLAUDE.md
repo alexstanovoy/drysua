@@ -17,12 +17,22 @@ plan and architecture decisions live in `docs/plan.md`.
 
 ## Checks
 
+Use targeted release tests during development and one release suite before committing.
+Do not run debug tests or repeat feature matrices without a specific reason. Use default
+Cargo build and test parallelism; fix shared-state races instead of serializing the suite.
+
 ```text
 cargo fmt
 cargo clippy --all-targets --all-features -- -D warnings
-cargo test --all-targets --all-features
-cargo test --release --all-targets --all-features
-cargo test --all-targets --no-default-features
-cargo test --release --all-targets --no-default-features
+cargo test --release --all-targets --all-features --quiet
 cargo machete
 ```
+
+## Simplicity
+
+- Reconsider optional machinery, duplicate paths, and designs based on weak assumptions
+  as soon as they are noticed. Delete or simplify when evidence supports it; leave uncertain
+  cases unchanged rather than replacing them with another speculative abstraction.
+- Preserve correctness checks, seat-data boundaries, and reproducibility when simplifying.
+- Keep all experiment artifacts under `artifacts/temp/`; release artifacts use
+  `artifacts/vX.Y.Z/`. Stop and report before long release training.

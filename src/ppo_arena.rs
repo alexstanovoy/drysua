@@ -1822,7 +1822,6 @@ where
         initial_weights_directory,
         config,
         run,
-        capacity,
     )?;
     let start = session.completed_updates;
     if start > settings.updates {
@@ -1856,8 +1855,6 @@ where
 struct TrainingSession {
     model: PolicyModel,
     trainer: PpoTrainer,
-    pipeline: ActorLearnerPipeline,
-    actor: crate::ActorRolloutSender,
     sampling: PpoRng,
     run: CheckpointRun,
     completed_updates: u64,
@@ -1873,7 +1870,6 @@ struct TrainingSession {
 }
 
 impl TrainingSession {
-    #[allow(clippy::too_many_arguments)]
     fn initialize(
         settings: &TrainingJobConfig,
         device: PolicyDevice,
@@ -1882,51 +1878,25 @@ impl TrainingSession {
         initial_weights_directory: Option<&Path>,
         config: PpoConfig,
         run: CheckpointRun,
-        capacity: usize,
     ) -> Result<Self, PpoError> {
         let model = PolicyModel::fresh_on(settings.seed, device).map_err(model_error)?;
         if !resume && let Some(initial_weights_directory) = initial_weights_directory {
             TrainingArtifact::load_runtime_weights(&model, initial_weights_directory)
                 .map_err(checkpoint_error)?;
         }
-        let (
-            trainer,
-            mut pipeline,
-            sampling,
-            completed_updates,
-            rollout_samples,
-            migrated_provenance,
-        ) = if resume {
-            restore_training_session(
-                &model,
-                directory,
-                &run,
-                config,
-                capacity,
-                settings.resume_provenance,
-            )?
+        let (trainer, sampling, completed_updates, rollout_samples, migrated_provenance) = if resume
+        {
+            restore_training_session(&model, directory, &run, config, settings.resume_provenance)?
         } else {
             let trainer = PpoTrainer::new(&model, config, settings.seed ^ 0x51a9)?;
-            let pipeline =
-                ActorLearnerPipeline::new(capacity, 1, &model).map_err(pipeline_error)?;
-            (
-                trainer,
-                pipeline,
-                PpoRng::new(settings.seed ^ 0xa17e),
-                0,
-                0,
-                false,
-            )
+            (trainer, PpoRng::new(settings.seed ^ 0xa17e), 0, 0, false)
         };
         let starting_policy_fingerprint = PolicySnapshot::capture(&model, completed_updates)
             .map_err(league_error)?
             .fingerprint();
-        let actor = pipeline.take_actor(0).map_err(pipeline_error)?;
         Ok(Self {
             model,
             trainer,
-            pipeline,
-            actor,
             sampling,
             run,
             completed_updates,
@@ -1949,14 +1919,10 @@ impl TrainingSession {
         config: PpoConfig,
         capacity: usize,
     ) -> Result<TrainingCheckpointReport, PpoError> {
-        let (lease, mut rollout) = self.actor.wait_rollout().map_err(pipeline_error)?;
-        if lease.policy().policy_identity().map_err(model_error)?
-            != self.model.policy_identity().map_err(model_error)?
-        {
-            return Err(PpoError::InvalidTransition(
-                "production actor and learner policy identity",
-            ));
-        }
+        assert_eq!(update, self.completed_updates);
+        assert_eq!(self.completed_updates, self.trainer.updates());
+        let mut rollout =
+            PpoRollout::new(capacity, self.model.policy_identity().map_err(model_error)?)?;
         let mut environments = build_training_environments(settings, update, config, &self.model)?;
         let mut actor_report = PpoSmokeReport::default();
         collect_update(
@@ -1988,14 +1954,9 @@ impl TrainingSession {
             .elapsed_ticks
             .checked_add(actor_report.elapsed_ticks)
             .ok_or(PpoError::CounterOverflow)?;
-        lease.try_submit(rollout).map_err(pipeline_error)?;
-        let batch = self
-            .pipeline
-            .accept()
-            .map_err(pipeline_error)?
-            .finish(config)?;
-        self.latest = self.trainer.train_pipeline_update(&self.model, &batch)?;
-        self.pipeline.publish(&self.model).map_err(pipeline_error)?;
+        assert_eq!(rollout.len(), capacity);
+        let batch = rollout.finish(config)?;
+        self.latest = self.trainer.train_update(&self.model, &batch)?;
         self.completed_updates = self.trainer.updates();
         self.rollout_samples = self
             .rollout_samples
@@ -2012,7 +1973,7 @@ impl TrainingSession {
         let (state, draws) = self.sampling.checkpoint();
         let progress = CheckpointProgress {
             global_update: self.completed_updates,
-            policy_version: self.pipeline.version().map_err(pipeline_error)?.get(),
+            policy_version: self.completed_updates,
             scheduler_step: self.completed_updates,
             curriculum_stage: 0,
             rollout_samples: self.rollout_samples,
@@ -2499,9 +2460,8 @@ fn restore_training_session(
     directory: &Path,
     run: &CheckpointRun,
     config: PpoConfig,
-    capacity: usize,
     provenance: ResumeProvenance,
-) -> Result<(PpoTrainer, ActorLearnerPipeline, PpoRng, u64, u64, bool), PpoError> {
+) -> Result<(PpoTrainer, PpoRng, u64, u64, bool), PpoError> {
     let (artifact, restore_run, migrated) = match provenance {
         ResumeProvenance::Strict => (
             TrainingArtifact::load_compatible(directory, run).map_err(checkpoint_error)?,
@@ -2530,13 +2490,9 @@ fn restore_training_session(
     let sampling = restore_sampling_rng(&progress.rng_states)?;
     let completed_updates = progress.global_update;
     let rollout_samples = progress.rollout_samples;
-    let pipeline = restored
-        .pipeline(capacity, 1, model)
-        .map_err(checkpoint_error)?;
     let (trainer, _, _) = restored.into_parts();
     Ok((
         trainer,
-        pipeline,
         sampling,
         completed_updates,
         rollout_samples,

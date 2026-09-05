@@ -966,6 +966,105 @@ fn wall_checkpoint_schedule_uses_fixed_monotonic_deadlines_without_drift() {
 
 #[cfg(feature = "builtin")]
 #[test]
+fn production_training_resume_matches_uninterrupted_parameters_adam_and_rng() {
+    let uninterrupted_directory = training_test_directory("production-uninterrupted");
+    let resumed_directory = training_test_directory("production-resumed");
+    let mut settings = crate::TrainingJobConfig {
+        updates: 2,
+        environments: 2,
+        rollout_decisions: 2,
+        epochs: 1,
+        minibatch: 2,
+        checkpoint_cadence: crate::TrainingCheckpointCadence::Updates(1),
+        resume_provenance: crate::ResumeProvenance::Strict,
+        seed: 23_071,
+        map: bota_proto::MapId(1),
+        git_commit: "test-drysua-commit".to_owned(),
+        simulator_commit: "test-bota-commit".to_owned(),
+    };
+
+    crate::run_training_job_on(
+        settings.clone(),
+        crate::PolicyDevice::Cpu,
+        &uninterrupted_directory,
+        false,
+        |_| {},
+    )
+    .expect("uninterrupted production updates");
+    settings.updates = 1;
+    crate::run_training_job_on(
+        settings.clone(),
+        crate::PolicyDevice::Cpu,
+        &resumed_directory,
+        false,
+        |_| {},
+    )
+    .expect("first production update");
+    settings.updates = 2;
+    crate::run_training_job_on(
+        settings,
+        crate::PolicyDevice::Cpu,
+        &resumed_directory,
+        true,
+        |_| {},
+    )
+    .expect("resumed production update");
+
+    let uninterrupted =
+        crate::TrainingArtifact::load(&uninterrupted_directory).expect("uninterrupted artifact");
+    let resumed = crate::TrainingArtifact::load(&resumed_directory).expect("resumed artifact");
+    assert_eq!(uninterrupted.run(), resumed.run());
+    assert_eq!(uninterrupted.progress(), resumed.progress());
+    assert_eq!(resumed.progress().global_update, 2);
+    assert_eq!(resumed.progress().policy_version, 2);
+    assert_eq!(resumed.progress().rollout_samples, 8);
+    assert_production_artifact_training_state_equal(&uninterrupted, &resumed);
+    std::fs::remove_dir_all(uninterrupted_directory).expect("remove uninterrupted directory");
+    std::fs::remove_dir_all(resumed_directory).expect("remove resumed directory");
+}
+
+#[cfg(feature = "builtin")]
+fn assert_production_artifact_training_state_equal(
+    uninterrupted: &crate::TrainingArtifact,
+    resumed: &crate::TrainingArtifact,
+) {
+    let source = PolicyModel::fresh(23_072).expect("source model");
+    let target = PolicyModel::fresh(23_073).expect("target model");
+    let source_state = uninterrupted
+        .restore(&source, uninterrupted.run())
+        .expect("source restore");
+    let target_state = resumed
+        .restore(&target, resumed.run())
+        .expect("target restore");
+    let source_trainer = source_state.trainer();
+    let target_trainer = target_state.trainer();
+    let source_snapshot = source_trainer
+        .checkpoint_snapshot(&source)
+        .expect("source snapshot");
+    let target_snapshot = target_trainer
+        .checkpoint_snapshot(&target)
+        .expect("target snapshot");
+
+    assert_eq!(source_snapshot.parameters, target_snapshot.parameters);
+    assert_eq!(
+        source_snapshot.adam.moments(),
+        target_snapshot.adam.moments()
+    );
+    assert_eq!(
+        source_trainer.optimizer_step(),
+        target_trainer.optimizer_step()
+    );
+    assert_eq!(source_trainer.updates(), target_trainer.updates());
+    assert_eq!(
+        source_trainer.rng_checkpoint(),
+        target_trainer.rng_checkpoint()
+    );
+    assert!(target_trainer.optimizer_step() > 0);
+    assert!(target_trainer.rng_checkpoint().1 > 0);
+}
+
+#[cfg(feature = "builtin")]
+#[test]
 fn training_job_checkpoints_and_resumes_from_the_next_update() {
     let directory = training_test_directory("resume");
     let mut settings = crate::TrainingJobConfig {

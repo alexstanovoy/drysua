@@ -1,8 +1,10 @@
 # Training throughput experiments
 
 Production now batches actor sampling and greedy warmup on the learner device.
-Actor collection and optimization remain sequential: the model identity must
-match the frozen rollout lease before collection. Each update derives bounded
+Actor collection and optimization remain sequential: each rollout binds the
+current model identity, which the direct trainer validates before optimization.
+Production does not publish CPU snapshots or send rollouts through loopback channels.
+Each update derives bounded
 per-environment RNG streams from the checkpointed master RNG.
 
 The rollout limit is 2048 decisions per environment, with an unchanged global
