@@ -1,0 +1,58 @@
+{
+  "candidate_tag": "v0.0.4",
+  "candidate_commit": "7a2b758eee4098c646ce6f18e1d13e905b3212c3",
+  "simulator_commit": "18db0f62d9a2b94e755c43fd29a959db204cc20b",
+  "map": 1,
+  "policy": "tactical",
+  "weights": {
+    "path": "artifacts/v0.0.4",
+    "sha256": "bfa19eb4ec2f11fd852f6f6fd6284be84aa0c0dc1b597a52fc00352d64ed5bd1"
+  },
+  "candidate_binary_sha256": "43a69a48ffad67aeebaeadcd3fb1d2f877ef34f0ce54d82f94f9cd16d7a58f9a",
+  "seeds": [
+    9000001,
+    9000002,
+    9000003,
+    9000004,
+    9000005,
+    9000006,
+    9000007,
+    9000008,
+    9000009,
+    9000010
+  ],
+  "sides_per_seed": 2,
+  "tick_limit": 30000,
+  "process_timeout_seconds": 90,
+  "passed": true,
+  "gate": {
+    "passed": true,
+    "opponents": {
+      "v0.0.1": {
+        "games": 20,
+        "wins": 19,
+        "passed": true
+      },
+      "v0.0.2": {
+        "games": 20,
+        "wins": 18,
+        "passed": true
+      },
+      "v0.0.3": {
+        "games": 20,
+        "wins": 14,
+        "passed": true
+      }
+    },
+    "errors": []
+  },
+  "clean_source": true,
+  "exact_frozen_v1_results_and_client_summaries_reproduced": true,
+  "local_full_report": "artifacts/temp/v0.0.4-final-clean/report.json",
+  "full_report_sha256": "c47bea3dbea98d9a4a5f47b43a2d1ae7695cc89a7e4b7519b6efea8690b2843a",
+  "errors": [],
+  "rejections": 0,
+  "draws": 0,
+  "timeouts": 0,
+  "limitations": "Strict per-opponent majority approved. v0.0.3 is 70%, below 80%; release seeds are reused, not held-out evidence."
+}

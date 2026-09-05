@@ -28,6 +28,17 @@
       "policy": "teacher",
       "simulator_commit": "18db0f62d9a2b94e755c43fd29a959db204cc20b",
       "map": 1
+    },
+    {
+      "tag": "v0.0.4",
+      "commit": "7a2b758eee4098c646ce6f18e1d13e905b3212c3",
+      "policy": "tactical",
+      "weights": {
+        "path": "artifacts/v0.0.4",
+        "sha256": "bfa19eb4ec2f11fd852f6f6fd6284be84aa0c0dc1b597a52fc00352d64ed5bd1"
+      },
+      "simulator_commit": "18db0f62d9a2b94e755c43fd29a959db204cc20b",
+      "map": 1
     }
   ]
 }

@@ -65,3 +65,12 @@ The annotated tag is created only after a clean committed-source build and a
 second complete 60-game gate. That final evidence and the registry entry are
 recorded in the follow-up registration commit, without changing the tagged source
 or its canonical weights. V2 objective-policy experiments are excluded.
+
+Clean release commit `7a2b758eee4098c646ce6f18e1d13e905b3212c3` was rebuilt from
+`git archive` against the pinned simulator and passed the full 60-game schedule
+before annotation. All 60 per-game outcomes and both client summaries exactly
+matched the frozen-source run above. The artifact loaded successfully from the
+committed archive. Final summary: `gate-clean.json`; full local evidence:
+`artifacts/temp/v0.0.4-final-clean/report.json`. Release all-target/all-feature
+Clippy passed with warnings denied; tests passed 473 with 8 ignored. Python gate
+tests passed 37; formatting, dependency audit, and diff checks passed.
