@@ -5,8 +5,8 @@ use std::time::{Duration, Instant};
 use clap::Parser;
 use drysua::{
     TACTICAL_FILE_BYTES, TacticalCohort, TacticalPolicy, TacticalSearchConfig,
-    evaluate_tactical_population, run_tactical_search, save_tactical_archive,
-    tactical_search_founders,
+    evaluate_tactical_population, evaluate_tactical_population_against, run_tactical_search,
+    save_tactical_archive, tactical_search_founders,
 };
 
 #[derive(Parser)]
@@ -37,6 +37,9 @@ struct Arguments {
     /// Validated standalone policy to continue searching, or evaluate with --probe.
     #[arg(long)]
     initial_policy: Option<PathBuf>,
+    /// Immutable V1 opponent artifact; adds its cohort alongside pure Teacher.
+    #[arg(long)]
+    opponent_policy: Option<PathBuf>,
     /// Evaluate founders (or --initial-policy) without running optimization.
     #[arg(long)]
     probe: bool,
@@ -51,6 +54,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(load_policy)
         .transpose()?;
     let settings = TacticalSearchConfig {
+        opponent_policy: arguments
+            .opponent_policy
+            .as_deref()
+            .map(load_policy)
+            .transpose()?,
         population: arguments.population,
         generations: arguments.generations,
         pairs: arguments.pairs,
@@ -67,6 +75,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let started = Instant::now();
     let report = run_tactical_search(&settings, &arguments.output_directory, policy.as_ref())?;
+    println!(
+        "phase=minimum_result selection_minimum_percent={:.3} confirmation_minimum_percent={:?}",
+        report.selection.fitness.minimum_win_percent(),
+        report
+            .confirmation
+            .as_ref()
+            .map(|result| result.fitness.minimum_win_percent())
+    );
     println!(
         "phase=finished generations={} evaluated_games={} deadline={} selection_wins={} selection_games={} win_percent={:.3} paired_sweep_lower_percent={:.3} archive={} elapsed_seconds={:.3}",
         report.completed_generations,
@@ -93,8 +109,18 @@ fn probe(
     );
     let cohort = TacticalCohort::new(settings.seed, settings.pairs, settings.tick_limit)?;
     let started = Instant::now();
-    let evaluations =
-        evaluate_tactical_population(&policies, cohort, settings.workers, settings.wall_time)?;
+    let evaluations = match &settings.opponent_policy {
+        Some(opponent) => evaluate_tactical_population_against(
+            &policies,
+            cohort,
+            opponent,
+            settings.workers,
+            settings.wall_time,
+        )?,
+        None => {
+            evaluate_tactical_population(&policies, cohort, settings.workers, settings.wall_time)?
+        }
+    };
     std::fs::create_dir(output)?;
     for (index, (policy, evaluated)) in policies.iter().zip(&evaluations).enumerate() {
         let label = format!("probe-{index}");
@@ -119,10 +145,18 @@ fn probe(
     }
     println!(
         "phase=probe_finished games={} elapsed_seconds={:.3}",
-        policies.len() * settings.pairs * 2,
+        probe_game_count(&evaluations),
         started.elapsed().as_secs_f64()
     );
     Ok(())
+}
+
+fn probe_game_count(evaluations: &[drysua::TacticalEvaluation]) -> usize {
+    assert!(evaluations.len() <= 24);
+    evaluations
+        .iter()
+        .map(|evaluation| evaluation.games.len())
+        .sum()
 }
 
 fn load_policy(path: &Path) -> Result<TacticalPolicy, Box<dyn std::error::Error>> {
@@ -155,4 +189,20 @@ fn validate_output(output: &Path) -> Result<(), Box<dyn std::error::Error>> {
         return Err("tactical output directory already exists".into());
     }
     Ok(())
+}
+
+#[test]
+fn probe_game_count_includes_both_mixed_opponent_cohorts() {
+    let policy = TacticalPolicy::default();
+    let cohort = TacticalCohort::new(9_203_900, 1, 2).expect("cohort");
+    let evaluations = evaluate_tactical_population_against(
+        std::slice::from_ref(&policy),
+        cohort,
+        &policy,
+        1,
+        Duration::from_secs(30),
+    )
+    .expect("mixed probe");
+    assert_eq!(probe_game_count(&evaluations), 4);
+    assert_eq!(evaluations.len(), 1);
 }

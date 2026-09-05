@@ -42,7 +42,21 @@ pub fn evaluate_tactical_match(
     policy: Option<&TacticalPolicy>,
     settings: TacticalMatchConfig,
 ) -> Result<TacticalMatchReport, TacticalSearchError> {
-    run_match(policy, settings, Instant::now() + Duration::from_secs(30))
+    evaluate_tactical_match_against(policy, None, settings)
+}
+
+/// Evaluates the same deployed tactical path for either seat; no opponent sampling occurs.
+pub fn evaluate_tactical_match_against(
+    policy: Option<&TacticalPolicy>,
+    opponent: Option<&TacticalPolicy>,
+    settings: TacticalMatchConfig,
+) -> Result<TacticalMatchReport, TacticalSearchError> {
+    run_match(
+        policy,
+        opponent,
+        settings,
+        Instant::now() + Duration::from_secs(30),
+    )
 }
 
 /// Runs deterministic elitist population search and atomically archives completed comparisons.
@@ -59,6 +73,10 @@ pub fn run_tactical_search(
         search_config_json(settings).as_bytes(),
     )?;
     let mut budget = SearchBudget::new(settings.wall_time);
+    budget.opponent = settings.opponent_policy.clone();
+    if let Some(opponent) = &budget.opponent {
+        write_new(&output.join("opponent.tactical.bin"), &opponent.to_bytes())?;
+    }
     let selection = TacticalCohort::new(
         settings.selection_seed,
         settings.selection_pairs,
@@ -92,7 +110,13 @@ pub fn run_tactical_search(
             Err(error) => return Err(error),
         }
     }
-    let confirmation = confirm_selection(settings, output, &state.policy, &mut budget)?;
+    let confirmation = confirm_selection(
+        settings,
+        output,
+        &state.policy,
+        &mut budget,
+        &mut state.stopped_for_deadline,
+    )?;
     let report = TacticalSearchReport {
         policy: state.policy,
         selection: state.selection,
@@ -124,6 +148,24 @@ pub fn evaluate_tactical_population(
     evaluate_batch(policies, cohort, workers, &mut SearchBudget::new(wall_time))
 }
 
+/// Adds a fixed immutable neural opponent alongside the pure Teacher cohort.
+pub fn evaluate_tactical_population_against(
+    policies: &[TacticalPolicy],
+    cohort: TacticalCohort,
+    opponent: &TacticalPolicy,
+    workers: usize,
+    wall_time: Duration,
+) -> Result<Vec<TacticalEvaluation>, TacticalSearchError> {
+    if wall_time.is_zero() || wall_time > Duration::from_secs(2_700) {
+        return Err(invalid(
+            "tactical wall time must be positive and at most 2700 seconds",
+        ));
+    }
+    let mut budget = SearchBudget::new(wall_time);
+    budget.opponent = Some(opponent.clone());
+    evaluate_batch(policies, cohort, workers, &mut budget)
+}
+
 /// Initial Teacher-equivalent and constant Fight, Recover, Farm policies for diagnostics.
 pub fn tactical_search_founders() -> [TacticalPolicy; 4] {
     TacticalMode::ALL.map(|mode| {
@@ -141,6 +183,7 @@ pub struct TacticalCohort {
     first_seed: u64,
     pairs: usize,
     tick_limit: u32,
+    opponent_hash: Option<[u8; 32]>,
 }
 
 impl TacticalCohort {
@@ -160,6 +203,7 @@ impl TacticalCohort {
             first_seed,
             pairs,
             tick_limit,
+            opponent_hash: None,
         })
     }
 
@@ -173,9 +217,23 @@ impl TacticalCohort {
         self.tick_limit
     }
 
+    pub fn with_opponent(mut self, opponent: Option<&TacticalPolicy>) -> Self {
+        self.opponent_hash = opponent.map(policy_digest);
+        self
+    }
+
+    pub const fn opponent_count(self) -> usize {
+        if self.opponent_hash.is_some() { 2 } else { 1 }
+    }
+
+    pub const fn game_count(self) -> usize {
+        self.pairs * 2 * self.opponent_count()
+    }
+
     fn match_settings(self, index: usize) -> TacticalMatchConfig {
-        assert!(index < self.pairs * 2);
+        assert!(index < self.game_count());
         assert!(self.pairs <= MAX_PAIRS);
+        let index = index % (self.pairs * 2);
         TacticalMatchConfig {
             seed: self.first_seed + (index / 2) as u64,
             candidate_seat: (index % 2) as u8,
@@ -203,6 +261,7 @@ pub enum TacticalMatchOutcome {
 /// Seat-visible result and deterministic action-path diagnostics, without wall timings.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TacticalMatchReport {
+    pub opponent_hash: Option<[u8; 32]>,
     pub settings: TacticalMatchConfig,
     pub outcome: TacticalMatchOutcome,
     pub ticks: u32,
@@ -225,6 +284,9 @@ pub struct TacticalFitness {
     pub death_margin: i64,
     pub farm_margin: i64,
     pub paired_sweeps: u32,
+    /// Teacher first, optional fixed policy second; each entry is wins/losses/timeouts.
+    pub opponent_results: [[u32; 3]; 2],
+    opponent_sweeps: [u32; 2],
 }
 
 impl TacticalFitness {
@@ -232,11 +294,11 @@ impl TacticalFitness {
         cohort: TacticalCohort,
         games: &[TacticalMatchReport],
     ) -> Result<Self, TacticalSearchError> {
-        if games.len() != cohort.pairs * 2 {
+        if games.len() != cohort.game_count() {
             return Err(message(format!(
                 "tactical cohort has {} games; expected {}",
                 games.len(),
-                cohort.pairs * 2
+                cohort.game_count()
             )));
         }
         let mut output = Self {
@@ -247,51 +309,45 @@ impl TacticalFitness {
             death_margin: 0,
             farm_margin: 0,
             paired_sweeps: 0,
+            opponent_results: [[0; 3]; 2],
+            opponent_sweeps: [0; 2],
         };
         for (index, game) in games.iter().enumerate() {
-            if game.settings != cohort.match_settings(index) {
-                return Err(invalid(
-                    "tactical cohort games must match each paired seed and both seats in order",
-                ));
-            }
-            if game.rejections != [0, 0] {
-                return Err(invalid(
-                    "tactical fitness requires zero rejected orders from both seats",
-                ));
-            }
-            if !(2..=cohort.tick_limit).contains(&game.ticks)
-                || (game.outcome == TacticalMatchOutcome::Timeout)
-                    != (game.ticks == cohort.tick_limit)
-            {
-                return Err(invalid(
-                    "tactical outcome must agree with the deployment tick-limit boundary",
-                ));
-            }
+            let opponent = validate_fitness_game(cohort, index, game)?;
             match game.outcome {
                 TacticalMatchOutcome::Win => output.wins += 1,
                 TacticalMatchOutcome::Loss => output.losses += 1,
                 TacticalMatchOutcome::Timeout => output.timeouts += 1,
             }
+            let outcome = match game.outcome {
+                TacticalMatchOutcome::Win => 0,
+                TacticalMatchOutcome::Loss => 1,
+                TacticalMatchOutcome::Timeout => 2,
+            };
+            output.opponent_results[opponent][outcome] += 1;
             let summary = game.final_summary;
             output.death_margin += difference(summary.enemy.deaths, summary.allied.deaths, 2);
             output.farm_margin +=
                 difference(summary.allied.last_hits, summary.enemy.last_hits, 500);
             output.farm_margin += difference(summary.allied.denies, summary.enemy.denies, 100);
         }
-        output.paired_sweeps = games
-            .as_chunks::<2>()
-            .0
-            .iter()
-            .filter(|pair| {
-                pair.iter()
-                    .all(|game| game.outcome == TacticalMatchOutcome::Win)
-            })
-            .count() as u32;
+        for (index, opponent_games) in games.chunks(cohort.pairs * 2).enumerate() {
+            output.opponent_sweeps[index] = opponent_games
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .filter(|pair| {
+                    pair.iter()
+                        .all(|game| game.outcome == TacticalMatchOutcome::Win)
+                })
+                .count() as u32;
+        }
+        output.paired_sweeps = output.opponent_sweeps.iter().sum();
         assert_eq!(
             output.wins + output.losses + output.timeouts,
             games.len() as u32
         );
-        assert!(output.paired_sweeps <= cohort.pairs as u32);
+        assert!(output.paired_sweeps <= (cohort.pairs * cohort.opponent_count()) as u32);
         Ok(output)
     }
 
@@ -306,7 +362,19 @@ impl TacticalFitness {
 
     /// Observed development rate, not a release approval or confidence guarantee.
     pub fn win_percent(&self) -> f64 {
-        f64::from(self.wins) * 100.0 / (self.cohort.pairs * 2) as f64
+        f64::from(self.wins) * 100.0 / self.cohort.game_count() as f64
+    }
+
+    pub fn minimum_win_percent(&self) -> f64 {
+        f64::from(self.minimum_wins()) * 100.0 / (self.cohort.pairs * 2) as f64
+    }
+
+    fn minimum_wins(&self) -> u32 {
+        self.opponent_results[..self.cohort.opponent_count()]
+            .iter()
+            .map(|result| result[0])
+            .min()
+            .expect("nonempty opponents")
     }
 
     /// Wilson 95% lower limit for sweeping a seed pair; does not treat seats as independent.
@@ -314,7 +382,12 @@ impl TacticalFitness {
     /// Adaptive selection invalidates nominal coverage; this diagnostic is not certification.
     pub fn paired_sweep_lower_percent(&self) -> f64 {
         let count = self.cohort.pairs as f64;
-        let proportion = f64::from(self.paired_sweeps) / count;
+        let sweeps = self.opponent_sweeps[..self.cohort.opponent_count()]
+            .iter()
+            .copied()
+            .min()
+            .expect("nonempty opponents");
+        let proportion = f64::from(sweeps) / count;
         let square = 1.96_f64.powi(2);
         let center = proportion + square / (2.0 * count);
         let radius = 1.96
@@ -322,14 +395,53 @@ impl TacticalFitness {
         ((center - radius) / (1.0 + square / count) * 100.0).max(0.0)
     }
 
-    fn rank(&self) -> (u32, Reverse<u32>, i64, i64) {
+    fn rank(&self) -> (u32, u32, Reverse<u32>, i64, i64) {
         (
+            self.minimum_wins(),
             self.wins,
             Reverse(self.timeouts),
             self.death_margin,
             self.farm_margin,
         )
     }
+}
+
+fn validate_fitness_game(
+    cohort: TacticalCohort,
+    index: usize,
+    game: &TacticalMatchReport,
+) -> Result<usize, TacticalSearchError> {
+    assert!(index < cohort.game_count());
+    let opponent = index / (cohort.pairs * 2);
+    assert!(opponent < 2);
+    let expected = if opponent == 0 {
+        None
+    } else {
+        cohort.opponent_hash
+    };
+    if game.opponent_hash != expected {
+        return Err(invalid(
+            "tactical game opponent does not match its cohort identity",
+        ));
+    }
+    if game.settings != cohort.match_settings(index) {
+        return Err(invalid(
+            "tactical cohort games must match each paired seed and both seats in order",
+        ));
+    }
+    if game.rejections != [0, 0] {
+        return Err(invalid(
+            "tactical fitness requires zero rejected orders from both seats",
+        ));
+    }
+    if !(2..=cohort.tick_limit).contains(&game.ticks)
+        || (game.outcome == TacticalMatchOutcome::Timeout) != (game.ticks == cohort.tick_limit)
+    {
+        return Err(invalid(
+            "tactical outcome must agree with the deployment tick-limit boundary",
+        ));
+    }
+    Ok(opponent)
 }
 
 /// Every game of one complete cohort, retained with its aggregate fitness.
@@ -342,6 +454,8 @@ pub struct TacticalEvaluation {
 /// Fixed search bounds and disjoint development cohorts. Four workers are the maximum.
 #[derive(Clone, Debug)]
 pub struct TacticalSearchConfig {
+    /// When present, every cohort includes both Teacher and this fixed policy.
+    pub opponent_policy: Option<TacticalPolicy>,
     pub population: usize,
     pub generations: u32,
     pub pairs: usize,
@@ -357,6 +471,7 @@ pub struct TacticalSearchConfig {
 impl Default for TacticalSearchConfig {
     fn default() -> Self {
         Self {
+            opponent_policy: None,
             population: 16,
             generations: 20,
             pairs: 4,
@@ -416,6 +531,7 @@ struct Seat {
 
 fn run_match(
     policy: Option<&TacticalPolicy>,
+    opponent: Option<&TacticalPolicy>,
     settings: TacticalMatchConfig,
     deadline: Instant,
 ) -> Result<TacticalMatchReport, TacticalSearchError> {
@@ -447,7 +563,7 @@ fn run_match(
         if arena.tick() > pregame && (arena.tick() - pregame - 1).is_multiple_of(3) {
             for (index, seat) in seats.iter_mut().enumerate() {
                 requests[index] =
-                    seat_request(seat, if index == candidate { policy } else { None })?;
+                    seat_request(seat, if index == candidate { policy } else { opponent })?;
             }
         }
         let step = arena.step(&requests).map_err(failure)?;
@@ -464,7 +580,9 @@ fn run_match(
             break;
         }
     }
-    match_report(settings, &seats, arena.tick(), winner)
+    let mut report = match_report(settings, &seats, arena.tick(), winner)?;
+    report.opponent_hash = opponent.map(policy_digest);
+    Ok(report)
 }
 
 fn match_report(
@@ -482,6 +600,7 @@ fn match_report(
         None => TacticalMatchOutcome::Timeout,
     };
     Ok(TacticalMatchReport {
+        opponent_hash: None,
         settings,
         outcome,
         ticks,
@@ -633,6 +752,7 @@ fn message_error(
 }
 
 struct SearchBudget {
+    opponent: Option<TacticalPolicy>,
     deadline: Instant,
     scheduled: usize,
     completed: usize,
@@ -640,6 +760,7 @@ struct SearchBudget {
 impl SearchBudget {
     fn new(wall_time: Duration) -> Self {
         Self {
+            opponent: None,
             deadline: Instant::now() + wall_time,
             scheduled: 0,
             completed: 0,
@@ -667,16 +788,30 @@ fn evaluate_batch(
         return Err(invalid("tactical evaluation population must be in 1..=24"));
     }
     validate_workers(workers)?;
-    let count = policies.len() * cohort.pairs * 2;
+    let actual = budget.opponent.as_ref().map(policy_digest);
+    if cohort.opponent_hash.is_some() && cohort.opponent_hash != actual {
+        return Err(invalid(
+            "tactical evaluation opponent does not match cohort identity",
+        ));
+    }
+    let cohort = cohort.with_opponent(budget.opponent.as_ref());
+    let count = policies.len() * cohort.game_count();
     budget.reserve(count)?;
     let completed = AtomicUsize::new(0);
-    let result = parallel_games(policies, cohort, workers, budget.deadline, &completed);
+    let result = parallel_games(
+        policies,
+        cohort,
+        budget.opponent.as_ref(),
+        workers,
+        budget.deadline,
+        &completed,
+    );
     budget.completed += completed.load(AtomicOrdering::Relaxed);
     let games = result?;
     assert_eq!(games.len(), count);
     assert!(budget.completed <= budget.scheduled);
     games
-        .chunks(cohort.pairs * 2)
+        .chunks(cohort.game_count())
         .map(|games| evaluation(cohort, games.to_vec()))
         .collect()
 }
@@ -684,11 +819,12 @@ fn evaluate_batch(
 fn parallel_games(
     policies: &[TacticalPolicy],
     cohort: TacticalCohort,
+    opponent: Option<&TacticalPolicy>,
     workers: usize,
     deadline: Instant,
     completed: &AtomicUsize,
 ) -> Result<Vec<TacticalMatchReport>, TacticalSearchError> {
-    let count = policies.len() * cohort.pairs * 2;
+    let count = policies.len() * cohort.game_count();
     let mut ordered = vec![None; count];
     std::thread::scope(|scope| {
         let mut handles = Vec::with_capacity(workers);
@@ -696,9 +832,15 @@ fn parallel_games(
             handles.push(scope.spawn(move || {
                 let mut results = Vec::with_capacity(count.div_ceil(workers));
                 for index in (worker..count).step_by(workers) {
-                    let policy = &policies[index / (cohort.pairs * 2)];
-                    let settings = cohort.match_settings(index % (cohort.pairs * 2));
-                    let game = run_match(Some(policy), settings, deadline)?;
+                    let policy = &policies[index / cohort.game_count()];
+                    let game_index = index % cohort.game_count();
+                    let settings = cohort.match_settings(game_index);
+                    let baseline = if game_index < cohort.pairs * 2 {
+                        None
+                    } else {
+                        opponent
+                    };
+                    let game = run_match(Some(policy), baseline, settings, deadline)?;
                     completed.fetch_add(1, AtomicOrdering::Relaxed);
                     results.push((index, game));
                 }
@@ -713,12 +855,10 @@ fn parallel_games(
                         ordered[index] = Some(game);
                     }
                 }
-                Ok(Err(failure)) => {
-                    if error.is_none() {
-                        error = Some(failure);
-                    }
+                Ok(Err(failure)) => record_worker_error(&mut error, failure),
+                Err(_) => {
+                    record_worker_error(&mut error, invalid("tactical match worker panicked"))
                 }
-                Err(_) => error = Some(invalid("tactical match worker panicked")),
             }
         }
         if let Some(error) = error {
@@ -729,6 +869,13 @@ fn parallel_games(
             .map(|game| game.ok_or(invalid("tactical worker result missing")))
             .collect()
     })
+}
+
+fn record_worker_error(selected: &mut Option<TacticalSearchError>, incoming: TacticalSearchError) {
+    if selected.is_none() || matches!(selected, Some(TacticalSearchError::Deadline)) {
+        *selected = Some(incoming);
+    }
+    assert!(selected.is_some());
 }
 
 fn evaluation(
@@ -833,6 +980,7 @@ fn confirm_selection(
     output: &Path,
     policy: &TacticalPolicy,
     budget: &mut SearchBudget,
+    stopped_for_deadline: &mut bool,
 ) -> Result<Option<TacticalEvaluation>, TacticalSearchError> {
     let cohort = TacticalCohort::new(
         settings.confirmation_seed,
@@ -852,7 +1000,10 @@ fn confirm_selection(
             print_evaluation("confirmation", &evaluated, Duration::ZERO);
             Ok(Some(evaluated))
         }
-        Err(TacticalSearchError::Deadline) => Ok(None),
+        Err(TacticalSearchError::Deadline) => {
+            *stopped_for_deadline = true;
+            Ok(None)
+        }
         Err(error) => Err(error),
     }
 }
@@ -957,7 +1108,12 @@ fn validate_search(settings: &TacticalSearchConfig) -> Result<(), TacticalSearch
     }
     let training = settings.population * settings.generations as usize * settings.pairs * 2;
     let selection_rounds = (settings.generations as usize).div_ceil(2) + 1;
-    let maximum = training + (selection_rounds * 2 + 2) * settings.selection_pairs * 2;
+    let maximum = (training + (selection_rounds * 2 + 2) * settings.selection_pairs * 2)
+        * if settings.opponent_policy.is_some() {
+            2
+        } else {
+            1
+        };
     if maximum > MAX_EVALUATED_GAMES {
         return Err(invalid(
             "tactical configuration exceeds 5120 scheduled games",
@@ -1111,9 +1267,17 @@ fn update_best_pointer(root: &Path, archive: &Path) -> Result<(), TacticalSearch
 }
 
 fn policy_hash(policy: &TacticalPolicy) -> String {
+    digest_hex(policy_digest(policy))
+}
+
+fn policy_digest(policy: &TacticalPolicy) -> [u8; 32] {
+    Sha256::digest(policy.to_bytes()).into()
+}
+
+fn digest_hex(digest: [u8; 32]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut output = String::with_capacity(64);
-    for byte in Sha256::digest(policy.to_bytes()) {
+    for byte in digest {
         output.push(char::from(HEX[usize::from(byte >> 4)]));
         output.push(char::from(HEX[usize::from(byte & 15)]));
     }
@@ -1121,12 +1285,41 @@ fn policy_hash(policy: &TacticalPolicy) -> String {
     output
 }
 
+fn opponent_hash_json(hash: Option<[u8; 32]>) -> String {
+    hash.map_or_else(
+        || "null".to_owned(),
+        |hash| format!("\"{}\"", digest_hex(hash)),
+    )
+}
+
+fn opponents_json(fitness: &TacticalFitness) -> String {
+    let mut output = String::from("[");
+    for index in 0..fitness.cohort.opponent_count() {
+        if index > 0 {
+            output.push(',');
+        }
+        let hash = if index == 0 {
+            None
+        } else {
+            fitness.cohort.opponent_hash
+        };
+        let counts = fitness.opponent_results[index];
+        output.push_str(&format!("{{\"policy\":\"{}\",\"sha256\":{},\"wins\":{},\"losses\":{},\"timeouts\":{},\"games\":{}}}",
+            if index == 0 { "Teacher" } else { "Tactical" }, opponent_hash_json(hash),
+            counts[0], counts[1], counts[2], fitness.cohort.pairs * 2));
+    }
+    output.push(']');
+    output
+}
+
 fn evaluation_json(policy: &TacticalPolicy, evaluated: &TacticalEvaluation) -> String {
     let fitness = &evaluated.fitness;
     let mut output = format!(
-        "{{\"schema_version\":1,\"policy_sha256\":\"{}\",\"policy_file\":\"{}\",\"opponent\":\"Teacher\",\"map\":1,\"development_only\":true,\"first_seed\":{},\"pairs\":{},\"tick_limit\":{},\"wins\":{},\"losses\":{},\"timeouts\":{},\"death_margin\":{},\"farm_margin\":{},\"win_percent\":{:.6},\"paired_sweeps\":{},\"paired_sweep_wilson95_lower_percent\":{:.6},\"games\":[",
+        "{{\"schema_version\":2,\"policy_sha256\":\"{}\",\"policy_file\":\"{}\",\"opponents\":{},\"minimum_win_percent\":{:.6},\"map\":1,\"development_only\":true,\"first_seed\":{},\"pairs\":{},\"tick_limit\":{},\"wins\":{},\"losses\":{},\"timeouts\":{},\"death_margin\":{},\"farm_margin\":{},\"win_percent\":{:.6},\"paired_sweeps\":{},\"paired_sweep_wilson95_lower_percent\":{:.6},\"games\":[",
         policy_hash(policy),
         TACTICAL_SEARCH_POLICY_FILE,
+        opponents_json(fitness),
+        fitness.minimum_win_percent(),
         fitness.cohort.first_seed,
         fitness.cohort.pairs,
         fitness.cohort.tick_limit,
@@ -1143,8 +1336,8 @@ fn evaluation_json(policy: &TacticalPolicy, evaluated: &TacticalEvaluation) -> S
         if index > 0 {
             output.push(',');
         }
-        output.push_str(&format!("{{\"seed\":{},\"candidate_seat\":{},\"outcome\":\"{:?}\",\"ticks\":{},\"decisions\":{:?},\"orders\":{:?},\"rejections\":{:?},\"order_fingerprints\":{:?},\"sampled_decisions\":{},\"effective_overrides\":{},\"kills\":{},\"deaths\":{},\"enemy_deaths\":{},\"last_hits\":{},\"denies\":{}}}",
-            game.settings.seed, game.settings.candidate_seat, game.outcome, game.ticks,
+        output.push_str(&format!("{{\"opponent_sha256\":{},\"seed\":{},\"candidate_seat\":{},\"outcome\":\"{:?}\",\"ticks\":{},\"decisions\":{:?},\"orders\":{:?},\"rejections\":{:?},\"order_fingerprints\":{:?},\"sampled_decisions\":{},\"effective_overrides\":{},\"kills\":{},\"deaths\":{},\"enemy_deaths\":{},\"last_hits\":{},\"denies\":{}}}",
+            opponent_hash_json(game.opponent_hash), game.settings.seed, game.settings.candidate_seat, game.outcome, game.ticks,
             game.decisions, game.orders, game.rejections, game.order_fingerprints,
             game.sampled_decisions, game.effective_overrides, game.final_summary.allied.kills,
             game.final_summary.allied.deaths, game.final_summary.enemy.deaths,
@@ -1178,7 +1371,8 @@ fn write_generation(
 
 fn search_config_json(settings: &TacticalSearchConfig) -> String {
     format!(
-        "{{\"schema_version\":1,\"population\":{},\"generations\":{},\"pairs\":{},\"workers\":{},\"seed\":{},\"selection_seed\":{},\"confirmation_seed\":{},\"selection_pairs\":{},\"tick_limit\":{},\"wall_seconds\":{},\"maximum_games\":{MAX_EVALUATED_GAMES},\"mutation_scales\":[0.1,0.2,0.35,0.5],\"head_only_generations\":4,\"diagnostic_stride\":{DIAGNOSTIC_STRIDE}}}\n",
+        "{{\"schema_version\":2,\"opponent_sha256\":{},\"population\":{},\"generations\":{},\"pairs\":{},\"workers\":{},\"seed\":{},\"selection_seed\":{},\"confirmation_seed\":{},\"selection_pairs\":{},\"tick_limit\":{},\"wall_seconds\":{},\"maximum_games\":{MAX_EVALUATED_GAMES},\"mutation_scales\":[0.1,0.2,0.35,0.5],\"head_only_generations\":4,\"diagnostic_stride\":{DIAGNOSTIC_STRIDE}}}\n",
+        opponent_hash_json(settings.opponent_policy.as_ref().map(policy_digest)),
         settings.population,
         settings.generations,
         settings.pairs,
@@ -1211,6 +1405,11 @@ fn search_summary_json(report: &TacticalSearchReport) -> String {
 
 fn print_evaluation(label: &str, evaluated: &TacticalEvaluation, elapsed: Duration) {
     let fitness = &evaluated.fitness;
+    println!(
+        "phase={label} minimum_win_percent={:.3} opponents={}",
+        fitness.minimum_win_percent(),
+        opponents_json(fitness)
+    );
     let sampled: u32 = evaluated
         .games
         .iter()

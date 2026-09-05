@@ -5,6 +5,163 @@ use super::*;
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
 #[test]
+fn worker_error_arbitration_preserves_real_failure_in_both_completion_orders() {
+    let failure = invalid("simulator rejected an order");
+    for errors in [
+        [TacticalSearchError::Deadline, failure.clone()],
+        [failure.clone(), TacticalSearchError::Deadline],
+    ] {
+        let mut selected = None;
+        for error in errors {
+            record_worker_error(&mut selected, error);
+        }
+        assert_eq!(selected, Some(failure.clone()));
+        assert_eq!(
+            selected.expect("error").to_string(),
+            "simulator rejected an order"
+        );
+    }
+}
+
+#[test]
+fn confirmation_only_deadline_sets_the_report_stop_flag() {
+    let mut budget = SearchBudget::new(Duration::ZERO);
+    let mut stopped = false;
+    let confirmation = confirm_selection(
+        &TacticalSearchConfig::default(),
+        Path::new("unused"),
+        &TacticalPolicy::default(),
+        &mut budget,
+        &mut stopped,
+    )
+    .expect("recoverable deadline");
+    assert!(confirmation.is_none());
+    assert!(stopped);
+}
+
+#[test]
+fn mixed_fitness_prefers_worst_opponent_wins_over_pooled_wins() {
+    let policy = TacticalPolicy::default();
+    let cohort = TacticalCohort::new(9_203_000, 2, 30_000)
+        .expect("cohort")
+        .with_opponent(Some(&policy));
+    let balanced = mixed_fitness(cohort, [3, 3]);
+    let pooled = mixed_fitness(cohort, [4, 2]);
+    assert_eq!(balanced.wins, pooled.wins);
+    assert_eq!(
+        balanced.compare(&pooled).expect("same opponents"),
+        Ordering::Greater
+    );
+    let lopsided = mixed_fitness(cohort, [4, 1]);
+    let weaker_total = mixed_fitness(cohort, [2, 2]);
+    assert_eq!(
+        weaker_total.compare(&lopsided).expect("same opponents"),
+        Ordering::Greater
+    );
+}
+
+#[test]
+fn mixed_fitness_rejects_another_opponent_or_game_identity() {
+    let policy = TacticalPolicy::default();
+    let cohort = TacticalCohort::new(9_203_000, 2, 30_000)
+        .expect("cohort")
+        .with_opponent(Some(&policy));
+    let other = TacticalCohort::new(9_203_000, 2, 30_000)
+        .expect("cohort")
+        .with_opponent(Some(&policy.mutated(7, 0.2).expect("other opponent")));
+    assert_eq!(
+        mixed_fitness(cohort, [2, 2])
+            .compare(&mixed_fitness(other, [2, 2]))
+            .expect_err("wrong opponent")
+            .to_string(),
+        "tactical fitness comparison requires identical seed, side and tick-limit cohorts"
+    );
+    let mut games = mixed_games(cohort, [2, 2]);
+    games[4].opponent_hash = None;
+    assert_eq!(
+        TacticalFitness::from_games(cohort, &games)
+            .expect_err("missing opponent identity")
+            .to_string(),
+        "tactical game opponent does not match its cohort identity"
+    );
+}
+
+#[test]
+fn fixed_v004_on_both_seats_has_identical_orders_and_opposite_candidate_results() {
+    let bytes = std::fs::read(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("artifacts/v0.0.4/drysua.tactical.bin"),
+    )
+    .expect("released opponent");
+    let policy = TacticalPolicy::from_bytes(&bytes).expect("V1 artifact");
+    let settings = TacticalMatchConfig {
+        seed: 9_203_000,
+        candidate_seat: 0,
+        tick_limit: 30_000,
+    };
+    let radiant =
+        evaluate_tactical_match_against(Some(&policy), Some(&policy), settings).expect("Radiant");
+    let dire = evaluate_tactical_match_against(
+        Some(&policy),
+        Some(&policy),
+        TacticalMatchConfig {
+            candidate_seat: 1,
+            ..settings
+        },
+    )
+    .expect("Dire");
+    assert_eq!(radiant.order_fingerprints, dire.order_fingerprints);
+    assert_eq!(radiant.ticks, dire.ticks);
+    assert_eq!(radiant.opponent_hash, Some(policy_digest(&policy)));
+    assert!(matches!(
+        (radiant.outcome, dire.outcome),
+        (TacticalMatchOutcome::Win, TacticalMatchOutcome::Loss)
+            | (TacticalMatchOutcome::Loss, TacticalMatchOutcome::Win)
+            | (TacticalMatchOutcome::Timeout, TacticalMatchOutcome::Timeout)
+    ));
+}
+
+#[test]
+fn default_neural_opponent_matches_the_pure_teacher_path() {
+    let policy = tactical_search_founders()[1].clone();
+    let settings = TacticalMatchConfig {
+        seed: 9_203_001,
+        candidate_seat: 0,
+        tick_limit: 6_001,
+    };
+    let teacher = evaluate_tactical_match(Some(&policy), settings).expect("Teacher");
+    let neural =
+        evaluate_tactical_match_against(Some(&policy), Some(&TacticalPolicy::default()), settings)
+            .expect("default");
+    assert_eq!(teacher.order_fingerprints, neural.order_fingerprints);
+    assert_eq!(teacher.outcome, neural.outcome);
+}
+
+fn mixed_games(cohort: TacticalCohort, wins: [usize; 2]) -> Vec<TacticalMatchReport> {
+    (0..cohort.game_count())
+        .map(|index| {
+            let opponent = index / (cohort.pairs * 2);
+            let settings = cohort.match_settings(index);
+            let outcome = if index % (cohort.pairs * 2) < wins[opponent] {
+                TacticalMatchOutcome::Win
+            } else {
+                TacticalMatchOutcome::Loss
+            };
+            let mut game = game(settings.seed, settings.candidate_seat, outcome);
+            game.opponent_hash = if opponent == 0 {
+                None
+            } else {
+                cohort.opponent_hash
+            };
+            game
+        })
+        .collect()
+}
+
+fn mixed_fitness(cohort: TacticalCohort, wins: [usize; 2]) -> TacticalFitness {
+    TacticalFitness::from_games(cohort, &mixed_games(cohort, wins)).expect("mixed fitness")
+}
+
+#[test]
 fn live_tactical_wire_orders_match_training_on_the_same_visible_stream() {
     for candidate_seat in 0..2 {
         let policy = tactical_search_founders()[TacticalMode::Recover.index()].clone();
@@ -416,6 +573,7 @@ fn fitness(
 
 fn game(seed: u64, candidate_seat: u8, outcome: TacticalMatchOutcome) -> TacticalMatchReport {
     TacticalMatchReport {
+        opponent_hash: None,
         settings: TacticalMatchConfig {
             seed,
             candidate_seat,

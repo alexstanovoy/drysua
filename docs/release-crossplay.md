@@ -69,8 +69,9 @@ PYTHONDONTWRITEBYTECODE=1 python3 scripts/release_crossplay.py \
   --run-name neural-v004-default-e8-crossplay-001
 ```
 
-This is the full **60-game** gate against the currently registered `v0.0.1`,
-`v0.0.2`, and `v0.0.3` Teachers, not a shortened smoke. A fresh run name is required.
+The full gate now schedules **80 games** against registered `v0.0.1`,
+`v0.0.2`, `v0.0.3` Teachers and the trained `v0.0.4` Tactical policy.
+A fresh run name is required.
 Build only after edits have settled; the metadata command records provenance but
 does not lock the working tree. The runner never trains or modifies source weights.
 
@@ -176,7 +177,7 @@ PYTHONDONTWRITEBYTECODE=1 python3 scripts/release_crossplay.py \
 ```
 
 Replace the output/provenance placeholders and use a new run name. A two-sided
-baseline TCP smoke is not this 60-game gate and cannot approve a release.
+baseline TCP smoke is not the full historical gate and cannot approve a release.
 
 Default Tactical parity evidence is retained at
 `artifacts/temp/tactical-default-tcp-001/evidence.md`. At seed 9,200,003 versus
@@ -185,7 +186,8 @@ the archived `v0.0.3` Teacher, both TCP matches ended with Dire winning at tick
 or timeouts. Builtin inference matched every accepted order/application tick and
 the complete terminal stats against each TCP replay. The default artifact is
 `artifacts/temp/tactical-default/drysua.tactical.bin`; this is not trained weight
-evidence and no full Tactical gate has been run.
+evidence. The trained v0.0.4 subsequently passed the full 60-game gate against
+its three predecessors; see `artifacts/v0.0.4/gate-clean.json`.
 
 Exit codes: `0` approved, `1` failed gate, `2` setup/build/registry failure. An
 interrupted or incomplete report is not approval. No selected-opponent, early-win,
