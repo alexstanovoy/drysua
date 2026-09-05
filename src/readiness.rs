@@ -192,13 +192,47 @@ impl ItemReadiness {
         }
         let from = usize::from(from.0);
         let to = usize::from(to.0);
-        if !(BACKPACK_SLOT_START..HERO_ITEM_SLOTS).contains(&from) || to >= INVENTORY_SLOTS {
+        let ready_tick = apply_tick.saturating_add(BACKPACK_MUTE_TICKS);
+        if (BACKPACK_SLOT_START..HERO_ITEM_SLOTS).contains(&from) && to < INVENTORY_SLOTS {
+            self.hero_mutes[to].push(ReadinessTimer {
+                sequence,
+                ready_tick,
+            });
             return;
         }
-        self.hero_mutes[to].push(ReadinessTimer {
-            sequence,
-            ready_tick: apply_tick.saturating_add(BACKPACK_MUTE_TICKS),
-        });
+        if (BACKPACK_SLOT_START..HERO_ITEM_SLOTS).contains(&to) && from < INVENTORY_SLOTS {
+            self.hero_mutes[from].push(ReadinessTimer {
+                sequence,
+                ready_tick,
+            });
+            return;
+        }
+        if from < INVENTORY_SLOTS && to < INVENTORY_SLOTS {
+            self.follow_active_mute(sequence, from, to, apply_tick);
+        }
+    }
+
+    fn follow_active_mute(&mut self, sequence: u32, from: usize, to: usize, apply_tick: u32) {
+        let from_ready = self.hero_mutes[from]
+            .current()
+            .map(|timer| timer.ready_tick)
+            .filter(|ready_tick| *ready_tick > apply_tick);
+        let to_ready = self.hero_mutes[to]
+            .current()
+            .map(|timer| timer.ready_tick)
+            .filter(|ready_tick| *ready_tick > apply_tick);
+        if let Some(ready_tick) = from_ready {
+            self.hero_mutes[to].push(ReadinessTimer {
+                sequence,
+                ready_tick,
+            });
+        }
+        if let Some(ready_tick) = to_ready {
+            self.hero_mutes[from].push(ReadinessTimer {
+                sequence,
+                ready_tick,
+            });
+        }
     }
 
     fn note_use(

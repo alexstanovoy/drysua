@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
 use std::path::Path;
 use std::sync::Arc;
@@ -16,12 +17,18 @@ use crate::{
     LEAGUE_MIN_PROMOTION_PAIRS, League, LeagueEvaluation, LeagueExploitAudit, LeagueMatchResult,
     LeagueOpponent, LeagueOpponentKind, LeaguePairedResult, LeaguePromotionDecision, LeagueSampler,
     LocalPolicyState, MAX_TRAINING_COUNTER, MODEL_MAX_OPTIMIZER_STEP, OfflineEvaluation,
-    OrderPersistence, PPO_MAX_POLICY_SAMPLE_DRAWS, PPO_RULES_AUDIT_VERSION, PolicyDevice,
-    PolicyModel, PolicySnapshot, PpoConfig, PpoError, PpoOutcome, PpoPolicyChoice, PpoRng,
-    PpoRollout, PpoTerminalOutcome, PpoTrainer, PpoUpdateReport, Request, RewardTracker,
-    RngCheckpoint, SHADOW_FIEND, SampleIdentity, SeedNamespace, SeedNamespaces, StateTracker,
-    Teacher, TeacherCoverage, TrainingArtifact, TrainingScope, compiled_features, tick_discount,
+    OrderPersistence, PPO_MAX_POLICY_SAMPLE_DRAWS, PPO_MAX_ROLLOUT_DECISIONS,
+    PPO_RULES_AUDIT_VERSION, PolicyDevice, PolicyModel, PolicySnapshot, PpoConfig, PpoError,
+    PpoOutcome, PpoPolicyChoice, PpoRng, PpoRollout, PpoTerminalOutcome, PpoTrainer,
+    PpoUpdateReport, Request, RewardTracker, RngCheckpoint, SHADOW_FIEND, SampleIdentity,
+    SeedNamespace, SeedNamespaces, StateTracker, Teacher, TeacherCoverage, TrainingArtifact,
+    TrainingScope, compiled_features, tick_discount,
 };
+
+const TRAINING_MAX_ENVIRONMENTS: usize = 16;
+const READINESS_ORDER_HISTORY: usize = 32;
+const _: () =
+    assert!(TRAINING_MAX_ENVIRONMENTS * PPO_MAX_ROLLOUT_DECISIONS <= crate::PPO_MAX_SAMPLES);
 
 /// Bounded builtin smoke-run settings for the complete actor-to-learner path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -355,6 +362,7 @@ struct ArenaSeatPolicy {
     sequence: u32,
     rejections: u64,
     pending_active: Option<(u32, Option<ActivePolicyOrder>)>,
+    readiness_orders: VecDeque<(u32, crate::IssuedOrder, u32)>,
     last_issued: Option<(u32, crate::IssuedOrder, ActionKind)>,
     last_rejection: Option<(u32, RejectReason)>,
 }
@@ -1942,11 +1950,17 @@ impl TrainingSession {
         capacity: usize,
     ) -> Result<TrainingCheckpointReport, PpoError> {
         let (lease, mut rollout) = self.actor.wait_rollout().map_err(pipeline_error)?;
-        let mut environments =
-            build_training_environments(settings, update, config, lease.policy())?;
+        if lease.policy().policy_identity().map_err(model_error)?
+            != self.model.policy_identity().map_err(model_error)?
+        {
+            return Err(PpoError::InvalidTransition(
+                "production actor and learner policy identity",
+            ));
+        }
+        let mut environments = build_training_environments(settings, update, config, &self.model)?;
         let mut actor_report = PpoSmokeReport::default();
         collect_update(
-            lease.policy(),
+            &self.model,
             &mut self.sampling,
             &mut environments,
             config,
@@ -2266,12 +2280,12 @@ fn validate_training_job(
         ));
     }
     if settings.environments == 0
-        || settings.environments > 16
+        || settings.environments > TRAINING_MAX_ENVIRONMENTS
         || !settings.environments.is_multiple_of(2)
     {
         return Err(PpoError::InvalidConfig("training environments"));
     }
-    if settings.rollout_decisions == 0 || settings.rollout_decisions > 256 {
+    if settings.rollout_decisions == 0 || settings.rollout_decisions > PPO_MAX_ROLLOUT_DECISIONS {
         return Err(PpoError::InvalidConfig("training rollout decisions"));
     }
     if !matches!(settings.map, MapId(0) | MapId(1)) {
@@ -2338,12 +2352,14 @@ fn validate_training_counters(
     let samples = (settings.environments as u64)
         .checked_mul(settings.rollout_decisions as u64)
         .ok_or(PpoError::InvalidConfig("training sample counter"))?;
-    let actor_draws = settings
+    let actor_seed_draws = settings
         .updates
-        .checked_mul(samples)
-        .and_then(|count| count.checked_mul(PPO_MAX_POLICY_SAMPLE_DRAWS))
+        .checked_mul(settings.environments as u64)
         .ok_or(PpoError::InvalidConfig("training actor RNG counter"))?;
-    if actor_draws > MAX_TRAINING_COUNTER {
+    let actor_stream_draws = (settings.rollout_decisions as u64)
+        .checked_mul(PPO_MAX_POLICY_SAMPLE_DRAWS)
+        .ok_or(PpoError::InvalidConfig("training actor RNG counter"))?;
+    if actor_seed_draws > MAX_TRAINING_COUNTER || actor_stream_draws > MAX_TRAINING_COUNTER {
         return Err(PpoError::InvalidConfig("training actor RNG counter"));
     }
     let shuffle_draws = settings
@@ -2650,6 +2666,7 @@ fn build_training_environments(
         .checked_mul(settings.environments as u64)
         .ok_or(PpoError::CounterOverflow)?;
     let mut environments = Vec::with_capacity(settings.environments);
+    let mut warmup_decisions = Vec::with_capacity(settings.environments);
     for index in 0..settings.environments {
         let stream = offset
             .checked_add(index as u64)
@@ -2659,7 +2676,7 @@ fn build_training_environments(
             CheckpointEvaluationBaseline::Weak => OpponentSpec::Weak,
             CheckpointEvaluationBaseline::Teacher => OpponentSpec::Teacher,
         };
-        let mut environment = build_environment(
+        let environment = build_environment(
             derive_training_seed(settings.seed, pair, 0x6172_656e_615f_7365),
             derive_training_seed(settings.seed, pair, 0x6f70_706f_6e65_6e74),
             settings.map,
@@ -2667,14 +2684,15 @@ fn build_training_environments(
             decision,
             opponent,
         )?;
-        warmup_environment_with_policy(
-            &mut environment,
-            model,
-            training_warmup_decisions(pair),
-            config.decision_interval_ticks,
-        )?;
         environments.push(environment);
+        warmup_decisions.push(training_warmup_decisions(pair));
     }
+    warmup_training_environments(
+        &mut environments,
+        &warmup_decisions,
+        model,
+        config.decision_interval_ticks,
+    )?;
     Ok(environments)
 }
 
@@ -2716,13 +2734,62 @@ pub(crate) const fn training_warmup_decisions(phase: u64) -> usize {
     PHASES[(phase % PHASES.len() as u64) as usize]
 }
 
-fn warmup_environment_with_policy(
-    environment: &mut TrainingEnvironment,
+fn warmup_training_environments(
+    environments: &mut [TrainingEnvironment],
+    decisions: &[usize],
     model: &PolicyModel,
-    decisions: usize,
     decision_interval_ticks: u32,
 ) -> Result<(), PpoError> {
-    run_warmup_decisions(environment, model, decisions, decision_interval_ticks)?;
+    if environments.is_empty()
+        || environments.len() != decisions.len()
+        || environments.len() > TRAINING_MAX_ENVIRONMENTS
+    {
+        return Err(PpoError::InvalidConfig("training warmup environments"));
+    }
+    let maximum = decisions.iter().copied().max().unwrap_or(0);
+    for decision in 0..maximum {
+        let active = decisions
+            .iter()
+            .enumerate()
+            .filter_map(|(index, limit)| (decision < *limit).then_some(index))
+            .collect::<Vec<_>>();
+        let requests = requests_for_batched_greedy_decisions(environments, &active, model)?;
+        advance_warmup_environments(environments, &active, requests, decision_interval_ticks)?;
+    }
+    for environment in environments {
+        finish_warmup_environment(environment, decision_interval_ticks)?;
+    }
+    Ok(())
+}
+
+fn advance_warmup_environments(
+    environments: &mut [TrainingEnvironment],
+    active: &[usize],
+    requests: Vec<Vec<Option<Request>>>,
+    decision_interval_ticks: u32,
+) -> Result<(), PpoError> {
+    if active.len() != requests.len() {
+        return Err(PpoError::InvalidTransition("batched warmup request count"));
+    }
+    for (&index, requests) in active.iter().zip(requests) {
+        let environment = environments
+            .get_mut(index)
+            .ok_or(PpoError::InvalidTransition(
+                "batched warmup environment index",
+            ))?;
+        let advanced = advance_interval(environment, requests, decision_interval_ticks)?;
+        reject_production_rejection(environment, "production warmup")?;
+        if advanced.winner.is_some() {
+            restart_environment(environment)?;
+        }
+    }
+    Ok(())
+}
+
+fn finish_warmup_environment(
+    environment: &mut TrainingEnvironment,
+    decision_interval_ticks: u32,
+) -> Result<(), PpoError> {
     clear_warmup_orders(environment, decision_interval_ticks)?;
     environment.reward = RewardTracker::default();
     let summary = environment.seats[environment.policy_seat]
@@ -2733,6 +2800,7 @@ fn warmup_environment_with_policy(
     Ok(())
 }
 
+#[cfg(test)]
 fn run_warmup_decisions(
     environment: &mut TrainingEnvironment,
     model: &PolicyModel,
@@ -2759,6 +2827,25 @@ pub(crate) fn production_warmup_order_counts_for_test(
     run_warmup_decisions(&mut environment, model, decisions, 3)?;
     assert_eq!(environment.policy_seat, 0);
     Ok([environment.seats[0].sequence, environment.seats[1].sequence])
+}
+
+#[cfg(test)]
+pub(crate) fn production_batched_warmup_order_counts_for_test(
+    model: &PolicyModel,
+    decisions: usize,
+) -> Result<[[u32; 2]; 2], PpoError> {
+    let mut environments = vec![
+        build_environment(23_082, 23_083, MapId(1), 0, 0, OpponentSpec::Weak)?,
+        build_environment(23_082, 23_083, MapId(1), 1, 0, OpponentSpec::Weak)?,
+    ];
+    for _ in 0..decisions {
+        let active = [0, 1];
+        let requests = requests_for_batched_greedy_decisions(&mut environments, &active, model)?;
+        advance_warmup_environments(&mut environments, &active, requests, 3)?;
+    }
+    Ok(std::array::from_fn(|environment| {
+        std::array::from_fn(|seat| environments[environment].seats[seat].sequence)
+    }))
 }
 
 #[cfg(test)]
@@ -3610,6 +3697,7 @@ fn setup_seat(index: usize, messages: &[ServerMsg]) -> Result<ArenaSeatPolicy, P
         sequence: 0,
         rejections: 0,
         pending_active: None,
+        readiness_orders: VecDeque::with_capacity(READINESS_ORDER_HISTORY),
         last_issued: None,
         last_rejection: None,
     })
@@ -3626,14 +3714,24 @@ fn collect_update(
     smoke: &mut PpoSmokeReport,
 ) -> Result<(), PpoError> {
     let rejections_before = environment_rejections(environments)?;
+    let mut stream_rngs = actor_stream_rngs(sampling, environments.len())?;
     for _ in 0..decisions {
-        let pending = collect_round(model, sampling, environments, config)?;
+        let pending = collect_round(model, &mut stream_rngs, environments, config)?;
         let bootstrap = bootstrap_values(model, &pending)?;
         commit_round(environments, pending, bootstrap, rollout, smoke)?;
     }
     smoke.rejected_orders =
         rejection_delta(rejections_before, environment_rejections(environments)?)?;
     Ok(())
+}
+
+fn actor_stream_rngs(master: &mut PpoRng, count: usize) -> Result<Vec<PpoRng>, PpoError> {
+    if count == 0 || count > TRAINING_MAX_ENVIRONMENTS {
+        return Err(PpoError::InvalidConfig("actor RNG streams"));
+    }
+    (0..count)
+        .map(|_| master.next_word().map(PpoRng::new))
+        .collect()
 }
 
 fn environment_rejections(environments: &[TrainingEnvironment]) -> Result<u64, PpoError> {
@@ -3664,14 +3762,26 @@ pub(crate) fn rejection_delta_for_test(before: u64, after: u64) -> Result<u64, P
 
 fn collect_round(
     model: &PolicyModel,
-    sampling: &mut PpoRng,
+    sampling: &mut [PpoRng],
     environments: &mut [TrainingEnvironment],
     config: PpoConfig,
 ) -> Result<Vec<PendingTransition>, PpoError> {
+    if sampling.len() != environments.len() {
+        return Err(PpoError::InvalidConfig("actor RNG stream count"));
+    }
+    let mut frames = Vec::with_capacity(environments.len());
+    let mut spaces = Vec::with_capacity(environments.len());
+    for environment in environments.iter_mut() {
+        let (frame, space) = prepare_policy_sample(environment)?;
+        frames.push(frame);
+        spaces.push(space);
+    }
+    let choices = model
+        .sample_batch(&frames, &spaces, sampling)
+        .map_err(model_error)?;
     let mut pending = Vec::with_capacity(environments.len());
-    for environment in environments {
-        let choice = sample_policy(model, sampling, environment)?;
-        let requests = requests_for_decision(environment, &choice)?;
+    for ((environment, choice), space) in environments.iter_mut().zip(choices).zip(&spaces) {
+        let requests = requests_for_decision_in_space(environment, &choice, space)?;
         let advanced = advance_interval(environment, requests, config.decision_interval_ticks)?;
         reject_production_rejection(environment, "production rollout")?;
         let terminal = advanced.winner.is_some();
@@ -3698,6 +3808,31 @@ fn collect_round(
         });
     }
     Ok(pending)
+}
+
+fn prepare_policy_sample(
+    environment: &mut TrainingEnvironment,
+) -> Result<(FeatureFrame, ActionSpace), PpoError> {
+    let seat = &mut environment.seats[environment.policy_seat];
+    prepare_seat_policy_sample(seat)
+}
+
+fn prepare_seat_policy_sample(
+    seat: &mut ArenaSeatPolicy,
+) -> Result<(FeatureFrame, ActionSpace), PpoError> {
+    let space = ActionSpace::from_tracker_with_readiness(&seat.tracker, &seat.readiness)
+        .map_err(|error| PpoError::Model(error.to_string()))?;
+    let mut frame = FeatureFrame::new();
+    seat.encoder
+        .encode(
+            &seat.tracker,
+            &space,
+            &seat.readiness,
+            &seat.local,
+            &mut frame,
+        )
+        .map_err(feature_error)?;
+    Ok((frame, space))
 }
 
 fn terminal_outcome(
@@ -3843,10 +3978,21 @@ fn requests_for_decision(
     environment: &mut TrainingEnvironment,
     choice: &PpoPolicyChoice,
 ) -> Result<Vec<Option<Request>>, PpoError> {
+    let seat = &environment.seats[environment.policy_seat];
+    let space = ActionSpace::from_tracker_with_readiness(&seat.tracker, &seat.readiness)
+        .map_err(|error| PpoError::Model(error.to_string()))?;
+    requests_for_decision_in_space(environment, choice, &space)
+}
+
+fn requests_for_decision_in_space(
+    environment: &mut TrainingEnvironment,
+    choice: &PpoPolicyChoice,
+    space: &ActionSpace,
+) -> Result<Vec<Option<Request>>, PpoError> {
     let mut requests = Vec::with_capacity(environment.seats.len());
     for index in 0..environment.seats.len() {
         let request = if index == environment.policy_seat {
-            policy_request(&mut environment.seats[index], choice)?
+            policy_request_in_space(&mut environment.seats[index], choice, space)?
         } else {
             opponent_request(&mut environment.seats[index], &mut environment.opponent)?
         };
@@ -3860,8 +4006,79 @@ fn requests_for_greedy_decision(
     model: &PolicyModel,
 ) -> Result<(Vec<Option<Request>>, ActionKind), PpoError> {
     let policy_seat = environment.policy_seat;
-    let (action, mut candidate_request) =
+    let (action, candidate_request) =
         greedy_policy_request(&mut environment.seats[policy_seat], model)?;
+    let requests = requests_with_candidate(environment, candidate_request)?;
+    Ok((requests, action))
+}
+
+fn requests_for_batched_greedy_decisions(
+    environments: &mut [TrainingEnvironment],
+    active: &[usize],
+    model: &PolicyModel,
+) -> Result<Vec<Vec<Option<Request>>>, PpoError> {
+    if active.is_empty() {
+        return Ok(Vec::new());
+    }
+    if active.windows(2).any(|pair| pair[0] >= pair[1])
+        || active.iter().any(|index| *index >= environments.len())
+    {
+        return Err(PpoError::InvalidTransition(
+            "batched warmup active environments",
+        ));
+    }
+    if active
+        .iter()
+        .all(|index| deployment_uses_teacher(environments[*index].map))
+    {
+        return active
+            .iter()
+            .map(|index| {
+                requests_for_greedy_decision(&mut environments[*index], model).map(|v| v.0)
+            })
+            .collect();
+    }
+    requests_for_batched_model_greedy_decisions(environments, active, model)
+}
+
+fn requests_for_batched_model_greedy_decisions(
+    environments: &mut [TrainingEnvironment],
+    active: &[usize],
+    model: &PolicyModel,
+) -> Result<Vec<Vec<Option<Request>>>, PpoError> {
+    if active
+        .iter()
+        .any(|index| deployment_uses_teacher(environments[*index].map))
+    {
+        return Err(PpoError::InvalidTransition("mixed batched warmup policy"));
+    }
+    let mut frames = Vec::with_capacity(active.len());
+    let mut spaces = Vec::with_capacity(active.len());
+    for &index in active {
+        let (frame, space) = prepare_policy_sample(&mut environments[index])?;
+        frames.push(frame);
+        spaces.push(space);
+    }
+    let choices = model.choose_batch(&frames, &spaces).map_err(model_error)?;
+    let mut output = Vec::with_capacity(active.len());
+    for ((&index, choice), space) in active.iter().zip(choices).zip(&spaces) {
+        let environment = &mut environments[index];
+        let policy_seat = environment.policy_seat;
+        let (_, candidate_request) = greedy_policy_request_in_space(
+            &mut environment.seats[policy_seat],
+            choice.action,
+            space,
+        )?;
+        output.push(requests_with_candidate(environment, candidate_request)?);
+    }
+    Ok(output)
+}
+
+fn requests_with_candidate(
+    environment: &mut TrainingEnvironment,
+    mut candidate_request: Option<Request>,
+) -> Result<Vec<Option<Request>>, PpoError> {
+    let policy_seat = environment.policy_seat;
     let mut requests = Vec::with_capacity(environment.seats.len());
     for index in 0..environment.seats.len() {
         let request = if index == policy_seat {
@@ -3871,7 +4088,7 @@ fn requests_for_greedy_decision(
         };
         requests.push(request);
     }
-    Ok((requests, action))
+    Ok(requests)
 }
 
 #[cfg(test)]
@@ -3900,30 +4117,27 @@ fn greedy_policy_request(
     if deployment_uses_teacher(seat.tracker.metadata().map) {
         return teacher_request_with_action(seat);
     }
-    let space = ActionSpace::from_tracker_with_readiness(&seat.tracker, &seat.readiness)
-        .map_err(|error| PpoError::Model(error.to_string()))?;
-    let mut frame = FeatureFrame::new();
-    seat.encoder
-        .encode(
-            &seat.tracker,
-            &space,
-            &seat.readiness,
-            &seat.local,
-            &mut frame,
-        )
-        .map_err(feature_error)?;
+    let (frame, space) = prepare_seat_policy_sample(seat)?;
     let action = model.choose(&frame, &space).map_err(model_error)?.action;
+    greedy_policy_request_in_space(seat, action, &space)
+}
+
+fn greedy_policy_request_in_space(
+    seat: &mut ArenaSeatPolicy,
+    proposed: crate::StructuredAction,
+    space: &ActionSpace,
+) -> Result<(ActionKind, Option<Request>), PpoError> {
     let action = seat
         .teacher
-        .deployment_action(&seat.tracker, &space)
-        .unwrap_or(action);
+        .deployment_action(&seat.tracker, space)
+        .unwrap_or(proposed);
     seat.local
         .note_decision(space.tick(), action.kind())
         .map_err(|error| PpoError::Model(error.to_string()))?;
     let issued = space
         .decode(action)
         .map_err(|error| PpoError::Model(error.to_string()))?;
-    let request = issue_request(seat, issued, &space, action.kind(), true)?;
+    let request = issue_request(seat, issued, space, action.kind(), true)?;
     Ok((action.kind(), request))
 }
 
@@ -3969,13 +4183,24 @@ fn policy_request(
 ) -> Result<Option<Request>, PpoError> {
     let space = ActionSpace::from_tracker_with_readiness(&seat.tracker, &seat.readiness)
         .map_err(|error| PpoError::Model(error.to_string()))?;
+    policy_request_in_space(seat, choice, &space)
+}
+
+fn policy_request_in_space(
+    seat: &mut ArenaSeatPolicy,
+    choice: &PpoPolicyChoice,
+    space: &ActionSpace,
+) -> Result<Option<Request>, PpoError> {
+    if !choice.frame.matches_action_space(space) {
+        return Err(PpoError::InvalidTransition("prepared actor action space"));
+    }
     seat.local
         .note_decision(space.tick(), choice.action.kind())
         .map_err(|error| PpoError::Model(error.to_string()))?;
     let issued = space
         .decode(choice.action)
         .map_err(|error| PpoError::Model(error.to_string()))?;
-    issue_request(seat, issued, &space, choice.action.kind(), false)
+    issue_request(seat, issued, space, choice.action.kind(), false)
 }
 
 fn teacher_request(seat: &mut ArenaSeatPolicy) -> Result<Option<Request>, PpoError> {
@@ -4028,6 +4253,16 @@ fn issue_request(
         .record_sent(seat.sequence, issued)
         .map_err(|error| PpoError::Model(error.to_string()))?;
     seat.readiness.note_sent(seat.sequence, issued, space);
+    if matches!(
+        issued.order,
+        bota_proto::Order::Swap { .. } | bota_proto::Order::Use { .. }
+    ) {
+        if seat.readiness_orders.len() == READINESS_ORDER_HISTORY {
+            seat.readiness_orders.pop_front();
+        }
+        seat.readiness_orders
+            .push_back((seat.sequence, issued, space.tick()));
+    }
     let update = crate::active_order_update_for_sent(
         &seat.persistence,
         issued.unit,
@@ -4095,8 +4330,8 @@ fn reject_production_rejection(
     for (index, seat) in environment.seats.iter().enumerate() {
         if let Some((sequence, reason)) = seat.last_rejection {
             return Err(PpoError::Model(format!(
-                "{context} seat {index} sequence {sequence} rejected as {reason:?}; last issued {:?}",
-                seat.last_issued
+                "{context} seat {index} sequence {sequence} rejected as {reason:?}; last issued {:?}; readiness orders {:?}",
+                seat.last_issued, seat.readiness_orders,
             )));
         }
     }

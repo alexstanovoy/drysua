@@ -544,10 +544,15 @@ fn item_masks_cover_all_aims_and_reject_backpack_cooldown_charges_mana_and_range
         .as_mut()
         .expect("item")
         .mana_cost = 10_000;
+    view.units[hero_index].items[3]
+        .as_mut()
+        .expect("item")
+        .mute_left = 1;
     let blocked = ActionSpace::from_tracker(&tracker_with_view(view)).expect("blocked");
     assert!(!blocked.item_slot_mask(ControlledUnit::Hero)[0]);
     assert!(!blocked.item_slot_mask(ControlledUnit::Hero)[1]);
     assert!(!blocked.item_slot_mask(ControlledUnit::Hero)[2]);
+    assert!(!blocked.item_slot_mask(ControlledUnit::Hero)[3]);
 }
 
 #[test]
@@ -771,6 +776,14 @@ fn schema_decode_maps_every_action_family_to_wire_order_and_rejects_injected_ind
     let point = walkable_point(&space);
     let courier = entity_candidate(&space, EntityRelation::Own, UnitKind::Courier);
     let enemy = entity_candidate(&space, EntityRelation::Enemy, UnitKind::Hero);
+    assert!(space.put_underfoot_mask(ControlledUnit::Hero)[0]);
+    assert!(
+        space
+            .put_point_target_mask(ControlledUnit::Hero, ItemSlot(0))
+            .expect("put point mask")
+            .iter()
+            .all(|allowed| !allowed)
+    );
 
     assert_eq!(
         space.decode(StructuredAction::Continue).expect("continue"),
@@ -871,12 +884,12 @@ fn schema_decode_maps_every_action_family_to_wire_order_and_rejects_injected_ind
         StructuredAction::PutPoint {
             unit: ControlledUnit::Hero,
             source: ItemSlot(0),
-            target: PutPointTarget::Point(point),
+            target: PutPointTarget::Underfoot,
         },
         None,
         Order::Put {
             slot: ItemSlot(0),
-            target: Target::Pos(space.point_candidates()[point.0].position),
+            target: Target::None,
         },
     );
     assert_order(
@@ -1277,6 +1290,7 @@ fn item(aim: Option<Aim>, range: i32) -> ItemView {
         id: ItemId(0),
         charges: Some(1),
         cooldown_left: 0,
+        mute_left: 0,
         mode: None,
         mana_cost: 0,
         range,

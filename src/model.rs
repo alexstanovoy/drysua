@@ -25,7 +25,7 @@ use crate::{
 };
 
 /// Version of the fixed policy-model parameter schema.
-pub const MODEL_SCHEMA_VERSION: u32 = 6;
+pub const MODEL_SCHEMA_VERSION: u32 = 7;
 /// Maximum frame count accepted by one public batch call.
 pub const MODEL_MAX_BATCH: usize = 8_192;
 /// Frame count evaluated by one bounded host inference tensor graph.
@@ -76,8 +76,8 @@ static NEXT_OPTIMIZER_LINEAGE: AtomicU64 = AtomicU64::new(1);
 
 /// Canonical model shapes, parameter order, and linked feature schema.
 pub const MODEL_SCHEMA_DESCRIPTOR: &str = concat!(
-    "bota-drysua-model/v6;",
-    "feature_schema_version=6;feature_schema_hash=7342404552083153243;",
+    "bota-drysua-model/v7;",
+    "feature_schema_version=7;feature_schema_hash=13875648161437731669;",
     "dtype=f32;device=cpu_actor,cpu_cuda_or_metal_learner,one_learner_per_device;architecture=deepsets;activations=relu_after_every_encoder_and_trunk_linear;",
     "unit_mlp=69x64,64x128,128x128;",
     "ability_mlp=24x64,64x64;item_mlp=28x64,64x64;",
@@ -125,8 +125,8 @@ const fn linear_parameters(input: usize, output: usize) -> usize {
 /// Exact number of F32 parameters in the version-one policy model.
 pub const MODEL_PARAMETER_COUNT: usize = 1_684_724;
 
-const _: () = assert!(FEATURE_SCHEMA_VERSION == 6);
-const _: () = assert!(FEATURE_SCHEMA_HASH == 7_342_404_552_083_153_243);
+const _: () = assert!(FEATURE_SCHEMA_VERSION == 7);
+const _: () = assert!(FEATURE_SCHEMA_HASH == 13_875_648_161_437_731_669);
 const _: () = assert!(TRUNK_INPUT == 2_568);
 const _: () = assert!(
     DECODER_CONTEXT == TRUNK_WIDTH + KIND_EMBEDDING + UNIT_SELECTION_EMBEDDING + SLOT_EMBEDDING
@@ -202,6 +202,17 @@ pub enum ModelError {
     TrainingPrefixCount {
         prefixes: usize,
         frames: usize,
+    },
+    BatchActionSpaceCount {
+        action_spaces: usize,
+        frames: usize,
+    },
+    SamplingRngCount {
+        rngs: usize,
+        frames: usize,
+    },
+    BatchFrameActionSpaceMismatch {
+        index: usize,
     },
     TrainingSlotIndex {
         family: &'static str,
@@ -286,6 +297,9 @@ impl fmt::Display for ModelError {
             | Self::EmptyTrainingBatch
             | Self::TrainingBatchTooLarge { .. }
             | Self::TrainingPrefixCount { .. }
+            | Self::BatchActionSpaceCount { .. }
+            | Self::SamplingRngCount { .. }
+            | Self::BatchFrameActionSpaceMismatch { .. }
             | Self::TrainingSlotIndex { .. }
             | Self::NonFiniteFrame { .. }
             | Self::ParameterLength { .. }
@@ -324,6 +338,21 @@ impl ModelError {
             Self::TrainingPrefixCount { prefixes, frames } => write!(
                 formatter,
                 "model training prefix count {prefixes} differs from frame count {frames}"
+            ),
+            Self::BatchActionSpaceCount {
+                action_spaces,
+                frames,
+            } => write!(
+                formatter,
+                "model batch action-space count {action_spaces} differs from frame count {frames}"
+            ),
+            Self::SamplingRngCount { rngs, frames } => write!(
+                formatter,
+                "model sampling RNG count {rngs} differs from frame count {frames}"
+            ),
+            Self::BatchFrameActionSpaceMismatch { index } => write!(
+                formatter,
+                "model batch frame {index} does not belong to its action space"
             ),
             Self::TrainingSlotIndex {
                 family,
@@ -1474,6 +1503,24 @@ impl PolicyModel {
         Ok(PolicyChoice { action, value })
     }
 
+    /// Selects at most [`MODEL_TRAINING_BATCH`] greedy legal actions in input order.
+    pub fn choose_batch(
+        &self,
+        frames: &[FeatureFrame],
+        action_spaces: &[ActionSpace],
+    ) -> Result<Vec<PolicyChoice>, ModelError> {
+        validate_policy_batch(frames, action_spaces)?;
+        let _guard = self.read_parameter_lock()?;
+        Ok(self
+            .selection_batch_locked(frames, action_spaces, None)?
+            .into_iter()
+            .map(|choice| PolicyChoice {
+                action: choice.action,
+                value: choice.value,
+            })
+            .collect())
+    }
+
     /// Samples one legal autoregressive action and records exact old-policy statistics.
     pub fn sample(
         &self,
@@ -1515,6 +1562,56 @@ impl PolicyModel {
             entropy,
             value,
         })
+    }
+
+    /// Samples at most [`MODEL_TRAINING_BATCH`] rows with one transactional RNG per row.
+    pub fn sample_batch(
+        &self,
+        frames: &[FeatureFrame],
+        action_spaces: &[ActionSpace],
+        rngs: &mut [PpoRng],
+    ) -> Result<Vec<PpoPolicyChoice>, ModelError> {
+        validate_policy_batch(frames, action_spaces)?;
+        validate_sampling_rng_count(frames.len(), rngs.len())?;
+        let mut staged_rngs = rngs.to_vec();
+        let _guard = self.read_parameter_lock()?;
+        let selected =
+            self.selection_batch_locked(frames, action_spaces, Some(staged_rngs.as_mut_slice()))?;
+        let choices = finish_sampled_choices(
+            frames,
+            action_spaces,
+            selected,
+            self.policy_identity_locked(),
+        )?;
+        rngs.clone_from_slice(&staged_rngs);
+        Ok(choices)
+    }
+
+    fn selection_batch_locked(
+        &self,
+        frames: &[FeatureFrame],
+        action_spaces: &[ActionSpace],
+        mut rngs: Option<&mut [PpoRng]>,
+    ) -> Result<Vec<BatchSelection>, ModelError> {
+        let state = self.forward_frames(frames)?;
+        let base = self.sampling_base_logits(&state)?;
+        let mut rows = initialize_sampling_rows(&base, action_spaces, &mut rngs)?;
+        let kind = self.sampling_kind_logits(&state, &sampling_prefixes(&rows))?;
+        select_sampling_units(&mut rows, &kind, action_spaces, &mut rngs)?;
+        let unit = self.sampling_unit_logits(&state, &sampling_prefixes(&rows))?;
+        select_sampling_slots(&mut rows, &unit, action_spaces, &mut rngs)?;
+        let slot = self.sampling_slot_logits(&state, &sampling_prefixes(&rows))?;
+        decode_batch_rows(
+            action_spaces,
+            &mut rngs,
+            rows,
+            SamplingLogits {
+                base,
+                kind,
+                unit,
+                slot,
+            },
+        )
     }
 
     /// Evaluates one exact legal action path without sampling or mutation.
@@ -2034,22 +2131,107 @@ impl PolicyModel {
             .collect()
     }
 
+    fn sampling_base_logits(&self, state: &ForwardState) -> Result<SamplingBaseLogits, ModelError> {
+        Ok(SamplingBaseLogits {
+            value: self.value.forward(&state.trunk)?.flatten_all()?.to_vec1()?,
+            kind: self.kind.forward(&state.trunk)?.to_vec2()?,
+        })
+    }
+
+    fn sampling_kind_logits(
+        &self,
+        state: &ForwardState,
+        prefixes: &[TrainingPrefix],
+    ) -> Result<SamplingKindLogits, ModelError> {
+        let context = self.sampling_context(&state.trunk, prefixes, SamplingContext::Kind)?;
+        Ok(SamplingKindLogits {
+            controlled: self.controlled.forward(&context)?.to_vec2()?,
+            learn: self.learn_head.forward(&context)?.to_vec2()?,
+        })
+    }
+
+    fn sampling_unit_logits(
+        &self,
+        state: &ForwardState,
+        prefixes: &[TrainingPrefix],
+    ) -> Result<SamplingUnitLogits, ModelError> {
+        let context = self.sampling_context(&state.trunk, prefixes, SamplingContext::Unit)?;
+        Ok(SamplingUnitLogits {
+            ability: self.ability_head.forward(&context)?.to_vec2()?,
+            item: self.item_head.forward(&context)?.to_vec2()?,
+            shop: self.shop_head.forward(&context)?.to_vec2()?,
+            loot: self.loot_head.forward(&context)?.to_vec2()?,
+            entity: self.sampling_pointer_logits(
+                &context,
+                &state.current_units,
+                &self.entity_query,
+            )?,
+            point: self.sampling_pointer_logits(&context, &state.points, &self.point_query)?,
+        })
+    }
+
+    fn sampling_slot_logits(
+        &self,
+        state: &ForwardState,
+        prefixes: &[TrainingPrefix],
+    ) -> Result<SamplingSlotLogits, ModelError> {
+        let context = self.sampling_context(&state.trunk, prefixes, SamplingContext::Slot)?;
+        Ok(SamplingSlotLogits {
+            swap: self.swap_head.forward(&context)?.to_vec2()?,
+            target_mode: self.target_mode.forward(&context)?.to_vec2()?,
+            put_mode: self.put_mode.forward(&context)?.to_vec2()?,
+            entity: self.sampling_pointer_logits(
+                &context,
+                &state.current_units,
+                &self.entity_query,
+            )?,
+            point: self.sampling_pointer_logits(&context, &state.points, &self.point_query)?,
+        })
+    }
+
+    fn sampling_pointer_logits(
+        &self,
+        context: &Tensor,
+        tokens: &Tensor,
+        head: &Linear,
+    ) -> Result<Vec<Vec<f32>>, ModelError> {
+        let query = head.forward(context)?.unsqueeze(1)?;
+        Ok(tokens.broadcast_mul(&query)?.sum(2)?.to_vec2()?)
+    }
+
+    fn sampling_context(
+        &self,
+        trunk: &Tensor,
+        prefixes: &[TrainingPrefix],
+        depth: SamplingContext,
+    ) -> Result<Tensor, ModelError> {
+        let batch = prefixes.len();
+        let kind = self.training_kind_embeddings(prefixes)?;
+        let unit = match depth {
+            SamplingContext::Kind => Tensor::zeros(
+                (batch, UNIT_SELECTION_EMBEDDING),
+                DType::F32,
+                self.tensor_device(),
+            )?,
+            SamplingContext::Unit | SamplingContext::Slot => {
+                self.training_unit_embeddings(prefixes)?
+            }
+        };
+        let slot = match depth {
+            SamplingContext::Slot => self.training_slot_embeddings(prefixes)?,
+            SamplingContext::Kind | SamplingContext::Unit => {
+                Tensor::zeros((batch, SLOT_EMBEDDING), DType::F32, self.tensor_device())?
+            }
+        };
+        Ok(Tensor::cat(&[trunk, &kind, &unit, &slot], 1)?)
+    }
+
     fn training_contexts(
         &self,
         trunk: &Tensor,
         prefixes: &[TrainingPrefix],
     ) -> Result<TrainingContexts, ModelError> {
-        let batch = prefixes.len();
-        let kind_indices = prefixes
-            .iter()
-            .map(|prefix| prefix.kind.index() as u32)
-            .collect::<Vec<_>>();
-        let kind_indices = Tensor::from_vec(kind_indices, batch, self.tensor_device())?;
-        let kind = self
-            .kind_embedding
-            .value
-            .as_tensor()
-            .index_select(&kind_indices, 0)?;
+        let kind = self.training_kind_embeddings(prefixes)?;
         let unit = self.training_unit_embeddings(prefixes)?;
         let slot = self.training_slot_embeddings(prefixes)?;
         let zero_unit = Tensor::zeros(unit.shape(), DType::F32, self.tensor_device())?;
@@ -2059,6 +2241,19 @@ impl PolicyModel {
             unit: Tensor::cat(&[trunk, &kind, &unit, &zero_slot], 1)?,
             slot: Tensor::cat(&[trunk, &kind, &unit, &slot], 1)?,
         })
+    }
+
+    fn training_kind_embeddings(&self, prefixes: &[TrainingPrefix]) -> Result<Tensor, ModelError> {
+        let indices = prefixes
+            .iter()
+            .map(|prefix| prefix.kind.index() as u32)
+            .collect::<Vec<_>>();
+        let indices = Tensor::from_vec(indices, prefixes.len(), self.tensor_device())?;
+        Ok(self
+            .kind_embedding
+            .value
+            .as_tensor()
+            .index_select(&indices, 0)?)
     }
 
     fn training_unit_embeddings(&self, prefixes: &[TrainingPrefix]) -> Result<Tensor, ModelError> {
@@ -3341,6 +3536,51 @@ fn validate_batch(frames: &[FeatureFrame]) -> Result<(), ModelError> {
     Ok(())
 }
 
+fn validate_policy_batch(
+    frames: &[FeatureFrame],
+    action_spaces: &[ActionSpace],
+) -> Result<(), ModelError> {
+    validate_batch_count(frames.len())?;
+    if frames.len() > MODEL_TRAINING_BATCH {
+        return Err(ModelError::BatchTooLarge {
+            count: frames.len(),
+            maximum: MODEL_TRAINING_BATCH,
+        });
+    }
+    if action_spaces.len() != frames.len() {
+        return Err(ModelError::BatchActionSpaceCount {
+            action_spaces: action_spaces.len(),
+            frames: frames.len(),
+        });
+    }
+    if let Some((index, _)) = frames
+        .iter()
+        .enumerate()
+        .find(|(_, frame)| !frame.is_finite())
+    {
+        return Err(ModelError::NonFiniteFrame { index });
+    }
+    if let Some((index, _)) = frames
+        .iter()
+        .zip(action_spaces)
+        .enumerate()
+        .find(|(_, (frame, space))| !frame.matches_action_space(space))
+    {
+        return Err(ModelError::BatchFrameActionSpaceMismatch { index });
+    }
+    Ok(())
+}
+
+fn validate_sampling_rng_count(frame_count: usize, rng_count: usize) -> Result<(), ModelError> {
+    if rng_count != frame_count {
+        return Err(ModelError::SamplingRngCount {
+            rngs: rng_count,
+            frames: frame_count,
+        });
+    }
+    Ok(())
+}
+
 pub(crate) fn validate_batch_count(count: usize) -> Result<(), ModelError> {
     if count == 0 {
         return Err(ModelError::EmptyBatch);
@@ -3403,6 +3643,235 @@ fn training_slot_indices(prefixes: &[TrainingPrefix], ability: bool) -> (Vec<u32
     (indices, presence)
 }
 
+fn sampling_prefixes(rows: &[SamplingRow]) -> Vec<TrainingPrefix> {
+    rows.iter().map(|row| row.prefix).collect()
+}
+
+fn batch_row_rng<'a>(rngs: &'a mut Option<&mut [PpoRng]>, index: usize) -> Option<&'a mut PpoRng> {
+    rngs.as_deref_mut().map(|rngs| {
+        assert!(index < rngs.len());
+        &mut rngs[index]
+    })
+}
+
+fn initialize_sampling_rows(
+    logits: &SamplingBaseLogits,
+    action_spaces: &[ActionSpace],
+    rngs: &mut Option<&mut [PpoRng]>,
+) -> Result<Vec<SamplingRow>, ModelError> {
+    if logits.value.len() != action_spaces.len() || logits.kind.len() != action_spaces.len() {
+        return Err(ModelError::InvalidModelState("sampling base batch shape"));
+    }
+    let mut rows = Vec::with_capacity(action_spaces.len());
+    for (index, space) in action_spaces.iter().enumerate() {
+        let value = logits.value[index];
+        if !value.is_finite() {
+            return Err(ModelError::NonFiniteOutput {
+                field: "value",
+                batch: index,
+                index: 0,
+            });
+        }
+        let raw = finite_sampling_array("kind", index, &logits.kind)?;
+        let perturbed = perturb_logits(raw, batch_row_rng(rngs, index))?;
+        let selected = masked_argmax(&perturbed, space.kind_mask().as_array())?;
+        let kind = ActionKind::from_index(selected)
+            .ok_or(ModelError::InvalidModelState("sampling action kind"))?;
+        let mut observed = SampledPathLogits::default();
+        let mut sampled = SampledPathLogits::default();
+        observed.kind = Some(raw);
+        sampled.kind = Some(perturbed);
+        rows.push(SamplingRow {
+            value,
+            prefix: TrainingPrefix::new(kind, None, None),
+            observed,
+            perturbed: sampled,
+        });
+    }
+    Ok(rows)
+}
+
+fn select_sampling_units(
+    rows: &mut [SamplingRow],
+    logits: &SamplingKindLogits,
+    action_spaces: &[ActionSpace],
+    rngs: &mut Option<&mut [PpoRng]>,
+) -> Result<(), ModelError> {
+    for index in 0..rows.len() {
+        let kind = rows[index].prefix.kind();
+        if matches!(kind, ActionKind::Continue | ActionKind::Learn) {
+            continue;
+        }
+        let scores = sample_sampling_head(
+            "controlled",
+            index,
+            &logits.controlled,
+            batch_row_rng(rngs, index),
+            &mut rows[index].observed.controlled,
+            &mut rows[index].perturbed.controlled,
+        )?;
+        let mask = action_spaces[index].controlled_unit_mask(kind);
+        let selected = masked_argmax(&scores, mask.as_array())?;
+        let unit = [ControlledUnit::Hero, ControlledUnit::Courier]
+            .get(selected)
+            .copied()
+            .ok_or(ModelError::InvalidModelState("sampling controlled unit"))?;
+        rows[index].prefix = TrainingPrefix::new(kind, Some(unit), None);
+    }
+    Ok(())
+}
+
+fn select_sampling_slots(
+    rows: &mut [SamplingRow],
+    logits: &SamplingUnitLogits,
+    action_spaces: &[ActionSpace],
+    rngs: &mut Option<&mut [PpoRng]>,
+) -> Result<(), ModelError> {
+    for index in 0..rows.len() {
+        let Some(slot) = select_sampling_slot(
+            index,
+            &mut rows[index],
+            logits,
+            &action_spaces[index],
+            batch_row_rng(rngs, index),
+        )?
+        else {
+            continue;
+        };
+        let prefix = rows[index].prefix;
+        rows[index].prefix = TrainingPrefix::new(prefix.kind(), prefix.unit(), Some(slot));
+    }
+    Ok(())
+}
+
+fn select_sampling_slot(
+    batch: usize,
+    row: &mut SamplingRow,
+    logits: &SamplingUnitLogits,
+    space: &ActionSpace,
+    rng: Option<&mut PpoRng>,
+) -> Result<Option<TrainingSlot>, ModelError> {
+    let kind = row.prefix.kind();
+    let unit = row.prefix.unit();
+    match (kind, unit) {
+        (ActionKind::Cast, Some(unit)) => {
+            let scores = sample_sampling_head(
+                "ability",
+                batch,
+                &logits.ability,
+                rng,
+                &mut row.observed.ability,
+                &mut row.perturbed.ability,
+            )?;
+            let mask = padded_mask::<MODEL_ABILITY_HEAD>(&space.ability_slot_mask(unit))?;
+            let selected = masked_argmax(&scores, &mask)?;
+            Ok(Some(TrainingSlot::Ability(TrainingAbilitySlot::new(
+                selected,
+            )?)))
+        }
+        (kind, Some(_)) if kind_has_item_slot_context(kind) => {
+            select_sampling_item_slot(batch, row, logits, space, rng).map(Some)
+        }
+        _ => Ok(None),
+    }
+}
+
+const fn kind_has_item_slot_context(kind: ActionKind) -> bool {
+    matches!(
+        kind,
+        ActionKind::Use | ActionKind::PutPoint | ActionKind::PutUnit | ActionKind::Swap
+    )
+}
+
+fn select_sampling_item_slot(
+    batch: usize,
+    row: &mut SamplingRow,
+    logits: &SamplingUnitLogits,
+    space: &ActionSpace,
+    rng: Option<&mut PpoRng>,
+) -> Result<TrainingSlot, ModelError> {
+    let kind = row.prefix.kind();
+    let unit = row
+        .prefix
+        .unit()
+        .ok_or(ModelError::InvalidModelState("sampling item-slot unit"))?;
+    let scores = sample_sampling_head(
+        "item",
+        batch,
+        &logits.item,
+        rng,
+        &mut row.observed.item,
+        &mut row.perturbed.item,
+    )?;
+    let mask = sampling_item_slot_mask(space, kind, unit)?;
+    let selected = masked_argmax(&scores, &mask)?;
+    Ok(TrainingSlot::Item(TrainingItemSlot::new(selected)?))
+}
+
+fn sampling_item_slot_mask(
+    space: &ActionSpace,
+    kind: ActionKind,
+    unit: ControlledUnit,
+) -> Result<[bool; MODEL_ITEM_HEAD], ModelError> {
+    match kind {
+        ActionKind::Use => padded_mask(&space.item_slot_mask(unit)),
+        ActionKind::PutPoint => put_point_source_mask(space, unit),
+        ActionKind::PutUnit => put_unit_source_mask(space, unit),
+        ActionKind::Swap => Ok(swap_source_mask(space, unit)),
+        _ => Err(ModelError::InvalidModelState(
+            "sampling item-slot action kind",
+        )),
+    }
+}
+
+fn finite_sampling_array<const WIDTH: usize>(
+    field: &'static str,
+    batch: usize,
+    rows: &[Vec<f32>],
+) -> Result<[f32; WIDTH], ModelError> {
+    let values = rows
+        .get(batch)
+        .ok_or(ModelError::InvalidModelState("sampling head batch shape"))?;
+    if let Some((index, _)) = values
+        .iter()
+        .enumerate()
+        .find(|(_, value)| !value.is_finite())
+    {
+        return Err(ModelError::NonFiniteOutput {
+            field,
+            batch,
+            index,
+        });
+    }
+    values
+        .as_slice()
+        .try_into()
+        .map_err(|_| ModelError::InvalidModelState("sampling decoder head shape"))
+}
+
+fn sample_sampling_head<const WIDTH: usize>(
+    field: &'static str,
+    batch: usize,
+    rows: &[Vec<f32>],
+    rng: Option<&mut PpoRng>,
+    observed: &mut Option<[f32; WIDTH]>,
+    perturbed: &mut Option<[f32; WIDTH]>,
+) -> Result<[f32; WIDTH], ModelError> {
+    if let Some(values) = *perturbed {
+        if observed.is_none() {
+            return Err(ModelError::InvalidModelState(
+                "sampling perturbed head without raw logits",
+            ));
+        }
+        return Ok(values);
+    }
+    let raw = finite_sampling_array(field, batch, rows)?;
+    let sampled = perturb_logits(raw, rng)?;
+    *observed = Some(raw);
+    *perturbed = Some(sampled);
+    Ok(sampled)
+}
+
 fn validate_tensor_finite(field: &'static str, tensor: &Tensor) -> Result<(), ModelError> {
     let width = tensor.dims().last().copied().unwrap_or(1);
     let values = tensor.flatten_all()?.to_vec1::<f32>()?;
@@ -3462,6 +3931,60 @@ struct ForwardState {
     trunk: Tensor,
     current_units: Tensor,
     points: Tensor,
+}
+
+struct SamplingBaseLogits {
+    value: Vec<f32>,
+    kind: Vec<Vec<f32>>,
+}
+
+struct SamplingKindLogits {
+    controlled: Vec<Vec<f32>>,
+    learn: Vec<Vec<f32>>,
+}
+
+struct SamplingUnitLogits {
+    ability: Vec<Vec<f32>>,
+    item: Vec<Vec<f32>>,
+    shop: Vec<Vec<f32>>,
+    loot: Vec<Vec<f32>>,
+    entity: Vec<Vec<f32>>,
+    point: Vec<Vec<f32>>,
+}
+
+struct SamplingSlotLogits {
+    swap: Vec<Vec<f32>>,
+    target_mode: Vec<Vec<f32>>,
+    put_mode: Vec<Vec<f32>>,
+    entity: Vec<Vec<f32>>,
+    point: Vec<Vec<f32>>,
+}
+
+struct SamplingLogits {
+    base: SamplingBaseLogits,
+    kind: SamplingKindLogits,
+    unit: SamplingUnitLogits,
+    slot: SamplingSlotLogits,
+}
+
+#[derive(Clone, Copy)]
+enum SamplingContext {
+    Kind,
+    Unit,
+    Slot,
+}
+
+struct SamplingRow {
+    value: f32,
+    prefix: TrainingPrefix,
+    observed: SampledPathLogits,
+    perturbed: SampledPathLogits,
+}
+
+struct BatchSelection {
+    action: StructuredAction,
+    value: f32,
+    observed: SampledPathLogits,
 }
 
 struct TrainingContexts {
@@ -4221,12 +4744,7 @@ fn decode_swap(
     kind: ActionKind,
     unit: ControlledUnit,
 ) -> Result<StructuredAction, ModelError> {
-    let mut sources = [false; 15];
-    for (index, allowed) in sources.iter_mut().enumerate() {
-        *allowed = space
-            .swap_destination_mask(unit, bota_proto::ItemSlot(index as u8))
-            .is_some_and(|row| row.contains(&true));
-    }
+    let sources = swap_source_mask(space, unit);
     let from = masked_argmax(&source.item(kind, unit)?, &sources)?;
     let row = space
         .swap_destination_mask(unit, bota_proto::ItemSlot(from as u8))
@@ -4236,6 +4754,14 @@ fn decode_swap(
         unit,
         from: bota_proto::ItemSlot(from as u8),
         to: bota_proto::ItemSlot(to as u8),
+    })
+}
+
+fn swap_source_mask(space: &ActionSpace, unit: ControlledUnit) -> [bool; MODEL_ITEM_HEAD] {
+    std::array::from_fn(|index| {
+        space
+            .swap_destination_mask(unit, bota_proto::ItemSlot(index as u8))
+            .is_some_and(|row| row.contains(&true))
     })
 }
 
@@ -4405,11 +4931,202 @@ fn sampled_head_statistics<const WIDTH: usize>(
     host_head_statistics(logits, target)
 }
 
+fn decode_batch_rows(
+    action_spaces: &[ActionSpace],
+    rngs: &mut Option<&mut [PpoRng]>,
+    rows: Vec<SamplingRow>,
+    logits: SamplingLogits,
+) -> Result<Vec<BatchSelection>, ModelError> {
+    let mut selections = Vec::with_capacity(rows.len());
+    for (index, row) in rows.into_iter().enumerate() {
+        let mut source = SamplingDecoder {
+            batch: index,
+            logits: &logits,
+            rng: batch_row_rng(rngs, index),
+            observed: row.observed,
+            perturbed: row.perturbed,
+        };
+        let action = decode_from_source(&action_spaces[index], &mut source)?;
+        if !action_spaces[index].allows(action) {
+            return Err(ModelError::InvalidModelState("illegal decoded action"));
+        }
+        action_spaces[index]
+            .decode(action)
+            .map_err(|error| ModelError::Backend(error.to_string()))?;
+        selections.push(BatchSelection {
+            action,
+            value: row.value,
+            observed: source.observed,
+        });
+    }
+    Ok(selections)
+}
+
+fn finish_sampled_choices(
+    frames: &[FeatureFrame],
+    action_spaces: &[ActionSpace],
+    selections: Vec<BatchSelection>,
+    policy: PolicyIdentity,
+) -> Result<Vec<PpoPolicyChoice>, ModelError> {
+    let mut choices = Vec::with_capacity(selections.len());
+    for (index, selection) in selections.into_iter().enumerate() {
+        let action = selection.action;
+        let target = BehavioralTarget::from_action(&frames[index], &action_spaces[index], action)
+            .map_err(|error| ModelError::Backend(error.to_string()))?;
+        let (log_probability, entropy) = selection.observed.statistics(&target)?;
+        choices.push(PpoPolicyChoice {
+            frame: frames[index].clone(),
+            target,
+            action,
+            policy,
+            log_probability,
+            entropy,
+            value: selection.value,
+        });
+    }
+    Ok(choices)
+}
+
+struct SamplingDecoder<'logits, 'rng> {
+    batch: usize,
+    logits: &'logits SamplingLogits,
+    rng: Option<&'rng mut PpoRng>,
+    observed: SampledPathLogits,
+    perturbed: SampledPathLogits,
+}
+
+macro_rules! sampling_decoder_head {
+    ($source:ident, $name:literal, $rows:expr, $field:ident) => {
+        sample_sampling_head(
+            $name,
+            $source.batch,
+            $rows,
+            $source.rng.as_deref_mut(),
+            &mut $source.observed.$field,
+            &mut $source.perturbed.$field,
+        )
+    };
+}
+
+impl DecoderSource for SamplingDecoder<'_, '_> {
+    fn kind(&mut self) -> Result<[f32; 16], ModelError> {
+        sampling_decoder_head!(self, "kind", &self.logits.base.kind, kind)
+    }
+
+    fn controlled(&mut self, _: ActionKind) -> Result<[f32; 2], ModelError> {
+        sampling_decoder_head!(self, "controlled", &self.logits.kind.controlled, controlled)
+    }
+
+    fn ability(
+        &mut self,
+        _: ActionKind,
+        _: Option<ControlledUnit>,
+    ) -> Result<[f32; 8], ModelError> {
+        sampling_decoder_head!(self, "ability", &self.logits.unit.ability, ability)
+    }
+
+    fn item(&mut self, _: ActionKind, _: ControlledUnit) -> Result<[f32; 15], ModelError> {
+        sampling_decoder_head!(self, "item", &self.logits.unit.item, item)
+    }
+
+    fn swap(
+        &mut self,
+        _: ActionKind,
+        _: ControlledUnit,
+        _: usize,
+    ) -> Result<[f32; 15], ModelError> {
+        sampling_decoder_head!(self, "swap", &self.logits.slot.swap, swap)
+    }
+
+    fn learn(&mut self, _: ActionKind) -> Result<[f32; 6], ModelError> {
+        sampling_decoder_head!(self, "learn", &self.logits.kind.learn, learn)
+    }
+
+    fn shop(&mut self, _: ActionKind, _: ControlledUnit) -> Result<[f32; 64], ModelError> {
+        sampling_decoder_head!(self, "shop", &self.logits.unit.shop, shop)
+    }
+
+    fn loot(&mut self, _: ActionKind, _: ControlledUnit) -> Result<[f32; 16], ModelError> {
+        sampling_decoder_head!(self, "loot", &self.logits.unit.loot, loot)
+    }
+
+    fn target_mode(
+        &mut self,
+        _: ActionKind,
+        _: ControlledUnit,
+        _: SlotSelection,
+    ) -> Result<[f32; 3], ModelError> {
+        sampling_decoder_head!(
+            self,
+            "target mode",
+            &self.logits.slot.target_mode,
+            target_mode
+        )
+    }
+
+    fn put_mode(
+        &mut self,
+        _: ActionKind,
+        _: ControlledUnit,
+        _: usize,
+    ) -> Result<[f32; 2], ModelError> {
+        sampling_decoder_head!(self, "put mode", &self.logits.slot.put_mode, put_mode)
+    }
+
+    fn entity(
+        &mut self,
+        _: ActionKind,
+        _: ControlledUnit,
+        slot: Option<SlotSelection>,
+    ) -> Result<[f32; 96], ModelError> {
+        let rows = if slot.is_some() {
+            &self.logits.slot.entity
+        } else {
+            &self.logits.unit.entity
+        };
+        sampling_decoder_head!(self, "entity pointer", rows, entity_pointer)
+    }
+
+    fn point(
+        &mut self,
+        _: ActionKind,
+        _: ControlledUnit,
+        slot: Option<SlotSelection>,
+    ) -> Result<[f32; 48], ModelError> {
+        let rows = if slot.is_some() {
+            &self.logits.slot.point
+        } else {
+            &self.logits.unit.point
+        };
+        sampling_decoder_head!(self, "point pointer", rows, point_pointer)
+    }
+}
+
 struct ModelDecoder<'model, 'rng> {
     model: &'model PolicyModel,
     state: ForwardState,
     rng: Option<&'rng mut PpoRng>,
     observed: Option<SampledPathLogits>,
+}
+
+fn perturb_logits<const SIZE: usize>(
+    mut logits: [f32; SIZE],
+    rng: Option<&mut PpoRng>,
+) -> Result<[f32; SIZE], ModelError> {
+    let Some(rng) = rng else {
+        return Ok(logits);
+    };
+    for logit in &mut logits {
+        let uniform = rng
+            .uniform_open()
+            .map_err(|error| ModelError::Backend(error.to_string()))?;
+        let noise = -(-uniform.ln()).ln();
+        *logit += noise as f32;
+        if !logit.is_finite() {
+            return Err(ModelError::InvalidModelState("sampling noise"));
+        }
+    }
+    Ok(logits)
 }
 
 fn finite_array<const SIZE: usize>(
@@ -4435,22 +5152,9 @@ fn finite_array<const SIZE: usize>(
 impl ModelDecoder<'_, '_> {
     fn perturb<const SIZE: usize>(
         &mut self,
-        mut logits: [f32; SIZE],
+        logits: [f32; SIZE],
     ) -> Result<[f32; SIZE], ModelError> {
-        let Some(rng) = self.rng.as_deref_mut() else {
-            return Ok(logits);
-        };
-        for logit in &mut logits {
-            let uniform = rng
-                .uniform_open()
-                .map_err(|error| ModelError::Backend(error.to_string()))?;
-            let noise = -(-uniform.ln()).ln();
-            *logit += noise as f32;
-            if !logit.is_finite() {
-                return Err(ModelError::InvalidModelState("sampling noise"));
-            }
-        }
-        Ok(logits)
+        perturb_logits(logits, self.rng.as_deref_mut())
     }
 
     fn context(

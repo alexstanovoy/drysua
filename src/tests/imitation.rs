@@ -20,10 +20,10 @@ use crate::{
 
 #[test]
 fn action_and_training_schema_identities_are_stable() {
-    assert_eq!(ACTION_SCHEMA_VERSION, 1);
-    assert_eq!(ACTION_SCHEMA_HASH, 17_797_499_074_169_920_257);
+    assert_eq!(ACTION_SCHEMA_VERSION, 2);
+    assert_eq!(ACTION_SCHEMA_HASH, 1_018_254_919_734_743_331);
     assert_eq!(crate::IMITATION_OPTIMIZER_VERSION, 2);
-    assert_eq!(crate::IMITATION_RULES_AUDIT_VERSION, 11);
+    assert_eq!(crate::IMITATION_RULES_AUDIT_VERSION, 12);
 }
 
 #[test]
@@ -43,7 +43,7 @@ fn target_reconstructs_every_family_with_exact_active_path() {
 }
 
 #[test]
-fn target_modes_are_all_reconstructed_without_skipped_cases() {
+fn target_modes_and_the_safe_put_mode_reconstruct_without_skipped_cases() {
     for (aim, mode) in [(Aim::Own, 0), (Aim::Unit, 1), (Aim::Point, 2)] {
         for kind in [ActionKind::Cast, ActionKind::Use] {
             let (frame, space) = fixture_with_aim(aim, kind);
@@ -56,14 +56,11 @@ fn target_modes_are_all_reconstructed_without_skipped_cases() {
         }
     }
     let (frame, space) = complete_fixture_for(ImitationSide::Radiant);
-    for mode in 0..2 {
-        let mut logits = DecoderLogits::favor(ActionKind::PutPoint);
-        logits.put_mode[mode] = 10.0;
-        let action = decode_with_logits(&space, &logits).expect("put action");
-        let target = BehavioralTarget::from_action(&frame, &space, action).expect("target");
-        assert_eq!(target.put_mode.selected, mode);
-        assert_eq!(target.reconstruct_action().expect("reconstructed"), action);
-    }
+    let logits = DecoderLogits::favor(ActionKind::PutPoint);
+    let action = decode_with_logits(&space, &logits).expect("put action");
+    let target = BehavioralTarget::from_action(&frame, &space, action).expect("target");
+    assert_eq!(target.put_mode.selected, 0);
+    assert_eq!(target.reconstruct_action().expect("reconstructed"), action);
 }
 
 #[test]

@@ -876,6 +876,7 @@ fn item(id: ItemId, aim: Option<Aim>, range: i32, charges: Option<u8>) -> ItemVi
         id,
         charges,
         cooldown_left: 0,
+        mute_left: 0,
         mode: None,
         mana_cost: 0,
         range,

@@ -691,7 +691,7 @@ runtime evidence между процессами и не входит в feature
 | Параметр | Значение |
 |---|---:|
 | Decision interval | 3 ticks |
-| Rollout length | 256 decisions |
+| Rollout length | 2048 decisions |
 | Environments | 32-128 |
 | Samples/update | 8192-32768 |
 | PPO epochs | 4 |
@@ -759,7 +759,7 @@ Server и builtin Arena завершают каждый Snapshot явным Even
 Policy принимает решение только после этой tick-complete границы и не принимает решений
 до первого tick после pregame. Production arenas
 образуют полные frozen-policy side pairs.
-Current PPO contract: schema v11, hash `14036018647835121198`, rules audit v11.
+Current PPO contract: schema v13, hash `11103744726312279053`, rules audit v12.
 
 ## 15. Reward
 
@@ -839,7 +839,7 @@ Truncated matches считаются Draw и не превращаются в п
 промежуточным public statistics. Promotion требует минимум 20 disjoint paired seeds,
 1000 candidate actions, rejection rate ниже 0.1%, отсутствия regression на каждой стороне
 и opaque exploit audit, привязанный к candidate и accepted fingerprints. Stage-ten
-Current league contract: schema v12, hash `16404031783910159806`, rules audit v11.
+Current league contract: schema v14, hash `17777936678124847825`, rules audit v12.
 
 ## 17. GPU и actor-learner pipeline
 
@@ -887,7 +887,7 @@ Padding выполняется только при сборке minibatch.
 Metal выбираются явно через `PolicyDevice`; параметры, forward, loss и backward находятся на
 выбранном backend. Rollout хранит sparse token rows в typed arenas с проверяемыми offsets,
 bit-packed legal masks и разворачивает fixed padding только для текущего minibatch. Model
-schema v6, hash `50716688465199424`; PPO schema v11, hash `14036018647835121198`.
+schema v7, hash `10644717168650027237`; PPO schema v13, hash `11103744726312279053`.
 
 ## 18. Checkpoints
 

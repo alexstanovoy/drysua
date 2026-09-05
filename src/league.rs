@@ -31,16 +31,16 @@ pub const LEAGUE_MIN_EXPLOIT_PAIRS: usize = 2;
 /// Minimum candidate actions required in the exploit-regression namespace.
 pub const LEAGUE_MIN_EXPLOIT_ACTIONS: u64 = 100;
 /// Stage-ten league contract version.
-pub const LEAGUE_SCHEMA_VERSION: u32 = 12;
+pub const LEAGUE_SCHEMA_VERSION: u32 = 14;
 /// Audited simulator rules required by stage-ten league artifacts.
-pub const LEAGUE_RULES_AUDIT_VERSION: u32 = 11;
+pub const LEAGUE_RULES_AUDIT_VERSION: u32 = 12;
 /// Canonical stage-ten frozen-policy, scheduling, retention, and promotion contract.
 pub const LEAGUE_SCHEMA_DESCRIPTOR: &str = concat!(
-    "bota-drysua-league/v12;",
-    "action_schema_version=1;action_schema_hash=17797499074169920257;",
-    "feature_schema_version=6;feature_schema_hash=7342404552083153243;",
-    "model_schema_version=6;model_schema_hash=50716688465199424;",
-    "ppo_schema_version=11;ppo_schema_hash=14036018647835121198;rules_audit=11;",
+    "bota-drysua-league/v14;",
+    "action_schema_version=2;action_schema_hash=1018254919734743331;",
+    "feature_schema_version=7;feature_schema_hash=13875648161437731669;",
+    "model_schema_version=7;model_schema_hash=10644717168650027237;",
+    "ppo_schema_version=13;ppo_schema_hash=11103744726312279053;rules_audit=12;",
     "opponents=current30,accepted25,historical25,teacher15,weak5,frozen_per_rollout;",
     "league=capacity32,minimum9,protect_anchor_accepted_strongest_recent4,evict_nearest_cross_play_profile;",
     "snapshot=immutable_finite_f32_parameters,stable_parameter_fingerprint,generation;",
@@ -66,14 +66,14 @@ const fn league_fnv1a(bytes: &[u8]) -> u64 {
 /// Stable FNV-1a hash of [`LEAGUE_SCHEMA_DESCRIPTOR`].
 pub const LEAGUE_SCHEMA_HASH: u64 = league_fnv1a(LEAGUE_SCHEMA_DESCRIPTOR.as_bytes());
 
-const _: () = assert!(ACTION_SCHEMA_VERSION == 1);
-const _: () = assert!(ACTION_SCHEMA_HASH == 17_797_499_074_169_920_257);
-const _: () = assert!(FEATURE_SCHEMA_VERSION == 6);
-const _: () = assert!(FEATURE_SCHEMA_HASH == 7_342_404_552_083_153_243);
-const _: () = assert!(MODEL_SCHEMA_VERSION == 6);
-const _: () = assert!(MODEL_SCHEMA_HASH == 50_716_688_465_199_424);
-const _: () = assert!(PPO_SCHEMA_VERSION == 11);
-const _: () = assert!(PPO_SCHEMA_HASH == 14_036_018_647_835_121_198);
+const _: () = assert!(ACTION_SCHEMA_VERSION == 2);
+const _: () = assert!(ACTION_SCHEMA_HASH == 1_018_254_919_734_743_331);
+const _: () = assert!(FEATURE_SCHEMA_VERSION == 7);
+const _: () = assert!(FEATURE_SCHEMA_HASH == 13_875_648_161_437_731_669);
+const _: () = assert!(MODEL_SCHEMA_VERSION == 7);
+const _: () = assert!(MODEL_SCHEMA_HASH == 10_644_717_168_650_027_237);
+const _: () = assert!(PPO_SCHEMA_VERSION == 13);
+const _: () = assert!(PPO_SCHEMA_HASH == 11_103_744_726_312_279_053);
 
 static NEXT_SNAPSHOT_ID: AtomicU64 = AtomicU64::new(1);
 

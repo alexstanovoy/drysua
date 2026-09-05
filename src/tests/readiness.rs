@@ -64,6 +64,52 @@ fn backpack_swap_mutes_the_landing_inventory_slot_until_mute_expiry() {
 }
 
 #[test]
+fn reverse_backpack_swap_mutes_the_inventory_slot_receiving_the_backpack_item() {
+    let mut readiness = ItemReadiness::new();
+    let mut hero_items: Vec<Option<ItemView>> = vec![None; 9];
+    hero_items[2] = Some(usable_item());
+    hero_items[7] = Some(usable_item());
+    let space = space_at(1, &hero_items, &[None; 6], &readiness);
+    let swap = space
+        .decode(StructuredAction::Swap {
+            unit: ControlledUnit::Hero,
+            from: ItemSlot(2),
+            to: ItemSlot(7),
+        })
+        .expect("swap decodes")
+        .expect("swap is a wire order");
+
+    readiness.note_sent(1, swap, &space);
+
+    assert_eq!(
+        readiness.inventory_mute_left(ControlledUnit::Hero, ItemSlot(2), 2),
+        Some(BACKPACK_MUTE_TICKS)
+    );
+}
+
+#[test]
+fn active_inventory_swap_conservatively_follows_an_existing_mute() {
+    let mut readiness = ItemReadiness::new();
+    note_swap_timer(&mut readiness, 1, 1, ItemSlot(2));
+    let mut hero_items: Vec<Option<ItemView>> = vec![None; 9];
+    hero_items[2] = Some(usable_item());
+    hero_items[3] = Some(usable_item());
+    let space = space_at(2, &hero_items, &[None; 6], &readiness);
+    let swap = space
+        .decode(StructuredAction::Swap {
+            unit: ControlledUnit::Hero,
+            from: ItemSlot(2),
+            to: ItemSlot(3),
+        })
+        .expect("swap decodes")
+        .expect("swap is a wire order");
+
+    readiness.note_sent(2, swap, &space);
+
+    assert!(readiness.inventory_muted(ControlledUnit::Hero, ItemSlot(3), 3));
+}
+
+#[test]
 fn rejected_swap_rolls_back_the_mute_by_sequence() {
     let mut readiness = ItemReadiness::new();
     let mut hero_items: Vec<Option<ItemView>> = vec![None; 9];
@@ -193,7 +239,7 @@ fn rejection_does_not_change_other_readiness_channels() {
 }
 
 #[test]
-fn inventory_to_inventory_and_courier_swaps_never_mute() {
+fn ready_inventory_courier_and_backpack_only_swaps_never_add_a_mute() {
     let mut readiness = ItemReadiness::new();
     let mut hero_items: Vec<Option<ItemView>> = vec![None; 9];
     hero_items[1] = Some(usable_item());
@@ -598,6 +644,7 @@ fn usable_item() -> ItemView {
         id: TOWN_PORTAL_SCROLL,
         charges: Some(1),
         cooldown_left: 0,
+        mute_left: 0,
         mode: None,
         mana_cost: 0,
         range: 0,

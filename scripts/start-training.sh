@@ -2,8 +2,8 @@
 set -euo pipefail
 umask 077
 
-if (( $# < 1 || $# > 3 )); then
-    printf 'usage: %s RUN_DIRECTORY [TOTAL_UPDATES] [fresh|resume|migrate]\n' "$0" >&2
+if (( $# < 1 || $# > 4 )); then
+    printf 'usage: %s RUN_DIRECTORY [TOTAL_UPDATES] [fresh|resume|migrate] [INITIAL_WEIGHTS_DIRECTORY]\n' "$0" >&2
     exit 2
 fi
 
@@ -20,8 +20,9 @@ if [[ -L $repository/artifacts/temp ]]; then
 fi
 temporary_artifacts=$(realpath "$repository/artifacts/temp")
 run_directory=$(realpath -m "$1")
-total_updates=${2:-50000}
+total_updates=${2:-200}
 mode=${3:-fresh}
+initial_weights=${4:-}
 checkpoint_directory="$run_directory/checkpoint"
 log_file="$run_directory/training.log"
 pid_file="$run_directory/training.pid"
@@ -32,7 +33,8 @@ if [[ $run_directory != "$temporary_artifacts/"* ]]; then
     exit 2
 fi
 
-maximum_updates=$((1000000000 / (4 * 8 * 132)))
+samples_per_update=$((4 * 2048))
+maximum_updates=$((1000000000 / (4 * (samples_per_update - 1))))
 if [[ ! $total_updates =~ ^[0-9]+$ ]] || (( total_updates < 1 || total_updates > maximum_updates )); then
     printf 'TOTAL_UPDATES must be in 1..%s for the fixed checkpoint-safe rollout.\n' "$maximum_updates" >&2
     exit 2
@@ -40,6 +42,19 @@ fi
 if [[ $mode != fresh && $mode != resume && $mode != migrate ]]; then
     printf 'mode must be fresh, resume, or migrate.\n' >&2
     exit 2
+fi
+if [[ $mode != fresh && -n $initial_weights ]]; then
+    printf 'INITIAL_WEIGHTS_DIRECTORY is accepted only for a fresh run.\n' >&2
+    exit 2
+fi
+initial_weights_argument=()
+if [[ -n $initial_weights ]]; then
+    initial_weights=$(realpath "$initial_weights")
+    if [[ $initial_weights != "$repository/artifacts/"* || ! -d $initial_weights || -L $initial_weights ]]; then
+        printf 'INITIAL_WEIGHTS_DIRECTORY must be a real directory below %s/artifacts.\n' "$repository" >&2
+        exit 2
+    fi
+    initial_weights_argument=(--initial-weights "$initial_weights")
 fi
 if [[ $mode == fresh && -e $run_directory ]]; then
     printf 'fresh run directory already exists: %s\n' "$run_directory" >&2
@@ -198,15 +213,16 @@ command=(
     "$binary" train-full
     --updates "$total_updates"
     --environments 4
-    --rollout 8
-    --epochs 1
-    --minibatch 32
+    --rollout 2048
+    --epochs 4
+    --minibatch 2048
     --checkpoint-seconds 300
     --checkpoint-directory "$checkpoint_directory"
     --seed 9001
     --map 1
     --device cuda
     --device-ordinal 0
+    "${initial_weights_argument[@]}"
     "${resume_argument[@]}"
 )
 

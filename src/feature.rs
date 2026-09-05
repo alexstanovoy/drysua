@@ -22,7 +22,7 @@ use crate::{
 };
 
 /// Version of the append-only policy feature schema.
-pub const FEATURE_SCHEMA_VERSION: u32 = 6;
+pub const FEATURE_SCHEMA_VERSION: u32 = 7;
 /// Number of scalar global features.
 pub const GLOBAL_FEATURES: usize = 64;
 /// Number of scalar features in one global-history sample.
@@ -362,7 +362,7 @@ pub mod loot_feature {
 
 /// Canonical schema text covered by [`FEATURE_SCHEMA_HASH`].
 pub const FEATURE_SCHEMA_DESCRIPTOR: &str = concat!(
-    "bota-drysua-feature/v6;",
+    "bota-drysua-feature/v7;",
     "shapes=global:64,history:7x24,policy_history:16x4,unit:96x69,own_unit:2x69,remembered_unit:32x69,point:48x32,ability:14x24,item:85x28,projectile:32x20,loot:16x16,map:96;",
     "scalar_ranges=presence_and_one_hot:[0,1],unsigned_continuous:[0,1],signed_continuous:[-1,1],category:positive_exact_integer,all_finite;",
     "history_ages=480,240,120,60,30,15,0;",
@@ -389,7 +389,7 @@ pub const FEATURE_SCHEMA_DESCRIPTOR: &str = concat!(
     "visibility=allied_current_units,positive_vision_radius,within_radius,target_elevation_not_above_viewer,exact_fixed_point_supercover_line,intermediate_opaque_or_higher_cell_blocks,corner_touch_checks_both_cells;",
     "trees=opaque_cells_include_static_map_tree_cells,static_occupancy_baseline,dynamic_delta_proof_requires_live_allied_body_in_same_or_adjacent_cell,proof_ignores_all_dynamic_tree_entries,local_felled_unblocks_passability_and_tree_mask,local_planted_blocks_passability_and_enters_tree_mask,remote_dynamic_changes_invariant,no_hidden_dynamic_blocker_channel;",
     "events=input_batch_cap:payload_len_div_2:2097152_reject_before_mutation,snapshot_event_journal_cap64,only_ticks_strictly_before_snapshot,same_tick_delivery_cannot_overwrite_or_evict_prior_snapshot_features,ability_cast_age_per_caster_and_ability,combat_phase_for_any_tracked_source;",
-    "readiness=backpack_mute:180_from_apply_tick,teleport_shared_wait:2100_from_apply_tick,hero_inventory_journals6,body_shared_journals2,recent_request_cap8,effective_evicted_base_retained,rejection_exact_for_retained_sequences,evicted_sequence_rejection_unsupported,retained_rejections_restore_base;",
+    "readiness=wire_item_mute_exact,local_backpack_mute:180_from_apply_tick,effective_mute_max_wire_and_local,teleport_shared_wait:2100_from_apply_tick,hero_inventory_journals6,body_shared_journals2,recent_request_cap8,effective_evicted_base_retained,rejection_exact_for_retained_sequences,evicted_sequence_rejection_unsupported,retained_rejections_restore_base;",
     "local_rollback=active_assignment_transition_cap16,evicted_effective_base_retained,earliest_supported_tick_tracked,rollback_before_horizon_exact_error_and_atomic,decision_eviction_advances_horizon_to_incoming_tick;",
     "active_target=opaque_local_point_or_full_generation_unit_key_never_encoded_as_identifier,canonical_relative_position_distance,point_or_unit,visibility,unit_kind_and_relation;",
     "own_payloads=live_body_current,hero_scoreboard_kit_current_with_source_bit,absent_courier_ability_and_item_payloads_missing,no_remembered_body_payload_fallback;",
@@ -2770,11 +2770,13 @@ fn encode_owned_item(
     };
     encode_item_view(&mut token, tracker.shop(), item);
     let wire_slot = ItemSlot(u8::try_from(slot).unwrap_or(u8::MAX));
-    if let Some(left) = readiness.inventory_mute_left(unit, wire_slot, tick) {
-        token[item_feature::MUTE_REMAINING_PRESENT] = 1.0;
-        token[item_feature::MUTE_REMAINING] = unit_ratio(left, MAX_COOLDOWN as u32);
-        token[item_feature::MUTED] = bool_feature(left > 0);
-    }
+    let local_mute = readiness
+        .inventory_mute_left(unit, wire_slot, tick)
+        .unwrap_or(0);
+    let mute_left = item.mute_left.max(local_mute);
+    token[item_feature::MUTE_REMAINING_PRESENT] = 1.0;
+    token[item_feature::MUTE_REMAINING] = unit_ratio(mute_left, MAX_COOLDOWN as u32);
+    token[item_feature::MUTED] = bool_feature(mute_left > 0);
     if location != 2
         && let Some(left) = readiness.shared_wait_left(unit, item.id, tick)
     {

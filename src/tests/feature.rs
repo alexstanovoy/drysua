@@ -26,8 +26,8 @@ const ENEMY: EntityId = entity(20, 1);
 
 #[test]
 fn feature_schema_dimensions_and_hash_are_stable() {
-    assert_eq!(FEATURE_SCHEMA_VERSION, 6);
-    assert_eq!(FEATURE_SCHEMA_HASH, 7_342_404_552_083_153_243);
+    assert_eq!(FEATURE_SCHEMA_VERSION, 7);
+    assert_eq!(FEATURE_SCHEMA_HASH, 13_875_648_161_437_731_669);
     assert_eq!(GLOBAL_FEATURES, 64);
     assert_eq!((HISTORY_SAMPLES, HISTORY_FEATURES), (7, 24));
     assert_eq!((MAX_POLICY_HISTORY, POLICY_HISTORY_FEATURES), (16, 4));
@@ -1319,6 +1319,22 @@ fn readiness_timers_encode_known_zero_active_and_boundary_values() {
 }
 
 #[test]
+fn projected_item_mute_is_encoded_without_local_swap_history() {
+    let mut view = world_view(Team::Radiant, 10);
+    let hero_index = unit_index(&view, HERO);
+    let mut muted = item(ItemId(2));
+    muted.mute_left = 90;
+    view.units[hero_index].items[2] = Some(muted);
+    let tracker = tracker_with_view(Team::Radiant, view);
+
+    let frame = encode(&tracker, &LocalPolicyState::new(0));
+
+    assert_eq!(frame.items[2][item_feature::MUTE_REMAINING_PRESENT], 1.0);
+    assert_eq!(frame.items[2][item_feature::MUTED], 1.0);
+    assert!(frame.items[2][item_feature::MUTE_REMAINING] > 0.0);
+}
+
+#[test]
 fn first_projectile_and_loot_observation_marks_age_and_velocity_missing() {
     let frame = encoded_frame(Team::Radiant, world_view(Team::Radiant, 100));
 
@@ -2498,6 +2514,7 @@ fn item(id: ItemId) -> ItemView {
         id,
         charges: Some(2),
         cooldown_left: 0,
+        mute_left: 0,
         mode: None,
         mana_cost: 0,
         range: 0,

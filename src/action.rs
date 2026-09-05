@@ -17,9 +17,9 @@ use crate::{
 /// Distance at which drysua permits stash swaps around the own fountain.
 pub const STASH_ACCESS_RANGE: i32 = 1_000;
 /// Version of the append-only structured-action schema.
-pub const ACTION_SCHEMA_VERSION: u32 = 1;
+pub const ACTION_SCHEMA_VERSION: u32 = 2;
 /// Canonical action families, head widths, and autoregressive branch order.
-pub const ACTION_SCHEMA_DESCRIPTOR: &str = "bota-drysua-action/v1;kinds=Continue,Stop,MovePoint,FollowUnit,Hold,AttackMovePoint,AttackUnit,Cast,Use,PutPoint,PutUnit,Take,Buy,Sell,Swap,Learn;heads=kind16,controlled2,ability8,item15,swap15,learn6,shop64,loot16,target_mode3,put_mode2,entity96,point48;target_modes=None,Entity,Point;put_modes=Underfoot,Point;";
+pub const ACTION_SCHEMA_DESCRIPTOR: &str = "bota-drysua-action/v2;kinds=Continue,Stop,MovePoint,FollowUnit,Hold,AttackMovePoint,AttackUnit,Cast,Use,PutPoint,PutUnit,Take,Buy,Sell,Swap,Learn;heads=kind16,controlled2,ability8,item15,swap15,learn6,shop64,loot16,target_mode3,put_mode2,entity96,point48;target_modes=None,Entity,Point;put_modes=Underfoot,Point;put_point_legality=underfoot_only;";
 /// Stable FNV-1a identity of [`ACTION_SCHEMA_DESCRIPTOR`].
 pub const ACTION_SCHEMA_HASH: u64 = action_schema_hash(ACTION_SCHEMA_DESCRIPTOR.as_bytes());
 
@@ -2143,6 +2143,7 @@ fn fill_use_masks(
             continue;
         };
         let ready = item.cooldown_left == 0
+            && item.mute_left == 0
             && item.charges != Some(0)
             && state.unit.mana >= item.mana_cost
             && !has_status(&state.unit, StatusFlags::STUNNED)
@@ -2244,11 +2245,7 @@ fn fill_put_masks(
         let held = state.unit.items.get(source).is_some_and(Option::is_some);
         masks.put_points.push(PutPointMask {
             underfoot: held && underfoot,
-            points: space
-                .points
-                .iter()
-                .map(|point| held && point.walkable)
-                .collect(),
+            points: vec![false; space.points.len()],
         });
         masks.put_units.push(
             space

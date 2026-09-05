@@ -385,8 +385,8 @@ fn adam_rejects_invalid_config_nonfinite_and_extreme_updates_without_partial_sta
 
 #[test]
 fn model_schema_and_head_dimensions_are_stable() {
-    assert_eq!(MODEL_SCHEMA_VERSION, 6);
-    assert_eq!(MODEL_SCHEMA_HASH, 50_716_688_465_199_424);
+    assert_eq!(MODEL_SCHEMA_VERSION, 7);
+    assert_eq!(MODEL_SCHEMA_HASH, 10_644_717_168_650_027_237);
     assert_eq!(MODEL_KIND_HEAD, 16);
     assert_eq!(MODEL_UNIT_HEAD, 2);
     assert_eq!(MODEL_ABILITY_HEAD, 8);
@@ -1087,7 +1087,7 @@ fn scripted_decoder_covers_every_legal_family() {
 }
 
 #[test]
-fn scripted_decoder_selects_cast_and_use_target_modes_and_put_modes() {
+fn scripted_decoder_selects_cast_use_and_safe_put_modes() {
     let tracker = tracker_with_view(Team::Radiant, world_view(Team::Radiant, 10));
     let space = ActionSpace::from_tracker(&tracker).expect("space");
     let mut cast = DecoderLogits::favor(ActionKind::Cast);
@@ -1126,14 +1126,14 @@ fn scripted_decoder_selects_cast_and_use_target_modes_and_put_modes() {
         }
     ));
 
-    let mut put_point = DecoderLogits::favor(ActionKind::PutPoint);
-    put_point.item[0] = 100.0;
-    put_point.put_mode[1] = 100.0;
-    let put_point = decode_with_logits(&space, &put_point).expect("put point");
+    let mut unsafe_put_point = DecoderLogits::favor(ActionKind::PutPoint);
+    unsafe_put_point.item[0] = 100.0;
+    unsafe_put_point.put_mode[1] = 100.0;
+    let put_point = decode_with_logits(&space, &unsafe_put_point).expect("masked put point");
     assert!(matches!(
         put_point,
         StructuredAction::PutPoint {
-            target: PutPointTarget::Point(_),
+            target: PutPointTarget::Underfoot,
             ..
         }
     ));

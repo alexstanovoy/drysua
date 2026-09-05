@@ -12,11 +12,12 @@ use super::feature::{encode, tracker_with_view, world_view};
 use crate::ActionKind;
 use crate::{
     ABILITY_FEATURE_TOKENS, ActionSpace, BehavioralTarget, ControlledUnit, ITEM_FEATURE_TOKENS,
-    LOOT_FEATURE_TOKENS, LocalPolicyState, POINT_FEATURE_TOKENS, PPO_RULES_AUDIT_VERSION,
-    PPO_SCHEMA_HASH, PPO_SCHEMA_VERSION, PPO_SHAPING_BUDGET, PPO_TERMINAL_REWARD,
-    PROJECTILE_FEATURE_TOKENS, PolicyModel, PpoConfig, PpoOutcome, PpoPolicyChoice, PpoRng,
-    PpoRollout, PpoTerminalOutcome, PpoTrainer, REMEMBERED_UNIT_FEATURE_TOKENS, RewardTracker,
-    StructuredAction, UNIT_FEATURE_TOKENS, clipped_surrogate, tick_discount,
+    LOOT_FEATURE_TOKENS, LocalPolicyState, MODEL_TRAINING_BATCH, POINT_FEATURE_TOKENS,
+    PPO_MAX_ROLLOUT_DECISIONS, PPO_RULES_AUDIT_VERSION, PPO_SCHEMA_HASH, PPO_SCHEMA_VERSION,
+    PPO_SHAPING_BUDGET, PPO_TERMINAL_REWARD, PROJECTILE_FEATURE_TOKENS, PolicyModel, PpoConfig,
+    PpoOutcome, PpoPolicyChoice, PpoRng, PpoRollout, PpoTerminalOutcome, PpoTrainer,
+    REMEMBERED_UNIT_FEATURE_TOKENS, RewardTracker, StructuredAction, UNIT_FEATURE_TOKENS,
+    clipped_surrogate, tick_discount,
 };
 
 #[test]
@@ -121,9 +122,9 @@ fn rollout_compacts_sparse_tokens_and_bit_packs_behavioral_masks_losslessly() {
 
 #[test]
 fn ppo_schema_and_rules_audit_are_stable() {
-    assert_eq!(PPO_SCHEMA_VERSION, 11);
-    assert_eq!(PPO_RULES_AUDIT_VERSION, 11);
-    assert_eq!(PPO_SCHEMA_HASH, 14_036_018_647_835_121_198);
+    assert_eq!(PPO_SCHEMA_VERSION, 13);
+    assert_eq!(PPO_RULES_AUDIT_VERSION, 12);
+    assert_eq!(PPO_SCHEMA_HASH, 11_103_744_726_312_279_053);
 }
 
 #[test]
@@ -138,7 +139,7 @@ fn ppo_config_rejects_every_unbounded_dimension() {
     );
     assert!(
         PpoConfig {
-            rollout_decisions: 257,
+            rollout_decisions: PPO_MAX_ROLLOUT_DECISIONS + 1,
             ..PpoConfig::default()
         }
         .validate()
@@ -159,6 +160,35 @@ fn ppo_config_rejects_every_unbounded_dimension() {
         }
         .validate()
         .is_err()
+    );
+}
+
+#[test]
+fn ppo_config_accepts_the_maximum_bounded_production_rollout() {
+    let config = PpoConfig {
+        environments: 16,
+        rollout_decisions: PPO_MAX_ROLLOUT_DECISIONS,
+        minibatch: 8_192,
+        ..PpoConfig::default()
+    };
+
+    config.validate().expect("maximum bounded rollout");
+}
+
+#[test]
+fn ppo_config_reports_a_sample_product_above_the_global_bound() {
+    let error = PpoConfig {
+        environments: 17,
+        rollout_decisions: PPO_MAX_ROLLOUT_DECISIONS,
+        minibatch: 8_192,
+        ..PpoConfig::default()
+    }
+    .validate()
+    .expect_err("sample product exceeds the global rollout buffer");
+
+    assert_eq!(
+        error.to_string(),
+        "invalid PPO config field: samples per update"
     );
 }
 
@@ -205,6 +235,225 @@ fn sampled_action_is_legal_and_statistics_match_exactly() {
     assert!(choice.entropy >= 0.0);
     assert!(rng.draws() > 0);
     assert!(rng.draws() <= crate::PPO_MAX_POLICY_SAMPLE_DRAWS);
+}
+
+#[test]
+fn batched_sampling_matches_independent_scalar_streams_at_the_actor_batch_limit() {
+    let model = PolicyModel::fresh(9_101).expect("model");
+    let (frames, spaces) = policy_batch_inputs();
+    let mut scalar_rngs = (0..MODEL_TRAINING_BATCH)
+        .map(|index| PpoRng::new(17 + index as u64 * 97))
+        .collect::<Vec<_>>();
+    let mut batch_rngs = scalar_rngs.clone();
+    let scalar = frames
+        .iter()
+        .zip(&spaces)
+        .zip(&mut scalar_rngs)
+        .map(|((frame, space), rng)| model.sample(frame, space, rng).expect("scalar sample"))
+        .collect::<Vec<_>>();
+
+    let batch = model
+        .sample_batch(&frames, &spaces, &mut batch_rngs)
+        .expect("batch sample");
+
+    assert_eq!(batch.len(), MODEL_TRAINING_BATCH);
+    assert!(scalar.iter().any(|choice| matches!(
+        choice.action().kind(),
+        crate::ActionKind::Cast
+            | crate::ActionKind::Use
+            | crate::ActionKind::PutPoint
+            | crate::ActionKind::PutUnit
+            | crate::ActionKind::Swap
+    )));
+    assert!(
+        scalar_rngs
+            .iter()
+            .map(PpoRng::draws)
+            .min()
+            .expect("minimum draws")
+            < scalar_rngs
+                .iter()
+                .map(PpoRng::draws)
+                .max()
+                .expect("maximum draws")
+    );
+    for (index, (batch, scalar)) in batch.iter().zip(&scalar).enumerate() {
+        assert_eq!(batch.action(), scalar.action());
+        assert_eq!(batch.policy(), scalar.policy());
+        assert!((batch.log_probability() - scalar.log_probability()).abs() <= 1.0e-5);
+        assert!((batch.entropy() - scalar.entropy()).abs() <= 1.0e-5);
+        assert!((batch.value() - scalar.value()).abs() <= 1.0e-5);
+        assert!(spaces[index].allows(batch.action()));
+        assert!(spaces[index].decode(batch.action()).is_ok());
+    }
+    for (batch, scalar) in batch_rngs.iter().zip(&scalar_rngs) {
+        assert_eq!(batch.checkpoint(), scalar.checkpoint());
+    }
+}
+
+#[test]
+fn batched_choice_matches_independent_scalar_rows_at_the_actor_batch_limit() {
+    let model = PolicyModel::fresh(9_105).expect("model");
+    let (frames, spaces) = policy_batch_inputs();
+    let identity = model.policy_identity().expect("policy identity");
+    let scalar = frames
+        .iter()
+        .zip(&spaces)
+        .map(|(frame, space)| model.choose(frame, space).expect("scalar choice"))
+        .collect::<Vec<_>>();
+
+    let batch = model.choose_batch(&frames, &spaces).expect("batch choice");
+
+    assert_eq!(batch.len(), MODEL_TRAINING_BATCH);
+    for (index, (batch, scalar)) in batch.iter().zip(&scalar).enumerate() {
+        assert_eq!(batch.action, scalar.action);
+        assert!((batch.value - scalar.value).abs() <= 1.0e-5);
+        assert!(spaces[index].allows(batch.action));
+        assert!(spaces[index].decode(batch.action).is_ok());
+    }
+    assert_eq!(model.policy_identity().expect("stable identity"), identity);
+}
+
+#[test]
+fn batched_choice_rejects_empty_mismatched_and_stale_inputs() {
+    let model = PolicyModel::fresh(9_106).expect("model");
+    let (frame, _) = frame_and_space();
+
+    assert_eq!(
+        model.choose_batch(&[], &[]).unwrap_err().to_string(),
+        "model batch must contain at least one frame"
+    );
+    assert_eq!(
+        model
+            .choose_batch(std::slice::from_ref(&frame), &[])
+            .unwrap_err()
+            .to_string(),
+        "model batch action-space count 0 differs from frame count 1"
+    );
+    let (_, stale_space) = frame_and_space();
+    assert_eq!(
+        model
+            .choose_batch(
+                std::slice::from_ref(&frame),
+                std::slice::from_ref(&stale_space),
+            )
+            .unwrap_err()
+            .to_string(),
+        "model batch frame 0 does not belong to its action space"
+    );
+}
+
+#[test]
+fn batched_sampling_rejects_empty_and_mismatched_counts_without_rng_mutation() {
+    let model = PolicyModel::fresh(9_102).expect("model");
+    let (frame, space) = frame_and_space();
+    let mut rngs = vec![PpoRng::new(21)];
+    let before = rngs.clone();
+
+    assert_eq!(
+        model
+            .sample_batch(&[], &[], &mut [])
+            .unwrap_err()
+            .to_string(),
+        "model batch must contain at least one frame"
+    );
+    let oversized = vec![frame.clone(); MODEL_TRAINING_BATCH + 1];
+    assert_eq!(
+        model
+            .sample_batch(&oversized, &[], &mut rngs)
+            .unwrap_err()
+            .to_string(),
+        format!(
+            "model batch count {} exceeds maximum {MODEL_TRAINING_BATCH}",
+            MODEL_TRAINING_BATCH + 1
+        )
+    );
+    assert_eq!(rngs, before);
+    assert_eq!(
+        model
+            .sample_batch(std::slice::from_ref(&frame), &[], &mut rngs)
+            .unwrap_err()
+            .to_string(),
+        "model batch action-space count 0 differs from frame count 1"
+    );
+    assert_eq!(rngs, before);
+    let mut extra_rngs = vec![PpoRng::new(22), PpoRng::new(23)];
+    let extra_before = extra_rngs.clone();
+    assert_eq!(
+        model
+            .sample_batch(
+                std::slice::from_ref(&frame),
+                std::slice::from_ref(&space),
+                &mut extra_rngs,
+            )
+            .unwrap_err()
+            .to_string(),
+        "model sampling RNG count 2 differs from frame count 1"
+    );
+    assert_eq!(extra_rngs, extra_before);
+}
+
+#[test]
+fn batched_sampling_rejects_stale_provenance_without_rng_mutation() {
+    let model = PolicyModel::fresh(9_103).expect("model");
+    let (frame, _) = frame_and_space();
+    let (_, stale_space) = frame_and_space();
+    let mut rngs = vec![PpoRng::new(22)];
+    let before = rngs.clone();
+
+    assert_eq!(
+        model
+            .sample_batch(
+                std::slice::from_ref(&frame),
+                std::slice::from_ref(&stale_space),
+                &mut rngs,
+            )
+            .unwrap_err()
+            .to_string(),
+        "model batch frame 0 does not belong to its action space"
+    );
+    assert_eq!(rngs, before);
+}
+
+#[test]
+fn batched_sampling_rolls_back_rng_after_a_traversed_head_fails() {
+    let model = PolicyModel::fresh(9_104).expect("model");
+    let mut parameters = vec![0.0; model.parameter_count()];
+    let kind = crate::ActionKind::Stop.index();
+    set_policy_parameter_range(&model, &mut parameters, "kind.bias", kind..kind + 1, 100.0);
+    set_policy_parameter_range(
+        &model,
+        &mut parameters,
+        "kind_embedding.weight",
+        kind * 32..(kind + 1) * 32,
+        1.0,
+    );
+    set_policy_parameter_range(
+        &model,
+        &mut parameters,
+        "controlled.weight",
+        256 * 2..288 * 2,
+        f32::MAX,
+    );
+    model
+        .import_parameters(&parameters)
+        .expect("finite parameters");
+    let (frame, space) = frame_and_space();
+    let mut rngs = vec![PpoRng::new(24)];
+    let before = rngs.clone();
+
+    assert_eq!(
+        model
+            .sample_batch(
+                std::slice::from_ref(&frame),
+                std::slice::from_ref(&space),
+                &mut rngs,
+            )
+            .unwrap_err()
+            .to_string(),
+        "model controlled output at batch 0 index 0 is non-finite"
+    );
+    assert_eq!(rngs, before);
 }
 
 #[test]
@@ -536,6 +785,46 @@ fn frame_and_space() -> (crate::FeatureFrame, ActionSpace) {
     let space = ActionSpace::from_tracker(&tracker).expect("space");
     let frame = encode(&tracker, &LocalPolicyState::new(0));
     (frame, space)
+}
+
+fn policy_batch_inputs() -> (Vec<crate::FeatureFrame>, Vec<ActionSpace>) {
+    let mut frames = Vec::with_capacity(MODEL_TRAINING_BATCH);
+    let mut spaces = Vec::with_capacity(MODEL_TRAINING_BATCH);
+    for index in 0..MODEL_TRAINING_BATCH {
+        let team = if index.is_multiple_of(2) {
+            Team::Radiant
+        } else {
+            Team::Dire
+        };
+        let tracker = tracker_with_view(team, world_view(team, 10 + index as u32));
+        let space = ActionSpace::from_tracker(&tracker).expect("action space");
+        let mut frame = encode(&tracker, &LocalPolicyState::new(0));
+        frame.global[63] = index as f32 / MODEL_TRAINING_BATCH as f32;
+        frames.push(frame);
+        spaces.push(space);
+    }
+    (frames, spaces)
+}
+
+fn set_policy_parameter_range(
+    model: &PolicyModel,
+    parameters: &mut [f32],
+    target: &str,
+    range: std::ops::Range<usize>,
+    value: f32,
+) {
+    let mut offset = 0usize;
+    for (name, shape) in model.parameter_schema().expect("parameter schema") {
+        let count = shape.iter().product::<usize>();
+        if name == target {
+            assert!(range.start <= range.end);
+            assert!(range.end <= count);
+            parameters[offset + range.start..offset + range.end].fill(value);
+            return;
+        }
+        offset += count;
+    }
+    panic!("missing model parameter {target}");
 }
 
 fn choice(
@@ -939,6 +1228,15 @@ fn production_warmup_phases_cover_pregame_and_active_match_ticks() {
 
 #[cfg(feature = "builtin")]
 #[test]
+fn production_warmup_cycle_has_a_fixed_discarded_decision_budget() {
+    let decisions = (0..8).map(crate::training_warmup_decisions).sum::<usize>();
+
+    assert_eq!(decisions, 7_650);
+    assert_eq!(decisions * 2 * 2, 30_600);
+}
+
+#[cfg(feature = "builtin")]
+#[test]
 fn production_training_alternates_policy_side_for_odd_environment_counts() {
     assert_eq!(crate::training_policy_seat(0), 0);
     assert_eq!(crate::training_policy_seat(1), 1);
@@ -984,6 +1282,17 @@ fn production_warmup_runs_the_frozen_policy_against_the_scheduled_opponent() {
         .expect("policy warmup against Weak");
 
     assert_eq!(orders, [1, 0]);
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn batched_production_warmup_runs_both_policy_sides_without_weak_orders() {
+    let model = stop_policy_for_warmup();
+
+    let orders = crate::production_batched_warmup_order_counts_for_test(&model, 16)
+        .expect("batched policy warmup against Weak");
+
+    assert_eq!(orders, [[1, 0], [0, 1]]);
 }
 
 #[cfg(feature = "builtin")]
@@ -1285,7 +1594,7 @@ fn stop_policy_for_warmup() -> PolicyModel {
 
 #[cfg(feature = "builtin")]
 #[test]
-fn training_job_rejects_targets_that_cannot_fit_persisted_rng_counters() {
+fn training_job_rejects_targets_that_cannot_fit_shuffle_rng_counters() {
     let directory = training_test_directory("counter-bound");
     let error = crate::run_training_job_on(
         crate::TrainingJobConfig {
@@ -1306,11 +1615,11 @@ fn training_job_rejects_targets_that_cannot_fit_persisted_rng_counters() {
         false,
         |_| {},
     )
-    .expect_err("uncheckpointable actor RNG target");
+    .expect_err("uncheckpointable shuffle RNG target");
 
     assert_eq!(
         error.to_string(),
-        "invalid PPO config field: training actor RNG counter"
+        "invalid PPO config field: training shuffle RNG counter"
     );
     std::fs::remove_dir_all(directory).expect("remove checkpoint directory");
 }

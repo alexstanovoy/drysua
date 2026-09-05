@@ -1266,6 +1266,7 @@ fn item() -> ItemView {
         id: ItemId(1),
         charges: Some(1),
         cooldown_left: 0,
+        mute_left: 0,
         mode: None,
         mana_cost: 0,
         range: 0,

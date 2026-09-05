@@ -124,14 +124,14 @@ struct TrainFullArgs {
     /// Independent CPU arenas, hard-bounded to sixteen.
     #[arg(long, default_value_t = 4)]
     environments: usize,
-    /// Decisions collected from each arena per update, hard-bounded to 256.
-    #[arg(long, default_value_t = 8)]
+    /// Decisions collected from each arena per update, hard-bounded to 2048.
+    #[arg(long, default_value_t = 2_048)]
     rollout: usize,
     /// PPO passes over one rollout.
-    #[arg(long, default_value_t = 1)]
+    #[arg(long, default_value_t = 4)]
     epochs: usize,
     /// Effective Adam minibatch.
-    #[arg(long, default_value_t = 32)]
+    #[arg(long, default_value_t = 2_048)]
     minibatch: usize,
     /// Monotonic wall-clock seconds between durable checkpoints.
     #[arg(long, default_value_t = 300)]
