@@ -46,6 +46,81 @@ with another agent editing Teacher or building a different candidate. Use a fres
 run name each time; existing runs are never overwritten. `--bota-repository` can
 identify another local Git repository containing the pinned simulator commit.
 
+### Explicit neural candidate (full gate)
+
+The runner defaults to `--candidate-policy teacher` for backward compatibility.
+For a neural Map1 candidate, **both** `--candidate-policy hybrid` and
+`--candidate-weights DIRECTORY` are required. Supplying weights with Teacher is an
+error, not an ignored option; Hybrid without weights is also an error. This is
+independent of the bot CLI's own default policy. Every seat receives an explicit
+policy, and only Hybrid seats receive `--weights-directory`.
+
+After the candidate source/schema compatibility work is complete, run from `drysua`:
+
+```sh
+cargo build --release --locked --quiet --bin drysua --no-default-features \
+  --target-dir artifacts/temp/neural-release-build
+
+PYTHONDONTWRITEBYTECODE=1 python3 scripts/release_crossplay.py \
+  --candidate-binary artifacts/temp/neural-release-build/release/drysua \
+  --candidate-policy hybrid \
+  --candidate-weights artifacts/temp/neural-v004-default-e8 \
+  --candidate-metadata "cargo build --release --locked --quiet --bin drysua --no-default-features --target-dir artifacts/temp/neural-release-build; source=$(git rev-parse HEAD); dirty=$(git status --porcelain); accepted BC source=artifacts/temp/neural-v004-default-e8" \
+  --run-name neural-v004-default-e8-crossplay-001
+```
+
+This is the full **60-game** gate against the currently registered `v0.0.1`,
+`v0.0.2`, and `v0.0.3` Teachers, not a shortened smoke. A fresh run name is required.
+Build only after edits have settled; the metadata command records provenance but
+does not lock the working tree. The runner never trains or modifies source weights.
+
+The accepted BC source directory supplies **`drysua.weights.safetensors`**, the
+deployment-only SafeTensors artifact, not a training checkpoint or a directory of
+per-layer files. Its sole tensor is `model.parameters`, a finite F32 vector of
+the runtime's exact parameter count. The SafeTensors `__metadata__` object contains
+decimal-string values for `action_schema_hash`, `feature_schema_hash`,
+`model_schema_hash`, `ppo_schema_hash`, `ppo_schema_version`, and
+`ppo_rules_audit_version`. The binary validates the exact metadata, tensor name,
+shape, dtype, and finite values. Metadata must match the current runtime contract
+or its exact audited v13 inference-compatible tuple (see `ppo-v15-migration.md`).
+Old training resumes remain rejected. The runner never rewrites metadata to make
+old artifacts load.
+
+Before building opponents, the runner copies only that canonical file to
+`<run>/candidate-weights/drysua.weights.safetensors` and makes it read-only.
+Missing, empty, symlink, and over-256-MiB files are rejected. Source/copy hashes
+are checked around the copy; `report.json` binds the source path, snapshot path,
+SHA-256, and explicit policy to the binary SHA-256. Games use only the snapshot,
+so subsequent training output cannot change the evaluated weights. Final identity
+checks cover all binaries and weight snapshots. No `.previous`, temporary file,
+or other checkpoint fallback is copied. Schema/load failure remains a failed run;
+there is **no retry as Teacher**. The current Hybrid implementation selects neural
+inference on Map1 (its Map0 Teacher routing is not used by this registry). As with
+binary provenance generally, the harness trusts the supplied executable to honor
+its CLI; wire observations do not prove its internal inference implementation.
+
+### Future tagged Hybrid opponents
+
+Historical Teacher entries stay unchanged and weights-free. Registry schema 1
+also accepts a release entry with `"policy": "hybrid"` and:
+
+```json
+"weights": {
+  "path": "artifacts/v0.0.4",
+  "sha256": "<64 lowercase hexadecimal characters>"
+}
+```
+
+The path must be exactly `artifacts/<that entry's tag>`. The canonical deployment
+file must be committed **in the registered tagged source** at that path. The
+runner extracts it from the immutable tag archive, verifies the registered SHA-256,
+and snapshots it under `<run>/weights-<tag>`. It never takes historical weights
+from the mutable checkout. Teacher entries with a `weights` field, missing Hybrid
+weights, traversal/absolute/other-version paths, and malformed hashes fail closed.
+The top-level registry `policy: teacher` remains the legacy registry contract,
+not an override of explicit per-release or candidate policy. No registry entries
+or tags are added by this implementation.
+
 Exit codes: `0` approved, `1` failed gate, `2` setup/build/registry failure. An
 interrupted or incomplete report is not approval. No selected-opponent, early-win,
 pooled-score, or reduced-seed release mode is provided.
@@ -56,8 +131,9 @@ pooled-score, or reduced-seed release mode is provided.
   Each release directory is a sibling of `bota`, so its original `../bota/crates/*`
   path dependencies resolve against the **pinned** archive, not the working tree.
 * The simulator and every tagged bot are separately built with `--release --locked`.
-  Historical bots run their own tagged `play --policy teacher` implementations;
-  they are never approximated by the candidate's Teacher. Unsupported future
+  Historical Teachers run their own tagged `play --policy teacher` implementations;
+  they are never approximated by the candidate's Teacher. Tagged Hybrid releases
+  use their own source and SHA-bound archived weights. Unsupported future
   policy/map/protocol contracts fail closed and require an explicit runner update.
 * Two loopback TCP relays connect actual bot processes to the actual server.
   The first bot's wire `Welcome` must confirm slot zero before the second launches.
@@ -87,6 +163,8 @@ Each game retains `result.json`, exact server/client commands, wire observations
 exit status/cleanup information, client/server logs, and the server's `match.brp`.
 The final report includes the complete registry and per-opponent gate decisions.
 Setup errors additionally produce `failure.json`; partial reports stay failed.
+Hybrid runs additionally retain canonical weight snapshots and policy/weight
+provenance for the candidate and every opponent.
 
 ```sh
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover \
@@ -101,13 +179,21 @@ the replay file does not exist until match start, and full TCP close with unread
 final ACKs can reset a bot before it consumes MatchOver. Failed exploratory runs
 are retained rather than relabeled as successful evidence.
 
+Hybrid support verification: **31 script tests passed**, including CLI ambiguity,
+both policy/seat assignments, artifact size/type boundaries, SHA mismatch/copy
+races, snapshot isolation, final weight-tamper invalidation, and immutable tagged
+Hybrid weight paths. The unchanged live registry also validated all three Teacher
+tags. No neural smoke or full gate was run during this script-only change while
+candidate schema compatibility was being updated; these tests do not establish
+neural gameplay strength or artifact compatibility. No Rust checks were needed.
+
 Baseline evidence: `artifacts/temp/release-baseline-selfplay-v5/report.json`.
 Both candidate and historical opponent were separately built from the registered
 `v0.0.1` source against the pinned simulator. All 20 games had genuine terminal
 winners, no rejections or validation errors, and exactly **10 wins / 10 losses**:
 the gate correctly **failed**. This validates the pipeline, not a changed Teacher.
 
-The script suite passed 20 tests. Additional Rust checks ran only inside the
+The original script suite passed 20 tests. Additional Rust checks ran only inside the
 archived `v0.0.1` source, avoiding changes to another agent's mutable Rust files:
 all-target/all-feature Clippy with warnings denied, `cargo fmt`, and `cargo machete`
 passed. The debug all-feature test run exceeded the 120-second command timeout;

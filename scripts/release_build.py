@@ -1,12 +1,56 @@
 """Build immutable git archives with the original sibling path dependencies."""
 
+import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import tarfile
 
 SIMULATOR = "18db0f62d9a2b94e755c43fd29a959db204cc20b"
+WEIGHTS_NAME = "drysua.weights.safetensors"
+MAX_WEIGHTS_BYTES = 256 * 1024 * 1024
+
+
+def digest(path):
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def snapshot_weights(source, target, expected=None):
+    weights = source / WEIGHTS_NAME
+    if source.is_symlink() or not source.is_dir() or weights.is_symlink() or not weights.is_file():
+        raise ValueError("weights must be a regular non-symlink file in a directory")
+    if not 1 <= weights.stat().st_size <= MAX_WEIGHTS_BYTES:
+        raise ValueError("weights size must be 1..256 MiB")
+    identity = digest(weights)
+    if expected is not None and identity != expected:
+        raise ValueError("release weights SHA256 mismatch")
+    target.mkdir()
+    snapshot = target / WEIGHTS_NAME
+    shutil.copyfile(weights, snapshot)
+    snapshot.chmod(0o400)
+    if digest(snapshot) != identity or digest(weights) != identity:
+        raise ValueError("weights changed while being snapshotted; retry after training completes")
+    return dict(source=str(weights.absolute()), snapshot=str(snapshot), sha256=identity)
+
+
+def validate_release_weights(release):
+    policy = release["policy"]
+    if policy == "teacher":
+        if "weights" in release:
+            raise ValueError("teacher forbids weights")
+        return
+    if policy != "hybrid":
+        raise ValueError("unsupported release policy")
+    weights = release.get("weights")
+    if not isinstance(weights, dict):
+        raise ValueError("hybrid requires weights path and SHA256")
+    if weights.get("path") != f"artifacts/{release['tag']}":
+        raise ValueError("release weights path must be artifacts/<tag>")
+    if not isinstance(weights.get("sha256"), str) or not re.fullmatch(r"[0-9a-f]{64}", weights["sha256"]):
+        raise ValueError("release weights SHA256 must be 64 lowercase hexadecimal characters")
 
 
 def git(repository, *arguments):
@@ -46,8 +90,9 @@ def read_registry(path, repository, simulator_repository):
             raise ValueError(f"release {tag} must be an annotated tag")
         if git(repository, "rev-parse", f"refs/tags/{tag}^{{commit}}") != release["commit"]:
             raise ValueError(f"release {tag} commit identity mismatch")
-        if (release["simulator_commit"], release["map"], release["policy"]) != (SIMULATOR, 1, "teacher"):
+        if (release["simulator_commit"], release["map"]) != (SIMULATOR, 1):
             raise ValueError(f"release {tag} has unsupported simulator/map/policy")
+        validate_release_weights(release)
     if git(simulator_repository, "rev-parse", f"{SIMULATOR}^{{commit}}") != SIMULATOR:
         raise ValueError("simulator commit identity mismatch")
     return registry
@@ -99,5 +144,10 @@ def prepare(repository, simulator_repository, output, registry):
         archive(repository, release["commit"], source / tag, output)
         target = output / f"target-{tag}"
         build(source / tag, target, ["--bin", "drysua", "--no-default-features"], output, tag)
-        opponents[tag] = target / "release" / "drysua"
+        bot = dict(binary=target / "release" / "drysua", policy=release["policy"])
+        if release["policy"] == "hybrid":
+            bot["weights"] = output / f"weights-{tag}"
+            bot["weights_metadata"] = snapshot_weights(
+                source / tag / release["weights"]["path"], bot["weights"], release["weights"]["sha256"])
+        opponents[tag] = bot
     return output / "target-server" / "release" / "bota-server", opponents

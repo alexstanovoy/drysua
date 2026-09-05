@@ -1,17 +1,176 @@
 """Release gate regression tests (stdlib only)."""
 
 import json
+import io
 import unittest
 from unittest.mock import Mock, patch
 import socket
 import struct
 import threading
+import tempfile
+import argparse
 from pathlib import Path
 
 from release_build import read_registry, SIMULATOR
 
 from release_crossplay import check_resources, evaluate_gate, validate_game
 from release_wire import Relay
+import release_crossplay as crossplay
+import release_build as release_build
+
+
+class CandidateTests(unittest.TestCase):
+    def test_cli_defaults_teacher_and_requires_explicit_hybrid_weights(self):
+        parser = argparse.ArgumentParser()
+        crossplay.add_candidate_arguments(parser)
+        self.assertEqual(parser.parse_args([]).candidate_policy, "teacher")
+        for arguments, message in (([], None), (["--candidate-policy", "hybrid"],
+                "hybrid requires --candidate-weights"),
+                (["--candidate-weights", "."], "teacher forbids --candidate-weights")):
+            args = parser.parse_args(arguments)
+            if message:
+                with self.assertRaisesRegex(ValueError, message):
+                    crossplay.validate_candidate_arguments(args)
+            else:
+                crossplay.validate_candidate_arguments(args)
+        args = parser.parse_args(["--candidate-policy", "hybrid", "--candidate-weights", "."])
+        crossplay.validate_candidate_arguments(args)
+        with patch("sys.stderr", new_callable=io.StringIO) as errors, self.assertRaises(SystemExit):
+            parser.parse_args(["--candidate-policy", "network"])
+        self.assertIn("invalid choice: 'network'", errors.getvalue())
+
+    def test_snapshot_isolated_and_sha_bound(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary) / "source"
+            source.mkdir()
+            weights = source / release_build.WEIGHTS_NAME
+            weights.write_bytes(b"accepted runtime weights")
+            target = Path(temporary) / "snapshot"
+            metadata = release_build.snapshot_weights(source, target)
+            self.assertEqual(metadata["sha256"], crossplay.digest(target / weights.name))
+            weights.write_bytes(b"later training output")
+            self.assertEqual((target / weights.name).read_bytes(), b"accepted runtime weights")
+            self.assertNotEqual(metadata["sha256"], crossplay.digest(weights))
+
+    def test_missing_empty_symlink_and_oversized_weights_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary)
+            weights = source / release_build.WEIGHTS_NAME
+            with self.assertRaisesRegex(ValueError, "regular non-symlink"):
+                release_build.snapshot_weights(source, source / "missing")
+            weights.write_bytes(b"")
+            with self.assertRaisesRegex(ValueError, "weights size"):
+                release_build.snapshot_weights(source, source / "empty")
+            weights.unlink()
+            weights.symlink_to("absent")
+            with self.assertRaisesRegex(ValueError, "regular non-symlink"):
+                release_build.snapshot_weights(source, source / "link")
+            weights.unlink()
+            weights.write_bytes(b"12")
+            with patch.object(release_build, "MAX_WEIGHTS_BYTES", 1):
+                with self.assertRaisesRegex(ValueError, "weights size"):
+                    release_build.snapshot_weights(source, source / "large")
+
+    def test_wrong_digest_and_copy_race_fail_closed(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source = Path(temporary)
+            (source / release_build.WEIGHTS_NAME).write_bytes(b"weights")
+            with self.assertRaisesRegex(ValueError, "release weights SHA256 mismatch"):
+                release_build.snapshot_weights(source, source / "wrong", "0" * 64)
+            with patch.object(release_build, "digest", side_effect=["a", "b"]):
+                with self.assertRaisesRegex(ValueError, "weights changed while being snapshotted"):
+                    release_build.snapshot_weights(source, source / "race")
+
+    def test_run_wires_snapshot_metadata_and_does_not_change_gate(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(__file__).resolve().parents[1]
+            output = Path(temporary)
+            binary = output / "input-binary"
+            binary.write_bytes(b"binary")
+            weights = output / release_build.WEIGHTS_NAME
+            weights.write_bytes(b"weights")
+            args = argparse.Namespace(candidate_policy="hybrid", candidate_weights=output,
+                candidate_binary=binary, candidate_metadata="test provenance", bota_repository=root)
+            registry = dict(seeds=list(range(10)))
+            teacher = dict(binary=binary, policy="teacher")
+            with patch.object(crossplay, "read_registry", return_value=registry), \
+                    patch.object(crossplay, "prepare", return_value=(binary, {"v0.0.1": teacher})), \
+                    patch.object(crossplay, "execute_game", return_value=dict(result="draw", errors=[])) as execute, \
+                    patch("builtins.print"):
+                status = crossplay.run(args, root, output)
+            self.assertEqual(status, 1)
+            self.assertEqual(execute.call_count, 20)
+            for call in execute.call_args_list:
+                bots = call.args[2]
+                candidate = next(bot for bot in bots if bot["policy"] == "hybrid")
+                self.assertEqual(candidate["weights"], output / "candidate-weights")
+                self.assertIn(teacher, bots)
+            report = json.loads((output / "report.json").read_text())
+            self.assertEqual(report["candidate"]["weights"]["sha256"], crossplay.digest(weights))
+            self.assertEqual(report["candidate"]["policy"], "hybrid")
+            self.assertEqual(report["gate"]["opponents"]["v0.0.1"]["games"], 20)
+
+    def test_commands_keep_hybrid_weights_and_teacher_separate_in_either_seat(self):
+        hybrid = dict(binary=Path("/candidate"), policy="hybrid", weights=Path("/snapshot"))
+        teacher = dict(binary=Path("/historical"), policy="teacher")
+        for bots in ([hybrid, teacher], [teacher, hybrid]):
+            for index, bot in enumerate(bots):
+                command = crossplay.bot_command(bot, "127.0.0.1:1234", index, 30000)
+                self.assertEqual(command[command.index("--policy") + 1], bot["policy"])
+                self.assertEqual("--weights-directory" in command, bot is hybrid)
+                if bot is hybrid:
+                    self.assertEqual(command[-2:], ["--weights-directory", "/snapshot"])
+
+    def test_bot_command_rejects_missing_or_ambiguous_weights(self):
+        for bot in (dict(binary="bot", policy="hybrid"),
+                    dict(binary="bot", policy="teacher", weights="ignored"),
+                    dict(binary="bot", policy="unknown")):
+            with self.assertRaisesRegex(ValueError, "bot policy/weights contract mismatch"):
+                crossplay.bot_command(bot, "127.0.0.1:1234", 0, 30000)
+
+    def test_changed_snapshot_invalidates_otherwise_passing_run(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(__file__).resolve().parents[1]
+            output = Path(temporary)
+            binary = output / "input-binary"
+            binary.write_bytes(b"binary")
+            (output / release_build.WEIGHTS_NAME).write_bytes(b"weights")
+            args = argparse.Namespace(candidate_policy="hybrid", candidate_weights=output,
+                candidate_binary=binary, candidate_metadata="test", bota_repository=root)
+
+            def game(directory, server, bots, seed, registry):
+                snapshot = output / "candidate-weights" / release_build.WEIGHTS_NAME
+                snapshot.unlink()
+                snapshot.write_bytes(b"changed")
+                return dict(result="win" if bots[0]["policy"] == "hybrid" else "loss", errors=[])
+
+            with patch.object(crossplay, "read_registry", return_value=dict(seeds=list(range(10)))), \
+                    patch.object(crossplay, "prepare", return_value=(binary, {
+                        "v0.0.1": dict(binary=binary, policy="teacher")})), \
+                    patch.object(crossplay, "execute_game", side_effect=game), patch("builtins.print"):
+                status = crossplay.run(args, root, output)
+            report = json.loads((output / "report.json").read_text())
+            self.assertEqual(report["gate"]["opponents"]["v0.0.1"]["wins"], 20)
+            self.assertEqual(status, 1)
+            self.assertEqual(report["gate"]["errors"], ["binary or weights identity changed during run"])
+
+    def test_future_release_weights_contract_rejects_ambiguity_and_unsafe_paths(self):
+        teacher = dict(tag="v0.0.4", policy="teacher")
+        release_build.validate_release_weights(teacher)
+        with self.assertRaisesRegex(ValueError, "teacher forbids weights"):
+            release_build.validate_release_weights(dict(teacher, weights={}))
+        hybrid = dict(tag="v0.0.4", policy="hybrid")
+        with self.assertRaisesRegex(ValueError, "hybrid requires weights"):
+            release_build.validate_release_weights(hybrid)
+        for path in ("/artifacts/v0.0.4", "artifacts/temp", "artifacts/v0.0.4/../escape",
+                     "artifacts/v0.0.3", "artifacts/v0.0.4/subdir"):
+            with self.assertRaisesRegex(ValueError, "weights path"):
+                release_build.validate_release_weights(dict(hybrid, weights=dict(path=path, sha256="a" * 64)))
+        valid = dict(hybrid, weights=dict(path="artifacts/v0.0.4", sha256="a" * 64))
+        release_build.validate_release_weights(valid)
+        valid["weights"]["sha256"] = "not a digest"
+        with self.assertRaisesRegex(ValueError, "weights SHA256"):
+            release_build.validate_release_weights(valid)
 
 
 def games(tag="v0.0.1", wins=11):
@@ -187,6 +346,27 @@ class RegistryTests(unittest.TestCase):
         with patch("release_build.git", side_effect=["v0.0.1", "tag", commit, SIMULATOR]):
             registry = read_registry(registry_path, Path("bot"), Path("simulator"))
         self.assertEqual(registry["releases"][0]["commit"], commit)
+
+    def test_hybrid_registry_keeps_annotated_source_and_simulator_requirements(self):
+        registry = json.loads(self.registry_path().read_text())
+        release = registry["releases"][0]
+        release.update(policy="hybrid", weights=dict(path="artifacts/v0.0.1", sha256="a" * 64))
+        path = Mock(read_text=Mock(return_value=json.dumps(registry)))
+        with patch("release_build.git", side_effect=["v0.0.1", "tag", release["commit"], SIMULATOR]):
+            self.assertEqual(read_registry(path, Path("bot"), Path("simulator")), registry)
+
+    def test_hybrid_prepare_uses_weights_from_immutable_tag_archive(self):
+        registry = json.loads(self.registry_path().read_text())
+        release = registry["releases"][0]
+        release.update(policy="hybrid", weights=dict(path="artifacts/v0.0.1", sha256="a" * 64))
+        with patch.object(release_build, "archive") as archive, \
+                patch.object(release_build, "build"), \
+                patch.object(release_build, "snapshot_weights", return_value={}) as snapshot:
+            _, opponents = release_build.prepare(Path("bot"), Path("simulator"), Path("run"), registry)
+        archive.assert_any_call(Path("bot"), release["commit"], Path("run/sources/v0.0.1"), Path("run"))
+        snapshot.assert_called_once_with(Path("run/sources/v0.0.1/artifacts/v0.0.1"),
+                                         Path("run/weights-v0.0.1"), "a" * 64)
+        self.assertEqual(opponents["v0.0.1"]["policy"], "hybrid")
 
     def test_unregistered_release_lightweight_tag_or_moved_tag_fails(self):
         registry_path = self.registry_path()

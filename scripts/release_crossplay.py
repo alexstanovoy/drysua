@@ -1,7 +1,6 @@
 """Reproducible, fail-closed per-release TCP evaluation. Python stdlib only."""
 
 import argparse
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -12,7 +11,7 @@ import subprocess
 import sys
 import time
 
-from release_build import prepare, read_registry
+from release_build import digest, prepare, read_registry, snapshot_weights, WEIGHTS_NAME
 from release_wire import Relay
 
 SIDES = ("Radiant", "Dire")
@@ -93,9 +92,30 @@ def validate_game(clients, server_exit, timed_out, tick_limit):
     return ("win" if winners[0] == "Radiant" else "loss"), []
 
 
-def digest(path):
-    with path.open("rb") as stream:
-        return hashlib.file_digest(stream, "sha256").hexdigest()
+def add_candidate_arguments(parser):
+    parser.add_argument("--candidate-policy", choices=("teacher", "hybrid"), default="teacher")
+    parser.add_argument("--candidate-weights", type=Path,
+                        help="Directory containing drysua.weights.safetensors (hybrid only)")
+
+
+def validate_candidate_arguments(args):
+    if args.candidate_policy == "hybrid" and args.candidate_weights is None:
+        raise ValueError("hybrid requires --candidate-weights")
+    if args.candidate_policy == "teacher" and args.candidate_weights is not None:
+        raise ValueError("teacher forbids --candidate-weights")
+
+
+def bot_command(bot, address, index, tick_limit):
+    policy = bot["policy"]
+    if policy not in ("teacher", "hybrid") or ("weights" in bot) != (policy == "hybrid"):
+        raise ValueError("bot policy/weights contract mismatch")
+    assert index in (0, 1)
+    assert 1 <= tick_limit <= 100000
+    command = [str(bot["binary"]), "play", "--policy", policy, "--addr", address,
+               "--name", f"release-seat-{index}", "--limit", str(tick_limit)]
+    if policy == "hybrid":
+        command.extend(["--weights-directory", str(bot["weights"])])
+    return command
 
 
 def launch(command, path, processes, handles):
@@ -157,8 +177,7 @@ def execute_game(directory, server, bots, seed, registry):
         for index, bot in enumerate(bots):
             relay = Relay(port, 10, registry["tick_limit"])
             relays.append(relay)
-            command = [str(bot), "play", "--policy", "teacher", "--addr", relay.address,
-                       "--name", f"release-seat-{index}", "--limit", str(registry["tick_limit"])]
+            command = bot_command(bot, relay.address, index, registry["tick_limit"])
             commands.append(command)
             paths.append(directory / f"client-{index}.log")
             launch(command, paths[-1], processes, handles)
@@ -200,6 +219,7 @@ def execute_game(directory, server, bots, seed, registry):
 
 
 def run(args, root, output):
+    validate_candidate_arguments(args)
     registry = read_registry(root / "releases.json", root, args.bota_repository)
     candidate = output / "candidate"
     source_hash = digest(args.candidate_binary)
@@ -207,24 +227,33 @@ def run(args, root, output):
     candidate.chmod(0o500)
     if digest(candidate) != source_hash or digest(args.candidate_binary) != source_hash:
         raise ValueError("candidate changed while being snapshotted; retry after build completes")
+    candidate_bot = dict(binary=candidate, policy=args.candidate_policy)
+    if args.candidate_policy == "hybrid":
+        candidate_bot["weights"] = output / "candidate-weights"
+        candidate_bot["weights_metadata"] = snapshot_weights(
+            args.candidate_weights, candidate_bot["weights"])
     harness = output / "harness"
     harness.mkdir()
     for name in ("release_build.py", "release_crossplay.py", "release_wire.py"):
         shutil.copy2(root / "scripts" / name, harness / name)
     report = dict(registry=registry, candidate=dict(source=str(args.candidate_binary),
-                  sha256=source_hash, command_metadata=args.candidate_metadata), games=[],
+                  sha256=source_hash, policy=args.candidate_policy,
+                  weights=candidate_bot.get("weights_metadata"),
+                  command_metadata=args.candidate_metadata), games=[],
                   invocation=sys.argv, python=sys.version, platform=platform.platform(),
                   gate=dict(passed=False, errors=["incomplete run"]))
     (output / "report.json").write_text(json.dumps(report, indent=2) + "\n")
     server, opponents = prepare(root, args.bota_repository, output, registry)
     report["server_sha256"] = digest(server)
-    report["opponent_sha256"] = {tag: digest(binary) for tag, binary in opponents.items()}
-    for tag, binary in opponents.items():
+    report["opponent_sha256"] = {tag: digest(bot["binary"]) for tag, bot in opponents.items()}
+    report["opponent_policies"] = {tag: dict(policy=bot["policy"], weights=bot.get("weights_metadata"))
+                                   for tag, bot in opponents.items()}
+    for tag, bot in opponents.items():
         for seed in registry["seeds"]:
             for side in SIDES:
                 directory = output / f"{tag}-{seed}-{side}"
                 directory.mkdir()
-                bots = [candidate, binary] if side == "Radiant" else [binary, candidate]
+                bots = [candidate_bot, bot] if side == "Radiant" else [bot, candidate_bot]
                 game = execute_game(directory, server, bots, seed, registry)
                 if side == "Dire" and game["result"] in ("win", "loss"):
                     game["result"] = "loss" if game["result"] == "win" else "win"
@@ -235,10 +264,12 @@ def run(args, root, output):
                 print(f"{tag} seed={seed} side={side}: {game['result']} {game['errors']}", flush=True)
     report["gate"] = evaluate_gate(report["games"], list(opponents), registry["seeds"])
     identities = [(candidate, source_hash), (server, report["server_sha256"])]
-    identities.extend((binary, report["opponent_sha256"][tag]) for tag, binary in opponents.items())
+    identities.extend((bot["binary"], report["opponent_sha256"][tag]) for tag, bot in opponents.items())
+    identities.extend((bot["weights"] / WEIGHTS_NAME, bot["weights_metadata"]["sha256"])
+                      for bot in [candidate_bot, *opponents.values()] if "weights" in bot)
     if any(digest(binary) != expected for binary, expected in identities):
         report["gate"]["passed"] = False
-        report["gate"]["errors"].append("binary identity changed during run")
+        report["gate"]["errors"].append("binary or weights identity changed during run")
     (output / "report.json").write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps(report["gate"], indent=2), flush=True)
     return 0 if report["gate"]["passed"] else 1
@@ -247,12 +278,17 @@ def run(args, root, output):
 def main():
     root = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(description=__doc__)
+    add_candidate_arguments(parser)
     parser.add_argument("--candidate-binary", required=True, type=Path)
     parser.add_argument("--candidate-metadata", required=True,
                         help="Exact build command and source/commit/dirty-state description")
     parser.add_argument("--run-name", required=True)
     parser.add_argument("--bota-repository", type=Path, default=root.parent / "bota")
     args = parser.parse_args()
+    try:
+        validate_candidate_arguments(args)
+    except ValueError as error:
+        parser.error(str(error))
     if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,79}", args.run_name):
         parser.error("run-name must be a safe basename of at most 80 characters")
     args.candidate_binary = args.candidate_binary.resolve(strict=True)
