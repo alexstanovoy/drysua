@@ -22,7 +22,7 @@ use crate::{
 };
 
 /// Version of the append-only policy feature schema.
-pub const FEATURE_SCHEMA_VERSION: u32 = 7;
+pub const FEATURE_SCHEMA_VERSION: u32 = 8;
 /// Number of scalar global features.
 pub const GLOBAL_FEATURES: usize = 64;
 /// Number of scalar features in one global-history sample.
@@ -362,7 +362,8 @@ pub mod loot_feature {
 
 /// Canonical schema text covered by [`FEATURE_SCHEMA_HASH`].
 pub const FEATURE_SCHEMA_DESCRIPTOR: &str = concat!(
-    "bota-drysua-feature/v7;",
+    "bota-drysua-feature/v8;",
+    "action_schema_version=3;action_schema_hash=1755359086494840931;",
     "shapes=global:64,history:7x24,policy_history:16x4,unit:96x69,own_unit:2x69,remembered_unit:32x69,point:48x32,ability:14x24,item:85x28,projectile:32x20,loot:16x16,map:96;",
     "scalar_ranges=presence_and_one_hot:[0,1],unsigned_continuous:[0,1],signed_continuous:[-1,1],category:positive_exact_integer,all_finite;",
     "history_ages=480,240,120,60,30,15,0;",
@@ -434,6 +435,9 @@ const fn fnv1a(bytes: &[u8]) -> u64 {
 
 /// Stable FNV-1a hash of the complete feature schema descriptor.
 pub const FEATURE_SCHEMA_HASH: u64 = fnv1a(FEATURE_SCHEMA_DESCRIPTOR.as_bytes());
+
+const _: () = assert!(crate::ACTION_SCHEMA_VERSION == 3);
+const _: () = assert!(crate::ACTION_SCHEMA_HASH == 1_755_359_086_494_840_931);
 
 /// One fixed-shape policy input frame owned by its caller.
 ///

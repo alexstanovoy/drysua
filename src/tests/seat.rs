@@ -375,6 +375,8 @@ fn teacher_seat_rejects_incomplete_snapshot_ticks() {
         error.to_string(),
         "server sent Snapshot before completing the previous tick"
     );
+    assert!(wire.orders.is_empty());
+    assert!(wire.acknowledgements.is_empty());
 }
 
 #[cfg(feature = "builtin")]
@@ -471,12 +473,49 @@ fn deployment_seat_runs_loaded_policy_and_emits_an_order() {
     assert!(matches!(wire.orders[0].1, Order::Move { .. }));
 }
 
+#[cfg(feature = "builtin")]
 #[test]
-fn deployment_waits_until_the_first_tick_after_pregame() {
-    assert!(!crate::deployment_tick_is_active_for_test(1, 900));
-    assert!(!crate::deployment_tick_is_active_for_test(900, 900));
-    assert!(crate::deployment_tick_is_active_for_test(901, 900));
-    assert!(crate::deployment_tick_is_active_for_test(1, 0));
+fn pregame_deployment_decides_every_three_ticks_and_only_acknowledges_lockstep() {
+    let (mut arena, start) = crate::Arena::new(crate::ArenaConfig {
+        seats: 2,
+        map: MapId(1),
+        seed: 70_008,
+    })
+    .expect("real pregame MatchStart");
+    let mut messages = start.messages[0].clone();
+    for _ in 1..8 {
+        messages.extend(arena.step(&[None; 2]).expect("tick").messages[0].clone());
+    }
+    let model = stop_policy();
+    let tactical = crate::TacticalPolicy::default();
+    for mode in [TickMode::Lockstep, TickMode::Realtime] {
+        for controller in 0..3 {
+            let mut wire = MockWire {
+                messages: messages.clone().into(),
+                acknowledgements: Vec::new(),
+                orders: Vec::new(),
+            };
+            let ServerMsg::MatchStart { info } = &mut wire.messages[0] else {
+                panic!("MatchStart first");
+            };
+            assert_eq!(info.pregame_ticks, 900);
+            info.mode = mode;
+            let outcome = match controller {
+                0 => crate::play_teacher_on(&mut wire, seated(mode), Some(8)),
+                1 => crate::play_tactical_on(&mut wire, seated(mode), Some(8), &tactical),
+                _ => crate::play_policy_on(&mut wire, seated(mode), Some(8), &model),
+            }
+            .expect("pregame decisions");
+            assert_eq!(outcome.decisions, 3, "ticks 1, 4, 7");
+            assert!(outcome.orders > 0);
+            let expected = if mode == TickMode::Lockstep {
+                (1..=8).collect::<Vec<_>>()
+            } else {
+                Vec::new()
+            };
+            assert_eq!(wire.acknowledgements, expected);
+        }
+    }
 }
 
 #[cfg(feature = "builtin")]

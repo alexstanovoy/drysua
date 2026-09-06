@@ -4,6 +4,9 @@ use super::*;
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
 
+#[path = "tactical_pregame.rs"]
+mod pregame;
+
 #[test]
 fn worker_error_arbitration_preserves_real_failure_in_both_completion_orders() {
     let failure = invalid("simulator rejected an order");
@@ -87,12 +90,9 @@ fn mixed_fitness_rejects_another_opponent_or_game_identity() {
 }
 
 #[test]
-fn fixed_v004_on_both_seats_has_identical_orders_and_opposite_candidate_results() {
-    let bytes = std::fs::read(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("artifacts/v0.0.4/drysua.tactical.bin"),
-    )
-    .expect("released opponent");
-    let policy = TacticalPolicy::from_bytes(&bytes).expect("V1 artifact");
+fn fixed_current_policy_on_both_seats_has_identical_orders_and_opposite_candidate_results() {
+    let policy = tactical_search_founders()[TacticalMode::Farm.index()].clone();
+    assert_ne!(policy, TacticalPolicy::default());
     let settings = TacticalMatchConfig {
         seed: 9_203_000,
         candidate_seat: 0,
@@ -370,13 +370,13 @@ fn development_seed_namespace_and_cohort_bounds_fail_closed() {
             9_199_999,
             1,
             30_000,
-            "tactical seeds must remain in development namespace 9200000..9300000",
+            "tactical seeds must remain in development namespace 9200000..9300000 or 9400000..9500000",
         ),
         (
             9_299_999,
             2,
             30_000,
-            "tactical seeds must remain in development namespace 9200000..9300000",
+            "tactical seeds must remain in development namespace 9200000..9300000 or 9400000..9500000",
         ),
         (
             9_200_000,
@@ -435,20 +435,22 @@ fn default_policy_matches_teacher_full_game_orders_on_both_seats() {
 }
 
 #[test]
-fn pregame_and_tick_cap_do_not_create_decisions_or_terminal_wins() {
-    let game = evaluate_tactical_match(
-        Some(&TacticalPolicy::default()),
-        TacticalMatchConfig {
-            seed: 9_200_000,
-            candidate_seat: 0,
-            tick_limit: 901,
-        },
-    )
-    .expect("bounded game");
+fn pregame_decisions_use_three_tick_cadence_without_turning_tick_cap_into_a_win() {
+    for tick_limit in [2, 4, 899, 900, 901, 902, 904] {
+        let game = evaluate_tactical_match(
+            Some(&TacticalPolicy::default()),
+            TacticalMatchConfig {
+                seed: 9_200_000,
+                candidate_seat: 0,
+                tick_limit,
+            },
+        )
+        .expect("bounded game");
 
-    assert_eq!(game.ticks, 901);
-    assert_eq!(game.decisions, [0, 0]);
-    assert_eq!(game.outcome, TacticalMatchOutcome::Timeout);
+        assert_eq!(game.ticks, tick_limit);
+        assert_eq!(game.decisions, [(tick_limit - 1).div_ceil(3); 2]);
+        assert_eq!(game.outcome, TacticalMatchOutcome::Timeout);
+    }
 }
 
 #[test]
@@ -469,6 +471,78 @@ fn population_mutations_are_reproducible_preserve_anchor_and_explore_only_head_i
         assert!(TacticalPolicy::from_parameters(policy.parameters()).is_ok());
     }
     assert!(first[2..].iter().any(|policy| policy != &parent));
+}
+
+#[test]
+fn population_mutations_cover_current_parameter_layout_after_head_warmup() {
+    let parent = TacticalPolicy::default();
+    let children = population(&parent, 16, 4, 9_400_000).expect("current layout");
+
+    assert_eq!(OUTPUT_OFFSET, (TACTICAL_FEATURES + 1) * TACTICAL_HIDDEN);
+    assert_eq!(
+        TACTICAL_PARAMETERS - OUTPUT_OFFSET,
+        (TACTICAL_HIDDEN + 1) * crate::TACTICAL_MODES
+    );
+    assert!(
+        children[2..].iter().any(
+            |child| child.parameters()[..OUTPUT_OFFSET] != parent.parameters()[..OUTPUT_OFFSET]
+        )
+    );
+    assert!(
+        children[2..].iter().any(
+            |child| child.parameters()[OUTPUT_OFFSET..] != parent.parameters()[OUTPUT_OFFSET..]
+        )
+    );
+    for child in children {
+        assert_eq!(child.parameters().len(), TACTICAL_PARAMETERS);
+        assert_eq!(
+            TacticalPolicy::from_bytes(&child.to_bytes()).expect("round trip"),
+            child
+        );
+    }
+}
+
+#[test]
+fn new_laning_development_namespace_accepts_requested_cohorts_without_opening_gap() {
+    for seed in [9_400_000, 9_400_100, 9_400_200, 9_499_984] {
+        assert!(TacticalCohort::new(seed, 16, 30_000).is_ok());
+    }
+    for seed in [9_300_000, 9_399_999, 9_499_985, u64::MAX] {
+        assert_eq!(
+            TacticalCohort::new(seed, 16, 30_000)
+                .expect_err("outside approved namespaces")
+                .to_string(),
+            "tactical seeds must remain in development namespace 9200000..9300000 or 9400000..9500000"
+        );
+    }
+}
+
+#[test]
+fn training_metadata_binds_current_schema_layout_and_exact_policy_artifact() {
+    let policy = TacticalPolicy::default();
+    let cohort = TacticalCohort::new(9_200_100, 1, 30_000).expect("cohort");
+    let evaluated = evaluation(
+        cohort,
+        vec![
+            game(cohort.first_seed, 0, TacticalMatchOutcome::Win),
+            game(cohort.first_seed, 1, TacticalMatchOutcome::Loss),
+        ],
+    )
+    .expect("evaluation");
+    let schema_hash =
+        digest_hex(Sha256::digest(crate::TACTICAL_SCHEMA_DESCRIPTOR.as_bytes()).into());
+
+    for metadata in [
+        search_config_json(&TacticalSearchConfig::default()),
+        evaluation_json(&policy, &evaluated),
+    ] {
+        assert!(metadata.contains(&format!("\"tactical_schema_sha256\":\"{schema_hash}\"")));
+        assert!(metadata.contains(&format!("\"tactical_parameters\":{TACTICAL_PARAMETERS}")));
+    }
+    assert!(
+        evaluation_json(&policy, &evaluated)
+            .contains(&format!("\"policy_sha256\":\"{}\"", policy_hash(&policy)))
+    );
 }
 
 #[test]
@@ -616,7 +690,7 @@ impl crate::Wire for ReplayWire {
         order: bota_proto::Order,
     ) -> std::io::Result<u32> {
         assert!(self.orders < 2_000);
-        assert!(self.tick > 900);
+        assert!(self.tick > 0);
         self.orders += 1;
         (self.tick, unit, order).hash(&mut self.orders_hash);
         Ok(self.orders)
@@ -642,7 +716,7 @@ fn recorded_stream(policy: &TacticalPolicy, candidate_seat: u8) -> (Vec<ServerMs
     let mut messages = start.messages[candidate].clone();
     for _ in 1..6_001 {
         let mut requests = [None, None];
-        if arena.tick() > 900 && (arena.tick() - 901).is_multiple_of(3) {
+        if (arena.tick() - 1).is_multiple_of(3) {
             for (index, seat) in seats.iter_mut().enumerate() {
                 requests[index] = seat_request(
                     seat,

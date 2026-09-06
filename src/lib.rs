@@ -6,6 +6,7 @@ mod cli;
 mod feature;
 mod hero;
 mod imitation;
+mod laning_evaluation;
 mod league;
 mod link;
 mod model;
@@ -20,6 +21,7 @@ mod tactical;
 #[cfg(feature = "builtin")]
 mod tactical_training;
 mod teacher;
+mod teacher_economy;
 mod tracker;
 mod wire;
 
@@ -31,6 +33,7 @@ pub use cli::*;
 pub use feature::*;
 pub use hero::*;
 pub use imitation::*;
+pub use laning_evaluation::*;
 pub use league::*;
 pub use link::*;
 pub use model::*;

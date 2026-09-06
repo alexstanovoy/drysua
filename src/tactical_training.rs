@@ -17,12 +17,15 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     Arena, ArenaConfig, GlobalSummary, ItemReadiness, OrderPersistence, Request, StateTracker,
-    TACTICAL_FEATURES, TACTICAL_HIDDEN, TACTICAL_OUTPUT_BIAS_OFFSET, TACTICAL_PARAMETERS,
-    TacticalMode, TacticalPolicy, Teacher,
+    TACTICAL_FEATURES, TACTICAL_FILE_BYTES, TACTICAL_HIDDEN, TACTICAL_MODES,
+    TACTICAL_OUTPUT_BIAS_OFFSET, TACTICAL_PARAMETERS, TACTICAL_SCHEMA_DESCRIPTOR, TacticalMode,
+    TacticalPolicy, Teacher,
 };
 
 const DEVELOPMENT_START: u64 = 9_200_000;
 const DEVELOPMENT_END: u64 = 9_300_000;
+const LANING_DEVELOPMENT_START: u64 = 9_400_000;
+const LANING_DEVELOPMENT_END: u64 = 9_500_000;
 const MAX_TICKS: u32 = 30_000;
 const MAX_POPULATION: usize = 24;
 const MAX_GENERATIONS: u32 = 20;
@@ -32,6 +35,9 @@ const MAX_EVALUATED_GAMES: usize = 5_120;
 const OUTPUT_OFFSET: usize = (TACTICAL_FEATURES + 1) * TACTICAL_HIDDEN;
 const DIAGNOSTIC_STRIDE: u32 = 32;
 const _: () = assert!(OUTPUT_OFFSET < TACTICAL_PARAMETERS);
+const _: () =
+    assert!(OUTPUT_OFFSET + TACTICAL_HIDDEN * TACTICAL_MODES == TACTICAL_OUTPUT_BIAS_OFFSET);
+const _: () = assert!(TACTICAL_OUTPUT_BIAS_OFFSET + TACTICAL_MODES == TACTICAL_PARAMETERS);
 const _: () = assert!(MAX_POPULATION * MAX_PAIRS * 2 <= MAX_EVALUATED_GAMES);
 
 /// Exact standalone tactical artifact, not a PPO checkpoint or SafeTensors model.
@@ -552,7 +558,6 @@ fn run_match(
     ];
     assert_eq!(arena.tick(), 1);
     assert_eq!(seats[0].tracker.metadata(), seats[1].tracker.metadata());
-    let pregame = seats[0].tracker.metadata().pregame_ticks;
     let candidate = usize::from(settings.candidate_seat);
     let mut winner = None;
     for _ in 1..settings.tick_limit {
@@ -560,7 +565,7 @@ fn run_match(
             check_deadline(deadline)?;
         }
         let mut requests = [None, None];
-        if arena.tick() > pregame && (arena.tick() - pregame - 1).is_multiple_of(3) {
+        if (arena.tick() - 1).is_multiple_of(3) {
             for (index, seat) in seats.iter_mut().enumerate() {
                 requests[index] =
                     seat_request(seat, if index == candidate { policy } else { opponent })?;
@@ -1130,13 +1135,13 @@ fn validate_workers(workers: usize) -> Result<(), TacticalSearchError> {
 }
 
 fn validate_seed_range(seed: u64, count: u64) -> Result<(), TacticalSearchError> {
-    if seed < DEVELOPMENT_START
-        || seed
-            .checked_add(count)
-            .is_none_or(|end| end > DEVELOPMENT_END)
-    {
+    let allowed = seed.checked_add(count).is_some_and(|end| {
+        (seed >= DEVELOPMENT_START && end <= DEVELOPMENT_END)
+            || (seed >= LANING_DEVELOPMENT_START && end <= LANING_DEVELOPMENT_END)
+    });
+    if !allowed {
         return Err(invalid(
-            "tactical seeds must remain in development namespace 9200000..9300000",
+            "tactical seeds must remain in development namespace 9200000..9300000 or 9400000..9500000",
         ));
     }
     Ok(())
@@ -1312,10 +1317,18 @@ fn opponents_json(fitness: &TacticalFitness) -> String {
     output
 }
 
+fn tactical_metadata_json() -> String {
+    let schema_hash = digest_hex(Sha256::digest(TACTICAL_SCHEMA_DESCRIPTOR.as_bytes()).into());
+    format!(
+        "\"tactical_schema_sha256\":\"{schema_hash}\",\"tactical_features\":{TACTICAL_FEATURES},\"tactical_hidden\":{TACTICAL_HIDDEN},\"tactical_modes\":{TACTICAL_MODES},\"tactical_parameters\":{TACTICAL_PARAMETERS},\"tactical_artifact_bytes\":{TACTICAL_FILE_BYTES},\"damage_metrics\":\"not_collected\""
+    )
+}
+
 fn evaluation_json(policy: &TacticalPolicy, evaluated: &TacticalEvaluation) -> String {
     let fitness = &evaluated.fitness;
     let mut output = format!(
-        "{{\"schema_version\":2,\"policy_sha256\":\"{}\",\"policy_file\":\"{}\",\"opponents\":{},\"minimum_win_percent\":{:.6},\"map\":1,\"development_only\":true,\"first_seed\":{},\"pairs\":{},\"tick_limit\":{},\"wins\":{},\"losses\":{},\"timeouts\":{},\"death_margin\":{},\"farm_margin\":{},\"win_percent\":{:.6},\"paired_sweeps\":{},\"paired_sweep_wilson95_lower_percent\":{:.6},\"games\":[",
+        "{{\"schema_version\":2,{},\"policy_sha256\":\"{}\",\"policy_file\":\"{}\",\"opponents\":{},\"minimum_win_percent\":{:.6},\"map\":1,\"development_only\":true,\"first_seed\":{},\"pairs\":{},\"tick_limit\":{},\"wins\":{},\"losses\":{},\"timeouts\":{},\"death_margin\":{},\"farm_margin\":{},\"win_percent\":{:.6},\"paired_sweeps\":{},\"paired_sweep_wilson95_lower_percent\":{:.6},\"games\":[",
+        tactical_metadata_json(),
         policy_hash(policy),
         TACTICAL_SEARCH_POLICY_FILE,
         opponents_json(fitness),
@@ -1371,7 +1384,8 @@ fn write_generation(
 
 fn search_config_json(settings: &TacticalSearchConfig) -> String {
     format!(
-        "{{\"schema_version\":2,\"opponent_sha256\":{},\"population\":{},\"generations\":{},\"pairs\":{},\"workers\":{},\"seed\":{},\"selection_seed\":{},\"confirmation_seed\":{},\"selection_pairs\":{},\"tick_limit\":{},\"wall_seconds\":{},\"maximum_games\":{MAX_EVALUATED_GAMES},\"mutation_scales\":[0.1,0.2,0.35,0.5],\"head_only_generations\":4,\"diagnostic_stride\":{DIAGNOSTIC_STRIDE}}}\n",
+        "{{\"schema_version\":2,{},\"opponent_sha256\":{},\"population\":{},\"generations\":{},\"pairs\":{},\"workers\":{},\"seed\":{},\"selection_seed\":{},\"confirmation_seed\":{},\"selection_pairs\":{},\"tick_limit\":{},\"wall_seconds\":{},\"maximum_games\":{MAX_EVALUATED_GAMES},\"mutation_scales\":[0.1,0.2,0.35,0.5],\"head_only_generations\":4,\"diagnostic_stride\":{DIAGNOSTIC_STRIDE}}}\n",
+        tactical_metadata_json(),
         opponent_hash_json(settings.opponent_policy.as_ref().map(policy_digest)),
         settings.population,
         settings.generations,
@@ -1388,7 +1402,8 @@ fn search_config_json(settings: &TacticalSearchConfig) -> String {
 
 fn search_summary_json(report: &TacticalSearchReport) -> String {
     format!(
-        "{{\"schema_version\":1,\"completed_generations\":{},\"evaluated_games\":{},\"stopped_for_deadline\":{},\"policy_sha256\":\"{}\",\"selection_wins\":{},\"selection_games\":{},\"confirmation_wins\":{},\"confirmation_complete\":{}}}\n",
+        "{{\"schema_version\":1,{},\"completed_generations\":{},\"evaluated_games\":{},\"stopped_for_deadline\":{},\"policy_sha256\":\"{}\",\"selection_wins\":{},\"selection_games\":{},\"confirmation_wins\":{},\"confirmation_complete\":{}}}\n",
+        tactical_metadata_json(),
         report.completed_generations,
         report.evaluated_games,
         report.stopped_for_deadline,

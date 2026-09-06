@@ -26,6 +26,64 @@ struct GateCounts {
 }
 
 #[test]
+fn teachers_buy_wraith_and_tango_for_595_during_first_pregame_decisions_on_both_maps() {
+    for map in [MapId(0), MapId(1)] {
+        let (mut arena, start) = Arena::new(ArenaConfig {
+            seats: 2,
+            map,
+            seed: 92_009_004,
+        })
+        .expect("opening arena");
+        let mut seats = setup_seats(start);
+        let mut counts = GateCounts::default();
+        let mut purchases = [[None; 2]; 2];
+        let mut purchase_counts = [0; 2];
+        for tick in 1u32..=9 {
+            assert_eq!(arena.tick(), tick);
+            let mut requests = [None; 2];
+            if (tick - 1).is_multiple_of(3) {
+                for (index, seat) in seats.iter_mut().enumerate() {
+                    requests[index] = decide_request(seat, &mut counts);
+                    if let Some(Request {
+                        order: bota_proto::Order::Buy { item },
+                        ..
+                    }) = requests[index]
+                    {
+                        assert!(purchase_counts[index] < 2);
+                        purchases[index][purchase_counts[index]] = Some(item);
+                        purchase_counts[index] += 1;
+                    }
+                }
+            }
+            let step = arena.step(&requests).expect("opening tick");
+            for (seat, messages) in seats.iter_mut().zip(step.messages) {
+                observe_messages(seat, &messages, &mut counts);
+            }
+        }
+
+        assert_eq!(counts.rejections, 0);
+        assert_eq!(counts.suppressions, 0);
+        for (seat, purchased) in seats.iter().zip(purchases) {
+            assert_eq!(
+                purchased,
+                [Some(bota_proto::ItemId(33)), Some(bota_proto::ItemId(7))]
+            );
+            assert!(arena.tick() < seat.tracker.metadata().pregame_ticks);
+            assert_eq!(seat.tracker.own_player().expect("player").gold, Some(5));
+            let items = &seat.tracker.own_hero().expect("hero").items;
+            assert_eq!(
+                items
+                    .iter()
+                    .flatten()
+                    .map(|item| item.id)
+                    .collect::<Vec<_>>(),
+                [bota_proto::ItemId(33), bota_proto::ItemId(7)]
+            );
+        }
+    }
+}
+
+#[test]
 fn two_teachers_cover_and_decode_every_decision_with_low_rejection_rate_on_both_maps() {
     for map in [MapId(0), MapId(1)] {
         run_teacher_match(map);

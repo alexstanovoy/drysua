@@ -20,8 +20,8 @@ use crate::{
 
 #[test]
 fn action_and_training_schema_identities_are_stable() {
-    assert_eq!(ACTION_SCHEMA_VERSION, 2);
-    assert_eq!(ACTION_SCHEMA_HASH, 1_018_254_919_734_743_331);
+    assert_eq!(ACTION_SCHEMA_VERSION, 3);
+    assert_eq!(ACTION_SCHEMA_HASH, 1_755_359_086_494_840_931);
     assert_eq!(crate::IMITATION_RULES_AUDIT_VERSION, 12);
 }
 

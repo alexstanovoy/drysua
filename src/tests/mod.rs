@@ -5,6 +5,8 @@ mod checkpoint;
 mod cli;
 mod feature;
 mod imitation;
+#[cfg(feature = "builtin")]
+mod laning;
 mod league;
 mod link;
 mod model;
@@ -19,4 +21,6 @@ mod tactical;
 mod teacher;
 #[cfg(feature = "builtin")]
 mod teacher_arena;
+#[cfg(feature = "builtin")]
+mod teacher_economy;
 mod tracker;

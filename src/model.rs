@@ -25,7 +25,7 @@ use crate::{
 };
 
 /// Version of the fixed policy-model parameter schema.
-pub const MODEL_SCHEMA_VERSION: u32 = 7;
+pub const MODEL_SCHEMA_VERSION: u32 = 8;
 /// Maximum frame count accepted by one public batch call.
 pub const MODEL_MAX_BATCH: usize = 8_192;
 /// Frame count evaluated by one bounded host inference tensor graph.
@@ -74,10 +74,11 @@ const PUT_MODE_HEAD: usize = 2;
 static NEXT_MODEL_LINEAGE: AtomicU64 = AtomicU64::new(1);
 static NEXT_OPTIMIZER_LINEAGE: AtomicU64 = AtomicU64::new(1);
 
-/// Canonical model shapes, parameter order, and linked feature schema.
+/// Canonical model shapes, parameter order, and linked action/feature semantics.
 pub const MODEL_SCHEMA_DESCRIPTOR: &str = concat!(
-    "bota-drysua-model/v7;",
-    "feature_schema_version=7;feature_schema_hash=13875648161437731669;",
+    "bota-drysua-model/v8;",
+    "action_schema_version=3;action_schema_hash=1755359086494840931;",
+    "feature_schema_version=8;feature_schema_hash=10322490384647633864;",
     "dtype=f32;device=cpu_actor,cpu_cuda_or_metal_learner,one_learner_per_device;architecture=deepsets;activations=relu_after_every_encoder_and_trunk_linear;",
     "unit_mlp=69x64,64x128,128x128;",
     "ability_mlp=24x64,64x64;item_mlp=28x64,64x64;",
@@ -125,8 +126,10 @@ const fn linear_parameters(input: usize, output: usize) -> usize {
 /// Exact number of F32 parameters in the version-one policy model.
 pub const MODEL_PARAMETER_COUNT: usize = 1_684_724;
 
-const _: () = assert!(FEATURE_SCHEMA_VERSION == 7);
-const _: () = assert!(FEATURE_SCHEMA_HASH == 13_875_648_161_437_731_669);
+const _: () = assert!(FEATURE_SCHEMA_VERSION == 8);
+const _: () = assert!(FEATURE_SCHEMA_HASH == 10_322_490_384_647_633_864);
+const _: () = assert!(crate::ACTION_SCHEMA_VERSION == 3);
+const _: () = assert!(crate::ACTION_SCHEMA_HASH == 1_755_359_086_494_840_931);
 const _: () = assert!(TRUNK_INPUT == 2_568);
 const _: () = assert!(
     DECODER_CONTEXT == TRUNK_WIDTH + KIND_EMBEDDING + UNIT_SELECTION_EMBEDDING + SLOT_EMBEDDING

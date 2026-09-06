@@ -1120,6 +1120,232 @@ fn composite_buy_requires_full_price_and_missing_leaf_price() {
     assert!(enough_for_both.buy_mask(ControlledUnit::Hero)[2]);
 }
 
+#[cfg(feature = "builtin")]
+#[test]
+fn composite_buy_at_missing_cost_decodes_to_legal_recipe_and_assembles_wraith_band() {
+    let (mut world, info) = wraith_upgrade_world(210);
+    let order = Order::Buy { item: ItemId(33) };
+    assert_eq!(
+        world.validate_order(SlotId(0), None, &order),
+        Err(bota_proto::RejectReason::NotEnoughGold)
+    );
+    let tracker = tracker_with_info_and_view(&info, world.view(Team::Radiant));
+    let space = ActionSpace::from_tracker(&tracker).expect("upgrade space");
+    let action = buy_action(&space, ItemId(33));
+
+    assert!(space.allows(action), "the remaining recipe costs only 210");
+    let issued = space.decode(action).expect("upgrade decodes").expect("buy");
+    assert_eq!(issued.order, Order::Buy { item: ItemId(39) });
+    assert_eq!(
+        world.validate_order(SlotId(0), issued.unit, &issued.order),
+        Ok(())
+    );
+    world.advance(&[bota_server::game::Command {
+        slot: SlotId(0),
+        unit: issued.unit,
+        order: issued.order,
+    }]);
+
+    assert_eq!(world.seats[0].gold, 0);
+    let hero = world.seats[0].unit.expect("hero");
+    let bag = &world.inventory.get(hero).expect("inventory").slots;
+    assert_eq!(
+        bag.iter().flatten().map(|item| item.id).collect::<Vec<_>>(),
+        [ItemId(33)]
+    );
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn composite_buy_below_missing_cost_is_masked_with_exact_decode_error() {
+    let (world, info) = wraith_upgrade_world(209);
+    let tracker = tracker_with_info_and_view(&info, world.view(Team::Radiant));
+    let space = ActionSpace::from_tracker(&tracker).expect("upgrade space");
+    let action = buy_action(&space, ItemId(33));
+
+    assert!(!space.allows(action));
+    let error = space.decode(action).expect_err("cannot afford the recipe");
+    assert_eq!(error, ActionError::NotAllowed(ActionKind::Buy));
+    assert_eq!(
+        error.to_string(),
+        "action Buy is masked by the current action space"
+    );
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn composite_buy_with_full_gold_keeps_root_order_and_pays_only_missing_cost() {
+    let (mut world, info) = wraith_upgrade_world(505);
+    let tracker = tracker_with_info_and_view(&info, world.view(Team::Radiant));
+    let space = ActionSpace::from_tracker(&tracker).expect("upgrade space");
+    let action = buy_action(&space, ItemId(33));
+
+    let issued = space.decode(action).expect("upgrade decodes").expect("buy");
+    assert_eq!(issued.order, Order::Buy { item: ItemId(33) });
+    assert_eq!(
+        world.validate_order(SlotId(0), issued.unit, &issued.order),
+        Ok(())
+    );
+    world.advance(&[bota_server::game::Command {
+        slot: SlotId(0),
+        unit: issued.unit,
+        order: issued.order,
+    }]);
+    assert_eq!(world.seats[0].gold, 295);
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn composite_buy_with_no_delivery_capacity_is_masked_and_recipe_is_rejected() {
+    let (mut world, info) = wraith_upgrade_world(210);
+    let hero = world.seats[0].unit.expect("hero");
+    let bag = world.inventory.get_mut(hero).expect("inventory");
+    let filler = bag.slots[0];
+    for slot in &mut bag.slots[2..] {
+        *slot = filler;
+    }
+    world.seats[0].stash.slots.fill(filler);
+    let tracker = tracker_with_info_and_view(&info, world.view(Team::Radiant));
+    let space = ActionSpace::from_tracker(&tracker).expect("full inventory");
+
+    assert!(!space.allows(buy_action(&space, ItemId(33))));
+    assert_eq!(
+        world.validate_order(SlotId(0), None, &Order::Buy { item: ItemId(39) }),
+        Err(bota_proto::RejectReason::InventoryFull)
+    );
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn composite_buy_does_not_discount_parts_on_courier_but_does_discount_stash() {
+    for in_stash in [true, false] {
+        let (mut world, info) = wraith_upgrade_world(210);
+        let hero = world.seats[0].unit.expect("hero");
+        let circlet = world.inventory.get_mut(hero).expect("inventory").slots[0].take();
+        if in_stash {
+            world.seats[0].stash.slots[0] = circlet;
+        } else {
+            let courier = world.seats[0].courier.expect("courier");
+            world.inventory.get_mut(courier).expect("courier bag").slots[0] = circlet;
+        }
+        let tracker = tracker_with_info_and_view(&info, world.view(Team::Radiant));
+        let space = ActionSpace::from_tracker(&tracker).expect("component locations");
+
+        assert_eq!(space.allows(buy_action(&space, ItemId(33))), in_stash);
+        assert!(space.allows(buy_action(&space, ItemId(39))));
+    }
+}
+
+#[test]
+fn composite_buy_buys_missing_leaves_in_recipe_order_without_overspending() {
+    let mut info = match_info();
+    info.shop = vec![
+        ShopEntry {
+            id: ItemId(0),
+            cost: 100,
+            components: Vec::new(),
+        },
+        ShopEntry {
+            id: ItemId(1),
+            cost: 150,
+            components: Vec::new(),
+        },
+        ShopEntry {
+            id: ItemId(2),
+            cost: 500,
+            components: vec![ItemId(1), ItemId(0)],
+        },
+    ];
+    let mut view = world_view(1);
+    view.players[0].gold = Some(250);
+    let tracker = tracker_with_info_and_view(&info, view.clone());
+    let space = ActionSpace::from_tracker(&tracker).expect("first component");
+
+    assert_order(
+        &space,
+        buy_action(&space, ItemId(2)),
+        None,
+        Order::Buy { item: ItemId(1) },
+    );
+
+    let hero = hero_index(&view);
+    view.units[hero].items[0] = Some(item_with_id(ItemId(1), None, 0, false));
+    view.players[0].gold = Some(100);
+    let tracker = tracker_with_info_and_view(&info, view);
+    let space = ActionSpace::from_tracker(&tracker).expect("second component");
+    assert_order(
+        &space,
+        buy_action(&space, ItemId(2)),
+        None,
+        Order::Buy { item: ItemId(0) },
+    );
+}
+
+#[test]
+fn composite_buy_with_no_missing_parts_is_masked_instead_of_issuing_a_noop() {
+    let mut info = match_info();
+    info.shop.push(ShopEntry {
+        id: ItemId(2),
+        cost: 750,
+        components: vec![ItemId(0), ItemId(1)],
+    });
+    let mut view = world_view(1);
+    let hero = hero_index(&view);
+    for (slot, id) in [ItemId(0), ItemId(1)].into_iter().enumerate() {
+        view.units[hero].items[slot] = Some(item_with_id(id, None, 0, false));
+    }
+    view.players[0].gold = Some(1_000);
+    let tracker = tracker_with_info_and_view(&info, view);
+    let space = ActionSpace::from_tracker(&tracker).expect("all parts held");
+
+    assert!(!space.allows(buy_action(&space, ItemId(2))));
+    assert!(space.allows(buy_action(&space, ItemId(0))));
+}
+
+#[test]
+fn composite_component_decoding_is_identified_by_action_schema_three() {
+    assert_eq!(crate::ACTION_SCHEMA_VERSION, 3);
+    assert!(crate::ACTION_SCHEMA_DESCRIPTOR.contains("buy_decode=root_or_first_missing_leaf"));
+    assert_eq!(crate::ACTION_SCHEMA_HASH, 1_755_359_086_494_840_931);
+}
+
+fn buy_action(space: &ActionSpace, item: ItemId) -> StructuredAction {
+    let index = space
+        .shop_candidates()
+        .iter()
+        .position(|candidate| candidate.item == item)
+        .expect("shop item");
+    StructuredAction::Buy {
+        unit: ControlledUnit::Hero,
+        item: ShopIndex(index),
+    }
+}
+
+#[cfg(feature = "builtin")]
+fn wraith_upgrade_world(gold: i32) -> (bota_server::game::World, MatchInfo) {
+    let config = bota_server::game::MatchConfig {
+        match_id: 92_009_002,
+        master_key: [0; 32],
+        picks: match_info().picks,
+        map: MapId(1),
+        tick_rate: 30,
+        mode: TickMode::Lockstep,
+        ack_timeout_ticks: 30,
+    };
+    let mut world = bota_server::game::World::for_match(&config, config.rng());
+    let mut events = Vec::new();
+    for item in [ItemId(9), ItemId(11)] {
+        assert_eq!(
+            world.validate_order(SlotId(0), None, &Order::Buy { item }),
+            Ok(())
+        );
+        assert!(world.buy(SlotId(0), item, &mut events));
+    }
+    world.step();
+    world.seats[0].gold = gold;
+    (world, config.info())
+}
+
 #[test]
 fn cyclic_and_unknown_recipe_schemas_return_action_error() {
     let mut cyclic_info = match_info();

@@ -26,8 +26,12 @@ const ENEMY: EntityId = entity(20, 1);
 
 #[test]
 fn feature_schema_dimensions_and_hash_are_stable() {
-    assert_eq!(FEATURE_SCHEMA_VERSION, 7);
-    assert_eq!(FEATURE_SCHEMA_HASH, 13_875_648_161_437_731_669);
+    assert_eq!(FEATURE_SCHEMA_VERSION, 8);
+    assert!(
+        FEATURE_SCHEMA_DESCRIPTOR
+            .contains("action_schema_version=3;action_schema_hash=1755359086494840931;")
+    );
+    assert_eq!(FEATURE_SCHEMA_HASH, 10_322_490_384_647_633_864);
     assert_eq!(GLOBAL_FEATURES, 64);
     assert_eq!((HISTORY_SAMPLES, HISTORY_FEATURES), (7, 24));
     assert_eq!((MAX_POLICY_HISTORY, POLICY_HISTORY_FEATURES), (16, 4));

@@ -28,15 +28,15 @@ pub const PPO_SHAPING_BUDGET: f32 = 100.0 / PPO_REWARD_SCALE;
 pub const PPO_TERMINAL_REWARD: f32 = 1.0;
 const _: () = assert!(PPO_TERMINAL_REWARD > PPO_SHAPING_BUDGET);
 /// Version of rollout, GAE, objective, optimizer, and reward semantics.
-pub const PPO_SCHEMA_VERSION: u32 = 15;
+pub const PPO_SCHEMA_VERSION: u32 = 16;
 /// Audited simulator and learner rules required by stage-nine rollouts.
-pub const PPO_RULES_AUDIT_VERSION: u32 = 14;
+pub const PPO_RULES_AUDIT_VERSION: u32 = 15;
 /// Canonical stage-nine learner contract covered by [`PPO_SCHEMA_HASH`].
 pub const PPO_SCHEMA_DESCRIPTOR: &str = concat!(
-    "bota-drysua-ppo/v15;",
-    "action_schema_version=2;action_schema_hash=1018254919734743331;",
-    "feature_schema_version=7;feature_schema_hash=13875648161437731669;",
-    "model_schema_version=7;model_schema_hash=10644717168650027237;rules_audit=14;",
+    "bota-drysua-ppo/v16;",
+    "action_schema_version=3;action_schema_hash=1755359086494840931;",
+    "feature_schema_version=8;feature_schema_hash=10322490384647633864;",
+    "model_schema_version=8;model_schema_hash=3097714014199697774;rules_audit=15;",
     "bounds=rollout32768,streams1280,environments128,decisions2048,epochs16,minibatch8192,microbatch64;",
     "actor=frozen_exact_policy_identity,batch_max64_single_shared_trunk_forward,independent_per_environment_rng_seeded_from_checkpointed_master,transactional_batch_rng,legal_masked_gumbel_max_open_f64_uniform,exact_autoregressive_log_probability_and_entropy;",
     "gae=gamma_tick0.9966555_pow_elapsed_ticks,lambda0.98,terminal_reset,bootstrap_truncation,normalized_advantages;",
@@ -45,9 +45,10 @@ pub const PPO_SCHEMA_DESCRIPTOR: &str = concat!(
     "optimizer=adam_lr3e-6_beta1_0.9_beta2_0.999_epsilon1e-5_global_clip0.5,weighted_host_microbatch_accumulation,transactional_parameters_moments_shuffle;",
     "kl_guard=pre_step_rejection,post_step_sample_weighted_complete_effective_minibatch_rollout_policy_kl,candidate_exceeds_target_or_evaluation_error_restores_exact_parameters_adam_moments_step_policy_revision_under_exclusive_parameter_lock,applied_report_post_step_kl,rejected_report_candidate_kl;",
     "reward=seat_safe_global_summary,all_components_normalized_by101,episode_sum_absolute_emitted_shaping_components_budget100_over101_nonreplenishing_f64_expenditure,terminal_next_potential_zero,xp_advantage0.02_over101,cash_wealth_last_hit_deny_zero_reward,enemy_gold_unavailable_by_seat_contract,combat2_over101,structures5_over101,terminal_win1_loss-1_draw0,separate_consistently_scaled_breakdown,wide_public_score_subtraction_before_f32_conversion;",
-    "arena=one_learner_seat_against_independent_opponent,snapshot_then_explicit_events_including_empty_complete_every_visible_tick,decision_after_tick_complete,decision_interval3,suppress_deployment_decisions_through_pregame,batched_bootstrap,restart_on_terminal,complete_frozen_side_pairs_require_even_production_environments,paired_side_seed_and_warmup_phase,on_policy_greedy_burn_in,eight_phase_blocks_alternate_weak_teacher,clear_hero_and_courier_warmup_orders,hero_identity_change_invalidates_local_body_order,hero_active_order_feature_ignores_courier_orders;",
+    "arena=one_learner_seat_against_independent_opponent,snapshot_then_explicit_events_including_empty_complete_every_visible_tick,decision_after_tick_complete,decision_interval3,default_all_policy_decision_ticks1_plus3n,pregame_enabled,batched_bootstrap,restart_on_terminal,complete_frozen_side_pairs_require_even_production_environments,paired_side_seed_and_warmup_phase,on_policy_greedy_burn_in,eight_phase_blocks_alternate_weak_teacher,clear_hero_and_courier_warmup_orders,hero_identity_change_invalidates_local_body_order,hero_active_order_feature_ignores_courier_orders;",
     "navigation=building_landing_points_reserved_for_teleport_targets,seat_visible_channel_masks_cast_and_use,seat_visible_item_mute_masks_use,put_point_underfoot_only;",
     "deployment=audited_seat_visible_teacher_on_map0,model_with_channel_preservation_sustain_emergency_retreat_and_safe_in_range_structure_attack_on_map1,dagger_uses_safety_shield_without_objective_override,raw_ppo_sampling_remains_on_policy;",
+    "teacher_economy=custom_bota_wraith_band_tango_boots_optional_stick_gloves_belt_once_only;",
     "pretraining=bounded_map1_teacher_and_dagger_corpus,map_qualified_sample_identity,two_offline_validation_seeds_and_three_gameplay_validation_seeds_for_stage_selection,two_untouched_held_out_seeds_for_final_agreement,dagger_rejection_fail_fast,map1_paired_win_acceptance,map0_teacher_paired_structure_progress_acceptance;",
     "pipeline=bounded_cpu_worker_endpoints,smoke_and_league_persistent_actor_thread,production_actor_uses_same_identity_learner_device_model_then_serial_learner_update,immutable_identity_bound_actor_lease,exactly_two_fixed_capacity_buffer_permits,one_generation_lag_allowed,two_generation_lag_rejected,live_generation_read_guard_held_through_optimizer_update,ragged_feature_arenas,bit_packed_behavioral_masks,padding_only_per_minibatch,explicit_cpu_cuda_metal_learner_selection;"
 );
@@ -69,12 +70,13 @@ const fn ppo_fnv1a(bytes: &[u8]) -> u64 {
 /// Stable FNV-1a hash of [`PPO_SCHEMA_DESCRIPTOR`].
 pub const PPO_SCHEMA_HASH: u64 = ppo_fnv1a(PPO_SCHEMA_DESCRIPTOR.as_bytes());
 
-const _: () = assert!(ACTION_SCHEMA_VERSION == 2);
-const _: () = assert!(ACTION_SCHEMA_HASH == 1_018_254_919_734_743_331);
-const _: () = assert!(FEATURE_SCHEMA_VERSION == 7);
-const _: () = assert!(FEATURE_SCHEMA_HASH == 13_875_648_161_437_731_669);
-const _: () = assert!(MODEL_SCHEMA_VERSION == 7);
-const _: () = assert!(MODEL_SCHEMA_HASH == 10_644_717_168_650_027_237);
+const _: () = assert!(ACTION_SCHEMA_VERSION == 3);
+const _: () = assert!(ACTION_SCHEMA_HASH == 1_755_359_086_494_840_931);
+const _: () = assert!(FEATURE_SCHEMA_VERSION == 8);
+const _: () = assert!(FEATURE_SCHEMA_HASH == 10_322_490_384_647_633_864);
+const _: () = assert!(MODEL_SCHEMA_VERSION == 8);
+const _: () = assert!(MODEL_SCHEMA_HASH == 3_097_714_014_199_697_774);
+const _: () = assert!(PPO_RULES_AUDIT_VERSION == 15);
 
 /// Stage-nine PPO hyperparameters and bounded rollout dimensions.
 #[derive(Clone, Copy, Debug, PartialEq)]

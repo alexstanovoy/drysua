@@ -402,9 +402,6 @@ impl LivePolicy {
     }
 
     fn should_decide(&self, tick: u32) -> std::io::Result<bool> {
-        if !deployment_tick_is_active(tick, self.tracker.metadata().pregame_ticks) {
-            return Ok(false);
-        }
         let Some(previous) = self.last_decision_tick else {
             return Ok(true);
         };
@@ -598,15 +595,6 @@ impl LivePolicy {
         }
         Ok(())
     }
-}
-
-const fn deployment_tick_is_active(tick: u32, pregame_ticks: u32) -> bool {
-    tick > pregame_ticks
-}
-
-#[cfg(test)]
-pub(crate) const fn deployment_tick_is_active_for_test(tick: u32, pregame_ticks: u32) -> bool {
-    deployment_tick_is_active(tick, pregame_ticks)
 }
 
 fn validate_snapshot(outcome: &Outcome, viewer: Option<Team>, tick: u32) -> std::io::Result<()> {

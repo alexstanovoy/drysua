@@ -1,5 +1,10 @@
 # PPO v15: normalized, purchase-neutral, episodically bounded rewards
 
+**Historical migration, superseded by [PPO v16](ppo-v16-migration.md).** Reward semantics
+remain in force, but the v13 runtime exception below no longer exists. Action v3 requires
+fresh current-schema artifacts; current builds reject v13/v14/v15 runtime and training
+metadata, including provenance migration. Historical artifacts must use their old binaries.
+
 PPO schema v15/hash `13893101989595893928`, learner rules audit v14, and
 league schema v16/hash `1035319045739487525` supersede PPO v14 for training.
 

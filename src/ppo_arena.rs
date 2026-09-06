@@ -1251,7 +1251,6 @@ fn collect_dagger_side(
         opponent,
     )?;
     assert_eq!(environment.policy_seat, policy_seat);
-    warmup_checkpoint_evaluation(&mut environment)?;
     let mut retained = 0usize;
     let mut trajectory = 0u64;
     for decision in 0..PRETRAINING_DAGGER_DECISIONS {
@@ -1284,7 +1283,6 @@ fn collect_dagger_side(
         if advanced.winner.is_some() {
             trajectory = trajectory.checked_add(1).ok_or(PpoError::CounterOverflow)?;
             restart_environment(&mut environment)?;
-            warmup_checkpoint_evaluation(&mut environment)?;
         }
     }
     Ok(retained)
@@ -3372,7 +3370,6 @@ fn evaluate_checkpoint_game(
     };
     let opponent_seed = derive_training_seed(seed, map.0 as u64, baseline_domain(baseline));
     let mut environment = build_environment(seed, opponent_seed, map, candidate_seat, 0, opponent)?;
-    warmup_checkpoint_evaluation(&mut environment)?;
     let candidate_team = environment.seats[candidate_seat].tracker.team();
     let mut action_counts = [0u32; ActionKind::COUNT];
     let mut decisions = 0u32;
@@ -3463,7 +3460,6 @@ fn evaluate_teacher_against_weak_game(
         0,
         OpponentSpec::Weak,
     )?;
-    warmup_checkpoint_evaluation(&mut environment)?;
     let teacher_team = environment.seats[teacher_seat].tracker.team();
     let mut action_counts = [0u32; ActionKind::COUNT];
     let mut decisions = 0u32;
@@ -3537,19 +3533,6 @@ const fn baseline_domain(baseline: CheckpointEvaluationBaseline) -> u64 {
         CheckpointEvaluationBaseline::Teacher => 0x7465_6163_6865_7221,
         CheckpointEvaluationBaseline::Weak => 0x7765_616b_5f5f_5f5f,
     }
-}
-
-fn warmup_checkpoint_evaluation(environment: &mut TrainingEnvironment) -> Result<(), PpoError> {
-    for _ in 0..300 {
-        let requests = vec![None; environment.seats.len()];
-        let advanced = advance_interval(environment, requests, 3)?;
-        if advanced.winner.is_some() {
-            return Err(PpoError::InvalidTransition(
-                "checkpoint evaluation warmup terminated",
-            ));
-        }
-    }
-    Ok(())
 }
 
 fn checkpoint_evaluation_outcome(
@@ -4410,3 +4393,7 @@ fn feature_error(error: crate::FeatureError) -> PpoError {
 fn league_error(error: crate::LeagueError) -> PpoError {
     PpoError::Model(error.to_string())
 }
+
+#[cfg(test)]
+#[path = "tests/ppo_pregame.rs"]
+mod pregame_tests;

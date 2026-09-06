@@ -83,9 +83,9 @@ decimal-string values for `action_schema_hash`, `feature_schema_hash`,
 `model_schema_hash`, `ppo_schema_hash`, `ppo_schema_version`, and
 `ppo_rules_audit_version`. The binary validates the exact metadata, tensor name,
 shape, dtype, and finite values. Metadata must match the current runtime contract
-or its exact audited v13 inference-compatible tuple (see `ppo-v15-migration.md`).
-Old training resumes remain rejected. The runner never rewrites metadata to make
-old artifacts load.
+exactly. Action v3 invalidated the former audited v13 exception; see
+`ppo-v16-migration.md`. Historical weights use their historical tagged runtimes.
+The runner never rewrites metadata to make old artifacts load.
 
 Before building opponents, the runner copies only that canonical file to
 `<run>/candidate-weights/drysua.weights.safetensors` and makes it read-only.

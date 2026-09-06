@@ -1,5 +1,11 @@
 # Tactical policy search
 
+Historical experiment note: the commands and v0.0.4 artifacts below refer to
+Tactical v1 (172 parameters). The current laning preview uses Tactical v2
+(236 parameters) and rejects v1 weights. Reproduce the old run using its matching
+tagged source; current `--initial-policy` and `--opponent-policy` inputs must use
+the current schema. See `laning-preview.md` for the newer experiments and limits.
+
 The first trained release is v0.0.4, not the rejected full-policy PPO experiments.
 It uses a 16→8→4 F32 neural selector (172 parameters) over Teacher/Fight/Recover/Farm.
 Economy, legal action construction and safety remain deterministic Teacher logic.

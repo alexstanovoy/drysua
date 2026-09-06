@@ -17,9 +17,9 @@ use crate::{
 /// Distance at which drysua permits stash swaps around the own fountain.
 pub const STASH_ACCESS_RANGE: i32 = 1_000;
 /// Version of the append-only structured-action schema.
-pub const ACTION_SCHEMA_VERSION: u32 = 2;
+pub const ACTION_SCHEMA_VERSION: u32 = 3;
 /// Canonical action families, head widths, and autoregressive branch order.
-pub const ACTION_SCHEMA_DESCRIPTOR: &str = "bota-drysua-action/v2;kinds=Continue,Stop,MovePoint,FollowUnit,Hold,AttackMovePoint,AttackUnit,Cast,Use,PutPoint,PutUnit,Take,Buy,Sell,Swap,Learn;heads=kind16,controlled2,ability8,item15,swap15,learn6,shop64,loot16,target_mode3,put_mode2,entity96,point48;target_modes=None,Entity,Point;put_modes=Underfoot,Point;put_point_legality=underfoot_only;";
+pub const ACTION_SCHEMA_DESCRIPTOR: &str = "bota-drysua-action/v3;kinds=Continue,Stop,MovePoint,FollowUnit,Hold,AttackMovePoint,AttackUnit,Cast,Use,PutPoint,PutUnit,Take,Buy,Sell,Swap,Learn;heads=kind16,controlled2,ability8,item15,swap15,learn6,shop64,loot16,target_mode3,put_mode2,entity96,point48;target_modes=None,Entity,Point;put_modes=Underfoot,Point;put_point_legality=underfoot_only;buy_legality=positive_missing_leaves_and_total_missing_cost_and_leaf_capacity;buy_decode=root_or_first_missing_leaf;";
 /// Stable FNV-1a identity of [`ACTION_SCHEMA_DESCRIPTOR`].
 pub const ACTION_SCHEMA_HASH: u64 = action_schema_hash(ACTION_SCHEMA_DESCRIPTOR.as_bytes());
 
@@ -520,6 +520,7 @@ struct ControlledState {
 struct BuyRequirement {
     missing_cost: i32,
     missing_slots: usize,
+    first_missing: Option<ItemId>,
 }
 
 #[derive(Clone, Debug)]
@@ -1086,7 +1087,14 @@ impl ActionSpace {
                 target: Target::Unit(self.loot[loot.0].id),
             },
             StructuredAction::Buy { item, .. } => Order::Buy {
-                item: self.shop[item.0].item,
+                item: if self.own_gold >= self.shop[item.0].cost {
+                    self.shop[item.0].item
+                } else {
+                    // The wire validator charges the root price even for an upgrade.
+                    self.buy_requirements[item.0]
+                        .first_missing
+                        .ok_or(ActionError::InvalidSchema("missing purchase leaf"))?
+                },
             },
             StructuredAction::Sell { slot, .. } => Order::Sell { slot },
             StructuredAction::Swap { from, to, .. } => Order::Swap { from, to },
@@ -2027,6 +2035,7 @@ fn missing_buy_requirement(
         return Ok(BuyRequirement {
             missing_cost: root.cost,
             missing_slots: 1,
+            first_missing: Some(item),
         });
     }
     let mut stack = root.components.iter().rev().copied().collect();
@@ -2050,6 +2059,7 @@ fn expand_missing_parts(
     let mut requirement = BuyRequirement {
         missing_cost: 0,
         missing_slots: 0,
+        first_missing: None,
     };
     for _ in 0..expansion_limit {
         let Some(item) = stack.pop() else {
@@ -2061,6 +2071,7 @@ fn expand_missing_parts(
         }
         let entry = shop_entry(shop, item)?;
         if entry.components.is_empty() {
+            requirement.first_missing.get_or_insert(item);
             requirement.missing_slots += 1;
             requirement.missing_cost = requirement
                 .missing_cost
@@ -2338,11 +2349,14 @@ fn fill_buy_mask(
         0
     };
     let free_slots = stash_slots + hero_slots;
-    for (index, item) in space.shop.iter().enumerate() {
-        let requirement = space.buy_requirements[index];
-        masks.buy[index] = free_slots > 0
+    assert_eq!(space.shop.len(), space.buy_requirements.len());
+    for (index, requirement) in space.buy_requirements.iter().enumerate() {
+        assert_eq!(
+            requirement.first_missing.is_some(),
+            requirement.missing_slots > 0
+        );
+        masks.buy[index] = requirement.missing_slots > 0
             && free_slots >= requirement.missing_slots
-            && space.own_gold >= item.cost
             && space.own_gold >= requirement.missing_cost;
     }
 }

@@ -422,8 +422,8 @@ impl TrainingArtifact {
         sync_directory(directory)
     }
 
-    /// Loads current or explicitly audited v13 inference metadata, never optimizer state.
-    /// The artifact metadata is validated without rewriting it; training resume stays strict.
+    /// Loads only exact current inference metadata, never optimizer state.
+    /// Action semantics are not portable across schemas; no legacy tuple is accepted or rewritten.
     pub fn load_runtime_weights(
         model: &PolicyModel,
         directory: &Path,
@@ -642,34 +642,6 @@ fn runtime_tensor_metadata() -> HashMap<String, String> {
     ])
 }
 
-fn audited_prior_runtime_metadata() -> HashMap<String, String> {
-    // Freeze the entire inference contract: future schema changes require a new audit.
-    HashMap::from([
-        (
-            "action_schema_hash".to_owned(),
-            "1018254919734743331".to_owned(),
-        ),
-        (
-            "feature_schema_hash".to_owned(),
-            "13875648161437731669".to_owned(),
-        ),
-        (
-            "model_schema_hash".to_owned(),
-            "10644717168650027237".to_owned(),
-        ),
-        ("ppo_rules_audit_version".to_owned(), "12".to_owned()),
-        (
-            "ppo_schema_hash".to_owned(),
-            "11103744726312279053".to_owned(),
-        ),
-        ("ppo_schema_version".to_owned(), "13".to_owned()),
-    ])
-}
-
-const _: () = assert!(ACTION_SCHEMA_HASH == 1_018_254_919_734_743_331);
-const _: () = assert!(FEATURE_SCHEMA_HASH == 13_875_648_161_437_731_669);
-const _: () = assert!(MODEL_SCHEMA_HASH == 10_644_717_168_650_027_237);
-
 fn serialize_named_tensors(
     tensors: &[(&str, &[f32])],
     metadata: Option<HashMap<String, String>>,
@@ -712,9 +684,7 @@ fn decode_runtime_tensor(bytes: &[u8]) -> Result<Vec<f32>, CheckpointError> {
     let (_, metadata) = SafeTensors::read_metadata(bytes)
         .map_err(|error| CheckpointError::Backend(error.to_string()))?;
     let expected = runtime_tensor_metadata();
-    if metadata.metadata().as_ref() != Some(&expected)
-        && metadata.metadata().as_ref() != Some(&audited_prior_runtime_metadata())
-    {
+    if metadata.metadata().as_ref() != Some(&expected) {
         return Err(CheckpointError::SchemaMismatch);
     }
     let tensors = SafeTensors::deserialize(bytes)

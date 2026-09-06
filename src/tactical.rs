@@ -10,29 +10,40 @@ const HIDDEN_BIAS_OFFSET: usize = TACTICAL_FEATURES * TACTICAL_HIDDEN;
 const OUTPUT_OFFSET: usize = HIDDEN_BIAS_OFFSET + TACTICAL_HIDDEN;
 
 /// Input width; all inputs are finite and normalized to [-1, 1].
-pub const TACTICAL_FEATURES: usize = 16;
+pub const TACTICAL_FEATURES: usize = 24;
 /// Width of the single hard-tanh hidden layer.
 pub const TACTICAL_HIDDEN: usize = 8;
-/// Teacher, Fight, Recover, Farm, in stable logit order.
+/// Teacher, Fight, Recover (lane backoff), Farm, in stable logit order.
 pub const TACTICAL_MODES: usize = 4;
 /// Start of the four output biases in the flat parameter vector.
 pub const TACTICAL_OUTPUT_BIAS_OFFSET: usize = OUTPUT_OFFSET + TACTICAL_MODES * TACTICAL_HIDDEN;
-/// Row-major W1[8,16], b1[8], W2[4,8], b2[4]; 172 trainable f32 values.
+/// Row-major W1[8,24], b1[8], W2[4,8], b2[4]; 236 trainable f32 values.
 pub const TACTICAL_PARAMETERS: usize = TACTICAL_OUTPUT_BIAS_OFFSET + TACTICAL_MODES;
 /// Independent artifact schema, including input semantics, architecture and parameter layout.
-/// Payload is exactly 172 little-endian f32 values following these UTF-8 bytes.
+/// Payload is exactly 236 little-endian f32 values following these UTF-8 bytes.
 pub const TACTICAL_SCHEMA_DESCRIPTOR: &str = concat!(
-    "drysua-tactical/v1;f32le;16x8x4;hardtanh;W1,b1,W2,b2;bound4;",
+    "drysua-tactical/v2;f32le;24x8x4;hardtanh;W1,b1,W2,b2;bound4;",
     "Teacher,Fight,Recover,Farm;argmax-first-available;",
     "hp_own,hp_enemy,mana_own,mana_enemy,attack_over_enemy_hp,attack_over_own_hp,",
     "distance_over_1200,ready_razes_over_3,own_burst_over_enemy_hp,enemy_burst_over_own_hp,",
-    "own_tower_danger,target_tower_danger,pressure_over_own_hp,allied_wave,last_hit,in_attack_range;",
-    "ratios=clamp01;burst=two_attacks_plus_one_best_ready_raze;current_visible_only\n"
+    "own_tower_danger,target_tower_danger,pressure_over_own_hp,allied_wave,last_hit,in_attack_range,",
+    "facing_gap_over_32768,raze_margin_over_250,predicted_enemy_distance_over_1200,",
+    "allied_ranged_distance_over_1200_or_enemy_distance,enemy_melee_distance_over_500_or_one,",
+    "aggro_wait_over_90,plan_time_left_over_90,plan_displacement_over_200;",
+    "ratios=clamp01;burst=two_attacks_plus_mana_budgeted_ready_razes_in_slot_order;",
+    "prediction=one_tick_visible_velocity_capped_by_speed_over_30_clamped_to_public_map;raze_margin=best_ready_circle_or_zero;",
+    "victim=killable_safe_corridor_then_distance_hp_id;current_visible_only;",
+    "Fight=follow_turn_stop_best_margin_raze_or_attack;aim_limit18;",
+    "attack_commitment=ceil15x100_over_attack_speed_plus_ceil32768_over_5795;",
+    "Recover=lane_backoff;step200;threat_within800;hp_at_most80_or_mana_at_most25;",
+    "Farm=last_hit_deny_aggro_pull;aggro_radius500;hold70;cooldown90;",
+    "farm_priority=attack_lh,raze_lh,deny,pull,lane_hold_or_stop;early_aggro=visible_creep_contact_or_after5min;",
+    "navigation=fixed_goal_limit90_stall18_arrival40;decision_ticks=1+3n;pregame=enabled\n"
 );
 /// Exact byte count accepted by [`TacticalPolicy::from_bytes`].
 pub const TACTICAL_FILE_BYTES: usize = TACTICAL_SCHEMA_DESCRIPTOR.len() + TACTICAL_PARAMETERS * 4;
 
-const _: () = assert!(TACTICAL_PARAMETERS == 172);
+const _: () = assert!(TACTICAL_PARAMETERS == 236);
 const _: () = assert!(TACTICAL_MODES == TacticalMode::ALL.len());
 
 /// A legal macro, not an arbitrary action or a simulation seed.
@@ -175,6 +186,9 @@ impl TacticalPolicy {
     /// Rejects truncated/oversized files, different schemas and invalid weight values.
     /// File callers should bound reads to [`TACTICAL_FILE_BYTES`] plus one byte.
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, TacticalError> {
+        if bytes.starts_with(b"drysua-tactical/v1;") {
+            return Err(TacticalError::Schema);
+        }
         if bytes.len() != TACTICAL_FILE_BYTES {
             return Err(TacticalError::FileSize {
                 actual: bytes.len(),

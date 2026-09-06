@@ -140,9 +140,9 @@ fn rollout_compacts_sparse_tokens_and_bit_packs_behavioral_masks_losslessly() {
 
 #[test]
 fn ppo_schema_and_rules_audit_are_stable() {
-    assert_eq!(PPO_SCHEMA_VERSION, 15);
-    assert_eq!(PPO_RULES_AUDIT_VERSION, 14);
-    assert_eq!(PPO_SCHEMA_HASH, 13_893_101_989_595_893_928);
+    assert_eq!(PPO_SCHEMA_VERSION, 16);
+    assert_eq!(PPO_RULES_AUDIT_VERSION, 15);
+    assert_eq!(PPO_SCHEMA_HASH, 11_450_737_853_127_354_910);
     assert_eq!(PpoConfig::default().learning_rate, 3.0e-6);
 }
 
@@ -1566,7 +1566,7 @@ fn production_seed_derivation_accepts_maximum_seed_without_overflow() {
 #[cfg(feature = "builtin")]
 #[test]
 fn teacher_pretraining_collection_is_balanced_bounded_and_diverse() {
-    const EXPECTED_MAP_ONE_SAMPLES: u64 = 4_058;
+    const EXPECTED_MAP_ONE_SAMPLES: u64 = 4_581;
     let (samples, actions, splits) =
         crate::collect_pretraining_summary_for_test(50_001).expect("pretraining collection");
     println!("samples={samples} actions={actions:?} splits={splits:?}");

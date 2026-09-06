@@ -757,13 +757,17 @@ nonterminal state. Builtin smoke держит одного learner seat прот
 double buffering и массовое использование RTX относятся к этапу 17; этап 9 не добавляет
 CUDA supply-chain/build complexity и не выдаёт короткий smoke за GPU benchmark.
 Server и builtin Arena завершают каждый Snapshot явным Events batch, включая пустой.
-Policy принимает решение только после этой tick-complete границы и не принимает решений
-до первого tick после pregame. Production arenas
+Policy принимает решение только после этой tick-complete границы, начиная с tick 1,
+включая pregame; default cadence для всех policy — `1 + 3n`. Production arenas
 образуют полные frozen-policy side pairs.
-Current PPO contract: schema v15, hash `13893101989595893928`, rules audit v14.
+Current PPO contract: schema v16, hash `11450737853127354910`, rules audit v15.
+Action v3 changes composite Buy legality and root/first-missing-leaf wire decoding.
+Feature v8/hash `10322490384647633864` binds that action-dependent legality; model
+v8/hash `3097714014199697774` binds the new action/feature contracts without changing
+tensor shapes or parameter order. See [PPO v16 migration](ppo-v16-migration.md).
 PPO value regression detaches the value-head input and trains only that head, not shared
-actor features; BC, public training forward, inference, parameter order and model schema
-are unchanged. KL is checked before and after the candidate optimizer step. Post-step KL
+actor features; this isolation does not alter BC, public training forward, parameter order
+or architecture. KL is checked before and after the candidate optimizer step. Post-step KL
 is sample-weighted over the complete effective minibatch against the rollout policy.
 Overshoot or candidate-evaluation error restores exact parameters, Adam moments/step and
 policy revision under the exclusive parameter lock when rollback succeeds. If the backend
@@ -851,7 +855,7 @@ Truncated matches считаются Draw и не превращаются в п
 промежуточным public statistics. Promotion требует минимум 20 disjoint paired seeds,
 1000 candidate actions, rejection rate ниже 0.1%, отсутствия regression на каждой стороне
 и opaque exploit audit, привязанный к candidate и accepted fingerprints. Stage-ten
-Current league contract: schema v16, hash `1035319045739487525`, rules audit v14.
+Current league contract: schema v17, hash `14981756892451872554`, rules audit v15.
 
 ## 17. GPU и actor-learner pipeline
 
@@ -899,7 +903,7 @@ Padding выполняется только при сборке minibatch.
 Metal выбираются явно через `PolicyDevice`; параметры, forward, loss и backward находятся на
 выбранном backend. Rollout хранит sparse token rows в typed arenas с проверяемыми offsets,
 bit-packed legal masks и разворачивает fixed padding только для текущего minibatch. Model
-schema v7, hash `10644717168650027237`; PPO schema v15, hash `13893101989595893928`.
+schema v8, hash `3097714014199697774`; PPO schema v16, hash `11450737853127354910`.
 
 ## 18. Checkpoints
 
@@ -962,14 +966,14 @@ schema до атомарной установки model+optimizer ownership. Sav
 generation, canonical tensor copy и recoverable manifest последним; каждый файл и directory
 fsync-ится. Двухфайловая копия остаётся independently loadable через hash-checked canonical
 fallback. Runtime weights additionally bind PPO schema/version and rules audit metadata.
-Training resume is strictly current-schema: v13 and v14 training manifests are rejected, including
-the pre-migration conservative probes. Runtime reads alone also accept the exact audited
-prior metadata map: action hash `1018254919734743331`, feature hash `13875648161437731669`,
-model hash `10644717168650027237`, PPO version `13`, PPO hash `11103744726312279053`, rules
-audit `12`. Missing/extra fields, wrong hashes and older deployment contracts are rejected.
-This inference-only whitelist preserves accepted BC anchor `e63f0bdb478ebb8b` without
-rewriting any metadata; names, shapes, F32 and finite checks remain mandatory. New runtime
-writes use current metadata. The checkpoint wire layout itself is unchanged.
+Training resume and runtime reads are strictly current-schema. PPO v13/v14/v15 training
+manifests are rejected, including under `--migrate-provenance`. The former exact v13 runtime
+exception is removed: action v2 semantics are incompatible with action v3 even though tensor
+shapes match. Historical BC anchor `e63f0bdb478ebb8b` and probe weights cannot initialize this
+build. Missing/extra metadata fields, wrong hashes and mixed tuples reject before model
+mutation; names, shapes, F32 and finite checks remain mandatory. Historical tag artifacts
+stay immutable and run only with their matching historical binaries/source trees. Do not
+rewrite metadata or bypass validation. The checkpoint wire layout itself is unchanged.
 Checkpoint schema v2, hash `4581258024746721724`.
 
 `drysua evaluate` загружает runtime artifact и всегда запускает фиксированную матрицу из обеих

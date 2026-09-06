@@ -1,5 +1,10 @@
 # PPO v14 training migration
 
+**Historical record, superseded by [PPO v16](ppo-v16-migration.md).** The v13 runtime
+exception described below was removed when action v3 changed Buy semantics. Current
+binaries reject that anchor and all v13/v14/v15 runtime/training metadata. The prior
+verification results below describe the v14 build, not current compatibility.
+
 **Superseded by [PPO v15 / league v16](ppo-v15-migration.md).** This document
 records the historical v14 contract, not the current reward or resume semantics.
 v14 training checkpoints cannot resume under v15.

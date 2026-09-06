@@ -342,32 +342,11 @@ fn ppo_rollback_fixture(
     (model, adam, samples, config)
 }
 
-#[test]
-#[ignore = "requires the accepted local BC artifact"]
-fn bc_anchor_critic_only_step_preserves_actor_and_trains_value() {
-    assert_bc_anchor_transfer(PolicyDevice::Cpu);
-}
-
 #[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
 #[test]
-#[ignore = "requires CUDA and the accepted local BC artifact"]
-fn cuda_bc_anchor_critic_only_step_preserves_actor_and_trains_value() {
-    assert_bc_anchor_transfer(PolicyDevice::Cuda { ordinal: 0 });
-}
-
-fn assert_bc_anchor_transfer(device: PolicyDevice) {
-    let model = PolicyModel::fresh_on(9_101, device).expect("model");
-    crate::TrainingArtifact::load_runtime_weights(
-        &model,
-        std::path::Path::new("artifacts/temp/neural-v004-default-e8"),
-    )
-    .expect("validated accepted BC weights");
-    assert_eq!(
-        crate::PolicySnapshot::capture(&model, 0)
-            .expect("snapshot")
-            .fingerprint(),
-        0xe63f_0bdb_478e_bb8b
-    );
+#[ignore = "requires a CUDA device"]
+fn cuda_ppo_critic_only_step_preserves_actor_and_trains_value() {
+    let model = PolicyModel::fresh_on(9_101, PolicyDevice::Cuda { ordinal: 0 }).expect("model");
     assert_critic_transfer(&model);
 }
 
@@ -831,8 +810,12 @@ fn adam_rejects_invalid_config_nonfinite_and_extreme_updates_without_partial_sta
 
 #[test]
 fn model_schema_and_head_dimensions_are_stable() {
-    assert_eq!(MODEL_SCHEMA_VERSION, 7);
-    assert_eq!(MODEL_SCHEMA_HASH, 10_644_717_168_650_027_237);
+    assert_eq!(MODEL_SCHEMA_VERSION, 8);
+    assert!(
+        crate::MODEL_SCHEMA_DESCRIPTOR
+            .contains("action_schema_version=3;action_schema_hash=1755359086494840931;")
+    );
+    assert_eq!(MODEL_SCHEMA_HASH, 3_097_714_014_199_697_774);
     assert_eq!(MODEL_KIND_HEAD, 16);
     assert_eq!(MODEL_UNIT_HEAD, 2);
     assert_eq!(MODEL_ABILITY_HEAD, 8);

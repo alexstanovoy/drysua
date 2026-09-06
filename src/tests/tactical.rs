@@ -9,12 +9,34 @@ use crate::{
 };
 
 #[test]
+fn tactical_v2_rejects_released_v1_weights_instead_of_reinterpreting_them() {
+    let bytes = include_bytes!("../../artifacts/v0.0.4/drysua.tactical.bin");
+
+    let error = TacticalPolicy::from_bytes(bytes).expect_err("v1 is not a v2 policy");
+
+    assert_eq!(
+        error.to_string(),
+        "tactical file schema does not match this architecture and feature order"
+    );
+    assert!(crate::TACTICAL_SCHEMA_DESCRIPTOR.starts_with("drysua-tactical/v2;"));
+}
+
+#[test]
+fn tactical_v2_descriptor_records_macro_and_decision_cadence_semantics() {
+    let descriptor = crate::TACTICAL_SCHEMA_DESCRIPTOR;
+
+    assert!(descriptor.contains("Recover=lane_backoff"));
+    assert!(descriptor.contains("decision_ticks=1+3n;pregame=enabled"));
+    assert!(descriptor.contains("Farm=last_hit_deny_aggro_pull"));
+}
+
+#[test]
 fn tactical_parameters_reject_wrong_shape_with_specific_error() {
     let error = TacticalPolicy::from_parameters(&[0.0; 1]).expect_err("wrong shape");
 
     assert_eq!(
         error.to_string(),
-        "tactical parameters have 1 values; expected 172"
+        "tactical parameters have 1 values; expected 236"
     );
 }
 

@@ -37,7 +37,7 @@ struct Arguments {
     /// Validated standalone policy to continue searching, or evaluate with --probe.
     #[arg(long)]
     initial_policy: Option<PathBuf>,
-    /// Immutable V1 opponent artifact; adds its cohort alongside pure Teacher.
+    /// Immutable current-schema opponent artifact; adds its cohort alongside pure Teacher.
     #[arg(long)]
     opponent_policy: Option<PathBuf>,
     /// Evaluate founders (or --initial-policy) without running optimization.
