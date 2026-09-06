@@ -1566,7 +1566,7 @@ fn production_seed_derivation_accepts_maximum_seed_without_overflow() {
 #[cfg(feature = "builtin")]
 #[test]
 fn teacher_pretraining_collection_is_balanced_bounded_and_diverse() {
-    const EXPECTED_MAP_ONE_SAMPLES: u64 = 4_581;
+    const EXPECTED_MAP_ONE_SAMPLES: u64 = 4_663;
     let (samples, actions, splits) =
         crate::collect_pretraining_summary_for_test(50_001).expect("pretraining collection");
     println!("samples={samples} actions={actions:?} splits={splits:?}");

@@ -1,8 +1,8 @@
 # Tactical policy search
 
 Historical experiment note: the commands and v0.0.4 artifacts below refer to
-Tactical v1 (172 parameters). The current laning preview uses Tactical v2
-(236 parameters) and rejects v1 weights. Reproduce the old run using its matching
+Tactical v1 (172 parameters). The current laning preview uses Tactical v3
+(236 parameters) and rejects v1/v2 weights. Reproduce the old run using its matching
 tagged source; current `--initial-policy` and `--opponent-policy` inputs must use
 the current schema. See `laning-preview.md` for the newer experiments and limits.
 

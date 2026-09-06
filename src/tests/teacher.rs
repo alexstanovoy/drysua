@@ -1640,7 +1640,12 @@ fn tactical_pursuit_releases_body_order_when_target_leaves_visibility() {
         .expect("release pursuit");
 
     assert_ne!(action, StructuredAction::Continue);
-    assert!(matches!(action, StructuredAction::AttackMovePoint { .. }));
+    assert_eq!(
+        action,
+        StructuredAction::Stop {
+            unit: ControlledUnit::Hero
+        }
+    );
     assert!(space.allows(action));
 }
 
@@ -3114,6 +3119,824 @@ fn decide_stopped(tracker: &StateTracker) -> (StructuredAction, crate::ActionSpa
     teacher
         .decide(tracker, &persistence, &ItemReadiness::new())
         .expect("stopped teacher")
+}
+
+#[test]
+fn finish_one_auto_selects_the_hero_before_farm_at_fifteen_percent_health() {
+    let mut view = one_auto_view();
+    let mut creep = unit(CREEP_ID, UnitKind::CreepMelee, Team::Dire, 3_200, 3_000);
+    creep.hp = 10;
+    creep.attack_damage = 0;
+    view.units.push(creep);
+    sort_units(&mut view);
+    let tracker = tracker(view);
+
+    let (action, space) = Teacher::new()
+        .decide_tactical(
+            &tracker,
+            &OrderPersistence::default(),
+            &ItemReadiness::new(),
+            &tactical_policy(crate::TacticalMode::Farm),
+        )
+        .expect("one-auto finish");
+
+    assert_eq!(
+        space.decode(action).expect("decode").expect("attack").order,
+        Order::Attack {
+            target: Target::Unit(ENEMY_HERO_ID)
+        }
+    );
+}
+
+#[test]
+fn finish_one_auto_declines_leeway_healing_disables_and_lethal_replies() {
+    for scenario in 0..7 {
+        let mut view = one_auto_view();
+        match scenario {
+            0 => enemy_hero_mut(&mut view).pos.x = Fixed::from_int(3_549),
+            1 => enemy_hero_mut(&mut view).hp = 37,
+            2 => own_hero_mut(&mut view).hp = 37,
+            3 => own_hero_mut(&mut view).statuses.bits = StatusFlags::STUNNED,
+            4 => own_hero_mut(&mut view).statuses.bits = StatusFlags::DOT,
+            5 => {
+                let enemy = enemy_hero_mut(&mut view);
+                enemy.mana = 75;
+                enemy.abilities = vec![ability(13, 2, 75, false)];
+            }
+            _ => own_hero_mut(&mut view).attack_interval = 255,
+        }
+        let tracker = tracker(view);
+
+        let (action, space) = decide(&tracker);
+
+        assert!(
+            !matches!(action, StructuredAction::AttackUnit { .. }),
+            "scenario {scenario}"
+        );
+        assert!(space.allows(action));
+    }
+}
+
+#[test]
+fn finish_raze_budget_allows_a_nonlethal_known_raze_but_rejects_a_lethal_one() {
+    for (level, cost, expected) in [(1, 75, true), (2, 80, false)] {
+        let mut view = finish_raze_view();
+        let enemy = enemy_hero_mut(&mut view);
+        enemy.mana = cost;
+        enemy.abilities = vec![ability(13, level, cost, false)];
+        let tracker = tracker(view);
+
+        let (action, _) = decide(&tracker);
+
+        assert_eq!(
+            matches!(action, StructuredAction::AttackUnit { .. }),
+            expected
+        );
+    }
+}
+
+#[test]
+fn finish_raze_budget_counts_only_mana_feasible_casts_from_three_learned_razes() {
+    for (mana, expected) in [(75, true), (150, false)] {
+        let mut view = finish_raze_view();
+        let enemy = enemy_hero_mut(&mut view);
+        enemy.mana = mana;
+        enemy.abilities = [13, 14, 15].map(|id| ability(id, 1, 75, false)).to_vec();
+        let tracker = tracker(view);
+
+        let (action, _) = decide(&tracker);
+
+        assert_eq!(
+            matches!(action, StructuredAction::AttackUnit { .. }),
+            expected
+        );
+    }
+}
+
+#[test]
+fn finish_raze_budget_chooses_the_most_damaging_affordable_subset_not_slot_order() {
+    for ids in [[13, 14, 15], [15, 14, 13]] {
+        let mut view = finish_raze_view();
+        let enemy = enemy_hero_mut(&mut view);
+        enemy.mana = 80;
+        enemy.abilities = ids
+            .map(|id| {
+                ability(
+                    id,
+                    if id == 14 { 2 } else { 1 },
+                    if id == 14 { 80 } else { 75 },
+                    false,
+                )
+            })
+            .to_vec();
+        let tracker = tracker(view);
+
+        let (action, _) = decide(&tracker);
+
+        assert!(matches!(action, StructuredAction::MovePoint { .. }));
+    }
+}
+
+#[test]
+fn finish_raze_budget_ignores_cooldowns_beyond_the_deadline_but_not_at_it() {
+    for (cooldown, expected) in [(44, false), (45, true)] {
+        let mut view = finish_raze_view();
+        let enemy = enemy_hero_mut(&mut view);
+        enemy.mana = 80;
+        let mut raze = ability(13, 2, 80, false);
+        raze.cooldown_left = cooldown;
+        enemy.abilities = vec![raze];
+        let tracker = tracker(view);
+
+        let (action, _) = decide(&tracker);
+
+        assert_eq!(
+            matches!(action, StructuredAction::AttackUnit { .. }),
+            expected
+        );
+    }
+}
+
+#[test]
+fn finish_raze_budget_excludes_impossible_geometry_but_ignores_facing() {
+    for (reach_id, expected) in [(13, false), (15, true)] {
+        let mut view = finish_raze_view();
+        let enemy = enemy_hero_mut(&mut view);
+        enemy.pos = Vec2::from_ints(3_080, 3_000);
+        enemy.move_speed = Fixed::ZERO;
+        enemy.facing.brads = 0;
+        enemy.mana = 80;
+        enemy.abilities = vec![ability(reach_id, 2, 80, false)];
+        let tracker = tracker(view);
+
+        let (action, _) = decide(&tracker);
+
+        assert_eq!(
+            matches!(action, StructuredAction::AttackUnit { .. }),
+            expected
+        );
+    }
+}
+
+#[test]
+fn finish_raze_budget_reserves_natural_mana_regeneration_and_visible_restore_uncertainty() {
+    for (mana, restore, expected) in [(75, false, true), (78, false, false), (0, true, true)] {
+        let mut view = finish_raze_view();
+        let enemy = enemy_hero_mut(&mut view);
+        enemy.mana = mana;
+        enemy.abilities = vec![ability(13, 2, 80, false)];
+        if restore {
+            enemy.effects.push(EffectView {
+                id: EffectId(2),
+                ticks_left: Some(300),
+                stacks: None,
+            });
+        }
+        let tracker = tracker(view);
+
+        let (action, _) = decide(&tracker);
+
+        assert_eq!(
+            matches!(action, StructuredAction::AttackUnit { .. }),
+            expected
+        );
+    }
+}
+
+#[test]
+fn finish_raze_budget_keeps_the_unknown_active_and_requiem_veto() {
+    for id in [16, 999] {
+        let mut view = finish_raze_view();
+        let enemy = enemy_hero_mut(&mut view);
+        enemy.mana = 150;
+        enemy.abilities = vec![ability(id, 1, 150, false)];
+        let tracker = tracker(view);
+
+        let (action, _) = decide(&tracker);
+
+        assert!(matches!(action, StructuredAction::MovePoint { .. }));
+    }
+}
+
+fn finish_raze_view() -> WorldView {
+    let mut view = one_auto_view();
+    let hero = own_hero_mut(&mut view);
+    hero.hp = 150;
+    hero.max_hp = 1_000;
+    let enemy = enemy_hero_mut(&mut view);
+    enemy.max_mana = 291;
+    view
+}
+
+#[test]
+fn finish_restoration_empty_stick_and_wand_cannot_fund_a_raze() {
+    for id in [35, 36] {
+        let tracker = tracker(finish_item_view(id, 0, 0));
+
+        let (action, _) = decide(&tracker);
+
+        assert!(matches!(action, StructuredAction::AttackUnit { .. }));
+    }
+}
+
+#[test]
+fn finish_restoration_one_wand_charge_adds_only_fifteen_mana() {
+    for (mana, expected) in [(0, true), (61, true), (62, false)] {
+        let mut view = finish_item_view(36, 1, 0);
+        enemy_hero_mut(&mut view).mana = mana;
+        let tracker = tracker(view);
+
+        let (action, _) = decide(&tracker);
+
+        assert_eq!(
+            matches!(action, StructuredAction::AttackUnit { .. }),
+            expected
+        );
+    }
+}
+
+#[test]
+fn finish_restoration_uses_only_inventory_items_ready_within_the_window() {
+    for (slot, cooldown, mute, funded) in [
+        (0, 0, 0, true),
+        (5, 44, 0, true),
+        (0, 45, 0, false),
+        (0, 0, 44, true),
+        (0, 0, 45, false),
+        (6, 0, 0, false),
+        (8, 0, 0, false),
+    ] {
+        let mut view = finish_item_view(36, 1, slot);
+        let enemy = enemy_hero_mut(&mut view);
+        enemy.mana = 62;
+        let held = enemy.items[slot].as_mut().expect("wand");
+        held.cooldown_left = cooldown;
+        held.mute_left = mute;
+        let tracker = tracker(view);
+
+        let (action, _) = decide(&tracker);
+
+        assert_eq!(
+            matches!(action, StructuredAction::AttackUnit { .. }),
+            !funded,
+            "slot={slot} cooldown={cooldown} mute={mute}"
+        );
+    }
+}
+
+#[test]
+fn finish_restoration_wand_healing_invalidates_one_hit_even_without_enemy_spells() {
+    for (hp, expected) in [(5, true), (15, true), (16, false), (20, false)] {
+        let mut view = finish_item_view(36, 1, 0);
+        let enemy = enemy_hero_mut(&mut view);
+        enemy.hp = hp;
+        enemy.abilities.clear();
+        let tracker = tracker(view);
+
+        let (action, _) = decide(&tracker);
+
+        assert_eq!(
+            matches!(action, StructuredAction::AttackUnit { .. }),
+            expected
+        );
+    }
+}
+
+#[test]
+fn finish_restoration_unavailable_wand_does_not_inflate_enemy_health() {
+    for (charges, slot, cooldown) in [(0, 0, 0), (1, 6, 0), (1, 0, 45)] {
+        let mut view = finish_item_view(36, charges, slot);
+        let enemy = enemy_hero_mut(&mut view);
+        enemy.hp = 20;
+        enemy.abilities.clear();
+        enemy.items[slot].as_mut().expect("wand").cooldown_left = cooldown;
+        let tracker = tracker(view);
+
+        let (action, _) = decide(&tracker);
+
+        assert!(matches!(action, StructuredAction::AttackUnit { .. }));
+    }
+}
+
+#[test]
+fn finish_restoration_treads_mana_increase_is_finite_and_respects_current_mode() {
+    for (mana, mode, expected) in [
+        (0, Attribute::Strength, true),
+        (30, Attribute::Strength, false),
+        (30, Attribute::Intelligence, true),
+    ] {
+        let mut view = finish_item_view(29, 0, 0);
+        let enemy = enemy_hero_mut(&mut view);
+        enemy.mana = mana;
+        enemy.items[0].as_mut().expect("treads").mode = Some(mode);
+        enemy.abilities = [13, 14, 15].map(|id| ability(id, 1, 75, false)).to_vec();
+        let tracker = tracker(view);
+
+        let (action, _) = decide(&tracker);
+
+        assert_eq!(
+            matches!(action, StructuredAction::AttackUnit { .. }),
+            expected
+        );
+    }
+}
+
+#[test]
+fn finish_restoration_clarity_is_duration_bounded_and_does_not_stack_with_its_item() {
+    for (mana, duration, consumable, expected) in [
+        (0, 300, false, true),
+        (67, 300, false, true),
+        (68, 300, false, false),
+        (75, 5, false, true),
+        (76, 5, false, false),
+        (60, 300, true, true),
+    ] {
+        let mut view = finish_raze_view();
+        let enemy = enemy_hero_mut(&mut view);
+        enemy.mana = mana;
+        enemy.abilities = vec![ability(13, 2, 80, false)];
+        enemy.effects.push(EffectView {
+            id: EffectId(2),
+            ticks_left: Some(duration),
+            stacks: None,
+        });
+        if consumable {
+            enemy.items = vec![Some(item(ItemId(1), Some(Aim::Unit), 250, Some(1)))];
+        }
+        let tracker = tracker(view);
+
+        let (action, _) = decide(&tracker);
+
+        assert_eq!(
+            matches!(action, StructuredAction::AttackUnit { .. }),
+            expected
+        );
+    }
+}
+
+#[test]
+fn finish_restoration_clarity_item_requires_a_charge_and_a_ready_inventory_slot() {
+    for (charges, slot, cooldown, expected) in [
+        (1, 0, 0, false),
+        (0, 0, 0, true),
+        (1, 6, 0, true),
+        (1, 0, 45, true),
+    ] {
+        let mut view = finish_item_view(1, charges, slot);
+        let enemy = enemy_hero_mut(&mut view);
+        enemy.mana = 68;
+        enemy.items[slot].as_mut().expect("clarity").cooldown_left = cooldown;
+        let tracker = tracker(view);
+
+        let (action, _) = decide(&tracker);
+
+        assert_eq!(
+            matches!(action, StructuredAction::AttackUnit { .. }),
+            expected
+        );
+    }
+}
+
+#[test]
+fn finish_restoration_reserves_future_charges_only_for_a_visible_ready_allied_caster() {
+    for (mana, cooldown, expected) in [(0, 0, true), (75, 0, false), (75, 45, true)] {
+        let mut view = finish_item_view(36, 0, 0);
+        let mut caster = unit(entity(30, 1), UnitKind::Hero, Team::Radiant, 3_200, 3_100);
+        caster.mana = mana;
+        let mut raze = ability(13, 1, 75, false);
+        raze.cooldown_left = cooldown;
+        caster.abilities = vec![raze];
+        view.units.push(caster);
+        sort_units(&mut view);
+        let tracker = tracker(view);
+
+        let (action, _) = decide(&tracker);
+
+        assert_eq!(
+            matches!(action, StructuredAction::AttackUnit { .. }),
+            expected
+        );
+    }
+}
+
+fn finish_item_view(id: u16, charges: u8, slot: usize) -> WorldView {
+    assert!(slot < 9);
+    let mut view = finish_raze_view();
+    let enemy = enemy_hero_mut(&mut view);
+    enemy.hp = 5;
+    enemy.mana = 0;
+    enemy.abilities = vec![ability(13, 2, 80, false)];
+    enemy.items = vec![None; 9];
+    enemy.items[slot] = Some(item(ItemId(id), Some(Aim::Own), 0, Some(charges)));
+    view
+}
+
+#[test]
+fn finish_one_auto_expires_without_renewal_and_aborts_when_normal_range_is_lost() {
+    for elapsed in [3, 60, 63] {
+        let mut view = one_auto_view();
+        let mut tracker = tracker(view.clone());
+        let mut teacher = Teacher::new();
+        let mut persistence = OrderPersistence::default();
+        let policy = tactical_policy(crate::TacticalMode::Farm);
+        let first = send_combat_decision(&mut teacher, &tracker, &mut persistence, &policy);
+        assert_eq!(
+            first,
+            Order::Attack {
+                target: Target::Unit(ENEMY_HERO_ID)
+            }
+        );
+        view.tick += elapsed;
+        if elapsed == 3 {
+            enemy_hero_mut(&mut view).pos.x = Fixed::from_int(3_549);
+        }
+        tracker
+            .observe_snapshot(&view)
+            .expect("expired or out of reach");
+
+        let stop = send_combat_decision(&mut teacher, &tracker, &mut persistence, &policy);
+        assert!(matches!(stop, Order::Move { .. }));
+        view.tick += 3;
+        tracker.observe_snapshot(&view).expect("next decision");
+        let (next, _) = teacher
+            .decide(&tracker, &persistence, &ItemReadiness::new())
+            .expect("no renewal");
+        assert!(!matches!(next, StructuredAction::AttackUnit { .. }));
+    }
+}
+
+#[test]
+fn finish_one_auto_adopts_an_existing_attack_without_resetting_its_deadline() {
+    let mut view = one_auto_view();
+    let mut tracker = tracker(view.clone());
+    let mut teacher = Teacher::new();
+    let mut persistence = OrderPersistence::default();
+    record_combat_order(
+        &mut teacher,
+        &mut persistence,
+        Order::Attack {
+            target: Target::Unit(ENEMY_HERO_ID),
+        },
+        view.tick,
+    );
+
+    let (first, _) = teacher
+        .decide(&tracker, &persistence, &ItemReadiness::new())
+        .expect("adopt");
+    assert_eq!(first, StructuredAction::Continue);
+    view.tick += 63;
+    tracker.observe_snapshot(&view).expect("deadline");
+    let (next, _) = teacher
+        .decide(&tracker, &persistence, &ItemReadiness::new())
+        .expect("expire");
+    assert!(matches!(
+        next,
+        StructuredAction::Stop { .. } | StructuredAction::MovePoint { .. }
+    ));
+}
+
+#[test]
+fn finish_one_auto_safety_adoption_is_bounded_and_rejected_orders_roll_back_the_attempt() {
+    for rejected in [false, true] {
+        let mut view = one_auto_view();
+        let mut tracker = tracker(view.clone());
+        let mut teacher = Teacher::new();
+        let mut persistence = OrderPersistence::default();
+        record_combat_order(
+            &mut teacher,
+            &mut persistence,
+            Order::Attack {
+                target: Target::Unit(ENEMY_HERO_ID),
+            },
+            view.tick,
+        );
+        let space = crate::ActionSpace::from_tracker(&tracker).expect("space");
+        let action = teacher
+            .safety_action(&tracker, &space)
+            .expect("adopt finish");
+        assert_eq!(
+            space.decode(action).expect("decode").expect("attack").order,
+            Order::Attack {
+                target: Target::Unit(ENEMY_HERO_ID)
+            }
+        );
+        if rejected {
+            assert!(teacher.note_rejected(1));
+            assert!(persistence.observe_rejection(1));
+        }
+        view.tick += 63;
+        tracker.observe_snapshot(&view).expect("expired");
+
+        let (action, _) = teacher
+            .decide(&tracker, &persistence, &ItemReadiness::new())
+            .expect("after deadline");
+
+        assert_eq!(
+            matches!(action, StructuredAction::AttackUnit { .. }),
+            rejected
+        );
+        if !rejected {
+            assert!(matches!(
+                action,
+                StructuredAction::Stop { .. } | StructuredAction::MovePoint { .. }
+            ));
+        }
+    }
+}
+
+#[test]
+fn finish_one_auto_vetoes_visible_hostile_flight_even_with_no_visible_launcher() {
+    let mut view = one_auto_view();
+    view.projectiles.push(bota_proto::ProjectileView {
+        id: entity(90, 1),
+        pos: Vec2::from_ints(3_100, 3_000),
+        facing: Angle { brads: 32_768 },
+        team: Team::Dire,
+        ability: None,
+    });
+    let tracker = tracker(view);
+
+    let (action, _) = decide(&tracker);
+
+    assert!(matches!(action, StructuredAction::MovePoint { .. }));
+}
+
+#[test]
+fn finish_one_auto_does_not_restart_by_switching_victims_while_still_low_health() {
+    let mut view = one_auto_view();
+    let mut tracker = tracker(view.clone());
+    let mut teacher = Teacher::new();
+    let mut persistence = OrderPersistence::default();
+    let policy = tactical_policy(crate::TacticalMode::Farm);
+    send_combat_decision(&mut teacher, &tracker, &mut persistence, &policy);
+    view.tick += 63;
+    tracker.observe_snapshot(&view).expect("expired");
+    send_combat_decision(&mut teacher, &tracker, &mut persistence, &policy);
+    view.tick += 3;
+    enemy_hero_mut(&mut view).id = entity(30, 1);
+    view.players[1].unit = Some(entity(30, 1));
+    sort_units(&mut view);
+    tracker.observe_snapshot(&view).expect("different victim");
+
+    let (action, _) = teacher
+        .decide(&tracker, &persistence, &ItemReadiness::new())
+        .expect("no second trial");
+
+    assert!(!matches!(action, StructuredAction::AttackUnit { .. }));
+}
+
+#[test]
+fn tower_guard_new_navigation_does_not_cross_toward_a_hero_even_with_a_wave() {
+    let mut view = base_view();
+    own_hero_mut(&mut view).pos = Vec2::from_ints(5_000, 6_000);
+    view.units
+        .retain(|unit| !matches!(unit.kind, UnitKind::Ancient));
+    view.units.push(unit(
+        entity(31, 1),
+        UnitKind::CreepRanged,
+        Team::Radiant,
+        6_700,
+        6_000,
+    ));
+    view.units.push(unit(
+        ENEMY_HERO_ID,
+        UnitKind::Hero,
+        Team::Dire,
+        6_400,
+        6_000,
+    ));
+    let tracker = tracker({
+        sort_units(&mut view);
+        view
+    });
+
+    let (action, space) = decide(&tracker);
+
+    let issued = space.decode(action).expect("decode").expect("navigation");
+    if let Order::Move {
+        target: Target::Pos(point),
+    }
+    | Order::Attack {
+        target: Target::Pos(point),
+    } = issued.order
+    {
+        assert!(
+            point.x <= Fixed::from_int(5_200),
+            "must not cut through tower to a wave: {point:?}"
+        );
+    } else {
+        assert!(matches!(
+            action,
+            StructuredAction::Stop { .. } | StructuredAction::Hold { .. }
+        ));
+    }
+}
+
+#[test]
+fn tower_guard_rechecks_an_aim_follow_when_the_target_enters_tower_cover() {
+    let mut view = tactical_view(-500, 500);
+    let hero = own_hero_mut(&mut view);
+    hero.pos = Vec2::from_ints(5_100, 6_000);
+    hero.mana = 75;
+    enemy_hero_mut(&mut view).pos = Vec2::from_ints(4_600, 6_000);
+    let mut tracker = tracker(view.clone());
+    let mut teacher = Teacher::new();
+    let mut persistence = OrderPersistence::default();
+    let aim = send_combat_decision(
+        &mut teacher,
+        &tracker,
+        &mut persistence,
+        &tactical_policy(crate::TacticalMode::Fight),
+    );
+    assert_eq!(
+        aim,
+        Order::Move {
+            target: Target::Unit(ENEMY_HERO_ID)
+        }
+    );
+    view.tick += 3;
+    enemy_hero_mut(&mut view).pos = Vec2::from_ints(5_850, 6_000);
+    tracker.observe_snapshot(&view).expect("target at tower");
+
+    let (action, _) = teacher
+        .decide(&tracker, &persistence, &ItemReadiness::new())
+        .expect("revalidate aim");
+
+    assert_eq!(
+        action,
+        StructuredAction::Stop {
+            unit: ControlledUnit::Hero
+        }
+    );
+}
+
+#[test]
+fn tower_guard_cancels_retained_attack_follow_move_and_attack_move_across_the_corridor() {
+    for order_kind in 0usize..4 {
+        let mut view = tactical_view(1_100, 100);
+        own_hero_mut(&mut view).pos = Vec2::from_ints(5_300, 5_700);
+        enemy_hero_mut(&mut view).pos = Vec2::from_ints(6_400, 5_300);
+        view.tick = 4;
+        let target = if order_kind < 2 {
+            Target::Unit(ENEMY_HERO_ID)
+        } else {
+            Target::Pos(Vec2::from_ints(6_400, 5_300))
+        };
+        let order = if order_kind.is_multiple_of(2) {
+            Order::Attack { target }
+        } else {
+            Order::Move { target }
+        };
+        let tracker = tracker(view);
+        let mut teacher = Teacher::new();
+        let mut persistence = OrderPersistence::default();
+        record_combat_order(&mut teacher, &mut persistence, order, 1);
+        let space = crate::ActionSpace::from_tracker(&tracker).expect("space");
+
+        let action = teacher
+            .safety_action(&tracker, &space)
+            .expect("unsafe retained order");
+
+        assert_eq!(
+            action,
+            StructuredAction::Stop {
+                unit: ControlledUnit::Hero
+            },
+            "order {order:?}"
+        );
+    }
+}
+
+#[test]
+fn tower_guard_allows_an_in_range_shot_from_outside_but_not_creep_covered_hero_aggro() {
+    for own_x in [5_100, 5_250, 5_500] {
+        let mut view = one_auto_view();
+        own_hero_mut(&mut view).pos = Vec2::from_ints(own_x, 6_000);
+        enemy_hero_mut(&mut view).pos = Vec2::from_ints(own_x + 240, 6_000);
+        view.units.push(unit(
+            CREEP_ID,
+            UnitKind::CreepMelee,
+            Team::Radiant,
+            5_700,
+            6_000,
+        ));
+        sort_units(&mut view);
+        let tracker = tracker(view);
+
+        let (action, _) = decide(&tracker);
+
+        assert_eq!(
+            matches!(action, StructuredAction::AttackUnit { .. }),
+            own_x == 5_100
+        );
+    }
+}
+
+#[test]
+fn tower_guard_does_not_block_a_retained_escape_from_inside_range() {
+    let mut view = base_view();
+    own_hero_mut(&mut view).pos = Vec2::from_ints(5_500, 6_000);
+    view.tick = 4;
+    let tracker = tracker(view);
+    let mut teacher = Teacher::new();
+    let mut persistence = OrderPersistence::default();
+    record_combat_order(
+        &mut teacher,
+        &mut persistence,
+        Order::Move {
+            target: Target::Pos(Vec2::from_ints(5_000, 6_000)),
+        },
+        1,
+    );
+
+    let (action, _) = teacher
+        .decide(&tracker, &persistence, &ItemReadiness::new())
+        .expect("escape");
+
+    assert!(!matches!(
+        action,
+        StructuredAction::Stop { .. } | StructuredAction::AttackUnit { .. }
+    ));
+}
+
+#[test]
+fn finish_one_auto_budgets_a_possible_tower_windup_beyond_acquisition_range() {
+    let mut view = one_auto_view();
+    own_hero_mut(&mut view).pos = Vec2::from_ints(5_190, 6_000);
+    enemy_hero_mut(&mut view).pos = Vec2::from_ints(5_430, 6_000);
+    let tower = view
+        .units
+        .iter_mut()
+        .find(|unit| unit.id == entity(12, 1))
+        .expect("tower");
+    tower.radius = Fixed::from_int(40);
+    tower.attack_range = Fixed::from_int(700);
+    tower.attack_damage = 110;
+    tower.attack_interval = 29;
+    tower.move_speed = Fixed::ZERO;
+    let tracker = tracker(view);
+
+    let (action, _) = decide(&tracker);
+
+    assert!(matches!(action, StructuredAction::MovePoint { .. }));
+}
+
+#[test]
+fn attack_protection_keeps_the_full_fifteen_tick_windup_at_high_attack_speed() {
+    let mut view = tactical_view(800, 100);
+    view.tick = 16;
+    own_hero_mut(&mut view).attack_speed = 300;
+    let mut creep = unit(CREEP_ID, UnitKind::CreepMelee, Team::Dire, 3_600, 3_000);
+    creep.hp = 1_000;
+    view.units.push(creep);
+    sort_units(&mut view);
+    let tracker = tracker(view);
+    let mut teacher = Teacher::new();
+    let mut persistence = OrderPersistence::default();
+    record_combat_order(
+        &mut teacher,
+        &mut persistence,
+        Order::Attack {
+            target: Target::Unit(CREEP_ID),
+        },
+        1,
+    );
+
+    let (action, _) = teacher
+        .decide_tactical(
+            &tracker,
+            &persistence,
+            &ItemReadiness::new(),
+            &tactical_policy(crate::TacticalMode::Farm),
+        )
+        .expect("windup");
+
+    assert_eq!(action, StructuredAction::Continue);
+}
+
+fn one_auto_view() -> WorldView {
+    let mut view = tactical_view(240, 20);
+    for body in [
+        own_hero_mut as fn(&mut WorldView) -> &mut UnitView,
+        enemy_hero_mut,
+    ] {
+        let hero = body(&mut view);
+        hero.max_hp = 516;
+        hero.attack_damage = 45;
+        hero.attack_interval = 42;
+        hero.attack_speed = 120;
+        hero.armor = Fixed::from_ratio(20, 6);
+        hero.magic_resist = Fixed::from_ratio(25, 100);
+    }
+    own_hero_mut(&mut view).hp = 80;
+    view
+}
+
+fn enemy_hero_mut(view: &mut WorldView) -> &mut UnitView {
+    view.units
+        .iter_mut()
+        .find(|unit| unit.id == ENEMY_HERO_ID)
+        .expect("enemy hero")
 }
 
 fn tactical_view(distance: i32, hp: i32) -> WorldView {

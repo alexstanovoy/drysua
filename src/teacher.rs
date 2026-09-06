@@ -1,6 +1,6 @@
 use bota_proto::{
-    AbilityId, AbilitySlot, EffectId, EntityId, Fixed, ItemId, Order, Target, Team, UnitKind,
-    UnitView, Vec2,
+    AbilityId, AbilitySlot, Attribute, EffectId, EntityId, Fixed, ItemId, ItemView, Order, Target,
+    Team, UnitKind, UnitView, Vec2,
 };
 
 use crate::teacher_economy::{self, EconomyObservation, attack_damage_against, holds_item};
@@ -48,13 +48,20 @@ const NAVIGATION_STALL_TICKS: u32 = 18;
 const AGGRO_COOLDOWN_TICKS: u32 = 90;
 const AGGRO_HOLD_TICKS: u32 = 70;
 const AGGRO_RANGE: i32 = 500;
+const FINISH_LIMIT_TICKS: u32 = 60;
+const FINISH_ITEM_SLOTS: usize = 6;
+const DECISION_TICKS: u32 = 3;
+const COLLISION_MARGIN: i32 = DECISION_TICKS as i32 * 4;
 
 const _: () = assert!(AGGRO_HOLD_TICKS < AGGRO_COOLDOWN_TICKS);
 const _: () = assert!(AIM_PLAN_TICKS <= COMBAT_PLAN_TICKS);
+const _: () = assert!(FINISH_LIMIT_TICKS <= COMBAT_PLAN_TICKS);
+const _: () = assert!(FINISH_LIMIT_TICKS < 300);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CombatPurpose {
     Retreat,
+    Finish { target: EntityId, until: u32 },
     Backoff(EntityId),
     Aim(EntityId),
     AggroClick { anchor: Vec2 },
@@ -76,6 +83,7 @@ struct CombatMemory {
     body: Option<OrderNote>,
     plan: Option<CombatPlan>,
     last_aggro: Option<u32>,
+    finish_attempted: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -145,6 +153,7 @@ impl Teacher {
                 body: None,
                 plan: None,
                 last_aggro: None,
+                finish_attempted: false,
             },
             combat_proposal: None,
             combat_rollback: None,
@@ -196,7 +205,7 @@ impl Teacher {
         Ok((action, space))
     }
 
-    /// Selects mandatory channel, sustain, stale-navigation cancellation, or retreat work.
+    /// Selects channel, sustain, bounded finishing, navigation cancellation, or retreat work.
     /// Stages bookkeeping for `note_sent`, just like `decide`.
     pub fn safety_action(
         &mut self,
@@ -235,6 +244,16 @@ impl Teacher {
         choice: CombatChoice,
     ) -> Result<StructuredAction, ActionError> {
         assert_eq!(tracker.current().map(|view| view.tick), Some(space.tick()));
+        let choice = if space
+            .decode(choice.action)?
+            .is_some_and(|issued| issued.unit.is_none() && !tower_order_safe(tracker, issued.order))
+        {
+            CombatChoice::plain(StructuredAction::Stop {
+                unit: ControlledUnit::Hero,
+            })
+        } else {
+            choice
+        };
         if !space.allows(choice.action) {
             return Err(ActionError::InvalidSchema("teacher selected masked action"));
         }
@@ -248,6 +267,17 @@ impl Teacher {
                 tick: previous.map_or(space.tick(), |plan| plan.tick),
             })
         });
+        if let Some(plan) = self.combat_proposal
+            && matches!(plan.purpose, CombatPurpose::Finish { .. })
+            && self
+                .combat
+                .body
+                .is_some_and(|note| note.issued == plan.issued)
+        {
+            // Safety/deployment callers also suppress identical body orders without note_sent.
+            self.accept_combat_plan(plan);
+            self.combat_proposal = None;
+        }
         Ok(choice.action)
     }
 
@@ -260,9 +290,15 @@ impl Teacher {
             return Some(CombatChoice::plain(StructuredAction::Continue));
         }
         if let Some(action) = self
-            .sustain(tracker, space)
-            .or_else(|| self.cancel_combat(tracker, space))
+            .cancel_unsafe_order(tracker, space)
+            .or_else(|| self.sustain(tracker, space))
         {
+            return Some(CombatChoice::plain(action));
+        }
+        if let Some(choice) = self.finish_one_auto(tracker, space) {
+            return Some(choice);
+        }
+        if let Some(action) = self.cancel_combat(tracker, space) {
             return Some(CombatChoice::plain(action));
         }
         let action = self.retreat(tracker, space)?;
@@ -331,6 +367,9 @@ impl Teacher {
     ) -> CombatChoice {
         if self.protects_channel(tracker, space) {
             return CombatChoice::plain(StructuredAction::Continue);
+        }
+        if let Some(action) = self.cancel_unsafe_order(tracker, space) {
+            return CombatChoice::plain(action);
         }
         if let Some(action) = self
             .learn(tracker, space)
@@ -441,7 +480,12 @@ impl Teacher {
         last_hit: bool,
     ) -> Option<CombatChoice> {
         let lethal = tactical_burst(hero, enemy, Some(space)) >= enemy.hp;
-        if !tactical_chase_safe(tracker, hero, enemy.pos) || (!lethal && last_hit) {
+        let approach = if in_attack_reach(hero, enemy) {
+            hero.pos
+        } else {
+            enemy.pos
+        };
+        if !tactical_chase_safe(tracker, hero, approach) || (!lethal && last_hit) {
             return None;
         }
         if let Some(action) = self.requiem(tracker, space) {
@@ -476,6 +520,12 @@ impl Teacher {
             self.combat_rollback = None;
         }
         self.combat.hero = hero;
+        if tracker
+            .own_hero()
+            .is_some_and(|hero| !ratio_at_most(hero.hp, hero.max_hp, RETREAT_HEALTH_PERCENT))
+        {
+            self.combat.finish_attempted = false;
+        }
         self.combat.active_items = std::array::from_fn(|slot| {
             tracker
                 .own_hero()?
@@ -503,10 +553,7 @@ impl Teacher {
             .take()
             .filter(|plan| plan.issued == issued);
         if let Some(plan) = proposal {
-            if matches!(plan.purpose, CombatPurpose::AggroClick { .. }) {
-                self.combat.last_aggro = Some(tick);
-            }
-            self.combat.plan = Some(plan);
+            self.accept_combat_plan(plan);
         } else if !preserving
             || matches!(
                 issued.order,
@@ -540,6 +587,101 @@ impl Teacher {
             _ if preserving => {}
             _ => self.combat.body = None,
         }
+    }
+
+    fn accept_combat_plan(&mut self, plan: CombatPlan) {
+        match plan.purpose {
+            CombatPurpose::AggroClick { .. } => self.combat.last_aggro = Some(plan.tick),
+            CombatPurpose::Finish { until, .. } => {
+                assert!(until > plan.tick);
+                assert!(until - plan.tick <= FINISH_LIMIT_TICKS);
+                self.combat.finish_attempted = true;
+            }
+            _ => {}
+        }
+        self.combat.plan = Some(plan);
+    }
+
+    fn cancel_unsafe_order(
+        &self,
+        tracker: &StateTracker,
+        space: &ActionSpace,
+    ) -> Option<StructuredAction> {
+        let note = self.combat.body?;
+        if tower_order_safe(tracker, note.issued.order) {
+            return None;
+        }
+        let stop = StructuredAction::Stop {
+            unit: ControlledUnit::Hero,
+        };
+        space.allows(stop).then_some(stop)
+    }
+
+    fn finish_one_auto(&self, tracker: &StateTracker, space: &ActionSpace) -> Option<CombatChoice> {
+        let hero = tracker.own_hero()?;
+        if let Some(plan) = self.combat.plan
+            && let CombatPurpose::Finish { target, until } = plan.purpose
+        {
+            let remaining = until.saturating_sub(space.tick());
+            let viable = space.entity_index(target).is_some_and(|index| {
+                space.allows(StructuredAction::AttackUnit {
+                    unit: ControlledUnit::Hero,
+                    target: index,
+                }) && finish_risk_acceptable(
+                    tracker,
+                    hero,
+                    space.entity_candidates()[index.0].unit(),
+                    remaining,
+                )
+            });
+            let action = if remaining > 0 && viable {
+                StructuredAction::Continue
+            } else {
+                StructuredAction::Stop {
+                    unit: ControlledUnit::Hero,
+                }
+            };
+            return space.allows(action).then_some(CombatChoice::plain(action));
+        }
+        if !ratio_at_most(hero.hp, hero.max_hp, RETREAT_HEALTH_PERCENT)
+            || self.combat.finish_attempted
+            || own_fountain(tracker).is_some_and(|home| {
+                hero.pos
+                    .within(home, Fixed::from_int(FOUNTAIN_RECOVERY_RADIUS))
+            })
+        {
+            return None;
+        }
+        space
+            .entity_candidates()
+            .iter()
+            .enumerate()
+            .find_map(|(index, candidate)| {
+                let enemy = candidate.unit();
+                if candidate.relation != EntityRelation::Enemy
+                    || enemy.kind != UnitKind::Hero
+                    || self.combat.body.is_some_and(|note| {
+                        matches!(note.issued.order,
+                    Order::Attack { target: Target::Unit(other) } if other != enemy.id)
+                    })
+                {
+                    return None;
+                }
+                let ticks = finish_estimated_ticks(hero, enemy);
+                let until = space.tick().checked_add(ticks)?;
+                let action = StructuredAction::AttackUnit {
+                    unit: ControlledUnit::Hero,
+                    target: EntityIndex(index),
+                };
+                (space.allows(action) && finish_risk_acceptable(tracker, hero, enemy, ticks))
+                    .then_some(CombatChoice::planned(
+                        action,
+                        CombatPurpose::Finish {
+                            target: enemy.id,
+                            until,
+                        },
+                    ))
+            })
     }
 
     fn preserves_body(&self, order: Order) -> bool {
@@ -586,6 +728,7 @@ impl Teacher {
         let hero = tracker.own_hero()?;
         let elapsed = space.tick().saturating_sub(plan.tick);
         let invalid = match plan.purpose {
+            CombatPurpose::Finish { until, .. } => space.tick() >= until,
             CombatPurpose::Retreat => self.retreat(tracker, space).is_none(),
             CombatPurpose::Backoff(target) => !enemy_heroes(tracker)
                 .any(|enemy| enemy.id == target && backoff_needed(hero, enemy)),
@@ -872,12 +1015,8 @@ impl Teacher {
             target: Target::Unit(target),
         } = note.issued.order
         {
-            let Some(hero) = tracker.own_hero() else {
-                return false;
-            };
-            let windup = ATTACK_POINT_TICKS
-                .saturating_mul(100)
-                .div_ceil(hero.attack_speed.max(1) as u32);
+            // Attack speed scales the interval, not Shadow Fiend's attack point.
+            let windup = ATTACK_POINT_TICKS;
             let maximum_turn = 32_768u32.div_ceil(TURN_RATE_BRADS);
             return space.tick().saturating_sub(note.tick) <= windup.saturating_add(maximum_turn)
                 && self.continue_attack(tracker, space, target);
@@ -1359,9 +1498,66 @@ fn tactical_ratio(value: i32, maximum: i32) -> f32 {
 }
 
 fn tactical_chase_safe(tracker: &StateTracker, hero: &UnitView, target: Vec2) -> bool {
+    tower_corridor_safe(tracker, hero, target, false)
+}
+
+fn tower_order_safe(tracker: &StateTracker, order: Order) -> bool {
+    let Some(hero) = tracker.own_hero() else {
+        return true;
+    };
+    match order {
+        Order::Move {
+            target: Target::Pos(point),
+        }
+        | Order::Attack {
+            target: Target::Pos(point),
+        } => tower_corridor_safe(tracker, hero, point, true),
+        Order::Move {
+            target: Target::Unit(target),
+        }
+        | Order::Attack {
+            target: Target::Unit(target),
+        } => {
+            let Some(target) = tracker
+                .entity(target)
+                .filter(|target| target.visible && target.unit.hp > 0)
+            else {
+                return false;
+            };
+            if matches!(order, Order::Attack { .. }) && in_attack_reach(hero, &target.unit) {
+                return target.unit.kind != UnitKind::Hero
+                    || tactical_chase_safe(tracker, hero, hero.pos);
+            }
+            tactical_chase_safe(tracker, hero, target.unit.pos)
+        }
+        _ => true,
+    }
+}
+
+fn movement_guard(unit: &UnitView) -> Fixed {
+    Fixed {
+        raw: (unit.move_speed.raw.max(0) / 30)
+            .saturating_mul(DECISION_TICKS as i32)
+            .saturating_add(Fixed::from_int(COLLISION_MARGIN + 1).raw),
+    }
+}
+
+fn tower_corridor_safe(
+    tracker: &StateTracker,
+    hero: &UnitView,
+    target: Vec2,
+    navigation: bool,
+) -> bool {
     let horizontal = i128::from(target.x.raw) - i128::from(hero.pos.x.raw);
     let vertical = i128::from(target.y.raw) - i128::from(hero.pos.y.raw);
     let squared = horizontal * horizontal + vertical * vertical;
+    // Wave-supported structure work remains possible, but never excuses hero pursuit.
+    let pushing = navigation
+        && allied_creep_near(tracker, target, 750)
+        && !enemy_heroes(tracker).any(|enemy| {
+            hero.pos.within(enemy.pos, Fixed::from_int(1_200))
+                || target.within(enemy.pos, Fixed::from_int(1_200))
+        });
     tracker.current().is_some_and(|view| {
         view.units
             .iter()
@@ -1369,6 +1565,17 @@ fn tactical_chase_safe(tracker: &StateTracker, hero: &UnitView, target: Vec2) ->
                 unit.kind == UnitKind::Tower && unit.team != tracker.team() && unit.hp > 0
             })
             .all(|tower| {
+                let radius =
+                    Fixed::from_int(700) + hero.radius + tower.radius + movement_guard(hero);
+                let outward = (i128::from(hero.pos.x.raw) - i128::from(tower.pos.x.raw))
+                    * horizontal
+                    + (i128::from(hero.pos.y.raw) - i128::from(tower.pos.y.raw)) * vertical;
+                if navigation && hero.pos.within(tower.pos, radius) && squared > 0 && outward >= 0 {
+                    return true;
+                }
+                if pushing && target.within(tower.pos, radius) {
+                    return true;
+                }
                 // Endpoints alone miss a chase corridor that cuts through tower range.
                 let projection = ((i128::from(tower.pos.x.raw) - i128::from(hero.pos.x.raw))
                     * horizontal
@@ -1384,7 +1591,7 @@ fn tactical_chase_safe(tracker: &StateTracker, hero: &UnitView, target: Vec2) ->
                             as i32,
                     },
                 };
-                !closest.within(tower.pos, Fixed::from_int(701) + hero.radius + tower.radius)
+                !closest.within(tower.pos, radius)
             })
     })
 }
@@ -1423,6 +1630,7 @@ fn tactical_burst(source: &UnitView, target: &UnitView, space: Option<&ActionSpa
 
 fn combat_plan_remaining(plan: CombatPlan, last_aggro: Option<u32>, tick: u32) -> u32 {
     let (start, limit) = match plan.purpose {
+        CombatPurpose::Finish { until, .. } => (plan.tick, until.saturating_sub(plan.tick)),
         CombatPurpose::Aim(_) => (plan.tick, AIM_PLAN_TICKS),
         CombatPurpose::AggroClick { .. } | CombatPurpose::AggroPull => {
             (last_aggro.unwrap_or(plan.tick), AGGRO_HOLD_TICKS)
@@ -1634,6 +1842,283 @@ fn safe_kill_opportunity(tracker: &StateTracker, space: &ActionSpace, hero: &Uni
     })
 }
 
+// This is a bounded trial estimate, not an observed attack phase. Half an interval
+// budgets unknown cooldown; the fixed deadline and range abort prevent an open-ended chase.
+fn finish_estimated_ticks(hero: &UnitView, enemy: &UnitView) -> u32 {
+    let gap = u32::from(facing_gap(
+        hero.facing.brads,
+        facing_towards(hero.pos, enemy.pos),
+    ));
+    let turn = gap
+        .saturating_sub(u32::from(ATTACK_ANGLE_BRADS))
+        .div_ceil(TURN_RATE_BRADS);
+    let distance = isqrt(hero.pos.distance_squared(enemy.pos) as u64);
+    let travel =
+        distance.div_ceil((Fixed::ONE.raw * ATTACK_PROJECTILE_UNITS_PER_TICK) as u64) as u32;
+    hero.attack_interval
+        .div_ceil(2)
+        .max(turn)
+        .max(1)
+        .saturating_add(ATTACK_POINT_TICKS)
+        .saturating_add(travel.saturating_sub(1))
+        .saturating_add(DECISION_TICKS)
+}
+
+fn finish_risk_acceptable(
+    tracker: &StateTracker,
+    hero: &UnitView,
+    enemy: &UnitView,
+    ticks: u32,
+) -> bool {
+    if ticks == 0 || ticks > FINISH_LIMIT_TICKS || hero.hp <= 0 || enemy.hp <= 0 {
+        return false;
+    }
+    assert!(ticks <= FINISH_LIMIT_TICKS);
+    let disabled = bota_proto::StatusFlags::STUNNED
+        | bota_proto::StatusFlags::DISARMED
+        | bota_proto::StatusFlags::DOT
+        | bota_proto::StatusFlags::CHANNELLING;
+    let reach = hero.attack_range + hero.radius + enemy.radius - movement_guard(enemy);
+    // Keep restoration separate from the wire-truncation and natural-regeneration margin.
+    let health_margin = (2 + ticks.div_ceil(10) as i32)
+        .saturating_add(finish_item_restoration(tracker, enemy, ticks));
+    if hero.statuses.bits & disabled != 0
+        || enemy
+            .effects
+            .iter()
+            .any(|effect| matches!(effect.id, EffectId(1) | EffectId(3)))
+        || !hero.pos.within(enemy.pos, reach.max(Fixed::ZERO))
+        || !tactical_chase_safe(tracker, hero, hero.pos)
+        || physical_damage(hero.attack_damage.max(0), enemy.armor)
+            < enemy.hp.saturating_add(health_margin)
+    {
+        return false;
+    }
+    let Some(view) = tracker.current() else {
+        return false;
+    };
+    // The wire omits projectile targets and launch damage. Nearby hostile flight is a veto,
+    // not proof it targets us; newly launched enemy shots can also be absent for one tick.
+    if view
+        .projectiles
+        .iter()
+        .any(|shot| shot.team != hero.team && hero.pos.within(shot.pos, Fixed::from_int(1_200)))
+    {
+        return false;
+    }
+    let Some(spells) = enemy_heroes(tracker)
+        .filter(|source| hero.pos.within(source.pos, Fixed::from_int(1_200)))
+        .try_fold(0i32, |damage, source| {
+            Some(damage.saturating_add(finish_raze_budget(tracker, source, hero, ticks)?))
+        })
+    else {
+        return false;
+    };
+    finish_reply_estimate(view, hero, ticks)
+        .saturating_add(spells)
+        .saturating_add(1)
+        < hero.hp
+}
+
+fn finish_raze_budget(
+    tracker: &StateTracker,
+    source: &UnitView,
+    hero: &UnitView,
+    ticks: u32,
+) -> Option<i32> {
+    assert!(ticks > 0);
+    assert!(ticks <= FINISH_LIMIT_TICKS);
+    let mana = finish_mana_budget(tracker, source, ticks);
+    let mut casts = [(0i32, 0i32); SHADOWRAZES.len()];
+    for ability in &source.abilities {
+        if ability.passive
+            || ability.level == 0
+            || ability.cooldown_left > ticks
+            || ability.mana_cost > mana
+        {
+            continue;
+        }
+        let (index, &(_, reach)) = SHADOWRAZES
+            .iter()
+            .enumerate()
+            .find(|(_, (id, _))| *id == ability.id)?;
+        if source.hero != Some(crate::SHADOW_FIEND) || ability.level > 4 {
+            return None;
+        }
+        if possible_finish_raze(source, hero, reach, ticks) {
+            casts[index] = (
+                ability.mana_cost.max(0),
+                magical_damage(raze_damage(ability.level), hero.magic_resist),
+            );
+        }
+    }
+    // All eight subsets fit in constant work. Slot-order greed can spend mana on a weaker raze.
+    // Each raze's 300-tick cooldown exceeds the entire finish window, so it can cast only once.
+    let mut maximum = 0;
+    for subset in 0..(1 << SHADOWRAZES.len()) {
+        let (mut cost, mut damage) = (0i32, 0i32);
+        for (index, &(mana_cost, hit)) in casts.iter().enumerate() {
+            if subset & (1 << index) != 0 {
+                cost = cost.saturating_add(mana_cost);
+                damage = damage.saturating_add(hit);
+            }
+        }
+        if cost <= mana {
+            maximum = maximum.max(damage);
+        }
+    }
+    Some(maximum)
+}
+
+fn possible_finish_raze(source: &UnitView, hero: &UnitView, reach: i32, ticks: u32) -> bool {
+    assert!(SHADOWRAZES.iter().any(|(_, distance)| *distance == reach));
+    assert!(ticks <= FINISH_LIMIT_TICKS);
+    let distance = isqrt(source.pos.distance_squared(hero.pos) as u64) as i64;
+    // Facing is not a promise: allow the caster to turn/walk, plus both bodies' separation.
+    let movement = (i64::from(source.move_speed.raw.max(0)) / 30
+        + i64::from(Fixed::from_int(8).raw))
+        * i64::from(ticks);
+    let radius = i64::from(Fixed::from_int(SHADOWRAZE_RADIUS).raw) + movement + 1;
+    (distance - i64::from(Fixed::from_int(reach).raw)).abs() <= radius
+}
+
+fn finish_mana_budget(tracker: &StateTracker, source: &UnitView, ticks: u32) -> i32 {
+    assert!(ticks > 0);
+    assert!(ticks <= FINISH_LIMIT_TICKS);
+    // Fountain replenishment is outside this short lane estimate.
+    if source.effects.iter().any(|effect| effect.id == EffectId(3)) {
+        return i32::MAX;
+    }
+    // Audited SF regeneration is (0.25 + intelligence / 20 + Sage's Masks) mana/second.
+    // Readiness within the window permits a whole-window upper estimate of regeneration.
+    let masks = finish_eligible_items(source, ticks)
+        .filter(|item| item.id == ItemId(26))
+        .count() as u64;
+    let treads = finish_eligible_items(source, ticks)
+        .filter(|item| item.id == ItemId(29) && item.mode != Some(Attribute::Intelligence))
+        .count() as u64;
+    let whole = Fixed::ONE.raw as u64;
+    let rate =
+        (5 + 20 * masks + 10 * treads) * whole + source.attributes.intelligence.raw.max(0) as u64;
+    let regenerated = (rate * u64::from(ticks)).div_ceil(600 * whole);
+    source
+        .mana
+        .max(0)
+        .saturating_add(1)
+        .saturating_add(regenerated.min(i32::MAX as u64) as i32)
+        // Ten additional intelligence can increase the mana pool by at most 120 per Treads.
+        .saturating_add((120 * treads) as i32)
+        .saturating_add(finish_item_restoration(tracker, source, ticks))
+        .saturating_add(finish_clarity_mana(source, ticks))
+}
+
+fn finish_eligible_items(source: &UnitView, ticks: u32) -> impl Iterator<Item = &ItemView> {
+    assert!(ticks > 0);
+    assert!(ticks <= FINISH_LIMIT_TICKS);
+    source
+        .items
+        .iter()
+        .take(FINISH_ITEM_SLOTS)
+        .flatten()
+        .filter(move |item| item.cooldown_left <= ticks && item.mute_left <= ticks)
+}
+
+fn finish_item_restoration(tracker: &StateTracker, source: &UnitView, ticks: u32) -> i32 {
+    let can_recharge = finish_can_recharge(tracker, source, ticks);
+    // Without another visible affordable caster, use observed charges, not imagined full items.
+    let restoration = finish_eligible_items(source, ticks).fold(0i32, |restored, item| {
+        let maximum = match item.id {
+            ItemId(35) => 10,
+            ItemId(36) => 20,
+            ItemId(id) if id > 41 => return i32::MAX,
+            _ => return restored,
+        };
+        let charges = if can_recharge {
+            maximum
+        } else {
+            item.charges.unwrap_or(0).min(maximum)
+        };
+        restored.saturating_add(15 * i32::from(charges))
+    });
+    assert!(restoration >= 0);
+    restoration
+}
+
+fn finish_can_recharge(tracker: &StateTracker, source: &UnitView, ticks: u32) -> bool {
+    assert!(ticks > 0);
+    assert!(ticks <= FINISH_LIMIT_TICKS);
+    let own = tracker.own_hero().map(|hero| hero.id);
+    // The finishing hero is committed to an auto. Other visible allied casters may still cast;
+    // without their future orders/cooldowns, item capacity is the finite replenishment ceiling.
+    tracker.current().is_some_and(|view| {
+        view.units.iter().any(|caster| {
+            caster.kind == UnitKind::Hero
+                && caster.team == tracker.team()
+                && Some(caster.id) != own
+                && caster.hp > 0
+                && caster.pos.within(source.pos, Fixed::from_int(1_200))
+                && caster.abilities.iter().any(|ability| {
+                    !ability.passive
+                        && ability.level > 0
+                        && ability.cooldown_left <= ticks
+                        && ability.mana_cost <= caster.mana
+                })
+        })
+    })
+}
+
+fn finish_clarity_mana(source: &UnitView, ticks: u32) -> i32 {
+    assert!(ticks > 0);
+    assert!(ticks <= FINISH_LIMIT_TICKS);
+    let active = source
+        .effects
+        .iter()
+        .filter(|effect| effect.id == EffectId(2))
+        .map(|effect| effect.ticks_left.unwrap_or(ticks).min(ticks))
+        .max()
+        .unwrap_or(0);
+    let duration = if finish_eligible_items(source, ticks)
+        .any(|item| item.id == ItemId(1) && item.charges.is_some_and(|charges| charges > 0))
+    {
+        ticks
+    } else {
+        active
+    };
+    // Clarity restores 150 over 750 ticks; refreshing it does not stack another regeneration.
+    duration.div_ceil(5) as i32
+}
+
+// One reply may already be winding up, including beyond normal acquisition range.
+// Killing its source does not cancel an already launched projectile.
+fn finish_reply_estimate(view: &bota_proto::WorldView, hero: &UnitView, ticks: u32) -> i32 {
+    assert!(ticks > 0);
+    assert!(ticks <= FINISH_LIMIT_TICKS);
+    let incoming = view
+        .units
+        .iter()
+        .filter(|source| {
+            source.team != hero.team
+                && source.hp > 0
+                && source.attack_damage > 0
+                && hero.pos.within(
+                    source.pos,
+                    source.attack_range
+                        + source.radius
+                        + hero.radius
+                        + movement_guard(source)
+                        + Fixed::from_int(ATTACK_RANGE_LEEWAY),
+                )
+        })
+        .fold(0i32, |damage, source| {
+            let replies = 1 + ticks.saturating_sub(1) / source.attack_interval.max(1);
+            damage.saturating_add(
+                physical_damage(source.attack_damage, hero.armor).saturating_mul(replies as i32),
+            )
+        });
+    assert!(incoming >= 0);
+    incoming
+}
+
 fn raze_hit_margin(
     tracker: &StateTracker,
     space: &ActionSpace,
@@ -1707,10 +2192,7 @@ fn useful_walk(tracker: &StateTracker, target: Vec2) -> bool {
     }
     let healthy = !ratio_at_most(hero.hp, hero.max_hp, 25);
     let pressure_safe = visible_pressure(tracker, hero) < hero.hp.max(0);
-    healthy
-        && pressure_safe
-        && !enemy_tower_danger(tracker, hero.pos, hero.radius)
-        && !enemy_tower_danger(tracker, target, hero.radius)
+    healthy && pressure_safe && tower_corridor_safe(tracker, hero, target, true)
 }
 
 fn courier_threatened(tracker: &StateTracker, courier: &UnitView) -> bool {
@@ -2033,6 +2515,7 @@ fn best_safe_point(
         .filter(|(index, point)| {
             mask.get(*index) == Some(&true)
                 && (!require_progress || point.position.distance_squared(wanted) < current)
+                && tower_corridor_safe(tracker, hero, point.position, true)
                 && (!enemy_tower_danger(tracker, point.position, hero.radius)
                     || allied_creep_near(tracker, point.position, 750))
         })

@@ -9,25 +9,39 @@ use crate::{
 };
 
 #[test]
-fn tactical_v2_rejects_released_v1_weights_instead_of_reinterpreting_them() {
+fn tactical_v3_rejects_released_v1_weights_instead_of_reinterpreting_them() {
     let bytes = include_bytes!("../../artifacts/v0.0.4/drysua.tactical.bin");
 
-    let error = TacticalPolicy::from_bytes(bytes).expect_err("v1 is not a v2 policy");
+    let error = TacticalPolicy::from_bytes(bytes).expect_err("v1 is not a v3 policy");
 
     assert_eq!(
         error.to_string(),
         "tactical file schema does not match this architecture and feature order"
     );
-    assert!(crate::TACTICAL_SCHEMA_DESCRIPTOR.starts_with("drysua-tactical/v2;"));
+    assert!(crate::TACTICAL_SCHEMA_DESCRIPTOR.starts_with("drysua-tactical/v3;"));
 }
 
 #[test]
-fn tactical_v2_descriptor_records_macro_and_decision_cadence_semantics() {
+fn tactical_v3_descriptor_records_macro_and_decision_cadence_semantics() {
     let descriptor = crate::TACTICAL_SCHEMA_DESCRIPTOR;
 
     assert!(descriptor.contains("Recover=lane_backoff"));
     assert!(descriptor.contains("decision_ticks=1+3n;pregame=enabled"));
     assert!(descriptor.contains("Farm=last_hit_deny_aggro_pull"));
+    assert!(descriptor.contains("attack_commitment=15_plus_ceil32768_over_5795;"));
+    assert!(descriptor.contains("Finish=one_auto_trial_limit60"));
+    assert!(descriptor.contains("tower_guard=new_and_retained_orders"));
+}
+
+#[test]
+fn tactical_v3_rejects_the_previous_preview_schema() {
+    let error = TacticalPolicy::from_bytes(b"drysua-tactical/v2;")
+        .expect_err("v2 had different finishing and tower behavior");
+
+    assert_eq!(
+        error.to_string(),
+        "tactical file schema does not match this architecture and feature order"
+    );
 }
 
 #[test]

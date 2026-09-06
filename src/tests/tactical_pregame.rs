@@ -22,7 +22,7 @@ fn pregame_teacher_and_tactical_reach_lane_before_first_creep_meet_with_tcp_buil
 }
 
 #[test]
-fn pregame_nondefault_v2_policy_preserves_arrival_and_tcp_builtin_parity_on_both_seats() {
+fn pregame_nondefault_policy_preserves_arrival_and_tcp_builtin_parity_on_both_seats() {
     let policy = nondefault_policy();
     for candidate in 0..2 {
         assert_teacher_opponent_parity(&policy, candidate);
@@ -30,7 +30,7 @@ fn pregame_nondefault_v2_policy_preserves_arrival_and_tcp_builtin_parity_on_both
 }
 
 #[test]
-fn pregame_teacher_and_v2_policy_are_in_lane_at_first_creep_meet_without_early_combat() {
+fn pregame_teacher_and_tactical_policy_are_in_lane_at_first_creep_meet_without_early_combat() {
     let policy = nondefault_policy();
     for controller in [
         OpeningController::Teacher,
