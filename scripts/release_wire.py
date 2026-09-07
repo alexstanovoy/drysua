@@ -21,10 +21,14 @@ def varint(payload, offset):
 class Relay:
     """One bot connection; Welcome gates the next launch without a seat race."""
 
-    def __init__(self, port, timeout, tick_limit):
+    def __init__(self, port, timeout, tick_limit, expected_map=None, expected_seed=None,
+                 byte_limit=512 * 1024 * 1024):
         self.port = port
         self.timeout = timeout
         self.tick_limit = tick_limit
+        self.expected_map = expected_map
+        self.expected_seed = expected_seed
+        self.byte_limit = byte_limit
         self.listener = socket.socket()
         self.listener.bind(("127.0.0.1", 0))
         self.listener.listen(1)
@@ -32,8 +36,11 @@ class Relay:
         self.address = f"127.0.0.1:{self.listener.getsockname()[1]}"
         self.welcomed = threading.Event()
         self.stop = threading.Event()
-        self.observed = dict(slot=None, winner=None, rejected=0, errors=[])
+        self.observed = dict(slot=None, winner=None, rejected=0, errors=[], last_snapshot=0,
+                             cap_ack=False, cap_events=False, map=None)
         self.buffer = bytearray()
+        self.client_buffer = bytearray()
+        self.client_bytes = self.client_frames = 0
         self.frames = 0
         self.bytes = 0
         self.thread = threading.Thread(target=self.run, daemon=True)
@@ -41,7 +48,7 @@ class Relay:
 
     def observe(self, data):
         self.bytes += len(data)
-        if self.bytes > 512 * 1024 * 1024:
+        if self.bytes > getattr(self, "byte_limit", 512 * 1024 * 1024):
             raise ValueError("wire byte limit exceeded")
         self.buffer.extend(data)
         for _ in range(16385):
@@ -74,6 +81,18 @@ class Relay:
                 raise ValueError("duplicate or malformed Welcome")
             self.observed["slot"] = slot
             self.welcomed.set()
+        elif kind == 2:
+            match_id, offset = varint(payload, offset)
+            map_id, offset = varint(payload, offset)
+            tick_rate, _ = varint(payload, offset)
+            if self.observed.get("map") is not None or tick_rate != 30:
+                raise ValueError("duplicate MatchStart or wrong tick rate")
+            if self.expected_map is not None and map_id != self.expected_map:
+                raise ValueError("MatchStart map mismatch")
+            if self.expected_seed is not None and match_id != self.expected_seed:
+                raise ValueError("MatchStart seed mismatch")
+            self.observed["map"] = map_id
+            self.observed["match_id"] = match_id
         elif kind == 3:
             tick, offset = varint(payload, offset)
             if tick > self.tick_limit:
@@ -82,6 +101,17 @@ class Relay:
             viewer, _ = varint(payload, offset)
             if present != 1 or viewer != self.observed["slot"]:
                 raise ValueError("snapshot identity mismatch")
+            if tick <= self.observed.get("last_snapshot", 0):
+                raise ValueError("snapshot tick did not advance")
+            self.observed["last_snapshot"] = tick
+        elif kind == 4:
+            tick, _ = varint(payload, offset)
+            if tick != self.observed.get("last_snapshot"):
+                raise ValueError("Events snapshot tick mismatch")
+            if tick == self.tick_limit:
+                if self.observed.get("cap_events"):
+                    raise ValueError("duplicate cap Events")
+                self.observed["cap_events"] = True
         elif kind == 5:
             self.observed["rejected"] += 1
         elif kind == 7:
@@ -105,6 +135,39 @@ class Relay:
         elif kind > 8:
             raise ValueError("unknown server message")
 
+    def filter_client(self, data):
+        self.client_bytes += len(data)
+        if self.client_bytes > 64 * 1024 * 1024:
+            raise ValueError("client wire byte limit exceeded")
+        self.client_buffer.extend(data)
+        output = bytearray()
+        for _ in range(16385):
+            if len(self.client_buffer) < 4:
+                return output
+            length = struct.unpack_from("<I", self.client_buffer)[0]
+            if not 1 <= length <= 4 * 1024 * 1024:
+                raise ValueError("invalid client frame length")
+            if len(self.client_buffer) < length + 4:
+                return output
+            frame = bytes(self.client_buffer[:length + 4])
+            del self.client_buffer[:length + 4]
+            self.client_frames += 1
+            if self.client_frames > self.tick_limit * 4 + 1000:
+                raise ValueError("client wire frame limit exceeded")
+            kind, offset = varint(frame, 4)
+            if kind == 4:
+                tick, offset = varint(frame, offset)
+                if offset != len(frame) or tick > self.observed.get("last_snapshot", 0):
+                    raise ValueError("ACK exceeds observed snapshot or malformed ACK")
+                if tick == self.tick_limit:
+                    if self.observed.get("cap_ack"):
+                        raise ValueError("duplicate cap ACK")
+                    # Forwarding this ACK permits cap+1 before the client EOF reaches the server.
+                    self.observed["cap_ack"] = True
+                    continue
+            output.extend(frame)
+        raise ValueError("client wire batch limit exceeded")
+
     def run(self):
         try:
             with self.listener:
@@ -124,29 +187,53 @@ class Relay:
     def pump(self, client, server):
         readers = [client, server]
         writable = True
+        client_open = True
         for _ in range(self.tick_limit * 40 + 4000):
             if self.stop.is_set():
                 return
             readable, _, _ = select.select(readers, [], [], 0.1)
             for source in readable:
-                data = source.recv(65536)
+                try:
+                    data = source.recv(65536)
+                except ConnectionResetError:
+                    if source is not client or not self.observed.get("cap_ack"):
+                        raise
+                    data = b""
                 if not data:
                     if source is client:
+                        if getattr(self, "client_buffer", None):
+                            raise ValueError("truncated client frame")
+                        if self.observed.get("cap_ack"):
+                            readers.remove(client)
+                            client_open = False
+                            continue
                         return
                     if self.buffer:
                         raise ValueError("truncated server frame")
-                    if self.observed["winner"] is None:
+                    if self.observed["winner"] is None and not (
+                            self.observed.get("cap_ack") and self.observed.get("cap_events")):
                         raise ValueError("server closed before MatchOver")
                     # Closing with unread final ACKs sends RST instead of delivering MatchOver.
                     readers.remove(server)
                     writable = False
-                    client.shutdown(socket.SHUT_WR)
+                    if client_open:
+                        client.shutdown(socket.SHUT_WR)
+                    else:
+                        return
                 elif source is server:
                     self.observe(data)
-                    client.sendall(data)
+                    if client_open:
+                        try:
+                            client.sendall(data)
+                        except (BrokenPipeError, ConnectionResetError):
+                            if not self.observed.get("cap_ack"):
+                                raise
+                            client_open = False
                 elif writable:
                     try:
-                        server.sendall(data)
+                        filtered = self.filter_client(data)
+                        if filtered:
+                            server.sendall(filtered)
                     except (BrokenPipeError, ConnectionResetError):
                         # Drain the server's terminal frame before deciding whether EOF is valid.
                         writable = False

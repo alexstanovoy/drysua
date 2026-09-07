@@ -22,10 +22,10 @@ pub const TERRAIN_CELL_SIZE: i32 = 64;
 pub const MAX_SEATS: usize = 10;
 /// Maximum number of unit tokens selected by the future feature encoder.
 pub const UNIT_TOKENS: usize = 96;
-/// Maximum number of entity records retained by the tracker.
-pub const MAX_TRACKED_ENTITIES: usize = 256;
-/// Maximum number of projectiles in one snapshot.
-pub const MAX_PROJECTILES: usize = 32;
+/// Maximum visible units per snapshot and entity records retained by the tracker.
+pub const MAX_TRACKED_ENTITIES: usize = 4_096;
+/// Maximum observed projectiles per snapshot, independent of model token rows.
+pub const MAX_PROJECTILES: usize = 4_096;
 /// Maximum number of ground items in one snapshot.
 pub const MAX_LOOT: usize = 16;
 /// Number of fixed Shadow Fiend ability slots.

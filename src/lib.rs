@@ -3,6 +3,7 @@ mod action;
 mod arena;
 mod checkpoint;
 mod cli;
+mod default_deployment;
 mod feature;
 mod hero;
 mod imitation;
@@ -10,6 +11,8 @@ mod laning_evaluation;
 mod league;
 mod link;
 mod model;
+#[cfg(feature = "builtin")]
+mod neural_training;
 mod persistence;
 mod pipeline;
 mod ppo;
@@ -37,6 +40,8 @@ pub use laning_evaluation::*;
 pub use league::*;
 pub use link::*;
 pub use model::*;
+#[cfg(feature = "builtin")]
+pub use neural_training::*;
 pub use persistence::*;
 pub use pipeline::*;
 pub use ppo::*;

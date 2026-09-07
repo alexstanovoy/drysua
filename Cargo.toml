@@ -40,5 +40,10 @@ name = "train_tactical"
 path = "src/bin/train_tactical.rs"
 required-features = ["builtin"]
 
+[[bin]]
+name = "train_neural"
+path = "src/bin/train_neural.rs"
+required-features = ["builtin"]
+
 [lints.clippy]
 float_arithmetic = "deny"

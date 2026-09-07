@@ -22,7 +22,7 @@ use crate::{
 };
 
 /// Version of the append-only policy feature schema.
-pub const FEATURE_SCHEMA_VERSION: u32 = 8;
+pub const FEATURE_SCHEMA_VERSION: u32 = 10;
 /// Number of scalar global features.
 pub const GLOBAL_FEATURES: usize = 64;
 /// Number of scalar features in one global-history sample.
@@ -56,7 +56,7 @@ pub const ITEM_FEATURE_TOKENS: usize = OWN_ITEM_SLOTS + MAX_SHOP_ITEMS;
 /// Number of scalar features in one projectile token.
 pub const PROJECTILE_FEATURES: usize = 20;
 /// Number of fixed projectile tokens.
-pub const PROJECTILE_FEATURE_TOKENS: usize = MAX_PROJECTILES;
+pub const PROJECTILE_FEATURE_TOKENS: usize = 32;
 /// Number of scalar features in one loot token.
 pub const LOOT_FEATURES: usize = 16;
 /// Number of fixed loot tokens.
@@ -362,7 +362,7 @@ pub mod loot_feature {
 
 /// Canonical schema text covered by [`FEATURE_SCHEMA_HASH`].
 pub const FEATURE_SCHEMA_DESCRIPTOR: &str = concat!(
-    "bota-drysua-feature/v8;",
+    "bota-drysua-feature/v10;",
     "action_schema_version=3;action_schema_hash=1755359086494840931;",
     "shapes=global:64,history:7x24,policy_history:16x4,unit:96x69,own_unit:2x69,remembered_unit:32x69,point:48x32,ability:14x24,item:85x28,projectile:32x20,loot:16x16,map:96;",
     "scalar_ranges=presence_and_one_hot:[0,1],unsigned_continuous:[0,1],signed_continuous:[-1,1],category:positive_exact_integer,all_finite;",
@@ -377,13 +377,14 @@ pub const FEATURE_SCHEMA_DESCRIPTOR: &str = concat!(
     "unit_leading_when_present=own-hero-then-own-courier;item_fixed=hero9,stash6,courier6,shop64;",
     "unit_candidates=current_visible_live_only,cap96,priority:own_body_then_hero_then_structure_then_within1200_then_other,distance_then_relation_then_owner_relation_then_canonical_model_semantics_then_entity_id_only_for_semantically_identical_ties;",
     "unit_semantic_order=kind,canonical_position,canonical_facing,hp,max_hp,mana,max_mana,move_speed,attack_damage,attack_range,attack_interval,attack_speed,armor,magic_resistance,radius,vision,true_sight,statuses,item_slot_count,free_item_slots,item_capacity_available,canonical_velocity,hp_delta,mana_delta,recent_damage,recent_cast,recent_attack;",
-    "unit_memory=units_exact_current_pointer_order,own_units_fixed_hero_courier_current_or_remembered,remembered_units_nonown_hidden_cap32_lexicographic_complete_encoded_token,tracker_cap256_evict_complete_oldest_invisible_last_seen_tick_cohorts,no_target_handles;",
+    "unit_memory=units_exact_current_pointer_order,own_units_fixed_hero_courier_current_or_remembered,remembered_units_nonown_hidden_cap32_lexicographic_complete_encoded_token,tracker_cap4096_evict_complete_oldest_invisible_last_seen_tick_cohorts,no_target_handles;",
     "point_candidates=cap48,deduplicate_position_keep_first_source,canonical_team_directions,generate:tactical_radii200_600_1200_in_E_NE_N_NW_W_SW_S_SE_order_then_allied_building_landings_then_nearest8_visible_or_static-baseline_trees_then_own_fountain_enemy_fountain_own_tower_enemy_tower_then_predicted_units;",
     "point_features=exact_action_pointer_prefix,present,pointer_valid,canonical_position,relative_position,distance,direction,source_category,direction_radius_kind_relation_parameters,walkable,standing_tree,allied_building;",
     "point_order=building:distance_kind_canonical_landing_position_entity_id_identical_tie,tree:distance_canonical_position_planted,predicted:distance_source_relation_canonical_position_entity_id_identical_tie,landmark:distance_canonical_position_entity_id_identical_tie;shop_order=item_id;",
     "loot_candidates=current_visible,cap16,order:item_then_charges_then_position_then_entity_id_only_for_semantically_identical_ties;",
-    "projectile_order=lexicographic_encoded_semantics,feature_identical_ties_indistinguishable;",
-    "projectile_history=continuous_full_handle_observation,cap32,first_age,second_velocity,closest_approach,disappearance_or_generation_resets;loot_history=continuous_full_handle_observation,cap16,visible_age,duplicate_current_semantics_suppress_identity_age;",
+    "projectile_order=lexicographic_encoded_semantics,select_first32,feature_identical_ties_indistinguishable;",
+    "projectile_history=continuous_full_handle_observation,cap4096,first_age,second_velocity,closest_approach,disappearance_or_generation_resets;loot_history=continuous_full_handle_observation,cap16,visible_age,duplicate_current_semantics_suppress_identity_age;",
+    "mutual_attack_range=distance_squared_le_square_attack_range_plus_both_hull_radii,fixed_saturating_sum,inclusive,no_continuation_leeway;",
     "observation_journal=16_states,strictly_increasing_observe,exact_tracker_lineage_slot_static_snapshot_predecessor_and_tracker_history_provenance,rollback_at_or_before,eviction_horizon_exact_error_and_atomic,reset_empty,failed_observe_and_encode_atomic;",
     "loot_path=static-terrain-and-static-tree-grid;",
     "map_rays=E_NE_N_NW_W_SW_S_SE,20_cells,64_world_units_per_step,first_nonwalkable_water_opaque_tree_and_endpoint_elevation_walkability;",
@@ -438,6 +439,10 @@ pub const FEATURE_SCHEMA_HASH: u64 = fnv1a(FEATURE_SCHEMA_DESCRIPTOR.as_bytes())
 
 const _: () = assert!(crate::ACTION_SCHEMA_VERSION == 3);
 const _: () = assert!(crate::ACTION_SCHEMA_HASH == 1_755_359_086_494_840_931);
+const _: () = assert!(crate::MAX_TRACKED_ENTITIES == 4_096);
+const _: () = assert!(MAX_PROJECTILES == 4_096);
+const _: () = assert!(PROJECTILE_FEATURE_TOKENS == 32);
+const _: () = assert!(PROJECTILE_FEATURE_TOKENS < MAX_PROJECTILES);
 
 /// One fixed-shape policy input frame owned by its caller.
 ///
@@ -1264,18 +1269,18 @@ struct LootObservation {
 struct FeatureObservationState {
     tick: Option<u32>,
     provenance: Option<TrackerProvenance>,
-    projectiles: [Option<ProjectileObservation>; MAX_PROJECTILES],
+    projectiles: Box<[Option<ProjectileObservation>; MAX_PROJECTILES]>,
     projectile_count: usize,
     loot: [Option<LootObservation>; MAX_LOOT],
     loot_count: usize,
 }
 
 impl FeatureObservationState {
-    const fn new() -> Self {
+    fn new() -> Self {
         Self {
             tick: None,
             provenance: None,
-            projectiles: [None; MAX_PROJECTILES],
+            projectiles: Box::new([None; MAX_PROJECTILES]),
             projectile_count: 0,
             loot: [None; MAX_LOOT],
             loot_count: 0,
@@ -1884,6 +1889,7 @@ impl FeatureEncoder {
 
     fn encode_projectiles(&self, tracker: &StateTracker, output: &mut FeatureFrame) {
         let current = tracker.current().expect("snapshot was checked");
+        assert!(current.projectiles.len() <= MAX_PROJECTILES);
         let origin = own_origin(tracker);
         let mut count = 0usize;
         for projectile in &current.projectiles {
@@ -1891,6 +1897,7 @@ impl FeatureEncoder {
             let token = self.projectile_token(tracker.team(), projectile, origin, history);
             insert_sorted_token(&mut output.projectiles, &mut count, token);
         }
+        assert!(count <= PROJECTILE_FEATURE_TOKENS);
     }
 
     fn projectile_token(
@@ -2251,6 +2258,8 @@ fn next_observation_state(
     tracker: &StateTracker,
     current: &bota_proto::WorldView,
 ) -> FeatureObservationState {
+    assert!(current.projectiles.len() <= MAX_PROJECTILES);
+    assert!(previous.projectile_count <= MAX_PROJECTILES);
     let mut next = FeatureObservationState::new();
     next.tick = Some(current.tick);
     next.provenance = Some(tracker.provenance());
@@ -2657,10 +2666,11 @@ fn encode_unit_tactics(
             .unwrap_or(i64::MAX);
         token[unit_feature::TIME_TO_REACH] = ratio(ticks, 0, i64::from(MAX_AGE));
     }
+    let hulls = hero.radius + unit.radius;
     token[unit_feature::OWN_IN_ATTACK_RANGE] =
-        bool_feature(distance_squared <= hero.attack_range.squared_raw());
+        bool_feature(distance_squared <= (hero.attack_range + hulls).squared_raw());
     token[unit_feature::UNIT_IN_ATTACK_RANGE] =
-        bool_feature(distance_squared <= unit.attack_range.squared_raw());
+        bool_feature(distance_squared <= (unit.attack_range + hulls).squared_raw());
 }
 
 fn encode_unit_recent(

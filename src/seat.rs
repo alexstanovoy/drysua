@@ -42,7 +42,7 @@ struct LivePolicy {
     local: LocalPolicyState,
     persistence: OrderPersistence,
     readiness: ItemReadiness,
-    teacher: Teacher,
+    teacher: Option<Teacher>,
     last_decision_tick: Option<u32>,
     pending_snapshot_tick: Option<u32>,
     pending_active: Option<(u32, Option<ActivePolicyOrder>)>,
@@ -51,6 +51,7 @@ struct LivePolicy {
 #[derive(Clone, Copy)]
 enum LiveController<'model> {
     Hybrid(&'model PolicyModel),
+    Neural(&'model PolicyModel),
     Tactical(&'model TacticalPolicy),
     Teacher,
 }
@@ -144,6 +145,30 @@ pub fn play_policy_on(
     play_controller_on(wire, seated, limit, LiveController::Hybrid(model))
 }
 
+/// Loads required runtime weights before connecting; never constructs or invokes Teacher.
+pub fn play_neural(
+    address: &str,
+    name: &str,
+    limit: Option<u32>,
+    weights_directory: &Path,
+) -> std::io::Result<Outcome> {
+    let model = PolicyModel::fresh(0).map_err(std::io::Error::other)?;
+    TrainingArtifact::load_runtime_weights(&model, weights_directory)
+        .map_err(std::io::Error::other)?;
+    let (mut link, seated) = Link::join(address, name)?;
+    play_neural_on(&mut link, seated, limit, &model)
+}
+
+/// Runs pure greedy neural inference with legality masking on every supported map.
+pub fn play_neural_on(
+    wire: &mut impl Wire,
+    seated: Seated,
+    limit: Option<u32>,
+    model: &PolicyModel,
+) -> std::io::Result<Outcome> {
+    play_controller_on(wire, seated, limit, LiveController::Neural(model))
+}
+
 fn play_controller_on(
     wire: &mut impl Wire,
     seated: Seated,
@@ -189,7 +214,9 @@ fn handle_policy_message(
     message: ServerMsg,
 ) -> std::io::Result<bool> {
     match message {
-        ServerMsg::MatchStart { info } => start_policy_match(seated, outcome, policy, &info)?,
+        ServerMsg::MatchStart { info } => {
+            start_policy_match(seated, outcome, policy, &info, controller)?
+        }
         ServerMsg::Snapshot { view } => {
             return handle_policy_snapshot(wire, seated, limit, outcome, policy, view);
         }
@@ -232,13 +259,14 @@ fn start_policy_match(
     outcome: &mut Outcome,
     policy: &mut Option<LivePolicy>,
     info: &MatchInfo,
+    controller: LiveController<'_>,
 ) -> std::io::Result<()> {
     validate_match_terms(info.tick_rate, info.mode, seated)?;
     outcome.team = Some(validate_pick(&info.picks, seated.slot)?);
     if policy.is_some() {
         return Err(std::io::Error::other("server sent repeated MatchStart"));
     }
-    *policy = Some(LivePolicy::new(seated.slot, info)?);
+    *policy = Some(LivePolicy::new(seated.slot, info, controller)?);
     Ok(())
 }
 
@@ -385,7 +413,11 @@ impl MessageProgress {
 }
 
 impl LivePolicy {
-    fn new(slot: SlotId, info: &MatchInfo) -> std::io::Result<Self> {
+    fn new(
+        slot: SlotId,
+        info: &MatchInfo,
+        controller: LiveController<'_>,
+    ) -> std::io::Result<Self> {
         let tracker = StateTracker::new(slot, info).map_err(std::io::Error::other)?;
         let encoder = FeatureEncoder::new(&tracker);
         Ok(Self {
@@ -394,7 +426,11 @@ impl LivePolicy {
             local: LocalPolicyState::new(0),
             persistence: OrderPersistence::default(),
             readiness: ItemReadiness::new(),
-            teacher: Teacher::new(),
+            teacher: if matches!(controller, LiveController::Neural(_)) {
+                None
+            } else {
+                Some(Teacher::new())
+            },
             last_decision_tick: None,
             pending_snapshot_tick: None,
             pending_active: None,
@@ -504,7 +540,9 @@ impl LivePolicy {
             .record_sent(sequence, issued)
             .map_err(std::io::Error::other)?;
         self.readiness.note_sent(sequence, issued, &space);
-        self.teacher.note_sent(sequence, issued, space.tick());
+        if let Some(teacher) = &mut self.teacher {
+            teacher.note_sent(sequence, issued, space.tick());
+        }
         let update =
             active_order_update_for_sent(&self.persistence, issued.unit, sequence, action.kind());
         self.pending_active = match update {
@@ -535,9 +573,15 @@ impl LivePolicy {
         controller: LiveController<'_>,
     ) -> std::io::Result<(StructuredAction, ActionSpace)> {
         let model = match controller {
+            LiveController::Neural(model) => {
+                assert!(self.teacher.is_none());
+                model
+            }
             LiveController::Tactical(policy) => {
                 return self
                     .teacher
+                    .as_mut()
+                    .expect("historical controller has Teacher")
                     .decide_tactical(&self.tracker, &self.persistence, &self.readiness, policy)
                     .map_err(std::io::Error::other);
             }
@@ -549,6 +593,8 @@ impl LivePolicy {
             LiveController::Hybrid(_) | LiveController::Teacher => {
                 return self
                     .teacher
+                    .as_mut()
+                    .expect("historical controller has Teacher")
                     .decide(&self.tracker, &self.persistence, &self.readiness)
                     .map_err(std::io::Error::other);
             }
@@ -571,7 +617,8 @@ impl LivePolicy {
             .action;
         let action = self
             .teacher
-            .deployment_action(&self.tracker, &space)
+            .as_mut()
+            .and_then(|teacher| teacher.deployment_action(&self.tracker, &space))
             .unwrap_or(proposed);
         Ok((action, space))
     }
@@ -579,7 +626,9 @@ impl LivePolicy {
     fn observe_rejection(&mut self, sequence: u32) -> std::io::Result<()> {
         self.persistence.observe_rejection(sequence);
         self.readiness.note_rejected(sequence);
-        self.teacher.note_rejected(sequence);
+        if let Some(teacher) = &mut self.teacher {
+            teacher.note_rejected(sequence);
+        }
         if let Some((pending, previous)) = self.pending_active
             && pending == sequence
         {

@@ -708,16 +708,302 @@ fn replace_owned_hero_generation(view: &mut WorldView) {
 
 #[cfg(feature = "builtin")]
 fn stop_policy() -> PolicyModel {
+    biased_policy(ActionKind::Stop)
+}
+
+#[cfg(feature = "builtin")]
+fn biased_policy(kind: ActionKind) -> PolicyModel {
     let model = PolicyModel::fresh(70_002).expect("model");
     let mut parameters = vec![0.0; MODEL_PARAMETER_COUNT];
     let mut offset = 0usize;
     for (name, shape) in model.parameter_schema().expect("parameter schema") {
         if name == "kind.bias" {
-            parameters[offset + ActionKind::Stop.index()] = 10.0;
-            model.import_parameters(&parameters).expect("stop policy");
+            parameters[offset + kind.index()] = 10.0;
+            model.import_parameters(&parameters).expect("biased policy");
             return model;
         }
         offset += shape.iter().product::<usize>();
     }
     panic!("kind bias parameter is missing");
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn neural_sends_network_stop_instead_of_teacher_on_both_maps_at_low_health_and_during_channels() {
+    for map in [MapId(0), MapId(1)] {
+        for scenario in 0..3 {
+            let (info, mut view) = tactical_combat_fixture(map);
+            if scenario == 1 {
+                view.units[0].hp = 1;
+            }
+            if scenario == 2 {
+                view.units[0].statuses.bits = bota_proto::StatusFlags::CHANNELLING;
+            }
+            let mut tracker = crate::StateTracker::new(SlotId(0), &info).expect("tracker");
+            tracker.observe_snapshot(&view).expect("snapshot");
+            let (baseline, _) = crate::Teacher::new()
+                .decide(
+                    &tracker,
+                    &crate::OrderPersistence::default(),
+                    &crate::ItemReadiness::new(),
+                )
+                .expect("teacher baseline");
+            assert_ne!(baseline.kind(), ActionKind::Stop);
+            let mut finished = view.clone();
+            finished.tick += 1;
+            let mut wire = MockWire {
+                messages: VecDeque::from([
+                    ServerMsg::MatchStart { info },
+                    ServerMsg::Snapshot { view: view.clone() },
+                    ServerMsg::Events {
+                        tick: view.tick,
+                        events: Vec::new(),
+                    },
+                    ServerMsg::Snapshot { view: finished },
+                ]),
+                acknowledgements: Vec::new(),
+                orders: Vec::new(),
+            };
+            let outcome = crate::seat::play_neural_on(
+                &mut wire,
+                seated(TickMode::Lockstep),
+                Some(view.tick + 1),
+                &stop_policy(),
+            )
+            .expect("pure neural");
+            assert_eq!(outcome.decisions, 1);
+            assert_eq!(wire.orders.len(), 1);
+            assert_eq!(
+                wire.orders[0],
+                (
+                    None,
+                    Order::Move {
+                        target: bota_proto::Target::None
+                    }
+                )
+            );
+        }
+    }
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn neural_pregame_continue_does_not_buy_or_learn_and_keeps_phase_one_cadence() {
+    for map in [MapId(0), MapId(1)] {
+        let (mut arena, start) = crate::Arena::new(crate::ArenaConfig {
+            seats: 2,
+            map,
+            seed: 70_009,
+        })
+        .expect("arena");
+        let mut messages = start.messages[0].clone();
+        for _ in 1..8 {
+            messages.extend(arena.step(&[None; 2]).expect("tick").messages[0].clone());
+        }
+        let mut baseline = MockWire {
+            messages: messages.clone().into(),
+            acknowledgements: Vec::new(),
+            orders: Vec::new(),
+        };
+        crate::play_teacher_on(&mut baseline, seated(TickMode::Lockstep), Some(8))
+            .expect("teacher");
+        assert!(!baseline.orders.is_empty());
+        for mode in [TickMode::Lockstep, TickMode::Realtime] {
+            let mut wire = MockWire {
+                messages: messages.clone().into(),
+                acknowledgements: Vec::new(),
+                orders: Vec::new(),
+            };
+            let ServerMsg::MatchStart { info } = &mut wire.messages[0] else {
+                panic!("start");
+            };
+            info.mode = mode;
+            let outcome = crate::play_neural_on(
+                &mut wire,
+                seated(mode),
+                Some(8),
+                &biased_policy(ActionKind::Continue),
+            )
+            .expect("pure pregame");
+            assert_eq!(outcome.decisions, 3);
+            assert!(wire.orders.is_empty());
+            assert_eq!(
+                wire.acknowledgements,
+                if mode == TickMode::Lockstep {
+                    (1..=8).collect::<Vec<_>>()
+                } else {
+                    Vec::new()
+                }
+            );
+        }
+    }
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn neural_tcp_cli_loads_current_seed_weights_on_both_maps_without_training() {
+    let directory = tactical_directory("neural-tcp");
+    let model = PolicyModel::fresh(70_010).expect("untrained seed model");
+    crate::TrainingArtifact::save_runtime_weights(&model, &directory).expect("current metadata");
+    for map in [MapId(0), MapId(1)] {
+        neural_tcp_match(map, &directory);
+    }
+    std::fs::remove_dir_all(directory).expect("remove seed artifact");
+}
+
+#[cfg(feature = "builtin")]
+fn neural_tcp_match(map: MapId, directory: &std::path::Path) {
+    use std::{net::TcpListener, sync::mpsc, thread, time::Duration};
+    let listener = TcpListener::bind("127.0.0.1:0").expect("real TCP");
+    let address = listener.local_addr().expect("address").to_string();
+    let (finished, completion) = mpsc::sync_channel(1);
+    thread::spawn(move || {
+        let result = bota_server::game_loop::run(
+            listener,
+            bota_server::game_loop::ServerOpts {
+                mode: TickMode::Lockstep,
+                tick_rate: 30,
+                players: 2,
+                replay: None,
+                seed: 70_010,
+                map,
+                ack_timeout_ticks: 150,
+            },
+        );
+        finished.send(result).expect("completion receiver");
+    });
+    let (mut idle, idle_seat) =
+        crate::Link::join_with_timeout(&address, "idle", Duration::from_secs(5)).expect("opponent");
+    assert_eq!(idle_seat.slot, SlotId(0));
+    let opponent = thread::spawn(move || play_idle_on(&mut idle, idle_seat, Some(42)));
+    crate::cli::run_from_for_test([
+        "drysua",
+        "play",
+        "--policy",
+        "neural",
+        "--addr",
+        &address,
+        "--limit",
+        "32",
+        "--weights-directory",
+        directory.to_str().expect("path"),
+    ])
+    .expect("loaded pure neural TCP CLI");
+    let outcome = opponent
+        .join()
+        .expect("opponent thread")
+        .expect("opponent result");
+    assert!(outcome.ticks >= 32);
+    assert_eq!(outcome.orders, 0);
+    completion
+        .recv_timeout(Duration::from_secs(5))
+        .expect("bounded exit")
+        .expect("server result");
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn neural_deduplicates_body_orders_but_resends_after_rejection_or_respawn() {
+    for map in [MapId(0), MapId(1)] {
+        for reject in [false, true] {
+            let (info, mut view) = tactical_combat_fixture(map);
+            let mut messages = vec![ServerMsg::MatchStart { info }];
+            for tick in 1..=11 {
+                view.tick = tick;
+                if tick == 7 {
+                    replace_owned_hero_generation(&mut view);
+                }
+                messages.push(ServerMsg::Snapshot { view: view.clone() });
+                messages.push(ServerMsg::Events {
+                    tick,
+                    events: Vec::new(),
+                });
+                if tick == 1 && reject {
+                    messages.push(ServerMsg::OrderRejected {
+                        seq: 1,
+                        reason: bota_proto::RejectReason::UnknownTarget,
+                    });
+                }
+            }
+            let mut wire = MockWire {
+                messages: messages.into(),
+                acknowledgements: Vec::new(),
+                orders: Vec::new(),
+            };
+            let outcome = crate::play_neural_on(
+                &mut wire,
+                seated(TickMode::Lockstep),
+                Some(11),
+                &stop_policy(),
+            )
+            .expect("tracked pure neural");
+            assert_eq!(outcome.decisions, 4);
+            assert_eq!(outcome.orders, if reject { 3 } else { 2 });
+            assert_eq!(outcome.rejections, u32::from(reject));
+            assert_eq!(wire.acknowledgements, (1..=11).collect::<Vec<_>>());
+            assert!(wire.orders.iter().all(|order| *order
+                == (
+                    None,
+                    Order::Move {
+                        target: bota_proto::Target::None
+                    }
+                )));
+        }
+    }
+}
+
+#[test]
+fn neural_requires_snapshot_events_before_deciding_or_acknowledging() {
+    let mut wire = mock_wire();
+    let ServerMsg::MatchStart { info } = &mut wire.messages[0] else {
+        panic!("MatchStart first");
+    };
+    info.terrain_cells = 128;
+    info.terrain_rle = vec![(16_384, 0x80)];
+    let ServerMsg::Snapshot { view } = &mut wire.messages[1] else {
+        panic!("Snapshot second");
+    };
+    view.players.push(bota_proto::PlayerView {
+        slot: SlotId(0),
+        team: Team::Radiant,
+        hero: SHADOW_FIEND,
+        unit: None,
+        level: 1,
+        xp: 0,
+        gold: Some(0),
+        stash: Some(vec![None; 6]),
+        kit: None,
+        kills: 0,
+        deaths: 0,
+        assists: 0,
+        last_hits: 0,
+        denies: 0,
+        respawn_left: 0,
+    });
+    let mut next = view.clone();
+    next.tick = 2;
+    wire.messages.push_back(ServerMsg::Snapshot { view: next });
+    let model = crate::PolicyModel::fresh(70_011).expect("model");
+    let error = crate::play_neural_on(&mut wire, seated(TickMode::Lockstep), None, &model)
+        .expect_err("incomplete tick");
+    assert_eq!(
+        error.to_string(),
+        "server sent Snapshot before completing the previous tick"
+    );
+    assert!(wire.orders.is_empty());
+    assert!(wire.acknowledgements.is_empty());
+}
+
+#[test]
+fn neural_rejects_missing_weights_before_attempting_connection() {
+    let directory = tactical_directory("neural-missing");
+    let model = crate::PolicyModel::fresh(0).expect("model");
+    let expected = crate::TrainingArtifact::load_runtime_weights(&model, &directory)
+        .expect_err("missing weights")
+        .to_string();
+    let error = crate::play_neural("invalid address", "neural", None, &directory)
+        .expect_err("no fallback or connection");
+    assert_eq!(error.to_string(), expected);
+    assert_eq!(error.kind(), std::io::ErrorKind::Other);
+    std::fs::remove_dir_all(directory).expect("remove fixture");
 }

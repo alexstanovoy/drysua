@@ -11,7 +11,8 @@ import subprocess
 import sys
 import time
 
-from release_build import digest, prepare, read_registry, snapshot_weights, weights_name
+from release_build import (digest, prepare, read_registry,
+                           snapshot_weights, weights_name)
 from release_wire import Relay
 
 SIDES = ("Radiant", "Dire")
@@ -74,6 +75,11 @@ def validate_game(clients, server_exit, timed_out, tick_limit):
             errors.append("MatchOver mismatch")
         if winner is None and int(ticks) != tick_limit:
             errors.append("missing MatchOver before tick limit")
+        if winner is None and not (wire.get("last_snapshot") == tick_limit
+                                   and wire.get("cap_ack") and wire.get("cap_events")):
+            errors.append("unverified cap boundary")
+        if winner is not None and not (int(ticks) == wire.get("duration") == wire.get("last_snapshot")):
+            errors.append("terminal tick mismatch")
         winners.append(winner)
     if len(clients) != 2:
         errors.append("missing client")
@@ -93,13 +99,13 @@ def validate_game(clients, server_exit, timed_out, tick_limit):
 
 
 def add_candidate_arguments(parser):
-    parser.add_argument("--candidate-policy", choices=("teacher", "hybrid", "tactical"), default="teacher")
+    parser.add_argument("--candidate-policy", choices=("teacher", "hybrid", "neural", "tactical"), default="teacher")
     parser.add_argument("--candidate-weights", type=Path,
-                        help="Directory containing drysua.weights.safetensors (hybrid) or drysua.tactical.bin (tactical)")
+                        help="Directory containing drysua.weights.safetensors (hybrid/neural) or drysua.tactical.bin (tactical)")
 
 
 def validate_candidate_arguments(args):
-    if args.candidate_policy in ("hybrid", "tactical") and args.candidate_weights is None:
+    if args.candidate_policy in ("hybrid", "neural", "tactical") and args.candidate_weights is None:
         raise ValueError(f"{args.candidate_policy} requires --candidate-weights")
     if args.candidate_policy == "teacher" and args.candidate_weights is not None:
         raise ValueError("teacher forbids --candidate-weights")
@@ -107,10 +113,10 @@ def validate_candidate_arguments(args):
 
 def bot_command(bot, address, index, tick_limit):
     policy = bot["policy"]
-    if policy not in ("teacher", "hybrid", "tactical") or ("weights" in bot) != (policy != "teacher"):
+    if policy not in ("teacher", "hybrid", "neural", "tactical") or ("weights" in bot) != (policy != "teacher"):
         raise ValueError("bot policy/weights contract mismatch")
     assert index in (0, 1)
-    assert 1 <= tick_limit <= 100000
+    assert 1 <= tick_limit <= 108900
     command = [str(bot["binary"]), "play", "--policy", policy, "--addr", address,
                "--name", f"release-seat-{index}", "--limit", str(tick_limit)]
     if policy != "teacher":
@@ -118,11 +124,11 @@ def bot_command(bot, address, index, tick_limit):
     return command
 
 
-def launch(command, path, processes, handles):
+def launch(command, path, processes, handles, environment=None):
     handle = path.open("wb")
     handles.append(handle)
     process = subprocess.Popen(command, stdout=handle, stderr=subprocess.STDOUT,
-                               cwd=path.parent, start_new_session=True)
+                               cwd=path.parent, start_new_session=True, env=environment)
     processes.append(process)
     return process
 
@@ -166,21 +172,28 @@ def execute_game(directory, server, bots, seed, registry):
     killed, errors = set(), []
     timed_out = False
     deadline = time.monotonic() + registry["process_timeout_seconds"]
+    environment = None
+    if registry.get("cpu_threads") == 1:
+        environment = dict(os.environ, RAYON_NUM_THREADS="1", OMP_NUM_THREADS="1",
+                           OPENBLAS_NUM_THREADS="1", MKL_NUM_THREADS="1")
     command = [str(server), "--port", "0", "--mode", "lockstep", "--players", "2",
                "--map", str(registry["map"]), "--seed", str(seed), "--ack-timeout-ticks",
-               str(registry["process_timeout_seconds"] * 30 + 30),
-               "--replay", str(directory / "match.brp")]
+               str(registry["process_timeout_seconds"] * 30 + 30)]
+    if registry.get("record_replay", True):
+        command.extend(["--replay", str(directory / "match.brp")])
     commands.append(command)
     try:
-        host = launch(command, directory / "server.log", processes, handles)
+        host = launch(command, directory / "server.log", processes, handles, environment)
         port = server_port(directory / "server.log", host, min(deadline, time.monotonic() + 10))
         for index, bot in enumerate(bots):
-            relay = Relay(port, 10, registry["tick_limit"])
+            relay = Relay(port, 10, registry["tick_limit"], expected_map=registry["map"],
+                          expected_seed=seed,
+                          byte_limit=registry.get("wire_byte_limit", 512 * 1024 * 1024))
             relays.append(relay)
             command = bot_command(bot, relay.address, index, registry["tick_limit"])
             commands.append(command)
             paths.append(directory / f"client-{index}.log")
-            launch(command, paths[-1], processes, handles)
+            launch(command, paths[-1], processes, handles, environment)
             if not relay.welcomed.wait(timeout=10) or relay.observed["slot"] != index:
                 raise ValueError("identity mismatch: Welcome did not confirm scheduled seat")
         for _ in range(registry["process_timeout_seconds"] * 100 + 100):
@@ -192,6 +205,7 @@ def execute_game(directory, server, bots, seed, registry):
             time.sleep(0.01)
         else:
             raise TimeoutError("game polling limit exceeded")
+        await_cap_events(relays, min(deadline, time.monotonic() + 2))
         # A tick-limited server has no MatchOver and must be stopped by the runner.
         if all(relay.observed["winner"] is not None for relay in relays):
             host.wait(timeout=max(0.01, deadline - time.monotonic()))
@@ -200,15 +214,7 @@ def execute_game(directory, server, bots, seed, registry):
     except (OSError, ValueError) as error:
         errors.append(str(error))
     finally:
-        for process in processes:
-            if process.poll() is None:
-                killed.add(process.pid)
-                os.killpg(process.pid, 9)
-            process.wait(timeout=5)
-        for relay in relays:
-            relay.close()
-        for handle in handles:
-            handle.close()
+        stop_game(processes, relays, handles, killed, timed_out)
     clients = collect(processes, paths, relays, killed)
     server_exit = processes[0].returncode if processes and processes[0].pid not in killed else None
     result, validation = validate_game(clients, server_exit, timed_out, registry["tick_limit"])
@@ -218,7 +224,43 @@ def execute_game(directory, server, bots, seed, registry):
                 wall_seconds=time.monotonic() - deadline + registry["process_timeout_seconds"])
 
 
+def stop_game(processes, relays, handles, killed, timed_out):
+    assert len(processes) <= 3
+    assert len(relays) <= 2
+    # Host teardown must not turn still-running peers into apparent independent failures.
+    killed.update(process.pid for process in processes if process.poll() is None)
+    if timed_out:
+        for relay in relays:
+            relay.stop.set()
+    for process in processes:
+        if process.pid in killed:
+            try:
+                os.killpg(process.pid, 9)
+            except ProcessLookupError:
+                pass
+        process.wait(timeout=5)
+    for relay in relays:
+        relay.close()
+    for handle in handles:
+        handle.close()
+
+
+def await_cap_events(relays, deadline):
+    for _ in range(201):
+        if all(relay.observed.get("last_snapshot") != relay.tick_limit
+               or relay.observed.get("winner") is not None
+               or relay.observed.get("cap_ack") and relay.observed.get("cap_events") for relay in relays):
+            return
+        if time.monotonic() >= deadline:
+            raise ValueError("cap Events not drained before shutdown")
+        time.sleep(0.01)
+    raise ValueError("cap Events drain polling limit exceeded")
+
+
 def run(args, root, output):
+    if getattr(args, "teacher_challenge_map0", False):
+        from map0_challenge import run as run_challenge
+        return run_challenge(args, root, output)
     validate_candidate_arguments(args)
     registry = read_registry(root / "releases.json", root, args.bota_repository)
     candidate = output / "candidate"
@@ -228,7 +270,7 @@ def run(args, root, output):
     if digest(candidate) != source_hash or digest(args.candidate_binary) != source_hash:
         raise ValueError("candidate changed while being snapshotted; retry after build completes")
     candidate_bot = dict(binary=candidate, policy=args.candidate_policy)
-    if args.candidate_policy in ("hybrid", "tactical"):
+    if args.candidate_policy in ("hybrid", "neural", "tactical"):
         candidate_bot["weights"] = output / "candidate-weights"
         candidate_bot["weights_metadata"] = snapshot_weights(
             args.candidate_weights, candidate_bot["weights"], policy=args.candidate_policy)
@@ -236,7 +278,8 @@ def run(args, root, output):
     harness.mkdir()
     for name in ("release_build.py", "release_crossplay.py", "release_wire.py"):
         shutil.copy2(root / "scripts" / name, harness / name)
-    report = dict(registry=registry, candidate=dict(source=str(args.candidate_binary),
+    report = dict(evaluation="historical-map1",
+                  registry=registry, candidate=dict(source=str(args.candidate_binary),
                   sha256=source_hash, policy=args.candidate_policy,
                   weights=candidate_bot.get("weights_metadata"),
                   command_metadata=args.candidate_metadata), games=[],
@@ -244,6 +287,7 @@ def run(args, root, output):
                   gate=dict(passed=False, errors=["incomplete run"]))
     (output / "report.json").write_text(json.dumps(report, indent=2) + "\n")
     server, opponents = prepare(root, args.bota_repository, output, registry)
+    report["evaluation_map"] = registry["map"]
     report["server_sha256"] = digest(server)
     report["opponent_sha256"] = {tag: digest(bot["binary"]) for tag, bot in opponents.items()}
     report["opponent_policies"] = {tag: dict(policy=bot["policy"], weights=bot.get("weights_metadata"))
@@ -279,6 +323,13 @@ def main():
     root = Path(__file__).resolve().parents[1]
     parser = argparse.ArgumentParser(description=__doc__)
     add_candidate_arguments(parser)
+    parser.add_argument("--teacher-challenge-map0", action="store_true",
+                        help="Separate pure Neural challenge against an explicitly frozen Teacher; not the Map1 release gate")
+    parser.add_argument("--baseline-manifest", type=Path)
+    parser.add_argument("--challenge-final", action="store_true",
+                        help="Fixed 50 paired held-out seeds; never use for optimizer or stage selection")
+    parser.add_argument("--challenge-pairs", type=int, help="Development only: 1..10 pairs (default 10)")
+    parser.add_argument("--challenge-workers", type=int, default=4)
     parser.add_argument("--candidate-binary", required=True, type=Path)
     parser.add_argument("--candidate-metadata", required=True,
                         help="Exact build command and source/commit/dirty-state description")
@@ -287,12 +338,19 @@ def main():
     args = parser.parse_args()
     try:
         validate_candidate_arguments(args)
+        if args.teacher_challenge_map0:
+            from map0_challenge import validate_arguments
+            validate_arguments(args)
+        elif args.baseline_manifest or args.challenge_final or args.challenge_pairs is not None or args.challenge_workers != 4:
+            raise ValueError("challenge options require --teacher-challenge-map0")
     except ValueError as error:
         parser.error(str(error))
     if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]{0,79}", args.run_name):
         parser.error("run-name must be a safe basename of at most 80 characters")
     args.candidate_binary = args.candidate_binary.resolve(strict=True)
     args.bota_repository = args.bota_repository.resolve(strict=True)
+    if args.baseline_manifest is not None:
+        args.baseline_manifest = args.baseline_manifest.absolute()
     output = root / "artifacts" / "temp" / args.run_name
     output.mkdir(parents=True, exist_ok=False)
     try:

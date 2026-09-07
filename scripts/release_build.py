@@ -20,11 +20,11 @@ def digest(path):
 
 
 def weights_name(policy):
-    if policy == "hybrid":
+    if policy in ("hybrid", "neural"):
         return WEIGHTS_NAME
     if policy == "tactical":
         return TACTICAL_WEIGHTS_NAME
-    raise ValueError("weights require hybrid or tactical policy")
+    raise ValueError("weights require hybrid, neural, or tactical policy")
 
 
 def snapshot_weights(source, target, expected=None, policy="hybrid"):
@@ -52,7 +52,7 @@ def validate_release_weights(release):
         if "weights" in release:
             raise ValueError("teacher forbids weights")
         return
-    if policy not in ("hybrid", "tactical"):
+    if policy not in ("hybrid", "neural", "tactical"):
         raise ValueError("unsupported release policy")
     weights = release.get("weights")
     if not isinstance(weights, dict):
@@ -155,7 +155,7 @@ def prepare(repository, simulator_repository, output, registry):
         target = output / f"target-{tag}"
         build(source / tag, target, ["--bin", "drysua", "--no-default-features"], output, tag)
         bot = dict(binary=target / "release" / "drysua", policy=release["policy"])
-        if release["policy"] in ("hybrid", "tactical"):
+        if release["policy"] in ("hybrid", "neural", "tactical"):
             bot["weights"] = output / f"weights-{tag}"
             bot["weights_metadata"] = snapshot_weights(
                 source / tag / release["weights"]["path"], bot["weights"], release["weights"]["sha256"],

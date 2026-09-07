@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "epoch": "map0-fixed-teacher-4096-v1",
+  "map": 0,
+  "baseline_id": "map0-baseline-observationfix-4096",
+  "baseline_manifest_sha256": "e9c279bfe82b63a1c17ab2f3e1bbebb7b6936a0c256241251e1dfb4a992fbe8b",
+  "candidate_policy": "neural",
+  "baseline_policy": "teacher",
+  "tick_limit": 108900,
+  "process_timeout_seconds": 180,
+  "max_workers": 4,
+  "cpu_threads": 1,
+  "wire_byte_limit": 2147483648,
+  "record_replay": false,
+  "development_seed_start": 9870000,
+  "development_pairs_max": 10,
+  "final_seed_start": 9880000,
+  "final_pairs": 50,
+  "final_required_wins": 80,
+  "final_seed_use": "Held out: never optimizer input, stage selection, or development evaluation. Freeze candidate and weights before the final run."
+}

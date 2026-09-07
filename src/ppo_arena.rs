@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+pub(crate) mod episode;
 use std::fs::{File, OpenOptions};
 use std::path::Path;
 use std::sync::Arc;
@@ -26,8 +27,7 @@ use crate::{
 
 const TRAINING_MAX_ENVIRONMENTS: usize = 16;
 const READINESS_ORDER_HISTORY: usize = 32;
-const _: () =
-    assert!(TRAINING_MAX_ENVIRONMENTS * PPO_MAX_ROLLOUT_DECISIONS <= crate::PPO_MAX_SAMPLES);
+const _: () = assert!(PPO_MAX_ROLLOUT_DECISIONS <= crate::PPO_MAX_SAMPLES);
 
 /// Bounded builtin smoke-run settings for the complete actor-to-learner path.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -58,6 +58,7 @@ impl Default for PpoSmokeConfig {
 /// Aggregate result of a short real-simulator PPO run.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct PpoSmokeReport {
+    pub episode_timeouts: u64,
     pub updates: u32,
     pub transitions: usize,
     pub optimizer_step: u64,
@@ -73,13 +74,14 @@ pub struct PpoSmokeReport {
 }
 
 /// Bounded, resumable production PPO settings.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct TrainingJobConfig {
+    /// Suppress shaping in complete Map0 episodes; persisted in strict run scope.
+    pub terminal_only: bool,
+    pub complete_episodes: bool,
     pub updates: u64,
-    pub environments: usize,
-    pub rollout_decisions: usize,
-    pub epochs: usize,
-    pub minibatch: usize,
+    /// Single source of truth for rollout dimensions and checkpointed hyperparameters.
+    pub ppo: PpoConfig,
     pub checkpoint_cadence: TrainingCheckpointCadence,
     pub resume_provenance: ResumeProvenance,
     pub seed: u64,
@@ -106,6 +108,7 @@ pub enum ResumeProvenance {
 /// Durable progress plus invocation-local gameplay telemetry emitted after a committed checkpoint.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TrainingCheckpointReport {
+    pub episode_timeouts: u64,
     pub completed_updates: u64,
     pub optimizer_step: u64,
     pub rollout_samples: u64,
@@ -125,6 +128,7 @@ pub struct TrainingCheckpointReport {
 /// Final durable progress and gameplay telemetry from the current bounded invocation.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct TrainingJobReport {
+    pub episode_timeouts: u64,
     pub starting_policy_fingerprint: u64,
     pub completed_updates: u64,
     pub optimizer_step: u64,
@@ -473,7 +477,43 @@ pub fn evaluate_runtime_checkpoint(
     settings: CheckpointEvaluationConfig,
     checkpoint_directory: &Path,
 ) -> Result<CheckpointEvaluationReport, PpoError> {
-    validate_checkpoint_evaluation(settings)?;
+    evaluate_checkpoint_matrix(settings, checkpoint_directory, false, false)
+}
+
+/// Evaluates greedy Neural on Map0 against the unchanged Teacher and weak opponents.
+#[cfg(test)]
+pub(crate) fn evaluate_neural_map_zero_checkpoint(
+    settings: CheckpointEvaluationConfig,
+    checkpoint_directory: &Path,
+) -> Result<CheckpointEvaluationReport, PpoError> {
+    evaluate_neural_map_zero_checkpoint_cohort(settings, checkpoint_directory, false)
+}
+
+pub(crate) fn evaluate_neural_map_zero_checkpoint_cohort(
+    settings: CheckpointEvaluationConfig,
+    checkpoint_directory: &Path,
+    teacher_only: bool,
+) -> Result<CheckpointEvaluationReport, PpoError> {
+    evaluate_checkpoint_matrix(settings, checkpoint_directory, true, teacher_only)
+}
+
+fn evaluate_checkpoint_matrix(
+    settings: CheckpointEvaluationConfig,
+    checkpoint_directory: &Path,
+    neural_map_zero: bool,
+    teacher_only: bool,
+) -> Result<CheckpointEvaluationReport, PpoError> {
+    if neural_map_zero {
+        if !(1..=36_300).contains(&settings.decisions) {
+            return Err(PpoError::InvalidConfig("neural evaluation decisions"));
+        }
+        validate_checkpoint_evaluation(CheckpointEvaluationConfig {
+            decisions: 1,
+            ..settings
+        })?;
+    } else {
+        validate_checkpoint_evaluation(settings)?;
+    }
     let model = PolicyModel::fresh(settings.seed).map_err(model_error)?;
     TrainingArtifact::load_runtime_weights(&model, checkpoint_directory)
         .map_err(checkpoint_error)?;
@@ -485,24 +525,33 @@ pub fn evaluate_runtime_checkpoint(
         .checked_mul(8)
         .ok_or(PpoError::InvalidConfig("checkpoint evaluation matches"))?;
     let mut games = Vec::with_capacity(match_count);
-    for map in [MapId(0), MapId(1)] {
+    let maps: &[MapId] = if neural_map_zero {
+        &[MapId(0)]
+    } else {
+        &[MapId(0), MapId(1)]
+    };
+    for &map in maps {
         for baseline in [
             CheckpointEvaluationBaseline::Teacher,
             CheckpointEvaluationBaseline::Weak,
         ] {
+            if teacher_only && baseline == CheckpointEvaluationBaseline::Weak {
+                continue;
+            }
             for pair in 0..settings.pairs {
                 let seed = settings
                     .seed
                     .checked_add(pair as u64)
                     .ok_or(PpoError::InvalidConfig("checkpoint evaluation seed"))?;
                 for candidate_seat in 0..2 {
-                    games.push(evaluate_checkpoint_game(
+                    games.push(evaluate_checkpoint_game_with_policy(
                         &model,
                         settings,
                         map,
                         baseline,
                         seed,
                         candidate_seat,
+                        neural_map_zero,
                     )?);
                 }
             }
@@ -1806,9 +1855,9 @@ where
     let _directory_lock = TrainingDirectoryLock::acquire(checkpoint_directory)?;
     let config = validate_training_job(&settings, resume)?;
     let run = training_checkpoint_run(&settings, device, config)?;
-    let capacity = settings
+    let capacity = config
         .environments
-        .checked_mul(settings.rollout_decisions)
+        .checked_mul(config.rollout_decisions)
         .ok_or(PpoError::InvalidConfig("training samples"))?;
     let mut session = TrainingSession::initialize(
         &settings,
@@ -1849,6 +1898,7 @@ where
 }
 
 struct TrainingSession {
+    episode_timeouts: u64,
     model: PolicyModel,
     trainer: PpoTrainer,
     sampling: PpoRng,
@@ -1893,6 +1943,7 @@ impl TrainingSession {
         Ok(Self {
             model,
             trainer,
+            episode_timeouts: 0,
             sampling,
             run,
             completed_updates,
@@ -1921,15 +1972,31 @@ impl TrainingSession {
             PpoRollout::new(capacity, self.model.policy_identity().map_err(model_error)?)?;
         let mut environments = build_training_environments(settings, update, config, &self.model)?;
         let mut actor_report = PpoSmokeReport::default();
-        collect_update(
-            &self.model,
-            &mut self.sampling,
-            &mut environments,
-            config,
-            settings.rollout_decisions,
-            &mut rollout,
-            &mut actor_report,
-        )?;
+        if settings.complete_episodes {
+            episode::collect(
+                &self.model,
+                &mut self.sampling,
+                &mut environments,
+                config,
+                &mut rollout,
+                &mut actor_report,
+                settings.terminal_only,
+            )?;
+        } else {
+            collect_update(
+                &self.model,
+                &mut self.sampling,
+                &mut environments,
+                config,
+                config.rollout_decisions,
+                &mut rollout,
+                &mut actor_report,
+            )?;
+        }
+        self.episode_timeouts = self
+            .episode_timeouts
+            .checked_add(actor_report.episode_timeouts)
+            .ok_or(PpoError::CounterOverflow)?;
         self.terminal_wins = self
             .terminal_wins
             .checked_add(actor_report.terminal_wins)
@@ -1950,13 +2017,17 @@ impl TrainingSession {
             .elapsed_ticks
             .checked_add(actor_report.elapsed_ticks)
             .ok_or(PpoError::CounterOverflow)?;
-        assert_eq!(rollout.len(), capacity);
+        let samples = rollout.len();
+        if !settings.complete_episodes {
+            assert_eq!(samples, capacity);
+        }
+        assert!(samples <= capacity);
         let batch = rollout.finish(config)?;
         self.latest = self.trainer.train_update(&self.model, &batch)?;
         self.completed_updates = self.trainer.updates();
         self.rollout_samples = self
             .rollout_samples
-            .checked_add(capacity as u64)
+            .checked_add(samples as u64)
             .ok_or(PpoError::CounterOverflow)?;
         Ok(self.checkpoint_report(None))
     }
@@ -1996,6 +2067,7 @@ impl TrainingSession {
 
     fn checkpoint_report(&self, cleanup_warning: Option<String>) -> TrainingCheckpointReport {
         TrainingCheckpointReport {
+            episode_timeouts: self.episode_timeouts,
             completed_updates: self.completed_updates,
             optimizer_step: self.trainer.optimizer_step(),
             rollout_samples: self.rollout_samples,
@@ -2015,6 +2087,7 @@ impl TrainingSession {
 
     fn report(&self) -> TrainingJobReport {
         TrainingJobReport {
+            episode_timeouts: self.episode_timeouts,
             starting_policy_fingerprint: self.starting_policy_fingerprint,
             completed_updates: self.completed_updates,
             optimizer_step: self.trainer.optimizer_step(),
@@ -2236,13 +2309,15 @@ fn validate_training_job(
             "fresh training provenance migration",
         ));
     }
-    if settings.environments == 0
-        || settings.environments > TRAINING_MAX_ENVIRONMENTS
-        || !settings.environments.is_multiple_of(2)
+    if settings.ppo.environments == 0
+        || settings.ppo.environments > TRAINING_MAX_ENVIRONMENTS
+        || !settings.ppo.environments.is_multiple_of(2)
     {
         return Err(PpoError::InvalidConfig("training environments"));
     }
-    if settings.rollout_decisions == 0 || settings.rollout_decisions > PPO_MAX_ROLLOUT_DECISIONS {
+    if settings.ppo.rollout_decisions == 0
+        || settings.ppo.rollout_decisions > PPO_MAX_ROLLOUT_DECISIONS
+    {
         return Err(PpoError::InvalidConfig("training rollout decisions"));
     }
     if !matches!(settings.map, MapId(0) | MapId(1)) {
@@ -2254,7 +2329,8 @@ fn validate_training_job(
     if settings.simulator_commit.is_empty() || settings.simulator_commit.len() > 4_096 {
         return Err(PpoError::InvalidConfig("training simulator commit"));
     }
-    let config = training_ppo_config(settings).validate()?;
+    let config = settings.ppo.validate()?;
+    episode::validate(settings)?;
     validate_training_counters(settings, config)?;
     Ok(config)
 }
@@ -2292,28 +2368,23 @@ fn validate_checkpoint_cadence(cadence: TrainingCheckpointCadence) -> Result<(),
     }
 }
 
-fn training_ppo_config(settings: &TrainingJobConfig) -> PpoConfig {
-    PpoConfig {
-        environments: settings.environments,
-        rollout_decisions: settings.rollout_decisions,
-        epochs: settings.epochs,
-        minibatch: settings.minibatch,
-        ..PpoConfig::default()
-    }
-}
-
 fn validate_training_counters(
     settings: &TrainingJobConfig,
     config: PpoConfig,
 ) -> Result<(), PpoError> {
-    let samples = (settings.environments as u64)
-        .checked_mul(settings.rollout_decisions as u64)
+    let samples = (config.environments as u64)
+        .checked_mul(config.rollout_decisions as u64)
         .ok_or(PpoError::InvalidConfig("training sample counter"))?;
     let actor_seed_draws = settings
         .updates
-        .checked_mul(settings.environments as u64)
+        .checked_mul(config.environments as u64)
         .ok_or(PpoError::InvalidConfig("training actor RNG counter"))?;
-    let actor_stream_draws = (settings.rollout_decisions as u64)
+    let actor_decisions = if settings.complete_episodes {
+        episode::ACTOR_DECISIONS
+    } else {
+        config.rollout_decisions
+    };
+    let actor_stream_draws = (actor_decisions as u64)
         .checked_mul(PPO_MAX_POLICY_SAMPLE_DRAWS)
         .ok_or(PpoError::InvalidConfig("training actor RNG counter"))?;
     if actor_seed_draws > MAX_TRAINING_COUNTER || actor_stream_draws > MAX_TRAINING_COUNTER {
@@ -2428,15 +2499,21 @@ fn training_checkpoint_run(
         #[cfg(all(feature = "metal", target_os = "macos"))]
         PolicyDevice::Metal { .. } => "metal",
     };
-    let command_line = format!(
+    let mut command_line = format!(
         "train-full --environments {} --rollout {} --epochs {} --minibatch {} --seed {} --map {} --device {device_name}",
-        settings.environments,
-        settings.rollout_decisions,
-        settings.epochs,
-        settings.minibatch,
+        config.environments,
+        config.rollout_decisions,
+        config.epochs,
+        config.minibatch,
         settings.seed,
         settings.map.0,
     );
+    if settings.complete_episodes {
+        command_line.push_str(" --complete-episodes");
+    }
+    if settings.terminal_only {
+        command_line.push_str(" --terminal-only");
+    }
     Ok(CheckpointRun {
         git_commit: settings.git_commit.clone(),
         simulator_commit: settings.simulator_commit.clone(),
@@ -2610,16 +2687,19 @@ fn build_training_environments(
     config: PpoConfig,
     model: &PolicyModel,
 ) -> Result<Vec<TrainingEnvironment>, PpoError> {
+    if settings.complete_episodes {
+        return episode::environments(settings, update);
+    }
     let decision = update
-        .checked_mul(settings.rollout_decisions as u64)
+        .checked_mul(config.rollout_decisions as u64)
         .and_then(|value| u32::try_from(value).ok())
         .ok_or(PpoError::InvalidConfig("training decision counter"))?;
     let offset = update
-        .checked_mul(settings.environments as u64)
+        .checked_mul(config.environments as u64)
         .ok_or(PpoError::CounterOverflow)?;
-    let mut environments = Vec::with_capacity(settings.environments);
-    let mut warmup_decisions = Vec::with_capacity(settings.environments);
-    for index in 0..settings.environments {
+    let mut environments = Vec::with_capacity(config.environments);
+    let mut warmup_decisions = Vec::with_capacity(config.environments);
+    for index in 0..config.environments {
         let stream = offset
             .checked_add(index as u64)
             .ok_or(PpoError::CounterOverflow)?;
@@ -2753,6 +2833,74 @@ fn finish_warmup_environment(
 }
 
 #[cfg(test)]
+pub(crate) fn assert_frozen_neural_opponent_for_test(model: &PolicyModel) {
+    let snapshot = PolicySnapshot::capture(model, 0).expect("frozen snapshot");
+    for map in [MapId(0), MapId(1)] {
+        let mut environment = build_environment(
+            23_090,
+            23_091,
+            map,
+            0,
+            0,
+            OpponentSpec::Policy(snapshot.clone()),
+        )
+        .expect("frozen opponent arena");
+        assert!(matches!(
+            environment.opponent,
+            OpponentRuntime::Policy { .. }
+        ));
+        for _ in 0..4 {
+            let (requests, kind) = requests_for_neural_greedy_decision(&mut environment, model)
+                .expect("pure requests");
+            assert_eq!(kind, ActionKind::Stop);
+            assert!(requests.iter().flatten().all(|request| matches!(
+                request.order,
+                bota_proto::Order::Move {
+                    target: bota_proto::Target::None
+                }
+            )));
+            advance_interval(&mut environment, requests, 3).expect("pure ticks");
+        }
+        assert_eq!(environment.seats[0].sequence, 1);
+        assert!((1..=4).contains(&environment.seats[1].sequence));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn assert_pure_warmup_ledger_for_test(model: &PolicyModel, kind: ActionKind) {
+    for map in [MapId(0), MapId(1)] {
+        for side in 0..2 {
+            let mut batched = vec![
+                build_environment(23_088, 23_089, map, side, 0, OpponentSpec::Teacher)
+                    .expect("arena"),
+            ];
+            let mut raw = build_environment(23_088, 23_089, map, side, 0, OpponentSpec::Teacher)
+                .expect("arena");
+            for _ in 0..4 {
+                let requests = requests_for_batched_greedy_decisions(&mut batched, &[0], model)
+                    .expect("warmup");
+                let (expected, action) =
+                    requests_for_neural_greedy_decision(&mut raw, model).expect("raw neural");
+                assert_eq!(action, kind);
+                assert_eq!(requests, vec![expected.clone()]);
+                advance_warmup_environments(&mut batched, &[0], requests, 3).expect("warmup ticks");
+                advance_interval(&mut raw, expected, 3).expect("raw ticks");
+                for seat in 0..2 {
+                    assert_eq!(batched[0].seats[seat].sequence, raw.seats[seat].sequence);
+                    assert_eq!(
+                        batched[0].seats[seat].tracker.latest_summary(),
+                        raw.seats[seat].tracker.latest_summary()
+                    );
+                    assert_eq!(batched[0].seats[seat].rejections, 0);
+                }
+            }
+            assert!(raw.seats[1 - side].sequence > 0);
+            assert!(raw.seats[side].sequence <= 1);
+        }
+    }
+}
+
+#[cfg(test)]
 fn run_warmup_decisions(
     environment: &mut TrainingEnvironment,
     model: &PolicyModel,
@@ -2760,7 +2908,7 @@ fn run_warmup_decisions(
     decision_interval_ticks: u32,
 ) -> Result<(), PpoError> {
     for _ in 0..decisions {
-        let (requests, _) = requests_for_greedy_decision(environment, model)?;
+        let (requests, _) = requests_for_neural_greedy_decision(environment, model)?;
         let advanced = advance_interval(environment, requests, decision_interval_ticks)?;
         reject_production_rejection(environment, "production warmup")?;
         if advanced.winner.is_some() {
@@ -3364,6 +3512,26 @@ fn evaluate_checkpoint_game(
     seed: u64,
     candidate_seat: usize,
 ) -> Result<CheckpointEvaluationGame, PpoError> {
+    evaluate_checkpoint_game_with_policy(
+        candidate,
+        settings,
+        map,
+        baseline,
+        seed,
+        candidate_seat,
+        false,
+    )
+}
+
+fn evaluate_checkpoint_game_with_policy(
+    candidate: &PolicyModel,
+    settings: CheckpointEvaluationConfig,
+    map: MapId,
+    baseline: CheckpointEvaluationBaseline,
+    seed: u64,
+    candidate_seat: usize,
+    neural: bool,
+) -> Result<CheckpointEvaluationGame, PpoError> {
     let opponent = match baseline {
         CheckpointEvaluationBaseline::Teacher => OpponentSpec::Teacher,
         CheckpointEvaluationBaseline::Weak => OpponentSpec::Weak,
@@ -3376,8 +3544,21 @@ fn evaluate_checkpoint_game(
     let mut elapsed_ticks = 0u32;
     let mut winner = None;
     for _ in 0..settings.decisions {
-        let (requests, action) = requests_for_greedy_decision(&mut environment, candidate)?;
-        let advanced = advance_interval(&mut environment, requests, 3)?;
+        let tick = environment.seats[candidate_seat]
+            .tracker
+            .current()
+            .ok_or(PpoError::InvalidTransition("evaluation snapshot"))?
+            .tick;
+        if neural && tick >= 108_900 {
+            break;
+        }
+        let (requests, action) = if neural {
+            requests_for_neural_greedy_decision(&mut environment, candidate)?
+        } else {
+            requests_for_greedy_decision(&mut environment, candidate)?
+        };
+        let interval = if neural { 3.min(108_900 - tick) } else { 3 };
+        let advanced = advance_interval(&mut environment, requests, interval)?;
         action_counts[action.index()] = action_counts[action.index()]
             .checked_add(1)
             .ok_or(PpoError::CounterOverflow)?;
@@ -3938,6 +4119,39 @@ fn requests_for_decision_in_space(
     Ok(requests)
 }
 
+fn requests_for_neural_greedy_decision(
+    environment: &mut TrainingEnvironment,
+    model: &PolicyModel,
+) -> Result<(Vec<Option<Request>>, ActionKind), PpoError> {
+    assert!(environment.policy_seat < environment.seats.len());
+    let (frame, space) = prepare_policy_sample(environment)?;
+    let choice = model.choose(&frame, &space).map_err(model_error)?;
+    assert!(space.allows(choice.action));
+    let (action, request) = neural_policy_request_in_space(
+        &mut environment.seats[environment.policy_seat],
+        choice.action,
+        &space,
+    )?;
+    Ok((requests_with_candidate(environment, request)?, action))
+}
+
+fn neural_policy_request_in_space(
+    seat: &mut ArenaSeatPolicy,
+    proposed: crate::StructuredAction,
+    space: &ActionSpace,
+) -> Result<(ActionKind, Option<Request>), PpoError> {
+    assert!(space.allows(proposed));
+    let action = proposed.kind();
+    seat.local
+        .note_decision(space.tick(), action)
+        .map_err(|error| PpoError::Model(error.to_string()))?;
+    let issued = space
+        .decode(proposed)
+        .map_err(|error| PpoError::Model(error.to_string()))?;
+    let request = issue_request(seat, issued, space, action, false)?;
+    Ok((action, request))
+}
+
 fn requests_for_greedy_decision(
     environment: &mut TrainingEnvironment,
     model: &PolicyModel,
@@ -3964,17 +4178,6 @@ fn requests_for_batched_greedy_decisions(
             "batched warmup active environments",
         ));
     }
-    if active
-        .iter()
-        .all(|index| deployment_uses_teacher(environments[*index].map))
-    {
-        return active
-            .iter()
-            .map(|index| {
-                requests_for_greedy_decision(&mut environments[*index], model).map(|v| v.0)
-            })
-            .collect();
-    }
     requests_for_batched_model_greedy_decisions(environments, active, model)
 }
 
@@ -3983,12 +4186,6 @@ fn requests_for_batched_model_greedy_decisions(
     active: &[usize],
     model: &PolicyModel,
 ) -> Result<Vec<Vec<Option<Request>>>, PpoError> {
-    if active
-        .iter()
-        .any(|index| deployment_uses_teacher(environments[*index].map))
-    {
-        return Err(PpoError::InvalidTransition("mixed batched warmup policy"));
-    }
     let mut frames = Vec::with_capacity(active.len());
     let mut spaces = Vec::with_capacity(active.len());
     for &index in active {
@@ -4001,7 +4198,7 @@ fn requests_for_batched_model_greedy_decisions(
     for ((&index, choice), space) in active.iter().zip(choices).zip(&spaces) {
         let environment = &mut environments[index];
         let policy_seat = environment.policy_seat;
-        let (_, candidate_request) = greedy_policy_request_in_space(
+        let (_, candidate_request) = neural_policy_request_in_space(
             &mut environment.seats[policy_seat],
             choice.action,
             space,

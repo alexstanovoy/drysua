@@ -209,8 +209,9 @@ StateTracker закрывает неполноту одного snapshot.
 | Current unit pointer tokens | 96 |
 | Own unit memory tokens | 2 |
 | Remembered non-targetable unit tokens | 32 |
-| Tracked entities | 256 |
-| Projectiles | 32 |
+| Visible units / tracked entities | 4096 |
+| Observed projectiles / projectile histories | 4096 |
+| Model projectile tokens | 32 |
 | Loot | 16 |
 | Shadow Fiend ability slots | 6 |
 | Own item slots | 21 |
@@ -219,6 +220,12 @@ StateTracker закрывает неполноту одного snapshot.
 | Events per input batch | `MAX_PAYLOAD_LEN / 2` (2,097,152) |
 | Recent events | 64 |
 | History | 480 ticks |
+
+Map0 repair: [4096 bounds, hull reach, and explicit training initialization](map0-feature10-initialization.md).
+The wire payload cap remains 4 MiB; selected model rows and numeric normalizers
+are unchanged. Hull-inclusive attack-reach facts are corrected. The linked schemas
+are now Feature v10, Model v11, PPO v19, League v20
+(rules audit remains v15); this supersedes the earlier schema tuples below.
 
 Для каждой сущности храним:
 

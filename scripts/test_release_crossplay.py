@@ -20,6 +20,34 @@ import release_build as release_build
 
 
 class CandidateTests(unittest.TestCase):
+    def test_map_zero_teacher_challenge_never_loads_or_relabels_historical_registry(self):
+        args = argparse.Namespace(teacher_challenge_map0=True)
+        with patch("map0_challenge.run", return_value=0) as challenge, \
+                patch.object(crossplay, "read_registry") as registry:
+            self.assertEqual(crossplay.run(args, Path("root"), Path("output")), 0)
+        challenge.assert_called_once_with(args, Path("root"), Path("output"))
+        registry.assert_not_called()
+
+    def test_neural_requires_weights_and_snapshots_safetensors_with_unchanged_gate(self):
+        parser = argparse.ArgumentParser()
+        crossplay.add_candidate_arguments(parser)
+        args = parser.parse_args(["--candidate-policy", "neural"])
+        with self.assertRaisesRegex(ValueError, "neural requires --candidate-weights"):
+            crossplay.validate_candidate_arguments(args)
+        self.assertEqual(release_build.weights_name("neural"), release_build.WEIGHTS_NAME)
+        self.run_wires_snapshot("neural", release_build.WEIGHTS_NAME)
+
+    def test_neural_release_requires_version_bound_sha_weights(self):
+        release = dict(tag="v0.0.4", policy="neural")
+        with self.assertRaisesRegex(ValueError, "neural requires weights"):
+            release_build.validate_release_weights(release)
+        release["weights"] = dict(path="artifacts/v0.0.4", sha256="a" * 64)
+        release_build.validate_release_weights(release)
+        command = crossplay.bot_command(dict(binary="bot", policy="neural", weights="snapshot"),
+                                        "127.0.0.1:1", 0, 100)
+        self.assertEqual(command[2:4], ["--policy", "neural"])
+        self.assertEqual(command[-2:], ["--weights-directory", "snapshot"])
+
     def test_tactical_cli_requires_weights_and_emits_explicit_tactical_command(self):
         parser = argparse.ArgumentParser()
         crossplay.add_candidate_arguments(parser)
@@ -149,7 +177,7 @@ class CandidateTests(unittest.TestCase):
             weights.write_bytes(b"weights")
             args = argparse.Namespace(candidate_policy=policy, candidate_weights=output,
                 candidate_binary=binary, candidate_metadata="test provenance", bota_repository=root)
-            registry = dict(seeds=list(range(10)))
+            registry = dict(map=1, seeds=list(range(10)))
             teacher = dict(binary=binary, policy="teacher")
             with patch.object(crossplay, "read_registry", return_value=registry), \
                     patch.object(crossplay, "prepare", return_value=(binary, {"v0.0.1": teacher})), \
@@ -202,7 +230,7 @@ class CandidateTests(unittest.TestCase):
                 snapshot.write_bytes(b"changed")
                 return dict(result="win" if bots[0]["policy"] == "hybrid" else "loss", errors=[])
 
-            with patch.object(crossplay, "read_registry", return_value=dict(seeds=list(range(10)))), \
+            with patch.object(crossplay, "read_registry", return_value=dict(map=1, seeds=list(range(10)))), \
                     patch.object(crossplay, "prepare", return_value=(binary, {
                         "v0.0.1": dict(binary=binary, policy="teacher")})), \
                     patch.object(crossplay, "execute_game", side_effect=game), patch("builtins.print"):
@@ -278,11 +306,54 @@ class GateTests(unittest.TestCase):
 def client(side, winner="Radiant", rejected=0, exit_code=0):
     return dict(exit=exit_code, stdout=(f"played 100 ticks as Some({side}); "
                 f"winner Some({winner}); 10 decisions, 5 orders, {rejected} rejected orders\n"),
-                wire=dict(slot=0 if side == "Radiant" else 1, winner=winner,
-                          rejected=0, errors=[]))
+                 wire=dict(slot=0 if side == "Radiant" else 1, winner=winner,
+                           duration=100, last_snapshot=100, rejected=0, errors=[]))
 
 
 class GameTests(unittest.TestCase):
+    def test_wall_watchdog_marks_all_interrupted_peers_before_host_shutdown(self):
+        processes = [Mock(pid=pid, poll=Mock(return_value=None)) for pid in (101, 102, 103)]
+        relay, handle, killed = Mock(), Mock(), set()
+
+        def kill(process, signal):
+            self.assertEqual(killed, {101, 102, 103})
+            relay.stop.set.assert_called_once_with()
+
+        with patch.object(crossplay.os, "killpg", side_effect=kill):
+            crossplay.stop_game(processes, [relay], [handle], killed, True)
+        relay.close.assert_called_once_with()
+        handle.close.assert_called_once_with()
+
+    def test_supervisor_waits_for_cap_ack_as_well_as_events_before_killing_server(self):
+        relay = Mock(tick_limit=10)
+        relay.observed = dict(last_snapshot=10, cap_ack=False, cap_events=True, winner=None)
+
+        def acknowledge(_):
+            relay.observed["cap_ack"] = True
+
+        with patch.object(crossplay.time, "sleep", side_effect=acknowledge) as wait, \
+                patch.object(crossplay.time, "monotonic", return_value=0):
+            crossplay.await_cap_events([relay], 1)
+        wait.assert_called_once_with(0.01)
+
+    def test_verified_cap_is_timeout_not_error_or_win_and_identity_is_still_required(self):
+        clients = [client(side) for side in ("Radiant", "Dire")]
+        for record, side in zip(clients, ("Radiant", "Dire")):
+            record["stdout"] = f"played 100 ticks as Some({side}); winner None; 33 decisions, 2 orders, 0 rejected orders\n"
+            record["wire"].update(winner=None, last_snapshot=100, cap_ack=True, cap_events=True)
+        self.assertEqual(validate_game(clients, None, False, 100), ("timeout", []))
+        clients[1]["wire"]["slot"] = 0
+        self.assertIn("identity mismatch", validate_game(clients, None, False, 100)[1])
+        clients[1]["wire"].update(slot=1, cap_events=False)
+        self.assertIn("unverified cap boundary", validate_game(clients, None, False, 100)[1])
+
+    def test_terminal_tick_disagreement_cannot_become_a_win(self):
+        clients = [client("Radiant"), client("Dire")]
+        clients[0]["wire"]["duration"] = 99
+        result, errors = validate_game(clients, 0, False, 1000)
+        self.assertEqual(result, "error")
+        self.assertIn("terminal tick mismatch", errors)
+
     def test_replay_not_created_until_match_start_is_allowed(self):
         directory = Mock()
         directory.__truediv__ = Mock(return_value=Mock())
@@ -318,6 +389,56 @@ class GameTests(unittest.TestCase):
 
 
 class WireTests(unittest.TestCase):
+    def test_match_start_must_match_scheduled_map_and_seed(self):
+        relay = Relay.__new__(Relay)
+        relay.expected_map, relay.expected_seed = 0, 7
+        relay.observed = dict(map=None)
+        for payload in (bytes([2, 7, 1, 30]), bytes([2, 8, 0, 30])):
+            with self.assertRaisesRegex(ValueError, "MatchStart (map|seed) mismatch"):
+                relay.observe_message(payload)
+
+    def test_cap_ack_is_withheld_after_verified_snapshot_even_when_fragmented(self):
+        relay = Relay.__new__(Relay)
+        relay.tick_limit = 10
+        relay.client_buffer = bytearray()
+        relay.client_bytes = relay.client_frames = 0
+        relay.observed = dict(slot=0, last_snapshot=10, cap_ack=False)
+        frame = struct.pack("<I", 2) + bytes([4, 10])
+        output = bytearray()
+        for byte in frame:
+            output.extend(relay.filter_client(bytes([byte])))
+        self.assertEqual(output, b"")
+        self.assertTrue(relay.observed["cap_ack"])
+        with self.assertRaisesRegex(ValueError, "duplicate cap ACK"):
+            relay.filter_client(frame)
+
+    def test_cap_ack_cannot_forge_progress_and_earlier_ack_is_forwarded(self):
+        relay = Relay.__new__(Relay)
+        relay.tick_limit = 10
+        relay.client_buffer = bytearray()
+        relay.client_bytes = relay.client_frames = 0
+        relay.observed = dict(slot=0, last_snapshot=9, cap_ack=False)
+        earlier = struct.pack("<I", 2) + bytes([4, 9])
+        self.assertEqual(relay.filter_client(earlier), earlier)
+        with self.assertRaisesRegex(ValueError, "ACK exceeds observed snapshot"):
+            relay.filter_client(struct.pack("<I", 2) + bytes([4, 10]))
+
+    def test_cap_client_eof_keeps_server_connected_until_supervisor_stop(self):
+        relay = Relay.__new__(Relay)
+        relay.tick_limit = 10
+        relay.stop = Mock()
+        relay.stop.is_set.side_effect = [False, False, True]
+        relay.buffer = bytearray()
+        relay.client_buffer = bytearray()
+        relay.observed = dict(cap_ack=True, last_snapshot=10, winner=None, cap_events=False)
+        client_socket, server_socket = Mock(), Mock()
+        client_socket.recv.return_value = b""
+        with patch("release_wire.select.select", side_effect=[([client_socket], [], []), ([], [], [])]) as select:
+            relay.pump(client_socket, server_socket)
+        self.assertEqual(select.call_count, 2)
+        self.assertEqual(select.call_args.args[0], [server_socket])
+        server_socket.shutdown.assert_not_called()
+
     def test_fragmented_welcome_and_matchover_are_observed(self):
         relay = Relay.__new__(Relay)
         relay.tick_limit = 10
@@ -389,6 +510,9 @@ class WireTests(unittest.TestCase):
 
 
 class RegistryTests(unittest.TestCase):
+    def test_neural_prepare_uses_weights_from_immutable_tag_archive(self):
+        self.prepare_uses_archived_weights("neural")
+
     def registry_path(self):
         release = dict(tag="v0.0.1", commit="2cd104c8b8f0c5d1bed9988dfad4ddf4defd23f6",
                        policy="teacher", simulator_commit=SIMULATOR, map=1)

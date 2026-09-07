@@ -25,7 +25,7 @@ use crate::{
 };
 
 /// Version of the fixed policy-model parameter schema.
-pub const MODEL_SCHEMA_VERSION: u32 = 8;
+pub const MODEL_SCHEMA_VERSION: u32 = 11;
 /// Maximum frame count accepted by one public batch call.
 pub const MODEL_MAX_BATCH: usize = 8_192;
 /// Frame count evaluated by one bounded host inference tensor graph.
@@ -76,10 +76,13 @@ static NEXT_OPTIMIZER_LINEAGE: AtomicU64 = AtomicU64::new(1);
 
 /// Canonical model shapes, parameter order, and linked action/feature semantics.
 pub const MODEL_SCHEMA_DESCRIPTOR: &str = concat!(
-    "bota-drysua-model/v8;",
+    "bota-drysua-model/v11;",
     "action_schema_version=3;action_schema_hash=1755359086494840931;",
-    "feature_schema_version=8;feature_schema_hash=10322490384647633864;",
+    "feature_schema_version=10;feature_schema_hash=15519817897416174399;",
     "dtype=f32;device=cpu_actor,cpu_cuda_or_metal_learner,one_learner_per_device;architecture=deepsets;activations=relu_after_every_encoder_and_trunk_linear;",
+    "input_conditioning=host_before_tensor_after_presence_mask,feature_v9_unchanged;category_divisors=global10:5,12:3,32:16,55:12;policy_history3:16;unit5:12;ability1:2,2:8,11:5;item1:5,2:64,9:5,13:3;point10:8,12:8,16:12;semantic_ids=ability5_and_projectile6:ln1p(x)/ln(65548),item4_and_loot1:ln1p(x)/ln(65537);all_other_features_identity;",
+    "output_initialization=all_linear_outside_relu_mlps_including_value_and_pointer_queries:he_uniform_times0.01,bias_zero,no_extra_rng_draws;pointer_scaling=dot_div_sqrt_embedding_width_all_actor_batch_and_training_paths;",
+    "numeric_semantics=semantic_id_signed_ln1p_abs_extension_preserves_zero,bc_and_ppo_masked_cross_entropy_center_legal_logits_by_detached_row_max_before_logsumexp_and_selected_subtraction;",
     "unit_mlp=69x64,64x128,128x128;",
     "ability_mlp=24x64,64x64;item_mlp=28x64,64x64;",
     "point_mlp=32x64,64x64;projectile_mlp=20x64,64x64;loot_mlp=16x64,64x64;",
@@ -126,8 +129,8 @@ const fn linear_parameters(input: usize, output: usize) -> usize {
 /// Exact number of F32 parameters in the version-one policy model.
 pub const MODEL_PARAMETER_COUNT: usize = 1_684_724;
 
-const _: () = assert!(FEATURE_SCHEMA_VERSION == 8);
-const _: () = assert!(FEATURE_SCHEMA_HASH == 10_322_490_384_647_633_864);
+const _: () = assert!(FEATURE_SCHEMA_VERSION == 10);
+const _: () = assert!(FEATURE_SCHEMA_HASH == 15_519_817_897_416_174_399);
 const _: () = assert!(crate::ACTION_SCHEMA_VERSION == 3);
 const _: () = assert!(crate::ACTION_SCHEMA_HASH == 1_755_359_086_494_840_931);
 const _: () = assert!(TRUNK_INPUT == 2_568);
@@ -974,7 +977,19 @@ impl Linear {
         generator: &mut Initializer,
         device: &Device,
     ) -> Result<Self, ModelError> {
-        let scale = (6.0f32 / input as f32).sqrt();
+        Self::fresh_with_gain(input, output, generator, device, 0.01)
+    }
+
+    fn fresh_with_gain(
+        input: usize,
+        output: usize,
+        generator: &mut Initializer,
+        device: &Device,
+        gain: f32,
+    ) -> Result<Self, ModelError> {
+        assert!(input > 0);
+        assert!(output > 0);
+        let scale = (6.0f32 / input as f32).sqrt() * gain;
         let values = (0..input * output)
             .map(|_| generator.symmetric() * scale)
             .collect::<Vec<_>>();
@@ -1018,7 +1033,9 @@ impl Mlp {
     ) -> Result<Self, ModelError> {
         let mut layers = Vec::with_capacity(shapes.len());
         for &(input, output) in shapes {
-            layers.push(Linear::fresh(input, output, generator, device)?);
+            layers.push(Linear::fresh_with_gain(
+                input, output, generator, device, 1.0,
+            )?);
         }
         Ok(Self { layers })
     }
@@ -1869,8 +1886,8 @@ impl PolicyModel {
             loot: self.loot_head.forward(&contexts.unit)?,
             target_mode: self.target_mode.forward(&contexts.slot)?,
             put_mode: self.put_mode.forward(&contexts.slot)?,
-            entity_pointer: state.current_units.broadcast_mul(&entity_query)?.sum(2)?,
-            point_pointer: state.points.broadcast_mul(&point_query)?.sum(2)?,
+            entity_pointer: scaled_pointer_dot(&state.current_units, &entity_query)?,
+            point_pointer: scaled_pointer_dot(&state.points, &point_query)?,
         })
     }
 
@@ -2365,7 +2382,7 @@ impl PolicyModel {
         head: &Linear,
     ) -> Result<Vec<Vec<f32>>, ModelError> {
         let query = head.forward(context)?.unsqueeze(1)?;
-        Ok(tokens.broadcast_mul(&query)?.sum(2)?.to_vec2()?)
+        Ok(scaled_pointer_dot(tokens, &query)?.to_vec2()?)
     }
 
     fn sampling_context(
@@ -2538,6 +2555,38 @@ impl PolicyModel {
             .into_iter()
             .map(|gradient| (gradient.name, gradient.gradient.is_some()))
             .collect())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn behavioral_loss_for_test(
+        &self,
+        examples: &[&ImitationSample],
+    ) -> Result<f64, ModelError> {
+        assert!(!examples.is_empty());
+        assert!(examples.len() <= MODEL_TRAINING_BATCH);
+        let _guard = self.read_parameter_lock()?;
+        let result = self.behavioral_microbatch_locked(examples)?;
+        assert!(result.gradients.iter().all(|value| value.is_finite()));
+        Ok(result.loss_sum / examples.len() as f64)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn activation_rms_for_test(
+        &self,
+        frames: &[FeatureFrame],
+    ) -> Result<[f32; 3], ModelError> {
+        validate_batch(frames)?;
+        let _guard = self.read_parameter_lock()?;
+        let state = self.forward_frames(frames)?;
+        let mut norms = [0.0; 3];
+        for (norm, tensor) in
+            norms
+                .iter_mut()
+                .zip([&state.current_units, &state.points, &state.trunk])
+        {
+            *norm = tensor.sqr()?.mean_all()?.sqrt()?.to_scalar()?;
+        }
+        Ok(norms)
     }
 
     #[cfg(test)]
@@ -3094,6 +3143,7 @@ fn masked_loss_from_parts(
     let active = Tensor::from_vec(active, batch, device)?;
     let negative = Tensor::full(f32::NEG_INFINITY, logits.shape(), device)?;
     let legal_logits = masks.where_cond(logits, &negative)?;
+    let legal_logits = legal_logits.broadcast_sub(&legal_logits.max_keepdim(1)?.detach())?;
     let selected = legal_logits.gather(&labels, 1)?.squeeze(1)?;
     Ok((legal_logits.log_sum_exp(1)? - selected)?.mul(&active)?)
 }
@@ -3231,14 +3281,7 @@ fn masked_head_loss<const WIDTH: usize>(
         let head = target(sample.target());
         append_tensor_target(head, name, &mut masks, &mut labels, &mut active)?;
     }
-    let device = logits.device();
-    let masks = Tensor::from_vec(masks, (examples.len(), WIDTH), device)?;
-    let labels = Tensor::from_vec(labels, (examples.len(), 1), device)?;
-    let active = Tensor::from_vec(active, examples.len(), device)?;
-    let negative = Tensor::full(f32::NEG_INFINITY, logits.shape(), device)?;
-    let legal_logits = masks.where_cond(logits, &negative)?;
-    let selected = legal_logits.gather(&labels, 1)?.squeeze(1)?;
-    Ok((legal_logits.log_sum_exp(1)? - selected)?.mul(&active)?)
+    masked_loss_from_parts(logits, examples.len(), WIDTH, masks, labels, active)
 }
 
 fn append_tensor_target<const WIDTH: usize>(
@@ -3688,15 +3731,16 @@ fn dynamic_masked_loss(
             .chain(std::iter::repeat_n(0, target.mask.len() - 1))
             .collect()
     };
-    let mask = Tensor::from_vec(mask, (1, target.mask.len()), &Device::Cpu)?;
-    let negative = Tensor::full(f32::NEG_INFINITY, logits.shape(), &Device::Cpu)?;
-    let legal = mask.where_cond(logits, &negative)?;
     let selected = if target.active { target.selected } else { 0 };
-    let index = Tensor::from_vec(vec![selected as u32], (1, 1), &Device::Cpu)?;
-    let loss = (legal.log_sum_exp(1)? - legal.gather(&index, 1)?.squeeze(1)?)?;
-    Ok(loss
-        .affine(if target.active { 1.0 } else { 0.0 }, 0.0)?
-        .sum_all()?)
+    Ok(masked_loss_from_parts(
+        logits,
+        1,
+        target.mask.len(),
+        mask,
+        vec![selected as u32],
+        vec![if target.active { 1.0 } else { 0.0 }],
+    )?
+    .sum_all()?)
 }
 
 fn collect_outputs(
@@ -4235,6 +4279,44 @@ struct TokenEncoding {
     encoded: Tensor,
 }
 
+pub(crate) fn scaled_pointer_dot(tokens: &Tensor, query: &Tensor) -> Result<Tensor, ModelError> {
+    let width = tokens.dim(2)?;
+    assert!(matches!(width, UNIT_EMBEDDING | TOKEN_EMBEDDING));
+    assert_eq!(query.dim(2)?, width);
+    Ok(tokens
+        .broadcast_mul(query)?
+        .sum(2)?
+        .affine(1.0 / (width as f64).sqrt(), 0.0)?)
+}
+
+pub(crate) fn condition_rows(
+    values: &mut [f32],
+    features: usize,
+    divisors: &[(usize, f32)],
+    semantic_id: Option<(usize, f32)>,
+) {
+    assert!(features > 0);
+    assert!(values.len().is_multiple_of(features));
+    assert!(
+        divisors
+            .iter()
+            .all(|&(index, divisor)| index < features && divisor >= 1.0)
+    );
+    if let Some((index, maximum)) = semantic_id {
+        assert!(index < features);
+        assert!(maximum >= 1.0);
+    }
+    for row in values.chunks_exact_mut(features) {
+        for &(index, divisor) in divisors {
+            row[index] /= divisor;
+        }
+        if let Some((index, maximum)) = semantic_id {
+            // Log scaling preserves useful separation of common low IDs without huge unknown-ID activations.
+            row[index] = row[index].signum() * row[index].abs().ln_1p() / maximum.ln_1p();
+        }
+    }
+}
+
 fn encode_units(model: &PolicyModel, frames: &[FeatureFrame]) -> Result<UnitEncoding, ModelError> {
     let tokens = UNIT_FEATURE_TOKENS + REMEMBERED_UNIT_FEATURE_TOKENS;
     let mut values = Vec::with_capacity(frames.len() * tokens * UNIT_FEATURES);
@@ -4245,6 +4327,12 @@ fn encode_units(model: &PolicyModel, frames: &[FeatureFrame]) -> Result<UnitEnco
         append_unit_rows(&mut values, &mut masks, &frame.units);
         append_unit_rows(&mut values, &mut masks, &frame.remembered_units);
     }
+    condition_rows(
+        &mut values,
+        UNIT_FEATURES,
+        &[(unit_feature::KIND_TOKEN, 12.0)],
+        None,
+    );
     let rows = Tensor::from_vec(
         values,
         (frames.len() * tokens, UNIT_FEATURES),
@@ -4308,6 +4396,12 @@ fn encode_own_units(
             unit_feature::TOKEN_PRESENT,
         );
     }
+    condition_rows(
+        &mut values,
+        UNIT_FEATURES,
+        &[(unit_feature::KIND_TOKEN, 12.0)],
+        None,
+    );
     let rows = Tensor::from_vec(
         values,
         (frames.len() * OWN_UNIT_FEATURE_TOKENS, UNIT_FEATURES),
@@ -4378,6 +4472,51 @@ fn encode_tokens(
     let mut mask = Vec::with_capacity(frames.len() * tokens);
     for frame in frames {
         append_token_field(&mut values, &mut mask, frame, &field, presence);
+    }
+    match field {
+        TokenField::Ability => condition_rows(
+            &mut values,
+            features,
+            &[
+                (ability_feature::BODY_TOKEN, 2.0),
+                (ability_feature::SEMANTIC_SLOT_TOKEN, 8.0),
+                (ability_feature::AIM_TOKEN, 5.0),
+            ],
+            Some((ability_feature::ID_TOKEN, 65_547.0)),
+        ),
+        TokenField::Item => condition_rows(
+            &mut values,
+            features,
+            &[
+                (item_feature::LOCATION_TOKEN, 5.0),
+                (item_feature::SLOT_TOKEN, 64.0),
+                (item_feature::AIM_TOKEN, 5.0),
+                (item_feature::ATTRIBUTE_TOKEN, 3.0),
+            ],
+            Some((item_feature::ITEM_TOKEN, 65_536.0)),
+        ),
+        TokenField::Point => condition_rows(
+            &mut values,
+            features,
+            &[
+                (point_feature::SOURCE_TOKEN, 8.0),
+                (point_feature::SOURCE_DIRECTION_TOKEN, 8.0),
+                (point_feature::SOURCE_KIND_TOKEN, 12.0),
+            ],
+            None,
+        ),
+        TokenField::Projectile => condition_rows(
+            &mut values,
+            features,
+            &[],
+            Some((projectile_feature::ABILITY_TOKEN, 65_547.0)),
+        ),
+        TokenField::Loot => condition_rows(
+            &mut values,
+            features,
+            &[],
+            Some((loot_feature::ITEM_TOKEN, 65_536.0)),
+        ),
     }
     let rows = Tensor::from_vec(values, (frames.len() * tokens, features), device)?;
     let encoded = encoder
@@ -4515,9 +4654,24 @@ fn scalar_tensor(frames: &[FeatureFrame], device: &Device) -> Result<Tensor, Mod
         + MAP_FEATURES;
     let mut values = Vec::with_capacity(frames.len() * SCALARS);
     for frame in frames {
-        values.extend(frame.global);
+        let mut global = frame.global;
+        condition_rows(
+            &mut global,
+            GLOBAL_FEATURES,
+            &[
+                (crate::global_feature::ROLE_TOKEN, 5.0),
+                (crate::global_feature::LANE_TOKEN, 3.0),
+                (crate::global_feature::ACTIVE_ORDER_KIND, 16.0),
+                (crate::global_feature::ACTIVE_TARGET_KIND_TOKEN, 12.0),
+            ],
+            None,
+        );
+        values.extend(global);
         values.extend(frame.history.iter().flatten().copied());
-        values.extend(frame.policy_history.iter().flatten().copied());
+        for mut row in frame.policy_history {
+            condition_rows(&mut row, POLICY_HISTORY_FEATURES, &[(3, 16.0)], None);
+            values.extend(row);
+        }
         values.extend(frame.map);
     }
     Ok(Tensor::from_vec(values, (frames.len(), SCALARS), device)?)
@@ -5431,9 +5585,7 @@ impl ModelDecoder<'_, '_> {
         let query = head
             .forward(&self.context(kind, Some(unit), slot)?)?
             .unsqueeze(1)?;
-        let scores = tokens
-            .broadcast_mul(&query)?
-            .sum(2)?
+        let scores = scaled_pointer_dot(tokens, &query)?
             .flatten_all()?
             .to_vec1::<f32>()?;
         finite_array(field, scores)

@@ -439,6 +439,32 @@ impl TrainingArtifact {
             .map_err(|error| CheckpointError::Model(error.to_string()))
     }
 
+    /// Initializes a new training model from the selected M10/F9/A3/P18 artifact.
+    ///
+    /// Accepts only SHA-256 b3802642b34487d66fc3f0fe526e7f8b2a84df542793ac336b58ea046b8f8b53.
+    /// Returns the source digest for new-run provenance; source bytes are never rewritten.
+    /// The caller must explicitly opt into training initialization and construct a fresh
+    /// optimizer, RNG/run progress and current-feature samples. This is not runtime
+    /// compatibility or checkpoint resume and imports no optimizer or old samples.
+    pub fn initialize_selected_m10_for_training(
+        directory: &Path,
+        seed: u64,
+        device: PolicyDevice,
+    ) -> Result<(PolicyModel, [u8; 32]), CheckpointError> {
+        validate_directory(directory)?;
+        let bytes = read_recoverable(
+            &directory.join(RUNTIME_TENSOR_FILE),
+            MAX_RUNTIME_TENSOR_BYTES,
+        )?;
+        let parameters = decode_selected_m10_training_tensor(&bytes)?;
+        let model = PolicyModel::fresh_on(seed, device)
+            .map_err(|error| CheckpointError::Model(error.to_string()))?;
+        model
+            .import_parameters(&parameters)
+            .map_err(|error| CheckpointError::Model(error.to_string()))?;
+        Ok((model, sha256(&bytes)))
+    }
+
     fn validate(&self) -> Result<(), CheckpointError> {
         validate_run_without_model(&self.run, self.config)?;
         validate_progress(&self.progress, self.trainer_updates)?;
@@ -684,13 +710,104 @@ fn decode_runtime_tensor(bytes: &[u8]) -> Result<Vec<f32>, CheckpointError> {
     let (_, metadata) = SafeTensors::read_metadata(bytes)
         .map_err(|error| CheckpointError::Backend(error.to_string()))?;
     let expected = runtime_tensor_metadata();
-    if metadata.metadata().as_ref() != Some(&expected) {
+    if metadata.metadata().as_ref() != Some(&expected)
+        && metadata.metadata().as_ref() != Some(&audited_m11_ppo19_runtime_metadata())
+        && metadata.metadata().as_ref() != Some(&audited_m11_ppo20_runtime_metadata())
+        && metadata.metadata().as_ref() != Some(&audited_m11_ppo21_runtime_metadata())
+    {
         return Err(CheckpointError::SchemaMismatch);
     }
     let tensors = SafeTensors::deserialize(bytes)
         .map_err(|error| CheckpointError::Backend(error.to_string()))?;
     validate_names(&tensors, &["model.parameters"])?;
     decode_tensor(&tensors, "model.parameters")
+}
+
+fn audited_m11_ppo19_runtime_metadata() -> HashMap<String, String> {
+    // PPO20-22 change training only; this inference tuple has identical geometry and decoding.
+    const _: () = assert!(ACTION_SCHEMA_VERSION == 3);
+    const _: () = assert!(ACTION_SCHEMA_HASH == 1_755_359_086_494_840_931);
+    const _: () = assert!(FEATURE_SCHEMA_VERSION == 10);
+    const _: () = assert!(FEATURE_SCHEMA_HASH == 15_519_817_897_416_174_399);
+    const _: () = assert!(MODEL_SCHEMA_VERSION == 11);
+    const _: () = assert!(MODEL_SCHEMA_HASH == 18_229_126_264_156_367_519);
+    const _: () = assert!(PPO_SCHEMA_VERSION == 22);
+    [
+        ("action_schema_hash", "1755359086494840931"),
+        ("feature_schema_hash", "15519817897416174399"),
+        ("model_schema_hash", "18229126264156367519"),
+        ("ppo_schema_version", "19"),
+        ("ppo_schema_hash", "3810026640568905163"),
+        ("ppo_rules_audit_version", "15"),
+    ]
+    .into_iter()
+    .map(|(key, value)| (key.to_owned(), value.to_owned()))
+    .collect()
+}
+
+fn audited_m11_ppo20_runtime_metadata() -> HashMap<String, String> {
+    // PPO21 changes collection only, not the audited M11 inference contract.
+    let mut metadata = audited_m11_ppo19_runtime_metadata();
+    metadata.insert("ppo_schema_version".to_owned(), "20".to_owned());
+    metadata.insert(
+        "ppo_schema_hash".to_owned(),
+        "8812022392730398368".to_owned(),
+    );
+    metadata.insert("ppo_rules_audit_version".to_owned(), "16".to_owned());
+    metadata
+}
+
+fn audited_m11_ppo21_runtime_metadata() -> HashMap<String, String> {
+    // PPO22 adds reward/return/collection choices but leaves M11 inference unchanged.
+    let mut metadata = audited_m11_ppo19_runtime_metadata();
+    metadata.insert("ppo_schema_version".to_owned(), "21".to_owned());
+    metadata.insert(
+        "ppo_schema_hash".to_owned(),
+        "768751058595344501".to_owned(),
+    );
+    metadata.insert("ppo_rules_audit_version".to_owned(), "17".to_owned());
+    metadata
+}
+
+fn decode_selected_m10_training_tensor(bytes: &[u8]) -> Result<Vec<f32>, CheckpointError> {
+    const _: () = assert!(ACTION_SCHEMA_VERSION == 3);
+    const _: () = assert!(ACTION_SCHEMA_HASH == 1_755_359_086_494_840_931);
+    const _: () = assert!(FEATURE_SCHEMA_VERSION == 10);
+    const _: () = assert!(FEATURE_SCHEMA_HASH == 15_519_817_897_416_174_399);
+    const _: () = assert!(MODEL_SCHEMA_VERSION == 11);
+    const _: () = assert!(MODEL_SCHEMA_HASH == 18_229_126_264_156_367_519);
+    const _: () = assert!(MODEL_PARAMETER_COUNT == 1_684_724);
+    let expected: HashMap<_, _> = [
+        ("action_schema_hash", "1755359086494840931"),
+        ("feature_schema_hash", "9669721049329356661"),
+        ("model_schema_hash", "720439888929233033"),
+        ("ppo_schema_version", "18"),
+        ("ppo_schema_hash", "6877503070358232325"),
+        ("ppo_rules_audit_version", "15"),
+    ]
+    .into_iter()
+    .map(|(key, value)| (key.to_owned(), value.to_owned()))
+    .collect();
+    let (_, metadata) = SafeTensors::read_metadata(bytes)
+        .map_err(|error| CheckpointError::Backend(error.to_string()))?;
+    if metadata.metadata().as_ref() != Some(&expected) {
+        return Err(CheckpointError::SchemaMismatch);
+    }
+    let tensors = SafeTensors::deserialize(bytes)
+        .map_err(|error| CheckpointError::Backend(error.to_string()))?;
+    validate_names(&tensors, &["model.parameters"])?;
+    let parameters = decode_tensor(&tensors, "model.parameters")?;
+    let selected = [
+        0xb3, 0x80, 0x26, 0x42, 0xb3, 0x44, 0x87, 0xd6, 0x6f, 0xc3, 0xf0, 0xfe, 0x52, 0x6e, 0x7f,
+        0x8b, 0x2a, 0x84, 0xdf, 0x54, 0x27, 0x93, 0xac, 0x33, 0x6b, 0x58, 0xea, 0x04, 0x6b, 0x8f,
+        0x8b, 0x53,
+    ];
+    if sha256(bytes) != selected {
+        return Err(CheckpointError::TensorContract(
+            "selected M10 training source SHA-256",
+        ));
+    }
+    Ok(parameters)
 }
 
 fn validate_names(tensors: &SafeTensors<'_>, expected: &[&str]) -> Result<(), CheckpointError> {

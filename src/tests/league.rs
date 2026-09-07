@@ -15,9 +15,9 @@ use crate::{
 
 #[test]
 fn stage_ten_schema_is_stable_and_names_its_safety_contracts() {
-    assert_eq!(LEAGUE_SCHEMA_VERSION, 17);
-    assert_eq!(crate::LEAGUE_RULES_AUDIT_VERSION, 15);
-    assert_eq!(LEAGUE_SCHEMA_HASH, 14_981_756_892_451_872_554);
+    assert_eq!(LEAGUE_SCHEMA_VERSION, 23);
+    assert_eq!(crate::LEAGUE_RULES_AUDIT_VERSION, 18);
+    assert_eq!(LEAGUE_SCHEMA_HASH, 4_311_622_622_826_343_409);
     assert!(LEAGUE_SCHEMA_DESCRIPTOR.contains("held_out_seed_disjoint"));
     assert!(LEAGUE_SCHEMA_DESCRIPTOR.contains("training_reward_excluded"));
     assert!(LEAGUE_SCHEMA_DESCRIPTOR.contains("timeout_rejected"));

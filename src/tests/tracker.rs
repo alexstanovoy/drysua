@@ -68,11 +68,12 @@ fn match_start_opaque_baseline_contains_the_static_tree_cell() {
 }
 
 #[test]
-fn tracker_public_hard_limits_match_stage_three_contract() {
+fn tracker_observation_limits_are_separate_from_model_token_budgets() {
     assert_eq!(MAX_SEATS, 10);
     assert_eq!(UNIT_TOKENS, 96);
-    assert_eq!(MAX_TRACKED_ENTITIES, 256);
-    assert_eq!(MAX_PROJECTILES, 32);
+    assert_eq!(MAX_TRACKED_ENTITIES, 4_096);
+    assert_eq!(MAX_PROJECTILES, 4_096);
+    assert_eq!(crate::PROJECTILE_FEATURE_TOKENS, 32);
     assert_eq!(MAX_LOOT, 16);
     assert_eq!(SHADOW_FIEND_ABILITY_SLOTS, 6);
     assert_eq!(MAX_ABILITY_SLOTS, 8);
@@ -497,7 +498,7 @@ fn tracker_evicts_the_complete_oldest_invisible_tick_cohort() {
     let mut second = world_view(2);
     second
         .units
-        .push(creep(entity(300, 1), Team::Dire, 100, 100));
+        .push(creep(entity(10_000, 1), Team::Dire, 100, 100));
     second.units.sort_by_key(|unit| unit.id);
     tracker
         .observe_snapshot(&second)
@@ -507,7 +508,12 @@ fn tracker_evicts_the_complete_oldest_invisible_tick_cohort() {
     for index in 3..=MAX_TRACKED_ENTITIES as u32 {
         assert!(tracker.entity(entity(index, 1)).is_none());
     }
-    assert!(tracker.entity(entity(300, 1)).expect("new track").visible);
+    assert!(
+        tracker
+            .entity(entity(10_000, 1))
+            .expect("new track")
+            .visible
+    );
     assert!(tracker.entity(entity(1, 1)).expect("own hero").visible);
 }
 
@@ -535,7 +541,7 @@ fn tracker_evicts_only_complete_oldest_cohorts_needed_for_the_incoming_snapshot(
     third.tick = 3;
     third
         .units
-        .extend((300..397).map(|index| creep(entity(index, 1), Team::Dire, 100, 100)));
+        .extend((10_000..10_097).map(|index| creep(entity(index, 1), Team::Dire, 100, 100)));
     third.units.sort_by_key(|unit| unit.id);
     tracker.observe_snapshot(&third).expect("evicting snapshot");
 
@@ -551,7 +557,7 @@ fn tracker_evicts_only_complete_oldest_cohorts_needed_for_the_incoming_snapshot(
     );
     assert!(
         tracker
-            .entity(entity(396, 1))
+            .entity(entity(10_096, 1))
             .expect("incoming cohort")
             .visible
     );
@@ -559,20 +565,367 @@ fn tracker_evicts_only_complete_oldest_cohorts_needed_for_the_incoming_snapshot(
 
 #[test]
 fn tracker_rejects_visible_unit_input_above_hard_safe_cap() {
-    let mut tracker = new_tracker();
-    let mut view = world_view(1);
-    for index in 3..=257 {
-        view.units
-            .push(creep(entity(index, 1), Team::Dire, 100, 100));
-    }
-    view.units.sort_by_key(|unit| unit.id);
+    let mut tracker = tracker_with_first_tick(1);
+    let mut view = crowded_map0_view(MAX_TRACKED_ENTITIES + 1, 0);
+    view.tick = 2;
+    let before = tracker.provenance();
 
     assert_observe_error(
         &mut tracker,
         &view,
-        "WorldView.units has 257 entries; limit is 256",
+        "WorldView.units has 4097 entries; limit is 4096",
     );
-    assert!(tracker.current().is_none());
+    assert_eq!(tracker.provenance(), before);
+}
+
+#[test]
+fn tracker_accepts_33_projectiles_in_a_normal_map0_snapshot_without_truncation() {
+    let mut tracker = new_tracker();
+    let view = crowded_map0_view(2, 33);
+
+    tracker
+        .observe_snapshot(&view)
+        .expect("ordinary Map0 snapshot");
+
+    assert_eq!(tracker.metadata().map, MapId(0));
+    assert_eq!(tracker.current(), Some(&view));
+}
+
+#[test]
+fn tracker_accepts_crowded_map0_counts_and_exact_observation_capacity_on_wire() {
+    for (units, projectiles) in [(520, 39), (2_048, 2_048), (4_096, 4_096)] {
+        let view = crowded_map0_view(units, projectiles);
+        let message = bota_proto::ServerMsg::Snapshot { view: view.clone() };
+        let bytes = bota_proto::encode_frame_to_vec(&message).expect("bounded wire frame");
+        assert!(bytes.len() <= bota_proto::LEN_PREFIX + bota_proto::MAX_PAYLOAD_LEN);
+        eprintln!(
+            "representative units={units} projectiles={projectiles} frame_bytes={}",
+            bytes.len()
+        );
+        let mut reader = bota_proto::FrameReader::new();
+        reader.push(&bytes);
+        assert_eq!(reader.next_message().expect("decode"), Some(message));
+        let mut tracker = new_tracker();
+
+        tracker
+            .observe_snapshot(&view)
+            .expect("crowded Map0 snapshot");
+
+        assert_eq!(tracker.current(), Some(&view));
+        assert_eq!(tracker.entities().len(), units);
+    }
+}
+
+#[test]
+fn full_capacity_mixed_catalog_observation_fits_wire_without_truncation() {
+    let mut view = crowded_map0_view(4_096, 4_096);
+    let kinds = [
+        UnitKind::CreepMelee,
+        UnitKind::CreepRanged,
+        UnitKind::CreepSiege,
+        UnitKind::CreepFlagbearer,
+        UnitKind::CreepNeutral,
+        UnitKind::Tower,
+        UnitKind::Ancient,
+        UnitKind::Barracks,
+        UnitKind::Fountain,
+        UnitKind::Ward,
+    ];
+    for (index, unit) in view.units.iter_mut().enumerate().skip(2) {
+        unit.kind = kinds[index % kinds.len()];
+        if index.is_multiple_of(97) {
+            unit.kind = UnitKind::Hero;
+            unit.hero = Some(SHADOW_FIEND);
+            unit.abilities = vec![ability(); 6];
+            unit.items = vec![Some(item()); 9];
+            unit.effects = vec![effect(); 4];
+        }
+    }
+    let message = bota_proto::ServerMsg::Snapshot { view: view.clone() };
+
+    let bytes = bota_proto::encode_frame_to_vec(&message).expect("representative catalog frame");
+    new_tracker()
+        .observe_snapshot(&view)
+        .expect("all records accepted");
+
+    assert!(bytes.len() <= bota_proto::MAX_PAYLOAD_LEN + bota_proto::LEN_PREFIX);
+    let decoded: bota_proto::ServerMsg =
+        bota_proto::decode_payload(&bytes[bota_proto::LEN_PREFIX..]).expect("wire roundtrip");
+    assert_eq!(decoded, message);
+    eprintln!(
+        "mixed_catalog units=4096 projectiles=4096 frame_bytes={}",
+        bytes.len()
+    );
+}
+
+#[test]
+fn tracker_rejects_projectile_capacity_plus_one_before_any_state_mutation() {
+    let mut tracker = tracker_with_first_tick(1);
+    let mut view = crowded_map0_view(2, MAX_PROJECTILES + 1);
+    view.tick = 2;
+    let before = tracker.provenance();
+
+    assert_observe_error(
+        &mut tracker,
+        &view,
+        "WorldView.projectiles has 4097 entries; limit is 4096",
+    );
+
+    assert_eq!(tracker.provenance(), before);
+}
+
+#[test]
+fn tracker_validates_projectile_geometry_beyond_the_model_token_prefix() {
+    let mut tracker = tracker_with_first_tick(1);
+    let mut view = crowded_map0_view(2, 4_096);
+    view.tick = 2;
+    view.projectiles[4_095].pos = raw_position(-1, 0);
+    let before = tracker.provenance();
+
+    assert_observe_error(
+        &mut tracker,
+        &view,
+        "WorldView.projectiles[4095] position raw (-1, 0) is outside 0..=33554431",
+    );
+
+    assert_eq!(tracker.provenance(), before);
+}
+
+#[test]
+fn tracker_rejects_duplicate_projectiles_beyond_the_model_token_prefix() {
+    let mut tracker = tracker_with_first_tick(1);
+    let mut view = crowded_map0_view(2, 4_096);
+    view.tick = 2;
+    view.projectiles[4_095].id = view.projectiles[0].id;
+    let before = tracker.provenance();
+
+    assert_observe_error(
+        &mut tracker,
+        &view,
+        "snapshot projectiles repeats EntityId(1000, 1)",
+    );
+
+    assert_eq!(tracker.provenance(), before);
+}
+
+#[test]
+fn protocol_accepts_exact_byte_cap_and_rejects_next_byte_from_header_alone() {
+    let payload = vec![0u8; bota_proto::MAX_PAYLOAD_LEN - 4];
+    let bytes = bota_proto::encode_frame_to_vec(&payload).expect("exact byte cap");
+    assert_eq!(
+        bytes.len(),
+        bota_proto::LEN_PREFIX + bota_proto::MAX_PAYLOAD_LEN
+    );
+    let mut reader = bota_proto::FrameReader::new();
+    reader.push(&bytes);
+    assert_eq!(reader.next_message().expect("decode at cap"), Some(payload));
+    let excessive = bota_proto::MAX_PAYLOAD_LEN + 1;
+    reader.push(&(excessive as u32).to_le_bytes());
+
+    let error = reader
+        .next_message::<WorldView>()
+        .expect_err("oversize header");
+
+    assert_eq!(error, bota_proto::CodecError::TooLarge { len: excessive });
+    assert_eq!(
+        error.to_string(),
+        "frame payload of 4194305 bytes exceeds 4194304"
+    );
+    assert_eq!(reader.buffered(), bota_proto::LEN_PREFIX);
+}
+
+#[test]
+fn protocol_projectile_record_sizes_are_seven_to_twenty_eight_bytes_not_a_count_cap() {
+    let smallest = ProjectileView {
+        id: entity(0, 0),
+        pos: Vec2::ZERO,
+        facing: Angle { brads: 0 },
+        team: Team::Radiant,
+        ability: None,
+    };
+    let largest = ProjectileView {
+        id: entity(u32::MAX, u32::MAX),
+        pos: raw_position(i32::MAX, i32::MIN),
+        facing: Angle { brads: u16::MAX },
+        team: Team::Dire,
+        ability: Some(AbilityId(u16::MAX)),
+    };
+
+    let minimum = bota_proto::encode_frame_to_vec(&smallest).expect("minimum postcard record");
+    let maximum = bota_proto::encode_frame_to_vec(&largest).expect("maximum postcard record");
+
+    assert_eq!(minimum.len() - bota_proto::LEN_PREFIX, 7);
+    assert_eq!(maximum.len() - bota_proto::LEN_PREFIX, 28);
+}
+
+fn crowded_map0_view(units: usize, projectiles: usize) -> WorldView {
+    assert!((2..=4_097).contains(&units));
+    assert!(projectiles <= 4_097);
+    let mut view = world_view(1);
+    view.units
+        .extend((3..=units as u32).map(|index| creep(entity(index, 1), Team::Dire, 100, 100)));
+    view.projectiles = (0..projectiles as u32)
+        .map(|index| {
+            let mut shot = projectile();
+            shot.id = entity(1_000 + index, 1);
+            shot
+        })
+        .collect();
+    view
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+#[ignore = "requires DRYSUA_MAP0_REPLAY pointing to the frozen seed-9470002 replay; release only"]
+fn frozen_map0_replay_accepts_every_seat_frame_including_first_33_projectiles() {
+    use bota_proto::{ReplayRecord, ServerMsg};
+    let file = std::fs::File::open(
+        std::env::var_os("DRYSUA_MAP0_REPLAY").expect("DRYSUA_MAP0_REPLAY is required"),
+    )
+    .expect("frozen replay");
+    let mut remaining = file.metadata().expect("replay length").len();
+    assert_eq!(remaining, 533_134_855);
+    let mut reader = std::io::BufReader::new(file);
+    let (mut arena, start) = crate::Arena::new(crate::ArenaConfig {
+        seats: 2,
+        map: MapId(0),
+        seed: 9_470_002,
+    })
+    .expect("unmodified Map0 simulation");
+    let ServerMsg::MatchStart { info } = &start.messages[0][0] else {
+        panic!("MatchStart must precede seat observations");
+    };
+    assert_eq!(
+        read_frozen_record(&mut reader, &mut remaining),
+        ReplayRecord::Msg(ServerMsg::MatchStart { info: info.clone() })
+    );
+    let mut trackers = std::array::from_fn(|slot| {
+        StateTracker::new(SlotId(slot as u8), info).expect("seat tracker")
+    });
+    let mut counts = [0; 2];
+    let mut first_33 = [None; 2];
+    let mut peaks = [(0, 0); 2];
+    observe_replayed_seats(
+        &mut trackers,
+        start.messages,
+        &mut counts,
+        &mut first_33,
+        &mut peaks,
+    );
+    for _ in 0..48_626 * 3 {
+        if remaining == 0 {
+            break;
+        }
+        let ReplayRecord::Orders { tick, orders } = read_frozen_record(&mut reader, &mut remaining)
+        else {
+            continue;
+        };
+        assert!(orders.len() <= 2);
+        if tick == 1 {
+            assert!(orders.is_empty());
+            continue;
+        }
+        assert_eq!(tick, arena.tick() + 1);
+        let requests = replay_requests(tick, orders);
+        let step = arena.step(&requests).expect("recorded orders");
+        observe_replayed_seats(
+            &mut trackers,
+            step.messages,
+            &mut counts,
+            &mut first_33,
+            &mut peaks,
+        );
+    }
+    assert_eq!(remaining, 0);
+    assert_eq!(counts, [48_626; 2]);
+    assert_eq!(first_33, [Some(48_626), Some(47_725)]);
+    eprintln!(
+        "seed=9470002 snapshots={counts:?} first_33={first_33:?} unit_projectile_peaks={peaks:?}"
+    );
+}
+
+#[cfg(feature = "builtin")]
+fn replay_requests(tick: u32, orders: Vec<bota_proto::SlotOrder>) -> [Option<crate::Request>; 2] {
+    assert!((2..=48_626).contains(&tick));
+    assert!(orders.len() <= 2);
+    let mut requests = [None; 2];
+    for order in orders {
+        let slot = usize::from(order.slot.0);
+        assert!(slot < requests.len());
+        assert!(requests[slot].is_none());
+        requests[slot] = Some(crate::Request {
+            seq: tick,
+            unit: order.unit,
+            order: order.order,
+        });
+    }
+    requests
+}
+
+#[cfg(feature = "builtin")]
+fn read_frozen_record(
+    reader: &mut impl std::io::Read,
+    remaining: &mut u64,
+) -> bota_proto::ReplayRecord {
+    assert!(*remaining >= bota_proto::LEN_PREFIX as u64);
+    let mut header = [0; bota_proto::LEN_PREFIX];
+    reader.read_exact(&mut header).expect("replay header");
+    let length = u32::from_le_bytes(header) as usize;
+    assert!((1..=bota_proto::MAX_PAYLOAD_LEN).contains(&length));
+    assert!(length as u64 <= *remaining - bota_proto::LEN_PREFIX as u64);
+    let mut payload = vec![0; length];
+    reader.read_exact(&mut payload).expect("replay payload");
+    *remaining -= (bota_proto::LEN_PREFIX + length) as u64;
+    bota_proto::decode_payload(&payload).expect("replay record")
+}
+
+#[cfg(feature = "builtin")]
+fn observe_replayed_seats(
+    trackers: &mut [StateTracker; 2],
+    messages: Vec<Vec<bota_proto::ServerMsg>>,
+    counts: &mut [u32; 2],
+    first_33: &mut [Option<u32>; 2],
+    peaks: &mut [(usize, usize); 2],
+) {
+    assert_eq!(messages.len(), 2);
+    for (slot, stream) in messages.into_iter().enumerate() {
+        assert!(stream.len() <= 4);
+        for message in stream {
+            match message {
+                bota_proto::ServerMsg::Snapshot { view } => {
+                    assert_eq!(view.viewer, Some(trackers[slot].team()));
+                    assert_eq!(view.tick, counts[slot] + 1);
+                    trackers[slot]
+                        .observe_snapshot(&view)
+                        .unwrap_or_else(|error| {
+                            panic!("seed=9470002 slot={slot} tick={}: {error}", view.tick);
+                        });
+                    counts[slot] += 1;
+                    peaks[slot].0 = peaks[slot].0.max(view.units.len());
+                    peaks[slot].1 = peaks[slot].1.max(view.projectiles.len());
+                    if view.projectiles.len() > 32 && first_33[slot].is_none() {
+                        assert_eq!(view.projectiles.len(), 33);
+                        first_33[slot] = Some(view.tick);
+                        assert!(
+                            super::feature::encode(
+                                &trackers[slot],
+                                &crate::LocalPolicyState::new(0)
+                            )
+                            .is_finite()
+                        );
+                    }
+                }
+                bota_proto::ServerMsg::Events { tick, events } => {
+                    assert_eq!(tick, counts[slot]);
+                    trackers[slot]
+                        .observe_events(tick, &events)
+                        .expect("seat events");
+                }
+                bota_proto::ServerMsg::MatchStart { .. } => {}
+                other => panic!("unexpected replayed seat message: {other:?}"),
+            }
+        }
+    }
 }
 
 #[test]
@@ -921,11 +1274,7 @@ fn tracker_marks_destroyed_structure_count_missing_without_pregame_baseline() {
 }
 
 #[test]
-fn tracker_rejects_snapshot_projectile_loot_tree_and_nested_vector_bounds() {
-    assert_snapshot_limit(
-        |view| view.projectiles = vec![projectile(); MAX_PROJECTILES + 1],
-        "WorldView.projectiles has 33 entries; limit is 32",
-    );
+fn tracker_rejects_snapshot_loot_tree_and_nested_vector_bounds() {
     assert_snapshot_limit(
         |view| view.loot = vec![loot(); MAX_LOOT + 1],
         "WorldView.loot has 17 entries; limit is 16",

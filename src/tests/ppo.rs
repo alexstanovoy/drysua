@@ -140,9 +140,9 @@ fn rollout_compacts_sparse_tokens_and_bit_packs_behavioral_masks_losslessly() {
 
 #[test]
 fn ppo_schema_and_rules_audit_are_stable() {
-    assert_eq!(PPO_SCHEMA_VERSION, 16);
-    assert_eq!(PPO_RULES_AUDIT_VERSION, 15);
-    assert_eq!(PPO_SCHEMA_HASH, 11_450_737_853_127_354_910);
+    assert_eq!(PPO_SCHEMA_VERSION, 22);
+    assert_eq!(PPO_RULES_AUDIT_VERSION, 18);
+    assert_eq!(PPO_SCHEMA_HASH, 7_033_554_372_932_156_753);
     assert_eq!(PpoConfig::default().learning_rate, 3.0e-6);
 }
 
@@ -185,7 +185,7 @@ fn ppo_config_rejects_every_unbounded_dimension() {
 #[test]
 fn ppo_config_accepts_the_maximum_bounded_production_rollout() {
     let config = PpoConfig {
-        environments: 16,
+        environments: crate::PPO_MAX_SAMPLES / PPO_MAX_ROLLOUT_DECISIONS,
         rollout_decisions: PPO_MAX_ROLLOUT_DECISIONS,
         minibatch: 8_192,
         ..PpoConfig::default()
@@ -197,7 +197,7 @@ fn ppo_config_accepts_the_maximum_bounded_production_rollout() {
 #[test]
 fn ppo_config_reports_a_sample_product_above_the_global_bound() {
     let error = PpoConfig {
-        environments: 17,
+        environments: crate::PPO_MAX_SAMPLES / PPO_MAX_ROLLOUT_DECISIONS + 1,
         rollout_decisions: PPO_MAX_ROLLOUT_DECISIONS,
         minibatch: 8_192,
         ..PpoConfig::default()
@@ -1118,14 +1118,51 @@ fn wall_checkpoint_schedule_uses_fixed_monotonic_deadlines_without_drift() {
 #[cfg(feature = "builtin")]
 #[test]
 fn production_training_resume_matches_uninterrupted_parameters_adam_and_rng() {
+    assert_production_resume_matches_uninterrupted(None);
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn long_horizon_map_zero_resume_matches_uninterrupted_parameters_adam_and_rng() {
+    let settings = crate::cli::training_settings_for_test(&[
+        "--map",
+        "0",
+        "--environments",
+        "2",
+        "--rollout",
+        "2",
+        "--epochs",
+        "1",
+        "--minibatch",
+        "2",
+        "--learning-rate",
+        "3e-5",
+        "--gamma-per-tick",
+        "0.9999722",
+        "--gae-lambda",
+        "0.995",
+        "--entropy-coefficient",
+        "0.001",
+    ])
+    .expect("long horizon config");
+    assert_production_resume_matches_uninterrupted(Some(settings));
+}
+
+#[cfg(feature = "builtin")]
+fn assert_production_resume_matches_uninterrupted(overrides: Option<crate::TrainingJobConfig>) {
     let uninterrupted_directory = training_test_directory("production-uninterrupted");
     let resumed_directory = training_test_directory("production-resumed");
     let mut settings = crate::TrainingJobConfig {
+        terminal_only: false,
+        complete_episodes: false,
         updates: 2,
-        environments: 2,
-        rollout_decisions: 2,
-        epochs: 1,
-        minibatch: 2,
+        ppo: crate::PpoConfig {
+            environments: 2,
+            rollout_decisions: 2,
+            epochs: 1,
+            minibatch: 2,
+            ..crate::PpoConfig::default()
+        },
         checkpoint_cadence: crate::TrainingCheckpointCadence::Updates(1),
         resume_provenance: crate::ResumeProvenance::Strict,
         seed: 23_071,
@@ -1133,7 +1170,10 @@ fn production_training_resume_matches_uninterrupted_parameters_adam_and_rng() {
         git_commit: "test-drysua-commit".to_owned(),
         simulator_commit: "test-bota-commit".to_owned(),
     };
-
+    if let Some(overrides) = overrides {
+        settings.ppo = overrides.ppo;
+        settings.map = overrides.map;
+    }
     crate::run_training_job_on(
         settings.clone(),
         crate::PolicyDevice::Cpu,
@@ -1219,11 +1259,16 @@ fn assert_production_artifact_training_state_equal(
 fn training_job_checkpoints_and_resumes_from_the_next_update() {
     let directory = training_test_directory("resume");
     let mut settings = crate::TrainingJobConfig {
+        terminal_only: false,
+        complete_episodes: false,
         updates: 1,
-        environments: 2,
-        rollout_decisions: 2,
-        epochs: 1,
-        minibatch: 2,
+        ppo: crate::PpoConfig {
+            environments: 2,
+            rollout_decisions: 2,
+            epochs: 1,
+            minibatch: 2,
+            ..crate::PpoConfig::default()
+        },
         checkpoint_cadence: crate::TrainingCheckpointCadence::Updates(1),
         resume_provenance: crate::ResumeProvenance::Strict,
         seed: 23_071,
@@ -1333,11 +1378,16 @@ fn fresh_training_loads_the_requested_runtime_weights_before_the_first_update() 
         .expect("initial snapshot")
         .fingerprint();
     let settings = crate::TrainingJobConfig {
+        terminal_only: false,
+        complete_episodes: false,
         updates: 1,
-        environments: 2,
-        rollout_decisions: 2,
-        epochs: 1,
-        minibatch: 2,
+        ppo: crate::PpoConfig {
+            environments: 2,
+            rollout_decisions: 2,
+            epochs: 1,
+            minibatch: 2,
+            ..crate::PpoConfig::default()
+        },
         checkpoint_cadence: crate::TrainingCheckpointCadence::Updates(1),
         resume_provenance: crate::ResumeProvenance::Strict,
         seed: 23_075,
@@ -1368,11 +1418,16 @@ fn production_training_rejects_an_unpaired_environment_count() {
     let directory = training_test_directory("odd-environments");
     let error = crate::run_training_job_on(
         crate::TrainingJobConfig {
+            terminal_only: false,
+            complete_episodes: false,
             updates: 1,
-            environments: 1,
-            rollout_decisions: 2,
-            epochs: 1,
-            minibatch: 2,
+            ppo: crate::PpoConfig {
+                environments: 1,
+                rollout_decisions: 2,
+                epochs: 1,
+                minibatch: 2,
+                ..crate::PpoConfig::default()
+            },
             checkpoint_cadence: crate::TrainingCheckpointCadence::Updates(1),
             resume_provenance: crate::ResumeProvenance::Strict,
             seed: 23_079,
@@ -1399,11 +1454,16 @@ fn production_training_rejects_an_unpaired_environment_count() {
 fn resumed_training_rejects_an_initial_weights_directory() {
     let directory = training_test_directory("resume-with-initial");
     let settings = crate::TrainingJobConfig {
+        terminal_only: false,
+        complete_episodes: false,
         updates: 1,
-        environments: 1,
-        rollout_decisions: 2,
-        epochs: 1,
-        minibatch: 2,
+        ppo: crate::PpoConfig {
+            environments: 1,
+            rollout_decisions: 2,
+            epochs: 1,
+            minibatch: 2,
+            ..crate::PpoConfig::default()
+        },
         checkpoint_cadence: crate::TrainingCheckpointCadence::Updates(1),
         resume_provenance: crate::ResumeProvenance::Strict,
         seed: 23_076,
@@ -1442,11 +1502,16 @@ fn training_job_rejects_a_checkpoint_directory_locked_by_another_writer() {
     lock.lock().expect("hold training lock");
     let error = crate::run_training_job_on(
         crate::TrainingJobConfig {
+            terminal_only: false,
+            complete_episodes: false,
             updates: 1,
-            environments: 1,
-            rollout_decisions: 2,
-            epochs: 1,
-            minibatch: 2,
+            ppo: crate::PpoConfig {
+                environments: 1,
+                rollout_decisions: 2,
+                epochs: 1,
+                minibatch: 2,
+                ..crate::PpoConfig::default()
+            },
             checkpoint_cadence: crate::TrainingCheckpointCadence::Updates(1),
             resume_provenance: crate::ResumeProvenance::Strict,
             seed: 23_072,
@@ -1826,12 +1891,17 @@ fn boundary_pretraining_agreement() -> crate::OfflineEvaluation {
 
 #[cfg(feature = "builtin")]
 fn stop_policy_for_warmup() -> PolicyModel {
+    constant_policy_for_warmup(ActionKind::Stop)
+}
+
+#[cfg(feature = "builtin")]
+fn constant_policy_for_warmup(kind: ActionKind) -> PolicyModel {
     let model = PolicyModel::fresh(23_077).expect("warmup model");
     let mut parameters = vec![0.0; crate::MODEL_PARAMETER_COUNT];
     let mut offset = 0usize;
     for (name, shape) in model.parameter_schema().expect("parameter schema") {
         if name == "kind.bias" {
-            parameters[offset + ActionKind::Stop.index()] = 10.0;
+            parameters[offset + kind.index()] = 10.0;
             model
                 .import_parameters(&parameters)
                 .expect("stop policy parameters");
@@ -1844,15 +1914,36 @@ fn stop_policy_for_warmup() -> PolicyModel {
 
 #[cfg(feature = "builtin")]
 #[test]
+fn neural_warmup_stop_and_continue_match_raw_ledger_while_teacher_opponent_buys() {
+    for kind in [ActionKind::Stop, ActionKind::Continue] {
+        let model = constant_policy_for_warmup(kind);
+        crate::ppo_arena::assert_pure_warmup_ledger_for_test(&model, kind);
+    }
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn frozen_neural_opponent_keeps_its_policy_identity_and_never_uses_teacher_orders() {
+    let model = stop_policy_for_warmup();
+    crate::ppo_arena::assert_frozen_neural_opponent_for_test(&model);
+}
+
+#[cfg(feature = "builtin")]
+#[test]
 fn training_job_rejects_targets_that_cannot_fit_shuffle_rng_counters() {
     let directory = training_test_directory("counter-bound");
     let error = crate::run_training_job_on(
         crate::TrainingJobConfig {
+            terminal_only: false,
+            complete_episodes: false,
             updates: 1_000_000,
-            environments: 16,
-            rollout_decisions: 64,
-            epochs: 1,
-            minibatch: 32,
+            ppo: crate::PpoConfig {
+                environments: 16,
+                rollout_decisions: 64,
+                epochs: 1,
+                minibatch: 32,
+                ..crate::PpoConfig::default()
+            },
             checkpoint_cadence: crate::TrainingCheckpointCadence::Updates(5),
             resume_provenance: crate::ResumeProvenance::Strict,
             seed: 23_073,
@@ -1887,4 +1978,274 @@ fn training_test_directory(name: &str) -> std::path::PathBuf {
     }
     std::fs::create_dir(&directory).expect("create checkpoint directory");
     directory
+}
+#[cfg(feature = "builtin")]
+#[test]
+fn long_horizon_cli_checkpoint_restores_exact_config_and_rejects_changed_hyperparameters() {
+    let directory = training_test_directory("long-horizon-cli");
+    let settings = crate::cli::training_settings_for_test(&[
+        "--map",
+        "0",
+        "--environments",
+        "2",
+        "--rollout",
+        "2",
+        "--epochs",
+        "1",
+        "--minibatch",
+        "2",
+        "--learning-rate",
+        "3e-5",
+        "--gamma-per-tick",
+        "0.9999722",
+        "--gae-lambda",
+        "0.995",
+        "--entropy-coefficient",
+        "0.001",
+    ])
+    .expect("CLI training settings");
+    crate::run_training_job_on(
+        settings.clone(),
+        crate::PolicyDevice::Cpu,
+        &directory,
+        false,
+        |_| {},
+    )
+    .expect("first update");
+    let artifact = crate::TrainingArtifact::load(&directory).expect("checkpoint");
+    let model = PolicyModel::fresh(23_080).expect("restore model");
+    let restored = artifact
+        .restore(&model, artifact.run())
+        .expect("restore trainer");
+    assert_eq!(restored.trainer().config(), settings.ppo);
+    crate::run_training_job_on(
+        settings.clone(),
+        crate::PolicyDevice::Cpu,
+        &directory,
+        true,
+        |_| {},
+    )
+    .expect("same exact config resumes");
+    for field in 0..4 {
+        let mut changed = settings.clone();
+        match field {
+            0 => changed.ppo.learning_rate = 3e-6,
+            1 => changed.ppo.gamma_tick = 0.9966555,
+            2 => changed.ppo.gae_lambda = 0.98,
+            3 => changed.ppo.entropy_coefficient = 0.01,
+            _ => unreachable!(),
+        }
+        let error =
+            crate::run_training_job_on(changed, crate::PolicyDevice::Cpu, &directory, true, |_| {})
+                .expect_err("changed hyperparameter must reject resume");
+        assert_eq!(
+            error.to_string(),
+            "invalid PPO config field: training checkpoint PPO config"
+        );
+    }
+    std::fs::remove_dir_all(directory).expect("remove checkpoint");
+}
+#[cfg(feature = "builtin")]
+#[test]
+fn pure_map_zero_evaluation_uses_neural_stop_actions_on_both_sides_without_teacher_override() {
+    let directory = training_test_directory("pure-map-zero-evaluation");
+    let model = stop_policy_for_warmup();
+    crate::TrainingArtifact::save_runtime_weights(&model, &directory).expect("stop weights");
+    let report = crate::ppo_arena::evaluate_neural_map_zero_checkpoint(
+        crate::CheckpointEvaluationConfig {
+            pairs: 1,
+            decisions: 2,
+            seed: 23_082,
+        },
+        &directory,
+    )
+    .expect("pure neural evaluation");
+    assert_eq!(report.games.len(), 4);
+    for game in report.games {
+        assert_eq!(game.map, bota_proto::MapId(0));
+        assert_eq!(
+            game.action_counts[crate::ActionKind::Stop.index()],
+            game.decisions
+        );
+        assert_eq!(game.action_counts.iter().sum::<u32>(), game.decisions);
+    }
+    std::fs::remove_dir_all(directory).expect("remove weights");
+}
+#[cfg(feature = "builtin")]
+#[test]
+fn production_window_resets_lose_delayed_terminal_credit_while_episode_collection_preserves_it() {
+    crate::ppo_arena::episode::assert_reset_loses_terminal_credit_for_test();
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn episode_intervals_discount_rewards_flush_terminal_and_partial_timeout_without_false_done() {
+    crate::ppo_arena::episode::assert_discounted_intervals_for_test();
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn complete_episode_cli_binds_teacher_only_stride_cap_and_rejects_short_capacity() {
+    let settings = crate::cli::training_settings_for_test(&[
+        "--complete-episodes",
+        "--map",
+        "0",
+        "--environments",
+        "2",
+        "--rollout",
+        "8192",
+    ])
+    .expect("complete episode settings");
+    assert!(settings.complete_episodes);
+    assert_eq!(settings.ppo.rollout_decisions, 8192);
+    crate::ppo_arena::episode::validate(&settings).expect("bounded episode config");
+    let mut short = settings.clone();
+    short.ppo.rollout_decisions = 2048;
+    assert_eq!(
+        crate::ppo_arena::episode::validate(&short)
+            .expect_err("insufficient retained capacity")
+            .to_string(),
+        "invalid PPO config field: complete episode retained capacity"
+    );
+    short = settings;
+    short.map = bota_proto::MapId(1);
+    assert_eq!(
+        crate::ppo_arena::episode::validate(&short)
+            .expect_err("wrong map")
+            .to_string(),
+        "invalid PPO config field: complete episodes require Map0, two/four/six environments, and three-tick actions"
+    );
+}
+#[cfg(feature = "builtin")]
+#[test]
+fn episode_sampling_replays_rng_and_retains_original_logprob_without_action_overrides() {
+    crate::ppo_arena::episode::assert_rng_and_sample_provenance_for_test(&stop_policy_for_warmup());
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn episode_checkpoint_restores_exact_rng_and_rejects_window_collection_scope() {
+    let directory = training_test_directory("episode-scope");
+    let settings = crate::cli::training_settings_for_test(&[
+        "--complete-episodes",
+        "--map",
+        "0",
+        "--environments",
+        "2",
+        "--rollout",
+        "8192",
+    ])
+    .expect("episode settings");
+    crate::ppo_arena::episode::assert_checkpoint_scope_for_test(settings, &directory);
+    std::fs::remove_dir_all(directory).expect("cleanup");
+}
+#[test]
+fn exhausted_shaping_budget_can_make_a_discounted_losing_episode_positive() {
+    let mut tracker = RewardTracker::default();
+    let mut summary = crate::GlobalSummary::default();
+    tracker.observe(summary, 1.0, None).expect("baseline");
+    summary.allied.xp = 6000;
+    let gain = tracker
+        .observe(
+            summary,
+            tick_discount(0.9999722, 3).expect("discount"),
+            None,
+        )
+        .expect("early XP");
+    let loss = tracker
+        .observe(
+            summary,
+            tick_discount(0.9999722, 60000).expect("discount"),
+            Some(PpoTerminalOutcome::Loss),
+        )
+        .expect("loss");
+    assert_eq!(loss.experience, 0.0);
+    assert_eq!(loss.terminal, -1.0);
+    assert!(gain.total + loss.total < 0.0);
+    assert!(gain.total + tick_discount(0.9999722, 60000).expect("discount") * loss.total > 0.0);
+}
+
+#[test]
+fn terminal_only_reward_has_no_shaping_and_never_fabricates_draws() {
+    for (outcome, expected) in [
+        (None, 0.0),
+        (Some(PpoTerminalOutcome::Win), 1.0),
+        (Some(PpoTerminalOutcome::Loss), -1.0),
+    ] {
+        let reward = RewardTracker::terminal_only(outcome).expect("terminal-only reward");
+        assert_eq!(
+            reward,
+            crate::RewardBreakdown {
+                terminal: expected,
+                total: expected,
+                ..crate::RewardBreakdown::default()
+            }
+        );
+    }
+    assert_eq!(
+        RewardTracker::terminal_only(Some(PpoTerminalOutcome::Draw))
+            .expect_err("no synthetic draw")
+            .to_string(),
+        "invalid PPO transition: terminal-only Map0 draw"
+    );
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn terminal_only_e6_capacity_and_lambda_one_are_explicit_and_bounded() {
+    let settings = crate::cli::training_settings_for_test(&[
+        "--complete-episodes",
+        "--terminal-only",
+        "--map",
+        "0",
+        "--environments",
+        "6",
+        "--rollout",
+        "4538",
+        "--gae-lambda",
+        "1",
+    ])
+    .expect("terminal E6 settings");
+    assert!(settings.terminal_only);
+    assert_eq!(settings.ppo.gae_lambda, 1.0);
+    crate::ppo_arena::episode::validate(&settings).expect("E6 fits");
+    let mut four = settings.clone();
+    four.ppo.environments = 4;
+    four.ppo.rollout_decisions = 8192;
+    crate::ppo_arena::episode::validate(&four).expect("E4 reaches global product cap exactly");
+    assert_eq!(
+        four.ppo.environments * four.ppo.rollout_decisions,
+        crate::PPO_MAX_SAMPLES
+    );
+    let mut too_large = settings.clone();
+    too_large.ppo.rollout_decisions = 8192;
+    assert_eq!(
+        crate::ppo_arena::episode::validate(&too_large)
+            .expect_err("E6 cannot retain that capacity")
+            .to_string(),
+        "invalid PPO config field: samples per update"
+    );
+    let mut invalid = settings.clone();
+    invalid.complete_episodes = false;
+    assert_eq!(
+        crate::ppo_arena::episode::validate(&invalid)
+            .expect_err("scope")
+            .to_string(),
+        "invalid PPO config field: terminal-only requires complete episodes"
+    );
+    invalid = settings;
+    invalid.ppo.environments = 8;
+    assert!(crate::ppo_arena::episode::validate(&invalid).is_err());
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn lambda_one_on_retained_intervals_matches_full_discounted_terminal_return() {
+    crate::ppo_arena::episode::assert_full_mc_for_test();
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn e2_e4_e6_ragged_sampling_and_early_terminals_preserve_rng_and_retained_actions() {
+    crate::ppo_arena::episode::assert_ragged_streams_for_test(&stop_policy_for_warmup());
 }

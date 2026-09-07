@@ -28,6 +28,252 @@ use crate::{
 };
 
 #[test]
+fn fresh_policy_fixed_corpus_has_unsaturated_heads() {
+    assert_fresh_policy_conditioning(PolicyDevice::Cpu);
+}
+
+#[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
+#[test]
+#[ignore = "requires a CUDA device"]
+fn cuda_fresh_policy_fixed_corpus_has_unsaturated_heads() {
+    assert_fresh_policy_conditioning(PolicyDevice::Cuda { ordinal: 0 });
+}
+
+fn assert_fresh_policy_conditioning(device: PolicyDevice) {
+    let prefixes = mixed_training_prefixes();
+    let mut frames = vec![populated_frame(); prefixes.len()];
+    frames[1] = FeatureFrame::new();
+    frames[2].items[0][crate::item_feature::SLOT_TOKEN] = 64.0;
+    frames[2].items[0][crate::item_feature::ITEM_TOKEN] = 65_536.0;
+    frames[2].abilities[0][crate::ability_feature::ID_TOKEN] = 65_547.0;
+    let mut conditioned = true;
+    for seed in [1, 503, 9_101] {
+        let model = PolicyModel::fresh_on(seed, device).expect("model");
+        let norms = model.activation_rms_for_test(&frames).expect("norms");
+        eprintln!("seed={seed} unit_point_trunk_rms={norms:?}");
+        assert!(
+            norms
+                .iter()
+                .all(|norm| norm.is_finite() && *norm > 0.0 && *norm < 1.0)
+        );
+        let output = model.training_forward(&frames, &prefixes).expect("forward");
+        assert_pointer_scale_and_gradient(output.kind().device());
+        for (name, tensor) in [
+            ("kind", output.kind()),
+            ("controlled", output.controlled()),
+            ("ability", output.ability()),
+            ("item", output.item()),
+            ("swap", output.swap()),
+            ("learn", output.learn()),
+            ("shop", output.shop()),
+            ("loot", output.loot()),
+            ("target_mode", output.target_mode()),
+            ("put_mode", output.put_mode()),
+            ("entity", output.entity_pointer()),
+            ("point", output.point_pointer()),
+        ] {
+            for row in tensor.to_vec2::<f32>().expect("logits") {
+                let maximum = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let minimum = row.iter().copied().fold(f32::INFINITY, f32::min);
+                let sum = row.iter().map(|value| (value - maximum).exp()).sum::<f32>();
+                let entropy = row
+                    .iter()
+                    .map(|value| {
+                        let log_probability = value - maximum - sum.ln();
+                        -log_probability.exp() * log_probability
+                    })
+                    .sum::<f32>();
+                eprintln!(
+                    "seed={seed} head={name} spread={} entropy={entropy} uniform={}",
+                    maximum - minimum,
+                    (row.len() as f32).ln()
+                );
+                conditioned &= maximum - minimum < 2.0;
+                conditioned &= entropy > 0.95 * (row.len() as f32).ln();
+            }
+        }
+    }
+    assert!(conditioned, "fresh policy heads must start near uniform");
+}
+
+#[test]
+fn full_model_overfits_fixed_batch_and_learns_unseen_observations() {
+    assert_fixed_batch_learning(PolicyDevice::Cpu);
+}
+
+fn assert_pointer_scale_and_gradient(device: &candle_core::Device) {
+    for width in [64, 128] {
+        let tokens = candle_core::Tensor::ones((1, 2, width), candle_core::DType::F32, device)
+            .expect("tokens");
+        let query =
+            candle_core::Var::ones((1, 1, width), candle_core::DType::F32, device).expect("query");
+        let scores = crate::model::scaled_pointer_dot(&tokens, query.as_tensor()).expect("pointer");
+        for score in scores
+            .flatten_all()
+            .expect("flatten")
+            .to_vec1::<f32>()
+            .expect("scores")
+        {
+            assert!((score - (width as f32).sqrt()).abs() < 1.0e-6);
+        }
+        let gradients = scores.sum_all().expect("sum").backward().expect("backward");
+        let gradient = gradients.get(query.as_tensor()).expect("query gradient");
+        for value in gradient
+            .flatten_all()
+            .expect("flatten")
+            .to_vec1::<f32>()
+            .expect("gradient")
+        {
+            assert!((value - 2.0 / (width as f32).sqrt()).abs() < 1.0e-6);
+        }
+    }
+}
+
+#[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
+#[test]
+#[ignore = "requires a CUDA device"]
+fn cuda_full_model_overfits_fixed_batch_and_learns_unseen_observations() {
+    assert_fixed_batch_learning(PolicyDevice::Cuda { ordinal: 0 });
+}
+
+fn assert_fixed_batch_learning(device: PolicyDevice) {
+    let model = PolicyModel::fresh_on(503, device).expect("model");
+    let training = conditioning_learning_corpus(false);
+    let held_out = conditioning_learning_corpus(true);
+    let training = training.iter().collect::<Vec<_>>();
+    let held_out = held_out.iter().collect::<Vec<_>>();
+    let before = model
+        .behavioral_loss_for_test(&training)
+        .expect("initial loss");
+    let held_before = model
+        .behavioral_loss_for_test(&held_out)
+        .expect("held initial loss");
+    let mut adam = model
+        .claim_adam_for_test(AdamConfig {
+            learning_rate: 0.003,
+            ..AdamConfig::default()
+        })
+        .expect("Adam");
+    assert_ne!(
+        training[0].frame().global()[20],
+        training[1].frame().global()[20]
+    );
+    for _ in 0..192 {
+        let report = model.behavioral_update(&training, &mut adam).expect("step");
+        assert!(report.unclipped_norm.is_finite());
+        assert!(report.average_loss.is_finite());
+    }
+    let after = model
+        .behavioral_loss_for_test(&training)
+        .expect("final loss and gradients");
+    let held_after = model
+        .behavioral_loss_for_test(&held_out)
+        .expect("held final loss");
+    eprintln!(
+        "fixed_bc seed=503 steps=192 train={before}->{after} held={held_before}->{held_after}"
+    );
+    assert!(after < 0.05, "training loss {before} -> {after}");
+    assert!(held_after < 0.1, "held loss {held_before} -> {held_after}");
+    assert_actor_snapshot_sampling_parity(&model);
+    assert!(
+        model
+            .export_parameters()
+            .expect("weights")
+            .iter()
+            .all(|value| value.is_finite())
+    );
+    for (prediction, sample) in model
+        .behavioral_predictions(&held_out)
+        .expect("predictions")
+        .iter()
+        .zip(held_out)
+    {
+        assert_eq!(prediction.kind, sample.target().kind.selected);
+    }
+}
+
+fn conditioning_learning_corpus(held_out: bool) -> Vec<ImitationSample> {
+    [ActionKind::Cast, ActionKind::Swap]
+        .into_iter()
+        .enumerate()
+        .map(|(index, kind)| {
+            let tick = if held_out { 11 } else { 10 };
+            let mut view = world_view(Team::Radiant, tick);
+            let player = view
+                .players
+                .iter_mut()
+                .find(|player| player.slot == SlotId(0))
+                .expect("player");
+            player.gold = Some(if index == 0 {
+                100 + i32::from(held_out)
+            } else {
+                99_900 - i32::from(held_out)
+            });
+            let tracker = tracker_with_view(Team::Radiant, view);
+            let space = ActionSpace::from_tracker(&tracker).expect("space");
+            let frame = encode(&tracker, &LocalPolicyState::new(0));
+            let mut logits = DecoderLogits::favor(kind);
+            logits.target_mode[2] = 100.0;
+            let action = decode_with_logits(&space, &logits).expect("label");
+            assert_eq!(action.kind(), kind);
+            let namespace = if held_out {
+                SeedNamespace::Promotion
+            } else {
+                SeedNamespace::Training
+            };
+            let identity = SampleIdentity::from_frame(namespace, index as u64 + 1, 1, tick, &frame)
+                .expect("identity");
+            ImitationSample::teacher(frame, &space, action, identity).expect("sample")
+        })
+        .collect()
+}
+
+#[test]
+fn input_conditioning_preserves_zero_signed_scalars_and_semantic_id_distinctions() {
+    let mut rows = [0.0, 0.0, -0.75, 1.0, 1.0, 0.5, 64.0, 65_536.0, 1.0];
+    crate::model::condition_rows(&mut rows, 3, &[(0, 64.0)], Some((1, 65_536.0)));
+    assert_eq!(&rows[..3], &[0.0, 0.0, -0.75]);
+    assert_eq!(rows[3], 1.0 / 64.0);
+    assert!(rows[4] > 0.06);
+    assert!(rows[4] < 0.07);
+    assert_eq!(rows[5], 0.5);
+    assert_eq!(&rows[6..], &[1.0, 1.0, 1.0]);
+}
+
+#[test]
+fn output_head_gain_preserves_initializer_draw_order_and_hidden_parameters() {
+    let model = PolicyModel::fresh(503).expect("model");
+    let parameters = model.export_parameters().expect("parameters");
+    let mut state = 503u64;
+    let mut offset = 0;
+    let mut decoder = false;
+    for (name, shape) in model.parameter_schema().expect("schema") {
+        decoder |= name == "value.weight";
+        let count = shape.iter().product::<usize>();
+        for &parameter in &parameters[offset..offset + count] {
+            if name.ends_with(".bias") {
+                assert_eq!(parameter, 0.0);
+                continue;
+            }
+            state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+            let mut value = state;
+            value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            value ^= value >> 31;
+            let symmetric = (value >> 40) as f32 / ((1u32 << 24) - 1) as f32 * 2.0 - 1.0;
+            let scale = if name.contains("_embedding") {
+                (3.0 / shape[1] as f32).sqrt()
+            } else {
+                (6.0 / shape[0] as f32).sqrt() * if decoder { 0.01 } else { 1.0 }
+            };
+            assert_eq!(parameter, symmetric * scale, "{name}");
+        }
+        offset += count;
+    }
+    assert_eq!(offset, MODEL_PARAMETER_COUNT);
+}
+
+#[test]
 fn ppo_inactive_entropy_normalizers_and_gradients_are_finite() {
     assert_ppo_entropy(PolicyDevice::Cpu);
 }
@@ -139,6 +385,7 @@ fn cuda_ppo_sampled_actor_log_probability_matches_tensor_likelihood_before_updat
 
 fn assert_ppo_likelihood(device: PolicyDevice) {
     let model = PolicyModel::fresh_on(9_101, device).expect("model");
+    assert_actor_snapshot_sampling_parity(&model);
     let identity = model.policy_identity().expect("identity");
     for batched in [false, true] {
         let samples = sampled_ppo_examples(&model, MODEL_TRAINING_BATCH, batched);
@@ -190,6 +437,54 @@ fn assert_ppo_likelihood(device: PolicyDevice) {
 #[test]
 fn ppo_critic_only_step_preserves_actor_and_trains_value() {
     assert_critic_transfer(&PolicyModel::fresh(9_101).expect("model"));
+}
+
+fn assert_actor_snapshot_sampling_parity(model: &PolicyModel) {
+    let actor = model.actor_snapshot().expect("CPU actor snapshot");
+    let tracker = tracker_with_view(Team::Radiant, world_view(Team::Radiant, 10));
+    let frame = encode(&tracker, &LocalPolicyState::new(0));
+    let frames = vec![frame; 16];
+    let spaces = (0..16)
+        .map(|_| ActionSpace::from_tracker(&tracker).expect("space"))
+        .collect::<Vec<_>>();
+    let mut batch_random = (0..16)
+        .map(|index| PpoRng::new(17 + index * 97))
+        .collect::<Vec<_>>();
+    let mut actor_random = batch_random.clone();
+    let batch = model
+        .sample_batch(&frames, &spaces, &mut batch_random)
+        .expect("learner batch");
+    let mut samples = Vec::with_capacity(16);
+    for (index, choice) in batch.iter().enumerate() {
+        let sampled = actor
+            .sample(&frames[index], &spaces[index], &mut actor_random[index])
+            .expect("actor sample");
+        assert_eq!(sampled.action(), choice.action());
+        assert_eq!(sampled.policy(), choice.policy());
+        assert!((sampled.log_probability() - choice.log_probability()).abs() < 1.0e-4);
+        samples.push(PpoPreparedSample {
+            return_value: sampled.value(),
+            advantage: 1.0,
+            transition: sampled
+                .finish(PpoOutcome {
+                    stream: index,
+                    decision: 0,
+                    ticks: 3,
+                    next_value: 0.0,
+                    reward: 0.0,
+                    terminal: true,
+                })
+                .expect("transition"),
+        });
+    }
+    assert_eq!(actor_random, batch_random);
+    let references = samples.iter().collect::<Vec<_>>();
+    let (likelihood, _) = model
+        .ppo_likelihood_for_test(&references)
+        .expect("learner likelihood");
+    for (value, sample) in likelihood.iter().zip(samples) {
+        assert!((value - sample.transition.old_log_probability).abs() < 1.0e-4);
+    }
 }
 
 #[test]
@@ -709,6 +1004,28 @@ fn effective_batch_above_microbatch_boundary_matches_identical_single_example_up
 }
 
 #[test]
+fn masked_cross_entropy_is_invariant_to_representable_common_offsets() {
+    let baseline = masked_cross_entropy_for_test(&[0.0, 1.0, 2.0], &[true, true, false], 1, true)
+        .expect("baseline");
+    for offset in [-1_000_000.0, 1_000_000.0] {
+        let shifted = masked_cross_entropy_for_test(
+            &[offset, offset + 1.0, 1.0e30],
+            &[true, true, false],
+            1,
+            true,
+        )
+        .expect("shifted");
+        assert!(
+            (shifted.loss - baseline.loss).abs() < 1.0e-6,
+            "{shifted:?} != {baseline:?}"
+        );
+        for (left, right) in shifted.gradients.iter().zip(&baseline.gradients) {
+            assert!((left - right).abs() < 1.0e-6);
+        }
+    }
+}
+
+#[test]
 fn masked_cross_entropy_matches_reference_and_excludes_illegal_or_inactive_logits() {
     let positive = masked_cross_entropy_for_test(&[0.0, 1.0, 2.0], &[true, true, false], 1, true)
         .expect("positive");
@@ -810,12 +1127,12 @@ fn adam_rejects_invalid_config_nonfinite_and_extreme_updates_without_partial_sta
 
 #[test]
 fn model_schema_and_head_dimensions_are_stable() {
-    assert_eq!(MODEL_SCHEMA_VERSION, 8);
+    assert_eq!(MODEL_SCHEMA_VERSION, 11);
     assert!(
         crate::MODEL_SCHEMA_DESCRIPTOR
             .contains("action_schema_version=3;action_schema_hash=1755359086494840931;")
     );
-    assert_eq!(MODEL_SCHEMA_HASH, 3_097_714_014_199_697_774);
+    assert_eq!(MODEL_SCHEMA_HASH, 18_229_126_264_156_367_519);
     assert_eq!(MODEL_KIND_HEAD, 16);
     assert_eq!(MODEL_UNIT_HEAD, 2);
     assert_eq!(MODEL_ABILITY_HEAD, 8);

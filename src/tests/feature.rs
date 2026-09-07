@@ -26,12 +26,12 @@ const ENEMY: EntityId = entity(20, 1);
 
 #[test]
 fn feature_schema_dimensions_and_hash_are_stable() {
-    assert_eq!(FEATURE_SCHEMA_VERSION, 8);
+    assert_eq!(FEATURE_SCHEMA_VERSION, 10);
     assert!(
         FEATURE_SCHEMA_DESCRIPTOR
             .contains("action_schema_version=3;action_schema_hash=1755359086494840931;")
     );
-    assert_eq!(FEATURE_SCHEMA_HASH, 10_322_490_384_647_633_864);
+    assert_eq!(FEATURE_SCHEMA_HASH, 15_519_817_897_416_174_399);
     assert_eq!(GLOBAL_FEATURES, 64);
     assert_eq!((HISTORY_SAMPLES, HISTORY_FEATURES), (7, 24));
     assert_eq!((MAX_POLICY_HISTORY, POLICY_HISTORY_FEATURES), (16, 4));
@@ -1360,6 +1360,225 @@ fn first_projectile_and_loot_observation_marks_age_and_velocity_missing() {
 }
 
 #[test]
+fn projectile_selection_above_32_is_identifier_free_and_keeps_model_rows_bounded() {
+    for count in [33, 520, 4_096] {
+        let mut view = projectile_capacity_view(count);
+        let expected = encoded_frame(Team::Radiant, projectile_capacity_view(32));
+        let actual = encoded_frame(Team::Radiant, view.clone());
+        for projectile in &mut view.projectiles {
+            projectile.id.idx = 10_000 - projectile.id.idx;
+            projectile.id.generation = 7;
+        }
+        view.projectiles.sort_by_key(|projectile| projectile.id);
+        let remapped = encoded_frame(Team::Radiant, view);
+
+        assert_eq!(actual.projectiles, expected.projectiles);
+        assert_eq!(actual, remapped);
+        assert_eq!(actual.projectiles.len(), 32);
+        assert!(actual.is_finite());
+    }
+}
+
+#[test]
+fn projectile_observation_capacity_does_not_expand_the_inline_encoder_stack() {
+    assert!(std::mem::size_of::<FeatureEncoder>() <= 64 * 1024);
+    assert_eq!(PROJECTILE_FEATURE_TOKENS * PROJECTILE_FEATURES, 640);
+}
+
+#[test]
+fn full_projectile_history_capacity_survives_the_complete_rollback_journal_on_normal_stack() {
+    let mut view = projectile_capacity_view(4_096);
+    let mut tracker = tracker_with_view(Team::Radiant, view.clone());
+    let mut encoder = FeatureEncoder::new(&tracker);
+    for tick in 1..=crate::MAX_FEATURE_OBSERVATION_HISTORY as u32 + 1 {
+        if tick > 1 {
+            view.tick = tick;
+            tracker.observe_snapshot(&view).expect("full snapshot");
+        }
+        encoder.observe(&tracker).expect("full history");
+    }
+
+    let frame = encode_with_encoder(&tracker, &mut encoder);
+
+    assert_eq!(frame.projectiles.len(), 32);
+    assert!(
+        frame
+            .projectiles
+            .iter()
+            .all(|row| row[projectile_feature::VELOCITY_PRESENT] == 1.0)
+    );
+    assert!(frame.is_finite());
+}
+
+#[test]
+fn full_unit_observation_keeps_identifier_free_96_row_selection_and_256_normalizer() {
+    let mut view = capacity_view(Team::Radiant);
+    for index in view.units.len()..4_096 {
+        view.units
+            .push(creep(entity(3_000 + index as u32, 1), 3_000, 3_000));
+    }
+    view.units.sort_by_key(|unit| unit.id);
+    let expected = encoded_frame(Team::Radiant, view.clone());
+    reverse_entity_ids_and_generations(&mut view, 20_000, 9);
+
+    let actual = encoded_frame(Team::Radiant, view);
+
+    assert_eq!(actual, expected);
+    assert_eq!(present_unit_count(&actual), 96);
+    assert_eq!(actual.global[global_feature::VISIBLE_ENEMY_UNITS], 1.0);
+    assert!(actual.is_finite());
+}
+
+#[test]
+fn attack_range_features_include_both_hulls_at_exact_edges_for_both_teams_and_structures() {
+    let own_reach = Fixed::from_int(500 + 24 + 80).raw;
+    let unit_reach = Fixed::from_int(700 + 24 + 80).raw;
+    for team in [Team::Radiant, Team::Dire] {
+        for kind in [
+            UnitKind::CreepMelee,
+            UnitKind::Tower,
+            UnitKind::Ancient,
+            UnitKind::Barracks,
+            UnitKind::Fountain,
+        ] {
+            for distance in [
+                own_reach - 1,
+                own_reach,
+                own_reach + 1,
+                unit_reach - 1,
+                unit_reach,
+                unit_reach + 1,
+            ] {
+                let mut view = world_view(team, 1);
+                let canonical = Vec2 {
+                    x: Fixed {
+                        raw: Fixed::from_int(2_000).raw + distance,
+                    },
+                    y: Fixed::from_int(2_000),
+                };
+                let target = entity(9_999, 1);
+                view.units.push(building(
+                    target,
+                    opposing(team),
+                    kind,
+                    canonical_position(team, canonical),
+                ));
+                view.units.sort_by_key(|unit| unit.id);
+                let tracker = tracker_with_view(team, view);
+                let space = ActionSpace::from_tracker(&tracker).expect("space");
+                let row = space
+                    .entity_candidates()
+                    .iter()
+                    .position(|candidate| candidate.id() == target)
+                    .expect("target row");
+
+                let frame = encode(&tracker, &LocalPolicyState::new(0));
+
+                assert_eq!(
+                    frame.units[row][unit_feature::OWN_IN_ATTACK_RANGE],
+                    if distance <= own_reach { 1.0 } else { 0.0 },
+                    "{team:?} {kind:?} own {distance}"
+                );
+                assert_eq!(
+                    frame.units[row][unit_feature::UNIT_IN_ATTACK_RANGE],
+                    if distance <= unit_reach { 1.0 } else { 0.0 },
+                    "{team:?} {kind:?} unit {distance}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn unselected_projectile_keeps_full_history_when_it_enters_the_32_model_rows() {
+    let mut view = projectile_capacity_view(4_096);
+    let mut tracker = tracker_with_view(Team::Radiant, view.clone());
+    let mut encoder = FeatureEncoder::new(&tracker);
+    encoder.observe(&tracker).expect("crowded observation");
+    let initial = encode_with_encoder(&tracker, &mut encoder);
+    assert_eq!(
+        initial.projectiles[31][projectile_feature::TOKEN_PRESENT],
+        1.0
+    );
+    view.tick = 2;
+    let mut last = *view
+        .projectiles
+        .last()
+        .expect("previously unselected projectile");
+    last.pos.x += Fixed::from_int(1);
+    view.projectiles = vec![last];
+
+    tracker
+        .observe_snapshot(&view)
+        .expect("only previously unselected projectile remains");
+    encoder.observe(&tracker).expect("continuous history");
+    let actual = encode_with_encoder(&tracker, &mut encoder);
+
+    assert_eq!(
+        actual.projectiles[0][projectile_feature::VELOCITY_PRESENT],
+        1.0
+    );
+    assert!(actual.projectiles[0][projectile_feature::AGE] > 0.0);
+    assert!(actual.projectiles[0][projectile_feature::VELOCITY_X] > 0.0);
+    assert_eq!(
+        actual.projectiles[1][projectile_feature::TOKEN_PRESENT],
+        0.0
+    );
+}
+
+#[test]
+fn legacy_projectile_views_keep_exact_feature_bits() {
+    use sha2::{Digest, Sha256};
+    let mut digest = Sha256::new();
+    for count in [0, 1, 31, 32] {
+        let mut view = projectile_capacity_view(count);
+        let mut tracker = tracker_with_view(Team::Radiant, view.clone());
+        let mut encoder = FeatureEncoder::new(&tracker);
+        for tick in 1..=2 {
+            if tick == 2 {
+                view.tick = tick;
+                for projectile in &mut view.projectiles {
+                    projectile.pos.x += Fixed::from_int(1);
+                }
+                tracker.observe_snapshot(&view).expect("second observation");
+            }
+            encoder.observe(&tracker).expect("feature observation");
+            let frame = encode_with_encoder(&tracker, &mut encoder);
+            for value in all_values(&frame) {
+                digest.update(value.to_bits().to_le_bytes());
+            }
+            assert!(frame.is_finite());
+        }
+    }
+
+    let actual: [u8; 32] = digest.finalize().into();
+    // Captured from the frozen unpatched feature-v8 implementation.
+    assert_eq!(
+        actual,
+        [
+            249, 170, 21, 90, 136, 15, 9, 154, 230, 182, 38, 80, 211, 216, 220, 69, 73, 37, 62,
+            165, 136, 116, 105, 220, 105, 138, 185, 155, 165, 202, 206, 220,
+        ]
+    );
+}
+
+fn projectile_capacity_view(count: u32) -> WorldView {
+    assert!(count <= 4_096);
+    let mut view = world_view(Team::Radiant, 1);
+    let prototype = view.projectiles[0];
+    view.projectiles = (0..count)
+        .map(|index| {
+            let mut projectile = prototype;
+            projectile.id = entity(1_000 + index, 1);
+            projectile.pos = Vec2::from_ints(2_000 + index as i32, 2_000);
+            projectile
+        })
+        .collect();
+    assert_eq!(view.projectiles.len(), count as usize);
+    view
+}
+
+#[test]
 fn projectile_and_loot_history_handles_motion_zero_disappearance_and_generation() {
     let info = match_info(Team::Radiant);
     let mut tracker = StateTracker::new(SlotId(0), &info).expect("tracker");
@@ -2127,7 +2346,7 @@ fn tracker_after_capacity_eviction(remapped: bool) -> StateTracker {
     let info = match_info(Team::Radiant);
     let mut tracker = StateTracker::new(SlotId(0), &info).expect("tracker");
     let mut first = world_view(Team::Radiant, 1);
-    for index in 0..249u32 {
+    for index in 0..(crate::MAX_TRACKED_ENTITIES - first.units.len()) as u32 {
         let id = if remapped {
             50_000 - index
         } else {
@@ -2145,7 +2364,7 @@ fn tracker_after_capacity_eviction(remapped: bool) -> StateTracker {
         let id = if remapped {
             70_000 - index
         } else {
-            2_000 + index
+            10_000 + index
         };
         second.units.push(creep(
             entity(id, 7 + index % 5),

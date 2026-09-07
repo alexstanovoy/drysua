@@ -52,13 +52,19 @@ struct PretrainArgs {
 /// Options for a fixed deterministic checkpoint evaluation matrix.
 #[derive(Args)]
 struct EvaluateArgs {
+    /// Evaluate greedy Neural on Map0 only, without candidate Teacher overrides.
+    #[arg(long)]
+    neural_map0: bool,
+    /// Omit the secondary weak-opponent cohort from explicit pure Neural evaluation.
+    #[arg(long, requires = "neural_map0")]
+    teacher_only: bool,
     /// Directory containing drysua.weights.safetensors.
     #[arg(long)]
     checkpoint_directory: std::path::PathBuf,
     /// Paired held-out seeds per map and baseline, bounded to eight.
     #[arg(long, default_value_t = 1)]
     pairs: usize,
-    /// Greedy policy decisions per match after pregame, bounded to 4096.
+    /// Greedy decisions: at most 4096 for Hybrid, 36300 (tick cap 108900) for Neural.
     #[arg(long, default_value_t = 1_024)]
     decisions: usize,
     /// First deterministic held-out seed.
@@ -69,9 +75,9 @@ struct EvaluateArgs {
 /// Options for one server match.
 #[derive(Args)]
 struct PlayArgs {
-    /// Hybrid, compact Tactical deployment, or the deterministic weights-free Teacher.
-    #[arg(long, value_enum, default_value_t = PlayPolicy::Hybrid)]
-    policy: PlayPolicy,
+    /// Override the repository-selected default with Neural, Hybrid, Tactical, or Teacher.
+    #[arg(long, value_enum)]
+    policy: Option<PlayPolicy>,
     /// Server socket address.
     #[arg(long, default_value = "127.0.0.1:4455")]
     addr: String,
@@ -81,14 +87,15 @@ struct PlayArgs {
     /// Leave after receiving this snapshot tick.
     #[arg(long, value_name = "TICKS")]
     limit: Option<u32>,
-    /// Weights directory: Tactical requires it; Hybrid defaults to .; Teacher ignores it.
-    #[arg(long, required_if_eq("policy", "tactical"))]
+    /// Explicit experiment weights; without --policy this selects Hybrid. Defaults need no path.
+    #[arg(long, required_if_eq_any([("policy", "tactical"), ("policy", "neural")]))]
     weights_directory: Option<std::path::PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub(crate) enum PlayPolicy {
     Hybrid,
+    Neural,
     Tactical,
     Teacher,
 }
@@ -128,13 +135,31 @@ struct TrainArgs {
 /// Options for bounded resumable PPO training.
 #[derive(Args)]
 struct TrainFullArgs {
+    /// Use only actual Map0 terminal win/loss rewards; requires complete episodes.
+    #[arg(long, requires = "complete_episodes")]
+    terminal_only: bool,
+    /// Collect two, four, or six complete Map0 matches against Teacher; retain every eighth action.
+    #[arg(long)]
+    complete_episodes: bool,
+    /// Adam learning rate; must be finite and positive.
+    #[arg(long, default_value_t = crate::PpoConfig::default().learning_rate)]
+    learning_rate: f32,
+    /// Discount per simulator tick in [0, 1), not per policy decision.
+    #[arg(long, default_value_t = crate::PpoConfig::default().gamma_tick)]
+    gamma_per_tick: f32,
+    /// Generalized advantage trace decay in [0, 1]; one uses full discounted Monte Carlo returns.
+    #[arg(long, default_value_t = crate::PpoConfig::default().gae_lambda)]
+    gae_lambda: f32,
+    /// Entropy bonus coefficient; must be finite and positive.
+    #[arg(long, default_value_t = crate::PpoConfig::default().entropy_coefficient)]
+    entropy_coefficient: f32,
     /// Total PPO update target, including updates restored from a checkpoint.
     #[arg(long)]
     updates: u64,
     /// Independent CPU arenas, hard-bounded to sixteen.
     #[arg(long, default_value_t = 4)]
     environments: usize,
-    /// Decisions collected from each arena per update, hard-bounded to 2048.
+    /// Window decisions or per-episode retained capacity, hard-bounded to 16384.
     #[arg(long, default_value_t = 2_048)]
     rollout: usize,
     /// PPO passes over one rollout.
@@ -232,17 +257,30 @@ fn run(arguments: Cli) -> std::io::Result<()> {
         Some(Operation::TrainFull(train)) => return run_train_full(train),
         None => arguments.play,
     };
-    let outcome = match play.policy {
+    let (policy, weights_directory) = resolve_play_deployment(&play)?;
+    if play.policy.is_none() && play.weights_directory.is_none() {
+        eprintln!("deployment: repository-selected {policy:?}");
+    }
+    let outcome = match policy {
         PlayPolicy::Hybrid => crate::play(
             &play.addr,
             &play.name,
             play.limit,
-            play.weights_directory
+            weights_directory
                 .as_deref()
                 .unwrap_or(std::path::Path::new(".")),
         )?,
+        PlayPolicy::Neural => {
+            let directory = weights_directory.as_deref().ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "neural requires --weights-directory",
+                )
+            })?;
+            crate::seat::play_neural(&play.addr, &play.name, play.limit, directory)?
+        }
         PlayPolicy::Tactical => {
-            let directory = play.weights_directory.as_deref().ok_or_else(|| {
+            let directory = weights_directory.as_deref().ok_or_else(|| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     "tactical requires --weights-directory",
@@ -262,6 +300,18 @@ fn run(arguments: Cli) -> std::io::Result<()> {
         outcome.rejections
     );
     Ok(())
+}
+
+fn resolve_play_deployment(
+    play: &PlayArgs,
+) -> std::io::Result<(PlayPolicy, Option<std::path::PathBuf>)> {
+    if let Some(policy) = play.policy {
+        return Ok((policy, play.weights_directory.clone()));
+    }
+    if play.weights_directory.is_some() {
+        return Ok((PlayPolicy::Hybrid, play.weights_directory.clone()));
+    }
+    crate::default_deployment::DEFAULT_DEPLOYMENT.resolve()
 }
 
 #[cfg(feature = "builtin")]
@@ -297,26 +347,37 @@ fn run_pretrain(arguments: PretrainArgs) -> std::io::Result<()> {
 
 #[cfg(feature = "builtin")]
 fn run_evaluate(arguments: EvaluateArgs) -> std::io::Result<()> {
-    let report = crate::evaluate_runtime_checkpoint(
-        crate::CheckpointEvaluationConfig {
-            pairs: arguments.pairs,
-            decisions: arguments.decisions,
-            seed: arguments.seed,
-        },
-        &arguments.checkpoint_directory,
-    )
+    let settings = crate::CheckpointEvaluationConfig {
+        pairs: arguments.pairs,
+        decisions: arguments.decisions,
+        seed: arguments.seed,
+    };
+    let report = if arguments.neural_map0 {
+        crate::ppo_arena::evaluate_neural_map_zero_checkpoint_cohort(
+            settings,
+            &arguments.checkpoint_directory,
+            arguments.teacher_only,
+        )
+    } else {
+        crate::evaluate_runtime_checkpoint(settings, &arguments.checkpoint_directory)
+    }
     .map_err(std::io::Error::other)?;
     let mut wins = 0usize;
     let mut losses = 0usize;
     let mut timeouts = 0usize;
     for game in &report.games {
         match game.outcome {
-            crate::CheckpointEvaluationOutcome::Win => wins += 1,
+            crate::CheckpointEvaluationOutcome::Win
+                if game.rejected_orders == 0 && game.baseline_rejected_orders == 0 =>
+            {
+                wins += 1
+            }
+            crate::CheckpointEvaluationOutcome::Win => {}
             crate::CheckpointEvaluationOutcome::Loss => losses += 1,
             crate::CheckpointEvaluationOutcome::Timeout => timeouts += 1,
         }
         println!(
-            "map={} baseline={:?} team={:?} seed={} outcome={:?} decisions={} orders={} rejected={} baseline_orders={} baseline_rejected={} continue={} actions={:?} level={} gold={} kills={} deaths={} last_hits={} denies={} enemy_structures_destroyed={}",
+            "map={} baseline={:?} team={:?} seed={} outcome={:?} decisions={} orders={} rejected={} baseline_orders={} baseline_rejected={} continue={} actions={:?} level={} gold={} kills={} deaths={} last_hits={} denies={} enemy_structures_destroyed={} elapsed_ticks={}",
             game.map.0,
             game.baseline,
             game.candidate_team,
@@ -336,6 +397,7 @@ fn run_evaluate(arguments: EvaluateArgs) -> std::io::Result<()> {
             game.final_summary.allied.last_hits,
             game.final_summary.allied.denies,
             game.final_summary.enemy_structures_destroyed,
+            game.elapsed_ticks,
         );
     }
     let quality = report.quality();
@@ -450,27 +512,12 @@ fn run_train(arguments: TrainArgs) -> std::io::Result<()> {
 
 #[cfg(feature = "builtin")]
 fn run_train_full(arguments: TrainFullArgs) -> std::io::Result<()> {
+    let settings = arguments.training_settings(
+        embedded_commit("DRYSUA_GIT_COMMIT", option_env!("DRYSUA_GIT_COMMIT"))?,
+        embedded_commit("BOTA_GIT_COMMIT", option_env!("BOTA_GIT_COMMIT"))?,
+    )?;
     let device = arguments.device.policy_device(arguments.device_ordinal)?;
     validate_checkpoint_directory(&arguments.checkpoint_directory, arguments.resume)?;
-    let settings = crate::TrainingJobConfig {
-        updates: arguments.updates,
-        environments: arguments.environments,
-        rollout_decisions: arguments.rollout,
-        epochs: arguments.epochs,
-        minibatch: arguments.minibatch,
-        checkpoint_cadence: crate::TrainingCheckpointCadence::WallTime(
-            std::time::Duration::from_secs(arguments.checkpoint_seconds),
-        ),
-        resume_provenance: if arguments.migrate_provenance {
-            crate::ResumeProvenance::MigrateGitCommit
-        } else {
-            crate::ResumeProvenance::Strict
-        },
-        seed: arguments.seed,
-        map: bota_proto::MapId(arguments.map),
-        git_commit: embedded_commit("DRYSUA_GIT_COMMIT", option_env!("DRYSUA_GIT_COMMIT"))?,
-        simulator_commit: embedded_commit("BOTA_GIT_COMMIT", option_env!("BOTA_GIT_COMMIT"))?,
-    };
     let report = crate::run_training_job_on_with_initial_weights(
         settings,
         device,
@@ -479,7 +526,7 @@ fn run_train_full(arguments: TrainFullArgs) -> std::io::Result<()> {
         arguments.initial_weights.as_deref(),
         |checkpoint| {
             println!(
-                "checkpoint: update {}, samples {}, optimizer step {}, policy loss {:.6}, value loss {:.6}, entropy {:.6}, KL {:.6}, KL stop {}, session terminal wins {}, session terminal losses {}, session terminal draws {}, session rejected {}, session ticks {}",
+                "checkpoint: update {}, samples {}, optimizer step {}, policy loss {:.6}, value loss {:.6}, entropy {:.6}, KL {:.6}, KL stop {}, session terminal wins {}, session terminal losses {}, session terminal draws {}, session rejected {}, session ticks {}, session episode timeouts {}",
                 checkpoint.completed_updates,
                 checkpoint.rollout_samples,
                 checkpoint.optimizer_step,
@@ -493,6 +540,7 @@ fn run_train_full(arguments: TrainFullArgs) -> std::io::Result<()> {
                 checkpoint.terminal_draws,
                 checkpoint.rejected_orders,
                 checkpoint.elapsed_ticks,
+                checkpoint.episode_timeouts,
             );
             if let Some(warning) = checkpoint.cleanup_warning {
                 eprintln!("checkpoint cleanup warning: {warning}");
@@ -501,7 +549,7 @@ fn run_train_full(arguments: TrainFullArgs) -> std::io::Result<()> {
     )
     .map_err(std::io::Error::other)?;
     println!(
-        "training complete: starting fingerprint {:016x}, {} updates, {} samples, optimizer step {}, policy loss {:.6}, value loss {:.6}, entropy {:.6}, KL {:.6}, session terminal wins {}, session terminal losses {}, session terminal draws {}, session rejected {}, session ticks {}",
+        "training complete: starting fingerprint {:016x}, {} updates, {} samples, optimizer step {}, policy loss {:.6}, value loss {:.6}, entropy {:.6}, KL {:.6}, session terminal wins {}, session terminal losses {}, session terminal draws {}, session rejected {}, session ticks {}, session episode timeouts {}",
         report.starting_policy_fingerprint,
         report.completed_updates,
         report.rollout_samples,
@@ -515,8 +563,73 @@ fn run_train_full(arguments: TrainFullArgs) -> std::io::Result<()> {
         report.terminal_draws,
         report.rejected_orders,
         report.elapsed_ticks,
+        report.episode_timeouts,
     );
     Ok(())
+}
+
+#[cfg(feature = "builtin")]
+impl TrainFullArgs {
+    fn training_settings(
+        &self,
+        git_commit: String,
+        simulator_commit: String,
+    ) -> std::io::Result<crate::TrainingJobConfig> {
+        let ppo = crate::PpoConfig {
+            environments: self.environments,
+            rollout_decisions: self.rollout,
+            epochs: self.epochs,
+            minibatch: self.minibatch,
+            learning_rate: self.learning_rate,
+            gamma_tick: self.gamma_per_tick,
+            gae_lambda: self.gae_lambda,
+            entropy_coefficient: self.entropy_coefficient,
+            ..crate::PpoConfig::default()
+        }
+        .validate()
+        .map_err(std::io::Error::other)?;
+        Ok(crate::TrainingJobConfig {
+            terminal_only: self.terminal_only,
+            complete_episodes: self.complete_episodes,
+            updates: self.updates,
+            ppo,
+            checkpoint_cadence: crate::TrainingCheckpointCadence::WallTime(
+                std::time::Duration::from_secs(self.checkpoint_seconds),
+            ),
+            resume_provenance: if self.migrate_provenance {
+                crate::ResumeProvenance::MigrateGitCommit
+            } else {
+                crate::ResumeProvenance::Strict
+            },
+            seed: self.seed,
+            map: bota_proto::MapId(self.map),
+            git_commit,
+            simulator_commit,
+        })
+    }
+}
+
+#[cfg(all(test, feature = "builtin"))]
+pub(crate) fn training_settings_for_test(
+    overrides: &[&str],
+) -> std::io::Result<crate::TrainingJobConfig> {
+    let mut arguments = vec![
+        "drysua",
+        "train-full",
+        "--updates",
+        "1",
+        "--checkpoint-directory",
+        ".",
+    ];
+    arguments.extend_from_slice(overrides);
+    let cli = Cli::try_parse_from(arguments).map_err(std::io::Error::other)?;
+    let Some(Operation::TrainFull(train)) = cli.operation else {
+        unreachable!("train-full arguments");
+    };
+    train.training_settings(
+        "test-drysua-commit".to_owned(),
+        "test-bota-commit".to_owned(),
+    )
 }
 
 #[cfg(feature = "builtin")]
@@ -623,7 +736,9 @@ where
         None => cli.play,
         _ => panic!("expected play arguments"),
     };
-    Ok(play.policy)
+    resolve_play_deployment(&play)
+        .map(|(policy, _)| policy)
+        .map_err(|error| clap::Error::raw(clap::error::ErrorKind::ValueValidation, error))
 }
 
 #[cfg(test)]
