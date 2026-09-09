@@ -27,6 +27,9 @@ use crate::{
     TrainingAbilitySlot, TrainingItemSlot, TrainingPrefix, TrainingSlot, unit_feature,
 };
 
+#[path = "model_input_adapter.rs"]
+mod model_input_adapter;
+
 #[test]
 fn fresh_policy_fixed_corpus_has_unsaturated_heads() {
     assert_fresh_policy_conditioning(PolicyDevice::Cpu);
@@ -1127,12 +1130,12 @@ fn adam_rejects_invalid_config_nonfinite_and_extreme_updates_without_partial_sta
 
 #[test]
 fn model_schema_and_head_dimensions_are_stable() {
-    assert_eq!(MODEL_SCHEMA_VERSION, 11);
+    assert_eq!(MODEL_SCHEMA_VERSION, 14);
     assert!(
         crate::MODEL_SCHEMA_DESCRIPTOR
             .contains("action_schema_version=3;action_schema_hash=1755359086494840931;")
     );
-    assert_eq!(MODEL_SCHEMA_HASH, 18_229_126_264_156_367_519);
+    assert_eq!(MODEL_SCHEMA_HASH, 7_970_187_849_195_607_202);
     assert_eq!(MODEL_KIND_HEAD, 16);
     assert_eq!(MODEL_UNIT_HEAD, 2);
     assert_eq!(MODEL_ABILITY_HEAD, 8);
@@ -1157,7 +1160,7 @@ fn model_parameter_count_and_f32_size_are_bounded() {
     assert!((1_000_000..=3_000_000).contains(&count));
     assert!((4 * 1_048_576..=12 * 1_048_576).contains(&(count * size_of::<f32>())));
     assert_eq!(schema.len(), 62);
-    assert_eq!(schema.first(), Some(&("unit.0.weight", vec![69, 64])));
+    assert_eq!(schema.first(), Some(&("unit.0.weight", vec![73, 64])));
     assert_eq!(schema.last(), Some(&("point_query.bias", vec![64])));
     assert_eq!(
         schema

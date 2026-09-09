@@ -1,5 +1,30 @@
 use std::collections::VecDeque;
+#[cfg(test)]
+#[path = "tests/continuous_probe.rs"]
+mod continuous_probe;
 pub(crate) mod episode;
+#[cfg(test)]
+#[path = "tests/head_probe.rs"]
+mod head_probe;
+#[cfg(test)]
+#[path = "tests/history_probe.rs"]
+mod history_probe;
+#[cfg(test)]
+#[path = "tests/neural_diagnosis.rs"]
+mod neural_diagnosis;
+#[cfg(test)]
+#[path = "tests/neural_skills.rs"]
+mod neural_skills;
+mod parallel;
+#[cfg(test)]
+#[path = "tests/tail_curriculum.rs"]
+mod tail_curriculum;
+#[cfg(test)]
+#[path = "tests/training_order_contract.rs"]
+pub(crate) mod training_order_contract;
+#[cfg(test)]
+#[path = "tests/value_probe.rs"]
+mod value_probe;
 use std::fs::{File, OpenOptions};
 use std::path::Path;
 use std::sync::Arc;
@@ -8,6 +33,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use bota_proto::{EventKind, MapId, RejectReason, ServerMsg, SlotId, Team};
+
+use crate::persistence::training::PolicyOrderBookkeeping;
 
 use crate::{
     ACTOR_LEARNER_BUFFERS, ActionKind, ActionSpace, ActivePolicyOrder, ActorLearnerPipeline,
@@ -76,6 +103,8 @@ pub struct PpoSmokeReport {
 /// Bounded, resumable production PPO settings.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TrainingJobConfig {
+    /// Maximum elapsed-tick cost per capped terminal-only episode, including pregame.
+    pub episode_time_cost: f32,
     /// Suppress shaping in complete Map0 episodes; persisted in strict run scope.
     pub terminal_only: bool,
     pub complete_episodes: bool,
@@ -360,6 +389,7 @@ struct ArenaSeatPolicy {
     encoder: FeatureEncoder,
     local: LocalPolicyState,
     persistence: OrderPersistence,
+    order_bookkeeping: PolicyOrderBookkeeping,
     readiness: ItemReadiness,
     teacher: Teacher,
     sequence: u32,
@@ -368,6 +398,65 @@ struct ArenaSeatPolicy {
     readiness_orders: VecDeque<(u32, crate::IssuedOrder, u32)>,
     last_issued: Option<(u32, crate::IssuedOrder, ActionKind)>,
     last_rejection: Option<(u32, RejectReason)>,
+}
+
+#[cfg(test)]
+pub(crate) struct PpoOrderContractProbe(ArenaSeatPolicy);
+
+#[cfg(test)]
+impl PpoOrderContractProbe {
+    pub(crate) fn new(side: usize, messages: &[ServerMsg]) -> Self {
+        Self(setup_seat(side, messages).expect("PPO order-contract seat"))
+    }
+
+    pub(crate) fn observe(&mut self, messages: &[ServerMsg]) {
+        assert!(
+            observe_messages(&mut self.0, messages)
+                .expect("PPO probe observations")
+                .is_none()
+        );
+    }
+
+    pub(crate) fn decide(
+        &mut self,
+        model: &PolicyModel,
+        candidate: bool,
+    ) -> (FeatureFrame, Option<Request>, Option<ActivePolicyOrder>) {
+        let (frame, space) = if candidate {
+            prepare_neural_seat_policy_sample(&mut self.0)
+        } else {
+            prepare_seat_policy_sample(&mut self.0)
+        }
+        .expect("PPO probe input");
+        let action = model
+            .choose(&frame, &space)
+            .expect("PPO probe choice")
+            .action;
+        let request = if candidate {
+            // Only the learner's request transport is tested; these placeholder
+            // statistics never enter a rollout, reward calculation or optimizer.
+            let choice = PpoPolicyChoice {
+                frame: frame.clone(),
+                action,
+                target: crate::BehavioralTarget::from_action(&frame, &space, action)
+                    .expect("probe target"),
+                policy: model.policy_identity().expect("probe policy"),
+                log_probability: 0.0,
+                entropy: 0.0,
+                value: 0.0,
+            };
+            policy_request_in_space(&mut self.0, &choice, &space).expect("PPO learner transport")
+        } else {
+            neural_policy_request_in_space(&mut self.0, action, &space)
+                .expect("legacy probe request")
+                .1
+        };
+        (frame, request, self.0.local.active_order())
+    }
+
+    pub(crate) fn legacy_persistence(&self) -> OrderPersistence {
+        self.0.persistence
+    }
 }
 
 struct TrainingEnvironment {
@@ -1360,18 +1449,7 @@ fn dagger_decision(
     training_action_counts: &mut [u64; ActionKind::COUNT],
     dagger_window_counts: &mut [[[u64; ActionKind::COUNT]; PRETRAINING_WINDOWS]; 2],
 ) -> Result<usize, PpoError> {
-    let space = ActionSpace::from_tracker_with_readiness(&seat.tracker, &seat.readiness)
-        .map_err(|error| PpoError::Model(error.to_string()))?;
-    let mut frame = FeatureFrame::new();
-    seat.encoder
-        .encode(
-            &seat.tracker,
-            &space,
-            &seat.readiness,
-            &seat.local,
-            &mut frame,
-        )
-        .map_err(feature_error)?;
+    let (frame, space) = prepare_neural_observer_sample(seat)?;
     let learner = model.choose(&frame, &space).map_err(model_error)?.action;
     let (teacher, _) = seat
         .teacher
@@ -1424,18 +1502,7 @@ fn dagger_learner_request(
     if deployment_uses_teacher(seat.tracker.metadata().map) {
         return teacher_request(seat);
     }
-    let space = ActionSpace::from_tracker_with_readiness(&seat.tracker, &seat.readiness)
-        .map_err(|error| PpoError::Model(error.to_string()))?;
-    let mut frame = FeatureFrame::new();
-    seat.encoder
-        .encode(
-            &seat.tracker,
-            &space,
-            &seat.readiness,
-            &seat.local,
-            &mut frame,
-        )
-        .map_err(feature_error)?;
+    let (frame, space) = prepare_neural_observer_sample(seat)?;
     let action = model.choose(&frame, &space).map_err(model_error)?.action;
     let action = seat
         .teacher
@@ -1585,6 +1652,7 @@ fn pretraining_teacher_action(
     ),
     PpoError,
 > {
+    observe_neural_seat_orders(seat)?;
     let (action, space) = seat
         .teacher
         .decide(&seat.tracker, &seat.persistence, &seat.readiness)
@@ -1977,10 +2045,10 @@ impl TrainingSession {
                 &self.model,
                 &mut self.sampling,
                 &mut environments,
-                config,
+                settings,
+                update,
                 &mut rollout,
                 &mut actor_report,
-                settings.terminal_only,
             )?;
         } else {
             collect_update(
@@ -2514,6 +2582,12 @@ fn training_checkpoint_run(
     if settings.terminal_only {
         command_line.push_str(" --terminal-only");
     }
+    if settings.episode_time_cost > 0.0 {
+        command_line.push_str(&format!(
+            " --episode-time-cost {}",
+            settings.episode_time_cost
+        ));
+    }
     Ok(CheckpointRun {
         git_commit: settings.git_commit.clone(),
         simulator_commit: settings.simulator_commit.clone(),
@@ -2778,6 +2852,13 @@ fn warmup_training_environments(
     {
         return Err(PpoError::InvalidConfig("training warmup environments"));
     }
+    // Even a zero-decision warmup sends cleanup requests before the first sampled action.
+    for environment in environments.iter_mut() {
+        let seat = &mut environment.seats[environment.policy_seat];
+        seat.order_bookkeeping
+            .enable_candidate(&seat.persistence)
+            .map_err(PpoError::InvalidTransition)?;
+    }
     let maximum = decisions.iter().copied().max().unwrap_or(0);
     for decision in 0..maximum {
         let active = decisions
@@ -2977,6 +3058,10 @@ fn clear_warmup_orders(
     }
     for seat in &mut environment.seats {
         seat.persistence.clear_body();
+        if seat.order_bookkeeping.is_neural() {
+            seat.order_bookkeeping.clear_body();
+            seat.pending_active = None;
+        }
         seat.teacher = Teacher::new();
         let tick = seat
             .tracker
@@ -3204,7 +3289,16 @@ fn build_environment(
         seed,
     })
     .map_err(|error| PpoError::Model(error.to_string()))?;
-    let seats = setup_seats(start)?;
+    let mut seats = setup_seats(start)?;
+    if matches!(
+        opponent_spec,
+        OpponentSpec::Policy(_) | OpponentSpec::SharedPolicy(_)
+    ) {
+        let seat = &mut seats[1 - policy_seat];
+        seat.order_bookkeeping
+            .enable_candidate(&seat.persistence)
+            .map_err(PpoError::InvalidTransition)?;
+    }
     let mut reward = RewardTracker::default();
     reward.observe(
         seats[policy_seat]
@@ -3810,6 +3904,7 @@ fn setup_seat(index: usize, messages: &[ServerMsg]) -> Result<ArenaSeatPolicy, P
         encoder,
         local: LocalPolicyState::new(1),
         persistence: OrderPersistence::default(),
+        order_bookkeeping: PolicyOrderBookkeeping::Legacy,
         readiness: ItemReadiness::new(),
         teacher: Teacher::new(),
         sequence: 0,
@@ -3932,6 +4027,35 @@ fn prepare_policy_sample(
     environment: &mut TrainingEnvironment,
 ) -> Result<(FeatureFrame, ActionSpace), PpoError> {
     let seat = &mut environment.seats[environment.policy_seat];
+    prepare_neural_seat_policy_sample(seat)
+}
+
+fn prepare_neural_seat_policy_sample(
+    seat: &mut ArenaSeatPolicy,
+) -> Result<(FeatureFrame, ActionSpace), PpoError> {
+    seat.order_bookkeeping
+        .enable_candidate(&seat.persistence)
+        .map_err(PpoError::InvalidTransition)?;
+    seat.order_bookkeeping
+        .reconcile(&seat.tracker, &mut seat.local, &mut seat.pending_active)
+        .map_err(|error| PpoError::Model(error.to_string()))?;
+    prepare_seat_policy_sample(seat)
+}
+
+/// Starts model-facing observation before any actual send; Teacher transport remains legacy.
+fn observe_neural_seat_orders(seat: &mut ArenaSeatPolicy) -> Result<(), PpoError> {
+    seat.order_bookkeeping
+        .enable_observer(&seat.persistence)
+        .map_err(PpoError::InvalidTransition)?;
+    seat.order_bookkeeping
+        .reconcile(&seat.tracker, &mut seat.local, &mut seat.pending_active)
+        .map_err(|error| PpoError::Model(error.to_string()))
+}
+
+fn prepare_neural_observer_sample(
+    seat: &mut ArenaSeatPolicy,
+) -> Result<(FeatureFrame, ActionSpace), PpoError> {
+    observe_neural_seat_orders(seat)?;
     prepare_seat_policy_sample(seat)
 }
 
@@ -4059,19 +4183,7 @@ fn sample_policy(
     sampling: &mut PpoRng,
     environment: &mut TrainingEnvironment,
 ) -> Result<PpoPolicyChoice, PpoError> {
-    let seat = &mut environment.seats[environment.policy_seat];
-    let space = ActionSpace::from_tracker_with_readiness(&seat.tracker, &seat.readiness)
-        .map_err(|error| PpoError::Model(error.to_string()))?;
-    let mut frame = FeatureFrame::new();
-    seat.encoder
-        .encode(
-            &seat.tracker,
-            &space,
-            &seat.readiness,
-            &seat.local,
-            &mut frame,
-        )
-        .map_err(feature_error)?;
+    let (frame, space) = prepare_policy_sample(environment)?;
     model.sample(&frame, &space, sampling).map_err(model_error)
 }
 
@@ -4281,18 +4393,7 @@ fn opponent_request(
 ) -> Result<Option<Request>, PpoError> {
     match opponent {
         OpponentRuntime::Policy { model, rng } => {
-            let space = ActionSpace::from_tracker_with_readiness(&seat.tracker, &seat.readiness)
-                .map_err(|error| PpoError::Model(error.to_string()))?;
-            let mut frame = FeatureFrame::new();
-            seat.encoder
-                .encode(
-                    &seat.tracker,
-                    &space,
-                    &seat.readiness,
-                    &seat.local,
-                    &mut frame,
-                )
-                .map_err(feature_error)?;
+            let (frame, space) = prepare_neural_seat_policy_sample(seat)?;
             let choice = model.sample(&frame, &space, rng).map_err(model_error)?;
             policy_request(seat, &choice)
         }
@@ -4375,7 +4476,8 @@ fn issue_request(
     action_kind: ActionKind,
     synchronize_teacher: bool,
 ) -> Result<Option<Request>, PpoError> {
-    let Some(issued) = seat.persistence.should_send(issued) else {
+    let persistence = seat.order_bookkeeping.transport(&seat.persistence);
+    let Some(issued) = persistence.should_send(issued) else {
         return Ok(None);
     };
     let previous = seat.local.active_order();
@@ -4383,26 +4485,22 @@ fn issue_request(
         .sequence
         .checked_add(1)
         .ok_or(PpoError::CounterOverflow)?;
-    seat.persistence
-        .record_sent(seat.sequence, issued)
+    let preserves = seat
+        .order_bookkeeping
+        .record_sent(&mut seat.persistence, seat.sequence, issued, &seat.tracker)
         .map_err(|error| PpoError::Model(error.to_string()))?;
     seat.readiness.note_sent(seat.sequence, issued, space);
-    if matches!(
-        issued.order,
-        bota_proto::Order::Swap { .. } | bota_proto::Order::Use { .. }
-    ) {
-        if seat.readiness_orders.len() == READINESS_ORDER_HISTORY {
-            seat.readiness_orders.pop_front();
-        }
-        seat.readiness_orders
-            .push_back((seat.sequence, issued, space.tick()));
-    }
-    let update = crate::active_order_update_for_sent(
-        &seat.persistence,
-        issued.unit,
-        seat.sequence,
-        action_kind,
-    );
+    remember_readiness_order(seat, issued, space.tick());
+    let update = if preserves {
+        crate::ActiveOrderUpdate::Preserve
+    } else {
+        crate::active_order_update_for_sent(
+            seat.order_bookkeeping.effective(&seat.persistence),
+            issued.unit,
+            seat.sequence,
+            action_kind,
+        )
+    };
     seat.pending_active = match update {
         crate::ActiveOrderUpdate::Preserve => seat.pending_active,
         crate::ActiveOrderUpdate::Replace(None) if previous.is_none() => None,
@@ -4428,6 +4526,21 @@ fn issue_request(
         unit: issued.unit,
         order: issued.order,
     }))
+}
+
+fn remember_readiness_order(seat: &mut ArenaSeatPolicy, issued: crate::IssuedOrder, tick: u32) {
+    assert!(seat.readiness_orders.len() <= READINESS_ORDER_HISTORY);
+    if matches!(
+        issued.order,
+        bota_proto::Order::Swap { .. } | bota_proto::Order::Use { .. }
+    ) {
+        if seat.readiness_orders.len() == READINESS_ORDER_HISTORY {
+            seat.readiness_orders.pop_front();
+        }
+        seat.readiness_orders
+            .push_back((seat.sequence, issued, tick));
+    }
+    assert!(seat.readiness_orders.len() <= READINESS_ORDER_HISTORY);
 }
 
 fn advance_interval(
@@ -4485,6 +4598,9 @@ fn restart_environment(environment: &mut TrainingEnvironment) -> Result<(), PpoE
         environment.decision,
         environment.opponent_spec.clone(),
     )?;
+    for (previous, next) in environment.seats.iter().zip(&mut replacement.seats) {
+        next.order_bookkeeping = previous.order_bookkeeping.for_new_trajectory();
+    }
     replacement.retired_rejections = retired;
     *environment = replacement;
     Ok(())
@@ -4499,6 +4615,7 @@ fn observe_messages(
         match message {
             ServerMsg::OrderRejected { seq, reason } => {
                 seat.persistence.observe_rejection(*seq);
+                seat.order_bookkeeping.observe_rejection(*seq);
                 seat.readiness.note_rejected(*seq);
                 seat.teacher.note_rejected(*seq);
                 if let Some((pending, previous)) = seat.pending_active
@@ -4532,6 +4649,9 @@ fn observe_messages(
             | ServerMsg::ParticipantLeft { .. } => {}
         }
     }
+    seat.order_bookkeeping
+        .reconcile(&seat.tracker, &mut seat.local, &mut seat.pending_active)
+        .map_err(|error| PpoError::Model(error.to_string()))?;
     seat.encoder.observe(&seat.tracker).map_err(feature_error)?;
     Ok(winner)
 }
@@ -4557,6 +4677,7 @@ fn observe_arena_snapshot(
     let current = seat.tracker.own_hero().map(|hero| hero.id);
     if previous != current {
         seat.persistence.clear_body_for(None);
+        seat.order_bookkeeping.clear_body_for(None);
         seat.local
             .set_active_order(view.tick, None)
             .map_err(|error| PpoError::Model(error.to_string()))?;

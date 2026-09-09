@@ -14,6 +14,14 @@ use crate::{
 
 static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(1);
 
+const M11_PARAMETERS: usize = 1_684_724;
+#[path = "checkpoint_input_adapter.rs"]
+mod checkpoint_input_adapter;
+#[path = "checkpoint_order_contract.rs"]
+mod checkpoint_order_contract;
+#[path = "checkpoint_training_contract.rs"]
+mod checkpoint_training_contract;
+
 fn selected_m10_metadata() -> std::collections::HashMap<String, String> {
     [
         ("action_schema_hash", "1755359086494840931"),
@@ -31,7 +39,7 @@ fn selected_m10_metadata() -> std::collections::HashMap<String, String> {
 #[test]
 fn m10_training_initialization_rejects_wrong_or_partial_metadata_and_tensor_contracts() {
     let directory = test_directory("m10-initialization-contract");
-    let data = vec![0u8; crate::MODEL_PARAMETER_COUNT * 4];
+    let data = vec![0u8; M11_PARAMETERS * 4];
     for field in selected_m10_metadata().keys() {
         for replacement in [None, Some("0")] {
             let mut metadata = selected_m10_metadata();
@@ -39,8 +47,7 @@ fn m10_training_initialization_rejects_wrong_or_partial_metadata_and_tensor_cont
             if let Some(value) = replacement {
                 metadata.insert(field.clone(), value.to_owned());
             }
-            let tensor = TensorView::new(Dtype::F32, vec![crate::MODEL_PARAMETER_COUNT], &data)
-                .expect("tensor");
+            let tensor = TensorView::new(Dtype::F32, vec![M11_PARAMETERS], &data).expect("tensor");
             let bytes = serialize([("model.parameters", tensor)], Some(metadata)).expect("fixture");
             fs::write(directory.join("drysua.weights.safetensors"), bytes).expect("write");
 
@@ -59,18 +66,18 @@ fn m10_training_initialization_rejects_wrong_or_partial_metadata_and_tensor_cont
         }
     }
     for (name, dtype, count, expected) in [
-        ("wrong", Dtype::F32, crate::MODEL_PARAMETER_COUNT, "names"),
+        ("wrong", Dtype::F32, M11_PARAMETERS, "names"),
         (
             "model.parameters",
             Dtype::I32,
-            crate::MODEL_PARAMETER_COUNT,
+            M11_PARAMETERS,
             "dtype or shape",
         ),
         ("model.parameters", Dtype::F32, 1, "dtype or shape"),
         (
             "model.parameters",
             Dtype::F32,
-            crate::MODEL_PARAMETER_COUNT,
+            M11_PARAMETERS,
             "selected M10 training source SHA-256",
         ),
     ] {
@@ -98,11 +105,10 @@ fn m10_training_initialization_rejects_wrong_or_partial_metadata_and_tensor_cont
 #[test]
 fn m10_training_initialization_rejects_nonfinite_parameters() {
     let directory = test_directory("m10-initialization-nonfinite");
-    let mut data = vec![0u8; crate::MODEL_PARAMETER_COUNT * 4];
+    let mut data = vec![0u8; M11_PARAMETERS * 4];
     for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
         data[..4].copy_from_slice(&value.to_le_bytes());
-        let tensor =
-            TensorView::new(Dtype::F32, vec![crate::MODEL_PARAMETER_COUNT], &data).expect("tensor");
+        let tensor = TensorView::new(Dtype::F32, vec![M11_PARAMETERS], &data).expect("tensor");
         let bytes = serialize(
             [("model.parameters", tensor)],
             Some(selected_m10_metadata()),
@@ -170,7 +176,9 @@ fn selected_m10_initializes_fresh_training_but_runtime_rejects_before_mutation()
         initialized
             .export_parameters()
             .expect("initialized parameters"),
-        expected
+        initialized
+            .widen_m11_input_parameters(&expected)
+            .expect("audited old input layout")
     );
     assert_eq!(digest, <[u8; 32]>::from(Sha256::digest(&bytes)));
     let optimizer = initialized
@@ -187,18 +195,125 @@ const PRIOR_PPO_SCHEMAS: [(u32, u64, u32); 3] = [
 ];
 
 #[test]
-fn exact_m11_ppo19_runtime_loads_unchanged_but_ppo19_training_rejects() {
+fn exact_m12_ppo23_runtime_and_training_reject_before_mutation() {
+    assert_m12_order_contract_rejection(23, 765_990_392_710_687_046, 18);
+}
+
+#[test]
+fn exact_m12_ppo24_runtime_and_training_reject_before_mutation() {
+    assert_m12_order_contract_rejection(24, 17_486_156_843_355_673_207, 19);
+}
+
+#[test]
+fn exact_m12_ppo25_runtime_and_training_reject_before_mutation() {
+    assert_m12_order_contract_rejection(25, 12_302_688_747_093_836_273, 20);
+}
+
+fn m12_metadata(version: u32, hash: u64, rules: u32) -> std::collections::HashMap<String, String> {
+    let mut metadata = current_runtime_metadata();
+    metadata.insert(
+        "feature_schema_hash".to_owned(),
+        "8078516161541333175".to_owned(),
+    );
+    metadata.insert(
+        "model_schema_hash".to_owned(),
+        "17156054387874206897".to_owned(),
+    );
+    metadata.insert("ppo_schema_version".to_owned(), version.to_string());
+    metadata.insert("ppo_schema_hash".to_owned(), hash.to_string());
+    metadata.insert("ppo_rules_audit_version".to_owned(), rules.to_string());
+    metadata
+}
+
+fn assert_m12_order_contract_rejection(version: u32, hash: u64, rules: u32) {
+    let directory = test_directory("m12-old-order-contract");
+    let source = PolicyModel::fresh(18124).expect("model");
+    let parameters = source.export_parameters().expect("parameters");
+    let data: Vec<_> = parameters
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect();
+    let metadata = m12_metadata(version, hash, rules);
+    let view = TensorView::new(Dtype::F32, vec![parameters.len()], &data).expect("view");
+    let bytes = serialize([("model.parameters", view)], Some(metadata)).expect("runtime fixture");
+    let path = directory.join("drysua.weights.safetensors");
+    fs::write(&path, &bytes).expect("fixture");
+    let target = PolicyModel::fresh(18125).expect("target");
+    let identity = target.policy_identity().expect("identity");
+    let original = target.export_parameters().expect("original");
+    let target_trainer = PpoTrainer::new(&target, checkpoint_config(), 18127).expect("optimizer");
+    let error = TrainingArtifact::load_runtime_weights(&target, &directory)
+        .expect_err("legacy candidate order semantics must reject");
+    assert_eq!(error, CheckpointError::SchemaMismatch);
+    assert_eq!(
+        error.to_string(),
+        "checkpoint schema does not match this build"
+    );
+    assert_eq!(
+        target.policy_identity().expect("unchanged identity"),
+        identity
+    );
+    assert_eq!(
+        target.export_parameters().expect("unchanged parameters"),
+        original
+    );
+    assert_eq!(target_trainer.optimizer_step(), 0);
+    assert!(
+        TrainingArtifact::capture(
+            &target,
+            &target_trainer,
+            run_metadata(),
+            progress_metadata(0),
+        )
+        .is_ok(),
+        "rejection must preserve optimizer binding"
+    );
+    assert_eq!(fs::read(path).expect("unmodified"), bytes);
+    let trainer = PpoTrainer::new(&source, checkpoint_config(), 18126).expect("trainer");
+    TrainingArtifact::capture(&source, &trainer, run_metadata(), progress_metadata(0))
+        .expect("capture")
+        .save(&directory)
+        .expect("save");
+    let path = directory.join("checkpoint.meta");
+    let mut manifest = fs::read(&path).expect("manifest");
+    let offset = 8 + 4 + 8 + 3 * (4 + 8);
+    manifest[offset..offset + 4].copy_from_slice(&version.to_le_bytes());
+    manifest[offset + 4..offset + 12].copy_from_slice(&hash.to_le_bytes());
+    fs::write(&path, &manifest).expect("old training fixture");
+    let Err(error) = TrainingArtifact::load(&directory) else {
+        panic!("old training version {version} must reject");
+    };
+    assert_eq!(error, CheckpointError::SchemaMismatch);
+    assert_eq!(
+        error.to_string(),
+        "checkpoint schema does not match this build"
+    );
+    assert_eq!(
+        TrainingArtifact::load_compatible(&directory, &run_metadata()).expect_err("strict resume"),
+        CheckpointError::SchemaMismatch
+    );
+    assert_eq!(fs::read(path).expect("unchanged"), manifest);
+    fs::remove_dir_all(directory).expect("cleanup");
+}
+
+#[test]
+fn exact_m11_ppo19_runtime_and_training_reject_after_input_widening() {
     assert_m11_runtime_only_compatibility(19, 3_810_026_640_568_905_163, 15);
 }
 
 #[test]
-fn exact_m11_ppo20_runtime_loads_unchanged_but_ppo20_training_rejects() {
+fn exact_m11_ppo20_runtime_and_training_reject_after_input_widening() {
     assert_m11_runtime_only_compatibility(20, 8_812_022_392_730_398_368, 16);
 }
 
 #[test]
-fn exact_m11_ppo21_runtime_loads_unchanged_but_ppo21_training_rejects() {
+fn exact_m11_ppo21_runtime_and_training_reject_after_input_widening() {
     assert_m11_runtime_only_compatibility(21, 768_751_058_595_344_501, 17);
+}
+
+#[test]
+fn exact_m11_ppo22_runtime_and_training_reject_after_input_widening() {
+    assert_m11_runtime_only_compatibility(22, 7_033_554_372_932_156_753, 18);
 }
 
 fn assert_m11_runtime_only_compatibility(version: u32, hash: u64, rules: u32) {
@@ -210,6 +325,14 @@ fn assert_m11_runtime_only_compatibility(version: u32, hash: u64, rules: u32) {
         .flat_map(|value| value.to_le_bytes())
         .collect();
     let mut metadata = current_runtime_metadata();
+    metadata.insert(
+        "feature_schema_hash".to_owned(),
+        "15519817897416174399".to_owned(),
+    );
+    metadata.insert(
+        "model_schema_hash".to_owned(),
+        "18229126264156367519".to_owned(),
+    );
     metadata.insert("ppo_schema_version".to_owned(), version.to_string());
     metadata.insert("ppo_schema_hash".to_owned(), hash.to_string());
     metadata.insert("ppo_rules_audit_version".to_owned(), rules.to_string());
@@ -218,10 +341,20 @@ fn assert_m11_runtime_only_compatibility(version: u32, hash: u64, rules: u32) {
     let path = directory.join("drysua.weights.safetensors");
     fs::write(&path, &bytes).expect("fixture");
     let target = PolicyModel::fresh(18_122).expect("target");
-    TrainingArtifact::load_runtime_weights(&target, &directory).expect("audited inference tuple");
+    let original = target.export_parameters().expect("before");
+    let identity = target.policy_identity().expect("identity");
+    assert_eq!(
+        TrainingArtifact::load_runtime_weights(&target, &directory)
+            .expect_err("old inputs incompatible"),
+        CheckpointError::SchemaMismatch
+    );
     assert_eq!(
         target.export_parameters().expect("loaded parameters"),
-        parameters
+        original
+    );
+    assert_eq!(
+        target.policy_identity().expect("unchanged identity"),
+        identity
     );
     assert_eq!(fs::read(&path).expect("unchanged bytes"), bytes);
     let trainer = PpoTrainer::new(&source, checkpoint_config(), 18_123).expect("trainer");
@@ -505,6 +638,7 @@ fn provenance_migration_rejects_v13_v14_v15_without_rewriting_training_manifest(
     let path = directory.join("checkpoint.meta");
     let current = fs::read(&path).expect("manifest");
     let settings = crate::TrainingJobConfig {
+        episode_time_cost: 0.0,
         terminal_only: false,
         complete_episodes: false,
         updates: 1,
@@ -563,6 +697,11 @@ fn training_rejects_prior_action_feature_and_model_bindings_independently() {
         (1, 7, 13_875_648_161_437_731_669),
         (2, 7, 10_644_717_168_650_027_237),
         (2, 9, 832_872_366_354_465_423),
+        (1, 11, 8_078_516_161_541_333_175),
+        (2, 12, 17_156_054_387_874_206_897),
+        (3, 23, 765_990_392_710_687_046),
+        (3, 24, 17_486_156_843_355_673_207),
+        (3, 25, 12_302_688_747_093_836_273),
     ] {
         let mut bytes = current.clone();
         let offset = 8 + 4 + 8 + index * (4 + 8);

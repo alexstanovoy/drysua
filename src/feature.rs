@@ -21,10 +21,10 @@ use crate::{
     SHADOW_FIEND_ABILITY_SLOTS, StateTracker, TERRAIN_CELL_SIZE, UNIT_TOKENS,
 };
 
-/// Version of the append-only policy feature schema.
-pub const FEATURE_SCHEMA_VERSION: u32 = 10;
+/// Version of the policy feature layout and candidate input-state semantics.
+pub const FEATURE_SCHEMA_VERSION: u32 = 12;
 /// Number of scalar global features.
-pub const GLOBAL_FEATURES: usize = 64;
+pub const GLOBAL_FEATURES: usize = 72;
 /// Number of scalar features in one global-history sample.
 pub const HISTORY_FEATURES: usize = 24;
 /// Number of global-history samples.
@@ -34,7 +34,7 @@ pub const POLICY_HISTORY_FEATURES: usize = 4;
 /// Maximum number of local policy-history samples.
 pub const MAX_POLICY_HISTORY: usize = 16;
 /// Number of scalar features in one unit token.
-pub const UNIT_FEATURES: usize = 69;
+pub const UNIT_FEATURES: usize = 73;
 /// Number of unit tokens in exact ActionSpace entity-candidate order.
 pub const UNIT_FEATURE_TOKENS: usize = UNIT_TOKENS;
 /// Number of fixed own hero and courier unit tokens.
@@ -155,6 +155,14 @@ pub mod global_feature {
     pub const ACTIVE_TARGET_ALLIED: usize = 56;
     pub const ACTIVE_TARGET_ENEMY: usize = 57;
     pub const ACTIVE_TARGET_NEUTRAL: usize = 58;
+    pub const OWN_ANCIENT_PRESENT: usize = 64;
+    pub const OWN_ANCIENT_RELATIVE_X: usize = 65;
+    pub const OWN_ANCIENT_RELATIVE_Y: usize = 66;
+    pub const OWN_ANCIENT_DISTANCE: usize = 67;
+    pub const ENEMY_ANCIENT_PRESENT: usize = 68;
+    pub const ENEMY_ANCIENT_RELATIVE_X: usize = 69;
+    pub const ENEMY_ANCIENT_RELATIVE_Y: usize = 70;
+    pub const ENEMY_ANCIENT_DISTANCE: usize = 71;
 }
 
 /// Stable indices in each unit token.
@@ -215,6 +223,10 @@ pub mod unit_feature {
     pub const ITEM_SLOT_COUNT: usize = 66;
     pub const FREE_ITEM_SLOTS: usize = 67;
     pub const ITEM_CAPACITY_AVAILABLE: usize = 68;
+    pub const INVULNERABLE: usize = 69;
+    pub const CHANNELLING: usize = 70;
+    pub const FACING_COS: usize = 71;
+    pub const FACING_SIN: usize = 72;
 }
 
 /// Stable indices in each point-candidate token.
@@ -362,9 +374,9 @@ pub mod loot_feature {
 
 /// Canonical schema text covered by [`FEATURE_SCHEMA_HASH`].
 pub const FEATURE_SCHEMA_DESCRIPTOR: &str = concat!(
-    "bota-drysua-feature/v10;",
+    "bota-drysua-feature/v12;",
     "action_schema_version=3;action_schema_hash=1755359086494840931;",
-    "shapes=global:64,history:7x24,policy_history:16x4,unit:96x69,own_unit:2x69,remembered_unit:32x69,point:48x32,ability:14x24,item:85x28,projectile:32x20,loot:16x16,map:96;",
+    "shapes=global:72,history:7x24,policy_history:16x4,unit:96x73,own_unit:2x73,remembered_unit:32x73,point:48x32,ability:14x24,item:85x28,projectile:32x20,loot:16x16,map:96;",
     "scalar_ranges=presence_and_one_hot:[0,1],unsigned_continuous:[0,1],signed_continuous:[-1,1],category:positive_exact_integer,all_finite;",
     "history_ages=480,240,120,60,30,15,0;",
     "normalizers=tick:3600000,age:4800,history_age:480,gold_asset_item_cost:100000,score:1000,xp:100000,hp:100000,mana:20000,damage:10000,attack_interval:600,speed:2000,armor_raw:6553600,level:30,charges:255,cooldown:36000,structures:64;",
@@ -394,6 +406,11 @@ pub const FEATURE_SCHEMA_DESCRIPTOR: &str = concat!(
     "readiness=wire_item_mute_exact,local_backpack_mute:180_from_apply_tick,effective_mute_max_wire_and_local,teleport_shared_wait:2100_from_apply_tick,hero_inventory_journals6,body_shared_journals2,recent_request_cap8,effective_evicted_base_retained,rejection_exact_for_retained_sequences,evicted_sequence_rejection_unsupported,retained_rejections_restore_base;",
     "local_rollback=active_assignment_transition_cap16,evicted_effective_base_retained,earliest_supported_tick_tracked,rollback_before_horizon_exact_error_and_atomic,decision_eviction_advances_horizon_to_incoming_tick;",
     "active_target=opaque_local_point_or_full_generation_unit_key_never_encoded_as_identifier,canonical_relative_position_distance,point_or_unit,visibility,unit_kind_and_relation;",
+    "candidate_order=opt_in_live_pure_neural_ppo_learner_and_greedy_candidate_neuralseat_learner;legacy_order=teacher_tactical_hybrid_frozen_opponents_expert_collection_and_dagger_labeler_ledger_unchanged;",
+    "own_cast=implicit_own_shadow_fiend_nonpassive_visible_aimOwn_ability13_14_15_16_targetNone,preserve_body_directive_sequence_kind_target_start_and_pending_rollback_advance_actual_sent_sequence,not_attack_animation_phase;other_casts_use_put_take_legacy_interruption;",
+    "reconcile=complete_snapshot_and_current_tick_events_before_features,full_validated_snapshot_living_handles_not_cap96;fallback=absent_full_handle_attack_or_move_unit_to_last_observed_point_only_immediately_previous_tick_without_observed_death,keep_request_sequence,set_hero_AttackMovePoint_or_MovePoint_start_at_fallback_tick,reappearance_does_not_restore_unit_or_reset_age;unknown_target_or_unproved_final_position_clear_not_Stop;",
+    "candidate_ledgers=separate_legacy_actual_requests_and_candidate_effective_directives,two_bodies_one_previous_transition_each_one_hero_pending_rollback,reconcile_current_and_rollback_atomically_after_local_chronology_check,older_rejections_noop,hero_lifecycle_clears_both_hero_states,courier_death_disappearance_generation_invalidates_only_candidate_courier;prefix_replay=observations_actual_sends_rejections_and_explicit_candidate_role_both_ledgers;",
+    "policy_history=unchanged16x4_selected_kind_age_presence_only_no_targets_slots_outcomes_or_enriched_sent_history;fallback_bookkeeping=no_wire_request_no_selected_action_no_sent_history_insertion;numeric_event_features=unchanged_prior_snapshot_tick_filter_current_tick_death_used_only_for_candidate_reconciliation;",
     "own_payloads=live_body_current,hero_scoreboard_kit_current_with_source_bit,absent_courier_ability_and_item_payloads_missing,no_remembered_body_payload_fallback;",
     "provenance=private_nonzero_checked_tracker_lineage_clone_gets_fresh_lineage_move_preserves_lineage,action_space_exact_bounded_lineage_slot_static_snapshot_tracker_comparison,readiness_exact_bounded_comparison,observation_exact_bounded_lineage_slot_static_snapshot_tracker_comparison,encoder_static_exact_bounded_comparison,no_correctness_claim_for_fnv_schema_hash;",
     "audit=enemy_scoreboard_disabled_by_default,global47_and_history23_presence,disabled_zeros_enemy_alive_and_score_xp_level_kda_last_hit_deny_advantages;",
@@ -417,7 +434,9 @@ pub const FEATURE_SCHEMA_DESCRIPTOR: &str = concat!(
     "item_scalars=normalizers:charges255_cooldown36000_range_fixed_max_mana20000_value100000_mute36000_shared_wait36000,categories:location_hero2_stash3_courier4_shop5_with1_reserved_slot1..64_item1..65536_aim1..5_attribute1..3,reserved:27;",
     "projectile_scalars=normalizers:relative_extent_facing65535_velocity_extent_per_tick_age4800_closest_approach_extent,categories:relation_onehot4_ability1..65547,reserved:18..19;",
     "loot_scalars=normalizers:charges255_relative_extent_direct_extent_path_axis_squared_age4800,categories:item1..65536,reserved:12..15;",
-    "map_scalars=normalizers:elevation63_landmark_squared_extent_ray_step20,categories:direction_fixed_E_NE_N_NW_W_SW_S_SE_hit_kind_walkable_water_opaque_tree,reserved:14..15;"
+    "map_scalars=normalizers:elevation63_landmark_squared_extent_ray_step20,categories:direction_fixed_E_NE_N_NW_W_SW_S_SE_hit_kind_walkable_water_opaque_tree,reserved:14..15;",
+    "unit_append_indices=69:invulnerable,70:channelling,71:facing_cos,72:facing_sin;unit_append_semantics=wire_status_bits9_10,last_observed_only_with_visible_remembered_age_provenance,canonical_facing_brads_times_TAU_div65536_f32_sin_cos,absent_token_zero;",
+    "global_append_indices=64:own_ancient_present,65:own_ancient_relative_x,66:own_ancient_relative_y,67:own_ancient_distance,68:enemy_ancient_present,69:enemy_ancient_relative_x,70:enemy_ancient_relative_y,71:enemy_ancient_distance;ancient_geometry=seat_observed_current_or_remembered_Ancient_kind_exact_team,only_unique_known_position_per_team,requires_live_own_hero_origin,canonical_delta_extent_chebyshev_distance_extent,missing_or_ambiguous_all_zero,no_hidden_map_lookup_no_goal_priority;"
 );
 
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
@@ -438,6 +457,8 @@ const fn fnv1a(bytes: &[u8]) -> u64 {
 pub const FEATURE_SCHEMA_HASH: u64 = fnv1a(FEATURE_SCHEMA_DESCRIPTOR.as_bytes());
 
 const _: () = assert!(crate::ACTION_SCHEMA_VERSION == 3);
+const _: () = assert!(StatusFlags::INVULNERABLE == 1 << 9);
+const _: () = assert!(StatusFlags::CHANNELLING == 1 << 10);
 const _: () = assert!(crate::ACTION_SCHEMA_HASH == 1_755_359_086_494_840_931);
 const _: () = assert!(crate::MAX_TRACKED_ENTITIES == 4_096);
 const _: () = assert!(MAX_PROJECTILES == 4_096);
@@ -1588,6 +1609,42 @@ impl FeatureEncoder {
         let (dealt, taken) = snapshot_damage(tracker);
         output.global[index::SNAPSHOT_DAMAGE_DEALT] = signed_ratio(dealt, MAX_DAMAGE);
         output.global[index::SNAPSHOT_DAMAGE_TAKEN] = signed_ratio(taken, MAX_DAMAGE);
+        self.encode_ancient_geometry(tracker, &mut output.global);
+    }
+
+    fn encode_ancient_geometry(&self, tracker: &StateTracker, global: &mut [f32; GLOBAL_FEATURES]) {
+        let Some(origin) = tracker.own_hero().map(|unit| unit.pos) else {
+            return;
+        };
+        let enemy = match tracker.team() {
+            Team::Radiant => Team::Dire,
+            Team::Dire => Team::Radiant,
+            Team::Neutral => return,
+        };
+        for (team, offset) in [
+            (tracker.team(), global_feature::OWN_ANCIENT_PRESENT),
+            (enemy, global_feature::ENEMY_ANCIENT_PRESENT),
+        ] {
+            let mut positions = tracker
+                .entities()
+                .iter()
+                .filter(|track| track.unit.kind == UnitKind::Ancient && track.unit.team == team)
+                .map(|track| track.unit.pos);
+            let Some(position) = positions.next() else {
+                continue;
+            };
+            if positions.any(|other| other != position) {
+                continue;
+            }
+            let delta = self.canonical_delta(tracker.team(), position, origin);
+            global[offset] = 1.0;
+            global[offset + 1] = signed_raw_ratio(delta.0, self.extent_raw);
+            global[offset + 2] = signed_raw_ratio(delta.1, self.extent_raw);
+            global[offset + 3] =
+                raw_distance_ratio_i64(delta.0.abs().max(delta.1.abs()), self.extent_raw);
+            assert!(global[offset + 1].is_finite());
+            assert!((0.0..=1.0).contains(&global[offset + 3]));
+        }
     }
 
     fn encode_history(&self, tracker: &StateTracker, output: &mut FeatureFrame) {
@@ -1742,6 +1799,15 @@ impl FeatureEncoder {
         token[unit_feature::POSITION_X] = coordinate_ratio(position.x.raw, self.extent_raw);
         token[unit_feature::POSITION_Y] = coordinate_ratio(position.y.raw, self.extent_raw);
         token[unit_feature::FACING] = facing_feature(team, unit.facing);
+        let brads = if team == Team::Dire {
+            unit.facing.brads.wrapping_add(32768)
+        } else {
+            unit.facing.brads
+        };
+        let radians = f32::from(brads) * (std::f32::consts::TAU / 65536.0);
+        let (sine, cosine) = radians.sin_cos();
+        token[unit_feature::FACING_COS] = cosine;
+        token[unit_feature::FACING_SIN] = sine;
         token[unit_feature::RADIUS] = raw_distance_ratio(unit.radius.raw, self.extent_raw);
         if let Some(origin) = origin {
             token[unit_feature::ORIGIN_PRESENT] = 1.0;
@@ -2716,6 +2782,9 @@ fn encode_ability_history(
 }
 
 fn encode_statuses(token: &mut [f32; UNIT_FEATURES], statuses: StatusFlags) {
+    token[unit_feature::INVULNERABLE] =
+        bool_feature(statuses.bits & StatusFlags::INVULNERABLE != 0);
+    token[unit_feature::CHANNELLING] = bool_feature(statuses.bits & StatusFlags::CHANNELLING != 0);
     for (offset, flag) in [
         StatusFlags::STUNNED,
         StatusFlags::SILENCED,

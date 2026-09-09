@@ -24,20 +24,23 @@ const HERO: EntityId = entity(10, 1);
 const COURIER: EntityId = entity(11, 1);
 const ENEMY: EntityId = entity(20, 1);
 
+#[path = "feature_facts.rs"]
+mod feature_facts;
+
 #[test]
 fn feature_schema_dimensions_and_hash_are_stable() {
-    assert_eq!(FEATURE_SCHEMA_VERSION, 10);
+    assert_eq!(FEATURE_SCHEMA_VERSION, 12);
     assert!(
         FEATURE_SCHEMA_DESCRIPTOR
             .contains("action_schema_version=3;action_schema_hash=1755359086494840931;")
     );
-    assert_eq!(FEATURE_SCHEMA_HASH, 15_519_817_897_416_174_399);
-    assert_eq!(GLOBAL_FEATURES, 64);
+    assert_eq!(FEATURE_SCHEMA_HASH, 1_577_122_233_561_586_211);
+    assert_eq!(GLOBAL_FEATURES, 72);
     assert_eq!((HISTORY_SAMPLES, HISTORY_FEATURES), (7, 24));
     assert_eq!((MAX_POLICY_HISTORY, POLICY_HISTORY_FEATURES), (16, 4));
-    assert_eq!((UNIT_FEATURE_TOKENS, UNIT_FEATURES), (96, 69));
-    assert_eq!((OWN_UNIT_FEATURE_TOKENS, UNIT_FEATURES), (2, 69));
-    assert_eq!((REMEMBERED_UNIT_FEATURE_TOKENS, UNIT_FEATURES), (32, 69));
+    assert_eq!((UNIT_FEATURE_TOKENS, UNIT_FEATURES), (96, 73));
+    assert_eq!((OWN_UNIT_FEATURE_TOKENS, UNIT_FEATURES), (2, 73));
+    assert_eq!((REMEMBERED_UNIT_FEATURE_TOKENS, UNIT_FEATURES), (32, 73));
     assert_eq!((POINT_FEATURE_TOKENS, POINT_FEATURES), (48, 32));
     assert_eq!((ABILITY_FEATURE_TOKENS, ABILITY_FEATURES), (14, 24));
     assert_eq!((ITEM_FEATURE_TOKENS, ITEM_FEATURES), (85, 28));
@@ -47,6 +50,20 @@ fn feature_schema_dimensions_and_hash_are_stable() {
     assert!(FEATURE_SCHEMA_DESCRIPTOR.contains("48:active_target_present"));
     assert!(FEATURE_SCHEMA_DESCRIPTOR.contains("59-63:reserved"));
     assert!(!FEATURE_SCHEMA_DESCRIPTOR.contains("48-63:reserved"));
+}
+
+#[test]
+fn feature_schema_labels_candidate_bookkeeping_without_claiming_enriched_history() {
+    for contract in [
+        "candidate_order=opt_in_live_pure_neural_ppo_learner_and_greedy_candidate_neuralseat_learner",
+        "own_cast=implicit_own_shadow_fiend_nonpassive_visible_aimOwn_ability13_14_15_16_targetNone",
+        "reconcile=complete_snapshot_and_current_tick_events_before_features",
+        "fallback=absent_full_handle_attack_or_move_unit_to_last_observed_point_only_immediately_previous_tick_without_observed_death",
+        "legacy_order=teacher_tactical_hybrid_frozen_opponents_expert_collection_and_dagger_labeler_ledger_unchanged",
+        "policy_history=unchanged16x4_selected_kind_age_presence_only_no_targets_slots_outcomes_or_enriched_sent_history",
+    ] {
+        assert!(FEATURE_SCHEMA_DESCRIPTOR.contains(contract), "{contract}");
+    }
 }
 
 #[test]
@@ -1544,7 +1561,7 @@ fn legacy_projectile_views_keep_exact_feature_bits() {
             }
             encoder.observe(&tracker).expect("feature observation");
             let frame = encode_with_encoder(&tracker, &mut encoder);
-            for value in all_values(&frame) {
+            for value in legacy_feature_values(&frame) {
                 digest.update(value.to_bits().to_le_bytes());
             }
             assert!(frame.is_finite());
@@ -1576,6 +1593,33 @@ fn projectile_capacity_view(count: u32) -> WorldView {
         .collect();
     assert_eq!(view.projectiles.len(), count as usize);
     view
+}
+
+fn legacy_feature_values(frame: &FeatureFrame) -> impl Iterator<Item = f32> + '_ {
+    frame.global[..64]
+        .iter()
+        .copied()
+        .chain(frame.history.iter().flatten().copied())
+        .chain(frame.policy_history.iter().flatten().copied())
+        .chain(frame.units.iter().flat_map(|row| row[..69].iter().copied()))
+        .chain(
+            frame
+                .own_units
+                .iter()
+                .flat_map(|row| row[..69].iter().copied()),
+        )
+        .chain(
+            frame
+                .remembered_units
+                .iter()
+                .flat_map(|row| row[..69].iter().copied()),
+        )
+        .chain(frame.points.iter().flatten().copied())
+        .chain(frame.abilities.iter().flatten().copied())
+        .chain(frame.items.iter().flatten().copied())
+        .chain(frame.projectiles.iter().flatten().copied())
+        .chain(frame.loot.iter().flatten().copied())
+        .chain(frame.map.iter().copied())
 }
 
 #[test]

@@ -22,15 +22,16 @@ use crate::{
 };
 
 /// Maximum number of owned samples retained by one imitation pool.
-pub const MAX_IMITATION_SAMPLES: usize = 9_216;
+pub const MAX_IMITATION_SAMPLES: usize = 32_768;
 /// Maximum seed count in each training, validation, or promotion namespace.
 pub const MAX_SEED_NAMESPACE: usize = 8_192;
 /// Maximum epoch, optimizer-step, and global-update counter value.
 pub const MAX_TRAINING_COUNTER: u64 = 1_000_000_000;
 /// Minimum rollout action count accepted by the promotion gate.
 pub const MIN_PROMOTION_ROLLOUT_ACTIONS: u64 = 1_000;
-/// Current audited game-rules scope for stage-eight artifacts.
-pub const IMITATION_RULES_AUDIT_VERSION: u32 = 12;
+/// Current training scope: unchanged Teacher decisions with F12 observation-only order bookkeeping.
+/// Prior rule-12 samples are historical data, not relabeled rule-13 observations.
+pub const IMITATION_RULES_AUDIT_VERSION: u32 = 13;
 
 const TARGET_MODE_HEAD: usize = 3;
 const PUT_MODE_HEAD: usize = 2;

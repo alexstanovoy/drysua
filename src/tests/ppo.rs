@@ -140,9 +140,9 @@ fn rollout_compacts_sparse_tokens_and_bit_packs_behavioral_masks_losslessly() {
 
 #[test]
 fn ppo_schema_and_rules_audit_are_stable() {
-    assert_eq!(PPO_SCHEMA_VERSION, 22);
-    assert_eq!(PPO_RULES_AUDIT_VERSION, 18);
-    assert_eq!(PPO_SCHEMA_HASH, 7_033_554_372_932_156_753);
+    assert_eq!(PPO_SCHEMA_VERSION, 27);
+    assert_eq!(PPO_RULES_AUDIT_VERSION, 22);
+    assert_eq!(PPO_SCHEMA_HASH, 9_274_275_648_898_675_046);
     assert_eq!(PpoConfig::default().learning_rate, 3.0e-6);
 }
 
@@ -1153,6 +1153,7 @@ fn assert_production_resume_matches_uninterrupted(overrides: Option<crate::Train
     let uninterrupted_directory = training_test_directory("production-uninterrupted");
     let resumed_directory = training_test_directory("production-resumed");
     let mut settings = crate::TrainingJobConfig {
+        episode_time_cost: 0.0,
         terminal_only: false,
         complete_episodes: false,
         updates: 2,
@@ -1259,6 +1260,7 @@ fn assert_production_artifact_training_state_equal(
 fn training_job_checkpoints_and_resumes_from_the_next_update() {
     let directory = training_test_directory("resume");
     let mut settings = crate::TrainingJobConfig {
+        episode_time_cost: 0.0,
         terminal_only: false,
         complete_episodes: false,
         updates: 1,
@@ -1378,6 +1380,7 @@ fn fresh_training_loads_the_requested_runtime_weights_before_the_first_update() 
         .expect("initial snapshot")
         .fingerprint();
     let settings = crate::TrainingJobConfig {
+        episode_time_cost: 0.0,
         terminal_only: false,
         complete_episodes: false,
         updates: 1,
@@ -1418,6 +1421,7 @@ fn production_training_rejects_an_unpaired_environment_count() {
     let directory = training_test_directory("odd-environments");
     let error = crate::run_training_job_on(
         crate::TrainingJobConfig {
+            episode_time_cost: 0.0,
             terminal_only: false,
             complete_episodes: false,
             updates: 1,
@@ -1454,6 +1458,7 @@ fn production_training_rejects_an_unpaired_environment_count() {
 fn resumed_training_rejects_an_initial_weights_directory() {
     let directory = training_test_directory("resume-with-initial");
     let settings = crate::TrainingJobConfig {
+        episode_time_cost: 0.0,
         terminal_only: false,
         complete_episodes: false,
         updates: 1,
@@ -1502,6 +1507,7 @@ fn training_job_rejects_a_checkpoint_directory_locked_by_another_writer() {
     lock.lock().expect("hold training lock");
     let error = crate::run_training_job_on(
         crate::TrainingJobConfig {
+            episode_time_cost: 0.0,
             terminal_only: false,
             complete_episodes: false,
             updates: 1,
@@ -1934,6 +1940,7 @@ fn training_job_rejects_targets_that_cannot_fit_shuffle_rng_counters() {
     let directory = training_test_directory("counter-bound");
     let error = crate::run_training_job_on(
         crate::TrainingJobConfig {
+            episode_time_cost: 0.0,
             terminal_only: false,
             complete_episodes: false,
             updates: 1_000_000,
@@ -2248,4 +2255,111 @@ fn lambda_one_on_retained_intervals_matches_full_discounted_terminal_return() {
 #[test]
 fn e2_e4_e6_ragged_sampling_and_early_terminals_preserve_rng_and_retained_actions() {
     crate::ppo_arena::episode::assert_ragged_streams_for_test(&stop_policy_for_warmup());
+}
+#[cfg(feature = "builtin")]
+#[test]
+fn elapsed_time_cost_orders_equal_outcomes_and_keeps_wins_above_losses() {
+    crate::ppo_arena::episode::assert_time_cost_for_test();
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn gamma_one_time_cost_mc_preserves_variable_intervals_and_timeout_bootstrap() {
+    crate::ppo_arena::episode::assert_time_cost_mc_for_test();
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn time_cost_cli_accepts_finite_boundaries_and_rejects_invalid_profiles() {
+    let settings = crate::cli::training_settings_for_test(&[
+        "--complete-episodes",
+        "--terminal-only",
+        "--episode-time-cost",
+        "0.25",
+        "--map",
+        "0",
+        "--environments",
+        "6",
+        "--rollout",
+        "4538",
+        "--gamma-per-tick",
+        "1",
+        "--gae-lambda",
+        "1",
+    ])
+    .expect("undiscounted time-cost profile");
+    assert_eq!(settings.episode_time_cost, 0.25);
+    assert_eq!(settings.ppo.gamma_tick, 1.0);
+    crate::ppo_arena::episode::validate(&settings).expect("validated profile");
+    assert_eq!(tick_discount(1.0, 108900).expect("no discount"), 1.0);
+    assert_eq!(
+        crate::cli::training_settings_for_test(&[])
+            .expect("defaults")
+            .episode_time_cost,
+        0.0
+    );
+    for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.01, 0.250001] {
+        let mut changed = settings.clone();
+        changed.episode_time_cost = invalid;
+        assert_eq!(
+            crate::ppo_arena::episode::validate(&changed)
+                .expect_err("cost bound")
+                .to_string(),
+            "invalid PPO config field: episode time cost must be finite in [0, 0.25]"
+        );
+    }
+    let mut changed = settings;
+    changed.terminal_only = false;
+    assert_eq!(
+        crate::ppo_arena::episode::validate(&changed)
+            .expect_err("profile scope")
+            .to_string(),
+        "invalid PPO config field: episode time cost requires terminal-only complete episodes"
+    );
+}
+#[cfg(feature = "builtin")]
+#[test]
+fn time_cost_checkpoint_restores_same_budget_and_rejects_changed_budget() {
+    let directory = training_test_directory("time-cost-scope");
+    let settings = crate::cli::training_settings_for_test(&[
+        "--complete-episodes",
+        "--terminal-only",
+        "--episode-time-cost",
+        "0.25",
+        "--map",
+        "0",
+        "--environments",
+        "6",
+        "--rollout",
+        "4538",
+        "--gamma-per-tick",
+        "1",
+        "--gae-lambda",
+        "1",
+    ])
+    .expect("time-cost settings");
+    crate::ppo_arena::episode::assert_time_cost_checkpoint_for_test(settings, &directory);
+    std::fs::remove_dir_all(directory).expect("cleanup");
+}
+#[cfg(feature = "builtin")]
+#[test]
+fn production_episode_retention_covers_all_eight_indexed_action_phases() {
+    crate::ppo_arena::episode::assert_all_retention_phase_labels_for_test(&stop_policy_for_warmup());
+}
+#[cfg(feature = "builtin")]
+#[test]
+fn randomized_retention_preserves_actor_rng_orders_and_skips_past_rewards() {
+    crate::ppo_arena::episode::assert_retention_actor_parity_for_test(&stop_policy_for_warmup());
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn randomized_retention_flushes_partial_terminal_and_timeout_without_fabricating_short_samples() {
+    crate::ppo_arena::episode::assert_retention_boundaries_for_test(&stop_policy_for_warmup());
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn episode_phase_is_replayable_and_independent_of_actor_rng() {
+    crate::ppo_arena::episode::assert_retention_phase_replay_for_test();
 }

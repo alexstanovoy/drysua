@@ -1,9 +1,49 @@
 use super::*;
 use crate::Wire;
 
+#[path = "input_transfer.rs"]
+mod input_transfer;
+
 #[test]
-fn current_m11_training_configuration_is_accepted() {
-    validate_config(&NeuralTrainingConfig::default()).expect("current M11/F10");
+fn current_m12_training_configuration_is_accepted() {
+    validate_config(&NeuralTrainingConfig::default()).expect("current M12/F11");
+}
+
+#[test]
+fn current_initialization_rejects_wrong_model_and_feature_hashes() {
+    let directory = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("artifacts/temp")
+        .join(format!(
+            "neural-incompatible-current-{}",
+            std::process::id()
+        ));
+    fs::create_dir(&directory).expect("directory");
+    let model = PolicyModel::fresh(87).expect("current model");
+    TrainingArtifact::save_runtime_weights(&model, &directory).expect("save");
+    let path = directory.join("drysua.weights.safetensors");
+    let original = fs::read(&path).expect("weights");
+    for hash in [crate::MODEL_SCHEMA_HASH, crate::FEATURE_SCHEMA_HASH] {
+        let needle = hash.to_string();
+        let mut bytes = original.clone();
+        let index = bytes
+            .windows(needle.len())
+            .position(|window| window == needle.as_bytes())
+            .expect("metadata hash");
+        bytes[index] = if bytes[index] == b'1' { b'2' } else { b'1' };
+        fs::write(&path, bytes).expect("wrong hash");
+        let config = NeuralTrainingConfig {
+            initial_weights: Some(directory.clone()),
+            ..NeuralTrainingConfig::default()
+        };
+        assert_eq!(
+            initialize_model(&config)
+                .err()
+                .expect("incompatible artifact")
+                .to_string(),
+            "checkpoint schema does not match this build"
+        );
+    }
+    fs::remove_dir_all(directory).expect("cleanup");
 }
 
 #[test]
@@ -143,9 +183,8 @@ fn legacy_initialization_flag_rejects_correct_tuple_with_wrong_sha() {
         .join("artifacts/temp")
         .join(format!("neural-wrong-sha-{}", std::process::id()));
     fs::create_dir(&directory).expect("directory");
-    let data = vec![0u8; crate::MODEL_PARAMETER_COUNT * 4];
-    let tensor =
-        TensorView::new(Dtype::F32, vec![crate::MODEL_PARAMETER_COUNT], &data).expect("tensor");
+    let data = vec![0u8; 1_684_724 * 4];
+    let tensor = TensorView::new(Dtype::F32, vec![1_684_724], &data).expect("tensor");
     let metadata = [
         ("action_schema_hash", "1755359086494840931"),
         ("feature_schema_hash", "9669721049329356661"),
@@ -299,7 +338,7 @@ fn train_selection_and_final_namespaces_are_distinct_and_map0_only() {
     assert_eq!(config.tick_limit, 108900);
     assert!(
         validate_config(&NeuralTrainingConfig {
-            training_games: 9,
+            training_games: 21,
             ..config
         })
         .is_err()
@@ -401,8 +440,9 @@ fn late_common_samples_cannot_erase_opening_or_seat_phase_coverage() {
 }
 
 #[test]
-fn stratified_budgets_keep_total_pool_at_9216_and_continue_at_most_one_third() {
-    assert_eq!(BASE_KIND_CAPACITIES.iter().sum::<usize>(), 4096);
+fn stratified_budgets_keep_total_pool_at_32768_and_continue_at_most_one_third() {
+    assert_eq!(CAPACITIES, [16384, 6144, 6144]);
+    assert_eq!(DAGGER_CAPACITY, 4096);
     assert_eq!(
         CAPACITIES.iter().sum::<usize>() + DAGGER_CAPACITY,
         MAX_IMITATION_SAMPLES
@@ -491,7 +531,7 @@ fn dagger_labels_never_replace_the_network_order_and_track_only_real_sends() {
     note_labeler_send(&mut collection, seat.sequence, issued, space.tick());
     expected.note_sent(seat.sequence, issued, space.tick());
     assert_eq!(collection.labeler.as_ref().expect("labeler"), &expected);
-    let sample = &collection.reservoir.samples[expert.kind().index()][0];
+    let sample = &collection.reservoir.samples[0];
     assert_eq!(sample.source(), crate::ImitationSource::Dagger);
     assert_eq!(sample.learner_action(), Some(learner));
     assert_eq!(sample.teacher_action(), expert);
@@ -602,19 +642,152 @@ fn dagger_append_preserves_held_out_binding_and_trains_only_the_expanded_train_s
 }
 
 #[test]
-fn corrective_reservoir_reserves_more_buy_and_cast_labels_without_exceeding_2048() {
-    let reservoir = Reservoir::dagger(2048, 51);
-    assert_eq!(DAGGER_KIND_CAPACITIES.iter().sum::<usize>(), 2048);
-    assert_eq!(reservoir.selectors[ActionKind::Buy.index()].capacity, 384);
-    assert_eq!(reservoir.selectors[ActionKind::Cast.index()].capacity, 384);
-    assert_eq!(
-        reservoir
-            .selectors
-            .iter()
-            .map(|selector| selector.capacity)
-            .sum::<usize>(),
-        2048
+fn broad_configuration_accepts_twenty_matches_and_45_minutes() {
+    let config = NeuralTrainingConfig {
+        seed: 9950000,
+        training_games: 20,
+        wall_time: Duration::from_secs(2700),
+        ..NeuralTrainingConfig::default()
+    };
+    validate_config(&config).expect("bounded broad collection");
+    assert_eq!(namespaces(&config).expect("seeds").training().len(), 21);
+}
+
+#[test]
+fn branch_keys_separate_body_and_slot_before_target_classification() {
+    use crate::{ActionTarget, ControlledUnit, EntityIndex};
+    let action = StructuredAction::Use {
+        unit: ControlledUnit::Hero,
+        slot: bota_proto::ItemSlot(0),
+        target: ActionTarget::Entity(EntityIndex(1)),
+    };
+    let (hero, pointer) = BranchKey::new(action, 0);
+    let (courier, _) = BranchKey::new(
+        StructuredAction::Use {
+            unit: ControlledUnit::Courier,
+            slot: bota_proto::ItemSlot(0),
+            target: pointer,
+        },
+        0,
     );
+    let (other_slot, _) = BranchKey::new(
+        StructuredAction::Use {
+            unit: ControlledUnit::Hero,
+            slot: bota_proto::ItemSlot(1),
+            target: pointer,
+        },
+        0,
+    );
+    assert_ne!(hero, courier);
+    assert_ne!(hero, other_slot);
+    assert_eq!(hero.slot, 1);
+    assert_eq!(courier.body, 1);
+}
+
+#[test]
+fn expanded_pool_paired_frame_estimate_leaves_room_below_eight_gib() {
+    let paired = std::mem::size_of::<ImitationSample>() + std::mem::size_of::<FeatureFrame>();
+    let storage = paired * MAX_IMITATION_SAMPLES;
+    assert!(storage > 3 * 1024 * 1024 * 1024usize);
+    assert!(storage < 5 * 1024 * 1024 * 1024usize);
+    let transient = std::mem::size_of::<ImitationSample>() * CAPACITIES[0] * 2;
+    assert!(storage + transient < 8 * 1024 * 1024 * 1024usize);
+}
+
+#[test]
+fn late_rare_branch_displaces_common_rows_without_losing_observed_counts() {
+    let common = BranchKey {
+        kind: 7,
+        body: 0,
+        target: 0,
+        slot: 1,
+        point: 0,
+        cell: 2,
+    };
+    let rare = BranchKey {
+        body: 1,
+        slot: 3,
+        ..common
+    };
+    let mut selector = BranchSelector::new(64, 23);
+    for _ in 0..10000 {
+        selector.destination(common).expect("common");
+    }
+    for _ in 0..20 {
+        assert!(selector.destination(rare).expect("rare").is_some());
+    }
+    for _ in 0..10000 {
+        selector.destination(common).expect("later common");
+    }
+    assert_eq!(selector.counts[&rare].1.len(), 20);
+    assert_eq!(selector.counts[&rare].0, 20);
+    assert_eq!(selector.counts[&common].0, 20000);
+    assert_eq!(
+        selector
+            .counts
+            .values()
+            .map(|entry| entry.1.len())
+            .sum::<usize>(),
+        64
+    );
+}
+
+#[test]
+fn conditional_stratum_limit_rejects_the_next_key_with_a_specific_error() {
+    let mut selector = BranchSelector::new(16384, 29);
+    for index in 0..8192 {
+        selector
+            .destination(BranchKey {
+                kind: index / 512,
+                body: index % 2,
+                target: 0,
+                slot: index / 2 % 256,
+                point: 0,
+                cell: 0,
+            })
+            .expect("bounded stratum");
+    }
+    let error = selector
+        .destination(BranchKey {
+            kind: 0,
+            body: 2,
+            target: 0,
+            slot: 0,
+            point: 0,
+            cell: 0,
+        })
+        .expect_err("excess stratum");
+    assert_eq!(
+        error.to_string(),
+        "conditional reservoir exceeds 8192 observed strata"
+    );
+    assert_eq!(selector.counts.len(), 8192);
+    assert_eq!(selector.keys.len(), 8192);
+}
+
+#[test]
+fn branch_reservoir_preserves_rare_courier_and_is_reproducible() {
+    let mut first = BranchSelector::new(64, 17);
+    let mut second = BranchSelector::new(64, 17);
+    let common = BranchKey {
+        kind: 2,
+        body: 0,
+        target: 0,
+        slot: 0,
+        point: 1,
+        cell: 0,
+    };
+    let rare = BranchKey { body: 1, ..common };
+    for index in 0..10000 {
+        let key = if index < 20 { rare } else { common };
+        assert_eq!(
+            first.destination(key).expect("draw"),
+            second.destination(key).expect("draw")
+        );
+    }
+    assert_eq!(first.counts[&rare].1.len(), 20);
+    assert_eq!(first.keys.len(), 64);
+    assert_eq!(first.counts[&common].0, 9980);
 }
 
 #[test]

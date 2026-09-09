@@ -519,7 +519,7 @@ fn train_full_rejects_nonfinite_and_out_of_range_hyperparameters() {
         (
             "--gamma-per-tick",
             "discount",
-            vec!["NaN", "inf", "-inf", "-0.1", "1", "1.01"],
+            vec!["NaN", "inf", "-inf", "-0.1", "1.01"],
         ),
         (
             "--gae-lambda",

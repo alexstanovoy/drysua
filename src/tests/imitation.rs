@@ -22,7 +22,7 @@ use crate::{
 fn action_and_training_schema_identities_are_stable() {
     assert_eq!(ACTION_SCHEMA_VERSION, 3);
     assert_eq!(ACTION_SCHEMA_HASH, 1_755_359_086_494_840_931);
-    assert_eq!(crate::IMITATION_RULES_AUDIT_VERSION, 12);
+    assert_eq!(crate::IMITATION_RULES_AUDIT_VERSION, 13);
 }
 
 #[test]
@@ -282,6 +282,21 @@ fn held_out_evaluation_rejects_same_identity_from_outside_the_pool() {
             .to_string(),
         "imitation held-out evaluation received a sample outside the pool"
     );
+}
+
+#[test]
+fn pool_accepts_32768_but_rejects_the_next_capacity() {
+    assert_eq!(MAX_IMITATION_SAMPLES, 32768);
+    let pool = ImitationPool::new(32768, 1, seeds(), scope()).expect("expanded bounded pool");
+    assert_eq!(pool.binding().capacity, 32768);
+    assert_eq!(
+        ImitationPool::new(32769, 1, seeds(), scope())
+            .err()
+            .expect("capacity exceeded")
+            .to_string(),
+        "imitation pool capacity 32769 is outside 1..=32768"
+    );
+    assert!(ImitationPool::new(9216, 1, seeds(), scope()).is_ok());
 }
 
 #[test]

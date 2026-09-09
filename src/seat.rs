@@ -6,7 +6,7 @@ use crate::{
     ActionSpace, ActiveOrderUpdate, ActivePolicyOrder, FeatureEncoder, FeatureFrame, ItemReadiness,
     Link, LocalPolicyState, OrderPersistence, PolicyModel, SHADOW_FIEND, Seated, StateTracker,
     StructuredAction, TACTICAL_FILE_BYTES, TacticalPolicy, Teacher, TrainingArtifact, Wire,
-    active_order_update_for_sent,
+    active_order_update_for_sent, record_sent_for_policy,
 };
 
 const MAX_MATCH_MESSAGES: usize = 16_777_216;
@@ -41,6 +41,7 @@ struct LivePolicy {
     encoder: FeatureEncoder,
     local: LocalPolicyState,
     persistence: OrderPersistence,
+    neural_persistence: Option<OrderPersistence>,
     readiness: ItemReadiness,
     teacher: Option<Teacher>,
     last_decision_tick: Option<u32>,
@@ -425,6 +426,8 @@ impl LivePolicy {
             encoder,
             local: LocalPolicyState::new(0),
             persistence: OrderPersistence::default(),
+            neural_persistence: matches!(controller, LiveController::Neural(_))
+                .then(OrderPersistence::default),
             readiness: ItemReadiness::new(),
             teacher: if matches!(controller, LiveController::Neural(_)) {
                 None
@@ -492,6 +495,9 @@ impl LivePolicy {
         let current = self.tracker.own_hero().map(|hero| hero.id);
         if previous != current {
             self.persistence.clear_body_for(None);
+            if let Some(neural) = &mut self.neural_persistence {
+                neural.clear_body_for(None);
+            }
             self.local
                 .set_active_order(view.tick, None)
                 .map_err(std::io::Error::other)?;
@@ -510,6 +516,11 @@ impl LivePolicy {
         self.tracker
             .observe_events(tick, events)
             .map_err(std::io::Error::other)?;
+        if let Some(neural) = &mut self.neural_persistence {
+            neural
+                .reconcile_neural_snapshot(&self.tracker, &mut self.local, &mut self.pending_active)
+                .map_err(std::io::Error::other)?;
+        }
         self.encoder
             .observe(&self.tracker)
             .map_err(std::io::Error::other)
@@ -531,20 +542,36 @@ impl LivePolicy {
             .checked_add(1)
             .ok_or_else(|| std::io::Error::other("policy decision count overflowed"))?;
         let decoded = space.decode(action).map_err(std::io::Error::other)?;
-        let Some(issued) = self.persistence.should_send(decoded) else {
+        let persistence = self
+            .neural_persistence
+            .as_ref()
+            .unwrap_or(&self.persistence);
+        let Some(issued) = persistence.should_send(decoded) else {
             return Ok(());
         };
         let previous = self.local.active_order();
         let sequence = wire.order(issued.unit, issued.order)?;
-        self.persistence
-            .record_sent(sequence, issued)
-            .map_err(std::io::Error::other)?;
+        let preserves = record_sent_for_policy(
+            &mut self.persistence,
+            &mut self.neural_persistence,
+            sequence,
+            issued,
+            &self.tracker,
+        )
+        .map_err(std::io::Error::other)?;
         self.readiness.note_sent(sequence, issued, &space);
         if let Some(teacher) = &mut self.teacher {
             teacher.note_sent(sequence, issued, space.tick());
         }
-        let update =
-            active_order_update_for_sent(&self.persistence, issued.unit, sequence, action.kind());
+        let persistence = self
+            .neural_persistence
+            .as_ref()
+            .unwrap_or(&self.persistence);
+        let update = if preserves {
+            ActiveOrderUpdate::Preserve
+        } else {
+            active_order_update_for_sent(persistence, issued.unit, sequence, action.kind())
+        };
         self.pending_active = match update {
             ActiveOrderUpdate::Preserve => self.pending_active,
             ActiveOrderUpdate::Replace(None) if previous.is_none() => None,
@@ -625,6 +652,9 @@ impl LivePolicy {
 
     fn observe_rejection(&mut self, sequence: u32) -> std::io::Result<()> {
         self.persistence.observe_rejection(sequence);
+        if let Some(neural) = &mut self.neural_persistence {
+            neural.observe_rejection(sequence);
+        }
         self.readiness.note_rejected(sequence);
         if let Some(teacher) = &mut self.teacher {
             teacher.note_rejected(sequence);

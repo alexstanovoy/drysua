@@ -11,6 +11,12 @@ use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use candle_core::{DType, Device, Tensor, Var};
 
+#[path = "model_input_adapter.rs"]
+mod input_adapter;
+#[cfg(all(test, feature = "builtin"))]
+#[path = "model_value_probe.rs"]
+mod value_probe;
+
 use crate::{
     ABILITY_FEATURE_TOKENS, ABILITY_FEATURES, ActionKind, ActionSpace, ActionTarget,
     BehavioralPrediction, BehavioralTarget, ControlledUnit, EntityIndex, FEATURE_SCHEMA_HASH,
@@ -24,8 +30,8 @@ use crate::{
     loot_feature, point_feature, projectile_feature, unit_feature,
 };
 
-/// Version of the fixed policy-model parameter schema.
-pub const MODEL_SCHEMA_VERSION: u32 = 11;
+/// Version of the fixed policy-model layout and linked candidate execution contract.
+pub const MODEL_SCHEMA_VERSION: u32 = 14;
 /// Maximum frame count accepted by one public batch call.
 pub const MODEL_MAX_BATCH: usize = 8_192;
 /// Frame count evaluated by one bounded host inference tensor graph.
@@ -62,7 +68,7 @@ const UNIT_EMBEDDING: usize = 128;
 const TOKEN_HIDDEN: usize = 64;
 const TOKEN_EMBEDDING: usize = 64;
 const UNIT_GROUPS: usize = 5;
-const TRUNK_INPUT: usize = 2_568;
+const TRUNK_INPUT: usize = 2_576;
 const TRUNK_WIDE: usize = 512;
 const TRUNK_WIDTH: usize = 256;
 const KIND_EMBEDDING: usize = 32;
@@ -76,20 +82,21 @@ static NEXT_OPTIMIZER_LINEAGE: AtomicU64 = AtomicU64::new(1);
 
 /// Canonical model shapes, parameter order, and linked action/feature semantics.
 pub const MODEL_SCHEMA_DESCRIPTOR: &str = concat!(
-    "bota-drysua-model/v11;",
+    "bota-drysua-model/v14;",
     "action_schema_version=3;action_schema_hash=1755359086494840931;",
-    "feature_schema_version=10;feature_schema_hash=15519817897416174399;",
+    "feature_schema_version=12;feature_schema_hash=1577122233561586211;",
+    "candidate_execution=feature12_opt_in_order_bookkeeping,legacy_teacher_and_frozen_opponent_paths_unchanged;layout=unchanged_m12_62_named_tensors_1689076_f32;transfer=audited_parameters_only_new_owned_model_fresh_optimizer_and_progress_not_resume_or_old_gameplay_compatibility;model13_reserved_isolated_wide_experiment;",
     "dtype=f32;device=cpu_actor,cpu_cuda_or_metal_learner,one_learner_per_device;architecture=deepsets;activations=relu_after_every_encoder_and_trunk_linear;",
     "input_conditioning=host_before_tensor_after_presence_mask,feature_v9_unchanged;category_divisors=global10:5,12:3,32:16,55:12;policy_history3:16;unit5:12;ability1:2,2:8,11:5;item1:5,2:64,9:5,13:3;point10:8,12:8,16:12;semantic_ids=ability5_and_projectile6:ln1p(x)/ln(65548),item4_and_loot1:ln1p(x)/ln(65537);all_other_features_identity;",
     "output_initialization=all_linear_outside_relu_mlps_including_value_and_pointer_queries:he_uniform_times0.01,bias_zero,no_extra_rng_draws;pointer_scaling=dot_div_sqrt_embedding_width_all_actor_batch_and_training_paths;",
     "numeric_semantics=semantic_id_signed_ln1p_abs_extension_preserves_zero,bc_and_ppo_masked_cross_entropy_center_legal_logits_by_detached_row_max_before_logsumexp_and_selected_subtraction;",
-    "unit_mlp=69x64,64x128,128x128;",
+    "unit_mlp=73x64,64x128,128x128;",
     "ability_mlp=24x64,64x64;item_mlp=28x64,64x64;",
     "point_mlp=32x64,64x64;projectile_mlp=20x64,64x64;loot_mlp=16x64,64x64;",
     "unit_groups=hero,creep,structure,neutral,courier_ward;",
     "pool=token_present_and_semantic_group_mask,mean=sum_over_selected/divide_by_positive_count,max=where_selected_embedding_else_negative_infinity_then_argmax_lowest_token_tie_per_channel_then_differentiable_gather_original_embedding,one_token_receives_max_gradient,empty_mean_and_max_exact_zero,cross_group_rows_never_enter_reduction;",
     "token_pools=ability,item,point,projectile,loot;own_units=hero,courier;",
-    "trunk=2568x512,512x256,256x256;",
+    "trunk=2576x512,512x256,256x256;",
     "embeddings=kind:16x32,unit:2x32,ability:8x16,item:15x16;",
     "heads=value:1,kind:16,unit:2,ability:8,item_source_from:15,swap_to:15,learn:6,shop:64,loot:16,target_mode:3,put_mode:2,entity_query:128,point_query:64;",
     "action_kind=0Continue,1Stop,2MovePoint,3FollowUnit,4Hold,5AttackMovePoint,6AttackUnit,7Cast,8Use,9PutPoint,10PutUnit,11Take,12Buy,13Sell,14Swap,15Learn;",
@@ -127,13 +134,13 @@ const fn linear_parameters(input: usize, output: usize) -> usize {
 }
 
 /// Exact number of F32 parameters in the version-one policy model.
-pub const MODEL_PARAMETER_COUNT: usize = 1_684_724;
+pub const MODEL_PARAMETER_COUNT: usize = 1_689_076;
 
-const _: () = assert!(FEATURE_SCHEMA_VERSION == 10);
-const _: () = assert!(FEATURE_SCHEMA_HASH == 15_519_817_897_416_174_399);
+const _: () = assert!(FEATURE_SCHEMA_VERSION == 12);
+const _: () = assert!(FEATURE_SCHEMA_HASH == 1_577_122_233_561_586_211);
 const _: () = assert!(crate::ACTION_SCHEMA_VERSION == 3);
 const _: () = assert!(crate::ACTION_SCHEMA_HASH == 1_755_359_086_494_840_931);
-const _: () = assert!(TRUNK_INPUT == 2_568);
+const _: () = assert!(TRUNK_INPUT == 2_576);
 const _: () = assert!(
     DECODER_CONTEXT == TRUNK_WIDTH + KIND_EMBEDDING + UNIT_SELECTION_EMBEDDING + SLOT_EMBEDDING
 );
@@ -1540,6 +1547,75 @@ impl PolicyModel {
         let _guard = self.read_parameter_lock()?;
         Ok(self
             .selection_batch_locked(frames, action_spaces, None)?
+            .into_iter()
+            .map(|choice| PolicyChoice {
+                action: choice.action,
+                value: choice.value,
+            })
+            .collect())
+    }
+
+    #[cfg(all(test, feature = "builtin"))]
+    pub(crate) fn choose_kind_bias_probe(
+        &self,
+        frames: &[FeatureFrame],
+        spaces: &[ActionSpace],
+        biases: &[[f32; MODEL_KIND_HEAD]],
+    ) -> Result<Vec<PolicyChoice>, ModelError> {
+        validate_policy_batch(frames, spaces)?;
+        if biases.len() != frames.len() {
+            return Err(ModelError::InvalidModelState("kind-bias probe count"));
+        }
+        if biases
+            .iter()
+            .flatten()
+            .any(|value| !value.is_finite() || value.abs() > 4.0)
+        {
+            return Err(ModelError::InvalidModelState(
+                "kind-bias probe finite bound",
+            ));
+        }
+        let _guard = self.read_parameter_lock()?;
+        let state = self.forward_frames(frames)?;
+        let original = self.kind.bias.to_vec1::<f32>()?;
+        assert_eq!(original.len(), MODEL_KIND_HEAD);
+        let changed: Vec<_> = biases
+            .iter()
+            .flat_map(|row| original.iter().zip(row).map(|(value, delta)| value + delta))
+            .collect();
+        let changed = Tensor::from_vec(
+            changed,
+            (frames.len(), MODEL_KIND_HEAD),
+            self.tensor_device(),
+        )?;
+        let base = SamplingBaseLogits {
+            value: self.value.forward(&state.trunk)?.flatten_all()?.to_vec1()?,
+            kind: state
+                .trunk
+                .matmul(self.kind.weight.as_tensor())?
+                .add(&changed)?
+                .to_vec2()?,
+        };
+        let mut random = None;
+        let mut rows = initialize_sampling_rows(&base, spaces, &mut random)?;
+        let kind = self.sampling_kind_logits(&state, &sampling_prefixes(&rows))?;
+        select_sampling_units(&mut rows, &kind, spaces, &mut random)?;
+        let unit = self.sampling_unit_logits(&state, &sampling_prefixes(&rows))?;
+        select_sampling_slots(&mut rows, &unit, spaces, &mut random)?;
+        let slot = self.sampling_slot_logits(&state, &sampling_prefixes(&rows))?;
+        let selected = decode_batch_rows(
+            spaces,
+            &mut random,
+            rows,
+            SamplingLogits {
+                base,
+                kind,
+                unit,
+                slot,
+            },
+        )?;
+        assert_eq!(selected.len(), frames.len());
+        Ok(selected
             .into_iter()
             .map(|choice| PolicyChoice {
                 action: choice.action,

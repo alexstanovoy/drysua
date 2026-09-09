@@ -31,16 +31,17 @@ pub const LEAGUE_MIN_EXPLOIT_PAIRS: usize = 2;
 /// Minimum candidate actions required in the exploit-regression namespace.
 pub const LEAGUE_MIN_EXPLOIT_ACTIONS: u64 = 100;
 /// Stage-ten league contract version.
-pub const LEAGUE_SCHEMA_VERSION: u32 = 23;
+pub const LEAGUE_SCHEMA_VERSION: u32 = 27;
 /// Audited simulator and learner rules required by stage-ten league artifacts.
-pub const LEAGUE_RULES_AUDIT_VERSION: u32 = 18;
+pub const LEAGUE_RULES_AUDIT_VERSION: u32 = 22;
 /// Canonical stage-ten frozen-policy, scheduling, retention, and promotion contract.
 pub const LEAGUE_SCHEMA_DESCRIPTOR: &str = concat!(
-    "bota-drysua-league/v23;",
+    "bota-drysua-league/v27;",
     "action_schema_version=3;action_schema_hash=1755359086494840931;",
-    "feature_schema_version=10;feature_schema_hash=15519817897416174399;",
-    "model_schema_version=11;model_schema_hash=18229126264156367519;",
-    "ppo_schema_version=22;ppo_schema_hash=7033554372932156753;rules_audit=18;",
+    "feature_schema_version=12;feature_schema_hash=1577122233561586211;",
+    "model_schema_version=14;model_schema_hash=7970187849195607202;",
+    "ppo_schema_version=27;ppo_schema_hash=9274275648898675046;rules_audit=22;",
+    "execution_roles=current_m14_policy_sharedpolicy_current_accepted_new_run_historical_snapshots_use_unchanged_candidate_feature12_order_contract_including_restart,frozen_weights_not_legacy_execution,teacher_weak_transport_unchanged,observer_bookkeeping_never_changes_teacher_strategy_or_delivery,training_roles_supersede_v26_role_exclusions_not_feature12_model14_live_actor_semantics;initialization=audited_m12_parameter_copy_is_new_m14_policy_not_historical_opponent_identity_or_qualified_release,no_inherited_progress_moments_or_promotion_evidence;historical_opponents=original_binaries_no_m12_runtime_compatibility,no_parameter_fingerprint_as_execution_identity;",
     "opponents=current30,accepted25,historical25,teacher15,weak5,frozen_per_rollout;",
     "league=capacity32,minimum9,protect_anchor_accepted_strongest_recent4,evict_nearest_cross_play_profile;",
     "snapshot=immutable_finite_f32_parameters,stable_parameter_fingerprint,generation;",
@@ -68,12 +69,12 @@ pub const LEAGUE_SCHEMA_HASH: u64 = league_fnv1a(LEAGUE_SCHEMA_DESCRIPTOR.as_byt
 
 const _: () = assert!(ACTION_SCHEMA_VERSION == 3);
 const _: () = assert!(ACTION_SCHEMA_HASH == 1_755_359_086_494_840_931);
-const _: () = assert!(FEATURE_SCHEMA_VERSION == 10);
-const _: () = assert!(FEATURE_SCHEMA_HASH == 15_519_817_897_416_174_399);
-const _: () = assert!(MODEL_SCHEMA_VERSION == 11);
-const _: () = assert!(MODEL_SCHEMA_HASH == 18_229_126_264_156_367_519);
-const _: () = assert!(PPO_SCHEMA_VERSION == 22);
-const _: () = assert!(PPO_SCHEMA_HASH == 7_033_554_372_932_156_753);
+const _: () = assert!(FEATURE_SCHEMA_VERSION == 12);
+const _: () = assert!(FEATURE_SCHEMA_HASH == 1_577_122_233_561_586_211);
+const _: () = assert!(MODEL_SCHEMA_VERSION == 14);
+const _: () = assert!(MODEL_SCHEMA_HASH == 7_970_187_849_195_607_202);
+const _: () = assert!(PPO_SCHEMA_VERSION == 27);
+const _: () = assert!(PPO_SCHEMA_HASH == 9_274_275_648_898_675_046);
 const _: () = assert!(LEAGUE_RULES_AUDIT_VERSION == crate::PPO_RULES_AUDIT_VERSION);
 
 static NEXT_SNAPSHOT_ID: AtomicU64 = AtomicU64::new(1);

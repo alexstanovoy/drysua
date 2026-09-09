@@ -14,19 +14,14 @@ const KINDS: [ActionKind; 8] = [
 
 struct RealRows {
     reservoir: Reservoir,
-    spaces: [Vec<ActionSpace>; ActionKind::COUNT],
+    spaces: Vec<ActionSpace>,
 }
 
 impl RealRows {
     fn new(seed: u64) -> Self {
-        let mut budgets = [0; ActionKind::COUNT];
-        for kind in KINDS {
-            budgets[kind.index()] = 8;
-        }
-        assert_eq!(budgets.iter().sum::<usize>(), 64);
         Self {
-            reservoir: Reservoir::with_budgets(64, seed, budgets),
-            spaces: std::array::from_fn(|_| Vec::new()),
+            reservoir: Reservoir::new(64, seed),
+            spaces: Vec::with_capacity(64),
         }
     }
 
@@ -38,10 +33,12 @@ impl RealRows {
         seed: u64,
         namespace: SeedNamespace,
     ) -> Result<Option<usize>> {
+        if !KINDS.contains(&action.kind()) {
+            return Ok(None);
+        }
         self.reservoir
             .consider(seat, space, action, seed, namespace, None)?;
-        let kind = action.kind().index();
-        for (index, sample) in self.reservoir.samples[kind].iter().enumerate() {
+        for (index, sample) in self.reservoir.samples.iter().enumerate() {
             if sample.identity().tick() == space.tick()
                 && sample.frame().matches_action_space(space)
             {
@@ -83,7 +80,7 @@ impl RealRows {
                         });
                     }
                     if let Some(selected) = selected {
-                        let spaces = &mut rows.spaces[action.kind().index()];
+                        let spaces = &mut rows.spaces;
                         if selected == spaces.len() {
                             spaces.push(space);
                         } else {
@@ -108,16 +105,8 @@ impl RealRows {
     }
 
     fn pairs(&self) -> Vec<(&ImitationSample, &ActionSpace)> {
-        for (samples, spaces) in self.reservoir.samples.iter().zip(&self.spaces) {
-            assert_eq!(samples.len(), spaces.len());
-        }
-        let pairs: Vec<_> = self
-            .reservoir
-            .samples
-            .iter()
-            .zip(&self.spaces)
-            .flat_map(|(samples, spaces)| samples.iter().zip(spaces))
-            .collect();
+        assert_eq!(self.reservoir.samples.len(), self.spaces.len());
+        let pairs: Vec<_> = self.reservoir.samples.iter().zip(&self.spaces).collect();
         assert!(pairs.len() <= 64);
         assert!(
             pairs

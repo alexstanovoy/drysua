@@ -5,9 +5,16 @@
 
 use super::*;
 
+#[cfg(test)]
+#[path = "../tests/episode_collection_parallel.rs"]
+mod parallel_tests;
+
 pub(super) const TICK_CAP: u32 = 108_900;
 pub(super) const ACTOR_DECISIONS: usize = 36_300;
 const RETENTION_STRIDE: usize = 8;
+const RETENTION_DOMAIN: u64 = 0x7265_7465_6e74_696f;
+const RETENTION_STREAM_DOMAIN: u64 = 0x7068_6173_655f_726e;
+const _: () = assert!(RETENTION_STRIDE.is_power_of_two());
 const RETAINED_PER_EPISODE: usize = ACTOR_DECISIONS.div_ceil(RETENTION_STRIDE);
 const MAX_EPISODE_ENVIRONMENTS: usize = 6;
 const RETAINED_BYTES_PER_ENVIRONMENT: usize = 3
@@ -18,6 +25,13 @@ const _: () =
 const _: () = assert!(MAX_EPISODE_ENVIRONMENTS * RETAINED_PER_EPISODE <= crate::PPO_MAX_SAMPLES);
 
 pub(crate) fn validate(settings: &TrainingJobConfig) -> Result<(), PpoError> {
+    validate_time_cost(settings.episode_time_cost)?;
+    if settings.episode_time_cost > 0.0 && (!settings.terminal_only || !settings.complete_episodes)
+    {
+        return Err(PpoError::InvalidConfig(
+            "episode time cost requires terminal-only complete episodes",
+        ));
+    }
     if settings.terminal_only && !settings.complete_episodes {
         return Err(PpoError::InvalidConfig(
             "terminal-only requires complete episodes",
@@ -42,6 +56,35 @@ pub(crate) fn validate(settings: &TrainingJobConfig) -> Result<(), PpoError> {
     assert!(settings.ppo.environments * RETAINED_BYTES_PER_ENVIRONMENT < 6 * 1024 * 1024 * 1024);
     settings.ppo.validate()?;
     Ok(())
+}
+
+fn validate_time_cost(budget: f32) -> Result<(), PpoError> {
+    if !budget.is_finite() || !(0.0..=0.25).contains(&budget) {
+        return Err(PpoError::InvalidConfig(
+            "episode time cost must be finite in [0, 0.25]",
+        ));
+    }
+    Ok(())
+}
+
+fn elapsed_time_cost(budget: f32, elapsed: u32, ticks: u32) -> Result<f64, PpoError> {
+    validate_time_cost(budget)?;
+    if ticks == 0 {
+        return Err(PpoError::InvalidTransition("episode time-cost zero ticks"));
+    }
+    let end = elapsed
+        .checked_add(ticks)
+        .ok_or(PpoError::CounterOverflow)?;
+    if end >= TICK_CAP {
+        return Err(PpoError::InvalidTransition(
+            "episode time-cost elapsed tick bound",
+        ));
+    }
+    let before = f64::from(budget) * f64::from(elapsed) / f64::from(TICK_CAP);
+    let after = f64::from(budget) * f64::from(end) / f64::from(TICK_CAP);
+    assert!(after <= f64::from(budget));
+    assert!(after >= before);
+    Ok(after - before)
 }
 
 pub(super) fn environments(
@@ -74,24 +117,23 @@ pub(super) fn collect(
     model: &PolicyModel,
     sampling: &mut PpoRng,
     environments: &mut [TrainingEnvironment],
-    config: PpoConfig,
+    settings: &TrainingJobConfig,
+    update: u64,
     rollout: &mut PpoRollout,
     report: &mut PpoSmokeReport,
-    terminal_only: bool,
 ) -> Result<(), PpoError> {
+    let config = settings.ppo;
+    let terminal_only = settings.terminal_only;
+    validate(settings)?;
     assert!(matches!(environments.len(), 2 | 4 | 6));
     assert_eq!(config.decision_interval_ticks, 3);
     let mut random = actor_stream_rngs(sampling, environments.len())?;
-    let mut streams: Vec<_> = (0..environments.len())
-        .map(|_| EpisodeStream {
-            terminal_only,
-            ..EpisodeStream::default()
-        })
-        .collect();
+    let mut streams = streams_for_collection(settings, update)?;
     let retained_bytes_bound = environments.len() * RETAINED_BYTES_PER_ENVIRONMENT;
     eprintln!(
-        "collection: complete-episodes opponent=Teacher actor_ticks=3 retention_stride=8 tick_cap={TICK_CAP} environments={} terminal_only={terminal_only} retained_bytes_bound={retained_bytes_bound}",
-        environments.len()
+        "collection: complete-episodes opponent=Teacher actor_ticks=3 retention_stride=8 retention_phase=random_episode_independent_rng tick_cap={TICK_CAP} environments={} terminal_only={terminal_only} retained_bytes_bound={retained_bytes_bound} time_cost_budget={} cost_includes_pregame=true",
+        environments.len(),
+        settings.episode_time_cost
     );
     for _ in 0..ACTOR_DECISIONS {
         let active: Vec<_> = (0..streams.len())
@@ -101,13 +143,31 @@ pub(super) fn collect(
             break;
         }
         let (choices, spaces) = sample_active(model, &mut random, environments, &active)?;
-        for ((stream, choice), space) in active.into_iter().zip(choices).zip(spaces) {
-            advance_stream(
+        let mut samples = choices.into_iter().zip(spaces);
+        let jobs = streams
+            .iter_mut()
+            .enumerate()
+            .filter(|(stream, _)| active.contains(stream))
+            .map(|(stream, state)| {
+                let (choice, space) = samples.next().expect("one sample per active stream");
+                (stream, (state, choice, space))
+            })
+            .collect();
+        let completed = super::parallel::ordered_active(
+            environments,
+            jobs,
+            |_, environment, (state, choice, space)| {
+                advance_cpu(environment, state, choice, space, config)
+            },
+        )?;
+        assert!(samples.next().is_none());
+        for (stream, completed) in active.into_iter().zip(completed) {
+            finish_advance(
                 model,
                 &mut environments[stream],
                 &mut streams[stream],
-                (stream, choice, space),
-                config,
+                stream,
+                completed,
                 rollout,
                 report,
             )?;
@@ -116,12 +176,47 @@ pub(super) fn collect(
     assert!(streams.iter().all(|stream| stream.done));
     assert!(streams.iter().all(|stream| stream.choice.is_none()));
     report.rejected_orders = environment_rejections(environments)?;
+    validate_episode_batch(rollout, report)
+}
+
+fn validate_episode_batch(rollout: &PpoRollout, report: &PpoSmokeReport) -> Result<(), PpoError> {
+    if rollout.is_empty() {
+        return Err(PpoError::EmptyRollout);
+    }
     if report.terminal_wins + report.terminal_losses == 0 {
         return Err(PpoError::InvalidTransition(
             "complete episode batch has no authoritative terminal outcomes",
         ));
     }
     Ok(())
+}
+
+fn streams_for_collection(
+    settings: &TrainingJobConfig,
+    update: u64,
+) -> Result<Vec<EpisodeStream>, PpoError> {
+    validate(settings)?;
+    (0..settings.ppo.environments)
+        .map(|stream| {
+            Ok(EpisodeStream {
+                retention_phase: retention_phase(settings.seed, update, stream)?,
+                terminal_only: settings.terminal_only,
+                time_cost_budget: settings.episode_time_cost,
+                ..EpisodeStream::default()
+            })
+        })
+        .collect()
+}
+
+fn retention_phase(seed: u64, update: u64, stream: usize) -> Result<usize, PpoError> {
+    assert!(stream < MAX_EPISODE_ENVIRONMENTS);
+    let episode = derive_training_seed(seed, update, RETENTION_DOMAIN);
+    let seed = derive_training_seed(episode, stream as u64, RETENTION_STREAM_DOMAIN);
+    // A dedicated stream and power-of-two mask avoid actor RNG consumption and modulo bias.
+    let mut random = PpoRng::new(seed);
+    let phase = (random.next_word()? & (RETENTION_STRIDE as u64 - 1)) as usize;
+    assert!(phase < RETENTION_STRIDE);
+    Ok(phase)
 }
 
 fn sample_active(
@@ -138,15 +233,16 @@ fn sample_active(
     {
         return Err(PpoError::InvalidConfig("episode active streams"));
     }
-    let mut frames = Vec::with_capacity(active.len());
-    let mut spaces = Vec::with_capacity(active.len());
-    let mut selected_random = Vec::with_capacity(active.len());
-    for &stream in active {
-        let (frame, space) = prepare_policy_sample(&mut environments[stream])?;
-        frames.push(frame);
-        spaces.push(space);
-        selected_random.push(random[stream].clone());
-    }
+    let prepared = super::parallel::ordered_active(
+        environments,
+        active.iter().map(|&stream| (stream, ())).collect(),
+        |_, environment, ()| prepare_policy_sample(environment),
+    )?;
+    let (frames, spaces): (Vec<_>, Vec<_>) = prepared.into_iter().unzip();
+    let mut selected_random: Vec<_> = active
+        .iter()
+        .map(|&stream| random[stream].clone())
+        .collect();
     let choices = model
         .sample_batch(&frames, &spaces, &mut selected_random)
         .map_err(model_error)?;
@@ -158,6 +254,13 @@ fn sample_active(
 
 #[derive(Default)]
 struct EpisodeStream {
+    #[cfg(test)]
+    trace: std::collections::hash_map::DefaultHasher,
+    #[cfg(test)]
+    last_requests: Option<Vec<Option<Request>>>,
+    retention_phase: usize,
+    time_cost_budget: f32,
+    time_cost_spent: f64,
     terminal_only: bool,
     elapsed_ticks: u32,
     raw_return: f64,
@@ -172,6 +275,32 @@ struct EpisodeStream {
     done: bool,
 }
 
+impl EpisodeStream {
+    fn begins_interval(&self) -> bool {
+        assert!(self.retention_phase < RETENTION_STRIDE);
+        self.decisions >= self.retention_phase
+            && (self.decisions - self.retention_phase).is_multiple_of(RETENTION_STRIDE)
+    }
+
+    fn append_retained_reward(
+        &mut self,
+        reward: f64,
+        ticks: u32,
+        gamma: f32,
+    ) -> Result<(), PpoError> {
+        if self.choice.is_some() {
+            self.interval.append(reward, ticks, gamma)?;
+        } else {
+            assert_eq!(self.interval.steps, 0);
+        }
+        Ok(())
+    }
+
+    fn should_flush(&self) -> bool {
+        self.choice.is_some() && (self.interval.steps == RETENTION_STRIDE || self.done)
+    }
+}
+
 #[derive(Default)]
 struct DiscountedInterval {
     reward: f64,
@@ -180,7 +309,7 @@ struct DiscountedInterval {
 }
 
 impl DiscountedInterval {
-    fn append(&mut self, reward: f32, ticks: u32, gamma: f32) -> Result<(), PpoError> {
+    fn append(&mut self, reward: f64, ticks: u32, gamma: f32) -> Result<(), PpoError> {
         if !reward.is_finite() {
             return Err(PpoError::NonFinite("episode reward"));
         }
@@ -191,7 +320,7 @@ impl DiscountedInterval {
         } else {
             tick_discount(gamma, self.ticks)?
         };
-        self.reward += f64::from(discount) * f64::from(reward);
+        self.reward += f64::from(discount) * reward;
         self.ticks = self
             .ticks
             .checked_add(ticks)
@@ -215,6 +344,7 @@ impl DiscountedInterval {
     }
 }
 
+#[cfg(test)]
 fn advance_stream(
     model: &PolicyModel,
     environment: &mut TrainingEnvironment,
@@ -225,9 +355,36 @@ fn advance_stream(
     report: &mut PpoSmokeReport,
 ) -> Result<(), PpoError> {
     let (stream, choice, space) = sample;
+    let completed = advance_cpu(environment, state, choice, space, config)?;
+    finish_advance(
+        model,
+        environment,
+        state,
+        stream,
+        completed,
+        rollout,
+        report,
+    )
+}
+
+struct CompletedAdvance {
+    end_tick: u32,
+    ticks: u32,
+    outcome: Option<PpoTerminalOutcome>,
+}
+
+fn advance_cpu(
+    environment: &mut TrainingEnvironment,
+    state: &mut EpisodeStream,
+    choice: PpoPolicyChoice,
+    space: ActionSpace,
+    config: PpoConfig,
+) -> Result<CompletedAdvance, PpoError> {
     assert!(!state.done);
     assert!(state.decisions < ACTOR_DECISIONS);
-    if state.choice.is_none() {
+    if state.begins_interval() {
+        assert!(state.choice.is_none());
+        assert_eq!(state.interval.steps, 0);
         state.choice = Some(choice.clone());
     }
     let tick = environment.seats[environment.policy_seat]
@@ -237,6 +394,13 @@ fn advance_stream(
         .tick;
     assert!(tick < TICK_CAP);
     let requests = requests_for_decision_in_space(environment, &choice, &space)?;
+    #[cfg(test)]
+    {
+        use std::hash::Hash;
+        choice.action().hash(&mut state.trace);
+        format!("{requests:?}").hash(&mut state.trace);
+        state.last_requests = Some(requests.clone());
+    }
     let advanced = advance_interval(environment, requests, 3.min(TICK_CAP - tick))?;
     reject_production_rejection(environment, "complete episode rollout")?;
     let outcome = terminal_outcome(environment, advanced.winner);
@@ -248,29 +412,331 @@ fn advance_stream(
         config.gamma_tick,
     )?;
     state.actions[choice.action().kind().index()] += 1;
-    state
-        .interval
-        .append(reward, advanced.ticks, config.gamma_tick)?;
+    state.append_retained_reward(reward, advanced.ticks, config.gamma_tick)?;
     state.decisions += 1;
+    state.done = outcome.is_some() || tick + advanced.ticks >= TICK_CAP;
+    Ok(CompletedAdvance {
+        end_tick: tick + advanced.ticks,
+        ticks: advanced.ticks,
+        outcome,
+    })
+}
+
+fn finish_advance(
+    model: &PolicyModel,
+    environment: &mut TrainingEnvironment,
+    state: &mut EpisodeStream,
+    stream: usize,
+    completed: CompletedAdvance,
+    rollout: &mut PpoRollout,
+    report: &mut PpoSmokeReport,
+) -> Result<(), PpoError> {
     report.elapsed_ticks = report
         .elapsed_ticks
-        .checked_add(u64::from(advanced.ticks))
+        .checked_add(u64::from(completed.ticks))
         .ok_or(PpoError::CounterOverflow)?;
-    state.done = outcome.is_some() || tick + advanced.ticks >= TICK_CAP;
-    if state.interval.steps == RETENTION_STRIDE || state.done {
+    if state.should_flush() {
         flush(
             model,
             environment,
             state,
             stream,
-            outcome.is_some(),
+            completed.outcome.is_some(),
             rollout,
         )?;
     }
     if state.done {
-        record_episode(stream, tick + advanced.ticks, state, outcome, report)?;
+        record_episode(stream, completed.end_tick, state, completed.outcome, report)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn assert_retention_actor_parity_for_test(model: &PolicyModel) {
+    for phase in 1..RETENTION_STRIDE {
+        assert_actor_phase_parity_for_test(model, phase);
+    }
+}
+
+#[cfg(test)]
+fn assert_actor_phase_parity_for_test(model: &PolicyModel, phase: usize) {
+    let settings = parity_settings_for_test();
+    let mut reference = environments(&settings, 3).expect("reference worlds");
+    let mut candidate = environments(&settings, 3).expect("candidate worlds");
+    let mut random = actor_stream_rngs(&mut PpoRng::new(9971001), 2).expect("actor RNGs");
+    let mut replay = random.clone();
+    let mut source = parity_states_for_test(0);
+    let mut target = parity_states_for_test(phase);
+    let mut source_rollout =
+        PpoRollout::new(4, model.policy_identity().expect("identity")).expect("source rollout");
+    let mut target_rollout = PpoRollout::new(4, source_rollout.policy()).expect("target rollout");
+    for decision in 0..16 {
+        let (choices, spaces) =
+            sample_active(model, &mut random, &mut reference, &[0, 1]).expect("reference choices");
+        let (copies, targets) =
+            sample_active(model, &mut replay, &mut candidate, &[0, 1]).expect("candidate choices");
+        assert_eq!(random, replay);
+        for (stream, ((choice, space), (copy, target_space))) in choices
+            .into_iter()
+            .zip(spaces)
+            .zip(copies.into_iter().zip(targets))
+            .enumerate()
+        {
+            assert_eq!(choice.action(), copy.action());
+            assert_eq!(choice.log_probability(), copy.log_probability());
+            advance_stream(
+                model,
+                &mut reference[stream],
+                &mut source[stream],
+                (stream, choice, space),
+                settings.ppo,
+                &mut source_rollout,
+                &mut PpoSmokeReport::default(),
+            )
+            .expect("phase zero action");
+            advance_stream(
+                model,
+                &mut candidate[stream],
+                &mut target[stream],
+                (stream, copy, target_space),
+                settings.ppo,
+                &mut target_rollout,
+                &mut PpoSmokeReport::default(),
+            )
+            .expect("shifted phase action");
+            assert_eq!(source[stream].last_requests, target[stream].last_requests);
+            assert_eq!(source[stream].raw_return, target[stream].raw_return);
+            assert_eq!(
+                reference[stream].seats[stream].tracker.latest_summary(),
+                candidate[stream].seats[stream].tracker.latest_summary()
+            );
+            if decision < phase {
+                assert!(target[stream].choice.is_none());
+                assert_eq!(target[stream].interval.steps, 0);
+                assert!(target[stream].raw_return < 0.0);
+            }
+        }
+    }
+    assert_eq!(source_rollout.len(), 4);
+    assert_eq!(target_rollout.len(), 2);
+    let batch = target_rollout.finish(settings.ppo).expect("retained batch");
+    for index in 0..2 {
+        let sample = batch.sample(index).expect("sample").transition;
+        assert_eq!(sample.ticks, 24);
+        assert!((f64::from(sample.reward) + 0.25 * 24.0 / f64::from(TICK_CAP)).abs() < 1e-8);
+    }
+}
+
+#[cfg(test)]
+fn parity_settings_for_test() -> TrainingJobConfig {
+    crate::cli::training_settings_for_test(&[
+        "--complete-episodes",
+        "--terminal-only",
+        "--episode-time-cost",
+        "0.25",
+        "--map",
+        "0",
+        "--environments",
+        "2",
+        "--rollout",
+        "4538",
+        "--gamma-per-tick",
+        "1",
+    ])
+    .expect("settings")
+}
+
+#[cfg(test)]
+fn parity_states_for_test(retention_phase: usize) -> Vec<EpisodeStream> {
+    assert!(retention_phase < RETENTION_STRIDE);
+    (0..2)
+        .map(|_| EpisodeStream {
+            retention_phase,
+            time_cost_budget: 0.25,
+            terminal_only: true,
+            ..EpisodeStream::default()
+        })
+        .collect()
+}
+
+#[cfg(test)]
+pub(crate) fn assert_retention_phase_replay_for_test() {
+    let settings = crate::cli::training_settings_for_test(&[
+        "--complete-episodes",
+        "--map",
+        "0",
+        "--environments",
+        "6",
+        "--rollout",
+        "4538",
+    ])
+    .expect("settings");
+    let mut master = PpoRng::new(9971002);
+    let before = master.checkpoint();
+    let mut restored = PpoRng::from_checkpoint(before.0, before.1).expect("restore");
+    for update in [0, 1, 31, 999999] {
+        let first = streams_for_collection(&settings, update).expect("phases");
+        let replay = streams_for_collection(&settings, update).expect("replay phases");
+        assert_eq!(
+            first
+                .iter()
+                .map(|state| state.retention_phase)
+                .collect::<Vec<_>>(),
+            replay
+                .iter()
+                .map(|state| state.retention_phase)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(master.checkpoint(), before);
+    }
+    assert_eq!(
+        actor_stream_rngs(&mut master, 6).expect("master streams"),
+        actor_stream_rngs(&mut restored, 6).expect("restored streams")
+    );
+    for length in [1, 3, 8, 9, 17, ACTOR_DECISIONS] {
+        let mut inclusions = vec![0; length];
+        for phase in 0..8 {
+            let mut state = EpisodeStream {
+                retention_phase: phase,
+                ..EpisodeStream::default()
+            };
+            for (decision, included) in inclusions.iter_mut().enumerate() {
+                state.decisions = decision;
+                *included += usize::from(state.begins_interval());
+            }
+        }
+        assert!(inclusions.iter().all(|count| *count == 1));
+    }
+    for phase in 0..8 {
+        let count = (ACTOR_DECISIONS - phase).div_ceil(RETENTION_STRIDE);
+        assert!(count <= RETAINED_PER_EPISODE);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn assert_retention_boundaries_for_test(_: &PolicyModel) {
+    let model = PolicyModel::fresh(9971003).expect("nonzero value model");
+    let settings = crate::cli::training_settings_for_test(&[
+        "--complete-episodes",
+        "--map",
+        "0",
+        "--environments",
+        "2",
+        "--rollout",
+        "4538",
+    ])
+    .expect("settings");
+    let mut arena = environments(&settings, 0).expect("worlds").remove(0);
+    let choice = sample_policy(&model, &mut PpoRng::new(9971004), &mut arena).expect("choice");
+    for terminal in [true, false] {
+        let mut state = EpisodeStream {
+            retention_phase: 3,
+            ..EpisodeStream::default()
+        };
+        let mut rollout = PpoRollout::new(1, choice.policy()).expect("rollout");
+        for decision in 0..8 {
+            if state.begins_interval() {
+                state.choice = Some(choice.clone());
+            }
+            let reward = if decision < 3 { 1000.0 } else { 2.0 };
+            state
+                .append_retained_reward(reward, if decision == 7 { 2 } else { 3 }, 0.5)
+                .expect("reward");
+            state.decisions += 1;
+        }
+        state.done = true;
+        assert!(state.should_flush());
+        let bootstrap = model
+            .evaluate_batch(&[encode_next_frame(&mut arena).expect("frame")])
+            .expect("value")[0]
+            .value;
+        assert_ne!(bootstrap, 0.0);
+        flush(&model, &mut arena, &mut state, 0, terminal, &mut rollout).expect("partial flush");
+        let sample = rollout
+            .finish(settings.ppo)
+            .expect("batch")
+            .sample(0)
+            .expect("sample")
+            .transition;
+        assert_eq!(sample.ticks, 14);
+        assert_eq!(sample.terminal, terminal);
+        assert_eq!(sample.next_value, if terminal { 0.0 } else { bootstrap });
+        assert_eq!(
+            sample.reward,
+            2.0 * (1.0 + 0.5f32.powi(3) + 0.5f32.powi(6) + 0.5f32.powi(9) + 0.5f32.powi(12))
+        );
+    }
+    assert_unsampled_short_episode_for_test(&choice);
+}
+
+#[cfg(test)]
+fn assert_unsampled_short_episode_for_test(choice: &PpoPolicyChoice) {
+    let mut state = EpisodeStream {
+        retention_phase: 7,
+        ..EpisodeStream::default()
+    };
+    assert!(!state.begins_interval());
+    state
+        .append_retained_reward(1.0, 3, 1.0)
+        .expect("unretained terminal reward");
+    state.raw_return = 1.0;
+    state.decisions = 1;
+    state.done = true;
+    assert!(!state.should_flush());
+    assert!(state.choice.is_none());
+    assert_eq!(state.interval.steps, 0);
+    let mut report = PpoSmokeReport::default();
+    record_episode(0, 4, &state, Some(PpoTerminalOutcome::Win), &mut report)
+        .expect("complete outcome");
+    assert_eq!(report.terminal_wins, 1);
+    assert_eq!(state.retained, 0);
+    let rollout = PpoRollout::new(1, choice.policy()).expect("empty rollout");
+    assert_eq!(
+        validate_episode_batch(&rollout, &report),
+        Err(PpoError::EmptyRollout)
+    );
+    assert_eq!(
+        validate_episode_batch(&rollout, &report)
+            .expect_err("no optimizer input")
+            .to_string(),
+        "PPO rollout is empty"
+    );
+}
+
+#[cfg(test)]
+pub(crate) fn assert_all_retention_phase_labels_for_test(model: &PolicyModel) {
+    let settings = crate::cli::training_settings_for_test(&[
+        "--complete-episodes",
+        "--map",
+        "0",
+        "--environments",
+        "2",
+        "--rollout",
+        "4538",
+    ])
+    .expect("settings");
+    let mut arena = environments(&settings, 0).expect("arena").remove(0);
+    let choice = sample_policy(model, &mut PpoRng::new(9971000), &mut arena).expect("sample");
+    let mut retained_phase_labels = std::collections::BTreeSet::new();
+    for update in 0..64 {
+        for mut state in streams_for_collection(&settings, update).expect("production streams") {
+            for action_index in 0..16 {
+                if state.begins_interval() {
+                    retained_phase_labels.insert(action_index % 8);
+                    state.choice = Some(choice.clone());
+                }
+                if state.choice.is_some() {
+                    state.interval.append(0.0, 3, 1.0).expect("interval");
+                }
+                state.decisions += 1;
+                if state.interval.steps == 8 {
+                    state.choice = None;
+                    state.interval = DiscountedInterval::default();
+                }
+            }
+        }
+    }
+    assert_eq!(retained_phase_labels, (0..8).collect());
 }
 
 fn observe_reward(
@@ -279,7 +745,7 @@ fn observe_reward(
     outcome: Option<PpoTerminalOutcome>,
     ticks: u32,
     gamma: f32,
-) -> Result<f32, PpoError> {
+) -> Result<f64, PpoError> {
     assert!(ticks > 0);
     assert!(state.elapsed_ticks < TICK_CAP);
     let reward = if state.terminal_only {
@@ -293,13 +759,17 @@ fn observe_reward(
             .reward
             .observe(summary, tick_discount(gamma, ticks)?, outcome)?
     };
-    state.raw_return += f64::from(reward.total);
-    state.discounted_return +=
-        f64::from(gamma).powi(state.elapsed_ticks as i32) * f64::from(reward.total);
+    let cost = elapsed_time_cost(state.time_cost_budget, state.elapsed_ticks, ticks)?;
+    let emitted = f64::from(reward.total) - cost;
+    state.raw_return += emitted;
+    state.discounted_return += f64::from(gamma).powi(state.elapsed_ticks as i32) * emitted;
     state.shaping_return += f64::from(reward.total - reward.terminal);
     state.terminal_reward = reward.terminal;
     state.elapsed_ticks += ticks;
-    Ok(reward.total)
+    state.time_cost_spent =
+        f64::from(state.time_cost_budget) * f64::from(state.elapsed_ticks) / f64::from(TICK_CAP);
+    assert!(state.time_cost_spent <= f64::from(state.time_cost_budget));
+    Ok(emitted)
 }
 
 fn flush(
@@ -350,17 +820,20 @@ fn record_episode(
     };
     *counter = counter.checked_add(1).ok_or(PpoError::CounterOverflow)?;
     eprintln!(
-        "episode: stream={stream} opponent=Teacher tick={tick} outcome={label} actor_decisions={} retained={} terminal_sample={} terminal_only={} raw_return={:.9} discounted_return={:.9} terminal_reward={} shaping_return={:.9} actions={:?} noncontinue={}",
+        "episode: stream={stream} opponent=Teacher tick={tick} outcome={label} actor_decisions={} retained={} terminal_sample={} terminal_only={} raw_return={:.9} discounted_return={:.9} terminal_reward={} shaping_return={:.9} actions={:?} noncontinue={} time_cost_budget={} time_cost_spent={:.9} retention_phase={}",
         state.decisions,
         state.retained,
-        outcome.is_some(),
+        outcome.is_some() && state.retained > 0,
         state.terminal_only,
         state.raw_return,
         state.discounted_return,
         state.terminal_reward,
         state.shaping_return,
         state.actions,
-        state.decisions - state.actions[ActionKind::Continue.index()] as usize
+        state.decisions - state.actions[ActionKind::Continue.index()] as usize,
+        state.time_cost_budget,
+        state.time_cost_spent,
+        state.retention_phase
     );
     Ok(())
 }
@@ -385,7 +858,7 @@ pub(crate) fn assert_discounted_intervals_for_test() {
     let mut invalid = DiscountedInterval::default();
     assert_eq!(
         invalid
-            .append(f32::NAN, 3, 0.9)
+            .append(f64::NAN, 3, 0.9)
             .expect_err("NaN")
             .to_string(),
         "PPO episode reward is non-finite"
@@ -532,6 +1005,21 @@ pub(crate) fn assert_checkpoint_scope_for_test(mut settings: TrainingJobConfig, 
     .expect("restore");
     assert_eq!(restored.0.config(), config);
     assert_eq!(restored.1, session.sampling);
+    for stream in 0..settings.ppo.environments {
+        assert_eq!(
+            retention_phase(settings.seed, session.completed_updates, stream)
+                .expect("original phase"),
+            retention_phase(settings.seed, restored.2, stream).expect("resumed phase")
+        );
+    }
+    settings.episode_time_cost = 0.25;
+    let timed =
+        training_checkpoint_run(&settings, PolicyDevice::Cpu, config).expect("time cost run");
+    assert_eq!(
+        TrainingArtifact::load_compatible(directory, &timed).expect_err("time cost mismatch"),
+        crate::CheckpointError::InvalidManifest("compatibility scope")
+    );
+    settings.episode_time_cost = 0.0;
     settings.terminal_only = true;
     let terminal =
         training_checkpoint_run(&settings, PolicyDevice::Cpu, config).expect("terminal run");
@@ -547,6 +1035,164 @@ pub(crate) fn assert_checkpoint_scope_for_test(mut settings: TrainingJobConfig, 
         TrainingArtifact::load_compatible(directory, &windows).expect_err("mode mismatch"),
         crate::CheckpointError::InvalidManifest("compatibility scope")
     );
+}
+
+#[cfg(test)]
+pub(crate) fn assert_time_cost_for_test() {
+    let fast = elapsed_time_cost(0.25, 0, 300).expect("pregame cost");
+    let slow = elapsed_time_cost(0.25, 0, 60000).expect("long cost");
+    let maximum = elapsed_time_cost(0.25, 0, TICK_CAP - 1).expect("maximum elapsed");
+    assert!(fast > 0.0);
+    assert!(1.0 - fast > 1.0 - slow);
+    assert!(-1.0 - fast > -1.0 - slow);
+    assert!(1.0 - maximum >= 0.75);
+    assert!(-1.0 - maximum <= -1.0);
+    assert!(1.0 - maximum > -1.0 - fast);
+    let mut elapsed = 0;
+    let mut spent = 0.0;
+    for _ in 0..ACTOR_DECISIONS {
+        let ticks = 3.min(TICK_CAP - 1 - elapsed);
+        spent += elapsed_time_cost(0.25, elapsed, ticks).expect("costed interval");
+        elapsed += ticks;
+        assert!(spent <= 0.25);
+    }
+    assert_eq!(elapsed, TICK_CAP - 1);
+    assert!((spent - maximum).abs() < 1e-12);
+    assert_eq!(elapsed_time_cost(0.0, 0, 3).expect("old profile"), 0.0);
+    assert_eq!(
+        elapsed_time_cost(0.25, TICK_CAP - 2, 3)
+            .expect_err("overrun")
+            .to_string(),
+        "invalid PPO transition: episode time-cost elapsed tick bound"
+    );
+    assert_eq!(
+        elapsed_time_cost(0.25, 0, 0)
+            .expect_err("zero span")
+            .to_string(),
+        "invalid PPO transition: episode time-cost zero ticks"
+    );
+}
+
+#[cfg(test)]
+pub(crate) fn assert_time_cost_checkpoint_for_test(
+    mut settings: TrainingJobConfig,
+    directory: &Path,
+) {
+    validate(&settings).expect("valid time cost");
+    let config = settings.ppo;
+    let run = training_checkpoint_run(&settings, PolicyDevice::Cpu, config).expect("run");
+    assert!(
+        run.command_line
+            .ends_with(" --terminal-only --episode-time-cost 0.25")
+    );
+    let session = TrainingSession::initialize(
+        &settings,
+        PolicyDevice::Cpu,
+        directory,
+        false,
+        None,
+        config,
+        run.clone(),
+    )
+    .expect("session");
+    session
+        .save(directory, session.checkpoint_report(None))
+        .expect("checkpoint");
+    let model = PolicyModel::fresh(9941004).expect("restore target");
+    let restored =
+        restore_training_session(&model, directory, &run, config, ResumeProvenance::Strict)
+            .expect("exact resume");
+    assert_eq!(restored.0.config(), config);
+    assert_eq!(restored.1, session.sampling);
+    settings.episode_time_cost = 0.125;
+    validate(&settings).expect("different valid cost");
+    let changed =
+        training_checkpoint_run(&settings, PolicyDevice::Cpu, config).expect("different run");
+    let Err(error) = TrainingArtifact::load_compatible(directory, &changed) else {
+        panic!("different time-cost budget must reject resume");
+    };
+    assert_eq!(
+        error,
+        crate::CheckpointError::InvalidManifest("compatibility scope")
+    );
+}
+
+#[cfg(test)]
+pub(crate) fn assert_time_cost_mc_for_test() {
+    let model = PolicyModel::fresh(9941000).expect("model");
+    let mut arena =
+        build_environment(9941001, 9941002, MapId(0), 0, 0, OpponentSpec::Teacher).expect("arena");
+    let choice = sample_policy(&model, &mut PpoRng::new(9941003), &mut arena).expect("sample");
+    let config = PpoConfig {
+        environments: 3,
+        rollout_decisions: RETAINED_PER_EPISODE,
+        minibatch: 512,
+        gamma_tick: 1.0,
+        gae_lambda: 1.0,
+        ..PpoConfig::default()
+    };
+    let mut rollout = PpoRollout::new(3 * RETAINED_PER_EPISODE, choice.policy()).expect("rollout");
+    for stream in 0..3 {
+        time_cost_mc_stream_for_test(&mut rollout, &choice, stream);
+    }
+    let batch = rollout.finish(config).expect("MC batch");
+    let cost = elapsed_time_cost(0.25, 0, TICK_CAP - 1).expect("total cost");
+    for (stream, expected) in [(0, 1.0 - cost), (1, -1.0 - cost), (2, 0.5 - cost)] {
+        let first = batch.sample(stream * RETAINED_PER_EPISODE).expect("first");
+        assert!((f64::from(first.return_value()) - expected).abs() < 1e-5);
+        let last = batch
+            .sample((stream + 1) * RETAINED_PER_EPISODE - 1)
+            .expect("last");
+        assert_eq!(last.transition.terminal, stream < 2);
+        assert_eq!(
+            last.transition.next_value,
+            if stream < 2 { 0.0 } else { 0.5 }
+        );
+    }
+    assert!(batch.sample(0).expect("win").return_value() >= 0.75);
+    assert!(
+        batch
+            .sample(RETAINED_PER_EPISODE)
+            .expect("loss")
+            .return_value()
+            <= -1.0
+    );
+}
+
+#[cfg(test)]
+fn time_cost_mc_stream_for_test(rollout: &mut PpoRollout, choice: &PpoPolicyChoice, stream: usize) {
+    let mut elapsed = 0;
+    let mut retained = 0;
+    let mut interval = DiscountedInterval::default();
+    for decision in 0..ACTOR_DECISIONS {
+        let ticks = 3.min(TICK_CAP - 1 - elapsed);
+        let last = decision + 1 == ACTOR_DECISIONS;
+        let terminal = last && stream < 2;
+        let reward = if terminal {
+            if stream == 0 { 1.0 } else { -1.0 }
+        } else {
+            0.0
+        };
+        let cost = elapsed_time_cost(0.25, elapsed, ticks).expect("cost");
+        interval
+            .append(reward - cost, ticks, 1.0)
+            .expect("aggregate");
+        elapsed += ticks;
+        if interval.steps == RETENTION_STRIDE || last {
+            let outcome = std::mem::take(&mut interval).finish(
+                stream,
+                retained,
+                terminal,
+                if last { 0.5 } else { 99.0 },
+            );
+            rollout
+                .push(choice.clone().finish(outcome).expect("transition"))
+                .expect("retained");
+            retained += 1;
+        }
+    }
+    assert_eq!(retained, RETAINED_PER_EPISODE as u32);
+    assert_eq!(elapsed, TICK_CAP - 1);
 }
 
 #[cfg(test)]
@@ -606,6 +1252,11 @@ pub(crate) fn assert_full_mc_for_test() {
         let expected = sign * f64::from(config.gamma_tick).powi(exponent);
         assert!((f64::from(sample.return_value()) - expected).abs() < 1.0e-5);
     }
+    assert_mc_timeout_for_test(choice, config);
+}
+
+#[cfg(test)]
+fn assert_mc_timeout_for_test(choice: PpoPolicyChoice, config: PpoConfig) {
     let mut truncated = PpoRollout::new(1, choice.policy()).expect("truncated rollout");
     truncated
         .push(

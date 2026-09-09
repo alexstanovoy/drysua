@@ -28,19 +28,21 @@ pub const PPO_SHAPING_BUDGET: f32 = 100.0 / PPO_REWARD_SCALE;
 pub const PPO_TERMINAL_REWARD: f32 = 1.0;
 const _: () = assert!(PPO_TERMINAL_REWARD > PPO_SHAPING_BUDGET);
 /// Version of rollout, GAE, objective, optimizer, and reward semantics.
-pub const PPO_SCHEMA_VERSION: u32 = 22;
+pub const PPO_SCHEMA_VERSION: u32 = 27;
 /// Audited simulator and learner rules required by stage-nine rollouts.
-pub const PPO_RULES_AUDIT_VERSION: u32 = 18;
+pub const PPO_RULES_AUDIT_VERSION: u32 = 22;
 /// Canonical stage-nine learner contract covered by [`PPO_SCHEMA_HASH`].
 pub const PPO_SCHEMA_DESCRIPTOR: &str = concat!(
-    "bota-drysua-ppo/v22;",
+    "bota-drysua-ppo/v27;",
     "action_schema_version=3;action_schema_hash=1755359086494840931;",
-    "feature_schema_version=10;feature_schema_hash=15519817897416174399;",
-    "model_schema_version=11;model_schema_hash=18229126264156367519;rules_audit=18;",
+    "feature_schema_version=12;feature_schema_hash=1577122233561586211;",
+    "model_schema_version=14;model_schema_hash=7970187849195607202;rules_audit=22;",
+    "candidate_order=unchanged_feature12_live_neural_ppo_learner_greedy_candidate_neuralseat_learner_and_current_m14_policy_sharedpolicy_opponents,including_current_accepted_new_run_historical_snapshots_and_restart,frozen_weights_not_legacy_execution;observer=explicit_from_trajectory_start,feature12_effective_directive_ledger_follows_all_actual_sends_complete_snapshot_events_lifecycle_rejections_even_without_retained_rows,never_deduplicates_transport,never_sends_labels_or_claims_successful_execution;teacher=original_decisions_legacy_request_ledger_readiness_actual_send_rejection_notifications_and_internal_state_unchanged;prediction=observer_only_never_execution_opt_in,no_role_bit_in_tensors;imitation_rules=13,no_rule12_data_relabel;legacy_generic_transport=unchanged;reconstruction=explicit_role_observations_actual_sends_rejections_bounded_ledgers,late_enable_after_actual_send_rejected,no_enriched_history;training_roles=supersede_v26_training_role_exclusions_in_unchanged_feature12_model14_descriptors_not_their_live_actor_tensor_contract;artifacts=exact_f12_m14_ppo26_hash4420330489262074980_rules21_runtime_only_audited_actor_compatibility,no_ppo26_training_resume,m12_ppo23_24_25_runtime_and_resume_rejected,only_existing_two_selected_m12_parameter_initializers,historical_opponents_original_binaries_not_initialized_m14_identity;",
     "warmup=all_maps_raw_neural_greedy_actions,no_learner_teacher_override_or_send_sync,independent_scheduled_opponent,frozen_policy_opponents_raw_neural_sampling;",
     "bounds=rollout32768,streams1280,environments128,decisions16384,epochs16,minibatch8192,microbatch64;",
-    "complete_episodes=opt_in_map0_two_four_six_paired_sides_fixed_teacher_no_warmup,act_every3ticks_until_terminal_or108900,retain_first_of_each8_actions_independent_of_kind,discounted_nstep_rewards_exact_elapsed_ticks,original_retained_action_logprob,lambda_per_retained_transition,terminal_zero_bootstrap_partial_flush,timeout_bootstrap_not_draw,no_update_without_authoritative_terminal,no_restart_within_collection,natural_episode_checkpoint_boundary;",
+    "complete_episodes=opt_in_map0_two_four_six_paired_sides_fixed_teacher_no_warmup,act_every3ticks_until_terminal_or108900,retain_uniform_episode_phase0to7_then_every8_actions_independent_of_kind,phase_rng_separate_runseed_update_stream_domains726574656e74696f_70686173655f726e_nextword_mask7_no_actor_draws,prefix_rewards_telemetry_only,terminal_before_phase_no_synthetic_sample,empty_optimizer_batch_rejected,discounted_nstep_rewards_exact_elapsed_ticks,original_retained_action_logprob,lambda_per_retained_transition,terminal_zero_bootstrap_partial_flush,timeout_bootstrap_not_draw,no_update_without_authoritative_terminal,no_restart_within_collection,natural_episode_checkpoint_boundary;",
     "terminal_only=opt_in_complete_episodes_only,all_shaping_components_zero,actual_win1_loss-1,timeout_zero_nonterminal_with_bootstrap,draw_rejected;lambda1=full_discounted_monte_carlo_f64_return_recurrence_ignores_intermediate_values_preserves_timeout_bootstrap;",
+    "episode_time_cost=opt_in_terminal_only_complete_episodes,finite_budget0_to0.25,negative_budget_times_actual_elapsed_ticks_over108900,includes_pregame_from_initial_tick1,strict_elapsed_cap108899,f64_interval_accumulation,no_xp_gold_or_hidden_state,gamma1_allowed_for_undiscounted_finish_preference,timeout_remains_nonterminal_with_bootstrap;",
     "actor=frozen_exact_policy_identity,batch_max64_single_shared_trunk_forward,independent_per_environment_rng_seeded_from_checkpointed_master,transactional_batch_rng,legal_masked_gumbel_max_open_f64_uniform,exact_autoregressive_log_probability_and_entropy;",
     "gae=gamma_tick0.9966555_pow_elapsed_ticks,lambda0.98,terminal_reset,bootstrap_truncation,normalized_advantages;",
     "objective=clipped_surrogate0.2,value_mse0.5,entropy0.01,target_kl0.02;",
@@ -75,11 +77,11 @@ pub const PPO_SCHEMA_HASH: u64 = ppo_fnv1a(PPO_SCHEMA_DESCRIPTOR.as_bytes());
 
 const _: () = assert!(ACTION_SCHEMA_VERSION == 3);
 const _: () = assert!(ACTION_SCHEMA_HASH == 1_755_359_086_494_840_931);
-const _: () = assert!(FEATURE_SCHEMA_VERSION == 10);
-const _: () = assert!(FEATURE_SCHEMA_HASH == 15_519_817_897_416_174_399);
-const _: () = assert!(MODEL_SCHEMA_VERSION == 11);
-const _: () = assert!(MODEL_SCHEMA_HASH == 18_229_126_264_156_367_519);
-const _: () = assert!(PPO_RULES_AUDIT_VERSION == 18);
+const _: () = assert!(FEATURE_SCHEMA_VERSION == 12);
+const _: () = assert!(FEATURE_SCHEMA_HASH == 1_577_122_233_561_586_211);
+const _: () = assert!(MODEL_SCHEMA_VERSION == 14);
+const _: () = assert!(MODEL_SCHEMA_HASH == 7_970_187_849_195_607_202);
+const _: () = assert!(PPO_RULES_AUDIT_VERSION == 22);
 
 /// Stage-nine PPO hyperparameters and bounded rollout dimensions.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -167,7 +169,8 @@ impl PpoConfig {
 
 fn validate_probabilities(config: PpoConfig) -> Result<(), PpoError> {
     let inside_unit = |value: f32| value.is_finite() && (0.0..1.0).contains(&value);
-    if !inside_unit(config.gamma_tick)
+    if !config.gamma_tick.is_finite()
+        || !(0.0..=1.0).contains(&config.gamma_tick)
         || !config.gae_lambda.is_finite()
         || !(0.0..=1.0).contains(&config.gae_lambda)
     {
@@ -221,6 +224,10 @@ pub enum PpoError {
         rollback: String,
     },
     Model(String),
+    EpisodeWorker {
+        stream: usize,
+        cause: String,
+    },
 }
 
 impl fmt::Display for PpoError {
@@ -258,6 +265,9 @@ impl fmt::Display for PpoError {
                 )
             }
             Self::Model(message) => write!(formatter, "PPO model error: {message}"),
+            Self::EpisodeWorker { stream, cause } => {
+                write!(formatter, "PPO episode worker {stream} failed: {cause}")
+            }
         }
     }
 }
@@ -1053,7 +1063,7 @@ fn expand_transition(
 
 /// Discount over an exact positive number of elapsed simulation ticks.
 pub fn tick_discount(gamma_tick: f32, ticks: u32) -> Result<f32, PpoError> {
-    if !gamma_tick.is_finite() || !(0.0..1.0).contains(&gamma_tick) || ticks == 0 {
+    if !gamma_tick.is_finite() || !(0.0..=1.0).contains(&gamma_tick) || ticks == 0 {
         return Err(PpoError::InvalidDiscount);
     }
     let exponent = i32::try_from(ticks).map_err(|_| PpoError::InvalidDiscount)?;

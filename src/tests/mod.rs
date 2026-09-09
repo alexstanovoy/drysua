@@ -11,6 +11,10 @@ mod league;
 mod link;
 mod model;
 #[cfg(feature = "builtin")]
+mod neural_order_contract;
+#[cfg(feature = "builtin")]
+mod neural_persistence;
+#[cfg(feature = "builtin")]
 mod parity;
 mod persistence;
 mod pipeline;

@@ -33,7 +33,7 @@ struct Arguments {
     dagger_rounds: usize,
     #[arg(long, default_value_t = 32)]
     dagger_epochs: u32,
-    /// Current M11 weights with a new optimizer, never an optimizer resume.
+    /// Current runtime weights with a new optimizer, never an optimizer resume.
     #[arg(long, conflicts_with = "initialize_selected_m10")]
     initial_weights: Option<PathBuf>,
     /// Explicit approved immutable M10 source initialization into a new M11 model.

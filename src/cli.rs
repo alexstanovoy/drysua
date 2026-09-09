@@ -135,16 +135,19 @@ struct TrainArgs {
 /// Options for bounded resumable PPO training.
 #[derive(Args)]
 struct TrainFullArgs {
+    /// Total time-cost bound in [0, 0.25] across the 108900-tick cap, including pregame.
+    #[arg(long, default_value_t = 0.0, requires = "terminal_only")]
+    episode_time_cost: f32,
     /// Use only actual Map0 terminal win/loss rewards; requires complete episodes.
     #[arg(long, requires = "complete_episodes")]
     terminal_only: bool,
-    /// Collect two, four, or six complete Map0 matches against Teacher; retain every eighth action.
+    /// Collect paired Map0 games against Teacher; retain one random phase of each eight actions.
     #[arg(long)]
     complete_episodes: bool,
     /// Adam learning rate; must be finite and positive.
     #[arg(long, default_value_t = crate::PpoConfig::default().learning_rate)]
     learning_rate: f32,
-    /// Discount per simulator tick in [0, 1), not per policy decision.
+    /// Discount per simulator tick in [0, 1]; one preserves undiscounted outcome/time ordering.
     #[arg(long, default_value_t = crate::PpoConfig::default().gamma_tick)]
     gamma_per_tick: f32,
     /// Generalized advantage trace decay in [0, 1]; one uses full discounted Monte Carlo returns.
@@ -589,6 +592,7 @@ impl TrainFullArgs {
         .validate()
         .map_err(std::io::Error::other)?;
         Ok(crate::TrainingJobConfig {
+            episode_time_cost: self.episode_time_cost,
             terminal_only: self.terminal_only,
             complete_episodes: self.complete_episodes,
             updates: self.updates,

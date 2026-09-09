@@ -3,6 +3,7 @@
     reason = "behavioral metrics and optimizer configuration"
 )]
 
+use std::collections::BTreeMap;
 use std::collections::hash_map::DefaultHasher;
 use std::error::Error;
 use std::fs::{self, File};
@@ -22,15 +23,11 @@ use crate::{
 use bota_proto::{MapId, ServerMsg, SlotId, Team};
 use sha2::{Digest, Sha256};
 
+use crate::persistence::training::PolicyOrderBookkeeping;
+
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
-const CAPACITIES: [usize; 3] = [4096, 1536, 1536];
-const DAGGER_CAPACITY: usize = 2048;
-const DAGGER_KIND_CAPACITIES: [usize; ActionKind::COUNT] = [
-    384, 128, 128, 32, 32, 192, 128, 384, 64, 32, 32, 32, 384, 16, 16, 64,
-];
-const BASE_KIND_CAPACITIES: [usize; ActionKind::COUNT] = [
-    1024, 256, 384, 128, 64, 384, 512, 512, 256, 64, 64, 64, 128, 64, 64, 128,
-];
+const CAPACITIES: [usize; 3] = [16384, 6144, 6144];
+const DAGGER_CAPACITY: usize = 4096;
 const _: () = assert!(
     CAPACITIES[0] + CAPACITIES[1] + CAPACITIES[2] + DAGGER_CAPACITY == MAX_IMITATION_SAMPLES
 );
@@ -63,6 +60,12 @@ pub fn run_neural_training(config: &NeuralTrainingConfig, output: &Path) -> Resu
         format!("{}\n", checkpoint.display()),
     )?;
     TrainingArtifact::load_runtime_weights(&actor, &checkpoint)?;
+    write_branch_accuracy(
+        &actor,
+        &data,
+        SeedNamespace::Promotion,
+        &output.join("final-branches.txt"),
+    )?;
     let held_out =
         OfflineEvaluation::evaluate_held_out(&actor, &data.pool, data.coverage[1].clone())?;
     fs::write(
@@ -79,6 +82,9 @@ pub fn run_neural_training(config: &NeuralTrainingConfig, output: &Path) -> Resu
         output.join("final-gameplay.txt"),
         format!("{final_games:?}\n"),
     )?;
+    let candidate = output.join("ppo-candidate");
+    fs::create_dir(&candidate)?;
+    TrainingArtifact::save_runtime_weights(&actor, &candidate)?;
     fs::write(
         output.join("status.json"),
         "{\"accepted\":false,\"phase\":\"completed_diagnostic\",\"promotion\":\"not_performed\"}\n",
@@ -99,6 +105,7 @@ fn train_checkpoints(
     data: &mut NeuralDataset,
 ) -> Result<(PathBuf, PolicyModel)> {
     let mut session = TrainingSession::new(config, data)?;
+    session.baseline(config, output, deadline, data)?;
     session.stage(config, output, deadline, data, 0)?;
     for round in 0..config.dagger_rounds {
         if Instant::now() + Duration::from_secs(420) >= deadline {
@@ -106,7 +113,9 @@ fn train_checkpoints(
                 output.join("dagger-deadline.txt"),
                 format!("round {round} not scheduled: insufficient complete-match budget\n"),
             )?;
-            break;
+            return Err(
+                "required DAgger pass cannot fit before deadline; experiment unaccepted".into(),
+            );
         }
         session
             .actor
@@ -131,6 +140,7 @@ fn train_checkpoints(
                     format!("{error}\nno_partial_pool_append=true\n"),
                 )?;
                 println!("dagger round={} failed_diagnostic={error}", round + 1);
+                return Err(error);
             }
         }
     }
@@ -172,12 +182,52 @@ impl Initialization {
             ),
         };
         format!(
-            "initialization={kind}\nsource={source:?}\nsource_sha256={sha256}\nold_tuple={old_tuple}\ncurrent_model=11:18229126264156367519\ncurrent_feature=10:15519817897416174399\noptimizer=new_Adam_no_resume\nlearning_rate=0.001 beta1=0.9 beta2=0.999 epsilon=1e-8 gradient_clip=0.5\nteacher_overrides=0\n"
+            "initialization={kind}\nsource={source:?}\nsource_sha256={sha256}\nold_tuple={old_tuple}\ncurrent_model={}:{}\ncurrent_feature={}:{}\noptimizer=new_Adam_no_resume\nlearning_rate=0.001 beta1=0.9 beta2=0.999 epsilon=1e-8 gradient_clip=0.5\nteacher_overrides=0\n",
+            crate::MODEL_SCHEMA_VERSION,
+            crate::MODEL_SCHEMA_HASH,
+            crate::FEATURE_SCHEMA_VERSION,
+            crate::FEATURE_SCHEMA_HASH
         )
     }
 }
 
 impl TrainingSession {
+    fn baseline(
+        &mut self,
+        config: &NeuralTrainingConfig,
+        output: &Path,
+        deadline: Instant,
+        data: &NeuralDataset,
+    ) -> Result<()> {
+        let baseline = output.join("baseline");
+        fs::create_dir(&baseline)?;
+        TrainingArtifact::save_runtime_weights(&self.model, &baseline)?;
+        fs::write(
+            baseline.join("initialization.txt"),
+            self.initialization.provenance(),
+        )?;
+        let validation = OfflineEvaluation::evaluate_validation(
+            &self.model,
+            &data.pool,
+            data.coverage[0].clone(),
+        )?;
+        fs::write(
+            baseline.join("offline.txt"),
+            format!(
+                "{:?}\nnoncontinue_full={:?}\n",
+                validation.metrics(),
+                noncontinue_full(validation.metrics())
+            ),
+        )?;
+        write_branch_accuracy(
+            &self.model,
+            data,
+            SeedNamespace::Validation,
+            &baseline.join("selection-branches.txt"),
+        )?;
+        self.select_checkpoint(config, baseline, validation.metrics(), deadline)
+    }
+
     fn new(config: &NeuralTrainingConfig, data: &NeuralDataset) -> Result<Self> {
         let (model, initialization) = initialize_model(config)?;
         let trainer = BehavioralTrainer::new(
@@ -217,22 +267,14 @@ impl TrainingSession {
         };
         for epoch in 1..=epochs {
             if Instant::now() + Duration::from_secs(180) >= deadline {
-                break;
+                return Err(
+                    "requested training epochs incomplete before deadline; experiment unaccepted"
+                        .into(),
+                );
             }
             let started = Instant::now();
             let trained = self.trainer.train_epoch(&self.model, &data.pool)?;
-            let checkpoint = output.join(format!("stage-{stage}-epoch-{epoch:03}"));
-            fs::create_dir(&checkpoint)?;
-            TrainingArtifact::save_runtime_weights(&self.model, &checkpoint)?;
-            fs::write(
-                checkpoint.join("initialization.txt"),
-                format!(
-                    "{}seed={} epoch={epoch} stage={stage} updates={}\n",
-                    self.initialization.provenance(),
-                    config.seed,
-                    self.trainer.counters().global_update
-                ),
-            )?;
+            let checkpoint = self.save_epoch(config, output, stage, epoch)?;
             let validation = OfflineEvaluation::evaluate_validation(
                 &self.model,
                 &data.pool,
@@ -266,11 +308,41 @@ impl TrainingSession {
                 ),
             )?;
             if epoch == epochs || (stage == 0 && matches!(epoch, 8 | 16 | 32)) {
+                write_branch_accuracy(
+                    &self.model,
+                    data,
+                    SeedNamespace::Validation,
+                    &checkpoint.join("selection-branches.txt"),
+                )?;
                 self.select_checkpoint(config, checkpoint, metrics, deadline)?;
             }
             std::io::stdout().flush()?;
         }
         Ok(())
+    }
+
+    fn save_epoch(
+        &self,
+        config: &NeuralTrainingConfig,
+        output: &Path,
+        stage: usize,
+        epoch: u32,
+    ) -> Result<PathBuf> {
+        assert!(stage <= config.dagger_rounds);
+        assert!((1..=64).contains(&epoch));
+        let checkpoint = output.join(format!("stage-{stage}-epoch-{epoch:03}"));
+        fs::create_dir(&checkpoint)?;
+        TrainingArtifact::save_runtime_weights(&self.model, &checkpoint)?;
+        fs::write(
+            checkpoint.join("initialization.txt"),
+            format!(
+                "{}seed={} epoch={epoch} stage={stage} updates={}\n",
+                self.initialization.provenance(),
+                config.seed,
+                self.trainer.counters().global_update
+            ),
+        )?;
+        Ok(checkpoint)
     }
 
     fn select_checkpoint(
@@ -355,6 +427,9 @@ fn append_dagger(
     }
     let raw = reservoir.counts;
     let raw_by_side = reservoir.counts_by_side;
+    for (key, (seen, _)) in &reservoir.selector.counts {
+        *data.seen_branches[0].entry(*key).or_default() += seen;
+    }
     let samples = reservoir.into_samples()?;
     assert!(data.pool.len() + samples.len() <= MAX_IMITATION_SAMPLES);
     let count = samples.len();
@@ -456,6 +531,7 @@ struct NeuralSeat {
     encoder: FeatureEncoder,
     local: LocalPolicyState,
     persistence: OrderPersistence,
+    order_bookkeeping: PolicyOrderBookkeeping,
     readiness: ItemReadiness,
     pending: Option<(u32, Option<ActivePolicyOrder>)>,
     decisions: u32,
@@ -466,6 +542,68 @@ struct NeuralSeat {
     opening_kinds: [u64; ActionKind::COUNT],
     fountain: Option<bota_proto::Vec2>,
     left_fountain_area: bool,
+}
+
+#[cfg(test)]
+pub(crate) struct NeuralSeatOrderContractProbe(NeuralSeat);
+
+#[cfg(test)]
+impl NeuralSeatOrderContractProbe {
+    pub(crate) fn new(side: usize, messages: &[ServerMsg]) -> Self {
+        Self(NeuralSeat::new(side as u8, messages).expect("NeuralSeat order-contract seat"))
+    }
+
+    pub(crate) fn observe(&mut self, messages: &[ServerMsg]) {
+        assert!(
+            self.0
+                .observe(messages)
+                .expect("NeuralSeat probe observations")
+                .is_none()
+        );
+    }
+
+    pub(crate) fn decide(
+        &mut self,
+        model: &PolicyModel,
+        candidate: bool,
+    ) -> (FeatureFrame, Option<Request>, Option<ActivePolicyOrder>) {
+        let (action, space) = if candidate {
+            self.0
+                .order_bookkeeping
+                .enable_candidate(&self.0.persistence)
+                .expect("candidate role");
+            self.0
+                .neural_choice(model)
+                .expect("NeuralSeat probe choice")
+        } else {
+            let space =
+                ActionSpace::from_tracker_with_readiness(&self.0.tracker, &self.0.readiness)
+                    .expect("legacy probe space");
+            let frame = self.0.frame(&space).expect("legacy probe input");
+            (
+                model
+                    .choose(&frame, &space)
+                    .expect("legacy probe choice")
+                    .action,
+                space,
+            )
+        };
+        let frame = self.0.frame(&space).expect("NeuralSeat probe input");
+        let request = self
+            .0
+            .issue(action, &space)
+            .expect("NeuralSeat probe send")
+            .map(|issued| Request {
+                seq: self.0.sequence,
+                unit: issued.unit,
+                order: issued.order,
+            });
+        (frame, request, self.0.local.active_order())
+    }
+
+    pub(crate) fn legacy_persistence(&self) -> OrderPersistence {
+        self.0.persistence
+    }
 }
 
 impl NeuralSeat {
@@ -481,6 +619,7 @@ impl NeuralSeat {
             tracker,
             local: LocalPolicyState::new(0),
             persistence: OrderPersistence::default(),
+            order_bookkeeping: PolicyOrderBookkeeping::Legacy,
             readiness: ItemReadiness::new(),
             pending: None,
             decisions: 0,
@@ -508,17 +647,24 @@ impl NeuralSeat {
                     self.observe_opening(view);
                     if previous != self.tracker.own_hero().map(|hero| hero.id) {
                         self.persistence.clear_body_for(None);
+                        self.order_bookkeeping.clear_body_for(None);
                         self.local.set_active_order(view.tick, None)?;
                         self.pending = None;
                     }
                 }
                 ServerMsg::Events { tick, events } => {
                     self.tracker.observe_events(*tick, events)?;
+                    self.order_bookkeeping.reconcile(
+                        &self.tracker,
+                        &mut self.local,
+                        &mut self.pending,
+                    )?;
                     self.encoder.observe(&self.tracker)?;
                 }
                 ServerMsg::OrderRejected { seq, .. } => {
                     self.rejections += 1;
                     self.persistence.observe_rejection(*seq);
+                    self.order_bookkeeping.observe_rejection(*seq);
                     self.readiness.note_rejected(*seq);
                     if let Some((pending, previous)) = self.pending
                         && pending == *seq
@@ -580,7 +726,11 @@ impl NeuralSeat {
         }
     }
 
+    /// Predicts without opting a Teacher transport into candidate deduplication.
     fn neural_choice(&mut self, model: &PolicyModel) -> Result<(StructuredAction, ActionSpace)> {
+        self.order_bookkeeping.enable_observer(&self.persistence)?;
+        self.order_bookkeeping
+            .reconcile(&self.tracker, &mut self.local, &mut self.pending)?;
         let space = ActionSpace::from_tracker_with_readiness(&self.tracker, &self.readiness)?;
         let frame = self.frame(&space)?;
         let action = model.choose(&frame, &space)?.action;
@@ -600,20 +750,31 @@ impl NeuralSeat {
             self.opening_kinds[action.kind().index()] += 1;
         }
         self.local.note_decision(space.tick(), action.kind())?;
-        let Some(issued) = self.persistence.should_send(space.decode(action)?) else {
+        let persistence = self.order_bookkeeping.transport(&self.persistence);
+        let Some(issued) = persistence.should_send(space.decode(action)?) else {
             return Ok(None);
         };
         let previous = self.local.active_order();
         self.sequence += 1;
         (space.tick(), issued.unit, issued.order).hash(&mut self.orders_hash);
-        self.persistence.record_sent(self.sequence, issued)?;
-        self.readiness.note_sent(self.sequence, issued, space);
-        match active_order_update_for_sent(
-            &self.persistence,
-            issued.unit,
+        let preserves = self.order_bookkeeping.record_sent(
+            &mut self.persistence,
             self.sequence,
-            action.kind(),
-        ) {
+            issued,
+            &self.tracker,
+        )?;
+        self.readiness.note_sent(self.sequence, issued, space);
+        let update = if preserves {
+            ActiveOrderUpdate::Preserve
+        } else {
+            active_order_update_for_sent(
+                self.order_bookkeeping.effective(&self.persistence),
+                issued.unit,
+                self.sequence,
+                action.kind(),
+            )
+        };
+        match update {
             ActiveOrderUpdate::Preserve => {}
             ActiveOrderUpdate::Replace(None) if previous.is_none() => self.pending = None,
             ActiveOrderUpdate::Replace(next) => {
@@ -699,43 +860,204 @@ impl CoverageSelector {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct BranchKey {
+    kind: usize,
+    body: usize,
+    target: usize,
+    slot: usize,
+    point: usize,
+    cell: usize,
+}
+
+impl BranchKey {
+    fn new(action: StructuredAction, cell: usize) -> (Self, crate::ActionTarget) {
+        use crate::{ActionTarget as Target, PutPointTarget};
+        use StructuredAction::*;
+        let (slot, target) = match action {
+            MovePoint { point, .. } | AttackMovePoint { point, .. } => (0, Target::Point(point)),
+            FollowUnit { target, .. } | AttackUnit { target, .. } => (0, Target::Entity(target)),
+            Cast { slot, target, .. } => (usize::from(slot.0) + 1, target),
+            Use { slot, target, .. } => (usize::from(slot.0) + 1, target),
+            PutUnit { source, target, .. } => (usize::from(source.0) + 1, Target::Entity(target)),
+            PutPoint { source, target, .. } => (
+                usize::from(source.0) + 1,
+                match target {
+                    PutPointTarget::Underfoot => Target::None,
+                    PutPointTarget::Point(point) => Target::Point(point),
+                },
+            ),
+            Sell { slot, .. } => (usize::from(slot.0) + 1, Target::None),
+            Swap { from, to, .. } => (
+                1 + usize::from(from.0) * 15 + usize::from(to.0),
+                Target::None,
+            ),
+            Learn { slot } => (usize::from(slot.0) + 1, Target::None),
+            Buy { item, .. } => (item.0 + 1, Target::None),
+            Continue | Stop { .. } | Hold { .. } | Take { .. } => (0, Target::None),
+        };
+        assert!(slot < 256);
+        assert!(cell < 10);
+        (
+            Self {
+                kind: action.kind().index(),
+                body: action.controlled_unit().map_or(2, |unit| unit.index()),
+                target: 0,
+                slot,
+                point: 0,
+                cell,
+            },
+            target,
+        )
+    }
+
+    fn from_space(action: StructuredAction, space: &ActionSpace, cell: usize) -> Self {
+        let (mut key, target) = Self::new(action, cell);
+        match target {
+            crate::ActionTarget::None => {}
+            crate::ActionTarget::Entity(index) => {
+                let candidate = &space.entity_candidates()[index.0];
+                let relation = match candidate.relation {
+                    crate::EntityRelation::Own => 0,
+                    crate::EntityRelation::Allied => 1,
+                    crate::EntityRelation::Enemy => 2,
+                    crate::EntityRelation::Neutral => 3,
+                };
+                key.target = 1 + candidate.kind as usize * 4 + relation;
+            }
+            crate::ActionTarget::Point(index) => {
+                use crate::PointSource;
+                key.point = match space.point_candidates()[index.0].source {
+                    PointSource::Tactical { .. } => 1,
+                    PointSource::StaticTree => 2,
+                    PointSource::PlantedTree => 3,
+                    PointSource::BuildingLanding(_) => 4,
+                    PointSource::Fountain(_) => 5,
+                    PointSource::Tower(_) => 6,
+                    PointSource::PredictedHero(_) => 7,
+                    PointSource::PredictedCreep(_) => 8,
+                };
+            }
+        }
+        assert!(key.target <= 48);
+        assert!(key.point <= 8);
+        key
+    }
+
+    fn from_sample(sample: &ImitationSample) -> Self {
+        let cell = phase(sample.identity().tick()) * 2
+            + usize::from(sample.side() == crate::ImitationSide::Dire);
+        let (mut key, target) = Self::new(sample.teacher_action(), cell);
+        match target {
+            crate::ActionTarget::None => {}
+            crate::ActionTarget::Entity(index) => {
+                let row = sample.frame().units()[index.0];
+                let relation = (0..4)
+                    .find(|offset| row[crate::unit_feature::RELATION_START + offset] == 1.0)
+                    .expect("entity relation");
+                key.target = 1 + (row[crate::unit_feature::KIND_TOKEN] as usize - 1) * 4 + relation;
+            }
+            crate::ActionTarget::Point(index) => {
+                key.point =
+                    sample.frame().points()[index.0][crate::point_feature::SOURCE_TOKEN] as usize;
+            }
+        }
+        assert!(key.target <= 48);
+        assert!(key.point <= 8);
+        key
+    }
+}
+
+struct BranchSelector {
+    capacity: usize,
+    rng: PpoRng,
+    keys: Vec<BranchKey>,
+    counts: BTreeMap<BranchKey, (u64, Vec<usize>)>,
+}
+
+impl BranchSelector {
+    fn new(capacity: usize, seed: u64) -> Self {
+        assert!(capacity > 0);
+        assert!(capacity <= MAX_IMITATION_SAMPLES);
+        Self {
+            capacity,
+            rng: PpoRng::new(seed),
+            keys: Vec::with_capacity(capacity),
+            counts: BTreeMap::new(),
+        }
+    }
+
+    fn destination(&mut self, key: BranchKey) -> Result<Option<usize>> {
+        if !self.counts.contains_key(&key) && self.counts.len() == 8192 {
+            return Err("conditional reservoir exceeds 8192 observed strata".into());
+        }
+        let entry = self.counts.entry(key).or_default();
+        assert!(entry.0 < 108900 * 2 * 22);
+        entry.0 += 1;
+        let (seen, kept) = (entry.0, entry.1.len());
+        let index = if self.keys.len() < self.capacity {
+            self.keys.len()
+        } else {
+            let (&largest, (_, positions)) = self
+                .counts
+                .iter()
+                .max_by_key(|(_, entry)| entry.1.len())
+                .expect("nonempty strata");
+            if positions.len() > kept + 1 {
+                self.counts
+                    .get_mut(&largest)
+                    .expect("stratum")
+                    .1
+                    .pop()
+                    .expect("retained row")
+            } else {
+                let draw = (self.rng.next_u64()? % seen) as usize;
+                if draw >= kept {
+                    return Ok(None);
+                }
+                return Ok(Some(self.counts[&key].1[draw]));
+            }
+        };
+        if index == self.keys.len() {
+            self.keys.push(key);
+        } else {
+            self.keys[index] = key;
+        }
+        self.counts
+            .get_mut(&key)
+            .expect("incoming stratum")
+            .1
+            .push(index);
+        assert!(self.keys.len() <= self.capacity);
+        Ok(Some(index))
+    }
+}
+
 struct Reservoir {
     capacity: usize,
     seed: u64,
-    selectors: [CoverageSelector; ActionKind::COUNT],
-    samples: [Vec<ImitationSample>; ActionKind::COUNT],
+    selector: BranchSelector,
+    samples: Vec<ImitationSample>,
     counts: [[u64; ActionKind::COUNT]; 5],
     counts_by_side: [[[u64; ActionKind::COUNT]; 5]; 2],
 }
 
 impl Reservoir {
     fn new(capacity: usize, seed: u64) -> Self {
-        assert!((64..=4096).contains(&capacity));
+        assert!((64..=MAX_IMITATION_SAMPLES).contains(&capacity));
         assert!(capacity.is_multiple_of(64));
-        let budgets = BASE_KIND_CAPACITIES.map(|value| value * capacity / 4096);
-        Self::with_budgets(capacity, seed, budgets)
-    }
-    fn dagger(capacity: usize, seed: u64) -> Self {
-        assert!(matches!(capacity, 1024 | 2048));
-        let budgets = DAGGER_KIND_CAPACITIES.map(|value| value * capacity / DAGGER_CAPACITY);
-        Self::with_budgets(capacity, seed, budgets)
-    }
-    fn with_budgets(capacity: usize, seed: u64, budgets: [usize; ActionKind::COUNT]) -> Self {
-        assert_eq!(budgets.iter().sum::<usize>(), capacity);
         Self {
             capacity,
             seed,
-            selectors: std::array::from_fn(|index| {
-                CoverageSelector::new(
-                    budgets[index],
-                    seed ^ (index as u64 + 1),
-                    index != ActionKind::Continue.index(),
-                )
-            }),
-            samples: std::array::from_fn(|index| Vec::with_capacity(budgets[index])),
+            selector: BranchSelector::new(capacity, seed),
+            samples: Vec::with_capacity(capacity),
             counts: [[0; ActionKind::COUNT]; 5],
             counts_by_side: [[[0; ActionKind::COUNT]; 5]; 2],
         }
+    }
+    fn dagger(capacity: usize, seed: u64) -> Self {
+        assert!(matches!(capacity, 2048 | 4096));
+        Self::new(capacity, seed)
     }
     fn consider(
         &mut self,
@@ -750,40 +1072,45 @@ impl Reservoir {
         let cell = phase(space.tick()) * 2 + usize::from(seat.tracker.team() == Team::Dire);
         self.counts[phase(space.tick())][kind] += 1;
         self.counts_by_side[cell % 2][phase(space.tick())][kind] += 1;
-        if let Some(index) = self.selectors[kind].destination(cell)? {
+        let key = BranchKey::from_space(action, space, cell);
+        if let Some(index) = self.selector.destination(key)? {
             let frame = seat.frame(space)?;
             let identity = SampleIdentity::from_frame(namespace, seed, 0, space.tick(), &frame)?;
             let sample = match learner {
                 Some(learner) => ImitationSample::dagger(frame, space, learner, action, identity)?,
                 None => ImitationSample::teacher(frame, space, action, identity)?,
             };
-            if index == self.samples[kind].len() {
-                self.samples[kind].push(sample);
+            assert_eq!(BranchKey::from_sample(&sample), key);
+            if index == self.samples.len() {
+                self.samples.push(sample);
             } else {
-                self.samples[kind][index] = sample;
+                self.samples[index] = sample;
             }
         }
-        assert!(self.samples.iter().map(Vec::len).sum::<usize>() <= self.capacity);
+        assert!(self.samples.len() <= self.capacity);
         Ok(())
     }
     fn into_samples(mut self) -> Result<Vec<ImitationSample>> {
-        let noncontinue: usize = self.samples[1..].iter().map(Vec::len).sum();
-        let continued = std::mem::take(&mut self.samples[0]);
-        let limit = continued.len().min(noncontinue / 2);
+        let (continued, mut samples): (Vec<_>, Vec<_>) = self
+            .samples
+            .drain(..)
+            .partition(|sample| sample.teacher_action().kind() == ActionKind::Continue);
+        let limit = continued.len().min(samples.len() / 2);
+        let mut retained_continue = Vec::with_capacity(limit);
         let mut selector = CoverageSelector::new(limit, self.seed ^ 0xc017, false);
         for sample in continued {
             let cell = phase(sample.identity().tick()) * 2
                 + usize::from(sample.side() == crate::ImitationSide::Dire);
             if let Some(index) = selector.destination(cell)? {
-                if index == self.samples[0].len() {
-                    self.samples[0].push(sample);
+                if index == retained_continue.len() {
+                    retained_continue.push(sample);
                 } else {
-                    self.samples[0][index] = sample;
+                    retained_continue[index] = sample;
                 }
             }
         }
-        let mut samples = self.samples.into_iter().flatten().collect::<Vec<_>>();
-        samples.sort_by_key(ImitationSample::identity);
+        samples.extend(retained_continue);
+        samples.sort_unstable_by_key(ImitationSample::identity);
         assert!(samples.len() <= self.capacity);
         Ok(samples)
     }
@@ -801,6 +1128,7 @@ struct NeuralDataset {
     games: Vec<NeuralGameReport>,
     seen: [[[u64; ActionKind::COUNT]; 5]; 3],
     seen_by_side: [[[[u64; ActionKind::COUNT]; 5]; 2]; 3],
+    seen_branches: [BTreeMap<BranchKey, u64>; 3],
 }
 
 fn collect_dataset(
@@ -819,6 +1147,7 @@ fn collect_dataset(
     let mut games = Vec::with_capacity(config.training_games + 2);
     let mut seen = [[[0; ActionKind::COUNT]; 5]; 3];
     let mut seen_by_side = [[[[0; ActionKind::COUNT]; 5]; 2]; 3];
+    let mut seen_branches = std::array::from_fn(|_| BTreeMap::new());
     for (split, namespace) in [
         SeedNamespace::Training,
         SeedNamespace::Validation,
@@ -850,6 +1179,12 @@ fn collect_dataset(
         }
         seen[split] = reservoir.counts;
         seen_by_side[split] = reservoir.counts_by_side;
+        seen_branches[split] = reservoir
+            .selector
+            .counts
+            .iter()
+            .map(|(key, (seen, _))| (*key, *seen))
+            .collect();
         for sample in reservoir.into_samples()? {
             if split > 0 {
                 coverage[split - 1].record_represented_for(&sample)?;
@@ -863,6 +1198,7 @@ fn collect_dataset(
         games,
         seen,
         seen_by_side,
+        seen_branches,
     })
 }
 
@@ -896,6 +1232,7 @@ fn run_game(
         NeuralSeat::new(0, &start.messages[0])?,
         NeuralSeat::new(1, &start.messages[1])?,
     ];
+    prepare_game_seats(&mut seats, model.map(|_| candidate), collection.is_some())?;
     let mut experts = std::array::from_fn::<_, 2, _>(|index| {
         (model.is_none() || index != candidate).then(Teacher::new)
     });
@@ -922,6 +1259,25 @@ fn run_game(
         }
     }
     game_report(&seats, seed, candidate, arena.tick(), winner)
+}
+
+fn prepare_game_seats(
+    seats: &mut [NeuralSeat; 2],
+    candidate: Option<usize>,
+    collecting: bool,
+) -> Result<()> {
+    assert!(candidate.is_none_or(|side| side < seats.len()));
+    assert!(seats.iter().all(|seat| seat.sequence == 0));
+    if let Some(side) = candidate {
+        seats[side]
+            .order_bookkeeping
+            .enable_candidate(&seats[side].persistence)?;
+    } else if collecting {
+        for seat in seats {
+            seat.order_bookkeeping.enable_observer(&seat.persistence)?;
+        }
+    }
+    Ok(())
 }
 
 fn game_report(
@@ -1152,30 +1508,19 @@ fn namespaces(config: &NeuralTrainingConfig) -> Result<SeedNamespaces> {
 }
 
 fn validate_config(config: &NeuralTrainingConfig) -> Result<()> {
-    if (
-        crate::MODEL_SCHEMA_VERSION,
-        crate::MODEL_SCHEMA_HASH,
-        crate::FEATURE_SCHEMA_VERSION,
-        crate::FEATURE_SCHEMA_HASH,
-    ) != (11, 18229126264156367519, 10, 15519817897416174399)
-    {
-        return Err(
-            "this experiment requires exact M11/F10 hull-correct attack-range schema".into(),
-        );
-    }
     if config.initial_weights.is_some() && config.initialize_selected_m10.is_some() {
         return Err("choose only one of initial_weights and initialize_selected_m10".into());
     }
-    if !(1..=8).contains(&config.training_games)
+    if !(1..=20).contains(&config.training_games)
         || !(1..=64).contains(&config.epochs)
         || !(2..=108900).contains(&config.tick_limit)
         || config.seed.checked_add(201).is_none()
         || config.wall_time.is_zero()
-        || config.wall_time > Duration::from_secs(1800)
+        || config.wall_time > Duration::from_secs(2700)
         || config.dagger_rounds > 2
         || !(1..=64).contains(&config.dagger_epochs)
     {
-        return Err("Map0 training requires 1..8 expert games, 1..64 epochs per stage, 0..2 DAgger rounds, 2..108900 ticks, <=1800 seconds and nonoverflowing disjoint seeds".into());
+        return Err("Map0 training requires 1..20 expert games, 1..64 epochs per stage, 0..2 DAgger rounds, 2..108900 ticks, <=2700 seconds and nonoverflowing disjoint seeds".into());
     }
     Ok(())
 }
@@ -1230,6 +1575,7 @@ fn phase(tick: u32) -> usize {
 }
 
 fn write_dataset(data: &NeuralDataset, output: &Path) -> Result<()> {
+    write_branch_distribution(data, output)?;
     let mut retained = [[[0u64; ActionKind::COUNT]; 5]; 3];
     let mut retained_by_side = [[[[0u64; ActionKind::COUNT]; 5]; 2]; 3];
     let mut targets = [[0u64; 13]; 3];
@@ -1263,7 +1609,7 @@ fn write_dataset(data: &NeuralDataset, output: &Path) -> Result<()> {
     fs::write(
         output.join("dataset.txt"),
         format!(
-            "sampling=kind_stratified_coverage_protected_NOT_population_accuracy\ncontinue_max_fraction=1/3\nbase_kind_capacities={BASE_KIND_CAPACITIES:?}\ndagger_kind_capacities={DAGGER_KIND_CAPACITIES:?}\npool_binding={:?}\nframe_inline_bytes={} sample_inline_bytes={} samples={}\nseen={:?}\nretained={retained:?}\nentity_target_kinds={targets:?}\ndataset_sha256={identity}\nexpert_games={:?}\nseen_by_side={:?}\nretained_by_side={retained_by_side:?}\n",
+            "sampling=conditional_branch_stratified_NOT_population_accuracy\ncontinue_max_fraction=1/3\ncapacities={CAPACITIES:?} dagger_capacity={DAGGER_CAPACITY}\npool_binding={:?}\nframe_inline_bytes={} sample_inline_bytes={} samples={}\nseen={:?}\nretained={retained:?}\nentity_target_kinds={targets:?}\ndataset_sha256={identity}\nexpert_games={:?}\nseen_by_side={:?}\nretained_by_side={retained_by_side:?}\n",
             data.pool.binding(),
             std::mem::size_of::<FeatureFrame>(),
             std::mem::size_of::<ImitationSample>(),
@@ -1274,6 +1620,115 @@ fn write_dataset(data: &NeuralDataset, output: &Path) -> Result<()> {
         ),
     )?;
     Ok(())
+}
+
+fn write_branch_distribution(data: &NeuralDataset, output: &Path) -> Result<()> {
+    let mut retained: [BTreeMap<BranchKey, usize>; 3] = std::array::from_fn(|_| BTreeMap::new());
+    assert!(data.pool.len() <= MAX_IMITATION_SAMPLES);
+    for row in 0..data.pool.len() {
+        let sample = data.pool.get(row).ok_or("branch sample missing")?;
+        let split = match sample.identity().namespace() {
+            SeedNamespace::Training => 0,
+            SeedNamespace::Validation => 1,
+            SeedNamespace::Promotion => 2,
+        };
+        *retained[split]
+            .entry(BranchKey::from_sample(sample))
+            .or_default() += 1;
+    }
+    let mut file = File::create(output.join("branch-distribution.txt"))?;
+    writeln!(
+        file,
+        "body=0:Hero,1:Courier,2:none target=1+UnitKind*4+relation(Own,Allied,Enemy,Neutral) point=0:none,1:tactical,2:static_tree,3:planted_tree,4:building,5:fountain,6:tower,7:predicted_hero,8:predicted_creep cell=phase*2+side slot=0:none,otherwise_slot+1(or_shop+1,swap_pair+1)"
+    )?;
+    for (split, counts) in data.seen_branches.iter().enumerate() {
+        assert!(counts.len() <= 8192);
+        for (key, seen) in counts {
+            writeln!(
+                file,
+                "split={split} {key:?} seen={seen} retained={}",
+                retained[split].get(key).copied().unwrap_or(0)
+            )?;
+        }
+        let courier_seen: u64 = counts
+            .iter()
+            .filter(|(key, _)| key.body == 1)
+            .map(|(_, count)| count)
+            .sum();
+        let courier_retained: usize = retained[split]
+            .iter()
+            .filter(|(key, _)| key.body == 1)
+            .map(|(_, count)| count)
+            .sum();
+        writeln!(
+            file,
+            "split={split} courier_seen={courier_seen} courier_retained={courier_retained}"
+        )?;
+    }
+    Ok(())
+}
+
+fn write_branch_accuracy(
+    model: &PolicyModel,
+    data: &NeuralDataset,
+    namespace: SeedNamespace,
+    output: &Path,
+) -> Result<()> {
+    let samples = (0..data.pool.len())
+        .filter_map(|index| data.pool.get(index))
+        .filter(|sample| sample.identity().namespace() == namespace)
+        .collect::<Vec<_>>();
+    assert!(!samples.is_empty());
+    assert!(samples.len() <= MAX_IMITATION_SAMPLES);
+    let mut branches: BTreeMap<BranchKey, [crate::AgreementCount; 13]> = BTreeMap::new();
+    for batch in samples.chunks(64) {
+        for (sample, prediction) in batch.iter().zip(model.behavioral_predictions(batch)?) {
+            let counts = branches.entry(BranchKey::from_sample(sample)).or_default();
+            let target = sample.target();
+            let heads = [
+                head_match(&target.kind, Some(prediction.kind)),
+                head_match(&target.controlled, prediction.controlled),
+                head_match(&target.ability, prediction.ability),
+                head_match(&target.item, prediction.item),
+                head_match(&target.swap, prediction.swap),
+                head_match(&target.learn, prediction.learn),
+                head_match(&target.shop, prediction.shop),
+                head_match(&target.loot, prediction.loot),
+                head_match(&target.target_mode, prediction.target_mode),
+                head_match(&target.put_mode, prediction.put_mode),
+                head_match(&target.entity_pointer, prediction.entity_pointer),
+                head_match(&target.point_pointer, prediction.point_pointer),
+            ];
+            let mut full = true;
+            for (index, matching) in heads.into_iter().enumerate() {
+                if let Some(matching) = matching {
+                    counts[index].total += 1;
+                    counts[index].matching += usize::from(matching);
+                    full &= matching;
+                }
+            }
+            counts[12].total += 1;
+            counts[12].matching += usize::from(full);
+        }
+    }
+    let mut file = File::create(output)?;
+    writeln!(
+        file,
+        "teacher_forced_conditional_accuracy_not_free_running=true heads=kind,body,ability,item,swap,learn,shop,loot,target_mode,put_mode,entity,point,full"
+    )?;
+    for (key, counts) in branches {
+        writeln!(file, "{key:?} {counts:?}")?;
+    }
+    Ok(())
+}
+
+fn head_match<const N: usize>(
+    target: &crate::HeadTarget<N>,
+    prediction: Option<usize>,
+) -> Option<bool> {
+    assert!(!target.active || target.selected < N);
+    assert!(prediction.is_none_or(|index| index < N));
+    target.active.then_some(prediction == Some(target.selected))
 }
 
 fn hash_sample(sample: &ImitationSample, hash: &mut Sha256) -> String {
@@ -1319,3 +1774,7 @@ fn real_continue(data: &NeuralDataset, split: usize) -> f64 {
 #[cfg(test)]
 #[path = "tests/neural_training.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests/neural_training_contract.rs"]
+mod training_contract;
