@@ -1130,12 +1130,23 @@ fn adam_rejects_invalid_config_nonfinite_and_extreme_updates_without_partial_sta
 
 #[test]
 fn model_schema_and_head_dimensions_are_stable() {
-    assert_eq!(MODEL_SCHEMA_VERSION, 14);
-    assert!(
-        crate::MODEL_SCHEMA_DESCRIPTOR
-            .contains("action_schema_version=3;action_schema_hash=1755359086494840931;")
+    assert_eq!(MODEL_SCHEMA_VERSION, 17);
+    assert!(crate::MODEL_SCHEMA_DESCRIPTOR.contains("linked_schemas=action,feature,map2_reward;"));
+    assert_eq!(
+        MODEL_SCHEMA_HASH,
+        super::map2_checkpoint::schema_hash(
+            crate::MODEL_SCHEMA_DESCRIPTOR,
+            &[
+                (crate::ACTION_SCHEMA_VERSION, crate::ACTION_SCHEMA_HASH),
+                (crate::FEATURE_SCHEMA_VERSION, crate::FEATURE_SCHEMA_HASH),
+                (
+                    crate::MAP2_REWARD_SCHEMA_VERSION,
+                    crate::MAP2_REWARD_SCHEMA_HASH
+                ),
+            ],
+        )
     );
-    assert_eq!(MODEL_SCHEMA_HASH, 7_970_187_849_195_607_202);
+    assert_ne!(MODEL_SCHEMA_HASH, 7_970_187_849_195_607_202);
     assert_eq!(MODEL_KIND_HEAD, 16);
     assert_eq!(MODEL_UNIT_HEAD, 2);
     assert_eq!(MODEL_ABILITY_HEAD, 8);
@@ -1160,7 +1171,12 @@ fn model_parameter_count_and_f32_size_are_bounded() {
     assert!((1_000_000..=3_000_000).contains(&count));
     assert!((4 * 1_048_576..=12 * 1_048_576).contains(&(count * size_of::<f32>())));
     assert_eq!(schema.len(), 62);
-    assert_eq!(schema.first(), Some(&("unit.0.weight", vec![73, 64])));
+    assert_eq!(count, 1_696_436);
+    assert_eq!(schema.first(), Some(&("unit.0.weight", vec![84, 64])));
+    assert_eq!(
+        schema.iter().find(|(name, _)| *name == "trunk.0.weight"),
+        Some(&("trunk.0.weight", vec![2589, 512]))
+    );
     assert_eq!(schema.last(), Some(&("point_query.bias", vec![64])));
     assert_eq!(
         schema
@@ -1176,6 +1192,69 @@ fn model_parameter_count_and_f32_size_are_bounded() {
             .collect::<BTreeSet<_>>()
             .len(),
         schema.len()
+    );
+}
+
+#[test]
+fn retired_m11_adapter_preserves_length_and_finite_diagnostics_without_initializing_map2() {
+    let model = PolicyModel::fresh(408).expect("model");
+    let identity = model.policy_identity().expect("identity");
+    let error = model
+        .widen_m11_input_parameters(&[0.0])
+        .expect_err("legacy length");
+    assert_eq!(
+        error,
+        ModelError::ParameterLength {
+            actual: 1,
+            expected: 1_684_724
+        }
+    );
+    assert_eq!(
+        error.to_string(),
+        "model parameter length 1 differs from expected 1684724"
+    );
+    let mut source = vec![0.0; 1_684_724];
+    source[123] = f32::NAN;
+    let error = model
+        .widen_m11_input_parameters(&source)
+        .expect_err("legacy finite validation");
+    assert_eq!(error, ModelError::NonFiniteParameter { index: 123 });
+    assert_eq!(error.to_string(), "model parameter 123 is non-finite");
+    source[123] = 0.0;
+    let error = model
+        .widen_m11_input_parameters(&source)
+        .expect_err("retired initialization");
+    assert_eq!(
+        error,
+        ModelError::InvalidModelState(
+            "M11 initialization retired; use pinned M14 Map2 initialization"
+        )
+    );
+    assert_eq!(
+        error.to_string(),
+        "model produced invalid M11 initialization retired; use pinned M14 Map2 initialization"
+    );
+    assert_eq!(
+        model.policy_identity().expect("unchanged identity"),
+        identity
+    );
+}
+
+#[test]
+fn retired_m12_adapter_rejects_current_layout_instead_of_relabelling_it() {
+    let model = PolicyModel::fresh(409).expect("model");
+    let error =
+        PolicyModel::validate_m12_parameter_schema(&model.parameter_schema().expect("schema"))
+            .expect_err("retired M12 initialization");
+    assert_eq!(
+        error,
+        ModelError::InvalidModelState(
+            "M12 initialization retired; use pinned M14 Map2 initialization"
+        )
+    );
+    assert_eq!(
+        error.to_string(),
+        "model produced invalid M12 initialization retired; use pinned M14 Map2 initialization"
     );
 }
 

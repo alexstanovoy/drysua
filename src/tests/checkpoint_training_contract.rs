@@ -1,5 +1,7 @@
 use super::*;
 
+const M14_PARAMETERS: usize = 1_689_076;
+
 fn ppo26_runtime_metadata() -> std::collections::HashMap<String, String> {
     [
         ("action_schema_hash", "1755359086494840931"),
@@ -15,16 +17,16 @@ fn ppo26_runtime_metadata() -> std::collections::HashMap<String, String> {
 }
 
 #[test]
-fn training_contract_versions_change_training_scope_not_actor_schema() {
-    assert_eq!(crate::FEATURE_SCHEMA_VERSION, 12);
-    assert_eq!(crate::FEATURE_SCHEMA_HASH, 1_577_122_233_561_586_211);
-    assert_eq!(crate::MODEL_SCHEMA_VERSION, 14);
-    assert_eq!(crate::MODEL_SCHEMA_HASH, 7_970_187_849_195_607_202);
-    assert_eq!(crate::IMITATION_RULES_AUDIT_VERSION, 13);
-    assert_eq!(crate::PPO_SCHEMA_VERSION, 27);
-    assert_eq!(crate::PPO_RULES_AUDIT_VERSION, 22);
-    assert_eq!(crate::LEAGUE_SCHEMA_VERSION, 27);
-    assert_eq!(crate::LEAGUE_RULES_AUDIT_VERSION, 22);
+fn training_contract_map2_versions_change_both_actor_and_training_identities() {
+    assert_eq!(crate::FEATURE_SCHEMA_VERSION, 15);
+    assert_ne!(crate::FEATURE_SCHEMA_HASH, 1_577_122_233_561_586_211);
+    assert_eq!(crate::MODEL_SCHEMA_VERSION, 17);
+    assert_ne!(crate::MODEL_SCHEMA_HASH, 7_970_187_849_195_607_202);
+    assert_eq!(crate::IMITATION_RULES_AUDIT_VERSION, 15);
+    assert_eq!(crate::PPO_SCHEMA_VERSION, 30);
+    assert_eq!(crate::PPO_RULES_AUDIT_VERSION, 25);
+    assert_eq!(crate::LEAGUE_SCHEMA_VERSION, 30);
+    assert_eq!(crate::LEAGUE_RULES_AUDIT_VERSION, 25);
     assert!(crate::PPO_SCHEMA_DESCRIPTOR.contains("observer=explicit_from_trajectory_start"));
     assert!(crate::LEAGUE_SCHEMA_DESCRIPTOR.contains("frozen_weights_not_legacy_execution"));
     assert_eq!(
@@ -36,7 +38,7 @@ fn training_contract_versions_change_training_scope_not_actor_schema() {
 }
 
 #[test]
-fn training_contract_ppo26_checkpoint_rejects_even_with_identical_actor_layout() {
+fn training_contract_ppo26_checkpoint_binding_rejects_even_with_current_tensor_layout() {
     let directory = test_directory("training-contract-ppo26-resume");
     let model = PolicyModel::fresh(10_093_100).expect("model");
     let trainer = PpoTrainer::new(&model, checkpoint_config(), 1).expect("trainer");
@@ -68,19 +70,12 @@ fn training_contract_ppo26_checkpoint_rejects_even_with_identical_actor_layout()
 }
 
 #[test]
-fn training_contract_exact_ppo26_runtime_preserves_parameter_bits_and_predictions() {
+fn training_contract_exact_ppo26_runtime_rejects_without_changing_parameters_predictions_or_optimizer()
+ {
     let directory = test_directory("training-contract-ppo26-runtime");
-    let source = PolicyModel::fresh(10_093_100).expect("source");
-    let mut parameters = source.export_parameters().expect("parameters");
-    parameters[0] = -0.0;
-    source
-        .import_parameters(&parameters)
-        .expect("signed-zero boundary");
-    let data: Vec<_> = parameters
-        .iter()
-        .flat_map(|value| value.to_le_bytes())
-        .collect();
-    let tensor = TensorView::new(Dtype::F32, vec![parameters.len()], &data).expect("tensor");
+    let mut data = vec![0; M14_PARAMETERS * 4];
+    data[..4].copy_from_slice(&(-0.0f32).to_le_bytes());
+    let tensor = TensorView::new(Dtype::F32, vec![M14_PARAMETERS], &data).expect("M14 tensor");
     let bytes = serialize(
         [("model.parameters", tensor)],
         Some(ppo26_runtime_metadata()),
@@ -89,24 +84,37 @@ fn training_contract_exact_ppo26_runtime_preserves_parameter_bits_and_prediction
     let path = directory.join("drysua.weights.safetensors");
     fs::write(&path, &bytes).expect("fixture");
     let target = PolicyModel::fresh(10_093_101).expect("target");
-    TrainingArtifact::load_runtime_weights(&target, &directory)
-        .expect("audited identical actor contract");
-    let actual: Vec<_> = target
-        .export_parameters()
-        .expect("parameters")
-        .iter()
-        .flat_map(|value| value.to_le_bytes())
-        .collect();
-    assert_eq!(actual, data);
-    assert_eq!(
-        source.parameter_schema().expect("source layout"),
-        target.parameter_schema().expect("target layout")
-    );
+    let mut parameters = target.export_parameters().expect("parameters");
+    parameters[0] = -0.0;
+    target
+        .import_parameters(&parameters)
+        .expect("signed-zero target boundary");
+    let before = parameter_bits(&target);
+    let identity = target.policy_identity().expect("identity");
+    let trainer = PpoTrainer::new(&target, checkpoint_config(), 1).expect("bound optimizer");
     let frame = crate::FeatureFrame::new();
+    let prediction = target.evaluate(&frame).expect("before prediction");
+
+    let error = TrainingArtifact::load_runtime_weights(&target, &directory)
+        .expect_err("old actor contract is incompatible");
+
+    assert_eq!(error, CheckpointError::SchemaMismatch);
     assert_eq!(
-        source.evaluate(&frame).expect("source heads"),
-        target.evaluate(&frame).expect("target heads")
+        error.to_string(),
+        "checkpoint schema does not match this build"
     );
+    assert_eq!(
+        target.policy_identity().expect("unchanged identity"),
+        identity
+    );
+    assert_eq!(parameter_bits(&target), before);
+    assert_eq!(
+        target.evaluate(&frame).expect("unchanged prediction"),
+        prediction
+    );
+    assert_eq!(trainer.optimizer_step(), 0);
+    TrainingArtifact::capture(&target, &trainer, run_metadata(), progress_metadata(0))
+        .expect("optimizer binding remains intact");
     assert_eq!(fs::read(path).expect("unchanged source"), bytes);
     fs::remove_dir_all(directory).expect("cleanup");
 }
@@ -157,10 +165,26 @@ fn training_contract_ppo26_runtime_rejects_each_missing_wrong_or_extra_key_atomi
 }
 
 #[test]
-fn training_contract_ppo26_runtime_still_validates_tensor_names_shapes_and_dtype() {
-    let directory = test_directory("training-contract-ppo26-tensor");
+fn training_contract_ppo26_runtime_rejects_schema_before_tensor_names_shapes_and_dtype() {
+    assert_invalid_runtime_contract(ppo26_runtime_metadata(), M14_PARAMETERS, true);
+}
+
+#[test]
+fn training_contract_current_runtime_validates_tensor_names_shapes_and_dtype() {
+    assert_invalid_runtime_contract(
+        current_runtime_metadata(),
+        crate::MODEL_PARAMETER_COUNT,
+        false,
+    );
+}
+
+fn assert_invalid_runtime_contract(
+    metadata: std::collections::HashMap<String, String>,
+    count: usize,
+    schema_first: bool,
+) {
+    let directory = test_directory("training-contract-runtime-tensor");
     let model = PolicyModel::fresh(10_093_103).expect("model");
-    let count = crate::MODEL_PARAMETER_COUNT;
     let data = vec![0; count * 4];
     let identity = model.policy_identity().expect("identity");
     for (name, dtype, shape, expected) in [
@@ -191,53 +215,96 @@ fn training_contract_ppo26_runtime_still_validates_tensor_names_shapes_and_dtype
     ] {
         let size = shape.iter().product::<usize>() * 4;
         let tensor = TensorView::new(dtype, shape, &data[..size]).expect("tensor");
-        let bytes = serialize([(name, tensor)], Some(ppo26_runtime_metadata())).expect("fixture");
-        fs::write(directory.join("drysua.weights.safetensors"), bytes).expect("fixture");
+        let bytes = serialize([(name, tensor)], Some(metadata.clone())).expect("fixture");
+        let path = directory.join("drysua.weights.safetensors");
+        fs::write(&path, &bytes).expect("fixture");
         let error =
             TrainingArtifact::load_runtime_weights(&model, &directory).expect_err("invalid tensor");
-        assert_eq!(error.to_string(), expected.to_string());
-        assert_eq!(error, expected);
+        if schema_first {
+            assert_eq!(error, CheckpointError::SchemaMismatch);
+            assert_eq!(
+                error.to_string(),
+                "checkpoint schema does not match this build"
+            );
+        } else {
+            let CheckpointError::TensorContract(field) = expected else {
+                panic!("tensor fixture")
+            };
+            assert_eq!(error, CheckpointError::TensorContract(field));
+            assert_eq!(
+                error.to_string(),
+                format!("checkpoint tensor contract has invalid {field}")
+            );
+        }
         assert_eq!(
             model.policy_identity().expect("unchanged identity"),
             identity
         );
+        assert_eq!(fs::read(path).expect("unchanged source"), bytes);
     }
     fs::remove_dir_all(directory).expect("cleanup");
 }
 
 #[test]
-fn training_contract_ppo26_runtime_rejects_nonfinite_tensor_boundaries() {
-    let directory = test_directory("training-contract-ppo26-nonfinite");
+fn training_contract_ppo26_runtime_rejects_schema_before_nonfinite_tensor_boundaries() {
+    assert_nonfinite_runtime_contract(ppo26_runtime_metadata(), M14_PARAMETERS, true);
+}
+
+#[test]
+fn training_contract_current_runtime_rejects_nonfinite_tensor_boundaries() {
+    assert_nonfinite_runtime_contract(
+        current_runtime_metadata(),
+        crate::MODEL_PARAMETER_COUNT,
+        false,
+    );
+}
+
+fn assert_nonfinite_runtime_contract(
+    metadata: std::collections::HashMap<String, String>,
+    count: usize,
+    schema_first: bool,
+) {
+    let directory = test_directory("training-contract-runtime-nonfinite");
     let model = PolicyModel::fresh(10_093_103).expect("model");
-    let count = crate::MODEL_PARAMETER_COUNT;
     let mut data = vec![0; count * 4];
     let identity = model.policy_identity().expect("identity");
     for index in [0, count - 1] {
-        data[index * 4..index * 4 + 4].copy_from_slice(&f32::NAN.to_le_bytes());
-        let tensor = TensorView::new(Dtype::F32, vec![count], &data).expect("tensor");
-        let bytes = serialize(
-            [("model.parameters", tensor)],
-            Some(ppo26_runtime_metadata()),
-        )
-        .expect("fixture");
-        fs::write(directory.join("drysua.weights.safetensors"), bytes).expect("fixture");
-        let error = TrainingArtifact::load_runtime_weights(&model, &directory)
-            .expect_err("nonfinite tensor");
-        assert_eq!(
-            error,
-            CheckpointError::NonFiniteTensor {
-                name: "model.parameters",
-                index
+        for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            data[index * 4..index * 4 + 4].copy_from_slice(&value.to_le_bytes());
+            let tensor = TensorView::new(Dtype::F32, vec![count], &data).expect("tensor");
+            let bytes =
+                serialize([("model.parameters", tensor)], Some(metadata.clone())).expect("fixture");
+            let path = directory.join("drysua.weights.safetensors");
+            fs::write(&path, &bytes).expect("fixture");
+            let error = TrainingArtifact::load_runtime_weights(&model, &directory)
+                .expect_err("nonfinite tensor");
+            if schema_first {
+                assert_eq!(error, CheckpointError::SchemaMismatch);
+                assert_eq!(
+                    error.to_string(),
+                    "checkpoint schema does not match this build"
+                );
+            } else {
+                assert_eq!(
+                    error,
+                    CheckpointError::NonFiniteTensor {
+                        name: "model.parameters",
+                        index
+                    }
+                );
+                assert_eq!(
+                    error.to_string(),
+                    format!(
+                        "checkpoint tensor model.parameters contains non-finite value at {index}"
+                    )
+                );
             }
-        );
-        assert_eq!(
-            error.to_string(),
-            format!("checkpoint tensor model.parameters contains non-finite value at {index}")
-        );
-        assert_eq!(
-            model.policy_identity().expect("unchanged identity"),
-            identity
-        );
+            assert_eq!(
+                model.policy_identity().expect("unchanged identity"),
+                identity
+            );
+            assert_eq!(fs::read(path).expect("unchanged source"), bytes);
+        }
         data[index * 4..index * 4 + 4].fill(0);
     }
     fs::remove_dir_all(directory).expect("cleanup");
@@ -269,9 +336,18 @@ fn training_contract_runtime_rejects_partial_mix_of_ppo26_and_current_training_m
     fs::remove_dir_all(directory).expect("cleanup");
 }
 
+fn parameter_bits(model: &PolicyModel) -> Vec<u32> {
+    model
+        .export_parameters()
+        .expect("parameters")
+        .iter()
+        .map(|value| value.to_bits())
+        .collect()
+}
+
 #[test]
 #[ignore = "read-only local M14/PPO26 artifact audit; no arena, optimizer update, output artifacts or gameplay"]
-fn training_contract_local_m14_initializations_are_runtime_only_compatible_without_rewrite() {
+fn training_contract_local_m14_runtime_resume_and_m12_initialization_reject_without_rewrite() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     for (label, expected_digest) in [
         (
@@ -326,17 +402,22 @@ fn audit_ppo26_initialization(directory: &std::path::Path, expected_digest: &str
     );
     let tensors = safetensors::SafeTensors::deserialize(&bytes).expect("tensors");
     let payload = tensors.tensor("model.parameters").expect("parameters");
+    assert_eq!(payload.dtype(), Dtype::F32);
+    assert_eq!(payload.shape(), &[M14_PARAMETERS]);
     let model = PolicyModel::fresh(10_093_105).expect("owned model");
-    TrainingArtifact::load_runtime_weights(&model, directory).expect("unchanged actor contract");
-    PolicyModel::validate_m12_parameter_schema(&model.parameter_schema().expect("62-name layout"))
-        .expect("unchanged audited layout");
-    let actual: Vec<_> = model
-        .export_parameters()
-        .expect("parameters")
-        .iter()
-        .flat_map(|value| value.to_le_bytes())
-        .collect();
-    assert_eq!(actual, payload.data());
+    let before = parameter_bits(&model);
+    let identity = model.policy_identity().expect("identity");
+    let error = TrainingArtifact::load_runtime_weights(&model, directory).expect_err("old runtime");
+    assert_eq!(error, CheckpointError::SchemaMismatch);
+    assert_eq!(
+        error.to_string(),
+        "checkpoint schema does not match this build"
+    );
+    assert_eq!(parameter_bits(&model), before);
+    assert_eq!(
+        model.policy_identity().expect("unchanged identity"),
+        identity
+    );
     let Err(error) = TrainingArtifact::load(directory) else {
         panic!("PPO26 cannot resume")
     };
@@ -345,42 +426,39 @@ fn audit_ppo26_initialization(directory: &std::path::Path, expected_digest: &str
         error.to_string(),
         "checkpoint schema does not match this build"
     );
-    let trainer = PpoTrainer::new(&model, checkpoint_config(), 1).expect("fresh optimizer");
-    assert_eq!(trainer.optimizer_step(), 0);
-    assert_eq!(trainer.updates(), 0);
     assert_eq!(fs::read(path).expect("unchanged source"), bytes);
     eprintln!(
-        "runtime_only_compatible sha256={digest} parameter_bits_exact=true optimizer_step=0 old_resume=rejected output_artifacts=none"
+        "legacy_m14 sha256={digest} runtime=rejected resume=rejected source_unchanged=true output_artifacts=none"
     );
 }
 
 fn audit_selected_m12_initializer(source: &std::path::Path, expected: &str) {
+    use sha2::{Digest, Sha256};
     let path = source.join("drysua.weights.safetensors");
     let bytes = fs::read(&path).expect("immutable M12 source");
-    let (model, digest) = TrainingArtifact::initialize_selected_m12_for_training(
+    let digest: String = Sha256::digest(&bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    assert_eq!(digest, expected);
+    let error = TrainingArtifact::initialize_selected_m12_for_training(
         source,
         10_093_106,
         PolicyDevice::Cpu,
     )
-    .expect("unchanged two-source initialization whitelist");
-    let digest: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
-    assert_eq!(digest, expected);
-    let tensors = safetensors::SafeTensors::deserialize(&bytes).expect("M12 tensors");
-    let actual: Vec<_> = model
-        .export_parameters()
-        .expect("initialized parameters")
-        .iter()
-        .flat_map(|value| value.to_le_bytes())
-        .collect();
+    .err()
+    .expect("M12 initialization is retired under Map2");
+    assert_eq!(error, CheckpointError::SchemaMismatch);
     assert_eq!(
-        actual,
-        tensors
-            .tensor("model.parameters")
-            .expect("M12 payload")
-            .data()
+        error.to_string(),
+        "checkpoint schema does not match this build"
     );
+    let tensors = safetensors::SafeTensors::deserialize(&bytes).expect("M12 tensors");
+    let payload = tensors.tensor("model.parameters").expect("M12 payload");
+    assert_eq!(payload.dtype(), Dtype::F32);
+    assert_eq!(payload.shape(), &[M14_PARAMETERS]);
     assert_eq!(fs::read(path).expect("unchanged M12 source"), bytes);
     eprintln!(
-        "selected_m12_initialization sha256={digest} payload_exact=true source_unchanged=true output_artifacts=none"
+        "retired_m12_initialization sha256={digest} initialization=rejected source_unchanged=true output_artifacts=none"
     );
 }

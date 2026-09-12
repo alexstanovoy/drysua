@@ -5,8 +5,10 @@ use crate::Wire;
 mod input_transfer;
 
 #[test]
-fn current_m12_training_configuration_is_accepted() {
-    validate_config(&NeuralTrainingConfig::default()).expect("current M12/F11");
+fn current_map2_training_configuration_is_accepted() {
+    let config = NeuralTrainingConfig::default();
+    validate_config(&config).expect("current schema");
+    assert_eq!(config.tick_limit, crate::MAP2_TICK_CAP);
 }
 
 #[test]
@@ -119,7 +121,7 @@ fn stock_615_decisions_report_per_kind_accuracy_and_actual_actions() {
     let model = PolicyModel::fresh(9860400).expect("model");
     TrainingArtifact::load_runtime_weights(&model, &directory).expect("current schema");
     let (mut arena, start) = Arena::new(ArenaConfig {
-        map: MapId(0),
+        map: MapId(2),
         seats: 2,
         seed: 9860400,
     })
@@ -234,7 +236,7 @@ fn actual_tcp_neural_orders_match_builtin_neural_orders_without_teacher_override
                 players: 2,
                 replay: None,
                 seed,
-                map: MapId(0),
+                map: MapId(2),
                 ack_timeout_ticks: 300,
             },
         )
@@ -314,15 +316,25 @@ fn stratified_selector_is_bounded_and_reproducible() {
 }
 
 #[test]
-fn phase_bins_include_pregame_and_the_end_of_a_full_map0_game() {
-    assert_eq!(phase(1), 0);
-    assert_eq!(phase(899), 0);
-    assert_eq!(phase(900), 1);
-    assert_eq!(phase(108900), 4);
+fn map2_phase_bins_cover_pregame_and_four_equal_gameplay_intervals() {
+    for (tick, expected) in [
+        (1, 0),
+        (PREGAME_TICKS - 1, 0),
+        (PREGAME_TICKS, 1),
+        (PREGAME_TICKS + GAMEPLAY_PHASE_TICKS - 1, 1),
+        (PREGAME_TICKS + GAMEPLAY_PHASE_TICKS, 2),
+        (PREGAME_TICKS + 2 * GAMEPLAY_PHASE_TICKS - 1, 2),
+        (PREGAME_TICKS + 2 * GAMEPLAY_PHASE_TICKS, 3),
+        (PREGAME_TICKS + 3 * GAMEPLAY_PHASE_TICKS - 1, 3),
+        (PREGAME_TICKS + 3 * GAMEPLAY_PHASE_TICKS, 4),
+        (MAP2_TICK_CAP, 4),
+    ] {
+        assert_eq!(phase(tick), expected, "tick={tick}");
+    }
 }
 
 #[test]
-fn train_selection_and_final_namespaces_are_distinct_and_map0_only() {
+fn map2_train_selection_and_final_namespaces_are_distinct() {
     let config = NeuralTrainingConfig::default();
     let namespaces = namespaces(&config).expect("namespaces");
     assert!(
@@ -335,7 +347,7 @@ fn train_selection_and_final_namespaces_are_distinct_and_map0_only() {
             .validation()
             .contains(&config.seed.saturating_add(200))
     );
-    assert_eq!(config.tick_limit, 108900);
+    assert_eq!(config.tick_limit, crate::MAP2_TICK_CAP);
     assert!(
         validate_config(&NeuralTrainingConfig {
             training_games: 21,
@@ -349,7 +361,7 @@ fn train_selection_and_final_namespaces_are_distinct_and_map0_only() {
 fn learner_uses_network_choice_in_pregame_even_when_teacher_would_buy() {
     let (_, start) = Arena::new(ArenaConfig {
         seats: 2,
-        map: MapId(0),
+        map: MapId(2),
         seed: 9830000,
     })
     .expect("arena");
@@ -397,7 +409,8 @@ fn expert_collection_keeps_both_seats_and_no_eviction_of_evaluation_samples() {
     assert_eq!(data.games.len(), 3);
     assert!(data.pool.len() <= 60);
     assert!(!data.pool.is_empty());
-    assert!(data.pool.binding().scope.contains_map(MapId(0)));
+    assert!(data.pool.binding().scope.contains_map(MapId(2)));
+    assert!(!data.pool.binding().scope.contains_map(MapId(0)));
     assert!(!data.pool.binding().scope.contains_map(MapId(1)));
     assert!(
         data.games
@@ -501,7 +514,7 @@ fn selection_ties_use_noncontinue_full_agreement_not_checkpoint_age() {
 fn dagger_labels_never_replace_the_network_order_and_track_only_real_sends() {
     let (_, start) = Arena::new(ArenaConfig {
         seats: 2,
-        map: MapId(0),
+        map: MapId(2),
         seed: 9840000,
     })
     .expect("arena");
@@ -536,6 +549,7 @@ fn dagger_labels_never_replace_the_network_order_and_track_only_real_sends() {
     assert_eq!(sample.learner_action(), Some(learner));
     assert_eq!(sample.teacher_action(), expert);
     assert_eq!(sample.identity().namespace(), SeedNamespace::Training);
+    assert_eq!(sample.identity().map(), MapId(2));
     assert!(matches!(
         issued.order,
         bota_proto::Order::Attack {
@@ -570,6 +584,7 @@ fn dagger_collection_does_not_change_either_actual_game_order_stream() {
             .iter()
             .all(|sample| sample.source() == crate::ImitationSource::Dagger
                 && sample.identity().namespace() == SeedNamespace::Training
+                && sample.identity().map() == MapId(2)
                 && sample.side() == crate::ImitationSide::Radiant)
     );
 }
@@ -803,4 +818,95 @@ fn parallel_pure_evaluation_matches_sequential_order_streams() {
         assert_eq!(game.winner, sequential.winner);
         assert_eq!(game.ticks, sequential.ticks);
     }
+}
+
+#[test]
+fn map2_neural_training_tick_limits_reject_legacy_caps_and_accept_both_boundaries() {
+    for tick_limit in [2, 18_900, MAP2_TICK_CAP] {
+        validate_config(&NeuralTrainingConfig {
+            tick_limit,
+            ..NeuralTrainingConfig::default()
+        })
+        .expect("bounded Map2 ticks");
+    }
+    for tick_limit in [0, 1, MAP2_TICK_CAP + 1, 108_900, u32::MAX] {
+        let error = validate_config(&NeuralTrainingConfig {
+            tick_limit,
+            ..NeuralTrainingConfig::default()
+        })
+        .expect_err("out of Map2 bounds");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "Map2 training requires 1..20 expert games, 1..64 epochs per stage, 0..2 DAgger rounds, 2..{MAP2_TICK_CAP} ticks, <=2700 seconds and nonoverflowing disjoint seeds"
+            )
+        );
+    }
+}
+
+#[test]
+fn map2_neural_seat_rejects_legacy_maps_with_specific_error_before_tracking() {
+    for map in [MapId(0), MapId(1)] {
+        let (_, start) = Arena::new(ArenaConfig {
+            map,
+            seats: 2,
+            seed: 9840000,
+        })
+        .expect("legacy fixture");
+        let error = NeuralSeat::new(0, &start.messages[0])
+            .err()
+            .expect("Map2 only");
+        assert_eq!(error.to_string(), "neural training requires Map2");
+    }
+}
+
+#[test]
+fn map2_neural_seat_rejects_missing_match_start_without_panicking() {
+    let error = NeuralSeat::new(0, &[]).err().expect("missing start");
+    assert_eq!(error.to_string(), "initial MatchStart missing");
+}
+
+#[test]
+fn map2_order_probe_uses_the_production_constructor_and_keeps_map2_metadata() {
+    let (_, start) = Arena::new(ArenaConfig {
+        map: crate::MAP2_ID,
+        seats: 2,
+        seed: 9840000,
+    })
+    .expect("Map2 arena");
+    let model = PolicyModel::fresh(9840000).expect("model");
+    let mut probe = NeuralSeatOrderContractProbe::new(0, &start.messages[0]);
+    let (frame, _, _) = probe.decide(&model, true);
+    assert_eq!(frame.global()[crate::global_feature::MAP_TWO], 1.0);
+    assert_eq!(frame.global()[crate::global_feature::MAP_ZERO], 0.0);
+}
+
+#[test]
+fn map2_actor_budget_includes_pregame_and_ends_at_the_shared_decision_cap() {
+    assert_eq!(DECISION_INTERVAL_TICKS, crate::MAP2_DECISION_INTERVAL_TICKS);
+    assert_eq!(ACTOR_DECISIONS as usize, crate::MAP2_ACTOR_DECISIONS);
+    assert_eq!(ACTOR_DECISIONS * DECISION_INTERVAL_TICKS, MAP2_TICK_CAP);
+}
+
+#[test]
+fn map2_game_loop_preserves_authoritative_draw_at_the_inclusive_tick_cap() {
+    let seed = 9840000;
+    let (mut arena, mut start) = Arena::new(ArenaConfig {
+        map: MapId(2),
+        seats: 2,
+        seed,
+    })
+    .expect("Map2 arena");
+    let projected = arena.configure_for_test(|world| world.tick = MAP2_TICK_CAP - 1);
+    for (initial, current) in start.messages.iter_mut().zip(projected.messages) {
+        initial.truncate(1);
+        initial.extend(current);
+    }
+
+    let game = run_game_in_arena((arena, start), None, seed, 0, MAP2_TICK_CAP, None, None)
+        .expect("only the final cap tick runs");
+
+    assert_eq!(game.ticks, MAP2_TICK_CAP);
+    assert_eq!(game.winner, Some(Team::Neutral));
+    assert_eq!(game.decisions, [0, 0]);
 }

@@ -1,7 +1,15 @@
-use std::{io::Read, path::Path};
+use std::{
+    io::{Read, Write},
+    path::Path,
+    time::Duration,
+};
 
 use bota_proto::{MatchInfo, RejectReason, ServerMsg, SlotId, Team, TickMode};
 
+use crate::telemetry::{
+    AsyncLogWriter, Clock, FinishReason, LiveConfig, LiveMonitor, MeasuredWire, PerformanceOutput,
+    SystemClock, UpdateBoundary,
+};
 use crate::{
     ActionSpace, ActiveOrderUpdate, ActivePolicyOrder, FeatureEncoder, FeatureFrame, ItemReadiness,
     Link, LocalPolicyState, OrderPersistence, PolicyModel, SHADOW_FIEND, Seated, StateTracker,
@@ -47,6 +55,7 @@ struct LivePolicy {
     last_decision_tick: Option<u32>,
     pending_snapshot_tick: Option<u32>,
     pending_active: Option<(u32, Option<ActivePolicyOrder>)>,
+    decision_span: Option<(Duration, Duration)>,
 }
 
 #[derive(Clone, Copy)]
@@ -55,6 +64,17 @@ enum LiveController<'model> {
     Neural(&'model PolicyModel),
     Tactical(&'model TacticalPolicy),
     Teacher,
+}
+
+impl LiveController<'_> {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Hybrid(_) => "hybrid",
+            Self::Neural(_) => "neural",
+            Self::Tactical(_) => "tactical",
+            Self::Teacher => "teacher",
+        }
+    }
 }
 
 /// Loads bounded tactical weights before connecting, without constructing a tensor model.
@@ -176,6 +196,74 @@ fn play_controller_on(
     limit: Option<u32>,
     controller: LiveController<'_>,
 ) -> std::io::Result<Outcome> {
+    let clock = SystemClock::default();
+    let mut output = PerformanceOutput::new(AsyncLogWriter::default());
+    let value = std::env::var("DRYSUA_PERF_DEBUG_EVERY");
+    let config = match value {
+        Ok(value) => LiveConfig::from_debug_value(Some(&value)),
+        Err(std::env::VarError::NotPresent) => Ok(LiveConfig::default()),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            Err("DRYSUA_PERF_DEBUG_EVERY must be Unicode digits")
+        }
+    }
+    .unwrap_or_else(|error| {
+        output.emit(&format_args!(
+            "level=INFO event=live_performance_config_defaulted reason=\"{error}\""
+        ));
+        LiveConfig::default()
+    });
+    let result = play_controller_with_telemetry(
+        wire,
+        seated,
+        limit,
+        controller,
+        config,
+        &clock,
+        &mut output,
+    );
+    output.finish();
+    result
+}
+
+fn play_controller_with_telemetry(
+    wire: &mut impl Wire,
+    seated: Seated,
+    limit: Option<u32>,
+    controller: LiveController<'_>,
+    config: LiveConfig,
+    clock: &impl Clock,
+    output: &mut PerformanceOutput<impl Write>,
+) -> std::io::Result<Outcome> {
+    let mut monitor =
+        LiveMonitor::new(seated, controller.label(), config).map_err(std::io::Error::other)?;
+    let mut wire = MeasuredWire::new(wire, clock);
+    let result = run_controller(
+        &mut wire,
+        seated,
+        limit,
+        controller,
+        clock,
+        &mut monitor,
+        output,
+    );
+    let reason = match &result {
+        Ok(outcome) if limit.is_some_and(|limit| outcome.ticks >= limit) => FinishReason::Limit,
+        Ok(_) => FinishReason::MatchOver,
+        Err(_) => FinishReason::Error,
+    };
+    monitor.finish(reason, wire.receive_scope(), output);
+    result
+}
+
+fn run_controller<W: Wire, C: Clock>(
+    wire: &mut MeasuredWire<'_, W, C>,
+    seated: Seated,
+    limit: Option<u32>,
+    controller: LiveController<'_>,
+    clock: &C,
+    monitor: &mut LiveMonitor,
+    output: &mut PerformanceOutput<impl Write>,
+) -> std::io::Result<Outcome> {
     let mut outcome = Outcome {
         slot: Some(seated.slot),
         ..Outcome::default()
@@ -189,7 +277,10 @@ fn play_controller_on(
             ));
         };
         progress.observe(&message)?;
-        if handle_policy_message(
+        let boundary = UpdateBoundary::of(&message);
+        monitor.begin(boundary);
+        let started = clock.now();
+        let handled = handle_policy_message(
             wire,
             seated,
             limit,
@@ -197,7 +288,20 @@ fn play_controller_on(
             &mut outcome,
             &mut policy,
             message,
-        )? {
+            clock,
+        );
+        let now = clock.now();
+        let mut timing = wire.take_timing();
+        timing.finish_handler_span(
+            started,
+            now,
+            policy
+                .as_mut()
+                .and_then(|policy| policy.decision_span.take()),
+        );
+        let finished = handled?;
+        monitor.observe(boundary, now, timing, wire.receive_scope(), output);
+        if finished {
             return Ok(outcome);
         }
     }
@@ -213,6 +317,7 @@ fn handle_policy_message(
     outcome: &mut Outcome,
     policy: &mut Option<LivePolicy>,
     message: ServerMsg,
+    clock: &impl Clock,
 ) -> std::io::Result<bool> {
     match message {
         ServerMsg::MatchStart { info } => {
@@ -245,7 +350,9 @@ fn handle_policy_message(
             return Ok(true);
         }
         ServerMsg::Events { tick, events } => {
-            handle_policy_events(wire, seated, controller, outcome, policy, tick, &events)?;
+            handle_policy_events(
+                wire, seated, controller, outcome, policy, tick, &events, clock,
+            )?;
         }
         ServerMsg::Welcome { .. }
         | ServerMsg::LobbyState { .. }
@@ -295,6 +402,7 @@ fn handle_policy_snapshot(
     Ok(finished)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn handle_policy_events(
     wire: &mut impl Wire,
     seated: Seated,
@@ -303,12 +411,13 @@ fn handle_policy_events(
     policy: &mut Option<LivePolicy>,
     tick: u32,
     events: &[bota_proto::EventKind],
+    clock: &impl Clock,
 ) -> std::io::Result<()> {
     let policy = policy
         .as_mut()
         .ok_or_else(|| std::io::Error::other("server sent Events before MatchStart"))?;
     policy.observe_events(tick, events)?;
-    policy.complete_snapshot_tick(wire, controller, outcome, tick)?;
+    policy.complete_snapshot_tick(wire, controller, outcome, tick, clock)?;
     if seated.mode == TickMode::Lockstep {
         wire.acknowledge(tick)?;
     }
@@ -437,6 +546,7 @@ impl LivePolicy {
             last_decision_tick: None,
             pending_snapshot_tick: None,
             pending_active: None,
+            decision_span: None,
         })
     }
 
@@ -474,6 +584,7 @@ impl LivePolicy {
         controller: LiveController<'_>,
         outcome: &mut Outcome,
         tick: u32,
+        clock: &impl Clock,
     ) -> std::io::Result<()> {
         if self.pending_snapshot_tick != Some(tick) {
             return Err(std::io::Error::other(
@@ -482,7 +593,9 @@ impl LivePolicy {
         }
         self.pending_snapshot_tick = None;
         if self.should_decide(tick)? {
+            let started = clock.now();
             self.decide(wire, controller, outcome)?;
+            self.decision_span = Some((started, clock.now()));
         }
         Ok(())
     }
@@ -728,3 +841,7 @@ fn validate_pick(picks: &[bota_proto::Pick], slot: SlotId) -> std::io::Result<Te
     }
     Ok(pick.team)
 }
+
+#[cfg(all(test, feature = "builtin"))]
+#[path = "telemetry/seat_tests.rs"]
+mod performance_tests;

@@ -2,6 +2,8 @@
 
 import argparse
 from dataclasses import dataclass, field
+import hashlib
+import json
 import os
 from pathlib import Path
 import re
@@ -16,14 +18,21 @@ import tempfile
 import time
 from typing import BinaryIO
 
+from play_admission import Admission
+from play_weights import read_runtime_metadata
 
+
+ARTIFACT_LIMIT = 256 * 1024 * 1024
 BUILD_TIMEOUT = 1200
 LOG_LIMIT = 16 * 1024 * 1024
 MAX_CHILDREN = 5
 READ_CHUNK = 65536
 READINESS_LIMIT = 4096
 READINESS_TIMEOUT = 10
-REPLAY_LIMIT = 512 * 1024 * 1024
+REPLAY_LIMIT = 2 * 1024**3
+REVIEW_DIRECTORY = Path("drysua/artifacts/temp/human-review-20260909/current")
+REVIEW_BINARY_SHA = "64ba25ebb10e6beabc26ff667a3e3bddeb40dbf391110d4f0e31db6478500a2b"
+REVIEW_WEIGHTS_SHA = "6348fe57a128ebd521dba68da0949ceb7378d3e0d6b7d6a7ce9a5fb6446547ab"
 TERM_GRACE = 2
 assert READINESS_LIMIT < READ_CHUNK
 assert READ_CHUNK <= LOG_LIMIT
@@ -32,18 +41,15 @@ assert 0 < TERM_GRACE <= 3
 
 
 def main(arguments=None):
-    parser = argparse.ArgumentParser(prog="play.sh", description="Build and play bota against drysua.")
-    parser.add_argument("--port", type=lambda value: integer(value, 65535), default=4455,
-                        help="Server port, or 0 for an assigned port (default: 4455)")
-    parser.add_argument("--seed", type=lambda value: integer(value, 2**64 - 1), default=9000001,
-                        help="Match seed (default: 9000001)")
-    parser.add_argument("--no-build", action="store_true", help="Use existing per-repository release binaries")
-    arguments = parser.parse_args(arguments)
+    arguments = parse_arguments(arguments)
     root = Path(__file__).resolve().parents[2]
     supervisor, previous, mask = None, {}, None
     status = 1
     try:
+        _, arguments.weights_directory = current_paths(root, arguments.weights_directory)
         preflight(root, arguments.no_build)
+        if arguments.no_build:
+            release_executables(root)
         mask = os.umask(0o077)
         parent = root / "drysua"
         for part in ("artifacts", "temp"):
@@ -77,6 +83,100 @@ def main(arguments=None):
         if mask is not None:
             os.umask(mask)
     return status
+
+
+def parse_arguments(arguments):
+    parser = argparse.ArgumentParser(
+        prog="play.sh", description="Current Map2 pure Neural play; compatible explicit weights required (no default model).")
+    parser.add_argument("--port", type=lambda value: integer(value, 65535), default=4455,
+                        help="Server port, or 0 for an assigned port (default: 4455)")
+    parser.add_argument("--seed", type=lambda value: integer(value, 2**64 - 1), default=9000001,
+                        help="Match seed (default: 9000001)")
+    parser.add_argument("--no-build", action="store_true",
+                        help="Use existing current bota server/client and drysua release binaries")
+    parser.add_argument("--human-side", choices=("radiant", "dire"),
+                        help="Human side (default: radiant, or opposite --bot-side)")
+    parser.add_argument("--bot-side", choices=("radiant", "dire"),
+                        help="Neural bot side (default: dire, or opposite --human-side)")
+    parser.add_argument("--weights-directory", type=Path,
+                        help="Directory with compatible current F15/M17 runtime weights; no trained Map2 default yet")
+    result = parser.parse_args(arguments)
+    opposite = {"radiant": "dire", "dire": "radiant"}
+    if result.human_side is None:
+        result.human_side = opposite[result.bot_side] if result.bot_side else "radiant"
+    if result.bot_side is None:
+        result.bot_side = opposite[result.human_side]
+    if result.human_side == result.bot_side:
+        parser.error("--human-side and --bot-side must be opposite")
+    return result
+
+
+def current_paths(root, weights_directory):
+    if weights_directory is None:
+        raise RuntimeError("legacy F12/M14 human-review weights are incompatible with current Map2; "
+                           "provide --weights-directory with compatible F15/M17 runtime weights; "
+                           "no Map2 model has been trained or promoted; no Teacher fallback")
+    weights = weights_directory.resolve()
+    read_runtime_metadata(weights)
+    return root / "drysua/target/release/drysua", weights
+
+
+def release_executables(root):
+    binaries = [root / "bota/target/release/bota-server", root / "bota/target/release/bota-client",
+                root / "drysua/target/release/drysua"]
+    assert len(binaries) == 3
+    for executable in binaries:
+        if executable.is_symlink() or not executable.is_file() or not os.access(executable, os.X_OK):
+            raise RuntimeError(f"release executable missing: {executable}; rerun without --no-build")
+    assert all(executable.is_absolute() for executable in binaries)
+    return binaries
+
+
+def review_paths(root, weights_directory):
+    """Historical archive utility only; never called by the current launcher."""
+    review = root / REVIEW_DIRECTORY
+    binary = review / "drysua"
+    binary_digest = artifact_digest(binary)
+    if binary_digest != REVIEW_BINARY_SHA:
+        raise RuntimeError(f"pinned review binary SHA-256 mismatch: {binary}; never rebuild this copy")
+    if not os.access(binary, os.X_OK):
+        raise RuntimeError(f"pinned review binary is not executable: {binary}")
+    manifest = review / "manifest.json"
+    if not manifest.is_file() or manifest.is_symlink() or manifest.stat().st_size > READ_CHUNK:
+        raise RuntimeError(f"pinned review manifest missing, non-regular or exceeds 64 KiB: {manifest}")
+    try:
+        with manifest.open("rb") as stream:
+            data = stream.read(READ_CHUNK + 1)
+        if len(data) > READ_CHUNK or not isinstance(json.loads(data), dict):
+            raise ValueError("expected a bounded JSON object")
+    except (ValueError, OSError) as error:
+        raise RuntimeError(f"invalid review manifest {manifest}: {error}") from error
+    weights = weights_directory.resolve() if weights_directory is not None else review / "weights"
+    weights_digest = artifact_digest(weights / "drysua.weights.safetensors")
+    if weights_directory is None and weights_digest != REVIEW_WEIGHTS_SHA:
+        raise RuntimeError(f"pinned review weights SHA-256 mismatch: {weights}; no Teacher fallback")
+    selection = "explicit weights override" if weights_directory is not None else "corrected-ppo-001/u4"
+    print(f"play: human-review Neural {selection}; weights: {weights}; SHA-256 {weights_digest}", flush=True)
+    print(f"play: frozen review executable: {binary}; SHA-256 {binary_digest}", flush=True)
+    return binary, weights
+
+
+def artifact_digest(path):
+    if not path.is_file() or path.is_symlink() or not 0 < path.stat().st_size <= ARTIFACT_LIMIT:
+        raise RuntimeError(f"review artifact missing, non-regular or outside 1..{ARTIFACT_LIMIT} bytes: {path}; "
+                           "populate the immutable review copy; no build or Teacher fallback")
+    digest, size = hashlib.sha256(), 0
+    with path.open("rb") as stream:
+        for _ in range(ARTIFACT_LIMIT // READ_CHUNK + 1):
+            data = stream.read(READ_CHUNK)
+            if not data:
+                assert 0 < size <= ARTIFACT_LIMIT
+                return digest.hexdigest()
+            size += len(data)
+            if size > ARTIFACT_LIMIT:
+                break
+            digest.update(data)
+    raise RuntimeError(f"review artifact grew beyond {ARTIFACT_LIMIT} bytes while hashing: {path}")
 
 
 def integer(value, maximum):
@@ -144,6 +244,7 @@ class Supervisor:
         self.selector = selectors.DefaultSelector()
         self.stop_status = 0
         self.requested_port = 0
+        self.admission = None
 
     def request_stop(self, number, _frame):
         # A handler must not interrupt Popen before the new child has been registered.
@@ -174,6 +275,8 @@ class Supervisor:
         return child
 
     def pump(self, timeout, final=False):
+        if self.admission is not None and not final and self.admission.pump():
+            timeout = 0
         events = self.selector.select(timeout)
         assert len(events) <= MAX_CHILDREN * 2
         for key, _ in events:
@@ -201,6 +304,8 @@ class Supervisor:
             if child.name == "server" and stdout and child.port is None:
                 child.banner.extend(data[:READINESS_LIMIT + 1 - len(child.banner)])
                 child.port = ready_port(child.banner, self.requested_port)
+        if self.admission is not None and not final:
+            self.admission.pump()
         return len(events)
 
     def wait_build(self, child):
@@ -231,40 +336,59 @@ class Supervisor:
             self.pump(min(0.1, remaining))
 
     def run(self, root, arguments):
+        binary, weights = current_paths(root, arguments.weights_directory)
+        print(f"play: current Map2 pure Neural F15/M17; weights: {weights}; executable: {binary}; "
+              "metadata preflight only, Rust validates tensors before joining", flush=True)
         if not arguments.no_build:
-            for repository in ("bota", "drysua"):
-                command = ["cargo", "build", "--release", "--locked", "--quiet"]
-                if repository == "drysua":
-                    command.append("--no-default-features")
-                command += ["--manifest-path", str(root / repository / "Cargo.toml")]
-                command += (["-p", "bota-server", "-p", "bota-client", "--bin", "bota-server",
-                             "--bin", "bota-client"] if repository == "bota" else ["--bin", "drysua"])
-                environment = dict(os.environ, CARGO_TARGET_DIR=str(root / repository / "target"))
-                self.wait_build(self.spawn("build-" + repository, command, root, environment))
-        binaries = [root / "bota/target/release/bota-server", root / "bota/target/release/bota-client",
-                    root / "drysua/target/release/drysua"]
-        for binary in binaries:
-            if not binary.is_file() or not os.access(binary, os.X_OK):
-                raise RuntimeError(f"release executable missing: {binary}; rerun without --no-build")
+            command = ["cargo", "build", "--release", "--locked", "--quiet",
+                       "--manifest-path", str(root / "bota/Cargo.toml"), "-p", "bota-server",
+                       "-p", "bota-client", "--bin", "bota-server", "--bin", "bota-client"]
+            environment = dict(os.environ, CARGO_TARGET_DIR=str(root / "bota/target"))
+            self.wait_build(self.spawn("build-bota", command, root, environment))
+            command = ["cargo", "build", "--release", "--locked", "--quiet", "--bin", "drysua", "--no-default-features"]
+            environment = dict(os.environ, CARGO_TARGET_DIR=str(root / "drysua/target"))
+            self.wait_build(self.spawn("build-drysua", command, root / "drysua", environment))
+        binaries = release_executables(root)
+        assert binary == binaries[2]
         server = self.spawn("server", [str(binaries[0]), "--port", str(arguments.port), "--mode", "realtime",
-                            "--players", "2", "--map", "0", "--seed", str(arguments.seed),
+                            "--players", "2", "--map", "2", "--seed", str(arguments.seed),
                             "--replay", str(self.directory / "match.brp")], root)
         resource.prlimit(server.process.pid, resource.RLIMIT_FSIZE, (REPLAY_LIMIT, REPLAY_LIMIT))
         port = self.wait_ready(server, arguments.port)
-        client = self.spawn("client", [str(binaries[1]), "--addr", f"127.0.0.1:{port}", "--name", "human"], root)
-        bot = self.spawn("bot", [str(binaries[2]), "--addr", f"127.0.0.1:{port}", "--name", "drysua"], root)
-        print("play: choose a hero (1/2/3), then R to ready; sides follow connection order. Ctrl+C stops all.",
+        self.admission = Admission(port, arguments.human_side)
+        client = self.spawn("client", [str(binaries[1]), "--addr", self.admission.addresses["human"],
+                                      "--name", "human"], root)
+        bot = self.spawn("bot", [str(binary), "--addr", self.admission.addresses["bot"], "--name", "drysua",
+                                 "--policy", "neural", "--weights-directory", str(weights)], root)
+        print(f"play: requested human {arguments.human_side} / Neural bot {arguments.bot_side}; "
+              "verifying server Welcome seats. Choose a hero (1/2/3), then R to ready. Ctrl+C stops all.",
               flush=True)
+        self.wait_game(server, bot, client)
+
+    def wait_game(self, server, bot, client):
         # The results window controls lifetime; successful server/bot exits do not close it.
+        disconnected = {}
         while True:
             self.check_stop()
-            self.pump(0.1)
             for child in (server, bot, client):
                 status = child.exit_status()
                 if status not in (None, 0):
                     raise RuntimeError(f"{child.name} exited with status {status}; see {child.name}.log")
             if client.exit_status() == 0:
                 return
+            self.pump(0.01)
+            for relay in self.admission.relays:
+                if relay.endpoints and relay.endpoints[0].eof:
+                    deadline = disconnected.setdefault(relay.role, time.monotonic() + TERM_GRACE)
+                    child = client if relay.role == "human" else bot
+                    if time.monotonic() >= deadline and child.exit_status() is None:
+                        raise RuntimeError(f"{relay.role} disconnected but process did not exit; see {child.name}.log")
+                    if relay.role == "human":
+                        continue
+                if not relay.welcomed and relay.endpoints and any(peer.eof for peer in relay.endpoints):
+                    raise RuntimeError(f"{relay.role} disconnected before verified Welcome")
+            if not self.admission.welcomed and any(child.exit_status() == 0 for child in (server, bot)):
+                raise RuntimeError("server or bot exited before verified Welcome; see server.log and bot.log")
 
     def signal_groups(self, number):
         errors = []
@@ -278,7 +402,14 @@ class Supervisor:
         return errors
 
     def close(self):
-        errors = self.signal_groups(signal.SIGTERM)
+        errors = []
+        if self.admission is not None:
+            try:
+                self.admission.close()
+            except OSError as error:
+                errors.append(f"closing admission relays: {error}")
+            self.admission = None
+        errors.extend(self.signal_groups(signal.SIGTERM))
         try:
             deadline = time.monotonic() + TERM_GRACE
             for _ in range(40):

@@ -1,7 +1,11 @@
+#[cfg(test)]
+#[path = "tests/arena_map2.rs"]
+mod map2_tests;
+
 use core::fmt;
 
 use bota_proto::{EntityId, EventKind, MapId, Order, Pick, ServerMsg, SlotId, Team, TickMode};
-use bota_server::game::{Command, Event, EventVisibility, MatchConfig, World};
+use bota_server::game::{Command, Event, EventVisibility, MAPS, MatchConfig, World};
 
 use crate::SHADOW_FIEND;
 
@@ -17,7 +21,7 @@ pub const ARENA_TICK_RATE: u16 = 30;
 pub struct ArenaConfig {
     /// Number of seats in the range 2 through 10.
     pub seats: u8,
-    /// Map used by the match.
+    /// Registered map: 0 (Dota), 1 (demo), or 2 (mid-only Dota).
     pub map: MapId,
     /// Match identity and deterministic random seed.
     pub seed: u64,
@@ -37,14 +41,16 @@ pub struct Request {
 /// Initial message stream for each seat in slot order.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ArenaStart {
-    /// Per-seat messages, with MatchStart before the first Snapshot.
+    /// Per-seat streams: MatchStart, Snapshot, Events.
     pub messages: Vec<Vec<ServerMsg>>,
 }
 
 /// One advanced tick of message streams in slot order.
+///
+/// A terminal stream ends with MatchOver; its Neutral winner denotes a draw.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ArenaStep {
-    /// Per-seat messages for the advanced tick.
+    /// Per-seat streams: optional OrderRejected, Snapshot, Events, optional MatchOver.
     pub messages: Vec<Vec<ServerMsg>>,
 }
 
@@ -55,6 +61,11 @@ pub enum ArenaError {
     SeatCount {
         /// Rejected seat count.
         got: u8,
+    },
+    /// The configured map is not registered by the builtin server.
+    UnsupportedMap {
+        /// Rejected map identifier.
+        got: MapId,
     },
     /// The request slice does not contain one entry per seat.
     RequestCount {
@@ -76,6 +87,11 @@ impl fmt::Display for ArenaError {
                     "arena seat count must be between {MIN_ARENA_SEATS} and {MAX_ARENA_SEATS}, got {got}"
                 )
             }
+            Self::UnsupportedMap { got } => write!(
+                formatter,
+                "arena map must be 0 (Dota), 1 (demo), or 2 (mid-only Dota), got {}",
+                got.0
+            ),
             Self::RequestCount { expected, got } => write!(
                 formatter,
                 "arena request count must equal seat count {expected}, got {got}"
@@ -97,8 +113,13 @@ impl Arena {
     /// Creates a match and advances it to its first visible tick.
     pub fn new(settings: ArenaConfig) -> Result<(Self, ArenaStart), ArenaError> {
         validate_seat_count(settings.seats)?;
+        if !MAPS.iter().any(|map| map.id == settings.map) {
+            return Err(ArenaError::UnsupportedMap { got: settings.map });
+        }
         let match_config = match_config(settings);
         let mut world = World::for_match(&match_config, match_config.rng());
+        assert_eq!(world.map.id, settings.map);
+        assert_eq!(world.seats.len(), usize::from(settings.seats));
         let events = world.advance(&[]);
         assert_eq!(world.tick, 1, "the first visible arena tick must be one");
         let arena = Self {
@@ -120,6 +141,8 @@ impl Arena {
     }
 
     /// Validates one optional request per seat and advances one tick.
+    ///
+    /// Every step after MatchOver, including a draw, returns [`ArenaError::MatchOver`].
     pub fn step(&mut self, requests: &[Option<Request>]) -> Result<ArenaStep, ArenaError> {
         if self.world.victor().is_some() {
             return Err(ArenaError::MatchOver);

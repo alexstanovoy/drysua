@@ -4,7 +4,7 @@ use std::thread;
 
 use bota_proto::{
     AbilitySlot, EntityId, EventKind, Fixed, ItemId, Order, RejectReason, Target, TickMode,
-    UnitKind, Vec2, WorldView,
+    UnitKind, UnitView, Vec2, WorldView,
 };
 
 use super::*;
@@ -27,6 +27,48 @@ fn pregame_nondefault_policy_preserves_arrival_and_tcp_builtin_parity_on_both_se
     for candidate in 0..2 {
         assert_teacher_opponent_parity(&policy, candidate);
     }
+}
+
+#[test]
+fn opening_trace_preserves_arrival_and_hashes_the_native_hero_death_snapshot() {
+    let (mut arena, _) = pregame_arena();
+    let initial = arena.configure_for_test(|world| {
+        let hero = world.seats[0].unit.expect("native hero");
+        world.transform.get_mut(hero).expect("position").pos = LANE_CENTER;
+    });
+    let mut trace = OpeningTrace::new(SlotId(0));
+    for message in &initial.messages[0] {
+        trace.observe(message);
+    }
+    assert_eq!(trace.arrival, Some(1));
+    let initial_hash = trace.snapshot_hash.finish();
+
+    let death = arena.configure_for_test(|world| {
+        let hero = world.seats[0].unit.expect("native hero");
+        world.push_hit(None, hero, 10_000, bota_proto::DamageKind::Pure);
+        world.advance(&[]);
+    });
+    for message in &death.messages[0] {
+        trace.observe(message);
+    }
+
+    let view = trace.view.as_ref().expect("death snapshot retained");
+    assert_eq!(view.tick, 2);
+    assert_eq!(view.players[0].unit, None);
+    assert!(view.players[0].respawn_left > 0);
+    assert_eq!(trace.arrival, Some(1));
+    assert_ne!(trace.snapshot_hash.finish(), initial_hash);
+}
+
+#[test]
+#[should_panic(expected = "absent opening hero must be absent from the scoreboard")]
+fn opening_trace_rejects_missing_hero_while_scoreboard_still_names_a_live_body() {
+    let (_, seat) = pregame_arena();
+    let mut view = seat.tracker.current().expect("native snapshot").clone();
+    assert!(view.players[0].unit.is_some());
+    let hero = view.players[0].unit;
+    view.units.retain(|unit| Some(unit.id) != hero);
+    OpeningTrace::new(SlotId(0)).snapshot(&view);
 }
 
 #[test]
@@ -379,12 +421,13 @@ impl OpeningTrace {
             if !lane_creep(source.kind) || !lane_creep(target.kind) || source.team == target.team {
                 continue;
             }
-            let hero = view
-                .units
-                .iter()
-                .find(|unit| Some(unit.id) == own)
-                .expect("hero at creep meet");
             self.creep_meet = Some(tick);
+            let Some(hero) = view.units.iter().find(|unit| Some(unit.id) == own) else {
+                assert!(own.is_none());
+                assert!(view.players[usize::from(self.slot.0)].respawn_left > 0);
+                self.creep_meet_in_lane_reach = Some(false);
+                continue;
+            };
             self.creep_meet_position = Some(hero.pos);
             self.creep_meet_health = Some((hero.hp, hero.max_hp, hero.mana, hero.max_mana));
             let enemy = if source.team == hero.team {
@@ -446,20 +489,23 @@ impl OpeningTrace {
         let hero = view
             .units
             .iter()
-            .find(|unit| unit.owner == Some(self.slot) && unit.kind == UnitKind::Hero)
-            .expect("opening hero alive");
-        if view.tick < 900
-            && self
-                .minimum_pregame_health
-                .is_none_or(|(_, hp, ..)| hero.hp < hp)
-        {
-            self.minimum_pregame_health = Some((view.tick, hero.hp, hero.max_hp, hero.pos));
-        }
-        if hero.pos.within(LANE_CENTER, Fixed::from_int(600)) {
-            self.arrival.get_or_insert(view.tick);
+            .find(|unit| unit.owner == Some(self.slot) && unit.kind == UnitKind::Hero);
+        let player = &view.players[usize::from(self.slot.0)];
+        if let Some(hero) = hero {
+            self.observe_hero_position(view.tick, hero);
+        } else {
+            // Combat after lane arrival can kill the hero; parity still covers every snapshot.
+            assert!(
+                player.unit.is_none(),
+                "absent opening hero must be absent from the scoreboard"
+            );
+            assert!(
+                player.respawn_left > 0,
+                "absent opening hero must be respawning"
+            );
         }
         if view.tick == 900 {
-            self.horn_position = Some(hero.pos);
+            self.horn_position = hero.map(|hero| hero.pos);
             let spawn = if self.slot == SlotId(0) {
                 bota_server::game::rules::DEMO_RADIANT_CREEP_SPAWN
             } else {
@@ -468,7 +514,7 @@ impl OpeningTrace {
             let mut wave = view
                 .units
                 .iter()
-                .filter(|unit| unit.team == hero.team && lane_creep(unit.kind));
+                .filter(|unit| unit.team == player.team && lane_creep(unit.kind));
             assert_eq!(wave.clone().count(), 4);
             assert!(wave.all(|unit| unit.pos.within(spawn, Fixed::from_int(200))));
         }
@@ -476,6 +522,21 @@ impl OpeningTrace {
             self.wave_spawn.get_or_insert(view.tick);
         }
         self.view = Some(view.clone());
+    }
+
+    fn observe_hero_position(&mut self, tick: u32, hero: &UnitView) {
+        assert!(tick <= OPENING_LIMIT);
+        assert_eq!(hero.owner, Some(self.slot));
+        if tick < 900
+            && self
+                .minimum_pregame_health
+                .is_none_or(|(_, hp, ..)| hero.hp < hp)
+        {
+            self.minimum_pregame_health = Some((tick, hero.hp, hero.max_hp, hero.pos));
+        }
+        if hero.pos.within(LANE_CENTER, Fixed::from_int(600)) {
+            self.arrival.get_or_insert(tick);
+        }
     }
 
     fn order(&mut self, tick: u32, unit: Option<EntityId>, order: Order) {

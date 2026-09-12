@@ -1,6 +1,92 @@
 use bota_proto::{ItemId, MapId, Order, RejectReason, ServerMsg, SlotId, Team, UnitKind};
 
-use crate::{Arena, ArenaConfig, Request};
+use crate::{Arena, ArenaConfig, ArenaError, Request};
+
+#[test]
+fn arena_admits_all_registered_maps_and_every_supported_seat_count() {
+    for map in [MapId(0), MapId(1), MapId(2)] {
+        for seats in 2..=10 {
+            let (arena, start) = Arena::new(ArenaConfig {
+                seats,
+                map,
+                seed: 7,
+            })
+            .expect("registered map and supported seat count");
+
+            assert_eq!(arena.seat_count(), usize::from(seats));
+            assert_eq!(start.messages.len(), usize::from(seats));
+            for (index, messages) in start.messages.iter().enumerate() {
+                let [
+                    ServerMsg::MatchStart { info },
+                    ServerMsg::Snapshot { view },
+                    ServerMsg::Events { tick, .. },
+                ] = messages.as_slice()
+                else {
+                    panic!("start must contain exactly MatchStart, Snapshot, Events");
+                };
+                let slot = SlotId(u8::try_from(index).expect("bounded seat index"));
+                let team = if index.is_multiple_of(2) {
+                    Team::Radiant
+                } else {
+                    Team::Dire
+                };
+                assert_eq!(info.map, map);
+                assert_eq!(info.match_id, 7);
+                assert_eq!(info.picks.len(), usize::from(seats));
+                assert_eq!(info.picks[index].slot, slot);
+                assert_eq!(info.picks[index].team, team);
+                assert_eq!(info.picks[index].hero, crate::SHADOW_FIEND);
+                assert_eq!(view.viewer, Some(team));
+                assert!(has_owned_hero(view, slot));
+                assert_eq!(view.tick, 1);
+                assert_eq!(*tick, 1);
+            }
+        }
+    }
+}
+
+#[test]
+fn arena_rejects_unknown_maps_instead_of_silently_running_map0() {
+    for map in [MapId(3), MapId(u16::MAX)] {
+        let error = Arena::new(ArenaConfig {
+            seats: 2,
+            map,
+            seed: 7,
+        })
+        .err()
+        .expect("unknown map must fail admission");
+
+        assert_eq!(error, ArenaError::UnsupportedMap { got: map });
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "arena map must be 0 (Dota), 1 (demo), or 2 (mid-only Dota), got {}",
+                map.0
+            )
+        );
+    }
+}
+
+#[test]
+fn arena_rejects_invalid_seats_before_validating_the_map() {
+    for map in [MapId(0), MapId(1), MapId(2), MapId(3)] {
+        for seats in [0, 1, 11, u8::MAX] {
+            let error = Arena::new(ArenaConfig {
+                seats,
+                map,
+                seed: 7,
+            })
+            .err()
+            .expect("invalid seat count must fail admission");
+
+            assert_eq!(error, ArenaError::SeatCount { got: seats });
+            assert_eq!(
+                error.to_string(),
+                format!("arena seat count must be between 2 and 10, got {seats}")
+            );
+        }
+    }
+}
 
 #[test]
 fn arena_starts_with_match_start_then_snapshot_tick_one() {

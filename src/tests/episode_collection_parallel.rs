@@ -1,5 +1,13 @@
 use super::*;
 
+type CollectionResult = (
+    PpoRollout,
+    PpoRng,
+    PpoSmokeReport,
+    Vec<PpoRng>,
+    Vec<(u64, Map2TrainingReward)>,
+);
+
 #[test]
 fn parallel_collection_preserves_actor_rng_frames_outcomes_and_ordering() {
     let model = PolicyModel::fresh(9952000).expect("model");
@@ -23,11 +31,7 @@ fn profile_parallel_full_episode_collection() {
 fn compare_collections(model: &PolicyModel, count: usize, rounds: usize) {
     let mut settings = parity_settings_for_test();
     settings.ppo.environments = count;
-    settings.ppo.rollout_decisions = 4538;
-    settings.ppo.gamma_tick = 1.0;
     settings.ppo.gae_lambda = 1.0;
-    settings.terminal_only = true;
-    settings.episode_time_cost = 0.25;
     settings.seed = 9952000;
     let serial = comparison_collection(model, &settings, rounds, false);
     let parallel = comparison_collection(model, &settings, rounds, true);
@@ -37,6 +41,12 @@ fn compare_collections(model: &PolicyModel, count: usize, rounds: usize) {
     assert_eq!(serial.2.elapsed_ticks, parallel.2.elapsed_ticks);
     assert_eq!(serial.2.terminal_wins, parallel.2.terminal_wins);
     assert_eq!(serial.2.terminal_losses, parallel.2.terminal_losses);
+    assert_eq!(serial.2.terminal_draws, parallel.2.terminal_draws);
+    assert_eq!(serial.2.episode_timeouts, parallel.2.episode_timeouts);
+    assert_eq!(serial.2.map2_reward, parallel.2.map2_reward);
+    assert_eq!(serial.2.rejected_orders, 0);
+    assert_eq!(parallel.2.rejected_orders, 0);
+    assert!(!serial.0.is_empty());
     assert_eq!(serial.0.len(), parallel.0.len());
     let source = serial.0.finish(settings.ppo).expect("serial samples");
     let target = parallel.0.finish(settings.ppo).expect("parallel samples");
@@ -60,7 +70,9 @@ fn compare_collections(model: &PolicyModel, count: usize, rounds: usize) {
             right.transition.old_log_probability.to_bits()
         );
         assert_eq!(left.transition.stream, right.transition.stream);
+        assert_eq!(left.transition.decision, right.transition.decision);
         assert_eq!(left.transition.ticks, right.transition.ticks);
+        assert_eq!(left.transition.terminal, right.transition.terminal);
         assert_eq!(left.return_value.to_bits(), right.return_value.to_bits());
         assert_eq!(left.advantage.to_bits(), right.advantage.to_bits());
     }
@@ -71,14 +83,18 @@ fn comparison_collection(
     settings: &TrainingJobConfig,
     rounds: usize,
     parallel: bool,
-) -> (PpoRollout, PpoRng, PpoSmokeReport, Vec<PpoRng>, Vec<u64>) {
+) -> CollectionResult {
+    assert!(rounds > 0);
     assert!(rounds <= ACTOR_DECISIONS);
     let mut arenas = environments(settings, 0).expect("worlds");
     let mut master = PpoRng::new(settings.seed);
     let mut random = actor_stream_rngs(&mut master, arenas.len()).expect("actor RNG");
     let mut streams = streams_for_collection(settings, 0).expect("stream state");
-    let mut rollout =
-        PpoRollout::new(32768, model.policy_identity().expect("identity")).expect("rollout");
+    let mut rollout = PpoRollout::new(
+        settings.ppo.environments * RETAINED_PER_EPISODE,
+        model.policy_identity().expect("identity"),
+    )
+    .expect("rollout");
     let mut report = PpoSmokeReport::default();
     let started = Instant::now();
     for _ in 0..rounds {
@@ -135,7 +151,14 @@ fn comparison_collection(
                     &mut rollout,
                     &mut report,
                 )
-                .expect("serial advance");
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "serial stream={index} decision={} tick={} requests={:?}: {error}",
+                        streams[index].decisions,
+                        arenas[index].arena.tick(),
+                        streams[index].last_requests,
+                    );
+                });
             }
         }
     }
@@ -148,8 +171,12 @@ fn comparison_collection(
         report.terminal_wins,
         report.terminal_losses
     );
+    report.rejected_orders = environment_rejections(&arenas).expect("rejection totals");
     use std::hash::Hasher;
-    let traces = streams.iter().map(|stream| stream.trace.finish()).collect();
+    let traces = streams
+        .iter()
+        .map(|stream| (stream.trace.finish(), stream.map2_reward))
+        .collect();
     (rollout, master, report, random, traces)
 }
 

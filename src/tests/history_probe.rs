@@ -340,7 +340,7 @@ fn zero_probe_input_weights(model: &PolicyModel) -> Vec<f32> {
     let mut cleared = false;
     for (name, shape) in model.parameter_schema().expect("schema") {
         if name == "trunk.0.weight" {
-            assert_eq!(shape, [2576, 512]);
+            assert_eq!(shape, [2589, 512]);
             parameters[offset + 59 * 512..offset + 64 * 512].fill(0.0);
             cleared = true;
         }

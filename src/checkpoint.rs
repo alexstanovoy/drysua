@@ -10,8 +10,14 @@ use bota_proto::{HeroId, MapId};
 use safetensors::tensor::{Dtype, SafeTensors, TensorView, serialize};
 use sha2::{Digest, Sha256};
 
+#[path = "checkpoint_navigation.rs"]
+mod navigation;
+
+pub use navigation::Map2NavigationInitializationProvenance;
+
 use crate::{
     ACTION_SCHEMA_HASH, ACTION_SCHEMA_VERSION, FEATURE_SCHEMA_HASH, FEATURE_SCHEMA_VERSION,
+    MAP2_REWARD_SCHEMA_DESCRIPTOR, MAP2_REWARD_SCHEMA_HASH, MAP2_REWARD_SCHEMA_VERSION,
     MAX_TRAINING_COUNTER, MODEL_MAX_OPTIMIZER_STEP, MODEL_PARAMETER_COUNT, MODEL_SCHEMA_HASH,
     MODEL_SCHEMA_VERSION, PPO_RULES_AUDIT_VERSION, PPO_SCHEMA_HASH, PPO_SCHEMA_VERSION,
     PolicyDevice, PolicyModel, PpoConfig, PpoTrainer, SHADOW_FIEND,
@@ -19,11 +25,20 @@ use crate::{
 
 const CHECKPOINT_MAGIC: &[u8; 8] = b"DRYCKP18";
 /// Version of the strict on-disk tensor and manifest contract.
-pub const CHECKPOINT_SCHEMA_VERSION: u32 = 2;
+pub const CHECKPOINT_SCHEMA_VERSION: u32 = 5;
 /// Canonical strict checkpoint contract descriptor.
-pub const CHECKPOINT_SCHEMA_DESCRIPTOR: &str = "bota-drysua-checkpoint/v2;files=checkpoint.safetensors,checkpoint.meta,drysua.weights.safetensors,immutable_sha256_tensor_generation;tensors=model.parameters,adam.first_moment,adam.second_moment;dtype=f32;runtime_metadata=action_feature_model_ppo_schema_hashes,ppo_schema_version,ppo_rules_audit_version;load=exact_names_shapes_dtype_finite_schema_sha256,canonical_tensor_fallback;manifest=git_simulator_features_scope_seed_device_batch_command_rules_progress_rng_curriculum_league;save=immutable_generation,canonical_copy,recoverable_manifest_commit_last,file_and_directory_fsync;";
-/// Stable FNV-1a hash of [`CHECKPOINT_SCHEMA_DESCRIPTOR`].
-pub const CHECKPOINT_SCHEMA_HASH: u64 = checkpoint_fnv1a(CHECKPOINT_SCHEMA_DESCRIPTOR.as_bytes());
+pub const CHECKPOINT_SCHEMA_DESCRIPTOR: &str = "bota-drysua-checkpoint/v5;linked_schemas=action,feature,model,ppo,map2_reward;linked_hash=fnv1a_descriptor_then_ordered_version_le32_hash_le64_then_map2_reward_descriptor_utf8;files=checkpoint.safetensors,checkpoint.meta,drysua.weights.safetensors,immutable_sha256_tensor_generation;tensors=model.parameters,adam.first_moment,adam.second_moment;dtype=f32;runtime_metadata=action_feature_model_ppo_schema_hashes,ppo_schema_version,ppo_rules_audit_version,map2_reward_schema_version,map2_reward_schema_hash,map2_reward_schema_descriptor;load=exact_names_shapes_dtype_finite_schema_sha256,no_legacy_runtime_or_resume,canonical_tensor_fallback;initialization=explicit_two_pinned_m14_sources_candle_named_zero_row_insertion_or_two_pinned_m16_initial1739d280_advantagefdd4d3f2_exact_nine_key_a4_f14_m16_ppo29_rules24_reward1_full_sha_same_shape62_tensor_all_parameter_bits_new_provenance_no_gameplay_equivalence_fresh_optimizer_progress_rng_league;manifest=git_simulator_features_map2_scope_cap27900_including900_pregame_seed_device_batch_command_rules25_progress_rng_curriculum_league;observation=feature15_action5_walkable_building_landing_move_only_effects13_guarded14_inspired15_shadowraze_manual_hp_mana_restoration_reports_not_confirmed_tickregen;save=immutable_generation,canonical_copy,recoverable_manifest_commit_last,file_and_directory_fsync;";
+/// FNV-1a of the descriptor, ordered linked identities, and reward descriptor.
+pub const CHECKPOINT_SCHEMA_HASH: u64 = crate::model::linked_schema_hash(
+    CHECKPOINT_SCHEMA_DESCRIPTOR,
+    &[
+        (ACTION_SCHEMA_VERSION, ACTION_SCHEMA_HASH),
+        (FEATURE_SCHEMA_VERSION, FEATURE_SCHEMA_HASH),
+        (MODEL_SCHEMA_VERSION, MODEL_SCHEMA_HASH),
+        (PPO_SCHEMA_VERSION, PPO_SCHEMA_HASH),
+        (MAP2_REWARD_SCHEMA_VERSION, MAP2_REWARD_SCHEMA_HASH),
+    ],
+);
 const CHECKPOINT_TENSOR_FILE: &str = "checkpoint.safetensors";
 const CHECKPOINT_META_FILE: &str = "checkpoint.meta";
 const RUNTIME_TENSOR_FILE: &str = "drysua.weights.safetensors";
@@ -35,15 +50,38 @@ const MAX_RNG_STATES: usize = 32;
 const MAX_LEAGUE_REFERENCES: usize = 32;
 static NEXT_TEMPORARY_FILE: AtomicU64 = AtomicU64::new(1);
 
-const fn checkpoint_fnv1a(bytes: &[u8]) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325;
-    let mut index = 0;
-    while index < bytes.len() {
-        hash ^= bytes[index] as u64;
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-        index += 1;
+const M14_PARAMETER_COUNT: usize = 1_689_076;
+
+/// Parameter ancestry of a new, unqualified Map2 policy; never a resume/gameplay identity.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Map2InitializationProvenance {
+    pub source_sha256: [u8; 32],
+    pub source_ppo_schema_version: u32,
+    pub source_ppo_rules_audit_version: u32,
+}
+
+impl Map2InitializationProvenance {
+    /// Persist this in the new run's command/provenance record, not the source artifact.
+    pub fn description(&self) -> String {
+        let digest: String = self
+            .source_sha256
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        format!(
+            "INITIALIZATION_ONLY source_m14_sha256={digest} source_ppo={} source_rules={} target_f={} target_a={} target_m={} target_ppo={} target_rules={} reward_version={} reward_hash={} old_parameter_bits_preserved=true new_weights={}_positive_zero optimizer_progress_rng_league=fresh gameplay_equivalence=false qualification=false",
+            self.source_ppo_schema_version,
+            self.source_ppo_rules_audit_version,
+            FEATURE_SCHEMA_VERSION,
+            ACTION_SCHEMA_VERSION,
+            MODEL_SCHEMA_VERSION,
+            PPO_SCHEMA_VERSION,
+            PPO_RULES_AUDIT_VERSION,
+            MAP2_REWARD_SCHEMA_VERSION,
+            MAP2_REWARD_SCHEMA_HASH,
+            MODEL_PARAMETER_COUNT - M14_PARAMETER_COUNT,
+        )
     }
-    hash
 }
 
 /// Cargo feature set that strict checkpoint manifests must match.
@@ -422,8 +460,7 @@ impl TrainingArtifact {
         sync_directory(directory)
     }
 
-    /// Loads current inference metadata or the exact audited F12/M14/PPO26 actor tuple.
-    /// PPO26 compatibility is runtime-only: no metadata rewrite, old training resume or M12 load.
+    /// Loads only the exact current Map2 identity. Legacy tuples are not runtime compatible.
     pub fn load_runtime_weights(
         model: &PolicyModel,
         directory: &Path,
@@ -439,97 +476,80 @@ impl TrainingArtifact {
             .map_err(|error| CheckpointError::Model(error.to_string()))
     }
 
-    /// Initializes a new training model from the selected M10/F9/A3/P18 artifact.
-    ///
-    /// Accepts only SHA-256 b3802642b34487d66fc3f0fe526e7f8b2a84df542793ac336b58ea046b8f8b53.
-    /// Returns the source digest for new-run provenance; source bytes are never rewritten.
-    /// The caller must explicitly opt into training initialization and construct a fresh
-    /// optimizer, RNG/run progress and current-feature samples. This is not runtime
-    /// compatibility or checkpoint resume and imports no optimizer or old samples.
+    /// Retired M10 initializer: validates the legacy source, then rejects Map2 initialization.
     pub fn initialize_selected_m10_for_training(
         directory: &Path,
-        seed: u64,
-        device: PolicyDevice,
+        _seed: u64,
+        _device: PolicyDevice,
     ) -> Result<(PolicyModel, [u8; 32]), CheckpointError> {
         validate_directory(directory)?;
         let bytes = read_recoverable(
             &directory.join(RUNTIME_TENSOR_FILE),
             MAX_RUNTIME_TENSOR_BYTES,
         )?;
-        let parameters = decode_selected_m10_training_tensor(&bytes)?;
-        let model = PolicyModel::fresh_on(seed, device)
-            .map_err(|error| CheckpointError::Model(error.to_string()))?;
-        let parameters = model
-            .widen_m11_input_parameters(&parameters)
-            .map_err(|error| CheckpointError::Model(error.to_string()))?;
-        model
-            .import_parameters(&parameters)
-            .map_err(|error| CheckpointError::Model(error.to_string()))?;
-        Ok((model, sha256(&bytes)))
+        decode_selected_m10_training_tensor(&bytes)?;
+        Err(CheckpointError::SchemaMismatch)
     }
 
-    /// Initializes current training inputs from the approved M11/F10/A3/P21 u10 artifact.
-    /// Source SHA-256: 5bbb8843fec88f3c6443618de9cabeba44ff9dbb0b7f9a9856c2c8936551e880.
-    /// Copies the audited named layout, zeroes new input weights, and imports no optimizer state.
-    /// The returned model needs a fresh optimizer and current-feature samples; this is not resume.
+    /// Retired M11 initializer: validates the legacy source, then rejects Map2 initialization.
     pub fn initialize_selected_m11_for_training(
         directory: &Path,
-        seed: u64,
-        device: PolicyDevice,
+        _seed: u64,
+        _device: PolicyDevice,
     ) -> Result<(PolicyModel, [u8; 32]), CheckpointError> {
         validate_directory(directory)?;
         let bytes = read_recoverable(
             &directory.join(RUNTIME_TENSOR_FILE),
             MAX_RUNTIME_TENSOR_BYTES,
         )?;
-        let parameters = decode_selected_m11_training_tensor(&bytes)?;
-        let model = PolicyModel::fresh_on(seed, device)
-            .map_err(|error| CheckpointError::Model(error.to_string()))?;
-        let parameters = model
-            .widen_m11_input_parameters(&parameters)
-            .map_err(|error| CheckpointError::Model(error.to_string()))?;
-        model
-            .import_parameters(&parameters)
-            .map_err(|error| CheckpointError::Model(error.to_string()))?;
-        Ok((model, sha256(&bytes)))
+        decode_selected_m11_training_tensor(&bytes)?;
+        Err(CheckpointError::SchemaMismatch)
     }
 
-    /// Initializes a new M14/F12 training policy under candidate-only order bookkeeping.
-    ///
-    /// Accepts precisely these immutable M12/F11/A3 runtime artifacts:
-    /// - M12/PPO23 initializer: adbecb8293548ad1602b24b046b9a6f032fc62798d46102029a1f3448d764bdd.
-    /// - M12/PPO25 skill alpha050: d22a011f829c23593bbc6c03d22cbab9ab13bb79662959eda2d6c96b9de8098e.
-    ///
-    /// Verifies all six metadata keys, F32 count, finite payload, source digest and
-    /// the ordered 62-name/shape layout before importing into a new owned model.
-    /// Parameter bits are preserved, not old gameplay semantics. No source is rewritten.
-    /// The caller must create a fresh optimizer, RNG and run progress and collect
-    /// current-contract samples. This imports no moments or progress, is not resume,
-    /// does not enrich history and confers no qualification or promotion evidence.
+    /// Retired M12 initializer: validates the legacy source, then rejects Map2 initialization.
     pub fn initialize_selected_m12_for_training(
+        directory: &Path,
+        _seed: u64,
+        _device: PolicyDevice,
+    ) -> Result<(PolicyModel, [u8; 32]), CheckpointError> {
+        validate_directory(directory)?;
+        let bytes = read_recoverable(
+            &directory.join(RUNTIME_TENSOR_FILE),
+            MAX_RUNTIME_TENSOR_BYTES,
+        )?;
+        decode_selected_m12_training_tensor(&bytes)?;
+        Err(CheckpointError::SchemaMismatch)
+    }
+
+    /// INITIALIZATION ONLY from corrected M14 u4 (6348fe57...) or initial (ce17f6f1...).
+    /// Checks exact paired source SHA-256/metadata, names, F32 count, and finite values.
+    /// Candle inserts positive-zero input rows into the audited 62-tensor layout and
+    /// preserves every source parameter bit. This creates a new policy, not M14 gameplay.
+    /// No optimizer, progress, RNG history, samples, league or qualification is imported.
+    /// The caller must persist the returned provenance and create fresh training state.
+    /// Source files are read only; this function neither writes artifacts nor trains.
+    pub fn initialize_selected_m14_for_map2(
         directory: &Path,
         seed: u64,
         device: PolicyDevice,
-    ) -> Result<(PolicyModel, [u8; 32]), CheckpointError> {
+    ) -> Result<(PolicyModel, Map2InitializationProvenance), CheckpointError> {
         validate_directory(directory)?;
-        let bytes = read_recoverable(
+        let bytes = read_bounded(
             &directory.join(RUNTIME_TENSOR_FILE),
             MAX_RUNTIME_TENSOR_BYTES,
         )?;
-        let (parameters, digest) = decode_selected_m12_training_tensor(&bytes)?;
+        let (parameters, provenance) = decode_selected_m14_map2_tensor(&bytes)?;
         let model = PolicyModel::fresh_on(seed, device)
             .map_err(|error| CheckpointError::Model(error.to_string()))?;
-        let schema = model
-            .parameter_schema()
-            .map_err(|error| CheckpointError::Model(error.to_string()))?;
-        PolicyModel::validate_m12_parameter_schema(&schema)
+        let parameters = model
+            .widen_m14_input_parameters(&parameters)
             .map_err(|error| CheckpointError::Model(error.to_string()))?;
         assert_eq!(parameters.len(), MODEL_PARAMETER_COUNT);
-        assert_eq!(schema.len(), 62);
+        assert!(model.device() == device);
         model
             .import_parameters(&parameters)
             .map_err(|error| CheckpointError::Model(error.to_string()))?;
-        Ok((model, digest))
+        Ok((model, provenance))
     }
 
     fn validate(&self) -> Result<(), CheckpointError> {
@@ -607,13 +627,16 @@ fn validate_run_without_model(
     ] {
         validate_text(field, value)?;
     }
-    if run.hero != SHADOW_FIEND || !matches!(run.map, MapId(0) | MapId(1)) {
+    if run.hero != SHADOW_FIEND || run.map != MapId(2) {
         return Err(CheckpointError::InvalidManifest("hero or map scope"));
     }
     if run.rules_audit_version != PPO_RULES_AUDIT_VERSION || run.batch_size != config.minibatch {
         return Err(CheckpointError::InvalidManifest(
             "rules audit or batch size",
         ));
+    }
+    if config.gamma_tick != crate::MAP2_REWARD_GAMMA_TICK {
+        return Err(CheckpointError::InvalidManifest("Map2 reward discount"));
     }
     if run.enabled_features != compiled_features() {
         return Err(CheckpointError::InvalidManifest("enabled features"));
@@ -732,6 +755,18 @@ fn runtime_tensor_metadata() -> HashMap<String, String> {
             "ppo_schema_version".to_owned(),
             PPO_SCHEMA_VERSION.to_string(),
         ),
+        (
+            "map2_reward_schema_version".to_owned(),
+            MAP2_REWARD_SCHEMA_VERSION.to_string(),
+        ),
+        (
+            "map2_reward_schema_hash".to_owned(),
+            MAP2_REWARD_SCHEMA_HASH.to_string(),
+        ),
+        (
+            "map2_reward_schema_descriptor".to_owned(),
+            MAP2_REWARD_SCHEMA_DESCRIPTOR.to_owned(),
+        ),
     ])
 }
 
@@ -777,9 +812,7 @@ fn decode_runtime_tensor(bytes: &[u8]) -> Result<Vec<f32>, CheckpointError> {
     let (_, metadata) = SafeTensors::read_metadata(bytes)
         .map_err(|error| CheckpointError::Backend(error.to_string()))?;
     let expected = runtime_tensor_metadata();
-    if metadata.metadata().as_ref() != Some(&expected)
-        && metadata.metadata().as_ref() != Some(&audited_ppo26_runtime_metadata())
-    {
+    if metadata.metadata().as_ref() != Some(&expected) {
         return Err(CheckpointError::SchemaMismatch);
     }
     let tensors = SafeTensors::deserialize(bytes)
@@ -788,40 +821,77 @@ fn decode_runtime_tensor(bytes: &[u8]) -> Result<Vec<f32>, CheckpointError> {
     decode_tensor(&tensors, "model.parameters")
 }
 
-fn audited_ppo26_runtime_metadata() -> HashMap<String, String> {
-    // Training roles changed in PPO27; live candidate input/execution and all parameter shapes did not.
-    const _: () = assert!(ACTION_SCHEMA_VERSION == 3);
-    const _: () = assert!(ACTION_SCHEMA_HASH == 1_755_359_086_494_840_931);
-    const _: () = assert!(FEATURE_SCHEMA_VERSION == 12);
-    const _: () = assert!(FEATURE_SCHEMA_HASH == 1_577_122_233_561_586_211);
-    const _: () = assert!(MODEL_SCHEMA_VERSION == 14);
-    const _: () = assert!(MODEL_SCHEMA_HASH == 7_970_187_849_195_607_202);
-    const _: () = assert!(MODEL_PARAMETER_COUNT == 1_689_076);
-    const _: () = assert!(PPO_SCHEMA_VERSION == 27);
+fn selected_m14_map2_metadata(corrected_u4: bool) -> HashMap<String, String> {
+    let (version, hash, rules) = if corrected_u4 {
+        ("27", "9274275648898675046", "22")
+    } else {
+        ("26", "4420330489262074980", "21")
+    };
     [
         ("action_schema_hash", "1755359086494840931"),
         ("feature_schema_hash", "1577122233561586211"),
         ("model_schema_hash", "7970187849195607202"),
-        ("ppo_schema_version", "26"),
-        ("ppo_schema_hash", "4420330489262074980"),
-        ("ppo_rules_audit_version", "21"),
+        ("ppo_schema_version", version),
+        ("ppo_schema_hash", hash),
+        ("ppo_rules_audit_version", rules),
     ]
     .into_iter()
     .map(|(key, value)| (key.to_owned(), value.to_owned()))
     .collect()
 }
 
+fn decode_selected_m14_map2_tensor(
+    bytes: &[u8],
+) -> Result<(Vec<f32>, Map2InitializationProvenance), CheckpointError> {
+    let (_, metadata) = SafeTensors::read_metadata(bytes)
+        .map_err(|error| CheckpointError::Backend(error.to_string()))?;
+    let (selected, version, rules) =
+        if metadata.metadata().as_ref() == Some(&selected_m14_map2_metadata(true)) {
+            (
+                [
+                    0x63, 0x48, 0xfe, 0x57, 0xa1, 0x28, 0xeb, 0xd5, 0x21, 0xdb, 0xa6, 0x8d, 0xa0,
+                    0x94, 0x9c, 0xeb, 0x73, 0x78, 0xd3, 0xe0, 0xd6, 0xb7, 0xd6, 0xa7, 0xce, 0x9a,
+                    0x5f, 0xb6, 0x44, 0x65, 0x47, 0xab,
+                ],
+                27,
+                22,
+            )
+        } else if metadata.metadata().as_ref() == Some(&selected_m14_map2_metadata(false)) {
+            (
+                [
+                    0xce, 0x17, 0xf6, 0xf1, 0xe3, 0x66, 0x88, 0x37, 0x77, 0x6b, 0x36, 0x6f, 0xdc,
+                    0xab, 0x59, 0xc2, 0x50, 0xa4, 0xd6, 0xbb, 0x6d, 0xe3, 0xba, 0x36, 0x15, 0xdc,
+                    0x3e, 0x7f, 0x23, 0xa5, 0x3c, 0x4b,
+                ],
+                26,
+                21,
+            )
+        } else {
+            return Err(CheckpointError::SchemaMismatch);
+        };
+    let tensors = SafeTensors::deserialize(bytes)
+        .map_err(|error| CheckpointError::Backend(error.to_string()))?;
+    validate_names(&tensors, &["model.parameters"])?;
+    let parameters = decode_tensor_count(&tensors, "model.parameters", M14_PARAMETER_COUNT)?;
+    let digest = sha256(bytes);
+    if digest != selected {
+        return Err(CheckpointError::TensorContract(
+            "selected M14 Map2 initialization source SHA-256",
+        ));
+    }
+    assert_eq!(parameters.len(), M14_PARAMETER_COUNT);
+    assert_eq!(digest, selected);
+    Ok((
+        parameters,
+        Map2InitializationProvenance {
+            source_sha256: digest,
+            source_ppo_schema_version: version,
+            source_ppo_rules_audit_version: rules,
+        },
+    ))
+}
+
 fn selected_m12_training_metadata(skill_alpha050: bool) -> HashMap<String, String> {
-    const _: () = assert!(ACTION_SCHEMA_VERSION == 3);
-    const _: () = assert!(ACTION_SCHEMA_HASH == 1_755_359_086_494_840_931);
-    const _: () = assert!(FEATURE_SCHEMA_VERSION == 12);
-    const _: () = assert!(FEATURE_SCHEMA_HASH == 1_577_122_233_561_586_211);
-    const _: () = assert!(MODEL_SCHEMA_VERSION == 14);
-    const _: () = assert!(MODEL_SCHEMA_HASH == 7_970_187_849_195_607_202);
-    const _: () = assert!(MODEL_PARAMETER_COUNT == 1_689_076);
-    const _: () = assert!(PPO_SCHEMA_VERSION == 27);
-    const _: () = assert!(PPO_SCHEMA_HASH == 9_274_275_648_898_675_046);
-    const _: () = assert!(PPO_RULES_AUDIT_VERSION == 22);
     let (version, hash, rules) = if skill_alpha050 {
         ("25", "12302688747093836273", "20")
     } else {
@@ -863,7 +933,7 @@ fn decode_selected_m12_training_tensor(
     let tensors = SafeTensors::deserialize(bytes)
         .map_err(|error| CheckpointError::Backend(error.to_string()))?;
     validate_names(&tensors, &["model.parameters"])?;
-    let parameters = decode_tensor(&tensors, "model.parameters")?;
+    let parameters = decode_tensor_count(&tensors, "model.parameters", M14_PARAMETER_COUNT)?;
     let digest = sha256(bytes);
     if digest != selected {
         return Err(CheckpointError::TensorContract(
@@ -874,11 +944,6 @@ fn decode_selected_m12_training_tensor(
 }
 
 fn selected_m11_training_metadata() -> HashMap<String, String> {
-    const _: () = assert!(ACTION_SCHEMA_VERSION == 3);
-    const _: () = assert!(ACTION_SCHEMA_HASH == 1_755_359_086_494_840_931);
-    const _: () = assert!(FEATURE_SCHEMA_VERSION == 12);
-    const _: () = assert!(MODEL_SCHEMA_VERSION == 14);
-    const _: () = assert!(PPO_SCHEMA_VERSION == 27);
     [
         ("action_schema_hash", "1755359086494840931"),
         ("feature_schema_hash", "15519817897416174399"),
@@ -916,11 +981,6 @@ fn decode_selected_m11_training_tensor(bytes: &[u8]) -> Result<Vec<f32>, Checkpo
 }
 
 fn decode_selected_m10_training_tensor(bytes: &[u8]) -> Result<Vec<f32>, CheckpointError> {
-    const _: () = assert!(ACTION_SCHEMA_VERSION == 3);
-    const _: () = assert!(ACTION_SCHEMA_HASH == 1_755_359_086_494_840_931);
-    const _: () = assert!(FEATURE_SCHEMA_VERSION == 12);
-    const _: () = assert!(MODEL_SCHEMA_VERSION == 14);
-    const _: () = assert!(MODEL_PARAMETER_COUNT == 1_689_076);
     let expected: HashMap<_, _> = [
         ("action_schema_hash", "1755359086494840931"),
         ("feature_schema_hash", "9669721049329356661"),
@@ -1062,6 +1122,7 @@ fn encode_schema(writer: &mut ManifestWriter) {
         (FEATURE_SCHEMA_VERSION, FEATURE_SCHEMA_HASH),
         (MODEL_SCHEMA_VERSION, MODEL_SCHEMA_HASH),
         (PPO_SCHEMA_VERSION, PPO_SCHEMA_HASH),
+        (MAP2_REWARD_SCHEMA_VERSION, MAP2_REWARD_SCHEMA_HASH),
     ] {
         writer.u32(version);
         writer.u64(hash);
@@ -1074,6 +1135,7 @@ fn decode_schema(reader: &mut ManifestReader<'_>) -> Result<(), CheckpointError>
         (FEATURE_SCHEMA_VERSION, FEATURE_SCHEMA_HASH),
         (MODEL_SCHEMA_VERSION, MODEL_SCHEMA_HASH),
         (PPO_SCHEMA_VERSION, PPO_SCHEMA_HASH),
+        (MAP2_REWARD_SCHEMA_VERSION, MAP2_REWARD_SCHEMA_HASH),
     ] {
         if reader.u32()? != version || reader.u64()? != hash {
             return Err(CheckpointError::SchemaMismatch);

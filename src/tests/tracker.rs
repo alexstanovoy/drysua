@@ -101,10 +101,10 @@ fn tracker_rejects_invalid_hero_team_map_seats_and_tick_rate_with_exact_messages
     assert_new_error(&info, "own slot has non-playable team Neutral");
 
     let mut info = match_info();
-    info.map = MapId(2);
+    info.map = MapId(3);
     assert_new_error(
         &info,
-        "unsupported map MapId(2); expected MapId(0) or MapId(1)",
+        "unsupported map MapId(3); expected MapId(0), MapId(1), or MapId(2)",
     );
 
     let mut info = match_info();
@@ -949,6 +949,7 @@ fn tracker_updates_damage_heal_death_cast_and_possible_attack_observations() {
             source: Some(attacker),
             target: attacker,
             amount: 20,
+            mana: 0,
         },
         EventKind::Died {
             unit: target,

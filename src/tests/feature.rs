@@ -29,18 +29,29 @@ mod feature_facts;
 
 #[test]
 fn feature_schema_dimensions_and_hash_are_stable() {
-    assert_eq!(FEATURE_SCHEMA_VERSION, 12);
+    assert_eq!(FEATURE_SCHEMA_VERSION, 15);
     assert!(
-        FEATURE_SCHEMA_DESCRIPTOR
-            .contains("action_schema_version=3;action_schema_hash=1755359086494840931;")
+        FEATURE_SCHEMA_DESCRIPTOR.contains("action_schema_version=5;action_schema_hash=linked;")
     );
-    assert_eq!(FEATURE_SCHEMA_HASH, 1_577_122_233_561_586_211);
-    assert_eq!(GLOBAL_FEATURES, 72);
+    assert_eq!(
+        FEATURE_SCHEMA_HASH,
+        super::map2_checkpoint::independent_linked_hash(
+            FEATURE_SCHEMA_DESCRIPTOR,
+            &[
+                (crate::ACTION_SCHEMA_VERSION, crate::ACTION_SCHEMA_HASH),
+                (
+                    crate::MAP2_REWARD_SCHEMA_VERSION,
+                    crate::MAP2_REWARD_SCHEMA_HASH
+                )
+            ],
+        )
+    );
+    assert_eq!(GLOBAL_FEATURES, 85);
     assert_eq!((HISTORY_SAMPLES, HISTORY_FEATURES), (7, 24));
     assert_eq!((MAX_POLICY_HISTORY, POLICY_HISTORY_FEATURES), (16, 4));
-    assert_eq!((UNIT_FEATURE_TOKENS, UNIT_FEATURES), (96, 73));
-    assert_eq!((OWN_UNIT_FEATURE_TOKENS, UNIT_FEATURES), (2, 73));
-    assert_eq!((REMEMBERED_UNIT_FEATURE_TOKENS, UNIT_FEATURES), (32, 73));
+    assert_eq!((UNIT_FEATURE_TOKENS, UNIT_FEATURES), (96, 84));
+    assert_eq!((OWN_UNIT_FEATURE_TOKENS, UNIT_FEATURES), (2, 84));
+    assert_eq!((REMEMBERED_UNIT_FEATURE_TOKENS, UNIT_FEATURES), (32, 84));
     assert_eq!((POINT_FEATURE_TOKENS, POINT_FEATURES), (48, 32));
     assert_eq!((ABILITY_FEATURE_TOKENS, ABILITY_FEATURES), (14, 24));
     assert_eq!((ITEM_FEATURE_TOKENS, ITEM_FEATURES), (85, 28));
@@ -2504,7 +2515,7 @@ pub(super) fn tracker_with_view(team: Team, view: WorldView) -> StateTracker {
     tracker
 }
 
-fn match_info(team: Team) -> MatchInfo {
+pub(super) fn match_info(team: Team) -> MatchInfo {
     let enemy = opposing(team);
     let trees = canonical_positions(
         team,

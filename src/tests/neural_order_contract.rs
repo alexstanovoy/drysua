@@ -686,7 +686,7 @@ fn install_policy(model: &PolicyModel, policy: DiagnosticPolicy) {
         match (policy, name) {
             (DiagnosticPolicy::Constant(kind), "kind.bias") => values[kind.index()] = 10.0,
             (DiagnosticPolicy::ActiveOrderReadout, "trunk.0.weight") => {
-                assert_eq!(shape, [2576, 512]);
+                assert_eq!(shape, [2589, 512]);
                 values[global_feature::ACTIVE_ORDER_PRESENT * shape[1]] = 1.0;
             }
             (DiagnosticPolicy::ActiveOrderReadout, "trunk.1.weight" | "trunk.2.weight") => {
@@ -791,7 +791,7 @@ fn assert_candidate_training_replay(fixture: &CompletedFixture, scenario: Scenar
     };
     let start = messages_at(fixture, 1);
     let mut ppo = PpoOrderContractProbe::new(fixture.side, &start);
-    let mut neural = NeuralSeatOrderContractProbe::new(fixture.side, &start);
+    let mut neural = NeuralSeatOrderContractProbe::new_historical(fixture.side, &start);
     let model = PolicyModel::fresh(SEED).expect("replay instrument");
     for tick in 1..fixture.outcome.ticks {
         if tick > 1 {
@@ -805,6 +805,8 @@ fn assert_candidate_training_replay(fixture: &CompletedFixture, scenario: Scenar
         install_policy(&model, scheduled_policy(scenario, tick));
         let (ppo_frame, ppo_request, ppo_active) = ppo.decide(&model, true);
         let (neural_frame, neural_request, neural_active) = neural.decide(&model, true);
+        assert_eq!(neural_frame.global()[global_feature::MAP_ZERO], 1.0);
+        assert_eq!(neural_frame.global()[global_feature::MAP_TWO], 0.0);
         assert!(
             ppo_frame == neural_frame,
             "candidate input parity: {scenario:?} side={} tick={tick}",
@@ -860,7 +862,7 @@ fn noncandidate_training_seats_keep_legacy_cast_and_visibility_behavior() {
         let fixture = run_fixture(0, scenario, false);
         let start = messages_at(&fixture, 1);
         let mut ppo = PpoOrderContractProbe::new(0, &start);
-        let mut expert = NeuralSeatOrderContractProbe::new(0, &start);
+        let mut expert = NeuralSeatOrderContractProbe::new_historical(0, &start);
         let model = PolicyModel::fresh(SEED).expect("legacy instrument");
         for tick in 1..fixture.outcome.ticks {
             if tick > 1 {
@@ -901,7 +903,7 @@ fn candidate_training_paths_wait_for_current_tick_death_evidence_before_reconcil
     let fixture = run_fixture(0, Scenario::NoCast, false);
     let start = messages_at(&fixture, 1);
     let mut ppo = PpoOrderContractProbe::new(0, &start);
-    let mut neural = NeuralSeatOrderContractProbe::new(0, &start);
+    let mut neural = NeuralSeatOrderContractProbe::new_historical(0, &start);
     let model = PolicyModel::fresh(SEED).expect("probe");
     install_policy(&model, DiagnosticPolicy::Constant(ActionKind::AttackUnit));
     assert!(ppo.decide(&model, true).1.is_some());

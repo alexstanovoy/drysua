@@ -15,9 +15,25 @@ use crate::{
 
 #[test]
 fn stage_ten_schema_is_stable_and_names_its_safety_contracts() {
-    assert_eq!(LEAGUE_SCHEMA_VERSION, 27);
-    assert_eq!(crate::LEAGUE_RULES_AUDIT_VERSION, 22);
-    assert_eq!(LEAGUE_SCHEMA_HASH, 1_535_704_220_656_499_164);
+    assert_eq!(LEAGUE_SCHEMA_VERSION, 30);
+    assert_eq!(crate::LEAGUE_RULES_AUDIT_VERSION, 25);
+    assert_eq!(
+        LEAGUE_SCHEMA_HASH,
+        super::map2_checkpoint::schema_hash(
+            LEAGUE_SCHEMA_DESCRIPTOR,
+            &[
+                (crate::ACTION_SCHEMA_VERSION, crate::ACTION_SCHEMA_HASH),
+                (crate::FEATURE_SCHEMA_VERSION, crate::FEATURE_SCHEMA_HASH),
+                (crate::MODEL_SCHEMA_VERSION, crate::MODEL_SCHEMA_HASH),
+                (crate::PPO_SCHEMA_VERSION, crate::PPO_SCHEMA_HASH),
+                (
+                    crate::MAP2_REWARD_SCHEMA_VERSION,
+                    crate::MAP2_REWARD_SCHEMA_HASH
+                ),
+            ],
+        )
+    );
+    assert_ne!(LEAGUE_SCHEMA_HASH, 1_535_704_220_656_499_164);
     assert!(LEAGUE_SCHEMA_DESCRIPTOR.contains("held_out_seed_disjoint"));
     assert!(LEAGUE_SCHEMA_DESCRIPTOR.contains("training_reward_excluded"));
     assert!(LEAGUE_SCHEMA_DESCRIPTOR.contains("timeout_rejected"));
@@ -320,7 +336,7 @@ fn self_play_smoke_trains_against_scheduled_frozen_opponents_and_pairs_sides() {
         evaluation_pairs: 1,
         evaluation_decisions: 2,
         seed: 8_811,
-        map: bota_proto::MapId(1),
+        map: bota_proto::MapId(2),
     })
     .expect("league smoke");
 
@@ -346,7 +362,7 @@ fn persistent_league_actor_double_buffers_three_policy_generations() {
         evaluation_pairs: 1,
         evaluation_decisions: 2,
         seed: 8_811,
-        map: bota_proto::MapId(1),
+        map: bota_proto::MapId(2),
     })
     .expect("three-update league pipeline");
 
@@ -372,14 +388,14 @@ fn runtime_checkpoint_evaluation_is_deterministic_and_covers_the_fixed_matrix() 
     let second = crate::evaluate_runtime_checkpoint(settings, &directory).expect("second report");
 
     assert_eq!(first, second);
-    assert_eq!(first.games.len(), 8);
+    assert_eq!(first.games.len(), 4);
     assert_eq!(
         first.fingerprint,
         PolicySnapshot::capture(&model, 0)
             .expect("snapshot")
             .fingerprint()
     );
-    for map in [bota_proto::MapId(0), bota_proto::MapId(1)] {
+    for map in [bota_proto::MapId(2)] {
         for baseline in [
             CheckpointEvaluationBaseline::Teacher,
             CheckpointEvaluationBaseline::Weak,
@@ -481,6 +497,35 @@ fn checkpoint_quality_requires_an_authoritative_win() {
 }
 
 #[cfg(feature = "builtin")]
+#[test]
+fn checkpoint_quality_counts_a_weak_map2_cap_draw_as_stalled_but_not_a_technical_timeout() {
+    for tick in [crate::MAP2_TICK_CAP - 1, crate::MAP2_TICK_CAP] {
+        let mut drawn = quality_game(
+            CheckpointEvaluationBaseline::Weak,
+            crate::CheckpointEvaluationOutcome::Draw,
+            0,
+        );
+        drawn.map = bota_proto::MapId(2);
+        drawn.final_summary.tick = tick;
+        let report = quality_report([
+            drawn,
+            quality_game(
+                CheckpointEvaluationBaseline::Teacher,
+                crate::CheckpointEvaluationOutcome::Win,
+                0,
+            ),
+        ]);
+        let quality = report.quality();
+        assert_eq!(
+            quality.weak_stalled_games,
+            usize::from(tick == crate::MAP2_TICK_CAP)
+        );
+        assert_eq!(quality.timeout_games, 0);
+        assert_eq!(quality.passed, tick < crate::MAP2_TICK_CAP);
+    }
+}
+
+#[cfg(feature = "builtin")]
 fn quality_report(
     games: [crate::CheckpointEvaluationGame; 2],
 ) -> crate::CheckpointEvaluationReport {
@@ -504,7 +549,7 @@ fn quality_game(
         ..crate::GlobalSummary::default()
     };
     crate::CheckpointEvaluationGame {
-        map: bota_proto::MapId(1),
+        map: bota_proto::MapId(2),
         baseline,
         seed: 1,
         candidate_team: bota_proto::Team::Radiant,
@@ -532,7 +577,7 @@ fn promotion_gate_rejects_nonterminal_evaluation_horizons_as_timeouts() {
         evaluation_pairs: 20,
         evaluation_decisions: 25,
         seed: 8_812,
-        map: bota_proto::MapId(1),
+        map: bota_proto::MapId(2),
     })
     .expect("promotion-gate smoke");
 

@@ -9,7 +9,9 @@ use bota_proto::{
     ShopEntry, SlotId, Team, TickMode, UnitKind, UnitView, Vec2, WorldView,
 };
 
-use crate::SHADOW_FIEND;
+use crate::{
+    Map2Reward, Map2RewardBreakdown, Map2RewardEnd, Map2RewardError, Map2RewardState, SHADOW_FIEND,
+};
 
 pub(crate) const COURIER_ITEM_SLOTS: usize = 6;
 pub(crate) const HERO_ITEM_SLOTS: usize = 9;
@@ -55,6 +57,20 @@ pub const MAX_STATIC_TREES: usize = 4_096;
 pub const MAX_PLANTED_TREES: usize = 4_096;
 /// Maximum number of effects accepted on one unit.
 pub const MAX_EFFECTS_PER_UNIT: usize = 32;
+/// Visible anonymous Shadowraze damage-amplification effect.
+pub const SHADOWRAZE_EFFECT_ID: bota_proto::EffectId = bota_proto::EffectId(15);
+/// Visible tower protection aura on a recipient.
+pub const GUARDED_EFFECT_ID: bota_proto::EffectId = bota_proto::EffectId(13);
+/// Visible flagbearer regeneration aura on a recipient.
+pub const INSPIRED_EFFECT_ID: bota_proto::EffectId = bota_proto::EffectId(14);
+/// Maximum remaining time reported for a refreshed tower or flagbearer aura.
+pub const AURA_EFFECT_TICKS: u32 = 15;
+/// Largest accepted manual health or mana restoration report, in whole pool units.
+pub const MAX_RESTORATION_REPORT: i32 = 1_000_000;
+/// Maximum duration of one visible Shadowraze source record.
+pub const SHADOWRAZE_EFFECT_TICKS: u32 = 240;
+/// Maximum count of one visible Shadowraze source record.
+pub const SHADOWRAZE_EFFECT_STACKS: u32 = 255;
 /// Maximum terrain axis accepted from match metadata.
 pub const MAX_TERRAIN_AXIS: u32 = 512;
 /// Maximum number of terrain runs accepted from match metadata.
@@ -97,7 +113,7 @@ pub(crate) struct StaticTrackerProvenance {
 }
 
 /// Exact bounded provenance used to pair action masks and observations.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct TrackerProvenance {
     lineage: NonZeroU64,
     revision: u64,
@@ -112,6 +128,7 @@ pub(crate) struct TrackerProvenance {
     peak_allied_structures: Option<u32>,
     peak_enemy_structures: Option<u32>,
     structure_baseline_complete: bool,
+    map2_reward_state: Option<Map2RewardState>,
 }
 
 /// Exact displacement observed between two visible snapshots.
@@ -138,14 +155,25 @@ pub struct DamageObservation {
     pub counterpart: Option<EntityId>,
 }
 
-/// One observed healing relation.
+/// One manual health-restoration report; an over-time promise may be interrupted.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HealObservation {
     /// Tick that produced the event.
     pub tick: u32,
-    /// Health actually restored.
+    /// Positive reported health amount, not confirmed tick healing; at most 1,000,000.
     pub amount: i32,
     /// Other entity in the healing relation, when one was reported.
+    pub counterpart: Option<EntityId>,
+}
+
+/// One manual mana-restoration report; an over-time promise may be interrupted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ManaRestorationObservation {
+    /// Tick reporting the manual restoration, not its completion time.
+    pub tick: u32,
+    /// Positive reported mana amount, not confirmed tick regeneration; at most 1,000,000.
+    pub amount: i32,
+    /// Other entity in the report, when supplied; an opaque bookkeeping key.
     pub counterpart: Option<EntityId>,
 }
 
@@ -209,10 +237,14 @@ pub struct EntityTrack {
     pub last_damage_dealt: Option<DamageObservation>,
     /// Latest damage taken by this entity.
     pub last_damage_taken: Option<DamageObservation>,
-    /// Latest healing done by this entity.
+    /// Latest positive manual health-restoration report from this entity.
     pub last_heal_dealt: Option<HealObservation>,
-    /// Latest healing received by this entity.
+    /// Latest positive manual health-restoration report targeting this entity.
     pub last_heal_received: Option<HealObservation>,
+    /// Latest positive manual mana-restoration report from this entity.
+    pub last_mana_restoration_dealt: Option<ManaRestorationObservation>,
+    /// Latest positive manual mana-restoration report targeting this entity.
+    pub last_mana_restoration_received: Option<ManaRestorationObservation>,
     /// Latest death reported for this entity.
     pub last_death: Option<DeathObservation>,
     /// Latest completed ability cast reported for this entity.
@@ -295,6 +327,12 @@ pub struct GlobalSummary {
 /// A rejected tracker input.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TrackerError {
+    /// A manual restoration report was negative or outside the accepted pool bound.
+    RestorationReport { channel: &'static str, amount: i32 },
+    /// Map2 seat reward rejected an observation or lifecycle operation.
+    Map2Reward(Map2RewardError),
+    /// Reward interval/finalization APIs are exclusive to Map2 trackers.
+    Map2RewardUnavailable,
     /// A bounded vector exceeded its contract.
     LimitExceeded {
         /// Input field name.
@@ -406,6 +444,14 @@ pub enum TrackerError {
 impl fmt::Display for TrackerError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::RestorationReport { channel, amount } => write!(
+                formatter,
+                "Healed {channel} report {amount} is outside 0..={MAX_RESTORATION_REPORT}"
+            ),
+            Self::Map2Reward(error) => error.fmt(formatter),
+            Self::Map2RewardUnavailable => {
+                formatter.write_str("Map2 reward is unavailable outside MapId(2)")
+            }
             Self::LimitExceeded { .. }
             | Self::LineageExhausted
             | Self::UnsupportedMap(_)
@@ -462,7 +508,7 @@ fn fmt_match_error(error: &TrackerError, formatter: &mut fmt::Formatter<'_>) -> 
         }
         TrackerError::UnsupportedMap(map) => write!(
             formatter,
-            "unsupported map MapId({map}); expected MapId(0) or MapId(1)"
+            "unsupported map MapId({map}); expected MapId(0), MapId(1), or MapId(2)"
         ),
         TrackerError::ZeroTickRate => formatter.write_str("MatchInfo.tick_rate must be positive"),
         TrackerError::SeatCount(actual) => write!(
@@ -648,10 +694,24 @@ fn fmt_stream_error(error: &TrackerError, formatter: &mut fmt::Formatter<'_>) ->
     }
 }
 
-impl Error for TrackerError {}
+impl Error for TrackerError {
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        match self {
+            Self::Map2Reward(error) => Some(error),
+            _ => None,
+        }
+    }
+}
+
+impl From<Map2RewardError> for TrackerError {
+    fn from(error: Map2RewardError) -> Self {
+        Self::Map2Reward(error)
+    }
+}
 
 /// Bounded state memory built only from one seat's public match stream.
 pub struct StateTracker {
+    map2_reward: Option<Map2Reward>,
     lineage: NonZeroU64,
     revision: u64,
     slot: SlotId,
@@ -685,6 +745,7 @@ impl Clone for StateTracker {
         );
         Self {
             lineage: lineage.expect("lineage availability was asserted"),
+            map2_reward: self.map2_reward.clone(),
             revision: self.revision,
             slot: self.slot,
             team: self.team,
@@ -728,6 +789,9 @@ impl StateTracker {
         let (terrain, opaque) = decode_terrain(info);
         Ok(Self {
             lineage,
+            map2_reward: (info.map == MapId(2))
+                .then(|| Map2Reward::new(slot, info))
+                .transpose()?,
             revision: 0,
             slot,
             team,
@@ -836,6 +900,37 @@ impl StateTracker {
         self.current.as_ref()
     }
 
+    /// ID-free lifetime reward state, present only for Map2.
+    /// `completed_tick` trails the snapshot while its matching Events are pending.
+    pub fn map2_reward_state(&self) -> Option<Map2RewardState> {
+        self.map2_reward.as_ref().map(Map2Reward::state)
+    }
+
+    /// Drains a completed Map2 interval, preserving lifetime accounting and feature provenance.
+    /// Drain/discard the initial baseline before assigning the first actor action.
+    pub fn take_map2_reward_interval(&mut self) -> Result<Map2RewardBreakdown, TrackerError> {
+        self.map2_reward
+            .as_mut()
+            .ok_or(TrackerError::Map2RewardUnavailable)?
+            .take_interval()
+            .map_err(TrackerError::from)
+    }
+
+    /// Finalizes once with the authoritative seat outcome or explicit learner time cap.
+    /// Technical failures must never be passed here as fabricated game results.
+    pub fn finish_map2_reward(
+        &mut self,
+        end: Map2RewardEnd,
+    ) -> Result<Map2RewardBreakdown, TrackerError> {
+        let result = self
+            .map2_reward
+            .as_mut()
+            .ok_or(TrackerError::Map2RewardUnavailable)?
+            .finish(end)?;
+        self.advance_revision();
+        Ok(result)
+    }
+
     /// One remembered entity by its full opaque handle.
     pub fn entity(&self, id: EntityId) -> Option<&EntityTrack> {
         self.entities
@@ -912,6 +1007,7 @@ impl StateTracker {
 
     pub(crate) fn provenance(&self) -> TrackerProvenance {
         TrackerProvenance {
+            map2_reward_state: self.map2_reward_state(),
             lineage: self.lineage,
             revision: self.revision,
             static_data: self.static_provenance(),
@@ -935,6 +1031,9 @@ impl StateTracker {
     pub fn observe_snapshot(&mut self, view: &WorldView) -> Result<(), TrackerError> {
         validate_snapshot(self, view)?;
         validate_position_deltas(&self.entities, view)?;
+        if let Some(reward) = &mut self.map2_reward {
+            reward.observe_snapshot(view)?;
+        }
         if self.peak_allied_structures.is_none() {
             self.structure_baseline_complete = view.tick <= self.metadata.pregame_ticks;
         }
@@ -964,9 +1063,11 @@ impl StateTracker {
         Ok(())
     }
 
-    /// Records one batch from the independent strictly increasing event stream.
+    /// Records a complete matching Map2 Events batch before bounded journal retention.
+    /// Legacy Map0/1 diagnostic event streams remain independent and strictly increasing.
     pub fn observe_events(&mut self, tick: u32, events: &[EventKind]) -> Result<(), TrackerError> {
         validate_event_batch_limit(events.len())?;
+        validate_restoration_reports(events)?;
         if let Some(previous) = self.last_event_tick
             && tick <= previous
         {
@@ -974,6 +1075,9 @@ impl StateTracker {
                 incoming: tick,
                 previous,
             });
+        }
+        if let Some(reward) = &mut self.map2_reward {
+            reward.observe_events(tick, events)?;
         }
         self.update_casts(tick, events);
         for event in events {
@@ -996,7 +1100,7 @@ impl StateTracker {
         self.revision = self
             .revision
             .checked_add(1)
-            .expect("strict u32 snapshot and event ticks bound tracker revisions below u64");
+            .expect("strict u32 stream ticks and one reward finish bound revisions below u64");
     }
 
     fn record_snapshot_event(&mut self, tick: u32, event: &EventKind) {
@@ -1128,8 +1232,9 @@ impl StateTracker {
                 source,
                 target,
                 amount,
+                mana,
             } => {
-                self.update_heal(tick, source, target, amount);
+                self.update_restoration(tick, source, target, amount, mana);
             }
             EventKind::Died {
                 unit,
@@ -1194,22 +1299,49 @@ impl StateTracker {
         }
     }
 
-    fn update_heal(&mut self, tick: u32, source: Option<EntityId>, target: EntityId, amount: i32) {
+    fn update_restoration(
+        &mut self,
+        tick: u32,
+        source: Option<EntityId>,
+        target: EntityId,
+        amount: i32,
+        mana: i32,
+    ) {
+        assert!((0..=MAX_RESTORATION_REPORT).contains(&amount));
+        assert!((0..=MAX_RESTORATION_REPORT).contains(&mana));
         if let Some(source) = source
             && let Some(entity) = self.entity_mut(source)
         {
-            entity.last_heal_dealt = Some(HealObservation {
-                tick,
-                amount,
-                counterpart: Some(target),
-            });
+            if amount > 0 {
+                entity.last_heal_dealt = Some(HealObservation {
+                    tick,
+                    amount,
+                    counterpart: Some(target),
+                });
+            }
+            if mana > 0 {
+                entity.last_mana_restoration_dealt = Some(ManaRestorationObservation {
+                    tick,
+                    amount: mana,
+                    counterpart: Some(target),
+                });
+            }
         }
         if let Some(entity) = self.entity_mut(target) {
-            entity.last_heal_received = Some(HealObservation {
-                tick,
-                amount,
-                counterpart: source,
-            });
+            if amount > 0 {
+                entity.last_heal_received = Some(HealObservation {
+                    tick,
+                    amount,
+                    counterpart: source,
+                });
+            }
+            if mana > 0 {
+                entity.last_mana_restoration_received = Some(ManaRestorationObservation {
+                    tick,
+                    amount: mana,
+                    counterpart: source,
+                });
+            }
         }
     }
 
@@ -1249,7 +1381,7 @@ fn validate_match_info(slot: SlotId, info: &MatchInfo) -> Result<Team, TrackerEr
     if slot.0 >= MAX_SEATS as u8 {
         return Err(TrackerError::OwnSlotOutOfRange(slot.0));
     }
-    if !matches!(info.map, MapId(0) | MapId(1)) {
+    if !matches!(info.map, MapId(0) | MapId(1) | MapId(2)) {
         return Err(TrackerError::UnsupportedMap(info.map.0));
     }
     if info.tick_rate == 0 {
@@ -1636,6 +1768,8 @@ fn new_entity(tick: u32, unit: &UnitView) -> EntityTrack {
         last_damage_taken: None,
         last_heal_dealt: None,
         last_heal_received: None,
+        last_mana_restoration_dealt: None,
+        last_mana_restoration_received: None,
         last_death: None,
         last_ability_cast: None,
         last_possible_attack_landed: None,
@@ -2094,6 +2228,7 @@ impl TrackerProvenance {
             && self.peak_allied_structures == tracker.peak_allied_structures
             && self.peak_enemy_structures == tracker.peak_enemy_structures
             && self.structure_baseline_complete == tracker.structure_baseline_complete
+            && self.map2_reward_state == tracker.map2_reward_state()
     }
 
     pub(crate) fn snapshot_precedes(&self, tracker: &StateTracker) -> bool {
@@ -2101,4 +2236,104 @@ impl TrackerProvenance {
             && self.static_data.matches(tracker)
             && tracker.previous_snapshot.as_ref() == Some(&self.snapshot)
     }
+}
+
+/// Strongest anonymous active row, never a caster identity or a sum across casters.
+/// Memory timers decay from the last observation; fog cannot refresh a row.
+pub(crate) fn shadowraze_effect(unit: &UnitView, age: u32) -> Option<(u32, u32)> {
+    assert!(unit.effects.len() <= MAX_EFFECTS_PER_UNIT);
+    let result = unit
+        .effects
+        .iter()
+        .filter_map(|effect| {
+            if effect.id != SHADOWRAZE_EFFECT_ID {
+                return None;
+            }
+            let stacks = effect.stacks?;
+            let ticks = effect.ticks_left?;
+            if !(1..=SHADOWRAZE_EFFECT_STACKS).contains(&stacks)
+                || !(1..=SHADOWRAZE_EFFECT_TICKS).contains(&ticks)
+                || ticks <= age
+            {
+                return None;
+            }
+            Some((stacks, ticks - age))
+        })
+        .max();
+    if let Some((_, ticks)) = result {
+        assert!(ticks > 0);
+        assert!(ticks <= SHADOWRAZE_EFFECT_TICKS);
+    }
+    result
+}
+
+/// Remaining Guarded/Inspired times from valid anonymous wire rows, zero if absent.
+pub(crate) fn aura_effects(unit: &UnitView, age: u32) -> [u32; 2] {
+    assert!(unit.effects.len() <= MAX_EFFECTS_PER_UNIT);
+    let mut remaining = [0; 2];
+    for effect in &unit.effects {
+        let index = match effect.id {
+            GUARDED_EFFECT_ID => 0,
+            INSPIRED_EFFECT_ID => 1,
+            _ => continue,
+        };
+        if let Some(ticks) = effect.ticks_left
+            && (1..=AURA_EFFECT_TICKS).contains(&ticks)
+            && effect.stacks.is_none()
+        {
+            remaining[index] = remaining[index].max(ticks.saturating_sub(age));
+        }
+    }
+    assert!(remaining.iter().all(|ticks| *ticks <= AURA_EFFECT_TICKS));
+    remaining
+}
+
+fn validate_restoration_reports(events: &[EventKind]) -> Result<(), TrackerError> {
+    assert!(events.len() <= MAX_EVENTS_PER_BATCH);
+    for event in events {
+        if let EventKind::Healed { amount, mana, .. } = *event {
+            for (channel, amount) in [("health", amount), ("mana", mana)] {
+                if !(0..=MAX_RESTORATION_REPORT).contains(&amount) {
+                    return Err(TrackerError::RestorationReport { channel, amount });
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Latest positive received health/mana reports in the bounded strictly-prior journal.
+pub(crate) fn recent_restoration_reports(
+    tracker: &StateTracker,
+    target: EntityId,
+) -> [Option<(u32, i32)>; 2] {
+    let Some(tick) = tracker.current().map(|view| view.tick) else {
+        return [None; 2];
+    };
+    assert!(tracker.snapshot_events.len() <= MAX_RECENT_EVENTS);
+    let mut reports = [None; 2];
+    for event in tracker.snapshot_events.iter().rev() {
+        if event.tick >= tick || tick - event.tick > HISTORY_TICKS {
+            continue;
+        }
+        if let EventKind::Healed {
+            target: recipient,
+            amount,
+            mana,
+            ..
+        } = event.kind
+            && recipient == target
+        {
+            for (index, value) in [amount, mana].into_iter().enumerate() {
+                if value > 0 && reports[index].is_none() {
+                    assert!(value <= MAX_RESTORATION_REPORT);
+                    reports[index] = Some((event.tick, value));
+                }
+            }
+        }
+        if reports.iter().all(Option::is_some) {
+            break;
+        }
+    }
+    reports
 }

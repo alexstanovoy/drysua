@@ -13,13 +13,115 @@ import time
 
 from release_build import (digest, prepare, read_registry,
                            snapshot_weights, weights_name)
-from release_wire import Relay
+from release_wire import CURRENT_SIMULATOR, HISTORICAL_SIMULATOR, Relay
 
 SIDES = ("Radiant", "Dire")
 OUTCOMES = ("win", "loss", "draw", "timeout", "error")
 SUMMARY = re.compile(r"played (\d+) ticks as Some\((Radiant|Dire)\); winner "
                      r"(None|Some\((Radiant|Dire|Neutral)\)); "
                      r"\d+ decisions, \d+ orders, (\d+) rejected orders\n?")
+CLIENT_OUTPUT_LIMIT = 1024 * 1024
+TELEMETRY_LINE_LIMIT = 4096
+MAP2_TICK_LIMIT = 27000 + 900
+POLICY_FIELD = r"policy=(?:teacher|hybrid|neural|tactical)"
+RECEIVE_FIELD = r"receive_wait_scope=(?:socket_read|wire_hear_including_decode|mixed_socket_read_and_wire_hear|unavailable)"
+SEAT_FIELDS = rf"slot=(?P<slot>[01]) {POLICY_FIELD} mode=(?:lockstep|realtime)"
+HISTOGRAM_FIELDS = "".join(
+    rf" {name}_count=\d+ {name}_total_ns=\d+ {name}_p50_upper_ns=(?:\d+|unknown)"
+    rf" {name}_p95_upper_ns=(?:\d+|unknown) {name}_max_ns=\d+"
+    for name in ("compute", "receive_wait", "decision", "order_send", "ack_send"))
+ASYNC_LOG_FIELDS = r"(?: dropped_logs=(?P<dropped_logs>0|[1-9][0-9]{0,19}))?"
+TELEMETRY = tuple(re.compile(pattern + ASYNC_LOG_FIELDS) for pattern in (
+    rf"level=INFO event=live_performance_start {SEAT_FIELDS} tick_rate=30 "
+    rf"report_every=\d+ debug_every=\d+ debug_limit=\d+ {RECEIVE_FIELD} "
+    r"compute_scope=internal_elapsed_excluding_receive_and_send",
+    r"level=(?:INFO|WARN) event=live_performance scope=(?:window|total) "
+    r"reason=(?:periodic|match_over|limit) updates=\d+ progress_ticks=\d+ elapsed_ns=\d+ "
+    r"updates_per_second=(?:\d+\.\d{3}|unknown) realtime_factor=(?:\d+\.\d{3}|unknown) "
+    r"tick_rate=30 budget_ns=\d+ compute_overruns=\d+ service_overruns=\d+ percentiles=log2_upper_bounds"
+    rf"{HISTOGRAM_FIELDS} pending_update=(?:true|false) saturated=false {SEAT_FIELDS} "
+    rf"{RECEIVE_FIELD} timing_valid=true",
+    rf"level=DEBUG event=live_decision slot=(?P<slot>[01]) {POLICY_FIELD} tick=\d+ "
+    r"decision_ns=(?:\d+|unknown) order_sent=(?:true|false) order_send_ns=(?:\d+|unknown) "
+    r"ack_send_ns=(?:\d+|unknown)",
+    r'level=INFO event=live_performance_config_defaulted reason="DRYSUA_PERF_DEBUG_EVERY must be '
+    r'(?:Unicode digits|an integer in 0\.\.=4294967295)"',
+))
+assert TELEMETRY_LINE_LIMIT < CLIENT_OUTPUT_LIMIT
+assert MAP2_TICK_LIMIT == 27900
+
+
+def outcome_summary(text, slot):
+    """Find exactly one summary amid known, bounded telemetry; retain the original log."""
+    assert slot in (0, 1)
+    if len(text) > CLIENT_OUTPUT_LIMIT or len(text.encode("utf-8")) > CLIENT_OUTPUT_LIMIT:
+        raise ValueError("client output limit exceeded")
+    summary = None
+    for line in text.splitlines():
+        if len(line) > TELEMETRY_LINE_LIMIT:
+            raise ValueError("client output line limit exceeded")
+        match = SUMMARY.fullmatch(line)
+        if match:
+            if summary is not None:
+                raise ValueError("duplicate client outcome")
+            summary = match
+            continue
+        records = [pattern.fullmatch(line) for pattern in TELEMETRY]
+        record = next((record for record in records if record is not None), None)
+        if record is None:
+            raise ValueError("invalid client telemetry or unexpected output")
+        if record.groupdict().get("slot") is not None and int(record["slot"]) != slot:
+            raise ValueError("invalid client telemetry or unexpected output")
+        if record["dropped_logs"] is not None and int(record["dropped_logs"]) > 2**64 - 1:
+            raise ValueError("invalid client dropped_logs counter")
+    return summary
+
+
+def current_map2_registry(server_sha256, process_timeout_seconds=180):
+    """Live Map2 settings for execute_game; not a historical release/challenge gate.
+
+    Bots must carry simulator_commit and sha256 attestations bound to their binaries.
+    The caller is responsible for trusted build provenance; bota has no wire fingerprint.
+    """
+    if not isinstance(server_sha256, str) or not re.fullmatch(r"[0-9a-f]{64}", server_sha256):
+        raise ValueError("current Map2 requires server SHA256")
+    if type(process_timeout_seconds) is not int or not 1 <= process_timeout_seconds <= 600:
+        raise ValueError("process timeout must be 1..600 seconds")
+    return dict(map=2, tick_limit=MAP2_TICK_LIMIT, simulator_commit=CURRENT_SIMULATOR,
+                server_sha256=server_sha256, process_timeout_seconds=process_timeout_seconds,
+                wire_byte_limit=2 * 1024**3, record_replay=False)
+
+
+def validate_runtime_contract(server, bots, registry):
+    """Select a pinned decoder and reject verifiable cross-protocol binary mismatches."""
+    map_id = registry["map"]
+    if map_id not in (0, 1, 2):
+        raise ValueError("unsupported evaluator map")
+    expected = CURRENT_SIMULATOR if map_id == 2 else HISTORICAL_SIMULATOR
+    simulator = registry.get("simulator_commit", HISTORICAL_SIMULATOR)
+    if simulator != expected:
+        raise ValueError("simulator/map contract mismatch")
+    if map_id == 2:
+        if type(registry["tick_limit"]) is not int or not 1 <= registry["tick_limit"] <= MAP2_TICK_LIMIT:
+            raise ValueError("Map2 tick limit must be 1..27900 including pregame")
+        if len(bots) != 2:
+            raise ValueError("current Map2 requires two runtime attestations")
+        expected_hash = registry.get("server_sha256")
+        if not isinstance(expected_hash, str) or not re.fullmatch(r"[0-9a-f]{64}", expected_hash):
+            raise ValueError("current Map2 requires server SHA256")
+        if digest(server) != expected_hash:
+            raise ValueError("server runtime SHA256 mismatch")
+    for bot in bots:
+        if bot.get("simulator_commit", expected) != expected:
+            raise ValueError("bot simulator contract mismatch")
+        if map_id == 2:
+            identity = bot.get("sha256")
+            if (bot.get("simulator_commit") != expected or not isinstance(identity, str)
+                    or not re.fullmatch(r"[0-9a-f]{64}", identity)):
+                raise ValueError("current Map2 requires digest-bound runtime attestation")
+            if digest(bot["binary"]) != identity:
+                raise ValueError("bot runtime SHA256 mismatch")
+    return simulator
 
 
 def evaluate_gate(records, opponents, seeds):
@@ -50,18 +152,25 @@ def evaluate_gate(records, opponents, seeds):
 
 
 def validate_game(clients, server_exit, timed_out, tick_limit):
+    if len(clients) != 2:
+        return ("timeout" if timed_out else "error"), ["missing client"]
     errors = []
     winners = []
     for index, client in enumerate(clients):
         wire = client["wire"]
         errors.extend(wire["errors"])
+        errors.extend(client.get("output_errors", []))
         if wire["slot"] != index:
             errors.append("identity mismatch")
         if wire["rejected"]:
             errors.append("order rejection")
         if client["exit"] not in (0, None) and not client.get("killed", False):
             errors.append("client process failure")
-        match = SUMMARY.fullmatch(client["stdout"])
+        try:
+            match = outcome_summary(client["stdout"], index)
+        except ValueError as error:
+            errors.append(str(error))
+            match = None
         if not match:
             if not timed_out or client["exit"] == 0:
                 errors.append("missing or invalid outcome")
@@ -81,8 +190,6 @@ def validate_game(clients, server_exit, timed_out, tick_limit):
         if winner is not None and not (int(ticks) == wire.get("duration") == wire.get("last_snapshot")):
             errors.append("terminal tick mismatch")
         winners.append(winner)
-    if len(clients) != 2:
-        errors.append("missing client")
     if server_exit not in (0, None):
         errors.append("server process failure")
     if timed_out:
@@ -124,6 +231,18 @@ def bot_command(bot, address, index, tick_limit):
     return command
 
 
+def bot_tick_limit(registry):
+    """CLI safety bound for a validated registry; native Map2 waits for terminal frames."""
+    tick_limit = registry["tick_limit"]
+    assert type(tick_limit) is int
+    assert 1 <= tick_limit <= 108900
+    if (registry["map"], registry.get("simulator_commit"), tick_limit) == (
+            2, CURRENT_SIMULATOR, MAP2_TICK_LIMIT):
+        # The CLI exits on the limit Snapshot, before reading its Events/MatchOver.
+        return tick_limit + 1
+    return tick_limit
+
+
 def launch(command, path, processes, handles, environment=None):
     handle = path.open("wb")
     handles.append(handle)
@@ -150,17 +269,34 @@ def server_port(path, process, deadline):
     raise TimeoutError("server startup polling limit exceeded")
 
 
+def read_client_output(path):
+    """Read at most one MiB of UTF-8 client output, detecting growth with a sentinel byte."""
+    with path.open("rb") as stream:
+        data = stream.read(CLIENT_OUTPUT_LIMIT + 1)
+    if len(data) > CLIENT_OUTPUT_LIMIT:
+        raise ValueError("client output limit exceeded")
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError("client output is not UTF-8") from error
+
+
 def collect(processes, paths, relays, killed):
     clients = []
     for index, (process, path) in enumerate(zip(processes[1:], paths)):
-        text = path.read_text() if path.stat().st_size <= 65536 else "output limit exceeded"
+        text, errors = "", []
+        try:
+            text = read_client_output(path)
+        except (OSError, ValueError) as error:
+            errors.append(str(error))
         clients.append(dict(exit=process.returncode, stdout=text,
-                            killed=process.pid in killed, wire=relays[index].observed))
+                            killed=process.pid in killed, wire=relays[index].observed,
+                            output_errors=errors))
     return clients
 
 
 def check_resources(directory, paths):
-    if any(path.stat().st_size > 65536 for path in paths):
+    if any(path.stat().st_size > CLIENT_OUTPUT_LIMIT for path in paths):
         raise ValueError("client output limit exceeded")
     replay = directory / "match.brp"
     if replay.exists() and replay.stat().st_size > 512 * 1024 * 1024:
@@ -168,6 +304,7 @@ def check_resources(directory, paths):
 
 
 def execute_game(directory, server, bots, seed, registry):
+    simulator_commit = validate_runtime_contract(server, bots, registry)
     processes, handles, relays, commands, paths = [], [], [], [], []
     killed, errors = set(), []
     timed_out = False
@@ -188,9 +325,10 @@ def execute_game(directory, server, bots, seed, registry):
         for index, bot in enumerate(bots):
             relay = Relay(port, 10, registry["tick_limit"], expected_map=registry["map"],
                           expected_seed=seed,
-                          byte_limit=registry.get("wire_byte_limit", 512 * 1024 * 1024))
+                          byte_limit=registry.get("wire_byte_limit", 512 * 1024 * 1024),
+                          simulator_commit=simulator_commit)
             relays.append(relay)
-            command = bot_command(bot, relay.address, index, registry["tick_limit"])
+            command = bot_command(bot, relay.address, index, bot_tick_limit(registry))
             commands.append(command)
             paths.append(directory / f"client-{index}.log")
             launch(command, paths[-1], processes, handles, environment)
@@ -239,7 +377,10 @@ def stop_game(processes, relays, handles, killed, timed_out):
             except ProcessLookupError:
                 pass
         process.wait(timeout=5)
+    drain_deadline = time.monotonic() + 2
     for relay in relays:
+        if not timed_out:
+            relay.finish(timeout=max(0, min(2, drain_deadline - time.monotonic())))
         relay.close()
     for handle in handles:
         handle.close()

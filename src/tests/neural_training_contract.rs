@@ -1,8 +1,46 @@
 use super::*;
 use crate::ppo_arena::training_order_contract::{
-    attack_action, cast_action, constant_model, packet, snapshot, transcript,
+    attack_action, cast_action, constant_model, packet, snapshot,
 };
 use crate::{ActivePolicyTarget, global_feature};
+
+fn transcript(side: usize) -> Vec<ServerMsg> {
+    assert!(side < 2);
+    let (mut arena, start) = Arena::new(ArenaConfig {
+        seats: 2,
+        map: MapId(2),
+        seed: 10_093_000,
+    })
+    .expect("Map2 transcript fixture");
+    let projected = arena.configure_for_test(|world| {
+        let heroes = [
+            world.seats[0].unit.expect("Radiant"),
+            world.seats[1].unit.expect("Dire"),
+        ];
+        let removed: Vec<_> = world
+            .entities
+            .iter()
+            .filter(|entity| {
+                !heroes.contains(entity)
+                    && world.kind.get(*entity) != Some(&bota_proto::UnitKind::Ancient)
+            })
+            .collect();
+        assert!(removed.len() < 64);
+        for entity in removed {
+            assert!(world.despawn(entity));
+        }
+        for (index, hero) in heroes.into_iter().enumerate() {
+            world.transform.get_mut(hero).expect("position").pos =
+                bota_proto::Vec2::from_ints(8600 + index as i32 * 200, 8900);
+            world.statuses.remove(hero);
+            world.abilities.get_mut(hero).expect("kit").slots[0].level = 1;
+        }
+    });
+    let mut messages = vec![start.messages[side][0].clone()];
+    messages.extend(projected.messages[side].clone());
+    assert_eq!(messages.len(), 3);
+    messages
+}
 
 #[test]
 fn training_contract_prediction_does_not_change_teacher_repeat_delivery() {
@@ -92,6 +130,7 @@ fn training_contract_neuralseat_bc_frames_follow_actual_sends_fog_and_rejection(
         seat.observe(&messages).expect("observed tick");
         reference.observe(&messages).expect("legacy tick");
         let sample = retained_teacher_sample(seat);
+        assert_eq!(sample.identity().map(), MapId(2));
         assert_eq!(
             sample.frame().global()[global_feature::ACTIVE_ORDER_PRESENT],
             1.0
@@ -205,6 +244,7 @@ fn training_contract_dagger_roles_keep_candidate_and_labeler_ledgers_separate() 
             collection.reservoir.samples[0].source(),
             crate::ImitationSource::Dagger
         );
+        assert_eq!(collection.reservoir.samples[0].identity().map(), MapId(2));
         assert_eq!(
             collection.reservoir.samples[0].frame().global()[global_feature::ACTIVE_ORDER_PRESENT],
             1.0

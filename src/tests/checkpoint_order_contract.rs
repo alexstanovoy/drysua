@@ -16,6 +16,7 @@ const SOURCES: [(u32, u64, u32, &str); 2] = [
     ),
 ];
 const INITIALIZATION_SEED: u64 = 20_260_908;
+const M12_PARAMETERS: usize = 1_689_076;
 
 #[test]
 fn selected_m12_initializer_rejects_each_missing_wrong_or_extra_metadata_key() {
@@ -51,7 +52,7 @@ fn selected_m12_initializer_rejects_each_missing_wrong_or_extra_metadata_key() {
 #[test]
 fn selected_m12_initializer_rejects_names_dtype_shape_and_unapproved_sha() {
     let directory = test_directory("m12-initializer-tensor");
-    let count = crate::MODEL_PARAMETER_COUNT;
+    let count = M12_PARAMETERS;
     let data = vec![0; (count + 1) * 4];
     for (version, hash, rules, _) in SOURCES {
         for (name, dtype, shape, expected) in [
@@ -104,7 +105,7 @@ fn selected_m12_initializer_rejects_names_dtype_shape_and_unapproved_sha() {
 #[test]
 fn selected_m12_initializer_rejects_nonfinite_payload_at_both_boundaries() {
     let directory = test_directory("m12-initializer-nonfinite");
-    let count = crate::MODEL_PARAMETER_COUNT;
+    let count = M12_PARAMETERS;
     for (version, hash, rules, _) in SOURCES {
         for index in [0, count - 1] {
             for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
@@ -126,6 +127,28 @@ fn selected_m12_initializer_rejects_nonfinite_payload_at_both_boundaries() {
                 );
             }
         }
+    }
+    fs::remove_dir_all(directory).expect("cleanup");
+}
+
+#[test]
+fn selected_m12_initializer_rejects_m15_count_under_exact_historical_metadata() {
+    let directory = test_directory("m12-no-m15-count-relabel");
+    let count = crate::MODEL_PARAMETER_COUNT;
+    assert_ne!(count, M12_PARAMETERS);
+    let data = vec![0; count * 4];
+    for (version, hash, rules, _) in SOURCES {
+        let tensor = TensorView::new(Dtype::F32, vec![count], &data).expect("M15-sized tensor");
+        let bytes = serialize(
+            [("model.parameters", tensor)],
+            Some(m12_metadata(version, hash, rules)),
+        )
+        .expect("historical metadata with wrong current count");
+        assert_initializer_rejects(
+            &directory,
+            &bytes,
+            CheckpointError::TensorContract("dtype or shape"),
+        );
     }
     fs::remove_dir_all(directory).expect("cleanup");
 }
@@ -159,25 +182,12 @@ fn assert_initializer_rejects(
 }
 
 #[test]
-#[ignore = "requires DRYSUA_SELECTED_M12_SOURCE, new DRYSUA_M14_INITIALIZATION_OUTPUT, DRYSUA_INITIALIZATION_GIT_COMMIT and DRYSUA_INITIALIZATION_SIMULATOR_COMMIT; no gameplay or updates"]
-fn selected_m12_local_artifact_initializes_m14_with_bit_identical_parameters_and_fresh_state() {
+#[ignore = "read-only DRYSUA_SELECTED_M12_SOURCE audit; legacy initialization must reject, no outputs or training"]
+fn selected_m12_local_artifact_is_retired_without_writing_or_mutating_source() {
     let source =
         PathBuf::from(std::env::var_os("DRYSUA_SELECTED_M12_SOURCE").expect("explicit source"))
             .canonicalize()
             .expect("source directory");
-    let output = PathBuf::from(
-        std::env::var_os("DRYSUA_M14_INITIALIZATION_OUTPUT").expect("explicit new output"),
-    );
-    assert!(!output.exists(), "initializer never overwrites an output");
-    let parent = output
-        .parent()
-        .expect("output parent")
-        .canonicalize()
-        .expect("existing parent");
-    assert!(
-        !parent.starts_with(&source),
-        "output must be outside source"
-    );
     let path = source.join("drysua.weights.safetensors");
     let bytes = fs::read(&path).expect("audited source");
     let digest = hex_digest(&bytes);
@@ -192,29 +202,33 @@ fn selected_m12_local_artifact_initializes_m14_with_bit_identical_parameters_and
     );
     assert_old_runtime_rejected(&source);
 
-    let (model, returned_digest) = TrainingArtifact::initialize_selected_m12_for_training(
+    let error = TrainingArtifact::initialize_selected_m12_for_training(
         &source,
         INITIALIZATION_SEED,
         PolicyDevice::Cpu,
     )
-    .expect("explicit initialization, not resume");
+    .err()
+    .expect("historical authorization cannot initialize Map2");
 
-    assert_eq!(returned_digest, <[u8; 32]>::from(Sha256::digest(&bytes)));
+    assert_eq!(error, CheckpointError::SchemaMismatch);
+    assert_eq!(
+        error.to_string(),
+        "checkpoint schema does not match this build"
+    );
     let payload = parameter_payload(&bytes);
-    assert_parameter_bits(&model, &payload);
-    let schema = model.parameter_schema().expect("62 named tensors");
-    PolicyModel::validate_m12_parameter_schema(&schema).expect("audited M12 layout");
-    assert_eq!(schema.len(), 62);
-    fs::create_dir(&output).expect("new output only");
-    TrainingArtifact::save_runtime_weights(&model, &output).expect("M14 initialized runtime");
-    let reloaded = PolicyModel::fresh(2).expect("new runtime");
-    TrainingArtifact::load_runtime_weights(&reloaded, &output).expect("M14 strict reload");
-    assert_parameter_bits(&reloaded, &payload);
-    save_and_verify_fresh_checkpoint(&model, &output, &payload);
+    let (values, remainder) = payload.as_chunks::<4>();
+    assert!(remainder.is_empty());
+    assert!(
+        values
+            .iter()
+            .all(|bytes| f32::from_le_bytes(*bytes).is_finite())
+    );
     assert_eq!(fs::read(&path).expect("source unchanged"), bytes);
     assert_eq!(hex_digest(&fs::read(&path).expect("source rehash")), digest);
     verify_source_digest_and_tuple_are_paired(&bytes, version);
-    write_initialization_audit(&model, &source, &output, &digest);
+    eprintln!(
+        "retired_m12 source_sha256={digest} initialization=rejected runtime=rejected source_unchanged=true outputs=none"
+    );
 }
 
 fn assert_old_runtime_rejected(source: &std::path::Path) {
@@ -241,85 +255,8 @@ fn parameter_payload(bytes: &[u8]) -> Vec<u8> {
     let tensors = safetensors::SafeTensors::deserialize(bytes).expect("tensors");
     let tensor = tensors.tensor("model.parameters").expect("parameters");
     assert_eq!(tensor.dtype(), Dtype::F32);
-    assert_eq!(tensor.shape(), &[1_689_076]);
+    assert_eq!(tensor.shape(), &[M12_PARAMETERS]);
     tensor.data().to_vec()
-}
-
-fn assert_parameter_bits(model: &PolicyModel, expected: &[u8]) {
-    let values = model.export_parameters().expect("parameters");
-    assert_eq!(values.len(), 1_689_076);
-    assert!(values.iter().all(|value| value.is_finite()));
-    let bytes: Vec<_> = values
-        .iter()
-        .flat_map(|value| value.to_le_bytes())
-        .collect();
-    assert_eq!(
-        bytes, expected,
-        "all numeric F32 parameter bits, including signed zero"
-    );
-}
-
-fn fresh_progress() -> CheckpointProgress {
-    CheckpointProgress {
-        global_update: 0,
-        policy_version: 0,
-        scheduler_step: 0,
-        curriculum_stage: 0,
-        rollout_samples: 0,
-        best_evaluation: None,
-        rng_states: Vec::new(),
-        league_references: Vec::new(),
-    }
-}
-
-fn initialization_run() -> CheckpointRun {
-    CheckpointRun {
-        git_commit: std::env::var("DRYSUA_INITIALIZATION_GIT_COMMIT").expect("actual source revision"),
-        simulator_commit: std::env::var("DRYSUA_INITIALIZATION_SIMULATOR_COMMIT").expect("actual simulator revision"),
-        enabled_features: crate::compiled_features(),
-        command_line: "cargo test --release --features builtin --lib selected_m12_local_artifact_initializes_m14_with_bit_identical_parameters_and_fresh_state --quiet -- --ignored --nocapture".to_owned(),
-        run_seed: INITIALIZATION_SEED, map: MapId(0), hero: crate::SHADOW_FIEND,
-        device: CheckpointDevice::Cpu, batch_size: checkpoint_config().minibatch,
-        rules_audit_version: crate::PPO_RULES_AUDIT_VERSION,
-    }
-}
-
-fn save_and_verify_fresh_checkpoint(model: &PolicyModel, output: &std::path::Path, payload: &[u8]) {
-    let trainer =
-        PpoTrainer::new(model, checkpoint_config(), INITIALIZATION_SEED).expect("fresh trainer");
-    assert_fresh_trainer(model, &trainer);
-    let run = initialization_run();
-    let artifact = TrainingArtifact::capture(model, &trainer, run.clone(), fresh_progress())
-        .expect("fresh capture");
-    assert_eq!(
-        artifact.save(output).expect("fresh save"),
-        crate::CheckpointSaveOutcome::Committed
-    );
-    let loaded = TrainingArtifact::load_compatible(output, &run).expect("strict fresh checkpoint");
-    assert_eq!(loaded.progress(), &fresh_progress());
-    let restored = PolicyModel::fresh(3).expect("new owned restore target");
-    let state = loaded
-        .restore(&restored, &run)
-        .expect("restore only newly initialized state");
-    assert_fresh_trainer(&restored, state.trainer());
-    assert_parameter_bits(&restored, payload);
-    assert_eq!(state.trainer().rng_checkpoint(), trainer.rng_checkpoint());
-    assert_ne!(
-        restored.policy_identity().expect("restored identity"),
-        model.policy_identity().expect("initialized identity")
-    );
-}
-
-fn assert_fresh_trainer(model: &PolicyModel, trainer: &PpoTrainer) {
-    assert_eq!(trainer.updates(), 0);
-    assert_eq!(trainer.optimizer_step(), 0);
-    assert_eq!(trainer.rng_checkpoint().1, 0);
-    let snapshot = trainer.checkpoint_snapshot(model).expect("bound optimizer");
-    assert_eq!(snapshot.adam.step(), 0);
-    for moment in [snapshot.adam.moments().0, snapshot.adam.moments().1] {
-        assert_eq!(moment.len(), crate::MODEL_PARAMETER_COUNT);
-        assert!(moment.iter().all(|value| value.to_bits() == 0));
-    }
 }
 
 fn verify_source_digest_and_tuple_are_paired(bytes: &[u8], version: u32) {
@@ -329,8 +266,7 @@ fn verify_source_digest_and_tuple_are_paired(bytes: &[u8], version: u32) {
         .iter()
         .find(|source| source.0 != version)
         .expect("other source");
-    let tensor =
-        TensorView::new(Dtype::F32, vec![crate::MODEL_PARAMETER_COUNT], &payload).expect("tensor");
+    let tensor = TensorView::new(Dtype::F32, vec![M12_PARAMETERS], &payload).expect("tensor");
     let changed = serialize(
         [("model.parameters", tensor)],
         Some(m12_metadata(other_version, hash, rules)),
@@ -342,7 +278,8 @@ fn verify_source_digest_and_tuple_are_paired(bytes: &[u8], version: u32) {
         CheckpointError::TensorContract("selected M12 training source SHA-256"),
     );
     let mut corrupted = bytes.to_vec();
-    *corrupted.last_mut().expect("nonempty payload") ^= 1;
+    let last_value = corrupted.len() - 4;
+    corrupted[last_value] ^= 1;
     assert_initializer_rejects(
         &directory,
         &corrupted,
@@ -356,48 +293,4 @@ fn hex_digest(bytes: &[u8]) -> String {
         .iter()
         .map(|byte| format!("{byte:02x}"))
         .collect()
-}
-
-fn write_initialization_audit(
-    model: &PolicyModel,
-    source: &std::path::Path,
-    output: &std::path::Path,
-    source_hash: &str,
-) {
-    use std::fmt::Write as _;
-    let bytes = fs::read(output.join("drysua.weights.safetensors")).expect("output");
-    let (_, metadata) = safetensors::SafeTensors::read_metadata(&bytes).expect("output metadata");
-    assert_eq!(
-        metadata.metadata().as_ref(),
-        Some(&current_runtime_metadata())
-    );
-    let schema = model.parameter_schema().expect("schema");
-    let mut audit = format!(
-        "status=initialized_policy_not_qualified_release\ncontract=candidate_order_m14_not_old_gameplay_compatible\nsource={}\nsource_sha256={source_hash}\noutput={}\noutput_sha256={}\nparameter_payload_sha256={}\nseed={INITIALIZATION_SEED}\ndtype=F32\nparameters=1689076\nnamed_layout_count=62\nparameter_bits_identical_after_runtime_and_checkpoint_reload=true\nsource_unchanged=true\noptimizer_step=0\noptimizer_moments=all_positive_zero\nprogress=all_zero_no_evaluation_rng_history_or_league\ntraining_updates=0\ngameplay_runs=0\nfeature_version={}\nmodel_version={}\nleague_version={}\nleague_hash={}\n",
-        source.display(),
-        output.display(),
-        hex_digest(&bytes),
-        hex_digest(&parameter_payload(&bytes)),
-        crate::FEATURE_SCHEMA_VERSION,
-        crate::MODEL_SCHEMA_VERSION,
-        crate::LEAGUE_SCHEMA_VERSION,
-        crate::LEAGUE_SCHEMA_HASH
-    );
-    let sorted: std::collections::BTreeMap<_, _> = current_runtime_metadata().into_iter().collect();
-    for (name, value) in sorted {
-        writeln!(audit, "{name}={value}").expect("audit");
-    }
-    for (name, shape) in schema {
-        writeln!(audit, "layout.{name}={shape:?}").expect("layout audit");
-    }
-    for name in ["checkpoint.meta", "checkpoint.safetensors"] {
-        writeln!(
-            audit,
-            "{name}.sha256={}",
-            hex_digest(&fs::read(output.join(name)).expect("checkpoint"))
-        )
-        .expect("checkpoint audit");
-    }
-    fs::write(output.join("INITIALIZATION.txt"), &audit).expect("audit output");
-    eprintln!("{audit}");
 }

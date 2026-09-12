@@ -5,6 +5,11 @@ use bota_proto::{
 
 use crate::{Arena, ArenaConfig, LaningObserver, LaningProxy, LaningScript, Request};
 
+#[path = "laning_visibility.rs"]
+mod visibility;
+
+const LANING_TICKS: u32 = 6_300;
+
 #[test]
 fn laning_damage_counts_each_hero_hit_once_and_excludes_npcs_healing_and_friendly_fire() {
     let view = fixture();
@@ -31,6 +36,7 @@ fn laning_damage_counts_each_hero_hit_once_and_excludes_npcs_healing_and_friendl
                 source: Some(own),
                 target: enemy,
                 amount: 1000,
+                mana: 0,
             },
         ],
     };
@@ -352,10 +358,6 @@ fn laning_scripts_exercise_real_attacks_and_razes_on_paired_seeds_without_win_ga
                 hero_hits += observers[seat].metrics.hero_physical_hits;
                 casts += observers[seat].metrics.confirmed_casts;
                 phase_ticks += observers[seat].metrics.phase_ticks;
-                assert_eq!(
-                    observers[0].metrics.hero_damage,
-                    observers[1].metrics.hero_damage_taken
-                );
             }
         }
         if proxy != LaningProxy::LanePush {
@@ -399,7 +401,9 @@ fn scripted_match(seed: u64, seat: usize, proxy: LaningProxy) -> ([LaningObserve
         LaningObserver::new(SlotId(1)),
     ];
     let mut messages = start.messages;
-    for tick in 1..=6300 {
+    let mut visibility = visibility::VisibilityAudit::default();
+    for tick in 1..=LANING_TICKS {
+        visibility.observe(&messages);
         let requests: [_; 2] = std::array::from_fn(|index| {
             script_request(
                 &mut scripts[index],
@@ -408,11 +412,14 @@ fn scripted_match(seed: u64, seat: usize, proxy: LaningProxy) -> ([LaningObserve
                 tick,
             )
         });
-        if tick == 6300 || observers[0].metrics.winner.is_some() {
+        // Damage delivery follows impact visibility, not symmetric attacker/victim accounting.
+        visibility.assert_observers(&observers);
+        if tick == LANING_TICKS || observers[0].metrics.winner.is_some() {
             break;
         }
         messages = arena.step(&requests).unwrap().messages;
     }
+    visibility.report(seed, seat, proxy);
     (observers, pregame)
 }
 

@@ -5,6 +5,11 @@ pub trait Wire {
     /// Reads the next server message, or no message after a clean close.
     fn hear(&mut self) -> std::io::Result<Option<ServerMsg>>;
 
+    /// Takes socket-read elapsed time from the last `hear`, or `None` if unavailable.
+    fn take_receive_wait(&mut self) -> Option<std::time::Duration> {
+        None
+    }
+
     /// Sends one order and returns its connection sequence number.
     fn order(&mut self, unit: Option<EntityId>, order: Order) -> std::io::Result<u32>;
 

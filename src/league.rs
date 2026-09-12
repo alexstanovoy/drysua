@@ -31,50 +31,42 @@ pub const LEAGUE_MIN_EXPLOIT_PAIRS: usize = 2;
 /// Minimum candidate actions required in the exploit-regression namespace.
 pub const LEAGUE_MIN_EXPLOIT_ACTIONS: u64 = 100;
 /// Stage-ten league contract version.
-pub const LEAGUE_SCHEMA_VERSION: u32 = 27;
+pub const LEAGUE_SCHEMA_VERSION: u32 = 30;
 /// Audited simulator and learner rules required by stage-ten league artifacts.
-pub const LEAGUE_RULES_AUDIT_VERSION: u32 = 22;
+pub const LEAGUE_RULES_AUDIT_VERSION: u32 = 25;
 /// Canonical stage-ten frozen-policy, scheduling, retention, and promotion contract.
 pub const LEAGUE_SCHEMA_DESCRIPTOR: &str = concat!(
-    "bota-drysua-league/v27;",
-    "action_schema_version=3;action_schema_hash=1755359086494840931;",
-    "feature_schema_version=12;feature_schema_hash=1577122233561586211;",
-    "model_schema_version=14;model_schema_hash=7970187849195607202;",
-    "ppo_schema_version=27;ppo_schema_hash=9274275648898675046;rules_audit=22;",
-    "execution_roles=current_m14_policy_sharedpolicy_current_accepted_new_run_historical_snapshots_use_unchanged_candidate_feature12_order_contract_including_restart,frozen_weights_not_legacy_execution,teacher_weak_transport_unchanged,observer_bookkeeping_never_changes_teacher_strategy_or_delivery,training_roles_supersede_v26_role_exclusions_not_feature12_model14_live_actor_semantics;initialization=audited_m12_parameter_copy_is_new_m14_policy_not_historical_opponent_identity_or_qualified_release,no_inherited_progress_moments_or_promotion_evidence;historical_opponents=original_binaries_no_m12_runtime_compatibility,no_parameter_fingerprint_as_execution_identity;",
+    "bota-drysua-league/v30;",
+    "linked_schemas=action,feature,model,ppo,map2_reward;linked_hash=fnv1a_descriptor_then_ordered_version_le32_hash_le64_then_map2_reward_descriptor_utf8;rules_audit=25;",
+    "scope=map2_mid_only_second_hero_death_or_first_tower_loss_simultaneous_draw_cap27900_including900_pregame;reward=linked_map2_reward_schema_version_hash_and_full_descriptor;observations=Guarded13_Inspired14_Shadowraze15_Healed_hp_mana_manual_reports_not_confirmed_tickregen;",
+    "execution_roles=current_m17_policy_sharedpolicy_current_accepted_new_run_historical_snapshots_use_candidate_feature15_action5_move_landing_order_contract_including_restart,frozen_weights_not_legacy_execution,observer_bookkeeping_never_changes_teacher_strategy;initialization=explicit_two_pinned_m14_input_padding_or_two_pinned_m16_navigation_same_shape_sources_new_map2_m17_policy_not_historical_opponent_identity_or_qualified_release,no_inherited_progress_moments_rng_league_or_promotion_evidence,no_gameplay_equivalence,new_legal_actions_change_behavior;historical_opponents=original_binaries_remain_historical_explicit_map2_adapters_not_original_release_identity,no_old_runtime_or_resume,no_parameter_fingerprint_as_execution_identity;",
     "opponents=current30,accepted25,historical25,teacher15,weak5,frozen_per_rollout;",
     "league=capacity32,minimum9,protect_anchor_accepted_strongest_recent4,evict_nearest_cross_play_profile;",
     "snapshot=immutable_finite_f32_parameters,stable_parameter_fingerprint,generation;",
-    "evaluation=held_out_seed_disjoint,paired_radiant_and_dire,min20,max512,horizon_max1024,timeout_rejected,min_actions1000,rejections_below0.001,weak_loss_and_stall_rejected,authoritative_win_required;",
+    "evaluation=held_out_seed_disjoint,paired_radiant_and_dire,min20,max512,authoritative_map2_win_required,draw_and_task_timecap_nonwins,infrastructure_failures_invalidate,timeout_rejected,min_actions1000,rejections_below0.001,weak_loss_and_stall_rejected;",
     "exploit_audit=separate_seed_namespace,min2_pairs,min100_actions,timeout_rejected,nonnegative_each_side,rejections_below0.001;",
     "promotion=opaque_paired_evidence_and_exploit_audit,positive_combined_score,nonnegative_each_side,training_reward_excluded;"
 );
 
-const LEAGUE_FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-const LEAGUE_FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+/// FNV-1a of the descriptor, ordered linked identities, and reward descriptor.
+pub const LEAGUE_SCHEMA_HASH: u64 = crate::model::linked_schema_hash(
+    LEAGUE_SCHEMA_DESCRIPTOR,
+    &[
+        (ACTION_SCHEMA_VERSION, ACTION_SCHEMA_HASH),
+        (FEATURE_SCHEMA_VERSION, FEATURE_SCHEMA_HASH),
+        (MODEL_SCHEMA_VERSION, MODEL_SCHEMA_HASH),
+        (PPO_SCHEMA_VERSION, PPO_SCHEMA_HASH),
+        (
+            crate::MAP2_REWARD_SCHEMA_VERSION,
+            crate::MAP2_REWARD_SCHEMA_HASH,
+        ),
+    ],
+);
 
-const fn league_fnv1a(bytes: &[u8]) -> u64 {
-    let mut hash = LEAGUE_FNV_OFFSET;
-    let mut index = 0;
-    while index < bytes.len() {
-        hash ^= bytes[index] as u64;
-        hash = hash.wrapping_mul(LEAGUE_FNV_PRIME);
-        index += 1;
-    }
-    hash
-}
-
-/// Stable FNV-1a hash of [`LEAGUE_SCHEMA_DESCRIPTOR`].
-pub const LEAGUE_SCHEMA_HASH: u64 = league_fnv1a(LEAGUE_SCHEMA_DESCRIPTOR.as_bytes());
-
-const _: () = assert!(ACTION_SCHEMA_VERSION == 3);
-const _: () = assert!(ACTION_SCHEMA_HASH == 1_755_359_086_494_840_931);
-const _: () = assert!(FEATURE_SCHEMA_VERSION == 12);
-const _: () = assert!(FEATURE_SCHEMA_HASH == 1_577_122_233_561_586_211);
-const _: () = assert!(MODEL_SCHEMA_VERSION == 14);
-const _: () = assert!(MODEL_SCHEMA_HASH == 7_970_187_849_195_607_202);
-const _: () = assert!(PPO_SCHEMA_VERSION == 27);
-const _: () = assert!(PPO_SCHEMA_HASH == 9_274_275_648_898_675_046);
+const _: () = assert!(ACTION_SCHEMA_VERSION == 5);
+const _: () = assert!(FEATURE_SCHEMA_VERSION == 15);
+const _: () = assert!(MODEL_SCHEMA_VERSION == 17);
+const _: () = assert!(PPO_SCHEMA_VERSION == 30);
 const _: () = assert!(LEAGUE_RULES_AUDIT_VERSION == crate::PPO_RULES_AUDIT_VERSION);
 
 static NEXT_SNAPSHOT_ID: AtomicU64 = AtomicU64::new(1);

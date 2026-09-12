@@ -28,60 +28,52 @@ pub const PPO_SHAPING_BUDGET: f32 = 100.0 / PPO_REWARD_SCALE;
 pub const PPO_TERMINAL_REWARD: f32 = 1.0;
 const _: () = assert!(PPO_TERMINAL_REWARD > PPO_SHAPING_BUDGET);
 /// Version of rollout, GAE, objective, optimizer, and reward semantics.
-pub const PPO_SCHEMA_VERSION: u32 = 27;
+pub const PPO_SCHEMA_VERSION: u32 = 30;
 /// Audited simulator and learner rules required by stage-nine rollouts.
-pub const PPO_RULES_AUDIT_VERSION: u32 = 22;
+pub const PPO_RULES_AUDIT_VERSION: u32 = 25;
 /// Canonical stage-nine learner contract covered by [`PPO_SCHEMA_HASH`].
 pub const PPO_SCHEMA_DESCRIPTOR: &str = concat!(
-    "bota-drysua-ppo/v27;",
-    "action_schema_version=3;action_schema_hash=1755359086494840931;",
-    "feature_schema_version=12;feature_schema_hash=1577122233561586211;",
-    "model_schema_version=14;model_schema_hash=7970187849195607202;rules_audit=22;",
-    "candidate_order=unchanged_feature12_live_neural_ppo_learner_greedy_candidate_neuralseat_learner_and_current_m14_policy_sharedpolicy_opponents,including_current_accepted_new_run_historical_snapshots_and_restart,frozen_weights_not_legacy_execution;observer=explicit_from_trajectory_start,feature12_effective_directive_ledger_follows_all_actual_sends_complete_snapshot_events_lifecycle_rejections_even_without_retained_rows,never_deduplicates_transport,never_sends_labels_or_claims_successful_execution;teacher=original_decisions_legacy_request_ledger_readiness_actual_send_rejection_notifications_and_internal_state_unchanged;prediction=observer_only_never_execution_opt_in,no_role_bit_in_tensors;imitation_rules=13,no_rule12_data_relabel;legacy_generic_transport=unchanged;reconstruction=explicit_role_observations_actual_sends_rejections_bounded_ledgers,late_enable_after_actual_send_rejected,no_enriched_history;training_roles=supersede_v26_training_role_exclusions_in_unchanged_feature12_model14_descriptors_not_their_live_actor_tensor_contract;artifacts=exact_f12_m14_ppo26_hash4420330489262074980_rules21_runtime_only_audited_actor_compatibility,no_ppo26_training_resume,m12_ppo23_24_25_runtime_and_resume_rejected,only_existing_two_selected_m12_parameter_initializers,historical_opponents_original_binaries_not_initialized_m14_identity;",
-    "warmup=all_maps_raw_neural_greedy_actions,no_learner_teacher_override_or_send_sync,independent_scheduled_opponent,frozen_policy_opponents_raw_neural_sampling;",
+    "bota-drysua-ppo/v30;",
+    "linked_schemas=action,feature,model,map2_reward;linked_hash=fnv1a_descriptor_then_ordered_version_le32_hash_le64_then_map2_reward_descriptor_utf8;rules_audit=25;",
+    "scope=map2_mid_only_dota_geometry_mid_waves_second_hero_death_or_first_tower_loss_simultaneous_draw_cap27900_including900_pregame_cap_tick_draw;",
+    "candidate_order=feature15_live_neural_ppo_learner_and_current_m17_policy_sharedpolicy_opponents_including_current_accepted_new_run_historical_snapshots_and_restart,frozen_weights_not_legacy_execution;observer=explicit_from_trajectory_start,effective_directive_ledger_follows_all_actual_sends_complete_snapshot_events_lifecycle_rejections_even_without_retained_rows,never_deduplicates_transport,never_sends_labels_or_claims_successful_execution;teacher=original_strategy_no_learner_override;prediction=observer_only_never_execution_opt_in,no_role_bit_in_tensors;reconstruction=explicit_role_observations_actual_sends_rejections_bounded_ledgers,late_enable_after_actual_send_rejected,no_enriched_history;artifacts=no_old_runtime_or_training_resume,explicit_two_pinned_m14_padding_or_two_pinned_m16_navigation_same_shape_initializers_with_new_provenance_fresh_optimizer_progress_rng_league_no_gameplay_equivalence_or_qualification;",
+    "warmup=map2_raw_neural_greedy_actions,no_learner_teacher_override_or_send_sync,independent_scheduled_opponent,frozen_policy_opponents_raw_neural_sampling;",
     "bounds=rollout32768,streams1280,environments128,decisions16384,epochs16,minibatch8192,microbatch64;",
-    "complete_episodes=opt_in_map0_two_four_six_paired_sides_fixed_teacher_no_warmup,act_every3ticks_until_terminal_or108900,retain_uniform_episode_phase0to7_then_every8_actions_independent_of_kind,phase_rng_separate_runseed_update_stream_domains726574656e74696f_70686173655f726e_nextword_mask7_no_actor_draws,prefix_rewards_telemetry_only,terminal_before_phase_no_synthetic_sample,empty_optimizer_batch_rejected,discounted_nstep_rewards_exact_elapsed_ticks,original_retained_action_logprob,lambda_per_retained_transition,terminal_zero_bootstrap_partial_flush,timeout_bootstrap_not_draw,no_update_without_authoritative_terminal,no_restart_within_collection,natural_episode_checkpoint_boundary;",
-    "terminal_only=opt_in_complete_episodes_only,all_shaping_components_zero,actual_win1_loss-1,timeout_zero_nonterminal_with_bootstrap,draw_rejected;lambda1=full_discounted_monte_carlo_f64_return_recurrence_ignores_intermediate_values_preserves_timeout_bootstrap;",
-    "episode_time_cost=opt_in_terminal_only_complete_episodes,finite_budget0_to0.25,negative_budget_times_actual_elapsed_ticks_over108900,includes_pregame_from_initial_tick1,strict_elapsed_cap108899,f64_interval_accumulation,no_xp_gold_or_hidden_state,gamma1_allowed_for_undiscounted_finish_preference,timeout_remains_nonterminal_with_bootstrap;",
+    "complete_episodes=map2_paired_sides,retain_original_action_logprob_exact_elapsed_ticks_and_all_intervening_reward,terminal_zero_bootstrap_partial_flush,no_synthetic_zero_tick_samples,empty_optimizer_batch_rejected,natural_episode_checkpoint_boundary;lambda1=full_monte_carlo_f64_return_recurrence;",
+    "terminal=win1_loss-1_draw0_timecap0,draw_and_timecap_are_nonwins,infrastructure_failure_invalidates_not_fabricated_outcome;legacy_reward_profiles=not_map2_comprehensive_reward;",
     "actor=frozen_exact_policy_identity,batch_max64_single_shared_trunk_forward,independent_per_environment_rng_seeded_from_checkpointed_master,transactional_batch_rng,legal_masked_gumbel_max_open_f64_uniform,exact_autoregressive_log_probability_and_entropy;",
-    "gae=gamma_tick0.9966555_pow_elapsed_ticks,lambda0.98,terminal_reset,bootstrap_truncation,normalized_advantages;",
+    "gae=map2_gamma_tick1_required,lambda0.98,terminal_reset,bootstrap_collector_truncation_not_task_terminal,normalized_advantages;",
     "objective=clipped_surrogate0.2,value_mse0.5,entropy0.01,target_kl0.02;",
     "critic=ppo_only_detached_value_head_input,value_head_only_regression,bc_and_public_training_forward_unchanged;",
     "optimizer=adam_lr3e-6_beta1_0.9_beta2_0.999_epsilon1e-5_global_clip0.5,weighted_host_microbatch_accumulation,transactional_parameters_moments_shuffle;",
     "kl_guard=pre_step_rejection,post_step_sample_weighted_complete_effective_minibatch_rollout_policy_kl,candidate_exceeds_target_or_evaluation_error_restores_exact_parameters_adam_moments_step_policy_revision_under_exclusive_parameter_lock,applied_report_post_step_kl,rejected_report_candidate_kl;",
-    "reward=seat_safe_global_summary,all_components_normalized_by101,episode_sum_absolute_emitted_shaping_components_budget100_over101_nonreplenishing_f64_expenditure,terminal_next_potential_zero,xp_advantage0.02_over101,cash_wealth_last_hit_deny_zero_reward,enemy_gold_unavailable_by_seat_contract,combat2_over101,structures5_over101,terminal_win1_loss-1_draw0,separate_consistently_scaled_breakdown,wide_public_score_subtraction_before_f32_conversion;",
+    "reward=linked_map2_reward_schema_version_hash_and_full_descriptor,seat_only_full_contiguous_snapshot_events_before_retention_or_tracker_journal,gold_xp_hero_damage_received_damage_mana_tower_lane_terminal,no_creep_damage_credit,no_hidden_world_inputs,baseline_drain_before_first_action,accounting_state_persists_across_segments,feature15_nine_remaining_fractions_tower_lane_lane_observed,Healed_hp_mana_manual_promises_ignored_not_confirmed_tickregen_no_refund_double_credit;",
     "arena=one_learner_seat_against_independent_opponent,snapshot_then_explicit_events_including_empty_complete_every_visible_tick,decision_after_tick_complete,decision_interval3,default_all_policy_decision_ticks1_plus3n,pregame_enabled,batched_bootstrap,restart_on_terminal,complete_frozen_side_pairs_require_even_production_environments,paired_side_seed_and_warmup_phase,on_policy_greedy_burn_in,eight_phase_blocks_alternate_weak_teacher,clear_hero_and_courier_warmup_orders,hero_identity_change_invalidates_local_body_order,hero_active_order_feature_ignores_courier_orders;",
-    "navigation=building_landing_points_reserved_for_teleport_targets,seat_visible_channel_masks_cast_and_use,seat_visible_item_mute_masks_use,put_point_underfoot_only;",
-    "deployment=audited_seat_visible_teacher_on_map0,model_with_channel_preservation_sustain_emergency_retreat_and_safe_in_range_structure_attack_on_map1,dagger_uses_safety_shield_without_objective_override,raw_ppo_sampling_remains_on_policy;",
+    "navigation=existing_walkable_building_landing_points_allow_MovePoint_only,AttackMovePoint_source_veto_unchanged,tp_tree_collision_provenance_unchanged,no_goal_features_or_forced_retreat,seat_visible_channel_masks_cast_and_use,seat_visible_item_mute_masks_use,put_point_underfoot_only;",
+    "deployment=raw_map2_mid_neural_policy_no_teacher_override_or_strategic_masks,action5_mango_public_readiness_unchanged,feature15_anonymous_raze_effect15_guarded13_inspired14_and_manual_hp_mana_report_facts,raw_ppo_sampling_remains_on_policy;",
     "teacher_economy=custom_bota_wraith_band_tango_boots_optional_stick_gloves_belt_once_only;",
-    "pretraining=bounded_map1_teacher_and_dagger_corpus,map_qualified_sample_identity,two_offline_validation_seeds_and_three_gameplay_validation_seeds_for_stage_selection,two_untouched_held_out_seeds_for_final_agreement,dagger_rejection_fail_fast,map1_paired_win_acceptance,map0_teacher_paired_structure_progress_acceptance;",
+    "historical_evidence=map0_map1_weights_binaries_results_unchanged_not_map2_qualification,no_old_corpus_relabel;",
     "pipeline=bounded_cpu_worker_endpoints,smoke_and_league_persistent_actor_thread,production_actor_uses_same_identity_learner_device_model_then_serial_learner_update,immutable_identity_bound_actor_lease,exactly_two_fixed_capacity_buffer_permits,one_generation_lag_allowed,two_generation_lag_rejected,live_generation_read_guard_held_through_optimizer_update,ragged_feature_arenas,bit_packed_behavioral_masks,padding_only_per_minibatch,explicit_cpu_cuda_metal_learner_selection;"
 );
 
-const PPO_FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-const PPO_FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+/// FNV-1a of the descriptor, ordered linked identities, and reward descriptor.
+pub const PPO_SCHEMA_HASH: u64 = crate::model::linked_schema_hash(
+    PPO_SCHEMA_DESCRIPTOR,
+    &[
+        (ACTION_SCHEMA_VERSION, ACTION_SCHEMA_HASH),
+        (FEATURE_SCHEMA_VERSION, FEATURE_SCHEMA_HASH),
+        (MODEL_SCHEMA_VERSION, MODEL_SCHEMA_HASH),
+        (
+            crate::MAP2_REWARD_SCHEMA_VERSION,
+            crate::MAP2_REWARD_SCHEMA_HASH,
+        ),
+    ],
+);
 
-const fn ppo_fnv1a(bytes: &[u8]) -> u64 {
-    let mut hash = PPO_FNV_OFFSET;
-    let mut index = 0;
-    while index < bytes.len() {
-        hash ^= bytes[index] as u64;
-        hash = hash.wrapping_mul(PPO_FNV_PRIME);
-        index += 1;
-    }
-    hash
-}
-
-/// Stable FNV-1a hash of [`PPO_SCHEMA_DESCRIPTOR`].
-pub const PPO_SCHEMA_HASH: u64 = ppo_fnv1a(PPO_SCHEMA_DESCRIPTOR.as_bytes());
-
-const _: () = assert!(ACTION_SCHEMA_VERSION == 3);
-const _: () = assert!(ACTION_SCHEMA_HASH == 1_755_359_086_494_840_931);
-const _: () = assert!(FEATURE_SCHEMA_VERSION == 12);
-const _: () = assert!(FEATURE_SCHEMA_HASH == 1_577_122_233_561_586_211);
-const _: () = assert!(MODEL_SCHEMA_VERSION == 14);
-const _: () = assert!(MODEL_SCHEMA_HASH == 7_970_187_849_195_607_202);
-const _: () = assert!(PPO_RULES_AUDIT_VERSION == 22);
+const _: () = assert!(ACTION_SCHEMA_VERSION == 5);
+const _: () = assert!(FEATURE_SCHEMA_VERSION == 15);
+const _: () = assert!(MODEL_SCHEMA_VERSION == 17);
+const _: () = assert!(PPO_RULES_AUDIT_VERSION == 25);
 
 /// Stage-nine PPO hyperparameters and bounded rollout dimensions.
 #[derive(Clone, Copy, Debug, PartialEq)]

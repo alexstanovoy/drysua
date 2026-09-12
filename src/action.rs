@@ -17,9 +17,20 @@ use crate::{
 /// Distance at which drysua permits stash swaps around the own fountain.
 pub const STASH_ACCESS_RANGE: i32 = 1_000;
 /// Version of the append-only structured-action schema.
-pub const ACTION_SCHEMA_VERSION: u32 = 3;
+pub const ACTION_SCHEMA_VERSION: u32 = 5;
 /// Canonical action families, head widths, and autoregressive branch order.
-pub const ACTION_SCHEMA_DESCRIPTOR: &str = "bota-drysua-action/v3;kinds=Continue,Stop,MovePoint,FollowUnit,Hold,AttackMovePoint,AttackUnit,Cast,Use,PutPoint,PutUnit,Take,Buy,Sell,Swap,Learn;heads=kind16,controlled2,ability8,item15,swap15,learn6,shop64,loot16,target_mode3,put_mode2,entity96,point48;target_modes=None,Entity,Point;put_modes=Underfoot,Point;put_point_legality=underfoot_only;buy_legality=positive_missing_leaves_and_total_missing_cost_and_leaf_capacity;buy_decode=root_or_first_missing_leaf;";
+pub const ACTION_SCHEMA_DESCRIPTOR: &str = concat!(
+    "bota-drysua-action/v5;kinds=Continue,Stop,MovePoint,FollowUnit,Hold,AttackMovePoint,AttackUnit,Cast,Use,PutPoint,PutUnit,Take,Buy,Sell,Swap,Learn;",
+    "heads=kind16,controlled2,ability8,item15,swap15,learn6,shop64,loot16,target_mode3,put_mode2,entity96,point48;",
+    "target_modes=None,Entity,Point;put_modes=Underfoot,Point;put_point_legality=underfoot_only;",
+    "buy_legality=positive_missing_leaves_and_total_missing_cost_and_leaf_capacity;buy_decode=root_or_first_missing_leaf;",
+    "buy_mango=item42_one_charge_repeatable_home_bag_then_stash_remote_stash_empty_or_visible_compatible_stack_below3;",
+    "use_mango=hero_active_slots0..5_unmuted_charges1..3_target_none_provable_positive_own_mana_deficit;",
+    "mana_legality=all_casts_and_uses_conservative_own_wire_mana_affordability;",
+    "raze_legality=mechanical_only_empty_and_beneficial_allowed;",
+    "move_point_legality=live_body_unstunned_unrooted_and_walkable_including_existing_building_landing;attack_move_point_legality=unchanged_building_landing_source_excluded;building_landing_provenance=unchanged_tp_walkability_allied_anchor_and_target_kind_checks,no_new_points_or_goal_features;",
+    "entity_order=active_effect15_max_lexicographic_stacks_remaining_then_guarded13_inspired14_timers_then_prior_received_manual_hp_mana_report_semantics_before_opaque_id;",
+);
 /// Stable FNV-1a identity of [`ACTION_SCHEMA_DESCRIPTOR`].
 pub const ACTION_SCHEMA_HASH: u64 = action_schema_hash(ACTION_SCHEMA_DESCRIPTOR.as_bytes());
 
@@ -43,9 +54,15 @@ const PREDICTED_HERO_POINTS: usize = 4;
 const STATIC_TREE_CLEARANCE: i32 = 48 + 24 + 8;
 const STRUCTURE_CLEARANCE: i32 = 24 + 8;
 const MAX_PURCHASE_SLOTS: usize = WIRE_ITEM_SLOTS;
+const MANGO_ITEM: ItemId = ItemId(42);
+const MANGO_STACK_MAX: u8 = 3;
 const TACTICAL_RADII: [i32; 3] = [200, 600, 1_200];
 /// Cells scanned around a structure for a teleport landing; covers its range.
 const LANDING_SEARCH_CELLS: usize = 10;
+
+const _: () = assert!(ACTIVE_ITEM_SLOTS <= HERO_BAG_SLOTS);
+const _: () = assert!(STASH_SLOTS <= HERO_BAG_SLOTS);
+const _: () = assert!(MANGO_STACK_MAX > 1);
 
 /// Stable append-only top-level action discriminator.
 #[repr(u8)]
@@ -1432,6 +1449,18 @@ fn compare_units(tracker: &StateTracker, left: &UnitView, right: &UnitView) -> s
         .then_with(|| left.true_sight_radius.cmp(&right.true_sight_radius))
         .then_with(|| left.statuses.cmp(&right.statuses))
         .then_with(|| item_capacity_key(left).cmp(&item_capacity_key(right)))
+        .then_with(|| {
+            crate::tracker::shadowraze_effect(left, 0)
+                .cmp(&crate::tracker::shadowraze_effect(right, 0))
+        })
+        .then_with(|| {
+            crate::tracker::aura_effects(left, 0).cmp(&crate::tracker::aura_effects(right, 0))
+        })
+        .then_with(|| {
+            crate::tracker::recent_restoration_reports(tracker, left.id).cmp(
+                &crate::tracker::recent_restoration_reports(tracker, right.id),
+            )
+        })
 }
 
 fn item_capacity_key(unit: &UnitView) -> (usize, usize, bool) {
@@ -2126,7 +2155,7 @@ fn fill_body_masks(
     for (index, point) in space.points.iter().enumerate() {
         let body_navigation_target =
             point.walkable && !matches!(point.source, PointSource::BuildingLanding(_));
-        masks.move_points[index] = movement_enabled && body_navigation_target;
+        masks.move_points[index] = movement_enabled && point.walkable;
         masks.attack_move_points[index] = attack_enabled && body_navigation_target;
     }
     for (index, target) in space.entities.iter().enumerate() {
@@ -2147,7 +2176,7 @@ fn fill_cast_masks(space: &ActionSpace, state: &ControlledState, masks: &mut Con
             && !ability.passive
             && ability.level > 0
             && ability.cooldown_left == 0
-            && state.unit.mana >= ability.mana_cost;
+            && can_afford_mana(state.unit.mana, ability.mana_cost);
         masks.casts.push(target_mask(
             space,
             state,
@@ -2175,13 +2204,26 @@ fn fill_use_masks(
         let ready = item.cooldown_left == 0
             && item.mute_left == 0
             && item.charges != Some(0)
-            && state.unit.mana >= item.mana_cost
+            && can_afford_mana(state.unit.mana, item.mana_cost)
             && !has_status(&state.unit, StatusFlags::STUNNED)
             && !has_status(&state.unit, StatusFlags::CHANNELLING)
             && !space
                 .readiness
                 .inventory_muted(unit, ItemSlot(slot as u8), space.tick)
             && !space.readiness.shared_waiting(unit, item.id, space.tick);
+        if item.id == MANGO_ITEM {
+            let mut mask = empty_target_mask(space);
+            mask.none = ready
+                && unit == ControlledUnit::Hero
+                && item.aim == Some(Aim::Own)
+                && item
+                    .charges
+                    .is_some_and(|charges| (1..=MANGO_STACK_MAX).contains(&charges))
+                && state.unit.mana >= 0
+                && state.unit.mana < state.unit.max_mana;
+            masks.uses.push(mask);
+            continue;
+        }
         let Some(aim) = item.aim else {
             masks.uses.push(empty_target_mask(space));
             continue;
@@ -2190,6 +2232,14 @@ fn fill_use_masks(
             .uses
             .push(target_mask(space, state, aim, item.range, ready, true));
     }
+}
+
+fn can_afford_mana(mana: i32, cost: i32) -> bool {
+    assert!(cost >= 0);
+    // The wire shows any positive sub-one pool as one, which cannot prove a one-mana cost.
+    let minimum = if mana == 1 { 0 } else { mana };
+    assert!(minimum <= mana);
+    minimum >= cost
 }
 
 fn target_mask(
@@ -2337,8 +2387,9 @@ fn fill_buy_mask(
     if unit != ControlledUnit::Hero {
         return;
     }
+    let at_shop = near_own_fountain(space, state.unit.pos);
     let stash_slots = space.own_stash.iter().filter(|slot| slot.is_none()).count();
-    let hero_slots = if near_own_fountain(space, state.unit.pos) {
+    let hero_slots = if at_shop {
         state
             .unit
             .items
@@ -2349,16 +2400,35 @@ fn fill_buy_mask(
         0
     };
     let free_slots = stash_slots + hero_slots;
+    let mango_fits = free_slots > 0
+        || has_mango_merge_room(&space.own_stash)
+        || (at_shop && has_mango_merge_room(&state.unit.items));
     assert_eq!(space.shop.len(), space.buy_requirements.len());
     for (index, requirement) in space.buy_requirements.iter().enumerate() {
         assert_eq!(
             requirement.first_missing.is_some(),
             requirement.missing_slots > 0
         );
-        masks.buy[index] = requirement.missing_slots > 0
-            && free_slots >= requirement.missing_slots
-            && space.own_gold >= requirement.missing_cost;
+        let fits = if space.shop[index].item == MANGO_ITEM {
+            mango_fits
+        } else {
+            free_slots >= requirement.missing_slots
+        };
+        masks.buy[index] =
+            requirement.missing_slots > 0 && fits && space.own_gold >= requirement.missing_cost;
     }
+}
+
+fn has_mango_merge_room(slots: &[Option<ItemView>]) -> bool {
+    assert!(slots.len() <= HERO_BAG_SLOTS);
+    slots.iter().flatten().any(|item| {
+        item.id == MANGO_ITEM
+            && item
+                .charges
+                .is_some_and(|charges| (1..MANGO_STACK_MAX).contains(&charges))
+            && item.mode.is_none()
+            && !item.for_sale
+    })
 }
 
 fn item_at<'a>(

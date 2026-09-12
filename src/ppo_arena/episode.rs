@@ -6,16 +6,20 @@
 use super::*;
 
 #[cfg(test)]
+#[path = "../tests/map2_collection.rs"]
+mod map2_tests;
+
+#[cfg(test)]
 #[path = "../tests/episode_collection_parallel.rs"]
 mod parallel_tests;
 
-pub(super) const TICK_CAP: u32 = 108_900;
-pub(super) const ACTOR_DECISIONS: usize = 36_300;
-const RETENTION_STRIDE: usize = 8;
+pub(super) const TICK_CAP: u32 = crate::MAP2_TICK_CAP;
+pub(super) const ACTOR_DECISIONS: usize = crate::MAP2_ACTOR_DECISIONS;
+const RETENTION_STRIDE: usize = crate::MAP2_RETENTION_STRIDE;
 const RETENTION_DOMAIN: u64 = 0x7265_7465_6e74_696f;
 const RETENTION_STREAM_DOMAIN: u64 = 0x7068_6173_655f_726e;
 const _: () = assert!(RETENTION_STRIDE.is_power_of_two());
-const RETAINED_PER_EPISODE: usize = ACTOR_DECISIONS.div_ceil(RETENTION_STRIDE);
+const RETAINED_PER_EPISODE: usize = crate::MAP2_RETAINED_DECISIONS;
 const MAX_EPISODE_ENVIRONMENTS: usize = 6;
 const RETAINED_BYTES_PER_ENVIRONMENT: usize = 3
     * RETAINED_PER_EPISODE
@@ -25,27 +29,32 @@ const _: () =
 const _: () = assert!(MAX_EPISODE_ENVIRONMENTS * RETAINED_PER_EPISODE <= crate::PPO_MAX_SAMPLES);
 
 pub(crate) fn validate(settings: &TrainingJobConfig) -> Result<(), PpoError> {
-    validate_time_cost(settings.episode_time_cost)?;
-    if settings.episode_time_cost > 0.0 && (!settings.terminal_only || !settings.complete_episodes)
-    {
+    if settings.map != MapId(2) {
+        return Err(PpoError::InvalidConfig("production training requires Map2"));
+    }
+    if settings.ppo.gamma_tick != MAP2_REWARD_GAMMA_TICK {
         return Err(PpoError::InvalidConfig(
-            "episode time cost requires terminal-only complete episodes",
+            "Map2 comprehensive reward requires gamma per tick one",
         ));
     }
-    if settings.terminal_only && !settings.complete_episodes {
+    if settings.terminal_only {
         return Err(PpoError::InvalidConfig(
-            "terminal-only requires complete episodes",
+            "Map2 requires comprehensive reward; terminal-only is unsupported",
+        ));
+    }
+    if settings.episode_time_cost != 0.0 {
+        return Err(PpoError::InvalidConfig(
+            "Map2 comprehensive reward requires zero episode time cost",
         ));
     }
     if !settings.complete_episodes {
         return Ok(());
     }
-    if settings.map != MapId(0)
-        || !matches!(settings.ppo.environments, 2 | 4 | 6)
-        || settings.ppo.decision_interval_ticks != 3
+    if !matches!(settings.ppo.environments, 2 | 4 | 6)
+        || settings.ppo.decision_interval_ticks != crate::MAP2_DECISION_INTERVAL_TICKS
     {
         return Err(PpoError::InvalidConfig(
-            "complete episodes require Map0, two/four/six environments, and three-tick actions",
+            "complete episodes require Map2, two/four/six environments, and three-tick actions",
         ));
     }
     if settings.ppo.rollout_decisions < RETAINED_PER_EPISODE {
@@ -58,6 +67,7 @@ pub(crate) fn validate(settings: &TrainingJobConfig) -> Result<(), PpoError> {
     Ok(())
 }
 
+#[cfg(test)]
 fn validate_time_cost(budget: f32) -> Result<(), PpoError> {
     if !budget.is_finite() || !(0.0..=0.25).contains(&budget) {
         return Err(PpoError::InvalidConfig(
@@ -67,6 +77,7 @@ fn validate_time_cost(budget: f32) -> Result<(), PpoError> {
     Ok(())
 }
 
+#[cfg(test)]
 fn elapsed_time_cost(budget: f32, elapsed: u32, ticks: u32) -> Result<f64, PpoError> {
     validate_time_cost(budget)?;
     if ticks == 0 {
@@ -104,7 +115,7 @@ pub(super) fn environments(
             build_environment(
                 derive_training_seed(settings.seed, pair, 0x6172_656e_615f_7365),
                 derive_training_seed(settings.seed, pair, 0x6f70_706f_6e65_6e74),
-                MapId(0),
+                settings.map,
                 stream % 2,
                 0,
                 OpponentSpec::Teacher,
@@ -123,17 +134,19 @@ pub(super) fn collect(
     report: &mut PpoSmokeReport,
 ) -> Result<(), PpoError> {
     let config = settings.ppo;
-    let terminal_only = settings.terminal_only;
     validate(settings)?;
     assert!(matches!(environments.len(), 2 | 4 | 6));
-    assert_eq!(config.decision_interval_ticks, 3);
+    assert_eq!(
+        config.decision_interval_ticks,
+        crate::MAP2_DECISION_INTERVAL_TICKS
+    );
     let mut random = actor_stream_rngs(sampling, environments.len())?;
     let mut streams = streams_for_collection(settings, update)?;
     let retained_bytes_bound = environments.len() * RETAINED_BYTES_PER_ENVIRONMENT;
     eprintln!(
-        "collection: complete-episodes opponent=Teacher actor_ticks=3 retention_stride=8 retention_phase=random_episode_independent_rng tick_cap={TICK_CAP} environments={} terminal_only={terminal_only} retained_bytes_bound={retained_bytes_bound} time_cost_budget={} cost_includes_pregame=true",
+        "collection: complete-episodes map=2 reward=map2_full gamma_tick=1 opponent=Teacher actor_ticks={} retention_stride={RETENTION_STRIDE} retention_phase=random_episode_independent_rng tick_cap={TICK_CAP} environments={} retained_bytes_bound={retained_bytes_bound}",
+        config.decision_interval_ticks,
         environments.len(),
-        settings.episode_time_cost
     );
     for _ in 0..ACTOR_DECISIONS {
         let active: Vec<_> = (0..streams.len())
@@ -183,9 +196,17 @@ fn validate_episode_batch(rollout: &PpoRollout, report: &PpoSmokeReport) -> Resu
     if rollout.is_empty() {
         return Err(PpoError::EmptyRollout);
     }
-    if report.terminal_wins + report.terminal_losses == 0 {
+    if [
+        report.terminal_wins,
+        report.terminal_losses,
+        report.terminal_draws,
+        report.episode_timeouts,
+    ]
+    .iter()
+    .all(|count| *count == 0)
+    {
         return Err(PpoError::InvalidTransition(
-            "complete episode batch has no authoritative terminal outcomes",
+            "complete episode batch has no completed episodes",
         ));
     }
     Ok(())
@@ -200,8 +221,6 @@ fn streams_for_collection(
         .map(|stream| {
             Ok(EpisodeStream {
                 retention_phase: retention_phase(settings.seed, update, stream)?,
-                terminal_only: settings.terminal_only,
-                time_cost_budget: settings.episode_time_cost,
                 ..EpisodeStream::default()
             })
         })
@@ -259,9 +278,7 @@ struct EpisodeStream {
     #[cfg(test)]
     last_requests: Option<Vec<Option<Request>>>,
     retention_phase: usize,
-    time_cost_budget: f32,
-    time_cost_spent: f64,
-    terminal_only: bool,
+    map2_reward: Map2TrainingReward,
     elapsed_ticks: u32,
     raw_return: f64,
     discounted_return: f64,
@@ -401,9 +418,14 @@ fn advance_cpu(
         format!("{requests:?}").hash(&mut state.trace);
         state.last_requests = Some(requests.clone());
     }
-    let advanced = advance_interval(environment, requests, 3.min(TICK_CAP - tick))?;
+    let advanced = advance_interval(
+        environment,
+        requests,
+        config.decision_interval_ticks.min(TICK_CAP - tick),
+    )?;
     reject_production_rejection(environment, "complete episode rollout")?;
     let outcome = terminal_outcome(environment, advanced.winner);
+    state.done = outcome.is_some() || tick + advanced.ticks >= TICK_CAP;
     let reward = observe_reward(
         environment,
         state,
@@ -414,7 +436,6 @@ fn advance_cpu(
     state.actions[choice.action().kind().index()] += 1;
     state.append_retained_reward(reward, advanced.ticks, config.gamma_tick)?;
     state.decisions += 1;
-    state.done = outcome.is_some() || tick + advanced.ticks >= TICK_CAP;
     Ok(CompletedAdvance {
         end_tick: tick + advanced.ticks,
         ticks: advanced.ticks,
@@ -436,14 +457,7 @@ fn finish_advance(
         .checked_add(u64::from(completed.ticks))
         .ok_or(PpoError::CounterOverflow)?;
     if state.should_flush() {
-        flush(
-            model,
-            environment,
-            state,
-            stream,
-            completed.outcome.is_some(),
-            rollout,
-        )?;
+        flush(model, environment, state, stream, state.done, rollout)?;
     }
     if state.done {
         record_episode(stream, completed.end_tick, state, completed.outcome, report)?;
@@ -467,6 +481,7 @@ fn assert_actor_phase_parity_for_test(model: &PolicyModel, phase: usize) {
     let mut replay = random.clone();
     let mut source = parity_states_for_test(0);
     let mut target = parity_states_for_test(phase);
+    let mut retained_rewards = [0.0; 2];
     let mut source_rollout =
         PpoRollout::new(4, model.policy_identity().expect("identity")).expect("source rollout");
     let mut target_rollout = PpoRollout::new(4, source_rollout.policy()).expect("target rollout");
@@ -484,6 +499,7 @@ fn assert_actor_phase_parity_for_test(model: &PolicyModel, phase: usize) {
         {
             assert_eq!(choice.action(), copy.action());
             assert_eq!(choice.log_probability(), copy.log_probability());
+            let previous_reward = source[stream].map2_reward.total;
             advance_stream(
                 model,
                 &mut reference[stream],
@@ -505,7 +521,10 @@ fn assert_actor_phase_parity_for_test(model: &PolicyModel, phase: usize) {
             )
             .expect("shifted phase action");
             assert_eq!(source[stream].last_requests, target[stream].last_requests);
-            assert_eq!(source[stream].raw_return, target[stream].raw_return);
+            assert_eq!(source[stream].map2_reward, target[stream].map2_reward);
+            if (phase..phase + RETENTION_STRIDE).contains(&decision) {
+                retained_rewards[stream] += source[stream].map2_reward.total - previous_reward;
+            }
             assert_eq!(
                 reference[stream].seats[stream].tracker.latest_summary(),
                 candidate[stream].seats[stream].tracker.latest_summary()
@@ -513,7 +532,7 @@ fn assert_actor_phase_parity_for_test(model: &PolicyModel, phase: usize) {
             if decision < phase {
                 assert!(target[stream].choice.is_none());
                 assert_eq!(target[stream].interval.steps, 0);
-                assert!(target[stream].raw_return < 0.0);
+                assert_eq!(target[stream].map2_reward.ticks, (decision as u64 + 1) * 3);
             }
         }
     }
@@ -523,27 +542,31 @@ fn assert_actor_phase_parity_for_test(model: &PolicyModel, phase: usize) {
     for index in 0..2 {
         let sample = batch.sample(index).expect("sample").transition;
         assert_eq!(sample.ticks, 24);
-        assert!((f64::from(sample.reward) + 0.25 * 24.0 / f64::from(TICK_CAP)).abs() < 1e-8);
+        assert!((f64::from(sample.reward) - retained_rewards[sample.stream]).abs() < 1e-8);
     }
 }
 
 #[cfg(test)]
 fn parity_settings_for_test() -> TrainingJobConfig {
-    crate::cli::training_settings_for_test(&[
+    let settings = crate::cli::training_settings_for_test(&[
         "--complete-episodes",
-        "--terminal-only",
-        "--episode-time-cost",
-        "0.25",
         "--map",
-        "0",
+        "2",
         "--environments",
         "2",
         "--rollout",
-        "4538",
+        &crate::MAP2_RETAINED_DECISIONS.to_string(),
+        "--minibatch",
+        "512",
         "--gamma-per-tick",
         "1",
     ])
-    .expect("settings")
+    .expect("settings");
+    assert_eq!(TICK_CAP, crate::MAP2_TICK_CAP);
+    assert_eq!(ACTOR_DECISIONS, crate::MAP2_ACTOR_DECISIONS);
+    assert_eq!(RETENTION_STRIDE, 8);
+    assert_eq!(RETAINED_PER_EPISODE, crate::MAP2_RETAINED_DECISIONS);
+    settings
 }
 
 #[cfg(test)]
@@ -552,8 +575,6 @@ fn parity_states_for_test(retention_phase: usize) -> Vec<EpisodeStream> {
     (0..2)
         .map(|_| EpisodeStream {
             retention_phase,
-            time_cost_budget: 0.25,
-            terminal_only: true,
             ..EpisodeStream::default()
         })
         .collect()
@@ -561,16 +582,9 @@ fn parity_states_for_test(retention_phase: usize) -> Vec<EpisodeStream> {
 
 #[cfg(test)]
 pub(crate) fn assert_retention_phase_replay_for_test() {
-    let settings = crate::cli::training_settings_for_test(&[
-        "--complete-episodes",
-        "--map",
-        "0",
-        "--environments",
-        "6",
-        "--rollout",
-        "4538",
-    ])
-    .expect("settings");
+    let mut settings = parity_settings_for_test();
+    settings.ppo.environments = 6;
+    validate(&settings).expect("six Map2 streams");
     let mut master = PpoRng::new(9971002);
     let before = master.checkpoint();
     let mut restored = PpoRng::from_checkpoint(before.0, before.1).expect("restore");
@@ -616,16 +630,7 @@ pub(crate) fn assert_retention_phase_replay_for_test() {
 #[cfg(test)]
 pub(crate) fn assert_retention_boundaries_for_test(_: &PolicyModel) {
     let model = PolicyModel::fresh(9971003).expect("nonzero value model");
-    let settings = crate::cli::training_settings_for_test(&[
-        "--complete-episodes",
-        "--map",
-        "0",
-        "--environments",
-        "2",
-        "--rollout",
-        "4538",
-    ])
-    .expect("settings");
+    let settings = parity_settings_for_test();
     let mut arena = environments(&settings, 0).expect("worlds").remove(0);
     let choice = sample_policy(&model, &mut PpoRng::new(9971004), &mut arena).expect("choice");
     for terminal in [true, false] {
@@ -640,7 +645,11 @@ pub(crate) fn assert_retention_boundaries_for_test(_: &PolicyModel) {
             }
             let reward = if decision < 3 { 1000.0 } else { 2.0 };
             state
-                .append_retained_reward(reward, if decision == 7 { 2 } else { 3 }, 0.5)
+                .append_retained_reward(
+                    reward,
+                    if decision == 7 { 2 } else { 3 },
+                    settings.ppo.gamma_tick,
+                )
                 .expect("reward");
             state.decisions += 1;
         }
@@ -661,10 +670,7 @@ pub(crate) fn assert_retention_boundaries_for_test(_: &PolicyModel) {
         assert_eq!(sample.ticks, 14);
         assert_eq!(sample.terminal, terminal);
         assert_eq!(sample.next_value, if terminal { 0.0 } else { bootstrap });
-        assert_eq!(
-            sample.reward,
-            2.0 * (1.0 + 0.5f32.powi(3) + 0.5f32.powi(6) + 0.5f32.powi(9) + 0.5f32.powi(12))
-        );
+        assert_eq!(sample.reward, 10.0);
     }
     assert_unsampled_short_episode_for_test(&choice);
 }
@@ -679,7 +685,12 @@ fn assert_unsampled_short_episode_for_test(choice: &PpoPolicyChoice) {
     state
         .append_retained_reward(1.0, 3, 1.0)
         .expect("unretained terminal reward");
-    state.raw_return = 1.0;
+    state.map2_reward = Map2TrainingReward {
+        ticks: 3,
+        terminal: 1.0,
+        total: 1.0,
+        ..Map2TrainingReward::default()
+    };
     state.decisions = 1;
     state.done = true;
     assert!(!state.should_flush());
@@ -689,6 +700,7 @@ fn assert_unsampled_short_episode_for_test(choice: &PpoPolicyChoice) {
     record_episode(0, 4, &state, Some(PpoTerminalOutcome::Win), &mut report)
         .expect("complete outcome");
     assert_eq!(report.terminal_wins, 1);
+    assert_eq!(report.map2_reward, state.map2_reward);
     assert_eq!(state.retained, 0);
     let rollout = PpoRollout::new(1, choice.policy()).expect("empty rollout");
     assert_eq!(
@@ -705,16 +717,7 @@ fn assert_unsampled_short_episode_for_test(choice: &PpoPolicyChoice) {
 
 #[cfg(test)]
 pub(crate) fn assert_all_retention_phase_labels_for_test(model: &PolicyModel) {
-    let settings = crate::cli::training_settings_for_test(&[
-        "--complete-episodes",
-        "--map",
-        "0",
-        "--environments",
-        "2",
-        "--rollout",
-        "4538",
-    ])
-    .expect("settings");
+    let settings = parity_settings_for_test();
     let mut arena = environments(&settings, 0).expect("arena").remove(0);
     let choice = sample_policy(model, &mut PpoRng::new(9971000), &mut arena).expect("sample");
     let mut retained_phase_labels = std::collections::BTreeSet::new();
@@ -748,27 +751,17 @@ fn observe_reward(
 ) -> Result<f64, PpoError> {
     assert!(ticks > 0);
     assert!(state.elapsed_ticks < TICK_CAP);
-    let reward = if state.terminal_only {
-        RewardTracker::terminal_only(outcome)?
-    } else {
-        let summary = environment.seats[environment.policy_seat]
-            .tracker
-            .latest_summary()
-            .ok_or(PpoError::InvalidTransition("episode next summary"))?;
-        environment
-            .reward
-            .observe(summary, tick_discount(gamma, ticks)?, outcome)?
-    };
-    let cost = elapsed_time_cost(state.time_cost_budget, state.elapsed_ticks, ticks)?;
-    let emitted = f64::from(reward.total) - cost;
+    assert_eq!(gamma, MAP2_REWARD_GAMMA_TICK);
+    let end = map2_reward_end(outcome).or_else(|| state.done.then_some(Map2RewardEnd::TimeCap));
+    let reward = take_map2_reward(environment, end, ticks)?;
+    state.map2_reward.record(reward)?;
+    let emitted = reward.total;
     state.raw_return += emitted;
     state.discounted_return += f64::from(gamma).powi(state.elapsed_ticks as i32) * emitted;
-    state.shaping_return += f64::from(reward.total - reward.terminal);
-    state.terminal_reward = reward.terminal;
+    state.shaping_return += reward.total - reward.terminal;
+    state.terminal_reward = reward.terminal as f32;
     state.elapsed_ticks += ticks;
-    state.time_cost_spent =
-        f64::from(state.time_cost_budget) * f64::from(state.elapsed_ticks) / f64::from(TICK_CAP);
-    assert!(state.time_cost_spent <= f64::from(state.time_cost_budget));
+    assert_eq!(state.raw_return, state.discounted_return);
     Ok(emitted)
 }
 
@@ -813,27 +806,29 @@ fn record_episode(
     let (label, counter) = match outcome {
         Some(PpoTerminalOutcome::Win) => ("Win", &mut report.terminal_wins),
         Some(PpoTerminalOutcome::Loss) => ("Loss", &mut report.terminal_losses),
-        Some(PpoTerminalOutcome::Draw) => {
-            return Err(PpoError::InvalidTransition("Map0 episode draw"));
-        }
-        None => ("Timeout", &mut report.episode_timeouts),
+        Some(PpoTerminalOutcome::Draw) => ("Draw", &mut report.terminal_draws),
+        None => ("TimeCap", &mut report.episode_timeouts),
     };
     *counter = counter.checked_add(1).ok_or(PpoError::CounterOverflow)?;
+    report.map2_reward.merge(state.map2_reward)?;
     eprintln!(
-        "episode: stream={stream} opponent=Teacher tick={tick} outcome={label} actor_decisions={} retained={} terminal_sample={} terminal_only={} raw_return={:.9} discounted_return={:.9} terminal_reward={} shaping_return={:.9} actions={:?} noncontinue={} time_cost_budget={} time_cost_spent={:.9} retention_phase={}",
+        "episode: stream={stream} map=2 opponent=Teacher tick={tick} outcome={label} actor_decisions={} retained={} terminal_sample={} raw_return={:.9} discounted_return={:.9} terminal_reward={} shaping_return={:.9} actions={:?} noncontinue={} retention_phase={}",
         state.decisions,
         state.retained,
-        outcome.is_some() && state.retained > 0,
-        state.terminal_only,
+        state.retained > 0,
         state.raw_return,
         state.discounted_return,
         state.terminal_reward,
         state.shaping_return,
         state.actions,
         state.decisions - state.actions[ActionKind::Continue.index()] as usize,
-        state.time_cost_budget,
-        state.time_cost_spent,
         state.retention_phase
+    );
+    crate::telemetry::PerformanceOutput::new(crate::telemetry::AsyncLogWriter::default()).emit(
+        &format_args!(
+            "level=INFO event=map2_episode_reward stream={stream} tick={tick} outcome={label} {}",
+            state.map2_reward
+        ),
     );
     Ok(())
 }
@@ -867,7 +862,7 @@ pub(crate) fn assert_discounted_intervals_for_test() {
 
 #[cfg(test)]
 pub(crate) fn assert_reset_loses_terminal_credit_for_test() {
-    let delayed_terminal_tick = 20_000;
+    let delayed_terminal_tick = 18_000;
     let maximum_window_end = 1 + training_warmup_decisions(7) as u32 * 3 + 6 + 2048 * 3;
     assert!(maximum_window_end < delayed_terminal_tick);
     let mut reset_terminals = 0;
@@ -877,7 +872,7 @@ pub(crate) fn assert_reset_loses_terminal_credit_for_test() {
         let reset_tick = 1 + 2048 * 3;
         reset_terminals += usize::from(reset_tick >= delayed_terminal_tick);
         let previous = continuous_tick;
-        continuous_tick += 2048 * 3;
+        continuous_tick = (continuous_tick + 2048 * 3).min(TICK_CAP);
         continuous_terminals += usize::from(
             previous < delayed_terminal_tick && continuous_tick >= delayed_terminal_tick,
         );
@@ -885,8 +880,16 @@ pub(crate) fn assert_reset_loses_terminal_credit_for_test() {
     assert_eq!(reset_terminals, 0);
     assert_eq!(continuous_terminals, 1);
     assert!(TICK_CAP > delayed_terminal_tick);
-    let settings = crate::cli::training_settings_for_test(&["--map", "0", "--environments", "2"])
-        .expect("windows");
+    let settings = crate::cli::training_settings_for_test(&[
+        "--map",
+        "2",
+        "--environments",
+        "2",
+        "--gamma-per-tick",
+        "1",
+        "--complete-episodes=false",
+    ])
+    .expect("windows");
     let model = PolicyModel::fresh(9911000).expect("model");
     let mut initial =
         build_training_environments(&settings, 0, settings.ppo, &model).expect("first windows");
@@ -908,16 +911,7 @@ pub(crate) fn assert_reset_loses_terminal_credit_for_test() {
 
 #[cfg(test)]
 pub(crate) fn assert_rng_and_sample_provenance_for_test(model: &PolicyModel) {
-    let settings = crate::cli::training_settings_for_test(&[
-        "--complete-episodes",
-        "--map",
-        "0",
-        "--environments",
-        "2",
-        "--rollout",
-        "8192",
-    ])
-    .expect("settings");
+    let settings = parity_settings_for_test();
     let master = PpoRng::new(9911001);
     let mut first = master.clone();
     let (state, draws) = master.checkpoint();
@@ -1012,22 +1006,6 @@ pub(crate) fn assert_checkpoint_scope_for_test(mut settings: TrainingJobConfig, 
             retention_phase(settings.seed, restored.2, stream).expect("resumed phase")
         );
     }
-    settings.episode_time_cost = 0.25;
-    let timed =
-        training_checkpoint_run(&settings, PolicyDevice::Cpu, config).expect("time cost run");
-    assert_eq!(
-        TrainingArtifact::load_compatible(directory, &timed).expect_err("time cost mismatch"),
-        crate::CheckpointError::InvalidManifest("compatibility scope")
-    );
-    settings.episode_time_cost = 0.0;
-    settings.terminal_only = true;
-    let terminal =
-        training_checkpoint_run(&settings, PolicyDevice::Cpu, config).expect("terminal run");
-    assert_eq!(
-        TrainingArtifact::load_compatible(directory, &terminal).expect_err("reward mismatch"),
-        crate::CheckpointError::InvalidManifest("compatibility scope")
-    );
-    settings.terminal_only = false;
     settings.complete_episodes = false;
     let windows =
         training_checkpoint_run(&settings, PolicyDevice::Cpu, config).expect("window run");
@@ -1039,8 +1017,16 @@ pub(crate) fn assert_checkpoint_scope_for_test(mut settings: TrainingJobConfig, 
 
 #[cfg(test)]
 pub(crate) fn assert_time_cost_for_test() {
+    for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.01, 0.250001] {
+        assert_eq!(
+            validate_time_cost(invalid)
+                .expect_err("historical cost bound")
+                .to_string(),
+            "invalid PPO config field: episode time cost must be finite in [0, 0.25]"
+        );
+    }
     let fast = elapsed_time_cost(0.25, 0, 300).expect("pregame cost");
-    let slow = elapsed_time_cost(0.25, 0, 60000).expect("long cost");
+    let slow = elapsed_time_cost(0.25, 0, TICK_CAP / 2).expect("long cost");
     let maximum = elapsed_time_cost(0.25, 0, TICK_CAP - 1).expect("maximum elapsed");
     assert!(fast > 0.0);
     assert!(1.0 - fast > 1.0 - slow);
@@ -1074,139 +1060,17 @@ pub(crate) fn assert_time_cost_for_test() {
 }
 
 #[cfg(test)]
-pub(crate) fn assert_time_cost_checkpoint_for_test(
-    mut settings: TrainingJobConfig,
-    directory: &Path,
-) {
-    validate(&settings).expect("valid time cost");
-    let config = settings.ppo;
-    let run = training_checkpoint_run(&settings, PolicyDevice::Cpu, config).expect("run");
-    assert!(
-        run.command_line
-            .ends_with(" --terminal-only --episode-time-cost 0.25")
-    );
-    let session = TrainingSession::initialize(
-        &settings,
-        PolicyDevice::Cpu,
-        directory,
-        false,
-        None,
-        config,
-        run.clone(),
-    )
-    .expect("session");
-    session
-        .save(directory, session.checkpoint_report(None))
-        .expect("checkpoint");
-    let model = PolicyModel::fresh(9941004).expect("restore target");
-    let restored =
-        restore_training_session(&model, directory, &run, config, ResumeProvenance::Strict)
-            .expect("exact resume");
-    assert_eq!(restored.0.config(), config);
-    assert_eq!(restored.1, session.sampling);
-    settings.episode_time_cost = 0.125;
-    validate(&settings).expect("different valid cost");
-    let changed =
-        training_checkpoint_run(&settings, PolicyDevice::Cpu, config).expect("different run");
-    let Err(error) = TrainingArtifact::load_compatible(directory, &changed) else {
-        panic!("different time-cost budget must reject resume");
-    };
-    assert_eq!(
-        error,
-        crate::CheckpointError::InvalidManifest("compatibility scope")
-    );
-}
-
-#[cfg(test)]
-pub(crate) fn assert_time_cost_mc_for_test() {
-    let model = PolicyModel::fresh(9941000).expect("model");
-    let mut arena =
-        build_environment(9941001, 9941002, MapId(0), 0, 0, OpponentSpec::Teacher).expect("arena");
-    let choice = sample_policy(&model, &mut PpoRng::new(9941003), &mut arena).expect("sample");
-    let config = PpoConfig {
-        environments: 3,
-        rollout_decisions: RETAINED_PER_EPISODE,
-        minibatch: 512,
-        gamma_tick: 1.0,
-        gae_lambda: 1.0,
-        ..PpoConfig::default()
-    };
-    let mut rollout = PpoRollout::new(3 * RETAINED_PER_EPISODE, choice.policy()).expect("rollout");
-    for stream in 0..3 {
-        time_cost_mc_stream_for_test(&mut rollout, &choice, stream);
-    }
-    let batch = rollout.finish(config).expect("MC batch");
-    let cost = elapsed_time_cost(0.25, 0, TICK_CAP - 1).expect("total cost");
-    for (stream, expected) in [(0, 1.0 - cost), (1, -1.0 - cost), (2, 0.5 - cost)] {
-        let first = batch.sample(stream * RETAINED_PER_EPISODE).expect("first");
-        assert!((f64::from(first.return_value()) - expected).abs() < 1e-5);
-        let last = batch
-            .sample((stream + 1) * RETAINED_PER_EPISODE - 1)
-            .expect("last");
-        assert_eq!(last.transition.terminal, stream < 2);
-        assert_eq!(
-            last.transition.next_value,
-            if stream < 2 { 0.0 } else { 0.5 }
-        );
-    }
-    assert!(batch.sample(0).expect("win").return_value() >= 0.75);
-    assert!(
-        batch
-            .sample(RETAINED_PER_EPISODE)
-            .expect("loss")
-            .return_value()
-            <= -1.0
-    );
-}
-
-#[cfg(test)]
-fn time_cost_mc_stream_for_test(rollout: &mut PpoRollout, choice: &PpoPolicyChoice, stream: usize) {
-    let mut elapsed = 0;
-    let mut retained = 0;
-    let mut interval = DiscountedInterval::default();
-    for decision in 0..ACTOR_DECISIONS {
-        let ticks = 3.min(TICK_CAP - 1 - elapsed);
-        let last = decision + 1 == ACTOR_DECISIONS;
-        let terminal = last && stream < 2;
-        let reward = if terminal {
-            if stream == 0 { 1.0 } else { -1.0 }
-        } else {
-            0.0
-        };
-        let cost = elapsed_time_cost(0.25, elapsed, ticks).expect("cost");
-        interval
-            .append(reward - cost, ticks, 1.0)
-            .expect("aggregate");
-        elapsed += ticks;
-        if interval.steps == RETENTION_STRIDE || last {
-            let outcome = std::mem::take(&mut interval).finish(
-                stream,
-                retained,
-                terminal,
-                if last { 0.5 } else { 99.0 },
-            );
-            rollout
-                .push(choice.clone().finish(outcome).expect("transition"))
-                .expect("retained");
-            retained += 1;
-        }
-    }
-    assert_eq!(retained, RETAINED_PER_EPISODE as u32);
-    assert_eq!(elapsed, TICK_CAP - 1);
-}
-
-#[cfg(test)]
 pub(crate) fn assert_full_mc_for_test() {
     let model = PolicyModel::fresh(9921000).expect("model");
     let mut arena =
-        build_environment(9921001, 9921002, MapId(0), 0, 0, OpponentSpec::Teacher).expect("arena");
+        build_environment(9921001, 9921002, MapId(2), 0, 0, OpponentSpec::Teacher).expect("arena");
     let choice = sample_policy(&model, &mut PpoRng::new(9921003), &mut arena).expect("choice");
     let config = PpoConfig {
         environments: 2,
         rollout_decisions: RETAINED_PER_EPISODE,
         minibatch: 512,
         gae_lambda: 1.0,
-        gamma_tick: 0.9999722,
+        gamma_tick: 1.0,
         ..PpoConfig::default()
     };
     let mut rollout = PpoRollout::new(2 * RETAINED_PER_EPISODE, choice.policy()).expect("rollout");
@@ -1221,12 +1085,7 @@ pub(crate) fn assert_full_mc_for_test() {
                 -31.0
             };
             let sign = if stream == 0 { 1.0 } else { -1.0 };
-            let reward = if terminal {
-                sign * tick_discount(config.gamma_tick, (count as u32 - 1) * 3)
-                    .expect("within interval")
-            } else {
-                0.0
-            };
+            let reward = if terminal { sign } else { 0.0 };
             let ticks = count as u32 * 3 - u32::from(terminal);
             rollout
                 .push(
@@ -1245,12 +1104,21 @@ pub(crate) fn assert_full_mc_for_test() {
         }
     }
     let batch = rollout.finish(config).expect("MC batch");
-    for index in [0, 1, 2000, 4001, batch.len() - 2, batch.len() - 1] {
+    assert_eq!(batch.len(), 2 * RETAINED_PER_EPISODE);
+    for index in 0..batch.len() {
         let sample = batch.sample(index).expect("sample");
         let sign = if index.is_multiple_of(2) { 1.0 } else { -1.0 };
-        let exponent = 108897 - (index / 2 * 24) as i32;
+        let actions_remaining = ACTOR_DECISIONS - 1 - index / 2 * RETENTION_STRIDE;
+        let exponent = actions_remaining as i32 * config.decision_interval_ticks as i32;
         let expected = sign * f64::from(config.gamma_tick).powi(exponent);
         assert!((f64::from(sample.return_value()) - expected).abs() < 1.0e-5);
+        let terminal = index / 2 + 1 == RETAINED_PER_EPISODE;
+        assert_eq!(sample.transition.terminal, terminal);
+        let actions = (ACTOR_DECISIONS - index / 2 * RETENTION_STRIDE).min(RETENTION_STRIDE);
+        assert_eq!(
+            sample.transition.ticks,
+            actions as u32 * 3 - u32::from(terminal)
+        );
     }
     assert_mc_timeout_for_test(choice, config);
 }
@@ -1289,21 +1157,12 @@ fn assert_mc_timeout_for_test(choice: PpoPolicyChoice, config: PpoConfig) {
 #[cfg(test)]
 pub(crate) fn assert_ragged_streams_for_test(model: &PolicyModel) {
     for count in [2, 4, 6] {
-        let mut settings = crate::cli::training_settings_for_test(&[
-            "--complete-episodes",
-            "--map",
-            "0",
-            "--environments",
-            "2",
-            "--rollout",
-            "4538",
-        ])
-        .expect("settings");
+        let mut settings = parity_settings_for_test();
         settings.ppo.environments = count;
         validate(&settings).expect("bounded paired batch");
         if count == 2 {
             for update in [0, 1, 17] {
-                let arenas = environments(&settings, update).expect("legacy E2 seed mapping");
+                let arenas = environments(&settings, update).expect("paired E2 seed mapping");
                 for (side, arena) in arenas.iter().enumerate() {
                     assert_eq!(arena.policy_seat, side);
                     assert_eq!(

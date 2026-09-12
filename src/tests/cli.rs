@@ -237,7 +237,7 @@ fn cli_accepts_bounded_ppo_smoke_parameters() {
         "--seed",
         "77",
         "--map",
-        "1",
+        "2",
         "--device",
         "cuda",
         "--device-ordinal",
@@ -268,7 +268,7 @@ fn cli_accepts_bounded_self_play_smoke_parameters() {
         "--seed",
         "77",
         "--map",
-        "1",
+        "2",
         "--device",
         "metal",
         "--device-ordinal",
@@ -371,7 +371,7 @@ fn cli_accepts_fixed_checkpoint_evaluation_matrix() {
 }
 
 #[test]
-fn cli_rejects_partial_checkpoint_evaluation_matrix() {
+fn cli_evaluation_rejects_legacy_map_selection() {
     let error = crate::cli::parse_from([
         "drysua",
         "evaluate",
@@ -380,7 +380,7 @@ fn cli_rejects_partial_checkpoint_evaluation_matrix() {
         "--map",
         "1",
     ])
-    .expect_err("evaluation matrix must include both maps");
+    .expect_err("evaluation is Map2 only");
 
     assert!(error.to_string().contains("unexpected argument '--map'"));
 }
@@ -403,7 +403,7 @@ fn cli_accepts_bounded_teacher_pretraining() {
 }
 
 #[test]
-fn cli_rejects_partial_map_teacher_pretraining() {
+fn cli_teacher_pretraining_rejects_legacy_map_selection() {
     let error = crate::cli::parse_from([
         "drysua",
         "pretrain",
@@ -412,7 +412,7 @@ fn cli_rejects_partial_map_teacher_pretraining() {
         "--map",
         "1",
     ])
-    .expect_err("pretraining must cover both maps");
+    .expect_err("pretraining is Map2 only");
 
     assert!(error.to_string().contains("unexpected argument '--map'"));
 }
@@ -472,13 +472,18 @@ fn neural_default_rejects_missing_weights() {
 }
 #[cfg(feature = "builtin")]
 #[test]
-fn train_full_defaults_preserve_the_existing_ppo_config_exactly() {
+fn train_full_defaults_use_complete_map2_episodes_and_undiscounted_full_reward() {
     let settings = crate::cli::training_settings_for_test(&[]).expect("default settings");
+    assert_eq!(settings.map, bota_proto::MapId(2));
+    assert!(settings.complete_episodes);
+    assert!(!settings.terminal_only);
+    assert_eq!(settings.episode_time_cost, 0.0);
     assert_eq!(
         settings.ppo,
         crate::PpoConfig {
             environments: 4,
             rollout_decisions: 2_048,
+            gamma_tick: 1.0,
             ..crate::PpoConfig::default()
         }
     );
@@ -486,23 +491,23 @@ fn train_full_defaults_preserve_the_existing_ppo_config_exactly() {
 
 #[cfg(feature = "builtin")]
 #[test]
-fn train_full_long_horizon_flags_reach_training_config() {
+fn train_full_map2_hyperparameter_flags_reach_training_config_without_override() {
     let settings = crate::cli::training_settings_for_test(&[
         "--map",
-        "0",
+        "2",
         "--learning-rate",
         "3e-5",
         "--gamma-per-tick",
-        "0.9999722",
+        "1",
         "--gae-lambda",
         "0.995",
         "--entropy-coefficient",
         "0.001",
     ])
     .expect("long horizon settings");
-    assert_eq!(settings.map, bota_proto::MapId(0));
+    assert_eq!(settings.map, bota_proto::MapId(2));
     assert_eq!(settings.ppo.learning_rate, 3e-5);
-    assert_eq!(settings.ppo.gamma_tick, 0.9999722);
+    assert_eq!(settings.ppo.gamma_tick, 1.0);
     assert_eq!(settings.ppo.gae_lambda, 0.995);
     assert_eq!(settings.ppo.entropy_coefficient, 0.001);
 }
@@ -546,48 +551,207 @@ fn train_full_rejects_nonfinite_and_out_of_range_hyperparameters() {
 
 #[cfg(feature = "builtin")]
 #[test]
-fn train_full_accepts_existing_discount_boundaries() {
-    let settings = crate::cli::training_settings_for_test(&[
-        "--gamma-per-tick",
-        "0",
-        "--gae-lambda",
-        "0.99999994",
-    ])
-    .expect("existing valid boundaries");
-    assert_eq!(settings.ppo.gamma_tick, 0.0);
-    assert_eq!(settings.ppo.gae_lambda, 0.99999994);
+fn train_full_map2_rejects_discounting_instead_of_silently_forcing_gamma_one() {
+    for gamma in ["0", "0.9966555", "0.9999722", "0.99999994"] {
+        let error = crate::cli::training_settings_for_test(&["--gamma-per-tick", gamma])
+            .expect_err("Map2 potential accounting requires gamma one");
+        assert_eq!(
+            error.to_string(),
+            "Map2 comprehensive reward requires --gamma-per-tick 1"
+        );
+    }
 }
+
 #[test]
-fn cli_evaluate_accepts_explicit_pure_neural_map_zero_mode() {
-    crate::cli::parse_from([
-        "drysua",
-        "evaluate",
-        "--checkpoint-directory",
-        ".",
-        "--neural-map0",
-    ])
-    .expect("explicit pure evaluation flag");
-}
-#[test]
-fn neural_terminal_evaluation_accepts_teacher_only_but_hybrid_rejects_it() {
-    crate::cli::parse_from([
-        "drysua",
-        "evaluate",
-        "--checkpoint-directory",
-        ".",
-        "--neural-map0",
-        "--teacher-only",
-        "--decisions",
-        "36300",
-    ])
-    .expect("bounded full-game pure evaluation");
+fn cli_evaluate_rejects_removed_neural_map_zero_mode() {
     let error = crate::cli::parse_from([
         "drysua",
         "evaluate",
         "--checkpoint-directory",
         ".",
-        "--teacher-only",
+        "--neural-map0",
     ])
-    .expect_err("Teacher-only requires explicit Neural");
-    assert!(error.to_string().contains("--neural-map0"));
+    .expect_err("Map0 evaluation is no longer a production mode");
+    assert!(
+        error
+            .to_string()
+            .contains("unexpected argument '--neural-map0'")
+    );
+}
+
+#[test]
+fn cli_map2_evaluation_accepts_teacher_only_without_a_policy_override() {
+    crate::cli::parse_from([
+        "drysua",
+        "evaluate",
+        "--checkpoint-directory",
+        ".",
+        "--teacher-only",
+        "--decisions",
+        &crate::MAP2_ACTOR_DECISIONS.to_string(),
+    ])
+    .expect("bounded full-game pure evaluation");
+}
+
+#[test]
+fn cli_all_training_commands_default_to_map2_and_reject_other_maps_before_execution() {
+    for operation in ["train", "train-full", "league"] {
+        let help = crate::cli::parse_from(["drysua", operation, "--help"])
+            .expect_err("help is not execution")
+            .to_string();
+        let map_help = help.split("--map <MAP>").nth(1).expect("map option");
+        assert!(
+            map_help
+                .lines()
+                .take(2)
+                .any(|line| line.contains("[default: 2]"))
+        );
+        for map in ["0", "1", "3", "65535"] {
+            let mut arguments = vec!["drysua", operation, "--map", map];
+            if operation == "train-full" {
+                arguments.extend(["--updates", "1", "--checkpoint-directory", "."]);
+            }
+            crate::cli::parse_from(arguments.clone()).expect_err("reject before execution");
+            let error = crate::cli::run_from_for_test(arguments)
+                .expect_err("unsupported map must fail before provenance, devices, or arenas");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&format!("invalid value '{map}' for '--map <MAP>'"))
+            );
+        }
+    }
+}
+
+#[test]
+fn cli_map2_evaluation_defaults_to_the_complete_episode_action_cap() {
+    let help = crate::cli::parse_from(["drysua", "evaluate", "--help"])
+        .expect_err("help")
+        .to_string();
+    assert!(help.contains("Map2"));
+    assert!(help.contains(&format!("[default: {}]", crate::MAP2_ACTOR_DECISIONS)));
+    assert!(help.contains(&format!("{} ticks including pregame", crate::MAP2_TICK_CAP)));
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn train_full_map2_rejects_terminal_only_instead_of_silently_enabling_dense_reward() {
+    let error = crate::cli::training_settings_for_test(&["--terminal-only", "--complete-episodes"])
+        .expect_err("Map2 requires comprehensive reward");
+    assert_eq!(
+        error.to_string(),
+        "Map2 comprehensive reward forbids --terminal-only"
+    );
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn train_full_map2_reward_errors_precede_compiled_provenance_and_checkpoint_access() {
+    for (flag, message) in [
+        (
+            "--terminal-only",
+            "Map2 comprehensive reward forbids --terminal-only",
+        ),
+        (
+            "--episode-time-cost=0.1",
+            "Map2 comprehensive reward requires --episode-time-cost 0",
+        ),
+        (
+            "--gamma-per-tick=0.9",
+            "Map2 comprehensive reward requires --gamma-per-tick 1",
+        ),
+    ] {
+        let error = crate::cli::run_from_for_test([
+            "drysua",
+            "train-full",
+            "--updates",
+            "1",
+            "--checkpoint-directory",
+            "artifacts/temp/not-accessed-map2-reward-validation",
+            flag,
+        ])
+        .expect_err("invalid reward must not start a training job");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert_eq!(error.to_string(), message);
+    }
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn train_full_map2_rejects_nonzero_and_nonfinite_episode_time_cost() {
+    for cost in ["-0.1", "0.00000001", "0.25", "NaN", "inf", "-inf"] {
+        let argument = format!("--episode-time-cost={cost}");
+        let error = crate::cli::training_settings_for_test(&[&argument])
+            .expect_err("Map2 forbids a separate time cost");
+        assert_eq!(
+            error.to_string(),
+            "Map2 comprehensive reward requires --episode-time-cost 0"
+        );
+    }
+    for zero in ["0", "-0"] {
+        let argument = format!("--episode-time-cost={zero}");
+        let settings = crate::cli::training_settings_for_test(&[&argument]).expect("zero cost");
+        assert_eq!(settings.episode_time_cost, 0.0);
+    }
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn train_full_map2_retention_capacity_accepts_1163_and_rejects_1162_for_paired_environments() {
+    for environments in ["2", "4", "6"] {
+        let settings = crate::cli::training_settings_for_test(&[
+            "--environments",
+            environments,
+            "--rollout",
+            &crate::MAP2_RETAINED_DECISIONS.to_string(),
+            "--minibatch",
+            "64",
+        ])
+        .expect("shared ceiling actor budget divided by retention stride");
+        assert!(settings.complete_episodes);
+        assert_eq!(settings.ppo.decision_interval_ticks, 3);
+        let error = crate::cli::training_settings_for_test(&[
+            "--environments",
+            environments,
+            "--rollout",
+            &(crate::MAP2_RETAINED_DECISIONS - 1).to_string(),
+            "--minibatch",
+            "64",
+        ])
+        .expect_err("one row below complete episode capacity");
+        assert_eq!(
+            error.to_string(),
+            "invalid PPO config field: complete episode retained capacity"
+        );
+    }
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn train_full_map2_complete_episodes_reject_unpaired_or_excess_environment_counts() {
+    for environments in ["1", "3", "5", "8", "16"] {
+        let error = crate::cli::training_settings_for_test(&["--environments", environments])
+            .expect_err("complete episodes require two, four, or six environments");
+        assert_eq!(
+            error.to_string(),
+            "invalid PPO config field: complete episodes require Map2, two/four/six environments, and three-tick actions"
+        );
+    }
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn train_full_map2_reset_windows_require_explicit_opt_out_and_keep_full_reward() {
+    let settings = crate::cli::training_settings_for_test(&[
+        "--complete-episodes=false",
+        "--rollout",
+        "8",
+        "--minibatch",
+        "32",
+    ])
+    .expect("explicit reset window");
+    assert!(!settings.complete_episodes);
+    assert_eq!(settings.map, bota_proto::MapId(2));
+    assert_eq!(settings.ppo.gamma_tick, 1.0);
+    assert!(!settings.terminal_only);
 }

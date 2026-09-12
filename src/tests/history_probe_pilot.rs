@@ -548,7 +548,7 @@ fn conditioning_statistics_error(
 
 fn conditioning_frame(frame: &FeatureFrame) -> FeatureFrame {
     assert!(frame.is_finite());
-    assert_eq!(frame.global.len(), 72);
+    assert_eq!(frame.global.len(), 85);
     assert_eq!(frame.global[59..64], [0.0; 5], "no enriched history");
     let mut scaled = frame.clone();
     for index in CONDITIONING_GLOBALS {
@@ -592,7 +592,7 @@ fn conditioning_trunk_offset(model: &PolicyModel) -> usize {
     let mut trunk = None;
     for (name, shape) in model.parameter_schema().expect("audited parameter layout") {
         if name == "trunk.0.weight" {
-            assert_eq!(shape, [2576, 512]);
+            assert_eq!(shape, [2589, 512]);
             trunk = Some(offset);
         }
         offset += shape.iter().product::<usize>();

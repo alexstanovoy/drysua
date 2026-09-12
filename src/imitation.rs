@@ -29,9 +29,9 @@ pub const MAX_SEED_NAMESPACE: usize = 8_192;
 pub const MAX_TRAINING_COUNTER: u64 = 1_000_000_000;
 /// Minimum rollout action count accepted by the promotion gate.
 pub const MIN_PROMOTION_ROLLOUT_ACTIONS: u64 = 1_000;
-/// Current training scope: unchanged Teacher decisions with F12 observation-only order bookkeeping.
-/// Prior rule-12 samples are historical data, not relabeled rule-13 observations.
-pub const IMITATION_RULES_AUDIT_VERSION: u32 = 13;
+/// Current sample audit: F15/A5 includes walkable building-landing MovePoint targets.
+/// Prior masks, samples and reports cannot be relabelled under the expanded legal set.
+pub const IMITATION_RULES_AUDIT_VERSION: u32 = 15;
 
 const TARGET_MODE_HEAD: usize = 3;
 const PUT_MODE_HEAD: usize = 2;
@@ -1054,6 +1054,7 @@ impl SampleIdentity {
 pub enum TrainingMapScope {
     Zero,
     One,
+    Two,
     ZeroAndOne,
 }
 
@@ -1062,6 +1063,7 @@ impl TrainingMapScope {
         match map {
             MapId(0) => Ok(Self::Zero),
             MapId(1) => Ok(Self::One),
+            MapId(2) => Ok(Self::Two),
             _ => Err(ImitationError::InvalidFrameMap),
         }
     }
@@ -1069,7 +1071,9 @@ impl TrainingMapScope {
     pub const fn contains(self, map: MapId) -> bool {
         matches!(
             (self, map),
-            (Self::Zero | Self::ZeroAndOne, MapId(0)) | (Self::One | Self::ZeroAndOne, MapId(1))
+            (Self::Zero | Self::ZeroAndOne, MapId(0))
+                | (Self::One | Self::ZeroAndOne, MapId(1))
+                | (Self::Two, MapId(2))
         )
     }
 }
@@ -1523,9 +1527,11 @@ fn frame_side(frame: &FeatureFrame) -> Result<ImitationSide, ImitationError> {
 fn frame_map(frame: &FeatureFrame) -> Result<MapId, ImitationError> {
     let zero = frame.global()[global_feature::MAP_ZERO];
     let one = frame.global()[global_feature::MAP_ONE];
-    match (zero, one) {
-        (1.0, 0.0) => Ok(MapId(0)),
-        (0.0, 1.0) => Ok(MapId(1)),
+    let two = frame.global()[global_feature::MAP_TWO];
+    match (zero, one, two) {
+        (1.0, 0.0, 0.0) => Ok(MapId(0)),
+        (0.0, 1.0, 0.0) => Ok(MapId(1)),
+        (0.0, 0.0, 1.0) => Ok(MapId(2)),
         _ => Err(ImitationError::InvalidFrameMap),
     }
 }

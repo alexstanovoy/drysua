@@ -484,10 +484,12 @@ class WireTests(unittest.TestCase):
         relay.stop = Mock()
         relay.stop.is_set.return_value = False
         relay.buffer = bytearray()
-        relay.observed = dict(winner="Radiant")
+        relay.client_buffer = bytearray()
+        relay.client_bytes = relay.client_frames = 0
+        relay.observed = dict(winner="Radiant", last_snapshot=9)
         client_socket, server_socket = Mock(), Mock()
         server_socket.recv.return_value = b""
-        client_socket.recv.side_effect = [b"final ack", b""]
+        client_socket.recv.side_effect = [struct.pack("<I", 2) + bytes([4, 9]), b""]
         with patch("release_wire.select.select", side_effect=[
                 ([server_socket], [], []), ([client_socket], [], []), ([client_socket], [], [])]):
             relay.pump(client_socket, server_socket)

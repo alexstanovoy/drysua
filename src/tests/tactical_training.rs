@@ -179,12 +179,43 @@ fn live_tactical_wire_orders_match_training_on_the_same_visible_stream() {
             mode: bota_proto::TickMode::Lockstep,
         };
 
-        let outcome = crate::play_tactical_on(&mut wire, seated, Some(6_001), &policy)
-            .expect("replayed deployment");
+        let outcome =
+            crate::play_tactical_on(&mut wire, seated, Some(TACTICAL_REPLAY_LIMIT), &policy)
+                .expect("replayed deployment");
 
         assert_eq!(wire.orders_hash.finish(), expected);
         assert_eq!(outcome.orders, wire.orders);
+        assert_eq!(outcome.rejections, 0);
         assert!(outcome.decisions > 0);
+    }
+}
+
+#[test]
+fn tactical_override_witness_requires_a_visible_threat_and_an_eligible_recover_state() {
+    let policy = tactical_search_founders()[TacticalMode::Recover.index()].clone();
+    let (_, opening) = Arena::new(ArenaConfig {
+        seats: 2,
+        map: MapId(1),
+        seed: 9_200_400,
+    })
+    .expect("unprimed historical opening");
+    let (_, witness) = tactical_replay_arena();
+    for side in 0..2 {
+        let mut unprimed = new_seat(side, &opening.messages[usize::from(side)]).expect("opening");
+        let initial = seat_request(&mut unprimed, Some(&policy)).expect("opening request");
+        assert_eq!(unprimed.sampled_decisions, 1);
+        assert_eq!(unprimed.effective_overrides, 0);
+        let mut residual = new_seat(side, &witness.messages[usize::from(side)]).expect("witness");
+        let mut teacher =
+            new_seat(side, &witness.messages[usize::from(side)]).expect("counterfactual");
+        let selected = seat_request(&mut residual, Some(&policy)).expect("residual");
+        let original = seat_request(&mut teacher, None).expect("Teacher");
+        assert_eq!(residual.effective_overrides, 1);
+        assert_ne!(selected, original);
+        println!(
+            "tactical_fixture side={side} opening={initial:?} teacher={original:?} recover={selected:?} sampled={} overrides={}",
+            residual.sampled_decisions, residual.effective_overrides
+        );
     }
 }
 
@@ -407,14 +438,15 @@ fn development_seed_namespace_and_cohort_bounds_fail_closed() {
 }
 
 #[test]
-fn default_policy_matches_teacher_full_game_orders_on_both_seats() {
+fn default_policy_matches_teacher_bounded_map1_orders_on_both_seats() {
     let settings = TacticalMatchConfig {
         seed: 9_200_003,
         candidate_seat: 0,
-        tick_limit: 30_000,
+        tick_limit: TACTICAL_REPLAY_LIMIT,
     };
     let baseline = evaluate_tactical_match(None, settings).expect("Teacher mirror");
-    assert_ne!(baseline.outcome, TacticalMatchOutcome::Timeout);
+    // The rebased demo has neither an Ancient nor hero/tower termination.
+    assert_eq!(baseline.outcome, TacticalMatchOutcome::Timeout);
     for candidate_seat in 0..2 {
         let candidate = evaluate_tactical_match(
             Some(&TacticalPolicy::default()),
@@ -701,20 +733,17 @@ impl crate::Wire for ReplayWire {
     }
 }
 
+const TACTICAL_REPLAY_LIMIT: u32 = 31;
+
 fn recorded_stream(policy: &TacticalPolicy, candidate_seat: u8) -> (Vec<ServerMsg>, u64) {
-    let (mut arena, start) = Arena::new(ArenaConfig {
-        seats: 2,
-        map: MapId(1),
-        seed: 9_200_400,
-    })
-    .expect("arena");
+    let (mut arena, start) = tactical_replay_arena();
     let mut seats = [
         new_seat(0, &start.messages[0]).expect("Radiant"),
         new_seat(1, &start.messages[1]).expect("Dire"),
     ];
     let candidate = usize::from(candidate_seat);
     let mut messages = start.messages[candidate].clone();
-    for _ in 1..6_001 {
+    for _ in 1..TACTICAL_REPLAY_LIMIT {
         let mut requests = [None, None];
         if (arena.tick() - 1).is_multiple_of(3) {
             for (index, seat) in seats.iter_mut().enumerate() {
@@ -731,17 +760,41 @@ fn recorded_stream(policy: &TacticalPolicy, candidate_seat: u8) -> (Vec<ServerMs
         }
         let step = arena.step(&requests).expect("step");
         messages.extend(step.messages[candidate].clone());
-        let mut terminal = false;
         for (seat, stream) in seats.iter_mut().zip(&step.messages) {
-            terminal |= observe_messages(seat, stream).expect("stream").is_some();
-        }
-        if terminal {
-            break;
+            assert!(observe_messages(seat, stream).expect("stream").is_none());
         }
     }
-    assert!(messages.len() <= 18_004);
+    assert!(messages.len() <= TACTICAL_REPLAY_LIMIT as usize * 3 + 1);
     assert!(seats[candidate].effective_overrides > 0);
     (messages, seats[candidate].orders_hash.finish())
+}
+
+fn tactical_replay_arena() -> (Arena, crate::ArenaStart) {
+    let (mut arena, mut start) = Arena::new(ArenaConfig {
+        seats: 2,
+        map: MapId(1),
+        seed: 9_200_400,
+    })
+    .expect("arena");
+    let configured = arena.configure_for_test(|world| {
+        for index in 0..2 {
+            let hero = world.seats[index].unit.expect("hero");
+            world.seats[index].gold = 0;
+            world.statuses.remove(hero);
+            world.set_order(hero, bota_server::game::UnitOrder::Stand);
+            world.transform.get_mut(hero).expect("hero position").pos =
+                bota_proto::Vec2::from_ints(8_600 + index as i32 * 440, 8_900);
+            world.health.get_mut(hero).expect("health").hp = bota_proto::Fixed::from_int(400);
+            world.mana.get_mut(hero).expect("mana").mana = bota_proto::Fixed::from_int(100);
+            // Spend the initial point in a passive; learning/buying must not intercept this witness.
+            world.abilities.get_mut(hero).expect("abilities").slots[3].level = 1;
+        }
+    });
+    for (messages, current) in start.messages.iter_mut().zip(configured.messages) {
+        messages.truncate(1);
+        messages.extend(current);
+    }
+    (arena, start)
 }
 
 fn directory(label: &str) -> PathBuf {

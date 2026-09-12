@@ -59,6 +59,7 @@ fn teacher_release_evaluation_reports_three_seeds_on_both_sides() {
 #[test]
 fn actor_report_merge_retains_all_terminal_telemetry() {
     let mut aggregate = crate::PpoSmokeReport {
+        episode_timeouts: 5,
         terminal_wins: 1,
         terminal_losses: 2,
         terminal_draws: 3,
@@ -67,6 +68,7 @@ fn actor_report_merge_retains_all_terminal_telemetry() {
         ..crate::PpoSmokeReport::default()
     };
     let actor = crate::PpoSmokeReport {
+        episode_timeouts: 10,
         terminal_wins: 6,
         terminal_losses: 7,
         terminal_draws: 8,
@@ -82,6 +84,56 @@ fn actor_report_merge_retains_all_terminal_telemetry() {
     assert_eq!(aggregate.terminal_draws, 11);
     assert_eq!(aggregate.rejected_orders, 13);
     assert_eq!(aggregate.elapsed_ticks, 15);
+    assert_eq!(aggregate.episode_timeouts, 15);
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn actor_report_merge_preserves_map2_reward_components_and_raw_observations() {
+    let source = crate::Map2TrainingReward {
+        ticks: 3,
+        gold: 0.5,
+        experience: 0.25,
+        hero_damage: 0.125,
+        hero_damage_taken: -0.125,
+        creep_damage_taken: -0.25,
+        other_damage_taken: -0.5,
+        mana_spent: -0.25,
+        tower_health: 0.25,
+        lane_pressure: 0.5,
+        terminal: 1.0,
+        total: 1.5,
+        observations: crate::Map2RewardObservations {
+            hero_damage_dealt: 50,
+            mana_spent: 75,
+            lane_observed_ticks: 3,
+            ..crate::Map2RewardObservations::default()
+        },
+    };
+    let actor = crate::PpoSmokeReport {
+        map2_reward: source,
+        elapsed_ticks: 3,
+        ..crate::PpoSmokeReport::default()
+    };
+    let mut aggregate = actor;
+
+    crate::merge_actor_report_for_test(&mut aggregate, actor).expect("merge Map2 components");
+
+    assert_eq!(aggregate.map2_reward.ticks, 6);
+    assert_eq!(aggregate.map2_reward.gold, 1.0);
+    assert_eq!(aggregate.map2_reward.experience, 0.5);
+    assert_eq!(aggregate.map2_reward.hero_damage, 0.25);
+    assert_eq!(aggregate.map2_reward.hero_damage_taken, -0.25);
+    assert_eq!(aggregate.map2_reward.creep_damage_taken, -0.5);
+    assert_eq!(aggregate.map2_reward.other_damage_taken, -1.0);
+    assert_eq!(aggregate.map2_reward.mana_spent, -0.5);
+    assert_eq!(aggregate.map2_reward.tower_health, 0.5);
+    assert_eq!(aggregate.map2_reward.lane_pressure, 1.0);
+    assert_eq!(aggregate.map2_reward.terminal, 2.0);
+    assert_eq!(aggregate.map2_reward.total, 3.0);
+    assert_eq!(aggregate.map2_reward.observations.hero_damage_dealt, 100);
+    assert_eq!(aggregate.map2_reward.observations.mana_spent, 150);
+    assert_eq!(aggregate.map2_reward.observations.lane_observed_ticks, 6);
 }
 
 #[cfg(feature = "builtin")]
@@ -140,9 +192,24 @@ fn rollout_compacts_sparse_tokens_and_bit_packs_behavioral_masks_losslessly() {
 
 #[test]
 fn ppo_schema_and_rules_audit_are_stable() {
-    assert_eq!(PPO_SCHEMA_VERSION, 27);
-    assert_eq!(PPO_RULES_AUDIT_VERSION, 22);
-    assert_eq!(PPO_SCHEMA_HASH, 9_274_275_648_898_675_046);
+    assert_eq!(PPO_SCHEMA_VERSION, 30);
+    assert_eq!(PPO_RULES_AUDIT_VERSION, 25);
+    assert_eq!(
+        PPO_SCHEMA_HASH,
+        super::map2_checkpoint::schema_hash(
+            crate::PPO_SCHEMA_DESCRIPTOR,
+            &[
+                (crate::ACTION_SCHEMA_VERSION, crate::ACTION_SCHEMA_HASH),
+                (crate::FEATURE_SCHEMA_VERSION, crate::FEATURE_SCHEMA_HASH),
+                (crate::MODEL_SCHEMA_VERSION, crate::MODEL_SCHEMA_HASH),
+                (
+                    crate::MAP2_REWARD_SCHEMA_VERSION,
+                    crate::MAP2_REWARD_SCHEMA_HASH
+                ),
+            ],
+        )
+    );
+    assert_ne!(PPO_SCHEMA_HASH, 9_274_275_648_898_675_046);
     assert_eq!(PpoConfig::default().learning_rate, 3.0e-6);
 }
 
@@ -1056,7 +1123,7 @@ fn builtin_smoke_exercises_real_arena_rollout_and_one_ppo_update() {
         epochs: 1,
         minibatch: 2,
         seed: 77,
-        map: bota_proto::MapId(1),
+        map: bota_proto::MapId(2),
     })
     .expect("smoke PPO");
 
@@ -1064,6 +1131,8 @@ fn builtin_smoke_exercises_real_arena_rollout_and_one_ppo_update() {
     assert_eq!(report.transitions, 2);
     assert_eq!(report.optimizer_step, 1);
     assert_eq!(report.elapsed_ticks, 6);
+    assert_eq!(report.map2_reward.ticks, report.elapsed_ticks);
+    assert!(report.map2_reward.total.is_finite());
     assert!(report.final_policy_loss.is_finite());
     assert!(report.final_value_loss.is_finite());
     assert!(report.final_entropy.is_finite());
@@ -1080,7 +1149,7 @@ fn persistent_actor_refreshes_policy_after_waiting_for_a_recycled_buffer() {
         epochs: 1,
         minibatch: 4,
         seed: 3,
-        map: bota_proto::MapId(1),
+        map: bota_proto::MapId(2),
     })
     .expect("three-update pipeline");
 
@@ -1123,10 +1192,11 @@ fn production_training_resume_matches_uninterrupted_parameters_adam_and_rng() {
 
 #[cfg(feature = "builtin")]
 #[test]
-fn long_horizon_map_zero_resume_matches_uninterrupted_parameters_adam_and_rng() {
+fn map2_gamma_one_resume_matches_uninterrupted_parameters_adam_and_rng() {
     let settings = crate::cli::training_settings_for_test(&[
+        "--complete-episodes=false",
         "--map",
-        "0",
+        "2",
         "--environments",
         "2",
         "--rollout",
@@ -1138,13 +1208,13 @@ fn long_horizon_map_zero_resume_matches_uninterrupted_parameters_adam_and_rng() 
         "--learning-rate",
         "3e-5",
         "--gamma-per-tick",
-        "0.9999722",
+        "1",
         "--gae-lambda",
         "0.995",
         "--entropy-coefficient",
         "0.001",
     ])
-    .expect("long horizon config");
+    .expect("Map2 reset-window config");
     assert_production_resume_matches_uninterrupted(Some(settings));
 }
 
@@ -1162,12 +1232,13 @@ fn assert_production_resume_matches_uninterrupted(overrides: Option<crate::Train
             rollout_decisions: 2,
             epochs: 1,
             minibatch: 2,
+            gamma_tick: 1.0,
             ..crate::PpoConfig::default()
         },
         checkpoint_cadence: crate::TrainingCheckpointCadence::Updates(1),
         resume_provenance: crate::ResumeProvenance::Strict,
         seed: 23_071,
-        map: bota_proto::MapId(1),
+        map: bota_proto::MapId(2),
         git_commit: "test-drysua-commit".to_owned(),
         simulator_commit: "test-bota-commit".to_owned(),
     };
@@ -1269,12 +1340,13 @@ fn training_job_checkpoints_and_resumes_from_the_next_update() {
             rollout_decisions: 2,
             epochs: 1,
             minibatch: 2,
+            gamma_tick: 1.0,
             ..crate::PpoConfig::default()
         },
         checkpoint_cadence: crate::TrainingCheckpointCadence::Updates(1),
         resume_provenance: crate::ResumeProvenance::Strict,
         seed: 23_071,
-        map: bota_proto::MapId(1),
+        map: bota_proto::MapId(2),
         git_commit: "test-drysua-commit".to_owned(),
         simulator_commit: "test-bota-commit".to_owned(),
     };
@@ -1389,12 +1461,13 @@ fn fresh_training_loads_the_requested_runtime_weights_before_the_first_update() 
             rollout_decisions: 2,
             epochs: 1,
             minibatch: 2,
+            gamma_tick: 1.0,
             ..crate::PpoConfig::default()
         },
         checkpoint_cadence: crate::TrainingCheckpointCadence::Updates(1),
         resume_provenance: crate::ResumeProvenance::Strict,
         seed: 23_075,
-        map: bota_proto::MapId(1),
+        map: bota_proto::MapId(2),
         git_commit: "test-drysua-commit".to_owned(),
         simulator_commit: "test-bota-commit".to_owned(),
     };
@@ -1430,12 +1503,13 @@ fn production_training_rejects_an_unpaired_environment_count() {
                 rollout_decisions: 2,
                 epochs: 1,
                 minibatch: 2,
+                gamma_tick: 1.0,
                 ..crate::PpoConfig::default()
             },
             checkpoint_cadence: crate::TrainingCheckpointCadence::Updates(1),
             resume_provenance: crate::ResumeProvenance::Strict,
             seed: 23_079,
-            map: bota_proto::MapId(1),
+            map: bota_proto::MapId(2),
             git_commit: "test-drysua-commit".to_owned(),
             simulator_commit: "test-bota-commit".to_owned(),
         },
@@ -1463,16 +1537,17 @@ fn resumed_training_rejects_an_initial_weights_directory() {
         complete_episodes: false,
         updates: 1,
         ppo: crate::PpoConfig {
-            environments: 1,
+            environments: 2,
             rollout_decisions: 2,
             epochs: 1,
             minibatch: 2,
+            gamma_tick: 1.0,
             ..crate::PpoConfig::default()
         },
         checkpoint_cadence: crate::TrainingCheckpointCadence::Updates(1),
         resume_provenance: crate::ResumeProvenance::Strict,
         seed: 23_076,
-        map: bota_proto::MapId(1),
+        map: bota_proto::MapId(2),
         git_commit: "test-drysua-commit".to_owned(),
         simulator_commit: "test-bota-commit".to_owned(),
     };
@@ -1512,16 +1587,17 @@ fn training_job_rejects_a_checkpoint_directory_locked_by_another_writer() {
             complete_episodes: false,
             updates: 1,
             ppo: crate::PpoConfig {
-                environments: 1,
+                environments: 2,
                 rollout_decisions: 2,
                 epochs: 1,
                 minibatch: 2,
+                gamma_tick: 1.0,
                 ..crate::PpoConfig::default()
             },
             checkpoint_cadence: crate::TrainingCheckpointCadence::Updates(1),
             resume_provenance: crate::ResumeProvenance::Strict,
             seed: 23_072,
-            map: bota_proto::MapId(1),
+            map: bota_proto::MapId(2),
             git_commit: "test-drysua-commit".to_owned(),
             simulator_commit: "test-bota-commit".to_owned(),
         },
@@ -1636,47 +1712,177 @@ fn production_seed_derivation_accepts_maximum_seed_without_overflow() {
 
 #[cfg(feature = "builtin")]
 #[test]
-fn teacher_pretraining_collection_is_balanced_bounded_and_diverse() {
-    const EXPECTED_MAP_ONE_SAMPLES: u64 = 4_663;
-    let (samples, actions, splits) =
-        crate::collect_pretraining_summary_for_test(50_001).expect("pretraining collection");
-    println!("samples={samples} actions={actions:?} splits={splits:?}");
+fn teacher_pretraining_short_map2_collection_preserves_scope_splits_sides_and_sample_bounds() {
+    let pool = crate::collect_pretraining_pool_for_test(50_001, 8)
+        .expect("eight decisions per seed, not a full trajectory regression");
+    let mut sides = [[0usize; 2]; 3];
+    let mut kinds = [[0usize; ActionKind::COUNT]; 3];
+    let mut identities = std::collections::BTreeSet::new();
 
-    assert_eq!(
-        u64::try_from(samples).expect("sample count fits"),
-        EXPECTED_MAP_ONE_SAMPLES
-    );
-    assert_eq!(
-        actions.into_iter().flatten().sum::<u64>(),
-        EXPECTED_MAP_ONE_SAMPLES
-    );
-    assert_eq!(splits.iter().sum::<usize>(), samples);
-    assert!(splits.into_iter().all(|count| count > 0));
-    assert!(actions[0].iter().filter(|count| **count != 0).count() >= 2);
-    assert!(actions[1][ActionKind::MovePoint.index()] > 0);
-    assert!(actions[1][ActionKind::AttackMovePoint.index()] > 0);
-    assert!(actions[2][ActionKind::MovePoint.index()] > 0);
-    assert!(actions[2][ActionKind::AttackMovePoint.index()] > 0);
-    assert!(actions[0][ActionKind::Continue.index()] > actions[0][ActionKind::MovePoint.index()]);
-    assert!(
-        actions[0][ActionKind::Continue.index()] > actions[0][ActionKind::AttackMovePoint.index()]
-    );
-    assert_eq!(actions[0][ActionKind::Continue.index()], 1_536);
-    assert_eq!(actions[1][ActionKind::Continue.index()], 336);
-    assert_eq!(actions[2][ActionKind::Continue.index()], 336);
-    for kind in ActionKind::ALL
-        .into_iter()
-        .filter(|kind| *kind != ActionKind::Continue)
-    {
-        assert!(actions[0][kind.index()] <= 192);
-        assert!(actions[1][kind.index()] <= 64);
-        assert!(actions[2][kind.index()] <= 64);
+    assert!(!pool.is_empty());
+    assert!(pool.len() <= 8 * 8 * 2);
+    assert!(pool.binding().scope.contains_map(bota_proto::MapId(2)));
+    assert!(!pool.binding().scope.contains_map(bota_proto::MapId(0)));
+    assert!(!pool.binding().scope.contains_map(bota_proto::MapId(1)));
+    for index in 0..pool.len() {
+        let sample = pool.get(index).expect("retained sample");
+        let identity = sample.identity();
+        let split = match identity.namespace() {
+            crate::SeedNamespace::Training => 0,
+            crate::SeedNamespace::Validation => 1,
+            crate::SeedNamespace::Promotion => 2,
+        };
+        let side = usize::from(sample.side() == crate::ImitationSide::Dire);
+        sides[split][side] += 1;
+        kinds[split][sample.teacher_action().kind().index()] += 1;
+        assert_eq!(identity.map(), bota_proto::MapId(2));
+        assert!(identities.insert(identity));
+        assert!(identity.tick() <= 22);
+        assert!((identity.tick() - 1).is_multiple_of(3));
+        assert!(sample.frame().is_finite());
+        assert_eq!(sample.source(), crate::ImitationSource::Teacher);
     }
-    assert!(
-        actions[0].iter().copied().max().expect("action maximum") * 100
-            < u64::try_from(splits[0]).expect("training split fits") * 95,
-        "teacher actions: {actions:?}"
-    );
+    assert_eq!(sides.iter().flatten().sum::<usize>(), pool.len());
+    for split in 0..3 {
+        assert!(sides[split].iter().all(|count| *count > 0));
+        assert!(kinds[split].iter().filter(|count| **count > 0).count() >= 2);
+    }
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn pretraining_map2_profile_bounds_bc_dagger_and_gameplay_to_the_same_action_cap() {
+    let (map, decisions, capacity) = crate::pretraining_profile_for_test();
+    assert_eq!(map, bota_proto::MapId(2));
+    assert_eq!(decisions, [crate::MAP2_ACTOR_DECISIONS; 3]);
+    assert!(capacity <= crate::MAX_IMITATION_SAMPLES);
+    assert!(capacity >= 8 * 8 * 2);
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn pretraining_map2_retention_windows_cover_all_actor_decisions_without_overlap() {
+    let width = crate::MAP2_ACTOR_DECISIONS / 4;
+    for (decision, window) in [
+        (0, 0),
+        (width - 1, 0),
+        (width, 1),
+        (2 * width - 1, 1),
+        (2 * width, 2),
+        (3 * width - 1, 2),
+        (3 * width, 3),
+        (crate::MAP2_ACTOR_DECISIONS - 1, 3),
+    ] {
+        assert_eq!(crate::pretraining_window_for_test(decision), window);
+    }
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn pretraining_teacher_retention_checks_every_namespace_kind_cap_boundary() {
+    for namespace in [
+        crate::SeedNamespace::Training,
+        crate::SeedNamespace::Validation,
+        crate::SeedNamespace::Promotion,
+    ] {
+        for kind in ActionKind::ALL {
+            let cap = match (namespace, kind == ActionKind::Continue) {
+                (crate::SeedNamespace::Training, true) => 48,
+                (crate::SeedNamespace::Training, false) => 6,
+                (_, true) => 21,
+                (_, false) => 4,
+            };
+            assert!(crate::pretraining_retains_teacher_for_test(
+                namespace,
+                kind,
+                cap - 1
+            ));
+            for retained in [cap, cap + 1, u64::MAX] {
+                assert!(!crate::pretraining_retains_teacher_for_test(
+                    namespace, kind, retained
+                ));
+            }
+        }
+    }
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn pretraining_dagger_retains_disagreements_and_strided_agreements_without_exceeding_cap() {
+    for decision in [0, 126, 127, 128, 6_299] {
+        for agreement in [false, true] {
+            let expected = !agreement || (decision + 1usize).is_multiple_of(128);
+            assert_eq!(
+                crate::pretraining_retains_dagger_for_test(agreement, decision, 2),
+                expected
+            );
+            assert!(!crate::pretraining_retains_dagger_for_test(
+                agreement, decision, 3
+            ));
+        }
+    }
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn pretraining_dagger_records_and_sends_neural_stop_when_teacher_would_preserve_a_channel() {
+    let model = constant_policy_for_warmup(ActionKind::Stop);
+    let (_, mut start) = crate::Arena::new(crate::ArenaConfig {
+        map: bota_proto::MapId(2),
+        seats: 2,
+        seed: 50_001,
+    })
+    .expect("Map2 start");
+    for side in 0..2 {
+        for message in &mut start.messages[side] {
+            if let bota_proto::ServerMsg::Snapshot { view } = message {
+                let hero = view.players[side].unit.expect("own hero");
+                view.units
+                    .iter_mut()
+                    .find(|unit| unit.id == hero)
+                    .expect("visible own hero")
+                    .statuses
+                    .bits |= bota_proto::StatusFlags::CHANNELLING;
+            }
+        }
+        let (sample, request, candidate) =
+            crate::pretraining_dagger_choice_for_test(&model, side, &start.messages[side])
+                .expect("pure Neural decision and shadow label");
+        assert_eq!(sample.identity().map(), bota_proto::MapId(2));
+        assert_eq!(sample.teacher_action(), crate::StructuredAction::Continue);
+        assert_eq!(
+            sample.learner_action().expect("learner action").kind(),
+            ActionKind::Stop
+        );
+        assert_eq!(
+            request.expect("actual neural stop").order,
+            bota_proto::Order::Move {
+                target: bota_proto::Target::None,
+            }
+        );
+        assert!(candidate, "learner transport must use the candidate ledger");
+    }
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn pretraining_short_gameplay_evaluates_both_map2_sides_without_teacher_orders() {
+    let model = constant_policy_for_warmup(ActionKind::Stop);
+    let games = crate::pretraining_gameplay_games_for_test(&model, 90_001, 4)
+        .expect("four decisions per side");
+    assert_eq!(games.len(), 2);
+    for (game, team) in games
+        .iter()
+        .zip([bota_proto::Team::Radiant, bota_proto::Team::Dire])
+    {
+        assert_eq!(game.map, bota_proto::MapId(2));
+        assert_eq!(game.candidate_team, team);
+        assert_eq!(game.decisions, 4);
+        assert_eq!(game.action_counts[ActionKind::Stop.index()], 4);
+        assert_eq!(game.baseline_wire_orders, 0);
+        assert_eq!(game.rejected_orders, 0);
+        assert_eq!(game.outcome, crate::CheckpointEvaluationOutcome::Timeout);
+    }
 }
 
 #[cfg(feature = "builtin")]
@@ -1786,15 +1992,15 @@ fn pretraining_stage_selection_prefers_exact_agreement_then_kind_agreement() {
 #[test]
 fn pretraining_stage_selection_prioritizes_gameplay_failures_then_wins() {
     let selected = crate::pretraining_gameplay_stage_for_test(&[
-        [gameplay(0, 0, 2, 2, 1), gameplay(2, 0, 0, 0, 1)],
-        [gameplay(0, 0, 0, 0, 0), gameplay(1, 1, 1, 1, 2)],
-        [gameplay(0, 0, 0, 0, 0), gameplay(0, 0, 0, 0, 0)],
+        gameplay(2, 0, 0, 0, 1),
+        gameplay(1, 1, 1, 1, 2),
+        gameplay(0, 2, 0, 0, 0),
     ]);
     assert_eq!(selected, 2);
 
     let selected = crate::pretraining_gameplay_stage_for_test(&[
-        [gameplay(0, 0, 0, 0, 0), gameplay(0, 0, 0, 0, 0)],
-        [gameplay(0, 0, 0, 0, 0), gameplay(0, 2, 2, 2, 1)],
+        gameplay(1, 1, 0, 0, 0),
+        gameplay(0, 2, 2, 2, 1),
     ]);
     assert_eq!(selected, 1);
 }
@@ -1810,10 +2016,10 @@ fn pretraining_stage_selection_uses_three_fixed_gameplay_validation_seeds() {
 
 #[cfg(feature = "builtin")]
 #[test]
-fn pretraining_stage_selection_never_trades_a_map_one_failure_for_map_zero_progress() {
+fn pretraining_stage_selection_never_trades_a_map2_win_for_structure_progress() {
     let selected = crate::pretraining_gameplay_stage_for_test(&[
-        [gameplay(0, 0, 2, 2, 0), gameplay(1, 1, 1, 1, 0)],
-        [gameplay(2, 0, 0, 0, 0), gameplay(0, 0, 0, 0, 2)],
+        gameplay(1, 1, 2, 2, 0),
+        gameplay(0, 2, 0, 0, 2),
     ]);
 
     assert_eq!(selected, 1);
@@ -1821,10 +2027,10 @@ fn pretraining_stage_selection_never_trades_a_map_one_failure_for_map_zero_progr
 
 #[cfg(feature = "builtin")]
 #[test]
-fn pretraining_stage_selection_uses_map_zero_progress_after_map_one_ties() {
+fn pretraining_stage_selection_uses_map2_progress_after_outcome_ties() {
     let selected = crate::pretraining_gameplay_stage_for_test(&[
-        [gameplay(1, 0, 1, 1, 1), gameplay(0, 2, 2, 2, 1)],
-        [gameplay(0, 0, 2, 2, 0), gameplay(0, 2, 2, 2, 1)],
+        gameplay(0, 2, 1, 1, 1),
+        gameplay(0, 2, 2, 2, 0),
     ]);
 
     assert_eq!(selected, 1);
@@ -1832,24 +2038,83 @@ fn pretraining_stage_selection_uses_map_zero_progress_after_map_one_ties() {
 
 #[cfg(feature = "builtin")]
 #[test]
-fn pretraining_acceptance_allows_map_zero_timeouts_with_paired_structure_progress() {
-    crate::validate_pretraining_gameplay_acceptance_for_test(
-        gameplay(0, 0, 2, 2, 1),
-        gameplay(0, 2, 2, 2, 1),
-    )
-    .expect("both map gates");
+fn pretraining_acceptance_allows_paired_map2_wins_without_tower_destruction() {
+    crate::validate_pretraining_gameplay_acceptance_for_test(gameplay(0, 2, 0, 0, 1))
+        .expect("two hero-death wins are valid Map2 wins");
 }
 
 #[cfg(feature = "builtin")]
 #[test]
-fn pretraining_acceptance_rejects_a_map_zero_stall_on_one_side() {
-    let error = crate::validate_pretraining_gameplay_acceptance_for_test(
-        gameplay(1, 0, 1, 1, 1),
-        gameplay(0, 2, 2, 2, 1),
-    )
-    .expect_err("one Map0 side stalled");
+fn pretraining_acceptance_rejects_a_map2_nonwin_even_with_structure_progress() {
+    let game = gameplay(1, 1, 2, 2, 1);
+    let error = crate::validate_pretraining_gameplay_acceptance_for_test(game)
+        .expect_err("one Map2 side did not win");
+    assert_eq!(
+        error.to_string(),
+        format!(
+            "PPO model error: pretraining Map2 gameplay acceptance failed: {game:?}; validation stages=[]"
+        )
+    );
+}
 
-    assert!(error.to_string().contains("gameplay acceptance failed"));
+#[cfg(feature = "builtin")]
+#[test]
+fn pretraining_gameplay_counts_draw_and_timeout_as_valid_nonwins_not_infrastructure_errors() {
+    use crate::CheckpointEvaluationOutcome::{Draw, Loss, Timeout, Win};
+    for outcome in [Win, Loss, Draw, Timeout] {
+        let game = pretraining_game(outcome);
+        let result = crate::pretraining_gameplay_result_for_test(&game).expect("valid game result");
+        assert_eq!(result.games, 1);
+        assert_eq!(result.wins, usize::from(outcome == Win));
+        assert_eq!(result.failures, usize::from(outcome != Win));
+        assert_eq!(result.draws, usize::from(outcome == Draw));
+        assert_eq!(result.timeouts, usize::from(outcome == Timeout));
+    }
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn pretraining_gameplay_rejects_legacy_map_and_active_weak_baseline_with_specific_errors() {
+    for map in [bota_proto::MapId(0), bota_proto::MapId(1)] {
+        let mut game = pretraining_game(crate::CheckpointEvaluationOutcome::Win);
+        game.map = map;
+        let error = crate::pretraining_gameplay_result_for_test(&game).expect_err("wrong map");
+        assert_eq!(
+            error.to_string(),
+            "invalid PPO transition: pretraining Map2 weak gameplay scope"
+        );
+    }
+    let mut game = pretraining_game(crate::CheckpointEvaluationOutcome::Win);
+    game.baseline_wire_orders = 1;
+    let error = crate::pretraining_gameplay_result_for_test(&game).expect_err("invalid baseline");
+    assert_eq!(
+        error.to_string(),
+        "invalid PPO transition: pretraining weak baseline activity"
+    );
+}
+
+#[cfg(feature = "builtin")]
+fn pretraining_game(
+    outcome: crate::CheckpointEvaluationOutcome,
+) -> crate::CheckpointEvaluationGame {
+    crate::CheckpointEvaluationGame {
+        map: bota_proto::MapId(2),
+        baseline: crate::CheckpointEvaluationBaseline::Weak,
+        seed: 90_001,
+        candidate_team: bota_proto::Team::Radiant,
+        outcome,
+        decisions: 1,
+        wire_orders: 1,
+        rejected_orders: 0,
+        baseline_wire_orders: 0,
+        baseline_rejected_orders: 0,
+        elapsed_ticks: 3,
+        action_counts: [0; ActionKind::COUNT],
+        final_summary: crate::GlobalSummary {
+            destroyed_structures_present: true,
+            ..Default::default()
+        },
+    }
 }
 
 #[cfg(feature = "builtin")]
@@ -1868,6 +2133,8 @@ fn gameplay(
         structures,
         deaths,
         rejections: 0,
+        draws: 0,
+        timeouts: 0,
     }
 }
 
@@ -1949,12 +2216,13 @@ fn training_job_rejects_targets_that_cannot_fit_shuffle_rng_counters() {
                 rollout_decisions: 64,
                 epochs: 1,
                 minibatch: 32,
+                gamma_tick: 1.0,
                 ..crate::PpoConfig::default()
             },
             checkpoint_cadence: crate::TrainingCheckpointCadence::Updates(5),
             resume_provenance: crate::ResumeProvenance::Strict,
             seed: 23_073,
-            map: bota_proto::MapId(1),
+            map: bota_proto::MapId(2),
             git_commit: "test-drysua-commit".to_owned(),
             simulator_commit: "test-bota-commit".to_owned(),
         },
@@ -1988,11 +2256,12 @@ fn training_test_directory(name: &str) -> std::path::PathBuf {
 }
 #[cfg(feature = "builtin")]
 #[test]
-fn long_horizon_cli_checkpoint_restores_exact_config_and_rejects_changed_hyperparameters() {
-    let directory = training_test_directory("long-horizon-cli");
+fn map2_cli_checkpoint_restores_exact_config_and_rejects_changed_hyperparameters() {
+    let directory = training_test_directory("map2-cli");
     let settings = crate::cli::training_settings_for_test(&[
+        "--complete-episodes=false",
         "--map",
-        "0",
+        "2",
         "--environments",
         "2",
         "--rollout",
@@ -2004,7 +2273,7 @@ fn long_horizon_cli_checkpoint_restores_exact_config_and_rejects_changed_hyperpa
         "--learning-rate",
         "3e-5",
         "--gamma-per-tick",
-        "0.9999722",
+        "1",
         "--gae-lambda",
         "0.995",
         "--entropy-coefficient",
@@ -2045,20 +2314,22 @@ fn long_horizon_cli_checkpoint_restores_exact_config_and_rejects_changed_hyperpa
         let error =
             crate::run_training_job_on(changed, crate::PolicyDevice::Cpu, &directory, true, |_| {})
                 .expect_err("changed hyperparameter must reject resume");
-        assert_eq!(
-            error.to_string(),
+        let expected = if field == 1 {
+            "invalid PPO config field: Map2 comprehensive reward requires gamma per tick one"
+        } else {
             "invalid PPO config field: training checkpoint PPO config"
-        );
+        };
+        assert_eq!(error.to_string(), expected);
     }
     std::fs::remove_dir_all(directory).expect("remove checkpoint");
 }
 #[cfg(feature = "builtin")]
 #[test]
-fn pure_map_zero_evaluation_uses_neural_stop_actions_on_both_sides_without_teacher_override() {
-    let directory = training_test_directory("pure-map-zero-evaluation");
+fn runtime_map2_evaluation_uses_neural_stop_actions_on_both_sides_without_teacher_override() {
+    let directory = training_test_directory("pure-map2-evaluation");
     let model = stop_policy_for_warmup();
     crate::TrainingArtifact::save_runtime_weights(&model, &directory).expect("stop weights");
-    let report = crate::ppo_arena::evaluate_neural_map_zero_checkpoint(
+    let report = crate::evaluate_runtime_checkpoint(
         crate::CheckpointEvaluationConfig {
             pairs: 1,
             decisions: 2,
@@ -2068,14 +2339,26 @@ fn pure_map_zero_evaluation_uses_neural_stop_actions_on_both_sides_without_teach
     )
     .expect("pure neural evaluation");
     assert_eq!(report.games.len(), 4);
+    let mut covered = [[false; 2]; 2];
     for game in report.games {
-        assert_eq!(game.map, bota_proto::MapId(0));
+        assert_eq!(game.map, bota_proto::MapId(2));
+        let baseline = match game.baseline {
+            crate::CheckpointEvaluationBaseline::Teacher => 0,
+            crate::CheckpointEvaluationBaseline::Weak => 1,
+        };
+        covered[baseline][usize::from(game.candidate_team == Team::Dire)] = true;
+        assert_eq!(game.seed, 23_082);
+        assert_eq!(game.decisions, 2);
+        assert_eq!(game.elapsed_ticks, 6);
+        assert_eq!(game.outcome, crate::CheckpointEvaluationOutcome::Timeout);
+        assert_eq!(game.rejected_orders, 0);
         assert_eq!(
             game.action_counts[crate::ActionKind::Stop.index()],
             game.decisions
         );
         assert_eq!(game.action_counts.iter().sum::<u32>(), game.decisions);
     }
+    assert!(covered.into_iter().flatten().all(|present| present));
     std::fs::remove_dir_all(directory).expect("remove weights");
 }
 #[cfg(feature = "builtin")]
@@ -2092,36 +2375,49 @@ fn episode_intervals_discount_rewards_flush_terminal_and_partial_timeout_without
 
 #[cfg(feature = "builtin")]
 #[test]
-fn complete_episode_cli_binds_teacher_only_stride_cap_and_rejects_short_capacity() {
+fn complete_episode_cli_binds_map2_gamma_one_and_rejects_capacity_below_the_shared_bound() {
     let settings = crate::cli::training_settings_for_test(&[
         "--complete-episodes",
         "--map",
-        "0",
+        "2",
         "--environments",
         "2",
         "--rollout",
-        "8192",
+        &crate::MAP2_RETAINED_DECISIONS.to_string(),
+        "--minibatch",
+        "512",
+        "--gamma-per-tick",
+        "1",
     ])
     .expect("complete episode settings");
     assert!(settings.complete_episodes);
-    assert_eq!(settings.ppo.rollout_decisions, 8192);
+    assert_eq!(settings.map, bota_proto::MapId(2));
+    assert_eq!(settings.ppo.gamma_tick, 1.0);
+    assert_eq!(
+        settings.ppo.rollout_decisions,
+        crate::MAP2_RETAINED_DECISIONS
+    );
+    assert!(!settings.terminal_only);
+    assert_eq!(settings.episode_time_cost, 0.0);
     crate::ppo_arena::episode::validate(&settings).expect("bounded episode config");
     let mut short = settings.clone();
-    short.ppo.rollout_decisions = 2048;
+    short.ppo.rollout_decisions = crate::MAP2_RETAINED_DECISIONS - 1;
     assert_eq!(
         crate::ppo_arena::episode::validate(&short)
             .expect_err("insufficient retained capacity")
             .to_string(),
         "invalid PPO config field: complete episode retained capacity"
     );
-    short = settings;
-    short.map = bota_proto::MapId(1);
-    assert_eq!(
-        crate::ppo_arena::episode::validate(&short)
-            .expect_err("wrong map")
-            .to_string(),
-        "invalid PPO config field: complete episodes require Map0, two/four/six environments, and three-tick actions"
-    );
+    for map in [bota_proto::MapId(0), bota_proto::MapId(1)] {
+        let mut invalid = settings.clone();
+        invalid.map = map;
+        assert_eq!(
+            crate::ppo_arena::episode::validate(&invalid)
+                .expect_err("historical map")
+                .to_string(),
+            "invalid PPO config field: production training requires Map2"
+        );
+    }
 }
 #[cfg(feature = "builtin")]
 #[test]
@@ -2136,11 +2432,15 @@ fn episode_checkpoint_restores_exact_rng_and_rejects_window_collection_scope() {
     let settings = crate::cli::training_settings_for_test(&[
         "--complete-episodes",
         "--map",
-        "0",
+        "2",
         "--environments",
         "2",
         "--rollout",
-        "8192",
+        &crate::MAP2_RETAINED_DECISIONS.to_string(),
+        "--minibatch",
+        "512",
+        "--gamma-per-tick",
+        "1",
     ])
     .expect("episode settings");
     crate::ppo_arena::episode::assert_checkpoint_scope_for_test(settings, &directory);
@@ -2173,7 +2473,7 @@ fn exhausted_shaping_budget_can_make_a_discounted_losing_episode_positive() {
 }
 
 #[test]
-fn terminal_only_reward_has_no_shaping_and_never_fabricates_draws() {
+fn legacy_terminal_only_reward_has_no_shaping_and_never_fabricates_draws() {
     for (outcome, expected) in [
         (None, 0.0),
         (Some(PpoTerminalOutcome::Win), 1.0),
@@ -2199,21 +2499,24 @@ fn terminal_only_reward_has_no_shaping_and_never_fabricates_draws() {
 
 #[cfg(feature = "builtin")]
 #[test]
-fn terminal_only_e6_capacity_and_lambda_one_are_explicit_and_bounded() {
+fn map2_e6_capacity_and_lambda_one_are_explicit_and_bounded() {
     let settings = crate::cli::training_settings_for_test(&[
         "--complete-episodes",
-        "--terminal-only",
         "--map",
-        "0",
+        "2",
         "--environments",
         "6",
         "--rollout",
-        "4538",
+        &crate::MAP2_RETAINED_DECISIONS.to_string(),
+        "--gamma-per-tick",
+        "1",
         "--gae-lambda",
         "1",
     ])
-    .expect("terminal E6 settings");
-    assert!(settings.terminal_only);
+    .expect("Map2 E6 settings");
+    assert!(!settings.terminal_only);
+    assert_eq!(settings.episode_time_cost, 0.0);
+    assert_eq!(settings.ppo.gamma_tick, 1.0);
     assert_eq!(settings.ppo.gae_lambda, 1.0);
     crate::ppo_arena::episode::validate(&settings).expect("E6 fits");
     let mut four = settings.clone();
@@ -2233,21 +2536,26 @@ fn terminal_only_e6_capacity_and_lambda_one_are_explicit_and_bounded() {
         "invalid PPO config field: samples per update"
     );
     let mut invalid = settings.clone();
-    invalid.complete_episodes = false;
+    invalid.ppo.environments = 8;
     assert_eq!(
         crate::ppo_arena::episode::validate(&invalid)
-            .expect_err("scope")
+            .expect_err("unbounded complete-episode environment count")
             .to_string(),
-        "invalid PPO config field: terminal-only requires complete episodes"
+        "invalid PPO config field: complete episodes require Map2, two/four/six environments, and three-tick actions"
     );
     invalid = settings;
-    invalid.ppo.environments = 8;
-    assert!(crate::ppo_arena::episode::validate(&invalid).is_err());
+    invalid.ppo.decision_interval_ticks = 4;
+    assert_eq!(
+        crate::ppo_arena::episode::validate(&invalid)
+            .expect_err("non-three-tick episode actions")
+            .to_string(),
+        "invalid PPO config field: complete episodes require Map2, two/four/six environments, and three-tick actions"
+    );
 }
 
 #[cfg(feature = "builtin")]
 #[test]
-fn lambda_one_on_retained_intervals_matches_full_discounted_terminal_return() {
+fn map2_gamma_one_lambda_one_retention_preserves_full_mc_and_timeout_bootstrap() {
     crate::ppo_arena::episode::assert_full_mc_for_test();
 }
 
@@ -2258,88 +2566,51 @@ fn e2_e4_e6_ragged_sampling_and_early_terminals_preserve_rng_and_retained_action
 }
 #[cfg(feature = "builtin")]
 #[test]
-fn elapsed_time_cost_orders_equal_outcomes_and_keeps_wins_above_losses() {
+fn historical_elapsed_time_cost_orders_equal_outcomes_and_keeps_wins_above_losses() {
     crate::ppo_arena::episode::assert_time_cost_for_test();
 }
 
 #[cfg(feature = "builtin")]
 #[test]
-fn gamma_one_time_cost_mc_preserves_variable_intervals_and_timeout_bootstrap() {
-    crate::ppo_arena::episode::assert_time_cost_mc_for_test();
+fn map2_training_cli_rejects_terminal_only_in_complete_episodes_and_windows() {
+    for mode in ["--complete-episodes", "--complete-episodes=false"] {
+        let error = crate::cli::training_settings_for_test(&[
+            mode,
+            "--map",
+            "2",
+            "--gamma-per-tick",
+            "1",
+            "--terminal-only",
+        ])
+        .expect_err("Map2 never accepts terminal-only reward");
+        assert_eq!(
+            error.to_string(),
+            "Map2 comprehensive reward forbids --terminal-only"
+        );
+    }
 }
 
 #[cfg(feature = "builtin")]
 #[test]
-fn time_cost_cli_accepts_finite_boundaries_and_rejects_invalid_profiles() {
-    let settings = crate::cli::training_settings_for_test(&[
-        "--complete-episodes",
-        "--terminal-only",
-        "--episode-time-cost",
-        "0.25",
-        "--map",
-        "0",
-        "--environments",
-        "6",
-        "--rollout",
-        "4538",
-        "--gamma-per-tick",
-        "1",
-        "--gae-lambda",
-        "1",
-    ])
-    .expect("undiscounted time-cost profile");
-    assert_eq!(settings.episode_time_cost, 0.25);
-    assert_eq!(settings.ppo.gamma_tick, 1.0);
-    crate::ppo_arena::episode::validate(&settings).expect("validated profile");
-    assert_eq!(tick_discount(1.0, 108900).expect("no discount"), 1.0);
-    assert_eq!(
-        crate::cli::training_settings_for_test(&[])
-            .expect("defaults")
-            .episode_time_cost,
-        0.0
-    );
-    for invalid in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY, -0.01, 0.250001] {
-        let mut changed = settings.clone();
-        changed.episode_time_cost = invalid;
-        assert_eq!(
-            crate::ppo_arena::episode::validate(&changed)
-                .expect_err("cost bound")
-                .to_string(),
-            "invalid PPO config field: episode time cost must be finite in [0, 0.25]"
-        );
+fn map2_training_cli_rejects_nonzero_and_nonfinite_time_cost_in_every_collection_mode() {
+    for mode in ["--complete-episodes", "--complete-episodes=false"] {
+        for cost in ["0.125", "0.25", "NaN", "inf", "-inf", "-0.01", "0.250001"] {
+            let argument = format!("--episode-time-cost={cost}");
+            let error = crate::cli::training_settings_for_test(&[
+                mode,
+                "--map",
+                "2",
+                "--gamma-per-tick",
+                "1",
+                &argument,
+            ])
+            .expect_err("Map2 comprehensive reward never adds an episode time cost");
+            assert_eq!(
+                error.to_string(),
+                "Map2 comprehensive reward requires --episode-time-cost 0"
+            );
+        }
     }
-    let mut changed = settings;
-    changed.terminal_only = false;
-    assert_eq!(
-        crate::ppo_arena::episode::validate(&changed)
-            .expect_err("profile scope")
-            .to_string(),
-        "invalid PPO config field: episode time cost requires terminal-only complete episodes"
-    );
-}
-#[cfg(feature = "builtin")]
-#[test]
-fn time_cost_checkpoint_restores_same_budget_and_rejects_changed_budget() {
-    let directory = training_test_directory("time-cost-scope");
-    let settings = crate::cli::training_settings_for_test(&[
-        "--complete-episodes",
-        "--terminal-only",
-        "--episode-time-cost",
-        "0.25",
-        "--map",
-        "0",
-        "--environments",
-        "6",
-        "--rollout",
-        "4538",
-        "--gamma-per-tick",
-        "1",
-        "--gae-lambda",
-        "1",
-    ])
-    .expect("time-cost settings");
-    crate::ppo_arena::episode::assert_time_cost_checkpoint_for_test(settings, &directory);
-    std::fs::remove_dir_all(directory).expect("cleanup");
 }
 #[cfg(feature = "builtin")]
 #[test]

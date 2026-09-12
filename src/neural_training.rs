@@ -20,7 +20,10 @@ use crate::{
     SeedNamespaces, StateTracker, StructuredAction, Teacher, TeacherCoverage, TrainingArtifact,
     TrainingScope, active_order_update_for_sent,
 };
-use bota_proto::{MapId, ServerMsg, SlotId, Team};
+use crate::{MAP2_GAME_TICKS, MAP2_ID, MAP2_PREGAME_TICKS as PREGAME_TICKS, MAP2_TICK_CAP};
+#[cfg(test)]
+use bota_proto::MapId;
+use bota_proto::{ServerMsg, SlotId, Team};
 use sha2::{Digest, Sha256};
 
 use crate::persistence::training::PolicyOrderBookkeeping;
@@ -28,11 +31,17 @@ use crate::persistence::training::PolicyOrderBookkeeping;
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 const CAPACITIES: [usize; 3] = [16384, 6144, 6144];
 const DAGGER_CAPACITY: usize = 4096;
+const DECISION_INTERVAL_TICKS: u32 = crate::MAP2_DECISION_INTERVAL_TICKS;
+const ACTOR_DECISIONS: u32 = crate::MAP2_ACTOR_DECISIONS as u32;
+const GAMEPLAY_PHASE_TICKS: u32 = MAP2_GAME_TICKS / 4;
+const _: () = assert!(MAP2_TICK_CAP == PREGAME_TICKS + MAP2_GAME_TICKS);
+const _: () = assert!(MAP2_TICK_CAP.is_multiple_of(DECISION_INTERVAL_TICKS));
+const _: () = assert!(MAP2_GAME_TICKS.is_multiple_of(4));
 const _: () = assert!(
     CAPACITIES[0] + CAPACITIES[1] + CAPACITIES[2] + DAGGER_CAPACITY == MAX_IMITATION_SAMPLES
 );
 
-/// Fresh Map0-only BC probe. All outputs are diagnostic, never automatically promoted.
+/// Map2-only BC/DAgger probe. All outputs are diagnostic, never automatically promoted.
 pub fn run_neural_training(config: &NeuralTrainingConfig, output: &Path) -> Result<()> {
     validate_config(config)?;
     let root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -499,7 +508,7 @@ impl Default for NeuralTrainingConfig {
             seed: 9840000,
             training_games: 6,
             epochs: 64,
-            tick_limit: 108900,
+            tick_limit: MAP2_TICK_CAP,
             wall_time: Duration::from_secs(1800),
             device: PolicyDevice::Cpu,
             dagger_rounds: 1,
@@ -549,6 +558,17 @@ pub(crate) struct NeuralSeatOrderContractProbe(NeuralSeat);
 
 #[cfg(test)]
 impl NeuralSeatOrderContractProbe {
+    /// Replays archived Map0/Map1 order fixtures without relabeling their metadata.
+    pub(crate) fn new_historical(side: usize, messages: &[ServerMsg]) -> Self {
+        assert!(side < 2);
+        let Some(ServerMsg::MatchStart { info }) = messages.first() else {
+            panic!("historical order-contract MatchStart");
+        };
+        assert!(matches!(info.map, MapId(0) | MapId(1)));
+        let tracker = StateTracker::new(SlotId(side as u8), info).expect("historical tracker");
+        Self(NeuralSeat::from_tracker(tracker, messages).expect("historical seat"))
+    }
+
     pub(crate) fn new(side: usize, messages: &[ServerMsg]) -> Self {
         Self(NeuralSeat::new(side as u8, messages).expect("NeuralSeat order-contract seat"))
     }
@@ -608,12 +628,20 @@ impl NeuralSeatOrderContractProbe {
 
 impl NeuralSeat {
     fn new(slot: u8, messages: &[ServerMsg]) -> Result<Self> {
-        let ServerMsg::MatchStart { info } = &messages[0] else {
+        let Some(ServerMsg::MatchStart { info }) = messages.first() else {
             return Err("initial MatchStart missing".into());
         };
-        assert_eq!(info.map, MapId(0));
+        if info.map != MAP2_ID {
+            return Err("neural training requires Map2".into());
+        }
         assert_eq!(info.picks.len(), 2);
         let tracker = StateTracker::new(SlotId(slot), info)?;
+        Self::from_tracker(tracker, messages)
+    }
+
+    fn from_tracker(tracker: StateTracker, messages: &[ServerMsg]) -> Result<Self> {
+        assert!(messages.len() <= 4);
+        assert!(!messages.is_empty());
         let mut seat = Self {
             encoder: FeatureEncoder::new(&tracker),
             tracker,
@@ -743,7 +771,7 @@ impl NeuralSeat {
         action: StructuredAction,
         space: &ActionSpace,
     ) -> Result<Option<crate::IssuedOrder>> {
-        assert!(self.decisions < 36300);
+        assert!(self.decisions < ACTOR_DECISIONS);
         self.decisions += 1;
         self.kinds[action.kind().index()] += 1;
         if space.tick() <= 3000 {
@@ -824,7 +852,7 @@ impl CoverageSelector {
     }
     fn destination(&mut self, cell: usize) -> Result<Option<usize>> {
         assert!(cell < 10);
-        assert!(self.seen < 108900 * 2 * 10);
+        assert!(self.seen < u64::from(MAP2_TICK_CAP) * 2 * 10);
         self.seen += 1;
         if self.capacity == 0 {
             return Ok(None);
@@ -992,7 +1020,7 @@ impl BranchSelector {
             return Err("conditional reservoir exceeds 8192 observed strata".into());
         }
         let entry = self.counts.entry(key).or_default();
-        assert!(entry.0 < 108900 * 2 * 22);
+        assert!(entry.0 < u64::from(MAP2_TICK_CAP) * 2 * 22);
         entry.0 += 1;
         let (seen, kept) = (entry.0, entry.1.len());
         let index = if self.keys.len() < self.capacity {
@@ -1141,7 +1169,7 @@ fn collect_dataset(
         MAX_IMITATION_SAMPLES,
         config.seed | 1,
         seeds.clone(),
-        TrainingScope::new(MapId(0), IMITATION_RULES_AUDIT_VERSION)?,
+        TrainingScope::new(MAP2_ID, IMITATION_RULES_AUDIT_VERSION)?,
     )?;
     let mut coverage = [TeacherCoverage::new(), TeacherCoverage::new()];
     let mut games = Vec::with_capacity(config.training_games + 2);
@@ -1210,7 +1238,8 @@ fn run_game(
     deadline: Option<Instant>,
     collection: Option<(&mut Reservoir, SeedNamespace)>,
 ) -> Result<NeuralGameReport> {
-    assert!(candidate < 2 && (2..=108900).contains(&limit));
+    assert!(candidate < 2);
+    assert!((2..=MAP2_TICK_CAP).contains(&limit));
     if model.is_some()
         && collection
             .as_ref()
@@ -1218,16 +1247,31 @@ fn run_game(
     {
         return Err("DAgger may collect only Training namespace states".into());
     }
+    let arena = Arena::new(ArenaConfig {
+        map: MAP2_ID,
+        seats: 2,
+        seed,
+    })?;
+    run_game_in_arena(arena, model, seed, candidate, limit, deadline, collection)
+}
+
+fn run_game_in_arena(
+    (mut arena, start): (Arena, crate::ArenaStart),
+    model: Option<&PolicyModel>,
+    seed: u64,
+    candidate: usize,
+    limit: u32,
+    deadline: Option<Instant>,
+    collection: Option<(&mut Reservoir, SeedNamespace)>,
+) -> Result<NeuralGameReport> {
+    assert!(candidate < 2);
+    assert!(arena.tick() < limit);
+    assert!(limit <= MAP2_TICK_CAP);
     let mut collection = collection.map(|(reservoir, namespace)| Collection {
         reservoir,
         namespace,
         labeler: model.is_some().then(Teacher::new),
     });
-    let (mut arena, start) = Arena::new(ArenaConfig {
-        map: MapId(0),
-        seats: 2,
-        seed,
-    })?;
     let mut seats = [
         NeuralSeat::new(0, &start.messages[0])?,
         NeuralSeat::new(1, &start.messages[1])?,
@@ -1237,13 +1281,13 @@ fn run_game(
         (model.is_none() || index != candidate).then(Teacher::new)
     });
     let mut winner = None;
-    for _ in 1..limit {
+    for _ in arena.tick()..limit {
         if (arena.tick() == 1 || arena.tick().is_multiple_of(64))
             && deadline.is_some_and(|end| Instant::now() >= end)
         {
             return Err("neural match deadline exhausted".into());
         }
-        let terminal = game_tick(
+        winner = game_tick(
             &mut arena,
             &mut seats,
             &mut experts,
@@ -1251,10 +1295,7 @@ fn run_game(
             seed,
             &mut collection,
         )?;
-        if arena.tick() < limit {
-            winner = terminal;
-        }
-        if terminal.is_some() {
+        if winner.is_some() {
             break;
         }
     }
@@ -1288,7 +1329,7 @@ fn game_report(
     winner: Option<Team>,
 ) -> Result<NeuralGameReport> {
     assert!(candidate < 2);
-    assert!((2..=108900).contains(&ticks));
+    assert!((2..=MAP2_TICK_CAP).contains(&ticks));
     let summary = seats[candidate]
         .tracker
         .latest_summary()
@@ -1325,9 +1366,9 @@ fn game_tick(
     collection: &mut Option<Collection<'_>>,
 ) -> Result<Option<Team>> {
     assert!(arena.tick() > 0);
-    assert!(arena.tick() < 108900);
+    assert!(arena.tick() < MAP2_TICK_CAP);
     let mut requests = [None, None];
-    if (arena.tick() - 1).is_multiple_of(3) {
+    if (arena.tick() - 1).is_multiple_of(DECISION_INTERVAL_TICKS) {
         for (index, seat) in seats.iter_mut().enumerate() {
             let (action, space) = if let Some(expert) = &mut experts[index] {
                 expert.decide(&seat.tracker, &seat.persistence, &seat.readiness)?
@@ -1513,14 +1554,14 @@ fn validate_config(config: &NeuralTrainingConfig) -> Result<()> {
     }
     if !(1..=20).contains(&config.training_games)
         || !(1..=64).contains(&config.epochs)
-        || !(2..=108900).contains(&config.tick_limit)
+        || !(2..=MAP2_TICK_CAP).contains(&config.tick_limit)
         || config.seed.checked_add(201).is_none()
         || config.wall_time.is_zero()
         || config.wall_time > Duration::from_secs(2700)
         || config.dagger_rounds > 2
         || !(1..=64).contains(&config.dagger_epochs)
     {
-        return Err("Map0 training requires 1..20 expert games, 1..64 epochs per stage, 0..2 DAgger rounds, 2..108900 ticks, <=2700 seconds and nonoverflowing disjoint seeds".into());
+        return Err(format!("Map2 training requires 1..20 expert games, 1..64 epochs per stage, 0..2 DAgger rounds, 2..{MAP2_TICK_CAP} ticks, <=2700 seconds and nonoverflowing disjoint seeds").into());
     }
     Ok(())
 }
@@ -1567,10 +1608,12 @@ fn initialize_model(config: &NeuralTrainingConfig) -> Result<(PolicyModel, Initi
 }
 
 fn phase(tick: u32) -> usize {
-    if tick < 900 {
+    assert!(tick > 0);
+    assert!(tick <= MAP2_TICK_CAP);
+    if tick < PREGAME_TICKS {
         0
     } else {
-        (1 + (tick - 900) / 18000).min(4) as usize
+        (1 + (tick - PREGAME_TICKS) / GAMEPLAY_PHASE_TICKS).min(4) as usize
     }
 }
 

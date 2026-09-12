@@ -10,6 +10,8 @@ mod imitation;
 mod laning_evaluation;
 mod league;
 mod link;
+mod map2_contract;
+mod map2_reward;
 mod model;
 #[cfg(feature = "builtin")]
 mod neural_training;
@@ -25,6 +27,7 @@ mod tactical;
 mod tactical_training;
 mod teacher;
 mod teacher_economy;
+mod telemetry;
 mod tracker;
 mod wire;
 
@@ -39,6 +42,8 @@ pub use imitation::*;
 pub use laning_evaluation::*;
 pub use league::*;
 pub use link::*;
+pub use map2_contract::*;
+pub use map2_reward::*;
 pub use model::*;
 #[cfg(feature = "builtin")]
 pub use neural_training::*;

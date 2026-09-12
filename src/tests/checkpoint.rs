@@ -134,12 +134,20 @@ fn m10_training_initialization_rejects_nonfinite_parameters() {
 
 #[test]
 #[ignore = "requires DRYSUA_SELECTED_M10 directory containing the immutable b3802642 artifact"]
-fn selected_m10_initializes_fresh_training_but_runtime_rejects_before_mutation() {
+fn selected_m10_retired_initialization_and_runtime_reject_without_source_mutation() {
     use sha2::{Digest, Sha256};
     let directory =
         PathBuf::from(std::env::var_os("DRYSUA_SELECTED_M10").expect("selected fixture"));
     let path = directory.join("drysua.weights.safetensors");
     let bytes = fs::read(&path).expect("selected artifact");
+    let digest: String = Sha256::digest(&bytes)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    assert_eq!(
+        digest,
+        "b3802642b34487d66fc3f0fe526e7f8b2a84df542793ac336b58ea046b8f8b53"
+    );
     let runtime = PolicyModel::fresh(510).expect("runtime");
     let before = runtime.policy_identity().expect("identity");
     let parameters = runtime.export_parameters().expect("before parameters");
@@ -156,35 +164,18 @@ fn selected_m10_initializes_fresh_training_but_runtime_rejects_before_mutation()
         runtime.export_parameters().expect("after parameters"),
         parameters
     );
-    let (initialized, digest) = TrainingArtifact::initialize_selected_m10_for_training(
+    let error = TrainingArtifact::initialize_selected_m10_for_training(
         &directory,
         511,
         crate::PolicyDevice::Cpu,
     )
-    .expect("explicit selected-artifact initialization");
-    let tensors = safetensors::SafeTensors::deserialize(&bytes).expect("source tensors");
-    let expected: Vec<_> = tensors
-        .tensor("model.parameters")
-        .expect("parameters")
-        .data()
-        .as_chunks::<4>()
-        .0
-        .iter()
-        .map(|bytes| f32::from_le_bytes(*bytes))
-        .collect();
+    .err()
+    .expect("M10 authorization does not permit Map2 initialization");
+    assert_eq!(error, CheckpointError::SchemaMismatch);
     assert_eq!(
-        initialized
-            .export_parameters()
-            .expect("initialized parameters"),
-        initialized
-            .widen_m11_input_parameters(&expected)
-            .expect("audited old input layout")
+        error.to_string(),
+        "checkpoint schema does not match this build"
     );
-    assert_eq!(digest, <[u8; 32]>::from(Sha256::digest(&bytes)));
-    let optimizer = initialized
-        .claim_optimizer(crate::AdamConfig::default())
-        .expect("fresh optimizer ownership");
-    assert_eq!(optimizer.step(), 0);
     assert_eq!(fs::read(path).expect("source unchanged"), bytes);
 }
 
@@ -210,25 +201,57 @@ fn exact_m12_ppo25_runtime_and_training_reject_before_mutation() {
 }
 
 fn m12_metadata(version: u32, hash: u64, rules: u32) -> std::collections::HashMap<String, String> {
-    let mut metadata = current_runtime_metadata();
-    metadata.insert(
-        "feature_schema_hash".to_owned(),
-        "8078516161541333175".to_owned(),
-    );
-    metadata.insert(
-        "model_schema_hash".to_owned(),
-        "17156054387874206897".to_owned(),
-    );
-    metadata.insert("ppo_schema_version".to_owned(), version.to_string());
-    metadata.insert("ppo_schema_hash".to_owned(), hash.to_string());
-    metadata.insert("ppo_rules_audit_version".to_owned(), rules.to_string());
-    metadata
+    action_three_metadata(
+        "8078516161541333175",
+        "17156054387874206897",
+        version,
+        hash,
+        rules,
+    )
+}
+
+fn action_three_metadata(
+    feature: &str,
+    model: &str,
+    version: u32,
+    hash: u64,
+    rules: u32,
+) -> std::collections::HashMap<String, String> {
+    [
+        ("action_schema_hash", "1755359086494840931".to_owned()),
+        ("feature_schema_hash", feature.to_owned()),
+        ("model_schema_hash", model.to_owned()),
+        ("ppo_schema_version", version.to_string()),
+        ("ppo_schema_hash", hash.to_string()),
+        ("ppo_rules_audit_version", rules.to_string()),
+    ]
+    .into_iter()
+    .map(|(key, value)| (key.to_owned(), value))
+    .collect()
+}
+
+#[test]
+fn historical_m12_metadata_keeps_exact_six_key_a3_tuple_under_map2() {
+    let metadata = m12_metadata(23, 765_990_392_710_687_046, 18);
+    assert_eq!(metadata.len(), 6);
+    for (key, value) in [
+        ("action_schema_hash", "1755359086494840931"),
+        ("feature_schema_hash", "8078516161541333175"),
+        ("model_schema_hash", "17156054387874206897"),
+        ("ppo_schema_version", "23"),
+        ("ppo_schema_hash", "765990392710687046"),
+        ("ppo_rules_audit_version", "18"),
+    ] {
+        assert_eq!(metadata.get(key).map(String::as_str), Some(value));
+    }
+    assert_eq!(current_runtime_metadata().len(), 9);
+    assert!(!metadata.contains_key("map2_reward_schema_hash"));
 }
 
 fn assert_m12_order_contract_rejection(version: u32, hash: u64, rules: u32) {
     let directory = test_directory("m12-old-order-contract");
     let source = PolicyModel::fresh(18124).expect("model");
-    let parameters = source.export_parameters().expect("parameters");
+    let parameters = vec![0.0f32; 1_689_076];
     let data: Vec<_> = parameters
         .iter()
         .flat_map(|value| value.to_le_bytes())
@@ -319,23 +342,18 @@ fn exact_m11_ppo22_runtime_and_training_reject_after_input_widening() {
 fn assert_m11_runtime_only_compatibility(version: u32, hash: u64, rules: u32) {
     let directory = test_directory("exact-m11-ppo19");
     let source = PolicyModel::fresh(18_121).expect("source");
-    let parameters = source.export_parameters().expect("parameters");
+    let parameters = vec![0.0f32; M11_PARAMETERS];
     let data: Vec<_> = parameters
         .iter()
         .flat_map(|value| value.to_le_bytes())
         .collect();
-    let mut metadata = current_runtime_metadata();
-    metadata.insert(
-        "feature_schema_hash".to_owned(),
-        "15519817897416174399".to_owned(),
+    let metadata = action_three_metadata(
+        "15519817897416174399",
+        "18229126264156367519",
+        version,
+        hash,
+        rules,
     );
-    metadata.insert(
-        "model_schema_hash".to_owned(),
-        "18229126264156367519".to_owned(),
-    );
-    metadata.insert("ppo_schema_version".to_owned(), version.to_string());
-    metadata.insert("ppo_schema_hash".to_owned(), hash.to_string());
-    metadata.insert("ppo_rules_audit_version".to_owned(), rules.to_string());
     let view = TensorView::new(Dtype::F32, vec![parameters.len()], &data).expect("view");
     let bytes = serialize([("model.parameters", view)], Some(metadata)).expect("P19 fixture");
     let path = directory.join("drysua.weights.safetensors");
@@ -404,6 +422,18 @@ fn current_runtime_metadata() -> std::collections::HashMap<String, String> {
         (
             "ppo_rules_audit_version".to_owned(),
             crate::PPO_RULES_AUDIT_VERSION.to_string(),
+        ),
+        (
+            "map2_reward_schema_version".to_owned(),
+            crate::MAP2_REWARD_SCHEMA_VERSION.to_string(),
+        ),
+        (
+            "map2_reward_schema_hash".to_owned(),
+            crate::MAP2_REWARD_SCHEMA_HASH.to_string(),
+        ),
+        (
+            "map2_reward_schema_descriptor".to_owned(),
+            crate::MAP2_REWARD_SCHEMA_DESCRIPTOR.to_owned(),
         ),
     ])
 }
@@ -643,6 +673,7 @@ fn provenance_migration_rejects_v13_v14_v15_without_rewriting_training_manifest(
         complete_episodes: false,
         updates: 1,
         ppo: crate::PpoConfig {
+            gamma_tick: crate::MAP2_REWARD_GAMMA_TICK,
             environments: 2,
             rollout_decisions: 2,
             epochs: 1,
@@ -652,7 +683,7 @@ fn provenance_migration_rejects_v13_v14_v15_without_rewriting_training_manifest(
         checkpoint_cadence: crate::TrainingCheckpointCadence::Updates(1),
         resume_provenance: crate::ResumeProvenance::MigrateGitCommit,
         seed: 18_000,
-        map: MapId(1),
+        map: MapId(2),
         git_commit: "different-commit".to_owned(),
         simulator_commit: "b575129".to_owned(),
     };
@@ -771,7 +802,16 @@ fn current_runtime_metadata_does_not_bypass_tensor_validation() {
             .expect_err("invalid prior tensor");
 
         assert_eq!(error, expected);
-        assert_eq!(error.to_string(), expected.to_string());
+        let message = match expected {
+            CheckpointError::TensorContract(field) => {
+                format!("checkpoint tensor contract has invalid {field}")
+            }
+            CheckpointError::NonFiniteTensor { name, index } => {
+                format!("checkpoint tensor {name} contains non-finite value at {index}")
+            }
+            _ => panic!("unexpected tensor validation fixture"),
+        };
+        assert_eq!(error.to_string(), message);
         assert_eq!(model.policy_identity().expect("identity"), before);
         assert_eq!(model.export_parameters().expect("parameters"), parameters);
     }
@@ -841,8 +881,24 @@ fn legacy_anchor_runtime_and_pre_migration_probe_training_reject_without_mutatio
 
 #[test]
 fn checkpoint_schema_hash_is_stable() {
-    assert_eq!(crate::CHECKPOINT_SCHEMA_VERSION, 2);
-    assert_eq!(crate::CHECKPOINT_SCHEMA_HASH, 4_581_258_024_746_721_724);
+    assert_eq!(crate::CHECKPOINT_SCHEMA_VERSION, 5);
+    assert_eq!(
+        crate::CHECKPOINT_SCHEMA_HASH,
+        super::map2_checkpoint::schema_hash(
+            crate::CHECKPOINT_SCHEMA_DESCRIPTOR,
+            &[
+                (crate::ACTION_SCHEMA_VERSION, crate::ACTION_SCHEMA_HASH),
+                (crate::FEATURE_SCHEMA_VERSION, crate::FEATURE_SCHEMA_HASH),
+                (crate::MODEL_SCHEMA_VERSION, crate::MODEL_SCHEMA_HASH),
+                (crate::PPO_SCHEMA_VERSION, crate::PPO_SCHEMA_HASH),
+                (
+                    crate::MAP2_REWARD_SCHEMA_VERSION,
+                    crate::MAP2_REWARD_SCHEMA_HASH
+                ),
+            ],
+        )
+    );
+    assert_ne!(crate::CHECKPOINT_SCHEMA_HASH, 4_581_258_024_746_721_724);
 }
 
 #[test]
@@ -988,32 +1044,7 @@ fn runtime_weights_reject_unknown_tensor_name_before_model_mutation() {
     let before = model.export_parameters().expect("before");
     let data = 0.0f32.to_le_bytes();
     let view = TensorView::new(Dtype::F32, vec![1], &data).expect("view");
-    let metadata = std::collections::HashMap::from([
-        (
-            "action_schema_hash".to_owned(),
-            crate::ACTION_SCHEMA_HASH.to_string(),
-        ),
-        (
-            "feature_schema_hash".to_owned(),
-            crate::FEATURE_SCHEMA_HASH.to_string(),
-        ),
-        (
-            "model_schema_hash".to_owned(),
-            crate::MODEL_SCHEMA_HASH.to_string(),
-        ),
-        (
-            "ppo_rules_audit_version".to_owned(),
-            crate::PPO_RULES_AUDIT_VERSION.to_string(),
-        ),
-        (
-            "ppo_schema_hash".to_owned(),
-            crate::PPO_SCHEMA_HASH.to_string(),
-        ),
-        (
-            "ppo_schema_version".to_owned(),
-            crate::PPO_SCHEMA_VERSION.to_string(),
-        ),
-    ]);
+    let metadata = current_runtime_metadata();
     let bytes = serialize([("unknown", view)], Some(metadata)).expect("malformed runtime file");
     fs::write(directory.join("drysua.weights.safetensors"), bytes).expect("write malformed");
 
@@ -1021,6 +1052,10 @@ fn runtime_weights_reject_unknown_tensor_name_before_model_mutation() {
         .expect_err("unknown tensor name");
 
     assert_eq!(error, CheckpointError::TensorContract("names"));
+    assert_eq!(
+        error.to_string(),
+        "checkpoint tensor contract has invalid names"
+    );
     assert_eq!(model.export_parameters().expect("after"), before);
     fs::remove_dir_all(directory).expect("remove test directory");
 }
@@ -1206,6 +1241,7 @@ fn runtime_loader_rejects_symlink_artifact() {
 
 fn checkpoint_config() -> PpoConfig {
     PpoConfig {
+        gamma_tick: crate::MAP2_REWARD_GAMMA_TICK,
         rollout_decisions: 2,
         environments: 2,
         epochs: 1,
@@ -1221,7 +1257,7 @@ fn run_metadata() -> CheckpointRun {
         enabled_features: crate::compiled_features(),
         command_line: "drysua train --device cpu".to_owned(),
         run_seed: 18_000,
-        map: MapId(1),
+        map: MapId(2),
         hero: crate::SHADOW_FIEND,
         device: CheckpointDevice::Cpu,
         batch_size: 4,

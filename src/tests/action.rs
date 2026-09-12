@@ -733,7 +733,7 @@ fn reference_tree_points(
 }
 
 #[test]
-fn town_portal_landings_are_not_body_navigation_targets() {
+fn town_portal_landings_allow_move_but_not_attack_move_and_keep_tp_provenance() {
     let mut view = world_view(1);
     let hero_index = hero_index(&view);
     view.units[hero_index].pos = Vec2::from_ints(6_000, 6_000);
@@ -757,7 +757,23 @@ fn town_portal_landings_are_not_body_navigation_targets() {
         assert!(candidate.allied_building);
         assert!(matches!(candidate.source, PointSource::BuildingLanding(_)));
         for unit in [ControlledUnit::Hero, ControlledUnit::Courier] {
-            assert!(!space.move_point_mask(unit)[index]);
+            // Native navigation proves these are landing cells, not occupied building centers.
+            assert!(space.move_point_mask(unit)[index]);
+            assert_order(
+                &space,
+                StructuredAction::MovePoint {
+                    unit,
+                    point: PointIndex(index),
+                },
+                if unit == ControlledUnit::Hero {
+                    None
+                } else {
+                    Some(COURIER_ID)
+                },
+                Order::Move {
+                    target: Target::Pos(candidate.position),
+                },
+            );
             assert!(!space.attack_move_point_mask(unit)[index]);
         }
         assert!(
@@ -775,6 +791,68 @@ fn town_portal_landings_are_not_body_navigation_targets() {
             assert!(!mask.points()[index]);
             assert!(!candidate.walkable);
         }
+    }
+}
+
+#[test]
+fn building_landing_moves_keep_dead_stunned_rooted_gates_but_item_mute_only_blocks_tp() {
+    for status in [
+        0,
+        StatusFlags::DEAD,
+        StatusFlags::STUNNED,
+        StatusFlags::ROOTED,
+    ] {
+        let mut view = world_view(1);
+        let hero = hero_index(&view);
+        view.units[hero].statuses.bits = status;
+        view.units[hero].pos = Vec2::from_ints(6_000, 6_000);
+        let mut scroll = item_with_id(ItemId(8), Some(Aim::Building), 600, false);
+        scroll.mute_left = 1;
+        view.units[hero].items[0] = Some(scroll);
+        let space = ActionSpace::from_tracker(&tracker_with_view(view)).expect("landing gates");
+        let index = space
+            .point_candidates()
+            .iter()
+            .position(|candidate| {
+                matches!(candidate.source, PointSource::BuildingLanding(_)) && candidate.walkable
+            })
+            .expect("existing landing");
+        let action = StructuredAction::MovePoint {
+            unit: ControlledUnit::Hero,
+            point: PointIndex(index),
+        };
+        assert_eq!(
+            space.move_point_mask(ControlledUnit::Hero)[index],
+            status == 0
+        );
+        assert_eq!(space.allows(action), status == 0);
+        if status == 0 {
+            assert_order(
+                &space,
+                action,
+                None,
+                Order::Move {
+                    target: Target::Pos(space.point_candidates()[index].position),
+                },
+            );
+        } else {
+            let error = space.decode(action).expect_err("disabled hero cannot move");
+            assert_eq!(error, ActionError::NotAllowed(ActionKind::MovePoint));
+            assert_eq!(
+                error.to_string(),
+                "action MovePoint is masked by the current action space"
+            );
+        }
+        let teleport = StructuredAction::Use {
+            unit: ControlledUnit::Hero,
+            slot: ItemSlot(0),
+            target: ActionTarget::Point(PointIndex(index)),
+        };
+        assert!(!space.allows(teleport));
+        assert_eq!(
+            space.decode(teleport),
+            Err(ActionError::NotAllowed(ActionKind::Use))
+        );
     }
 }
 
@@ -1303,10 +1381,10 @@ fn composite_buy_with_no_missing_parts_is_masked_instead_of_issuing_a_noop() {
 }
 
 #[test]
-fn composite_component_decoding_is_identified_by_action_schema_three() {
-    assert_eq!(crate::ACTION_SCHEMA_VERSION, 3);
+fn composite_component_decoding_is_preserved_by_navigation_action_schema_five() {
+    assert_eq!(crate::ACTION_SCHEMA_VERSION, 5);
     assert!(crate::ACTION_SCHEMA_DESCRIPTOR.contains("buy_decode=root_or_first_missing_leaf"));
-    assert_eq!(crate::ACTION_SCHEMA_HASH, 1_755_359_086_494_840_931);
+    assert_eq!(crate::ACTION_SCHEMA_HASH, 10_658_390_830_565_586_343);
 }
 
 fn buy_action(space: &ActionSpace, item: ItemId) -> StructuredAction {

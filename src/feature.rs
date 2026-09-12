@@ -22,9 +22,9 @@ use crate::{
 };
 
 /// Version of the policy feature layout and candidate input-state semantics.
-pub const FEATURE_SCHEMA_VERSION: u32 = 12;
+pub const FEATURE_SCHEMA_VERSION: u32 = 15;
 /// Number of scalar global features.
-pub const GLOBAL_FEATURES: usize = 72;
+pub const GLOBAL_FEATURES: usize = 85;
 /// Number of scalar features in one global-history sample.
 pub const HISTORY_FEATURES: usize = 24;
 /// Number of global-history samples.
@@ -34,7 +34,7 @@ pub const POLICY_HISTORY_FEATURES: usize = 4;
 /// Maximum number of local policy-history samples.
 pub const MAX_POLICY_HISTORY: usize = 16;
 /// Number of scalar features in one unit token.
-pub const UNIT_FEATURES: usize = 73;
+pub const UNIT_FEATURES: usize = 84;
 /// Number of unit tokens in exact ActionSpace entity-candidate order.
 pub const UNIT_FEATURE_TOKENS: usize = UNIT_TOKENS;
 /// Number of fixed own hero and courier unit tokens.
@@ -163,6 +163,12 @@ pub mod global_feature {
     pub const ENEMY_ANCIENT_RELATIVE_X: usize = 69;
     pub const ENEMY_ANCIENT_RELATIVE_Y: usize = 70;
     pub const ENEMY_ANCIENT_DISTANCE: usize = 71;
+    pub const MAP_TWO: usize = 72;
+    /// Nine remaining fractions in MAP2_REWARD_SCHEMA_DESCRIPTOR channel order.
+    pub const MAP2_REWARD_REMAINING_START: usize = 73;
+    pub const MAP2_TOWER_POTENTIAL: usize = 82;
+    pub const MAP2_LANE_POTENTIAL: usize = 83;
+    pub const MAP2_LANE_OBSERVED: usize = 84;
 }
 
 /// Stable indices in each unit token.
@@ -227,6 +233,19 @@ pub mod unit_feature {
     pub const CHANNELLING: usize = 70;
     pub const FACING_COS: usize = 71;
     pub const FACING_SIN: usize = 72;
+    pub const RAZE_EFFECT_PRESENT: usize = 73;
+    pub const RAZE_STACKS: usize = 74;
+    pub const RAZE_TICKS_LEFT: usize = 75;
+    /// Guarded effect13 remaining ticks / 15; positive implies observed presence.
+    pub const GUARDED_TICKS_LEFT: usize = 76;
+    /// Inspired effect14 remaining ticks / 15; positive implies observed presence.
+    pub const INSPIRED_TICKS_LEFT: usize = 77;
+    pub const HEALTH_RESTORE_REPORT_PRESENT: usize = 78;
+    pub const HEALTH_RESTORE_REPORT_AMOUNT: usize = 79;
+    pub const HEALTH_RESTORE_REPORT_AGE: usize = 80;
+    pub const MANA_RESTORE_REPORT_PRESENT: usize = 81;
+    pub const MANA_RESTORE_REPORT_AMOUNT: usize = 82;
+    pub const MANA_RESTORE_REPORT_AGE: usize = 83;
 }
 
 /// Stable indices in each point-candidate token.
@@ -374,9 +393,10 @@ pub mod loot_feature {
 
 /// Canonical schema text covered by [`FEATURE_SCHEMA_HASH`].
 pub const FEATURE_SCHEMA_DESCRIPTOR: &str = concat!(
-    "bota-drysua-feature/v12;",
-    "action_schema_version=3;action_schema_hash=1755359086494840931;",
-    "shapes=global:72,history:7x24,policy_history:16x4,unit:96x73,own_unit:2x73,remembered_unit:32x73,point:48x32,ability:14x24,item:85x28,projectile:32x20,loot:16x16,map:96;",
+    "bota-drysua-feature/v15;",
+    "action_schema_version=5;action_schema_hash=linked;",
+    "navigation_contract=existing_walkable_building_landing_move_pointers_allowed,attack_move_veto_and_tp_provenance_unchanged;frame_legality_and_action_space_provenance=new_contract,raw_dimensions_field_ids_point_order_and_sources_unchanged,no_old_frame_or_corpus_relabel;",
+    "shapes=global:85,history:7x24,policy_history:16x4,unit:96x84,own_unit:2x84,remembered_unit:32x84,point:48x32,ability:14x24,item:85x28,projectile:32x20,loot:16x16,map:96;",
     "scalar_ranges=presence_and_one_hot:[0,1],unsigned_continuous:[0,1],signed_continuous:[-1,1],category:positive_exact_integer,all_finite;",
     "history_ages=480,240,120,60,30,15,0;",
     "normalizers=tick:3600000,age:4800,history_age:480,gold_asset_item_cost:100000,score:1000,xp:100000,hp:100000,mana:20000,damage:10000,attack_interval:600,speed:2000,armor_raw:6553600,level:30,charges:255,cooldown:36000,structures:64;",
@@ -436,30 +456,40 @@ pub const FEATURE_SCHEMA_DESCRIPTOR: &str = concat!(
     "loot_scalars=normalizers:charges255_relative_extent_direct_extent_path_axis_squared_age4800,categories:item1..65536,reserved:12..15;",
     "map_scalars=normalizers:elevation63_landmark_squared_extent_ray_step20,categories:direction_fixed_E_NE_N_NW_W_SW_S_SE_hit_kind_walkable_water_opaque_tree,reserved:14..15;",
     "unit_append_indices=69:invulnerable,70:channelling,71:facing_cos,72:facing_sin;unit_append_semantics=wire_status_bits9_10,last_observed_only_with_visible_remembered_age_provenance,canonical_facing_brads_times_TAU_div65536_f32_sin_cos,absent_token_zero;",
-    "global_append_indices=64:own_ancient_present,65:own_ancient_relative_x,66:own_ancient_relative_y,67:own_ancient_distance,68:enemy_ancient_present,69:enemy_ancient_relative_x,70:enemy_ancient_relative_y,71:enemy_ancient_distance;ancient_geometry=seat_observed_current_or_remembered_Ancient_kind_exact_team,only_unique_known_position_per_team,requires_live_own_hero_origin,canonical_delta_extent_chebyshev_distance_extent,missing_or_ambiguous_all_zero,no_hidden_map_lookup_no_goal_priority;"
+    "global_append_indices=64:own_ancient_present,65:own_ancient_relative_x,66:own_ancient_relative_y,67:own_ancient_distance,68:enemy_ancient_present,69:enemy_ancient_relative_x,70:enemy_ancient_relative_y,71:enemy_ancient_distance;ancient_geometry=seat_observed_current_or_remembered_Ancient_kind_exact_team,only_unique_known_position_per_team,requires_live_own_hero_origin,canonical_delta_extent_chebyshev_distance_extent,missing_or_ambiguous_all_zero,no_hidden_map_lookup_no_goal_priority;",
+    "map2_global_append=72:map2_present,73-81:reward_remaining_in_MAP2_REWARD_SCHEMA_channel_order,82:tower_potential_raw_f32_range[-.05,.05],83:lane_potential_raw_f32_range[-.01,.01],84:lane_observed;legacy_map0_map1_append_zero;",
+    "map2_reward=only_map2_tracker_owned_complete_contiguous_seat_snapshot_events_before_event_journal_trim,full_lifetime_clone,no_hidden_world_inputs,complete_pair_required_before_observe_and_encode,remaining_and_potentials_and_completed_tick_in_provenance,drain_does_not_invalidate_features,finish_advances_revision;reward_schema=linked_version_hash_and_complete_descriptor;",
+    "map2_audit=reward_state_includes_public_enemy_bounty_and_xp_budget_remaining_even_when_raw_enemy_scoreboard_disabled;no_hidden_enemy_economy;",
+    "raze_append=73:anonymous_effect15_present,74:stacks_div255,75:ticks_left_div240;pair=max_lexicographic_valid_active_row_stacks_then_remaining_ticks,never_sum_or_source_attribution;valid_stacks1..255_ticks1..240;memory_timer=observed_ticks_minus_age_expired_zero,no_fog_refresh,known_death_clears;rows_order_independent;entity_sort_pair_before_opaque_id;absent_incomplete_out_of_range_rows_zero;",
+    "rebase_effects=Guarded13_Inspired14_Shadowraze15;auras=unit76:guarded_remaining_div15,77:inspired_remaining_div15,positive_means_presence,anonymous_max_timer_valid1..15_no_stacks,age_subtracted_no_hidden_refresh_or_source,expired_absent_dead_zero;",
+    "manual_restoration=Healed_amount_health_and_mana_independent_reports_0..1000000_reject_invalid_before_tracker_mutation,positive_updates_only_other_channel_retained,instant_or_interruptible_overtime_promise_not_confirmed_tickregen,no_passive_or_fountain_report,no_pool_mutation_no_reward_credit_or_refund;unit78:health_report_present,79:amount_div100000_clamped,80:age_div480,81:mana_report_present,82:amount_div20000_clamped,83:age_div480;received_only_latest_positive_per_channel_from_existing64_prior_snapshot_event_journal,strict_tick_before_snapshot_age1..480,full_generation_bookkeeping_no_source_id;sorting=raze_pair_then_aura_timers_then_received_report_semantics_before_opaque_id;",
+    "map2_scope=cap27900_including900_pregame_15minute_gameplay;",
+    "mango=item42_category43_existing_item_and_loot_token_fields,no_new_item_rows;map2_geometry=map0_public_geometry_no_metadata_relabel;"
 );
 
-const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
-const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
+/// FNV-1a of the descriptor, action/reward version-le32/hash-le64 pairs, and reward descriptor.
+pub const FEATURE_SCHEMA_HASH: u64 = crate::model::linked_schema_hash(
+    FEATURE_SCHEMA_DESCRIPTOR,
+    &[
+        (crate::ACTION_SCHEMA_VERSION, crate::ACTION_SCHEMA_HASH),
+        (
+            crate::MAP2_REWARD_SCHEMA_VERSION,
+            crate::MAP2_REWARD_SCHEMA_HASH,
+        ),
+    ],
+);
 
-const fn fnv1a(bytes: &[u8]) -> u64 {
-    let mut hash = FNV_OFFSET;
-    let mut index = 0;
-    while index < bytes.len() {
-        hash ^= bytes[index] as u64;
-        hash = hash.wrapping_mul(FNV_PRIME);
-        index += 1;
-    }
-    hash
-}
-
-/// Stable FNV-1a hash of the complete feature schema descriptor.
-pub const FEATURE_SCHEMA_HASH: u64 = fnv1a(FEATURE_SCHEMA_DESCRIPTOR.as_bytes());
-
-const _: () = assert!(crate::ACTION_SCHEMA_VERSION == 3);
+const _: () = assert!(crate::ACTION_SCHEMA_VERSION == 5);
 const _: () = assert!(StatusFlags::INVULNERABLE == 1 << 9);
 const _: () = assert!(StatusFlags::CHANNELLING == 1 << 10);
-const _: () = assert!(crate::ACTION_SCHEMA_HASH == 1_755_359_086_494_840_931);
+const _: () = assert!(
+    global_feature::MAP2_REWARD_REMAINING_START + crate::MAP2_REWARD_CHANNELS
+        == global_feature::MAP2_TOWER_POTENTIAL
+);
+const _: () = assert!(global_feature::MAP2_LANE_OBSERVED + 1 == GLOBAL_FEATURES);
+const _: () = assert!(unit_feature::MANA_RESTORE_REPORT_AGE + 1 == UNIT_FEATURES);
+const _: () =
+    assert!(unit_feature::INSPIRED_TICKS_LEFT + 1 == unit_feature::HEALTH_RESTORE_REPORT_PRESENT);
 const _: () = assert!(crate::MAX_TRACKED_ENTITIES == 4_096);
 const _: () = assert!(MAX_PROJECTILES == 4_096);
 const _: () = assert!(PROJECTILE_FEATURE_TOKENS == 32);
@@ -1194,6 +1224,7 @@ const fn apply_active_transition(
 /// Feature construction failure.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum FeatureError {
+    Map2RewardIncomplete { snapshot: u32 },
     SnapshotRequired,
     TickMismatch { snapshot: u32, action_space: u32 },
     ActionSpaceMismatch,
@@ -1211,6 +1242,10 @@ pub enum FeatureError {
 impl fmt::Display for FeatureError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Map2RewardIncomplete { snapshot } => write!(
+                formatter,
+                "feature Map2 reward requires complete Snapshot/Events for tick {snapshot}"
+            ),
             Self::SnapshotRequired => formatter.write_str("feature encoding requires a snapshot"),
             Self::TickMismatch {
                 snapshot,
@@ -1286,7 +1321,7 @@ struct LootObservation {
     last_tick: u32,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 struct FeatureObservationState {
     tick: Option<u32>,
     provenance: Option<TrackerProvenance>,
@@ -1387,6 +1422,7 @@ impl FeatureEncoder {
     pub fn observe(&mut self, tracker: &StateTracker) -> Result<(), FeatureError> {
         let current = tracker.current().ok_or(FeatureError::SnapshotRequired)?;
         self.validate_map(tracker)?;
+        validate_map2_reward(tracker, current.tick)?;
         if tracker.lineage() != self.lineage {
             return Err(FeatureError::ObservationPredecessorMismatch {
                 incoming: current.tick,
@@ -1492,6 +1528,7 @@ impl FeatureEncoder {
         local: &LocalPolicyState,
         tick: u32,
     ) -> Result<(), FeatureError> {
+        validate_map2_reward(tracker, tick)?;
         if action_space.tick() != tick {
             return Err(FeatureError::TickMismatch {
                 snapshot: tick,
@@ -1610,6 +1647,7 @@ impl FeatureEncoder {
         output.global[index::SNAPSHOT_DAMAGE_DEALT] = signed_ratio(dealt, MAX_DAMAGE);
         output.global[index::SNAPSHOT_DAMAGE_TAKEN] = signed_ratio(taken, MAX_DAMAGE);
         self.encode_ancient_geometry(tracker, &mut output.global);
+        encode_map2_reward(tracker, &mut output.global);
     }
 
     fn encode_ancient_geometry(&self, tracker: &StateTracker, global: &mut [f32; GLOBAL_FEATURES]) {
@@ -1785,6 +1823,8 @@ impl FeatureEncoder {
         );
         encode_statuses(&mut token, unit.statuses);
         encode_unit_recent(&mut token, tracker, track, tick);
+        encode_unit_effects(&mut token, track, tick);
+        encode_restoration_reports(&mut token, tracker, track.id, tick);
         token
     }
 
@@ -2316,6 +2356,81 @@ impl FeatureEncoder {
         let x = usize::try_from(position.x.to_int() / TERRAIN_CELL_SIZE).ok()?;
         let y = usize::try_from(position.y.to_int() / TERRAIN_CELL_SIZE).ok()?;
         (x < self.axis && y < self.axis).then_some((x, y))
+    }
+}
+
+fn validate_map2_reward(tracker: &StateTracker, tick: u32) -> Result<(), FeatureError> {
+    if let Some(state) = tracker.map2_reward_state()
+        && state.completed_tick != Some(tick)
+    {
+        return Err(FeatureError::Map2RewardIncomplete { snapshot: tick });
+    }
+    Ok(())
+}
+
+fn encode_map2_reward(tracker: &StateTracker, global: &mut [f32; GLOBAL_FEATURES]) {
+    let Some(state) = tracker.map2_reward_state() else {
+        return;
+    };
+    assert_eq!(tracker.metadata().map.0, 2);
+    assert_eq!(
+        state.completed_tick,
+        tracker.current().map(|view| view.tick)
+    );
+    global[global_feature::MAP_TWO] = 1.0;
+    let start = global_feature::MAP2_REWARD_REMAINING_START;
+    global[start..start + crate::MAP2_REWARD_CHANNELS].copy_from_slice(&state.remaining);
+    global[global_feature::MAP2_TOWER_POTENTIAL] = state.tower_potential;
+    global[global_feature::MAP2_LANE_POTENTIAL] = state.lane_potential;
+    global[global_feature::MAP2_LANE_OBSERVED] = bool_feature(state.lane_observed);
+}
+
+fn encode_unit_effects(token: &mut [f32; UNIT_FEATURES], track: &crate::EntityTrack, tick: u32) {
+    if track.unit.hp <= 0
+        || track.unit.statuses.bits & StatusFlags::DEAD != 0
+        || track
+            .last_death
+            .is_some_and(|death| death.tick >= track.last_seen_tick)
+    {
+        return;
+    }
+    let age = tick.saturating_sub(track.last_seen_tick);
+    if let Some((stacks, ticks)) = crate::tracker::shadowraze_effect(&track.unit, age) {
+        token[unit_feature::RAZE_EFFECT_PRESENT] = 1.0;
+        token[unit_feature::RAZE_STACKS] = unit_ratio(stacks, crate::SHADOWRAZE_EFFECT_STACKS);
+        token[unit_feature::RAZE_TICKS_LEFT] = unit_ratio(ticks, crate::SHADOWRAZE_EFFECT_TICKS);
+    }
+    let [guarded, inspired] = crate::tracker::aura_effects(&track.unit, age);
+    token[unit_feature::GUARDED_TICKS_LEFT] = unit_ratio(guarded, crate::AURA_EFFECT_TICKS);
+    token[unit_feature::INSPIRED_TICKS_LEFT] = unit_ratio(inspired, crate::AURA_EFFECT_TICKS);
+}
+
+fn encode_restoration_reports(
+    token: &mut [f32; UNIT_FEATURES],
+    tracker: &StateTracker,
+    target: EntityId,
+    tick: u32,
+) {
+    let reports = crate::tracker::recent_restoration_reports(tracker, target);
+    for (report, offset, maximum) in [
+        (
+            reports[0],
+            unit_feature::HEALTH_RESTORE_REPORT_PRESENT,
+            MAX_HP,
+        ),
+        (
+            reports[1],
+            unit_feature::MANA_RESTORE_REPORT_PRESENT,
+            MAX_MANA,
+        ),
+    ] {
+        if let Some((reported_tick, amount)) = report {
+            assert!(reported_tick < tick);
+            assert!(tick - reported_tick <= crate::HISTORY_TICKS);
+            token[offset] = 1.0;
+            token[offset + 1] = ratio(i64::from(amount), 0, maximum);
+            token[offset + 2] = unit_ratio(tick - reported_tick, crate::HISTORY_TICKS);
+        }
     }
 }
 

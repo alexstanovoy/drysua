@@ -91,7 +91,7 @@ fn two_teachers_cover_and_decode_every_decision_with_low_rejection_rate_on_both_
 }
 
 #[test]
-fn teacher_against_weak_makes_gameplay_progress_on_both_maps_and_sides() {
+fn teacher_against_weak_makes_historical_map_progress_without_turning_demo_tower_loss_into_a_win() {
     let games =
         crate::evaluate_teacher_against_weak_for_test(TEACHER_WEAK_SEED, TEACHER_WEAK_DECISIONS)
             .expect("teacher-versus-weak evaluation");
@@ -148,7 +148,8 @@ fn teacher_against_weak_makes_gameplay_progress_on_both_maps_and_sides() {
             game.candidate_team,
         );
         if game.map == MapId(1) {
-            assert_eq!(game.outcome, CheckpointEvaluationOutcome::Win);
+            // The rebased demo has no Ancient, death limit, or tower-loss terminal.
+            assert_eq!(game.outcome, CheckpointEvaluationOutcome::Timeout);
             assert!(game.final_summary.enemy_structures_destroyed > 0);
         }
         total_denies = total_denies
