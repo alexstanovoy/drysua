@@ -4,13 +4,13 @@ use std::collections::HashMap;
 
 #[test]
 fn rebase_inference_versions_reject_old_effect_and_healing_interpretations() {
-    assert_eq!(crate::FEATURE_SCHEMA_VERSION, 15);
-    assert_eq!(crate::MODEL_SCHEMA_VERSION, 17);
-    assert_eq!(crate::PPO_SCHEMA_VERSION, 30);
-    assert_eq!(crate::PPO_RULES_AUDIT_VERSION, 25);
-    assert_eq!(crate::LEAGUE_SCHEMA_VERSION, 30);
-    assert_eq!(crate::CHECKPOINT_SCHEMA_VERSION, 5);
-    assert_eq!(crate::GLOBAL_FEATURES, 85);
+    assert_eq!(crate::FEATURE_SCHEMA_VERSION, 17);
+    assert_eq!(crate::MODEL_SCHEMA_VERSION, 19);
+    assert_eq!(crate::PPO_SCHEMA_VERSION, 32);
+    assert_eq!(crate::PPO_RULES_AUDIT_VERSION, 27);
+    assert_eq!(crate::LEAGUE_SCHEMA_VERSION, 32);
+    assert_eq!(crate::CHECKPOINT_SCHEMA_VERSION, 7);
+    assert_eq!(crate::GLOBAL_FEATURES, 90);
     assert_eq!(crate::UNIT_FEATURES, 84);
     assert!(crate::PPO_SCHEMA_DESCRIPTOR.contains("cap27900"));
     assert!(crate::LEAGUE_SCHEMA_DESCRIPTOR.contains("cap27900"));
@@ -102,7 +102,7 @@ fn m15_metadata() -> HashMap<String, String> {
         ("map2_reward_schema_hash", "798798703797057220".to_owned()),
         (
             "map2_reward_schema_descriptor",
-            crate::MAP2_REWARD_SCHEMA_DESCRIPTOR.to_owned(),
+            crate::checkpoint::legacy_reward::MAP2_REWARD_V1_DESCRIPTOR.to_owned(),
         ),
     ]
     .into_iter()

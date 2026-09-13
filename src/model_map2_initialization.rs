@@ -72,25 +72,62 @@ const GLOBAL_INSERTED: usize = super::GLOBAL_FEATURES - M14_GLOBAL_FEATURES;
 const UNIT_INSERTED: usize = super::UNIT_FEATURES - M14_UNIT_FEATURES;
 const _: () = assert!(super::GLOBAL_FEATURES > M14_GLOBAL_FEATURES);
 const _: () = assert!(super::UNIT_FEATURES > M14_UNIT_FEATURES);
-const _: () = assert!(super::GLOBAL_FEATURES == 85);
+const _: () = assert!(super::GLOBAL_FEATURES == 90);
 const _: () = assert!(super::UNIT_FEATURES == 84);
-const _: () = assert!(MODEL_PARAMETER_COUNT == 1_696_436);
+const _: () = assert!(MODEL_PARAMETER_COUNT == 1_698_996);
 const _: () = assert!(
     MODEL_PARAMETER_COUNT == M14_PARAMETER_COUNT + UNIT_INSERTED * 64 + GLOBAL_INSERTED * 512
 );
 
 impl PolicyModel {
-    /// Imports all M16 parameter bits with the same audited names, ordering and shapes.
+    /// Imports M16 ancestry with zero rows for wait/progress accounting and no training state.
     pub(crate) fn initialize_m16_navigation_parameters(
         &self,
         source: &[f32],
     ) -> Result<(), ModelError> {
-        super::validate_parameter_values(source)?;
-        let schema = self.parameter_schema()?;
-        Self::validate_map2_parameter_schema(&schema)?;
-        assert_eq!(schema.len(), 62);
-        assert_eq!(source.len(), 1_696_436);
-        self.import_parameters(source)
+        self.import_parameters(&self.widen_map2_wait_parameters(source)?)
+    }
+
+    /// Pads the frozen identical M16/M17 tensor layout at global row85 using CPU F32 Candle.
+    pub(crate) fn widen_map2_wait_parameters(
+        &self,
+        source: &[f32],
+    ) -> Result<Vec<f32>, ModelError> {
+        const SOURCE_COUNT: usize = 1_696_436;
+        if source.len() != SOURCE_COUNT {
+            return Err(ModelError::ParameterLength {
+                actual: source.len(),
+                expected: SOURCE_COUNT,
+            });
+        }
+        if let Some(index) = source.iter().position(|value| !value.is_finite()) {
+            return Err(ModelError::NonFiniteParameter { index });
+        }
+        Self::validate_map2_parameter_schema(&self.parameter_schema()?)?;
+        let flat = Tensor::from_slice(source, SOURCE_COUNT, &super::Device::Cpu)?;
+        let mut tensors = Vec::with_capacity(M14_LAYOUT.len());
+        let mut offset = 0;
+        for (name, old_shape) in M14_LAYOUT {
+            let shape = match name {
+                "unit.0.weight" => &[84, 64][..],
+                "trunk.0.weight" => &[2589, 512][..],
+                _ => old_shape,
+            };
+            let count = shape.iter().product::<usize>();
+            let tensor = flat.narrow(0, offset, count)?.reshape(shape)?;
+            let padded = if name == "trunk.0.weight" {
+                insert_rows(&tensor, 85, super::GLOBAL_FEATURES - 85)?
+            } else {
+                tensor
+            };
+            tensors.push(padded.flatten_all()?);
+            offset += count;
+        }
+        assert_eq!(offset, SOURCE_COUNT);
+        let target: Vec<f32> = Tensor::cat(&tensors, 0)?.to_vec1()?;
+        super::validate_parameter_values(&target)?;
+        assert_eq!(target.len(), SOURCE_COUNT + 2560);
+        Ok(target)
     }
 
     /// Checks the entire destination layout before interpreting an immutable M14 flat payload.

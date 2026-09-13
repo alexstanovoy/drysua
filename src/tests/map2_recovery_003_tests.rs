@@ -17,6 +17,7 @@ fn exact_and_near_ties_keep_reference_but_strict_gain_is_allowed() {
 }
 
 #[test]
+#[ignore = "Historical M17/reward1 saved-parent and recovery003 gameplay probe; preserve its original outcomes and use the original schema build, not M18."]
 fn actual_mango_after_attack_targets_parent_use_and_keeps_suffix() {
     let frozen = parent();
     let failed = start_model();

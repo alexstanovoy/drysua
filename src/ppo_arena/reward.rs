@@ -19,6 +19,11 @@ pub struct Map2TrainingReward {
     pub mana_spent: f64,
     pub tower_health: f64,
     pub lane_pressure: f64,
+    pub pregame_movement: f64,
+    pub fountain_wait: f64,
+    pub fountain_wait_refund: f64,
+    pub stagnation_base: f64,
+    pub stagnation_ticks_cost: f64,
     pub terminal: f64,
     pub total: f64,
     pub observations: Map2RewardObservations,
@@ -50,6 +55,11 @@ impl Map2TrainingReward {
             mana_spent: interval.mana_spent,
             tower_health: interval.tower_health,
             lane_pressure: interval.lane_pressure,
+            pregame_movement: interval.pregame_movement,
+            fountain_wait: interval.fountain_wait,
+            fountain_wait_refund: interval.fountain_wait_refund,
+            stagnation_base: interval.stagnation_base,
+            stagnation_ticks_cost: interval.stagnation_ticks_cost,
             terminal: interval.terminal,
             total: interval.total,
             observations: interval.observations,
@@ -76,6 +86,11 @@ impl Map2TrainingReward {
             mana_spent: self.mana_spent + other.mana_spent,
             tower_health: self.tower_health + other.tower_health,
             lane_pressure: self.lane_pressure + other.lane_pressure,
+            pregame_movement: self.pregame_movement + other.pregame_movement,
+            fountain_wait: self.fountain_wait + other.fountain_wait,
+            fountain_wait_refund: self.fountain_wait_refund + other.fountain_wait_refund,
+            stagnation_base: self.stagnation_base + other.stagnation_base,
+            stagnation_ticks_cost: self.stagnation_ticks_cost + other.stagnation_ticks_cost,
             terminal: self.terminal + other.terminal,
             total: self.total + other.total,
             observations: merge_observations(self.observations, other.observations)?,
@@ -89,7 +104,7 @@ impl Map2TrainingReward {
         Ok(())
     }
 
-    pub(super) fn components(&self) -> [f64; 11] {
+    pub(super) fn components(&self) -> [f64; 16] {
         [
             self.gold,
             self.experience,
@@ -100,6 +115,11 @@ impl Map2TrainingReward {
             self.mana_spent,
             self.tower_health,
             self.lane_pressure,
+            self.pregame_movement,
+            self.fountain_wait,
+            self.fountain_wait_refund,
+            self.stagnation_base,
+            self.stagnation_ticks_cost,
             self.terminal,
             self.total,
         ]
@@ -117,6 +137,9 @@ fn merge_observations(
         own_xp_gained: add(left.own_xp_gained, right.own_xp_gained)?,
         enemy_xp_gained: add(left.enemy_xp_gained, right.enemy_xp_gained)?,
         hero_damage_dealt: add(left.hero_damage_dealt, right.hero_damage_dealt)?,
+        structure_damage_dealt: add(left.structure_damage_dealt, right.structure_damage_dealt)?,
+        creep_kills: add(left.creep_kills, right.creep_kills)?,
+        creep_denies: add(left.creep_denies, right.creep_denies)?,
         hero_damage_taken: add(left.hero_damage_taken, right.hero_damage_taken)?,
         creep_damage_taken: add(left.creep_damage_taken, right.creep_damage_taken)?,
         other_damage_taken: add(left.other_damage_taken, right.other_damage_taken)?,
@@ -135,6 +158,21 @@ fn merge_observations(
         unattributed_deaths: add(left.unattributed_deaths, right.unattributed_deaths)?,
         duplicate_deaths: add(left.duplicate_deaths, right.duplicate_deaths)?,
         lane_observed_ticks: add(left.lane_observed_ticks, right.lane_observed_ticks)?,
+        fountain_wait_ticks: add(left.fountain_wait_ticks, right.fountain_wait_ticks)?,
+        fountain_wait_charged_ticks: add(
+            left.fountain_wait_charged_ticks,
+            right.fountain_wait_charged_ticks,
+        )?,
+        fountain_wait_refunds: add(left.fountain_wait_refunds, right.fountain_wait_refunds)?,
+        stagnation_active_ticks: add(left.stagnation_active_ticks, right.stagnation_active_ticks)?,
+        stagnation_idle_ticks: add(left.stagnation_idle_ticks, right.stagnation_idle_ticks)?,
+        stagnation_charged_ticks: add(
+            left.stagnation_charged_ticks,
+            right.stagnation_charged_ticks,
+        )?,
+        stagnation_base_charges: add(left.stagnation_base_charges, right.stagnation_base_charges)?,
+        stagnation_repaid_ticks: add(left.stagnation_repaid_ticks, right.stagnation_repaid_ticks)?,
+        progress_reasons: left.progress_reasons | right.progress_reasons,
     })
 }
 
@@ -142,7 +180,7 @@ impl std::fmt::Display for Map2TrainingReward {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
-            "reward_ticks={} reward_total={:.9} reward_gold={:.9} reward_xp={:.9} reward_hero_damage={:.9} reward_hero_taken={:.9} reward_creep_taken={:.9} reward_other_taken={:.9} reward_mana={:.9} reward_towers={:.9} reward_lane={:.9} reward_terminal={:.9}",
+            "reward_ticks={} reward_total={:.9} reward_gold={:.9} reward_xp={:.9} reward_hero_damage={:.9} reward_hero_taken={:.9} reward_creep_taken={:.9} reward_other_taken={:.9} reward_mana={:.9} reward_towers={:.9} reward_lane={:.9} reward_pregame_movement={:.9} reward_fountain_wait={:.9} reward_fountain_wait_refund={:.9} reward_stagnation_base={:.9} reward_stagnation_ticks_cost={:.9} reward_terminal={:.9}",
             self.ticks,
             self.total,
             self.gold,
@@ -154,12 +192,17 @@ impl std::fmt::Display for Map2TrainingReward {
             self.mana_spent,
             self.tower_health,
             self.lane_pressure,
+            self.pregame_movement,
+            self.fountain_wait,
+            self.fountain_wait_refund,
+            self.stagnation_base,
+            self.stagnation_ticks_cost,
             self.terminal
         )?;
         let raw = self.observations;
         write!(
             formatter,
-            " own_gold={} enemy_gold={} own_xp={} enemy_xp={} hero_damage_dealt={} hero_damage_taken={} creep_damage_taken={} other_damage_taken={} unattributed_damage_taken={} mana_spent={} mana_unobserved_ticks={} lane_last_hits={} neutral_last_hits={} unattributed_damage_events={} unattributed_deaths={} duplicate_deaths={} lane_observed_ticks={}",
+            " own_gold={} enemy_gold={} own_xp={} enemy_xp={} hero_damage_dealt={} hero_damage_taken={} creep_damage_taken={} other_damage_taken={} unattributed_damage_taken={} mana_spent={} mana_unobserved_ticks={} lane_last_hits={} neutral_last_hits={} unattributed_damage_events={} unattributed_deaths={} duplicate_deaths={} lane_observed_ticks={} fountain_wait_ticks={} fountain_wait_charged_ticks={} fountain_wait_refunds={}",
             raw.own_gold_earned,
             raw.enemy_gold_earned,
             raw.own_xp_gained,
@@ -176,7 +219,23 @@ impl std::fmt::Display for Map2TrainingReward {
             raw.unattributed_damage_events,
             raw.unattributed_deaths,
             raw.duplicate_deaths,
-            raw.lane_observed_ticks
+            raw.lane_observed_ticks,
+            raw.fountain_wait_ticks,
+            raw.fountain_wait_charged_ticks,
+            raw.fountain_wait_refunds
+        )?;
+        write!(
+            formatter,
+            " structure_damage_dealt={} creep_kills={} creep_denies={} stagnation_active_ticks={} stagnation_idle_ticks={} stagnation_charged_ticks={} stagnation_base_charges={} stagnation_repaid_ticks={} progress_reasons=0x{:04x}",
+            raw.structure_damage_dealt,
+            raw.creep_kills,
+            raw.creep_denies,
+            raw.stagnation_active_ticks,
+            raw.stagnation_idle_ticks,
+            raw.stagnation_charged_ticks,
+            raw.stagnation_base_charges,
+            raw.stagnation_repaid_ticks,
+            raw.progress_reasons
         )
     }
 }

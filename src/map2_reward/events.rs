@@ -141,6 +141,15 @@ impl Map2Reward {
             self.interval.observations.hero_damage_dealt += amount;
             self.interval.hero_damage += self.charge(4, amount);
         }
+        if source.is_some_and(|source| source.role == Some(0))
+            && target.team == self.roles[1].team
+            && matches!(
+                target.kind,
+                UnitKind::Tower | UnitKind::Barracks | UnitKind::Ancient
+            )
+        {
+            self.interval.observations.structure_damage_dealt += amount;
+        }
     }
 
     fn observe_received(
@@ -193,6 +202,7 @@ impl Map2Reward {
         victim.dead = true;
         victim.death_recorded = true;
         let victim = *victim;
+        self.observe_creep_objective(victim, killer, denied);
         if let Some(tower) = self.towers.get_mut(&unit) {
             tower.hp = 0;
         }
@@ -217,6 +227,25 @@ impl Map2Reward {
         } else {
             self.interval.observations.enemy_gold_earned += gold;
             self.interval.gold -= self.charge(1, gold);
+        }
+    }
+
+    fn observe_creep_objective(
+        &mut self,
+        victim: super::Identity,
+        killer: Option<super::Identity>,
+        denied: bool,
+    ) {
+        let Some(killer) = killer.filter(|killer| killer.role == Some(0)) else {
+            return;
+        };
+        if !creep(victim.kind) {
+            return;
+        }
+        if denied && killer.team == victim.team {
+            self.interval.observations.creep_denies += 1;
+        } else if !denied && killer.team != victim.team {
+            self.interval.observations.creep_kills += 1;
         }
     }
 }

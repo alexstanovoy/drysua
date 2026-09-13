@@ -19,9 +19,7 @@ const ADVANTAGE_SOURCE: [u8; 32] = [
     0xaa, 0xba, 0x8a, 0x8e, 0x31, 0x36, 0xe5, 0x1d, 0xab, 0x21, 0x52, 0x18, 0x1c, 0xdf, 0x63, 0xb7,
 ];
 
-const _: () = assert!(M16_PARAMETERS == crate::MODEL_PARAMETER_COUNT);
-const _: () = assert!(crate::MAP2_REWARD_SCHEMA_VERSION == 1);
-const _: () = assert!(crate::MAP2_REWARD_SCHEMA_HASH == 798_798_703_797_057_220);
+const _: () = assert!(M16_PARAMETERS + 5 * 512 == crate::MODEL_PARAMETER_COUNT);
 
 /// Whitelisted M16 parameter ancestry for an unqualified, new-navigation policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -33,7 +31,7 @@ impl TrainingArtifact {
     /// INITIALIZATION ONLY from the pinned M16 initial (1739d280...) or advantage (fdd4d3f2...).
     /// Validates exact nine-key A4/F14/M16/PPO29/rules24/reward1 metadata, full file SHA,
     /// names, F32 shape and finite values before creating a model. Candle copies all
-    /// parameter bits in the audited 62-tensor layout; no source training state is read.
+    /// parameter bits and inserts five wait/progress input rows as zero; no training state is read.
     /// New legal actions change behavior: GAMEPLAY_EQUIVALENCE=false, qualification=false.
     /// The caller must retain provenance and create fresh optimizer, progress, RNG and league.
     /// This reads source files only; it neither saves weights nor trains.
@@ -74,12 +72,14 @@ impl Map2NavigationInitializationProvenance {
             .collect();
         assert_eq!(digest.len(), 64);
         let description = format!(
-            "INITIALIZATION_ONLY source_m16_sha256={digest} source_f=14 source_a=4 source_m=16 source_ppo=29 source_rules=24 target_f={} target_a={} target_m={} target_ppo={} target_rules={} reward_version=1 reward_hash=798798703797057220 parameter_bits_preserved=true named_tensors=62 new_weights=0 optimizer_progress_rng_league=fresh GAMEPLAY_EQUIVALENCE=false new_legal_actions_change_behavior=true qualification=false",
+            "INITIALIZATION_ONLY source_m16_sha256={digest} source_f=14 source_a=4 source_m=16 source_ppo=29 source_rules=24 source_reward_version=1 source_reward_hash=798798703797057220 target_f={} target_a={} target_m={} target_ppo={} target_rules={} reward_version={} reward_hash={} parameter_bits_preserved=true named_tensors=62 new_weights=2560_positive_zero optimizer_progress_rng_league=fresh GAMEPLAY_EQUIVALENCE=false new_legal_actions_change_behavior=true qualification=false",
             crate::FEATURE_SCHEMA_VERSION,
             crate::ACTION_SCHEMA_VERSION,
             crate::MODEL_SCHEMA_VERSION,
             crate::PPO_SCHEMA_VERSION,
-            crate::PPO_RULES_AUDIT_VERSION
+            crate::PPO_RULES_AUDIT_VERSION,
+            crate::MAP2_REWARD_SCHEMA_VERSION,
+            crate::MAP2_REWARD_SCHEMA_HASH,
         );
         assert!(description.len() < 4_096);
         description
@@ -129,7 +129,7 @@ fn selected_m16_navigation_metadata() -> HashMap<String, String> {
         ("map2_reward_schema_hash", "798798703797057220"),
         (
             "map2_reward_schema_descriptor",
-            crate::MAP2_REWARD_SCHEMA_DESCRIPTOR,
+            super::legacy_reward::MAP2_REWARD_V1_DESCRIPTOR,
         ),
     ]
     .into_iter()

@@ -14,6 +14,9 @@ use candle_core::{DType, Device, Tensor, Var};
 #[cfg(all(test, feature = "builtin"))]
 #[path = "model_advantage_fit.rs"]
 mod advantage_fit;
+#[cfg(all(test, feature = "builtin"))]
+#[path = "model_exploration_probe.rs"]
+mod exploration_probe;
 #[path = "model_map2_initialization.rs"]
 mod map2_initialization;
 #[cfg(all(test, feature = "builtin"))]
@@ -41,7 +44,7 @@ use crate::{
 };
 
 /// Version of the fixed policy-model layout and linked candidate execution contract.
-pub const MODEL_SCHEMA_VERSION: u32 = 17;
+pub const MODEL_SCHEMA_VERSION: u32 = 19;
 /// Maximum frame count accepted by one public batch call.
 pub const MODEL_MAX_BATCH: usize = 8_192;
 /// Frame count evaluated by one bounded host inference tensor graph.
@@ -98,10 +101,10 @@ static NEXT_OPTIMIZER_LINEAGE: AtomicU64 = AtomicU64::new(1);
 
 /// Canonical model shapes, parameter order, and linked action/feature semantics.
 pub const MODEL_SCHEMA_DESCRIPTOR: &str = concat!(
-    "bota-drysua-model/v17;",
+    "bota-drysua-model/v19;",
     "linked_schemas=action,feature,map2_reward;linked_hash=fnv1a_descriptor_then_ordered_version_le32_hash_le64_then_map2_reward_descriptor_utf8;",
-    "scope=map2_mid_only_cap27900_including900_pregame;candidate_execution=feature15_candidate_order_bookkeeping_action5_walkable_building_landing_move_only_mango_unchanged;layout=62_named_tensors_1696436_f32;transfer=explicit_pinned_corrected_m14_u4_or_initial_input_padding_or_two_pinned_m16_initial_and_advantage_same_shape_all_bits_new_owned_model_fresh_optimizer_progress_rng_league_not_resume_or_old_gameplay_compatibility;new_legal_actions_change_behavior_no_qualification;model13_reserved_isolated_wide_experiment;",
-    "map2_inputs=global_old72_preserved_append_map2_flag_nine_remaining_reward_fractions_tower_potential_lane_potential_lane_observed;unit_old73_preserved_append_anonymous_effect15_presence_stacks_timer_guarded13_inspired14_timers_received_hp_mana_manual_report_presence_amount_age_not_confirmed_tickregen;initialization_padding=unit.0.weight_rows73..84_positive_zero,trunk.0.weight_rows72..85_positive_zero_all_later_rows_shift13,all_other_parameter_bits_unchanged;",
+    "scope=map2_mid_only_cap27900_including900_pregame;candidate_execution=feature17_candidate_order_bookkeeping_action5_walkable_building_landing_move_only_mango_unchanged;layout=62_named_tensors_1698996_f32;transfer=explicit_pinned_m14_u4_or_initial_or_m16_initial_and_advantage_or_m17_initial05e78663_and_recovery004107e19e6_new_owned_model_fresh_optimizer_progress_rng_league_not_resume_or_old_gameplay_compatibility,no_m18_source_pin;model13_reserved_isolated_wide_experiment;",
+    "map2_inputs=global_old87_preserved_append_stagnation_debt_div2700_activity_lease_div30_base_latch,unit84_unchanged;reward3=full_v2_plus_independent_progress_debt_with_direct_effect3_activity_partial_lease_purchase_only_rearm_at_debt_zero_no_stagnation_refund;initialization_padding=m14_unit.0.weight_rows73..84_positive_zero_trunk.0.weight_rows72..90_positive_zero_shift18,m16_m17_trunk.0.weight_rows85..90_positive_zero_shift5_all_other_parameter_bits_unchanged;",
     "dtype=f32;device=cpu_actor,cpu_cuda_or_metal_learner,one_learner_per_device;architecture=deepsets;activations=relu_after_every_encoder_and_trunk_linear;",
     "input_conditioning=host_before_tensor_after_presence_mask,feature_v9_unchanged;category_divisors=global10:5,12:3,32:16,55:12;policy_history3:16;unit5:12;ability1:2,2:8,11:5;item1:5,2:64,9:5,13:3;point10:8,12:8,16:12;semantic_ids=ability5_and_projectile6:ln1p(x)/ln(65548),item4_and_loot1:ln1p(x)/ln(65537);all_other_features_identity;",
     "output_initialization=all_linear_outside_relu_mlps_including_value_and_pointer_queries:he_uniform_times0.01,bias_zero,no_extra_rng_draws;pointer_scaling=dot_div_sqrt_embedding_width_all_actor_batch_and_training_paths;",
@@ -112,7 +115,7 @@ pub const MODEL_SCHEMA_DESCRIPTOR: &str = concat!(
     "unit_groups=hero,creep,structure,neutral,courier_ward;",
     "pool=token_present_and_semantic_group_mask,mean=sum_over_selected/divide_by_positive_count,max=where_selected_embedding_else_negative_infinity_then_argmax_lowest_token_tie_per_channel_then_differentiable_gather_original_embedding,one_token_receives_max_gradient,empty_mean_and_max_exact_zero,cross_group_rows_never_enter_reduction;",
     "token_pools=ability,item,point,projectile,loot;own_units=hero,courier;",
-    "trunk=2589x512,512x256,256x256;",
+    "trunk=2594x512,512x256,256x256;",
     "embeddings=kind:16x32,unit:2x32,ability:8x16,item:15x16;",
     "heads=value:1,kind:16,unit:2,ability:8,item_source_from:15,swap_to:15,learn:6,shop:64,loot:16,target_mode:3,put_mode:2,entity_query:128,point_query:64;",
     "action_kind=0Continue,1Stop,2MovePoint,3FollowUnit,4Hold,5AttackMovePoint,6AttackUnit,7Cast,8Use,9PutPoint,10PutUnit,11Take,12Buy,13Sell,14Swap,15Learn;",
@@ -170,14 +173,14 @@ const fn linear_parameters(input: usize, output: usize) -> usize {
     input * output + output
 }
 
-/// Exact number of F32 parameters in the M17 policy model.
-pub const MODEL_PARAMETER_COUNT: usize = 1_696_436;
+/// Exact number of F32 parameters in the M19 policy model.
+pub const MODEL_PARAMETER_COUNT: usize = 1_698_996;
 
-const _: () = assert!(FEATURE_SCHEMA_VERSION == 15);
+const _: () = assert!(FEATURE_SCHEMA_VERSION == 17);
 const _: () = assert!(crate::ACTION_SCHEMA_VERSION == 5);
-const _: () = assert!(GLOBAL_FEATURES == 85);
+const _: () = assert!(GLOBAL_FEATURES == 90);
 const _: () = assert!(UNIT_FEATURES == 84);
-const _: () = assert!(TRUNK_INPUT == 2_589);
+const _: () = assert!(TRUNK_INPUT == 2_594);
 const _: () = assert!(
     DECODER_CONTEXT == TRUNK_WIDTH + KIND_EMBEDDING + UNIT_SELECTION_EMBEDDING + SLOT_EMBEDDING
 );

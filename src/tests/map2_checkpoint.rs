@@ -66,15 +66,15 @@ pub(super) fn runtime_bytes(values: &[f32], metadata: HashMap<String, String>) -
 
 #[test]
 fn map2_semantic_versions_and_shapes_are_new_not_m14_relabels() {
-    assert_eq!(crate::MODEL_SCHEMA_VERSION, 17);
-    assert_eq!(crate::PPO_SCHEMA_VERSION, 30);
-    assert_eq!(crate::PPO_RULES_AUDIT_VERSION, 25);
-    assert_eq!(crate::LEAGUE_SCHEMA_VERSION, 30);
-    assert_eq!(crate::LEAGUE_RULES_AUDIT_VERSION, 25);
-    assert_eq!(crate::CHECKPOINT_SCHEMA_VERSION, 5);
+    assert_eq!(crate::MODEL_SCHEMA_VERSION, 19);
+    assert_eq!(crate::PPO_SCHEMA_VERSION, 32);
+    assert_eq!(crate::PPO_RULES_AUDIT_VERSION, 27);
+    assert_eq!(crate::LEAGUE_SCHEMA_VERSION, 32);
+    assert_eq!(crate::LEAGUE_RULES_AUDIT_VERSION, 27);
+    assert_eq!(crate::CHECKPOINT_SCHEMA_VERSION, 7);
     assert_eq!(
         crate::MODEL_PARAMETER_COUNT,
-        M14_PARAMETERS + 11 * 64 + 13 * 512
+        M14_PARAMETERS + 11 * 64 + 18 * 512
     );
 }
 
@@ -363,13 +363,13 @@ fn map2_initialization_provenance_names_ancestry_and_disclaims_gameplay_equivale
     for field in [
         format!("source_m14_sha256={}", "63".repeat(32)),
         "source_ppo=27 source_rules=22".to_owned(),
-        "target_f=15 target_a=5 target_m=17 target_ppo=30 target_rules=25".to_owned(),
+        "target_f=17 target_a=5 target_m=19 target_ppo=32 target_rules=27".to_owned(),
         format!(
             "reward_version={} reward_hash={}",
             crate::MAP2_REWARD_SCHEMA_VERSION,
             crate::MAP2_REWARD_SCHEMA_HASH
         ),
-        "old_parameter_bits_preserved=true new_weights=7360_positive_zero".to_owned(),
+        "old_parameter_bits_preserved=true new_weights=9920_positive_zero".to_owned(),
         "optimizer_progress_rng_league=fresh gameplay_equivalence=false qualification=false"
             .to_owned(),
     ] {

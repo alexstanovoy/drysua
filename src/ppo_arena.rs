@@ -28,6 +28,9 @@ mod neural_diagnosis;
 #[path = "tests/neural_skills.rs"]
 mod neural_skills;
 mod parallel;
+#[cfg(test)]
+#[path = "tests/ppo_exploration.rs"]
+mod ppo_exploration;
 mod reward;
 pub use reward::Map2TrainingReward;
 #[cfg(test)]

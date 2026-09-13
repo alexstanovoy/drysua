@@ -53,6 +53,8 @@ pub(super) struct SnapshotFacts {
     pub xp: [u32; 2],
     pub heroes: [Option<EntityId>; 2],
     pub mana: Option<Mana>,
+    /// Own projected fountain effect (ID3) has a strictly positive remaining duration.
+    pub fountain_aura: bool,
     pub units: Vec<UnitFact>,
 }
 
@@ -65,6 +67,12 @@ pub(super) fn roles(slot: SlotId, info: &MatchInfo) -> Result<[Role; 2], Map2Rew
     }
     if info.tick_rate != 30 {
         return invalid("expected 30 simulation ticks per second");
+    }
+    if info.pregame_ticks > MAX_TICK {
+        return invalid("pregame ticks exceed native Map2 cap");
+    }
+    if !(1..=512).contains(&info.terrain_cells) {
+        return invalid("terrain axis outside 1..=512");
     }
     let own = info
         .picks
@@ -104,7 +112,7 @@ pub(super) fn snapshot(
         return invalid("Snapshot viewer does not match own team");
     }
     if view.tick == 0 || view.tick > MAX_TICK {
-        return invalid("Snapshot tick outside 1..=3600000");
+        return invalid("Snapshot tick outside 1..=27900");
     }
     limit("visible units", view.units.len(), MAP2_REWARD_MAX_UNITS)?;
     limit("projectiles", view.projectiles.len(), 4096)?;
@@ -116,6 +124,7 @@ pub(super) fn snapshot(
         return invalid("visible units must have strictly increasing handles");
     }
     let mut mana = None;
+    let mut fountain_aura = false;
     let mut units = Vec::with_capacity(view.units.len());
     for unit in &view.units {
         validate_unit(unit)?;
@@ -125,6 +134,10 @@ pub(super) fn snapshot(
             return invalid("scoreboard body is not a hero");
         }
         if Some(unit.id) == heroes[0] {
+            fountain_aura = unit.effects.iter().any(|effect| {
+                effect.id == bota_proto::EffectId(3)
+                    && effect.ticks_left.is_some_and(|ticks| ticks > 0)
+            });
             mana = Some(Mana {
                 id: unit.id,
                 mana: unit.mana,
@@ -150,6 +163,7 @@ pub(super) fn snapshot(
         xp,
         heroes,
         mana,
+        fountain_aura,
         units,
     })
 }

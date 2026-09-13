@@ -31,15 +31,15 @@ pub const LEAGUE_MIN_EXPLOIT_PAIRS: usize = 2;
 /// Minimum candidate actions required in the exploit-regression namespace.
 pub const LEAGUE_MIN_EXPLOIT_ACTIONS: u64 = 100;
 /// Stage-ten league contract version.
-pub const LEAGUE_SCHEMA_VERSION: u32 = 30;
+pub const LEAGUE_SCHEMA_VERSION: u32 = 32;
 /// Audited simulator and learner rules required by stage-ten league artifacts.
-pub const LEAGUE_RULES_AUDIT_VERSION: u32 = 25;
+pub const LEAGUE_RULES_AUDIT_VERSION: u32 = 27;
 /// Canonical stage-ten frozen-policy, scheduling, retention, and promotion contract.
 pub const LEAGUE_SCHEMA_DESCRIPTOR: &str = concat!(
-    "bota-drysua-league/v30;",
-    "linked_schemas=action,feature,model,ppo,map2_reward;linked_hash=fnv1a_descriptor_then_ordered_version_le32_hash_le64_then_map2_reward_descriptor_utf8;rules_audit=25;",
+    "bota-drysua-league/v32;",
+    "linked_schemas=action,feature,model,ppo,map2_reward;linked_hash=fnv1a_descriptor_then_ordered_version_le32_hash_le64_then_map2_reward_descriptor_utf8;rules_audit=27;",
     "scope=map2_mid_only_second_hero_death_or_first_tower_loss_simultaneous_draw_cap27900_including900_pregame;reward=linked_map2_reward_schema_version_hash_and_full_descriptor;observations=Guarded13_Inspired14_Shadowraze15_Healed_hp_mana_manual_reports_not_confirmed_tickregen;",
-    "execution_roles=current_m17_policy_sharedpolicy_current_accepted_new_run_historical_snapshots_use_candidate_feature15_action5_move_landing_order_contract_including_restart,frozen_weights_not_legacy_execution,observer_bookkeeping_never_changes_teacher_strategy;initialization=explicit_two_pinned_m14_input_padding_or_two_pinned_m16_navigation_same_shape_sources_new_map2_m17_policy_not_historical_opponent_identity_or_qualified_release,no_inherited_progress_moments_rng_league_or_promotion_evidence,no_gameplay_equivalence,new_legal_actions_change_behavior;historical_opponents=original_binaries_remain_historical_explicit_map2_adapters_not_original_release_identity,no_old_runtime_or_resume,no_parameter_fingerprint_as_execution_identity;",
+    "execution_roles=current_m19_policy_sharedpolicy_current_accepted_new_run_historical_snapshots_use_candidate_feature17_action5_move_landing_order_contract_including_restart,frozen_weights_not_legacy_execution,observer_bookkeeping_never_changes_teacher_strategy;initialization=explicit_pinned_m14_m16_m17_input_padding_sources_new_map2_m19_policy_not_historical_opponent_identity_or_qualified_release,no_inherited_progress_moments_rng_league_or_promotion_evidence,no_gameplay_equivalence;reward3=unchanged_v2_plus_independent_generic_progress_debt_partial_activity_lease_and_repayment_base_latch_until_zero_no_stagnation_refunds,no_strategy_override;historical_opponents=original_binaries_remain_historical_explicit_map2_adapters_not_original_release_identity,no_old_runtime_or_resume,no_parameter_fingerprint_as_execution_identity;",
     "opponents=current30,accepted25,historical25,teacher15,weak5,frozen_per_rollout;",
     "league=capacity32,minimum9,protect_anchor_accepted_strongest_recent4,evict_nearest_cross_play_profile;",
     "snapshot=immutable_finite_f32_parameters,stable_parameter_fingerprint,generation;",
@@ -64,9 +64,9 @@ pub const LEAGUE_SCHEMA_HASH: u64 = crate::model::linked_schema_hash(
 );
 
 const _: () = assert!(ACTION_SCHEMA_VERSION == 5);
-const _: () = assert!(FEATURE_SCHEMA_VERSION == 15);
-const _: () = assert!(MODEL_SCHEMA_VERSION == 17);
-const _: () = assert!(PPO_SCHEMA_VERSION == 30);
+const _: () = assert!(FEATURE_SCHEMA_VERSION == 17);
+const _: () = assert!(MODEL_SCHEMA_VERSION == 19);
+const _: () = assert!(PPO_SCHEMA_VERSION == 32);
 const _: () = assert!(LEAGUE_RULES_AUDIT_VERSION == crate::PPO_RULES_AUDIT_VERSION);
 
 static NEXT_SNAPSHOT_ID: AtomicU64 = AtomicU64::new(1);

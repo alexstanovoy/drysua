@@ -39,6 +39,31 @@ impl CheckedActionSet {
 }
 
 impl PolicyModel {
+    pub(crate) fn checked_singleton_gradient(
+        &self,
+        sets: &[&CheckedActionSet],
+    ) -> Result<(f64, Vec<f32>), ModelError> {
+        if sets.is_empty() || sets.len() > 16 || sets.iter().any(|set| set.samples.len() != 1) {
+            return Err(ModelError::InvalidModelState("singleton gradient batch"));
+        }
+        let samples: Vec<_> = sets.iter().map(|set| &set.samples[0]).collect();
+        let (frames, prefixes) = transfer_fit::checked_inputs(&samples)?;
+        let _guard = self.read_parameter_lock()?;
+        let identity = self.policy_identity_locked();
+        let output = self.training_forward_locked(&frames, &prefixes)?;
+        validate_training_tensors_finite(&output)?;
+        let (losses, _) = transfer_fit::checked_row_losses(&output, &samples)?;
+        let loss = losses.mean_all()?;
+        let measured = f64::from(loss.to_scalar::<f32>()?);
+        if !measured.is_finite() {
+            return Err(ModelError::NonFiniteLoss);
+        }
+        let gradients = collect_host_gradients(self.backward_named_locked(&loss)?)?;
+        assert_eq!(gradients.len(), MODEL_PARAMETER_COUNT);
+        assert_eq!(identity, self.policy_identity_locked());
+        Ok((measured, gradients))
+    }
+
     pub(crate) fn train_checked_action_sets(
         &self,
         sets: &[&CheckedActionSet],

@@ -29,9 +29,9 @@ pub const MAX_SEED_NAMESPACE: usize = 8_192;
 pub const MAX_TRAINING_COUNTER: u64 = 1_000_000_000;
 /// Minimum rollout action count accepted by the promotion gate.
 pub const MIN_PROMOTION_ROLLOUT_ACTIONS: u64 = 1_000;
-/// Current sample audit: F15/A5 includes walkable building-landing MovePoint targets.
-/// Prior masks, samples and reports cannot be relabelled under the expanded legal set.
-pub const IMITATION_RULES_AUDIT_VERSION: u32 = 15;
+/// Current sample audit: F17 wait/progress-accounting globals with unchanged A5 legality.
+/// Prior samples and reports cannot be relabelled as reward-v3 observations.
+pub const IMITATION_RULES_AUDIT_VERSION: u32 = 17;
 
 const TARGET_MODE_HEAD: usize = 3;
 const PUT_MODE_HEAD: usize = 2;

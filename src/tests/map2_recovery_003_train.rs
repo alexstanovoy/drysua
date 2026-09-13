@@ -20,7 +20,7 @@ fn combat_cases(training: bool) -> Vec<(&'static str, Physics)> {
         .collect()
 }
 
-fn journeys(report: &mut String) -> Vec<Row> {
+pub(super) fn journeys(report: &mut String) -> Vec<Row> {
     let mut rows = Vec::new();
     for setup in trip_setups(true) {
         let mut state = trip::create(setup);

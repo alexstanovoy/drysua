@@ -8,6 +8,8 @@ mod learn;
 mod tests;
 #[path = "map2_recovery_003_witness.rs"]
 mod witness;
+#[path = "map2_recovery_004.rs"]
+mod recovery_004;
 
 const ROOT3: &str = "artifacts/temp/map2-gameplay-fix-20260912/recovery-003";
 const START_SHA: &str = "ed55f4dbee06c7e4ea0a3c42953f425e7b5851b0bccb813ca93c5a770ada35d0";

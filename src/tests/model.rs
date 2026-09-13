@@ -1130,7 +1130,7 @@ fn adam_rejects_invalid_config_nonfinite_and_extreme_updates_without_partial_sta
 
 #[test]
 fn model_schema_and_head_dimensions_are_stable() {
-    assert_eq!(MODEL_SCHEMA_VERSION, 17);
+    assert_eq!(MODEL_SCHEMA_VERSION, 19);
     assert!(crate::MODEL_SCHEMA_DESCRIPTOR.contains("linked_schemas=action,feature,map2_reward;"));
     assert_eq!(
         MODEL_SCHEMA_HASH,
@@ -1171,11 +1171,11 @@ fn model_parameter_count_and_f32_size_are_bounded() {
     assert!((1_000_000..=3_000_000).contains(&count));
     assert!((4 * 1_048_576..=12 * 1_048_576).contains(&(count * size_of::<f32>())));
     assert_eq!(schema.len(), 62);
-    assert_eq!(count, 1_696_436);
+    assert_eq!(count, 1_698_996);
     assert_eq!(schema.first(), Some(&("unit.0.weight", vec![84, 64])));
     assert_eq!(
         schema.iter().find(|(name, _)| *name == "trunk.0.weight"),
-        Some(&("trunk.0.weight", vec![2589, 512]))
+        Some(&("trunk.0.weight", vec![2594, 512]))
     );
     assert_eq!(schema.last(), Some(&("point_query.bias", vec![64])));
     assert_eq!(

@@ -1,6 +1,7 @@
 use super::*;
 
 #[test]
+#[ignore = "Historical M17/reward1 saved-parent gameplay probe; requires its original schema build, not M18 runtime loading or metadata relabelling."]
 fn frozen_neural_prefix_suffix_matches_direct_without_reset_or_double_drain() {
     let frozen = parent();
     let identity = frozen.policy_identity().unwrap();
@@ -29,6 +30,7 @@ fn frozen_neural_prefix_suffix_matches_direct_without_reset_or_double_drain() {
 }
 
 #[test]
+#[ignore = "Historical M17/reward1 saved-parent gameplay probe; requires its original schema build, not M18 runtime loading or metadata relabelling."]
 fn skipped_loss_still_visits_restored_mana_and_neural_cast_state() {
     let frozen = parent();
     let mut prefix = Prefix {
@@ -53,6 +55,7 @@ fn skipped_loss_still_visits_restored_mana_and_neural_cast_state() {
 }
 
 #[test]
+#[ignore = "Historical M17/reward1 saved-parent gameplay probe; requires its original schema build, not M18 runtime loading or metadata relabelling."]
 fn mango_timing_ties_are_accepted_as_equivalent_neural_returns() {
     let frozen = parent();
     let prefix = Prefix {

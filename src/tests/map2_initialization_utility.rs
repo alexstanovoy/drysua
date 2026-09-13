@@ -188,7 +188,7 @@ fn write_provenance(output: &Path, source: &Path, run: &crate::CheckpointRun, pr
         .map(|byte| format!("{byte:02x}"))
         .collect();
     let text = format!(
-        "{provenance}\nsource={}\noutput_sha256={output_hash}\ngit_commit={}\nsimulator_commit={}\nenabled_features={}\nseed={INITIALIZATION_SEED}\ntraining_updates=0\ngameplay_runs=0\noptimizer_moments=positive_zero\nprogress=all_zero_no_evaluation_rng_history_or_league\nsource_unchanged=true\nnamed_tensors=62\nold_parameters=1689076\nnew_parameters=1696436\nunit.0.weight=73x64_to_84x64_insert_rows73..84\ntrunk.0.weight=2576x512_to_2589x512_insert_rows72..85\nall_other_tensors_bit_identical=true\nruntime_and_checkpoint_reload_exact=true\nfeature_hash={}\naction_hash={}\nmodel_hash={}\nppo_hash={}\nleague_hash={}\ncheckpoint_hash={}\nreward_descriptor={}\n",
+        "{provenance}\nsource={}\noutput_sha256={output_hash}\ngit_commit={}\nsimulator_commit={}\nenabled_features={}\nseed={INITIALIZATION_SEED}\ntraining_updates=0\ngameplay_runs=0\noptimizer_moments=positive_zero\nprogress=all_zero_no_evaluation_rng_history_or_league\nsource_unchanged=true\nnamed_tensors=62\nold_parameters=1689076\nnew_parameters=1698996\nunit.0.weight=73x64_to_84x64_insert_rows73..84\ntrunk.0.weight=2576x512_to_2594x512_insert_rows72..90\nall_other_tensors_bit_identical=true\nruntime_and_checkpoint_reload_exact=true\nfeature_hash={}\naction_hash={}\nmodel_hash={}\nppo_hash={}\nleague_hash={}\ncheckpoint_hash={}\nreward_descriptor={}\n",
         source.display(),
         run.git_commit,
         run.simulator_commit,

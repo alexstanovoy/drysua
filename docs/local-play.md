@@ -1,5 +1,9 @@
 # Local play: current Map2 Neural integration
 
+The current reward3/F17/M19 progress-debt rules and verification are recorded in
+[`progress-debt-reward-20260913/integration/REPORT.md`](../artifacts/temp/progress-debt-reward-20260913/integration/REPORT.md).
+No model has been trained or promoted under that new reward yet.
+
 Integration checks against bota `037c6a2` are recorded in
 [`artifacts/temp/bota-rebase-integration-20260910/RESULTS.md`](../artifacts/temp/bota-rebase-integration-20260910/RESULTS.md).
 These are compatibility checks, not a trained-model release or win-rate result.
@@ -9,17 +13,17 @@ From an authorized Linux X11/Xwayland desktop terminal:
 ```sh
 # Requires an externally supplied compatible model; none is selected by default.
 /home/alexstanovoy/Workspace/bots/play.sh \
-  --weights-directory "/absolute/path/to/compatible M17 runtime weights"
+  --weights-directory "/absolute/path/to/compatible M19 runtime weights"
 # Human Dire, pure Neural bot Radiant. Either side option derives the other.
 /home/alexstanovoy/Workspace/bots/play.sh \
-  --weights-directory "/absolute/path/to/compatible M17 runtime weights" \
+  --weights-directory "/absolute/path/to/compatible M19 runtime weights" \
   --human-side dire --port 0 --seed 9000001 --no-build
 ```
 
 **No-argument play is not ready and fails closed.** No trained Map2 model has been
 supplied or promoted for this launcher. The old F12/M14 human-review checkpoint
 is incompatible with the current server/runtime. Supply `--weights-directory`
-containing compatible **A5/F15/M17/PPO30/rules25** `drysua.weights.safetensors`; do not relabel or
+containing compatible **A5/F17/M19/PPO32/rules27/reward3** `drysua.weights.safetensors`; do not relabel or
 copy old metadata to make a file pass. The launcher never creates, migrates,
 initializes, trains, promotes, or substitutes weights.
 
@@ -51,22 +55,47 @@ Exactly nine metadata keys are required; numeric values are decimal strings:
 | Key | Required value |
 | --- | --- |
 | `action_schema_hash` | `10658390830565586343` (A5) |
-| `feature_schema_hash` | `1861607613534772372` (F15) |
-| `model_schema_hash` | `13592057279889489276` (M17) |
-| `ppo_schema_version` | `30` |
-| `ppo_schema_hash` | `16275284022255703821` |
-| `ppo_rules_audit_version` | `25` |
-| `map2_reward_schema_version` | `1` |
-| `map2_reward_schema_hash` | `798798703797057220` |
+| `feature_schema_hash` | `4298252436472980484` (F17) |
+| `model_schema_hash` | `7182549121935768714` (M19) |
+| `ppo_schema_version` | `32` |
+| `ppo_schema_hash` | `9056229782321552319` |
+| `ppo_rules_audit_version` | `27` |
+| `map2_reward_schema_version` | `3` |
+| `map2_reward_schema_hash` | `11643768462079275437` |
 | `map2_reward_schema_descriptor` | Full current descriptor matching that FNV-1a hash |
 
-M17 makes existing walkable allied-building landing points legal for ordinary
-MovePoint. AttackMove's building-landing exclusion and TP/tree/collision checks
-are unchanged. This fixes action expressibility, not learned retreat behavior;
-it does not qualify any neural artifact. Global85/unit84 inputs and all 62 named
-parameter tensors (1,696,436 F32 values) retain their shapes. F15 still changes the
-linked legality/provenance contract, so A4/F14/M16 runtime and checkpoint-v4 resume
-are rejected rather than silently accepted with new masks.
+M19 retains A5 navigation and all action legality unchanged. Reward3 adds a
+second, independent progress-debt penalty; the v2 pre-wave movement hint and
+simple fountain waiting/refund rules are unchanged. F17 appends debt/2700,
+remaining activity lease/30 and its base-charge latch: global90, unit84,
+62 named tensors, 1,698,996 F32 parameters.
+
+Inactive ticks, including death, add one debt tick up to2700. Useful activity
+refreshes a30-tick lease including the current tick; active ticks repay3 debt.
+At2700, a0.02 base cost latches until debt reaches zero; subsequent inactive
+capped ticks cost0.000002. No stagnation refund is paid. A positive-timer own
+effect3 qualifies directly even with full pools or lingering outside a fountain.
+Any own purchase still fully refunds the open v2 fountain wait, but grants only
+a partial generic activity lease, not a generic debt reset. No strategy mask,
+Teacher override or extra anti-abuse condition is added.
+
+M17/M18 runtime and old checkpoint resumes are incompatible; metadata is not
+silently relabelled. No M18 weights were generated or added to the source
+whitelist. No-argument play still fails with the missing-model prompt, and
+never substitutes root M17 weights or a Teacher.
+
+Explicit M17-to-current-M19 **initialization only** is available through
+`TrainingArtifact::initialize_selected_m17_for_map2_wait(directory, seed, device)`.
+Only these full-file SHA256 sources and their exact original nine-key reward1
+metadata are accepted:
+
+- Initial: `05e78663dd45ac23ad6c0242a69d8b8e45c163f7861c59154e3f3fd81de9ab1f`
+- Recovery004: `107e19e61794c457ce8ec6adc2b3e66ccce08ee5b6544cb2005964f3e7dfedc8`
+
+Five positive-zero rows are inserted at row85 of `trunk.0.weight` (2589x512 to
+2594x512); every source parameter bit is retained. This creates fresh model and
+optimizer/progress ancestry, not runtime/resume compatibility, equivalent
+gameplay, or a qualified release. The launcher never calls this API.
 
 An explicitly selected M16 source may be used only through
 `TrainingArtifact::initialize_selected_m16_for_map2_navigation(directory, seed, device)`.
@@ -76,7 +105,9 @@ The exact permitted full-file SHA-256 values are:
 - Advantage: `fdd4d3f2a85a64d9b4d162f1607a94a4aaba8a8e3136e51dab2152181cdf63b7`
 
 The API also checks the complete old nine-key tuple, tensor contract and finite
-values before constructing a model. All parameter bits are copied; no optimizer,
+values before constructing a model. Source reward1 metadata remains frozen;
+the same five wait/progress-input rows are now zero-padded. All old parameter bits are
+copied; no optimizer,
 progress, RNG history, samples, league history or qualification is imported.
 Retain its `INITIALIZATION_ONLY` provenance with `GAMEPLAY_EQUIVALENCE=false` and
 create fresh training state. Do not replace historical metadata. The existing

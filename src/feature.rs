@@ -22,9 +22,9 @@ use crate::{
 };
 
 /// Version of the policy feature layout and candidate input-state semantics.
-pub const FEATURE_SCHEMA_VERSION: u32 = 15;
+pub const FEATURE_SCHEMA_VERSION: u32 = 17;
 /// Number of scalar global features.
-pub const GLOBAL_FEATURES: usize = 85;
+pub const GLOBAL_FEATURES: usize = 90;
 /// Number of scalar features in one global-history sample.
 pub const HISTORY_FEATURES: usize = 24;
 /// Number of global-history samples.
@@ -169,6 +169,16 @@ pub mod global_feature {
     pub const MAP2_TOWER_POTENTIAL: usize = 82;
     pub const MAP2_LANE_POTENTIAL: usize = 83;
     pub const MAP2_LANE_OBSERVED: usize = 84;
+    /// Open fountain-wait intervals divided by the native Map2 tick cap.
+    pub const MAP2_FOUNTAIN_WAIT_TICKS: usize = 85;
+    /// Open period refundable cost divided by the reward's lifetime wait-charge bound.
+    pub const MAP2_FOUNTAIN_WAIT_REFUNDABLE_COST: usize = 86;
+    /// Generic progress debt divided by its 2700-tick threshold.
+    pub const MAP2_STAGNATION_TICKS: usize = 87;
+    /// Remaining activity lease divided by 30, after consuming the current tick.
+    pub const MAP2_ACTIVITY_TICKS_LEFT: usize = 88;
+    /// Base-charge latch, cleared only when generic progress debt reaches zero.
+    pub const MAP2_STAGNATION_BASE_CHARGED: usize = 89;
 }
 
 /// Stable indices in each unit token.
@@ -393,10 +403,10 @@ pub mod loot_feature {
 
 /// Canonical schema text covered by [`FEATURE_SCHEMA_HASH`].
 pub const FEATURE_SCHEMA_DESCRIPTOR: &str = concat!(
-    "bota-drysua-feature/v15;",
+    "bota-drysua-feature/v17;",
     "action_schema_version=5;action_schema_hash=linked;",
     "navigation_contract=existing_walkable_building_landing_move_pointers_allowed,attack_move_veto_and_tp_provenance_unchanged;frame_legality_and_action_space_provenance=new_contract,raw_dimensions_field_ids_point_order_and_sources_unchanged,no_old_frame_or_corpus_relabel;",
-    "shapes=global:85,history:7x24,policy_history:16x4,unit:96x84,own_unit:2x84,remembered_unit:32x84,point:48x32,ability:14x24,item:85x28,projectile:32x20,loot:16x16,map:96;",
+    "shapes=global:90,history:7x24,policy_history:16x4,unit:96x84,own_unit:2x84,remembered_unit:32x84,point:48x32,ability:14x24,item:85x28,projectile:32x20,loot:16x16,map:96;",
     "scalar_ranges=presence_and_one_hot:[0,1],unsigned_continuous:[0,1],signed_continuous:[-1,1],category:positive_exact_integer,all_finite;",
     "history_ages=480,240,120,60,30,15,0;",
     "normalizers=tick:3600000,age:4800,history_age:480,gold_asset_item_cost:100000,score:1000,xp:100000,hp:100000,mana:20000,damage:10000,attack_interval:600,speed:2000,armor_raw:6553600,level:30,charges:255,cooldown:36000,structures:64;",
@@ -464,6 +474,8 @@ pub const FEATURE_SCHEMA_DESCRIPTOR: &str = concat!(
     "rebase_effects=Guarded13_Inspired14_Shadowraze15;auras=unit76:guarded_remaining_div15,77:inspired_remaining_div15,positive_means_presence,anonymous_max_timer_valid1..15_no_stacks,age_subtracted_no_hidden_refresh_or_source,expired_absent_dead_zero;",
     "manual_restoration=Healed_amount_health_and_mana_independent_reports_0..1000000_reject_invalid_before_tracker_mutation,positive_updates_only_other_channel_retained,instant_or_interruptible_overtime_promise_not_confirmed_tickregen,no_passive_or_fountain_report,no_pool_mutation_no_reward_credit_or_refund;unit78:health_report_present,79:amount_div100000_clamped,80:age_div480,81:mana_report_present,82:amount_div20000_clamped,83:age_div480;received_only_latest_positive_per_channel_from_existing64_prior_snapshot_event_journal,strict_tick_before_snapshot_age1..480,full_generation_bookkeeping_no_source_id;sorting=raze_pair_then_aura_timers_then_received_report_semantics_before_opaque_id;",
     "map2_scope=cap27900_including900_pregame_15minute_gameplay;",
+    "wait_accounting_append=global85:open_fountain_wait_ticks_div27900,86:open_refundable_cost_div.093,range0to1,legacy_maps_zero;reward2=prewave_center_hint_only_before_first_wave_no_new_postspawn_hero_constraint,any_movement_or_resource_break_resets_wait,any_own_purchase_refunds_open_period_including_drained_cost,only_two_new_accounting_facts_no_intent_price_or_antiabuse_conditions;",
+    "progress_accounting_append=global87:stagnation_ticks_div2700,88:activity_ticks_left_div30,89:stagnation_base_charged_0or1;invariants=debt0..2700_lease0..29_latch_implies_positive_debt,off_map2_zero,complete_snapshot_events_only,drains_clone_provenance_include_all_three_facts;reward3=independent_progress_debt_baseline_free_inactive_add1_including_death_active_repay3_refresh30_consumes_current_base.02_once_at2700_then_inactive_cap_rate.000002_rearm_only_debt0_no_refund;effect3_positive_ticks_direct_even_full_or_lingering,purchase_only_partial_activity_lease_plus_unchanged_v2_full_open_wait_refund,no_strategy_or_antiabuse_additions;",
     "mango=item42_category43_existing_item_and_loot_token_fields,no_new_item_rows;map2_geometry=map0_public_geometry_no_metadata_relabel;"
 );
 
@@ -486,7 +498,11 @@ const _: () = assert!(
     global_feature::MAP2_REWARD_REMAINING_START + crate::MAP2_REWARD_CHANNELS
         == global_feature::MAP2_TOWER_POTENTIAL
 );
-const _: () = assert!(global_feature::MAP2_LANE_OBSERVED + 1 == GLOBAL_FEATURES);
+const _: () = assert!(global_feature::MAP2_STAGNATION_BASE_CHARGED + 1 == GLOBAL_FEATURES);
+const _: () = assert!(crate::MAP2_REWARD_STAGNATION_THRESHOLD_TICKS == 2700);
+const _: () = assert!(crate::MAP2_REWARD_ACTIVITY_LEASE_TICKS == 30);
+const _: () = assert!(crate::MAP2_TICK_CAP == 27_900);
+const _: () = assert!(crate::MAP2_REWARD_FOUNTAIN_WAIT_BOUND > 0.0);
 const _: () = assert!(unit_feature::MANA_RESTORE_REPORT_AGE + 1 == UNIT_FEATURES);
 const _: () =
     assert!(unit_feature::INSPIRED_TICKS_LEFT + 1 == unit_feature::HEALTH_RESTORE_REPORT_PRESENT);
@@ -2383,6 +2399,30 @@ fn encode_map2_reward(tracker: &StateTracker, global: &mut [f32; GLOBAL_FEATURES
     global[global_feature::MAP2_TOWER_POTENTIAL] = state.tower_potential;
     global[global_feature::MAP2_LANE_POTENTIAL] = state.lane_potential;
     global[global_feature::MAP2_LANE_OBSERVED] = bool_feature(state.lane_observed);
+    global[global_feature::MAP2_FOUNTAIN_WAIT_TICKS] =
+        unit_ratio(state.fountain_wait_ticks, crate::MAP2_TICK_CAP);
+    global[global_feature::MAP2_FOUNTAIN_WAIT_REFUNDABLE_COST] =
+        (state.fountain_wait_refundable_cost / crate::MAP2_REWARD_FOUNTAIN_WAIT_BOUND as f32)
+            .clamp(0.0, 1.0);
+    encode_progress_debt(state, global);
+}
+
+fn encode_progress_debt(state: crate::Map2RewardState, global: &mut [f32; GLOBAL_FEATURES]) {
+    assert!(state.stagnation_ticks <= crate::MAP2_REWARD_STAGNATION_THRESHOLD_TICKS);
+    assert!(state.activity_ticks_left < crate::MAP2_REWARD_ACTIVITY_LEASE_TICKS);
+    if state.stagnation_base_charged {
+        assert!(state.stagnation_ticks > 0);
+    }
+    global[global_feature::MAP2_STAGNATION_TICKS] = unit_ratio(
+        state.stagnation_ticks,
+        crate::MAP2_REWARD_STAGNATION_THRESHOLD_TICKS,
+    );
+    global[global_feature::MAP2_ACTIVITY_TICKS_LEFT] = unit_ratio(
+        state.activity_ticks_left,
+        crate::MAP2_REWARD_ACTIVITY_LEASE_TICKS,
+    );
+    global[global_feature::MAP2_STAGNATION_BASE_CHARGED] =
+        bool_feature(state.stagnation_base_charged);
 }
 
 fn encode_unit_effects(token: &mut [f32; UNIT_FEATURES], track: &crate::EntityTrack, tick: u32) {

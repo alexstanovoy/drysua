@@ -308,7 +308,7 @@ fn legacy_features_leave_every_map2_global_zero() {
     let tracker = super::feature::tracker_with_view(Team::Radiant, world_view(Team::Radiant, 1));
     let frame = encode(&tracker, &LocalPolicyState::new(0));
 
-    assert_eq!(&frame.global()[72..], &[0.0; 13]);
+    assert_eq!(&frame.global()[72..], &[0.0; 18]);
 }
 
 #[test]

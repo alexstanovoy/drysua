@@ -19,6 +19,7 @@ fn whole_episode_dense_return_is_bounded_for_both_signs_and_all_channels() {
     let (negative, cost) = extreme_profile(true, Map2RewardEnd::Draw);
 
     assert!(positive.abs() <= MAP2_REWARD_DENSE_BOUND);
+    assert!(positive <= crate::MAP2_REWARD_POSITIVE_BOUND);
     assert!(negative.abs() <= MAP2_REWARD_DENSE_BOUND);
     assert!(gain.gold > 0.0);
     assert!(gain.experience > 0.0);

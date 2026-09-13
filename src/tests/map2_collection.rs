@@ -227,6 +227,158 @@ fn map2_final_damage_is_rewarded_before_draw_finish_in_window_collection() {
 }
 
 #[test]
+fn map2_wait_refund_crosses_retention_drains_and_preserves_ppo_component_sum() {
+    let environment = fixture_environment(1, 0, OpponentSpec::Weak);
+    let mut whole = environment.seats[0].tracker.clone();
+    let mut split = whole.clone();
+    let mut aggregate = super::super::Map2TrainingReward::default();
+    let mut view = whole.current().expect("snapshot").clone();
+    let own = whole.own_hero().expect("hero").id;
+    let hero = view
+        .units
+        .iter_mut()
+        .find(|unit| unit.id == own)
+        .expect("hero");
+    hero.hp = hero.max_hp;
+    hero.mana = hero.max_mana;
+    let position = hero.pos;
+    view.units
+        .iter_mut()
+        .find(|unit| unit.kind == bota_proto::UnitKind::Fountain && unit.team == whole.team())
+        .expect("own fountain")
+        .pos = position;
+    for tick in 2..=65 {
+        view.tick = tick;
+        let events = if tick == 62 {
+            vec![EventKind::ItemBought {
+                slot: whole.slot(),
+                item: bota_proto::ItemId(0),
+            }]
+        } else {
+            vec![]
+        };
+        for observer in [&mut whole, &mut split] {
+            observer.observe_snapshot(&view).expect("snapshot");
+            observer.observe_events(tick, &events).expect("events");
+        }
+        if tick % 7 == 0 {
+            aggregate
+                .record(
+                    split
+                        .take_map2_reward_interval()
+                        .expect("retained boundary"),
+                )
+                .expect("aggregate");
+        }
+    }
+    aggregate
+        .record(split.finish_map2_reward(Map2RewardEnd::Draw).expect("end"))
+        .expect("last segment");
+    let mut expected = super::super::Map2TrainingReward::default();
+    expected
+        .record(
+            whole
+                .finish_map2_reward(Map2RewardEnd::Draw)
+                .expect("whole end"),
+        )
+        .expect("aggregate");
+    assert!(aggregate.fountain_wait < 0.0);
+    assert!(aggregate.fountain_wait_refund > 0.0);
+    assert_eq!(aggregate.observations.fountain_wait_refunds, 1);
+    assert_eq!(aggregate.observations, expected.observations);
+    for (actual, expected) in aggregate
+        .components()
+        .into_iter()
+        .zip(expected.components())
+    {
+        assert!((actual - expected).abs() < 1e-12);
+    }
+    assert!((aggregate.components()[..15].iter().sum::<f64>() - aggregate.total).abs() < 1e-12);
+}
+
+#[test]
+fn map2_progress_debt_survives_ppo_drains_and_purchase_refund_with_reason_or_merge() {
+    let environment = fixture_environment(1, 0, OpponentSpec::Weak);
+    let mut whole = environment.seats[0].tracker.clone();
+    let mut split = whole.clone();
+    let mut aggregate = super::super::Map2TrainingReward::default();
+    let mut view = progress_debt_idle_fountain_view(&whole);
+    for tick in 2..=2705 {
+        view.tick = tick;
+        if tick == 2704 {
+            view.players[0].xp += 1;
+        }
+        let events = if tick == 2703 {
+            vec![EventKind::ItemBought {
+                slot: whole.slot(),
+                item: bota_proto::ItemId(0),
+            }]
+        } else {
+            vec![]
+        };
+        for observer in [&mut whole, &mut split] {
+            observer.observe_snapshot(&view).expect("snapshot");
+            observer.observe_events(tick, &events).expect("events");
+        }
+        if tick % 17 == 0 {
+            aggregate
+                .record(split.take_map2_reward_interval().expect("segment"))
+                .expect("aggregate");
+        }
+    }
+    aggregate
+        .record(split.finish_map2_reward(Map2RewardEnd::Draw).expect("end"))
+        .expect("aggregate");
+    let mut expected = super::super::Map2TrainingReward::default();
+    expected
+        .record(
+            whole
+                .finish_map2_reward(Map2RewardEnd::Draw)
+                .expect("whole"),
+        )
+        .expect("aggregate");
+    assert_eq!(aggregate.observations, expected.observations);
+    assert_eq!(
+        aggregate.observations.progress_reasons,
+        crate::MAP2_PROGRESS_PURCHASE | crate::MAP2_PROGRESS_XP
+    );
+    assert_eq!(aggregate.observations.stagnation_base_charges, 1);
+    assert_eq!(aggregate.stagnation_base, -0.02);
+    assert_eq!(aggregate.stagnation_ticks_cost, -0.000002);
+    assert!(aggregate.fountain_wait_refund > 0.0);
+    for (actual, expected) in aggregate
+        .components()
+        .into_iter()
+        .zip(expected.components())
+    {
+        assert!((actual - expected).abs() < 1e-12);
+    }
+    assert!((aggregate.components()[..15].iter().sum::<f64>() - aggregate.total).abs() < 1e-12);
+    assert_eq!(whole.map2_reward_state(), split.map2_reward_state());
+}
+
+fn progress_debt_idle_fountain_view(tracker: &crate::StateTracker) -> bota_proto::WorldView {
+    let mut view = tracker.current().expect("snapshot").clone();
+    let own = tracker.own_hero().expect("hero").id;
+    let hero = view
+        .units
+        .iter_mut()
+        .find(|unit| unit.id == own)
+        .expect("hero");
+    hero.hp = hero.max_hp;
+    hero.mana = hero.max_mana;
+    hero.effects
+        .retain(|effect| effect.id != bota_proto::EffectId(3));
+    let position = hero.pos;
+    view.units
+        .iter_mut()
+        .find(|unit| unit.kind == bota_proto::UnitKind::Fountain && unit.team == tracker.team())
+        .expect("own fountain")
+        .pos = position;
+    view
+}
+
+#[test]
 fn map2_reward_interval_and_full_episode_aggregates_preserve_every_component() {
     let mut split = fixture_environment(1, 0, OpponentSpec::Weak);
     let mut whole = fixture_environment(1, 0, OpponentSpec::Weak);
@@ -413,11 +565,17 @@ fn map2_training_reward_diagnostics_distinguish_cost_components_from_raw_units()
             hero_damage: 0.01,
             mana_spent: -0.002,
             hero_damage_taken: -0.001,
+            pregame_movement: 0.003,
+            fountain_wait: -0.0001,
+            fountain_wait_refund: 0.00005,
             observations: crate::Map2RewardObservations {
                 hero_damage_dealt: 67,
                 hero_damage_taken: 39,
                 mana_spent: 75,
                 lane_last_hits: 2,
+                fountain_wait_ticks: 60,
+                fountain_wait_charged_ticks: 31,
+                fountain_wait_refunds: 1,
                 ..crate::Map2RewardObservations::default()
             },
             ..crate::Map2RewardBreakdown::default()
@@ -428,10 +586,16 @@ fn map2_training_reward_diagnostics_distinguish_cost_components_from_raw_units()
         "reward_hero_damage=0.010000000",
         "reward_mana=-0.002000000",
         "reward_hero_taken=-0.001000000",
+        "reward_pregame_movement=0.003000000",
+        "reward_fountain_wait=-0.000100000",
+        "reward_fountain_wait_refund=0.000050000",
         "hero_damage_dealt=67",
         "hero_damage_taken=39",
         "mana_spent=75",
         "lane_last_hits=2",
+        "fountain_wait_ticks=60",
+        "fountain_wait_charged_ticks=31",
+        "fountain_wait_refunds=1",
     ] {
         assert!(
             output.split_whitespace().any(|entry| entry == field),
@@ -476,6 +640,170 @@ fn map2_training_reward_aggregation_rejects_overflow_and_nonfinite_values_atomic
         .expect_err("counter overflow");
     assert_eq!(error, PpoError::CounterOverflow);
     assert_eq!(report, before);
+}
+
+#[test]
+fn map2_training_reward_new_components_are_aggregated_and_checked_for_nonfinites() {
+    let interval = crate::Map2RewardBreakdown {
+        pregame_movement: 0.003,
+        fountain_wait: -0.0001,
+        fountain_wait_refund: 0.00005,
+        total: 0.00295,
+        ..crate::Map2RewardBreakdown::default()
+    };
+    let mut report = super::super::Map2TrainingReward::default();
+    report.record(interval).unwrap();
+    report.record(interval).unwrap();
+    let components = report.components();
+    assert!(
+        (components[..components.len() - 1].iter().sum::<f64>() - report.total).abs() < 1.0e-12
+    );
+    for index in 0..3 {
+        for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let mut bad = crate::Map2RewardBreakdown::default();
+            match index {
+                0 => bad.pregame_movement = invalid,
+                1 => bad.fountain_wait = invalid,
+                _ => bad.fountain_wait_refund = invalid,
+            }
+            let before = report;
+            assert_eq!(
+                report.record(bad).unwrap_err().to_string(),
+                "PPO Map2 reward telemetry is non-finite"
+            );
+            assert_eq!(report, before);
+        }
+    }
+}
+
+#[test]
+fn map2_training_reward_new_counter_overflow_does_not_partially_commit() {
+    for index in 0..3 {
+        let mut report = super::super::Map2TrainingReward::default();
+        let mut interval = crate::Map2RewardBreakdown::default();
+        match index {
+            0 => {
+                report.observations.fountain_wait_ticks = u64::MAX;
+                interval.observations.fountain_wait_ticks = 1;
+            }
+            1 => {
+                report.observations.fountain_wait_charged_ticks = u64::MAX;
+                interval.observations.fountain_wait_charged_ticks = 1;
+            }
+            _ => {
+                report.observations.fountain_wait_refunds = u64::MAX;
+                interval.observations.fountain_wait_refunds = 1;
+            }
+        }
+        let before = report;
+        assert_eq!(
+            report.record(interval).unwrap_err(),
+            PpoError::CounterOverflow
+        );
+        assert_eq!(report, before);
+    }
+}
+
+#[test]
+fn map2_training_reward_progress_format_and_total_include_both_costs_and_all_raw_fields() {
+    let mut report = super::super::Map2TrainingReward::default();
+    report
+        .record(crate::Map2RewardBreakdown {
+            stagnation_base: -0.02,
+            stagnation_ticks_cost: -0.000002,
+            total: -0.020002,
+            observations: crate::Map2RewardObservations {
+                structure_damage_dealt: 10,
+                creep_kills: 2,
+                creep_denies: 1,
+                stagnation_active_ticks: 30,
+                stagnation_idle_ticks: 2700,
+                stagnation_charged_ticks: 1,
+                stagnation_base_charges: 1,
+                stagnation_repaid_ticks: 90,
+                progress_reasons: 0x0084,
+                ..crate::Map2RewardObservations::default()
+            },
+            ..crate::Map2RewardBreakdown::default()
+        })
+        .unwrap();
+
+    let output = report.to_string();
+    let components = report.components();
+
+    assert!(
+        (components[..components.len() - 1].iter().sum::<f64>() - report.total).abs() < 1.0e-12
+    );
+    for field in [
+        "reward_stagnation_base=-0.020000000",
+        "reward_stagnation_ticks_cost=-0.000002000",
+        "structure_damage_dealt=10",
+        "creep_kills=2",
+        "creep_denies=1",
+        "stagnation_active_ticks=30",
+        "stagnation_idle_ticks=2700",
+        "stagnation_charged_ticks=1",
+        "stagnation_base_charges=1",
+        "stagnation_repaid_ticks=90",
+        "progress_reasons=0x0084",
+    ] {
+        assert!(
+            output.split_whitespace().any(|token| token == field),
+            "missing {field}: {output}"
+        );
+    }
+    assert!(output.len() < 4096);
+}
+
+#[test]
+fn map2_training_reward_progress_nonfinite_costs_fail_without_partial_mutation() {
+    let mut report = super::super::Map2TrainingReward::default();
+    for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+        for base in [false, true] {
+            let mut interval = crate::Map2RewardBreakdown::default();
+            if base {
+                interval.stagnation_base = value;
+            } else {
+                interval.stagnation_ticks_cost = value;
+            }
+            let before = report;
+
+            let error = report.record(interval).unwrap_err();
+
+            assert_eq!(error.to_string(), "PPO Map2 reward telemetry is non-finite");
+            assert_eq!(report, before);
+        }
+    }
+}
+
+#[test]
+fn map2_training_reward_progress_counter_overflow_is_atomic() {
+    for index in 0..8 {
+        let mut report = super::super::Map2TrainingReward::default();
+        let mut interval = crate::Map2RewardBreakdown::default();
+        set_progress_counter(&mut report.observations, index, u64::MAX);
+        set_progress_counter(&mut interval.observations, index, 1);
+        let before = report;
+
+        let error = report.record(interval).unwrap_err();
+
+        assert_eq!(error, PpoError::CounterOverflow);
+        assert_eq!(report, before);
+    }
+}
+
+fn set_progress_counter(raw: &mut crate::Map2RewardObservations, index: usize, value: u64) {
+    match index {
+        0 => raw.structure_damage_dealt = value,
+        1 => raw.creep_kills = value,
+        2 => raw.creep_denies = value,
+        3 => raw.stagnation_active_ticks = value,
+        4 => raw.stagnation_idle_ticks = value,
+        5 => raw.stagnation_charged_ticks = value,
+        6 => raw.stagnation_base_charges = value,
+        7 => raw.stagnation_repaid_ticks = value,
+        _ => panic!("unexpected progress counter index"),
+    }
 }
 
 #[test]

@@ -5,7 +5,9 @@
 
 mod events;
 mod observation;
+mod opening;
 mod potential;
+mod progress;
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -14,8 +16,10 @@ use bota_proto::{EntityId, EventKind, MatchInfo, SlotId};
 use observation::{Identity, Role, SnapshotFacts};
 use potential::Tower;
 
+pub use progress::*;
+
 /// Independent metadata version for the Map2 reward profile.
-pub const MAP2_REWARD_SCHEMA_VERSION: u32 = 1;
+pub const MAP2_REWARD_SCHEMA_VERSION: u32 = 3;
 /// Maximum events consumed atomically in one seat-visible tick.
 pub const MAP2_REWARD_MAX_EVENTS: usize = 4096;
 /// Maximum visible units accepted in one snapshot.
@@ -26,12 +30,55 @@ pub const MAP2_REWARD_MAX_IDENTITIES: usize = 8192;
 pub const MAP2_REWARD_CHANNELS: usize = 9;
 /// Required per-tick discount for exact potential cancellation and the return bound.
 pub const MAP2_REWARD_GAMMA_TICK: f32 = 1.0;
+/// Maximum pre-wave center-distance potential, in reward units.
+pub const MAP2_REWARD_PREGAME_CENTER_SCALE: f64 = 0.005;
+/// Complete stationary/full fountain intervals before the initial wait charge.
+pub const MAP2_REWARD_FOUNTAIN_GRACE_TICKS: u32 = crate::MAP2_TICK_RATE;
+/// Initial fountain wait cost at the grace boundary, in reward units.
+pub const MAP2_REWARD_FOUNTAIN_BASE_COST: f64 = 0.0001;
+/// Fountain wait cost per second after the grace boundary, prorated per tick.
+pub const MAP2_REWARD_FOUNTAIN_COST_PER_SECOND: f64 = 0.00005;
+/// Upper bound on total wait charges over the native Map2 cap, before refunds.
+pub const MAP2_REWARD_FOUNTAIN_WAIT_BOUND: f64 = MAP2_REWARD_FOUNTAIN_BASE_COST
+    * crate::MAP2_TICK_CAP as f64
+    / MAP2_REWARD_FOUNTAIN_GRACE_TICKS as f64;
+/// Unchanged v2 absolute dense bound, excluding stagnation and terminal reward.
+pub const MAP2_REWARD_V2_DENSE_BOUND: f64 =
+    V1_DENSE_BOUND + MAP2_REWARD_PREGAME_CENTER_SCALE + MAP2_REWARD_FOUNTAIN_WAIT_BOUND;
+/// Inactive debt threshold, clamped so sustained activity can always repay it.
+pub const MAP2_REWARD_STAGNATION_THRESHOLD_TICKS: u32 = 90 * crate::MAP2_TICK_RATE;
+/// Active ticks granted by one useful tick, including the useful tick itself.
+pub const MAP2_REWARD_ACTIVITY_LEASE_TICKS: u32 = crate::MAP2_TICK_RATE;
+/// Debt ticks repaid per active tick, capped at the current debt.
+pub const MAP2_REWARD_STAGNATION_REPAY_PER_TICK: u32 = 3;
+/// Base cost charged once per stall bout until its debt is fully repaid.
+pub const MAP2_REWARD_STAGNATION_BASE_COST: f64 = 0.02;
+/// Cost on subsequent inactive ticks at the threshold while the base is latched.
+pub const MAP2_REWARD_STAGNATION_TICK_COST: f64 = 0.000002;
+/// Conservative native-cap maximum of fully separated base-charge bouts.
+pub const MAP2_REWARD_STAGNATION_MAX_BASE_CHARGES: u32 = 1
+    + (MAX_TICK - MAP2_REWARD_STAGNATION_THRESHOLD_TICKS)
+        / (MAP2_REWARD_STAGNATION_THRESHOLD_TICKS
+            + MAP2_REWARD_STAGNATION_THRESHOLD_TICKS
+                .div_ceil(MAP2_REWARD_STAGNATION_REPAY_PER_TICK));
+/// Upper bound on stagnation charges; no runtime reward clipping is applied.
+pub const MAP2_REWARD_STAGNATION_BOUND: f64 = MAP2_REWARD_STAGNATION_MAX_BASE_CHARGES as f64
+    * MAP2_REWARD_STAGNATION_BASE_COST
+    + MAX_TICK as f64 * MAP2_REWARD_STAGNATION_TICK_COST;
 /// Upper bound on absolute undiscounted dense episode return, excluding terminal reward.
-pub const MAP2_REWARD_DENSE_BOUND: f64 = 0.4;
+pub const MAP2_REWARD_DENSE_BOUND: f64 = MAP2_REWARD_V2_DENSE_BOUND + MAP2_REWARD_STAGNATION_BOUND;
+/// Upper bound on positive dense return over a FULL episode including terminal lane closure.
+pub const MAP2_REWARD_POSITIVE_BOUND: f64 = BUDGETS[0]
+    + BUDGETS[2]
+    + BUDGETS[4]
+    + 2.0 * TOWER_SCALE
+    + LANE_SCALE
+    + MAP2_REWARD_PREGAME_CENTER_SCALE;
 /// Exact accounting and calibration contract; coefficients are engineering choices.
 pub const MAP2_REWARD_SCHEMA_DESCRIPTOR: &str = concat!(
-    "drysua-map2-reward/v1;map2_1v1_seat_snapshot_events_contiguous_tick_complete;",
-    "units4096_events4096_identities8192_towers64_tick3600000_amount1000000_xp1000000000;",
+    "drysua-map2-reward/v3;map2_1v1_seat_snapshot_events_contiguous_tick_complete;",
+    "units4096_events4096_identities8192_towers64_tick27900_amount1000000_xp1000000000;",
+    "public_metadata=map2_rate30_terrain_axis1to512_pregame0to27900;",
     "identity_opaque_full_generation_public_scoreboard_heroes_retained_other_metadata480ticks;",
     "snapshot_capacity_preflight_death_structure_current_and_prior_role_validation_no_alive_victim_or_known_resurrection;",
     "gold_observed_paid_died_own_minus_enemy_no_cash_networth_passive_sales_or_lh_double_payment;",
@@ -46,13 +93,28 @@ pub const MAP2_REWARD_SCHEMA_DESCRIPTOR: &str = concat!(
     "tower=.05*(mean_own_hp_fraction-mean_enemy_hp_fraction)_public_cached_no_absence_death;",
     "lane=.01*(mean_own_creep_axis+mean_enemy_creep_axis-1)_fountain_axis_public_both_cohorts_else_hold;",
     "potentials_exact_gamma1_deltas_not_budget_clipped_first_tick_resources_potentials_baseline_events_counted;",
+    "pregame_movement=.005_times_one_minus_clamped_euclidean_distance_to9216_9216_over9216sqrt2,only_pending_tick_lt_public_pregame_ticks,first_complete_observed_body_baseline_free,missing_body_holds_last_observed_potential,reappearance_uses_observed_position,no_cutoff_or_terminal_reversal,no_postspawn_hero_position_reward;",
+    "fountain_wait=own_live_full_projected_hp_mana_both_consecutive_snapshots_same_full_generation_raw_position_inside_observed_own_fountain1200_inclusive,first_eligible_elapsed0,grace30_at30_base.0001_then.00005_per_second_prorated_div30_per_tick,incremental_negative_cost,any_movement_or_condition_break_resets_without_refund;",
+    "fountain_purchase=any_confirmed_own_ItemBought_priority_before_condition_break_refunds_entire_open_period_including_drained_charges_then_resets_elapsed0_no_new_wait_interval,enemy_buy_ignored,no_price_intent_channel_saving_exceptions;",
+    "wait_state=fountain_wait_ticks_u32_current_refundable_cost_f32;",
+    "progress_flags=u16_or_per_tick_xp1_gold2_hero_damage4_structure_damage8_creep_kill16_creep_deny32_purchase64_fountain_aura128_pregame_movement256_nearby_wave_pressure512;",
+    "progress_sources=own_xp_gain_own_paid_bounty_own_hero_to_enemy_hero_damage_own_hero_to_enemy_tower_barracks_ancient_damage_own_nondenied_creep_kill_including_zero_gold_own_creep_deny_any_confirmed_own_purchase;",
+    "progress_snapshot=own_effect3_positive_ticks_even_full_without_regen_requirement_positive_prewave_center_increment_positive_existing_wave_increment_only_with_live_own_hero_within1500_of_visible_own_live_lane_creep;",
+    "progress_detection=completed_tick_counter_deltas_before_journal_trim_and_retention_not_accumulated_interval_totals_no_passive_gold_enemy_progress_unknown_targets_clicks_empty_casts_or_other_hero_movement;",
+    "progress_debt=baseline_free_all_completed_ticks_including_dead_clamp0to2700_any_reason_refreshes30tick_lease_current_tick_included_no_stacking_active_repay_min3_then_consume1_lease_inactive_add1;",
+    "progress_penalty=base.02_at_first2700_no_rate_same_tick_latch_until_debt0_subsequent_inactive_ticks_at2700_cost.000002_partial_repay_preserves_latch_no_refund_no_reward_clipping;",
+    "progress_state=stagnation_ticks_u32_activity_ticks_left_u32_stagnation_base_charged_bool_only;progress_purchase=lease_only_never_debt_reset_independent_of_unchanged_v2_fountain_full_refund;",
     "terminal_win1_loss-1_draw0_timecap0_distinct_lane_zero_tower_final_retained;",
-    "gamma1_only_dense_absolute_net_return_bound.4_no_strategy_masks_or_teacher_inputs;"
+    "finish_preserves_pregame_hint_wait_and_stagnation_totals_no_extra_charge_repayment_or_refund;",
+    "v2_dense_bound=.4_v1+.005_center+.0001_times27900over30=.498,wait_rate_le_base_refund_le_charged_current_period_no_wait_clipping;",
+    "progress_bounds=max_base_charges1plus27900minus2700_over2700plus900=8_cost_bound8times.02_plus27900times.000002=.2158;",
+    "gamma1_only_full_episode_negative_absolute_bound.7138_positive_bound.255_from_positive_budgets.14_tower.1_terminal_lane.01_center.005_sum.9688_lt1_no_strategy_masks_or_teacher_inputs;"
 );
 /// Stable FNV-1a hash of the complete independent reward descriptor.
 pub const MAP2_REWARD_SCHEMA_HASH: u64 = schema_hash(MAP2_REWARD_SCHEMA_DESCRIPTOR.as_bytes());
 
-const MAX_TICK: u32 = 3_600_000;
+const MAX_TICK: u32 = crate::MAP2_TICK_CAP;
+const V1_DENSE_BOUND: f64 = 0.4;
 const MAX_AMOUNT: i32 = 1_000_000;
 const MAX_XP: i32 = 1_000_000_000;
 const IDENTITY_AGE: u32 = 480;
@@ -66,10 +128,20 @@ const SCALES: [f64; MAP2_REWARD_CHANNELS] = [
 ];
 const _: () = assert!(MAP2_REWARD_MAX_IDENTITIES >= 2 * MAP2_REWARD_MAX_UNITS);
 const _: () = assert!(
-    event_budget_total() + 2.0 * TOWER_SCALE + 2.0 * LANE_SCALE
-        <= MAP2_REWARD_DENSE_BOUND + 1.0e-12
+    event_budget_total() + 2.0 * TOWER_SCALE + 2.0 * LANE_SCALE <= V1_DENSE_BOUND + 1.0e-12
 );
-const _: () = assert!(2.0 * MAP2_REWARD_DENSE_BOUND < 1.0);
+const _: () = assert!(MAX_TICK == 27_900);
+const _: () = assert!(MAP2_REWARD_FOUNTAIN_GRACE_TICKS == 30);
+const _: () = assert!(MAP2_REWARD_FOUNTAIN_BASE_COST > 0.0);
+const _: () = assert!(MAP2_REWARD_FOUNTAIN_COST_PER_SECOND <= MAP2_REWARD_FOUNTAIN_BASE_COST);
+const _: () = assert!(MAP2_REWARD_FOUNTAIN_COST_PER_SECOND > 0.0);
+const _: () = assert!(MAP2_REWARD_STAGNATION_THRESHOLD_TICKS == 2700);
+const _: () = assert!(MAP2_REWARD_ACTIVITY_LEASE_TICKS == 30);
+const _: () = assert!(MAP2_REWARD_STAGNATION_REPAY_PER_TICK > 0);
+const _: () = assert!(MAP2_REWARD_STAGNATION_MAX_BASE_CHARGES == 8);
+const _: () = assert!(MAP2_REWARD_STAGNATION_BASE_COST > 0.0);
+const _: () = assert!(MAP2_REWARD_STAGNATION_TICK_COST > 0.0);
+const _: () = assert!(MAP2_REWARD_DENSE_BOUND + MAP2_REWARD_POSITIVE_BOUND < 1.0);
 const _: () = assert!(
     (MAX_TICK as u64) * (MAP2_REWARD_MAX_EVENTS as u64) * (MAX_AMOUNT as u64) < u64::MAX / 2
 );
@@ -91,6 +163,12 @@ pub struct Map2RewardObservations {
     pub own_xp_gained: u64,
     pub enemy_xp_gained: u64,
     pub hero_damage_dealt: u64,
+    /// Own hero damage to opposing towers, barracks and Ancients; no separate instant credit.
+    pub structure_damage_dealt: u64,
+    /// Classified own non-denied creep kills, including zero-paid-gold kills.
+    pub creep_kills: u64,
+    /// Classified own friendly-creep denies; no separate instant credit.
+    pub creep_denies: u64,
     pub hero_damage_taken: u64,
     pub creep_damage_taken: u64,
     /// Damage from known non-hero/non-creep sources or the environment.
@@ -109,6 +187,21 @@ pub struct Map2RewardObservations {
     pub duplicate_deaths: u64,
     /// Completed nonbaseline ticks with both lane cohorts and a public fountain axis.
     pub lane_observed_ticks: u64,
+    /// Consecutive full stationary own-fountain intervals, including grace intervals.
+    pub fountain_wait_ticks: u64,
+    /// Intervals emitting a wait cost, including each period's base-charge interval.
+    pub fountain_wait_charged_ticks: u64,
+    /// Own purchase ticks refunding a positive open-period charge, once per tick.
+    pub fountain_wait_refunds: u64,
+    pub stagnation_active_ticks: u64,
+    pub stagnation_idle_ticks: u64,
+    /// Inactive ticks charged either the base or subsequent tick cost.
+    pub stagnation_charged_ticks: u64,
+    pub stagnation_base_charges: u64,
+    /// Actual debt removed, not the requested repayment when debt is already small.
+    pub stagnation_repaid_ticks: u64,
+    /// Bitwise OR of the useful-activity reasons observed during this interval.
+    pub progress_reasons: u16,
 }
 
 /// Normalized f64 components; `total` is their sum and `ticks` excludes the initial baseline.
@@ -125,6 +218,11 @@ pub struct Map2RewardBreakdown {
     pub mana_spent: f64,
     pub tower_health: f64,
     pub lane_pressure: f64,
+    pub pregame_movement: f64,
+    pub fountain_wait: f64,
+    pub fountain_wait_refund: f64,
+    pub stagnation_base: f64,
+    pub stagnation_ticks_cost: f64,
     pub terminal: f64,
     pub total: f64,
     pub end: Option<Map2RewardEnd>,
@@ -141,6 +239,16 @@ pub struct Map2RewardState {
     /// Current bounded observed wave potential, in `[-0.01, 0.01]`.
     pub lane_potential: f32,
     pub lane_observed: bool,
+    /// Full stationary intervals in the open own-fountain wait period.
+    pub fountain_wait_ticks: u32,
+    /// Current period's charged cost refundable by any confirmed own purchase.
+    pub fountain_wait_refundable_cost: f32,
+    /// Progress debt, in 0..=2700 ticks; not reset by death or movement.
+    pub stagnation_ticks: u32,
+    /// Remaining active intervals, in 0..30 after a completed tick.
+    pub activity_ticks_left: u32,
+    /// Whether this stall bout's base was charged; cleared only when debt reaches zero.
+    pub stagnation_base_charged: bool,
     /// Last fully consumed Snapshot/Events tick; absent before the first complete pair.
     pub completed_tick: Option<u32>,
 }
@@ -180,6 +288,7 @@ impl std::error::Error for Map2RewardError {}
 #[derive(Clone, Debug)]
 pub struct Map2Reward {
     roles: [Role; 2],
+    pregame_ticks: u32,
     current: Option<SnapshotFacts>,
     pending: Option<SnapshotFacts>,
     identities: BTreeMap<EntityId, Identity>,
@@ -188,6 +297,12 @@ pub struct Map2Reward {
     tower_potential: f64,
     lane_potential: f64,
     lane_observed: bool,
+    pregame_center_potential: Option<f64>,
+    fountain_wait_ticks: u32,
+    fountain_wait_refundable_cost: f64,
+    stagnation_ticks: u32,
+    activity_ticks_left: u32,
+    stagnation_base_charged: bool,
     interval: Map2RewardBreakdown,
     ended: bool,
 }
@@ -200,6 +315,7 @@ impl Map2Reward {
         assert_ne!(roles[0].slot, roles[1].slot);
         Ok(Self {
             roles,
+            pregame_ticks: info.pregame_ticks,
             current: None,
             pending: None,
             identities: BTreeMap::new(),
@@ -208,6 +324,12 @@ impl Map2Reward {
             tower_potential: 0.0,
             lane_potential: 0.0,
             lane_observed: false,
+            pregame_center_potential: None,
+            fountain_wait_ticks: 0,
+            fountain_wait_refundable_cost: 0.0,
+            stagnation_ticks: 0,
+            activity_ticks_left: 0,
+            stagnation_base_charged: false,
             interval: Map2RewardBreakdown::default(),
             ended: false,
         })
@@ -253,6 +375,7 @@ impl Map2Reward {
         events::validate(events)?;
         self.validate_event_lifecycle(pending, events)?;
         let pending = self.pending.take().expect("pending snapshot was validated");
+        let previous_interval = self.interval;
         self.update_identities(&pending);
         self.update_towers(&pending);
         self.observe_resources(&pending);
@@ -260,6 +383,9 @@ impl Map2Reward {
             self.observe_event(event);
         }
         self.observe_potentials(&pending);
+        self.observe_pregame_movement(&pending);
+        self.observe_fountain_wait(&pending, events);
+        self.observe_progress(&pending, events, previous_interval);
         if self.current.is_some() {
             self.interval.ticks += 1;
         }
@@ -281,6 +407,7 @@ impl Map2Reward {
 
     /// Drains the final interval, closes lane potential, and retains final tower-health progress.
     /// `TimeCap` is a learner terminal, not an invented `MatchOver` or a technical timeout.
+    /// Pregame, wait/refund and stagnation totals receive no additional charge or repayment.
     pub fn finish(&mut self, end: Map2RewardEnd) -> Result<Map2RewardBreakdown, Map2RewardError> {
         self.ensure_complete()?;
         self.interval.lane_pressure -= self.lane_potential;
@@ -300,7 +427,7 @@ impl Map2Reward {
         Ok(result)
     }
 
-    /// Copies observable diminishing-budget and potential state; no identity handle enters it.
+    /// Copies observable budgets, potentials, wait and progress state; no identity handle enters it.
     pub fn state(&self) -> Map2RewardState {
         let remaining = std::array::from_fn(|index| {
             (SCALES[index] / (SCALES[index] + self.counts[index] as f64)) as f32
@@ -312,6 +439,11 @@ impl Map2Reward {
             tower_potential: self.tower_potential as f32,
             lane_potential: self.lane_potential as f32,
             lane_observed: self.lane_observed,
+            fountain_wait_ticks: self.fountain_wait_ticks,
+            fountain_wait_refundable_cost: self.fountain_wait_refundable_cost as f32,
+            stagnation_ticks: self.stagnation_ticks,
+            activity_ticks_left: self.activity_ticks_left,
+            stagnation_base_charged: self.stagnation_base_charged,
             completed_tick: self.current.as_ref().map(|current| current.tick),
         }
     }
@@ -387,6 +519,11 @@ impl Map2RewardBreakdown {
             + self.mana_spent
             + self.tower_health
             + self.lane_pressure
+            + self.pregame_movement
+            + self.fountain_wait
+            + self.fountain_wait_refund
+            + self.stagnation_base
+            + self.stagnation_ticks_cost
             + self.terminal;
         assert!(self.total.is_finite());
         assert!(self.ticks <= MAX_TICK);

@@ -19,7 +19,7 @@ fn m16_metadata() -> HashMap<String, String> {
         ("map2_reward_schema_hash", "798798703797057220"),
         (
             "map2_reward_schema_descriptor",
-            crate::MAP2_REWARD_SCHEMA_DESCRIPTOR,
+            crate::checkpoint::legacy_reward::MAP2_REWARD_V1_DESCRIPTOR,
         ),
     ]
     .into_iter()
@@ -28,7 +28,7 @@ fn m16_metadata() -> HashMap<String, String> {
 }
 
 #[test]
-fn navigation_schema_changes_all_execution_identities_without_changing_shapes() {
+fn navigation_ancestry_targets_wait_progress_schema_with_five_zero_global_rows() {
     eprintln!(
         "navigation_schema A{}={} F{}={} M{}={} PPO{}={} rules={} League{}={} Checkpoint{}={} reward{}={}",
         crate::ACTION_SCHEMA_VERSION,
@@ -48,19 +48,19 @@ fn navigation_schema_changes_all_execution_identities_without_changing_shapes() 
         crate::MAP2_REWARD_SCHEMA_HASH
     );
     assert_eq!(crate::ACTION_SCHEMA_VERSION, 5);
-    assert_eq!(crate::FEATURE_SCHEMA_VERSION, 15);
-    assert_eq!(crate::MODEL_SCHEMA_VERSION, 17);
-    assert_eq!(crate::PPO_SCHEMA_VERSION, 30);
-    assert_eq!(crate::PPO_RULES_AUDIT_VERSION, 25);
-    assert_eq!(crate::LEAGUE_SCHEMA_VERSION, 30);
-    assert_eq!(crate::LEAGUE_RULES_AUDIT_VERSION, 25);
-    assert_eq!(crate::CHECKPOINT_SCHEMA_VERSION, 5);
-    assert_eq!(crate::IMITATION_RULES_AUDIT_VERSION, 15);
-    assert_eq!(crate::GLOBAL_FEATURES, 85);
+    assert_eq!(crate::FEATURE_SCHEMA_VERSION, 17);
+    assert_eq!(crate::MODEL_SCHEMA_VERSION, 19);
+    assert_eq!(crate::PPO_SCHEMA_VERSION, 32);
+    assert_eq!(crate::PPO_RULES_AUDIT_VERSION, 27);
+    assert_eq!(crate::LEAGUE_SCHEMA_VERSION, 32);
+    assert_eq!(crate::LEAGUE_RULES_AUDIT_VERSION, 27);
+    assert_eq!(crate::CHECKPOINT_SCHEMA_VERSION, 7);
+    assert_eq!(crate::IMITATION_RULES_AUDIT_VERSION, 17);
+    assert_eq!(crate::GLOBAL_FEATURES, 90);
     assert_eq!(crate::UNIT_FEATURES, 84);
-    assert_eq!(crate::MODEL_PARAMETER_COUNT, M16_PARAMETERS);
-    assert_eq!(crate::MAP2_REWARD_SCHEMA_VERSION, 1);
-    assert_eq!(crate::MAP2_REWARD_SCHEMA_HASH, 798_798_703_797_057_220);
+    assert_eq!(crate::MODEL_PARAMETER_COUNT, M16_PARAMETERS + 2560);
+    assert_eq!(crate::MAP2_REWARD_SCHEMA_VERSION, 3);
+    assert_eq!(crate::MAP2_REWARD_SCHEMA_HASH, 11_643_768_462_079_275_437);
 }
 
 #[test]
@@ -305,10 +305,11 @@ fn navigation_m16_copy_preserves_all_parameter_bits_and_has_fresh_training_state
 
     model
         .initialize_m16_navigation_parameters(&source)
-        .expect("same-shape Candle import");
+        .expect("Candle padding import");
 
     assert_eq!(model.parameter_schema().expect("layout").len(), 62);
-    assert_bits(&model.export_parameters().expect("all bits"), &source);
+    let padded = model.export_parameters().expect("all bits");
+    super::fountain_wait_initialization::assert_wait_padding(&model, &source, &padded);
     let trainer = crate::PpoTrainer::new(&model, config(), 10_091_704).expect("fresh optimizer");
     assert_fresh_state(&model, &trainer);
     let directory = Directory::new();
@@ -324,7 +325,7 @@ fn navigation_m16_copy_preserves_all_parameter_bits_and_has_fresh_training_state
     assert_fresh_state(&restored, state.trainer());
     assert_bits(
         &restored.export_parameters().expect("restored bits"),
-        &source,
+        &padded,
     );
     assert_ne!(
         model.policy_identity().expect("identity"),
@@ -386,8 +387,8 @@ fn navigation_initialization_whitelists_only_two_exact_m16_digests_and_disclaims
         for field in [
             format!("INITIALIZATION_ONLY source_m16_sha256={digest}"),
             "source_f=14 source_a=4 source_m=16 source_ppo=29 source_rules=24".to_owned(),
-            "target_f=15 target_a=5 target_m=17 target_ppo=30 target_rules=25".to_owned(),
-            "parameter_bits_preserved=true named_tensors=62 new_weights=0".to_owned(),
+            "target_f=17 target_a=5 target_m=19 target_ppo=32 target_rules=27".to_owned(),
+            "parameter_bits_preserved=true named_tensors=62 new_weights=2560_positive_zero".to_owned(),
             "optimizer_progress_rng_league=fresh GAMEPLAY_EQUIVALENCE=false new_legal_actions_change_behavior=true qualification=false".to_owned(),
         ] { assert!(text.contains(&field), "missing {field}"); }
         for index in 0..32 {

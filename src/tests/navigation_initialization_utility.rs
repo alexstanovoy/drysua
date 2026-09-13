@@ -33,7 +33,7 @@ fn initialize_pinned_m16_navigation_artifact_only() {
         provenance.source_sha256()
     );
     let parameters = model.export_parameters().expect("copied parameters");
-    assert_source_bits(&bytes, &parameters);
+    assert_source_bits(&model, &bytes, &parameters);
     let rejected = PolicyModel::fresh(seed).expect("runtime rejection target");
     let identity = rejected.policy_identity().expect("identity");
     assert_eq!(
@@ -91,7 +91,7 @@ fn new_output(source: &Path) -> PathBuf {
     output
 }
 
-fn assert_source_bits(bytes: &[u8], parameters: &[f32]) {
+fn assert_source_bits(model: &PolicyModel, bytes: &[u8], parameters: &[f32]) {
     let tensors = safetensors::SafeTensors::deserialize(bytes).expect("pinned tensors");
     let tensor = tensors
         .tensor("model.parameters")
@@ -104,7 +104,7 @@ fn assert_source_bits(bytes: &[u8], parameters: &[f32]) {
         .iter()
         .map(|bytes| f32::from_le_bytes(*bytes))
         .collect();
-    assert_bits(parameters, &source);
+    super::fountain_wait_initialization::assert_wait_padding(model, &source, parameters);
 }
 
 fn initialization_run(config: crate::PpoConfig, seed: u64, provenance: &str) -> CheckpointRun {
@@ -156,7 +156,7 @@ fn write_provenance(output: &Path, source: &Path, run: &CheckpointRun, provenanc
         .collect();
     assert_eq!(digest.len(), 64);
     let text = format!(
-        "{provenance}\nsource={}\noutput_sha256={digest}\ngit_commit={}\nsimulator_commit={}\nseed={}\nenabled_features={}\ntraining_updates=0\ngameplay_runs=0\nsource_unchanged=true\nparameters=1696436\nglobal_features=85\nunit_features=84\nall_62_named_tensors_bit_identical=true\nruntime_and_checkpoint_reload_exact=true\n",
+        "{provenance}\nsource={}\noutput_sha256={digest}\ngit_commit={}\nsimulator_commit={}\nseed={}\nenabled_features={}\ntraining_updates=0\ngameplay_runs=0\nsource_unchanged=true\nparameters=1698996\nglobal_features=90\nunit_features=84\nold_parameter_bits_preserved=true\nnew_zero_trunk_rows=85..90\nruntime_and_checkpoint_reload_exact=true\n",
         source.display(),
         run.git_commit,
         run.simulator_commit,

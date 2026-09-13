@@ -15,8 +15,8 @@ use crate::{
 
 #[test]
 fn stage_ten_schema_is_stable_and_names_its_safety_contracts() {
-    assert_eq!(LEAGUE_SCHEMA_VERSION, 30);
-    assert_eq!(crate::LEAGUE_RULES_AUDIT_VERSION, 25);
+    assert_eq!(LEAGUE_SCHEMA_VERSION, 32);
+    assert_eq!(crate::LEAGUE_RULES_AUDIT_VERSION, 27);
     assert_eq!(
         LEAGUE_SCHEMA_HASH,
         super::map2_checkpoint::schema_hash(

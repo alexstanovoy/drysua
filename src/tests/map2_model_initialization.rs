@@ -54,7 +54,7 @@ pub(super) fn assert_padding(model: &PolicyModel, source: &[f32], target: &[f32]
     let schema = model.parameter_schema().expect("schema");
     assert_eq!(schema.len(), 62);
     assert_eq!(source.len(), M14_PARAMETERS);
-    assert_eq!(target.len(), M14_PARAMETERS + 7_360);
+    assert_eq!(target.len(), M14_PARAMETERS + 9_920);
     let mut source_offset = 0;
     let mut target_offset = 0;
     let mut inserted_total = 0;
@@ -66,8 +66,8 @@ pub(super) fn assert_padding(model: &PolicyModel, source: &[f32], target: &[f32]
                 (73 * 64, 11 * 64)
             }
             "trunk.0.weight" => {
-                assert_eq!(shape, [2589, 512]);
-                (72 * 512, 13 * 512)
+                assert_eq!(shape, [2594, 512]);
+                (72 * 512, 18 * 512)
             }
             _ => (count, 0),
         };
@@ -86,7 +86,7 @@ pub(super) fn assert_padding(model: &PolicyModel, source: &[f32], target: &[f32]
     }
     assert_eq!(source_offset, source.len());
     assert_eq!(target_offset, target.len());
-    assert_eq!(inserted_total, 7_360);
+    assert_eq!(inserted_total, 9_920);
 }
 
 #[test]
@@ -143,11 +143,12 @@ fn map2_padded_bounded_parameters_produce_finite_outputs_for_all_heads() {
         .expect("bounded finite padding");
     model.import_parameters(&parameters).expect("finite import");
     let mut frame = crate::FeatureFrame::new();
-    let appended = frame.global.get_mut(72..85).expect("F14 global append");
+    let appended = frame.global.get_mut(72..90).expect("F17 global append");
     appended[..10].fill(1.0);
     appended[10] = 0.05;
     appended[11] = 0.01;
     appended[12] = 1.0;
+    appended[13..18].fill(1.0);
     frame.units[0][crate::unit_feature::TOKEN_PRESENT] = 1.0;
     frame.units[0][73..84].fill(1.0);
     let prefix = crate::TrainingPrefix::new(crate::ActionKind::Continue, None, None);

@@ -3,6 +3,11 @@
     reason = "Reward tests compare normalized components"
 )]
 
+#[path = "map2_reward_progress.rs"]
+mod progress;
+#[path = "map2_reward_simple_wait.rs"]
+mod simple_wait;
+
 use bota_proto::{
     Angle, Attributes, DamageKind, EntityId, EventKind, Fixed, HeroId, MapId, MatchInfo, Pick,
     PlayerView, SlotId, StatusFlags, Team, TickMode, UnitKind, UnitView, Vec2, WorldView,
@@ -463,8 +468,8 @@ pub(super) fn snapshot(tick: u32) -> WorldView {
             unit(4, UnitKind::Tower, Team::Dire, 800),
             unit(5, UnitKind::CreepMelee, Team::Radiant, 450),
             unit(6, UnitKind::CreepMelee, Team::Dire, 550),
-            unit(7, UnitKind::Fountain, Team::Radiant, 0),
-            unit(8, UnitKind::Fountain, Team::Dire, 1000),
+            unit(7, UnitKind::Fountain, Team::Radiant, -2000),
+            unit(8, UnitKind::Fountain, Team::Dire, 3000),
         ],
         projectiles: Vec::new(),
         players: vec![player(0), player(1)],

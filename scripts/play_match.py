@@ -99,7 +99,7 @@ def parse_arguments(arguments):
     parser.add_argument("--bot-side", choices=("radiant", "dire"),
                         help="Neural bot side (default: dire, or opposite --human-side)")
     parser.add_argument("--weights-directory", type=Path,
-                        help="Directory with compatible current F15/M17 runtime weights; no trained Map2 default yet")
+                        help="Directory with compatible current F17/M19 runtime weights; no trained Map2 default yet")
     result = parser.parse_args(arguments)
     opposite = {"radiant": "dire", "dire": "radiant"}
     if result.human_side is None:
@@ -114,7 +114,7 @@ def parse_arguments(arguments):
 def current_paths(root, weights_directory):
     if weights_directory is None:
         raise RuntimeError("legacy F12/M14 human-review weights are incompatible with current Map2; "
-                           "provide --weights-directory with compatible F15/M17 runtime weights; "
+                           "provide --weights-directory with compatible F17/M19 runtime weights; "
                            "no Map2 model has been trained or promoted; no Teacher fallback")
     weights = weights_directory.resolve()
     read_runtime_metadata(weights)
@@ -337,7 +337,7 @@ class Supervisor:
 
     def run(self, root, arguments):
         binary, weights = current_paths(root, arguments.weights_directory)
-        print(f"play: current Map2 pure Neural F15/M17; weights: {weights}; executable: {binary}; "
+        print(f"play: current Map2 pure Neural F17/M19; weights: {weights}; executable: {binary}; "
               "metadata preflight only, Rust validates tensors before joining", flush=True)
         if not arguments.no_build:
             command = ["cargo", "build", "--release", "--locked", "--quiet",

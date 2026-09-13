@@ -10,6 +10,11 @@ mod bota_rebase_schema;
 mod checkpoint;
 mod cli;
 mod feature;
+mod progress_debt_features;
+mod progress_debt_initialization;
+mod fountain_wait_features;
+mod fountain_wait_initialization;
+mod fountain_wait_initialization_utility;
 mod imitation;
 #[cfg(feature = "builtin")]
 mod laning;

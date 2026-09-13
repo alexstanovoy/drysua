@@ -101,12 +101,20 @@ fn actor_report_merge_preserves_map2_reward_components_and_raw_observations() {
         mana_spent: -0.25,
         tower_health: 0.25,
         lane_pressure: 0.5,
+        pregame_movement: 0.125,
+        fountain_wait: -0.25,
+        fountain_wait_refund: 0.125,
+        stagnation_base: 0.0,
+        stagnation_ticks_cost: 0.0,
         terminal: 1.0,
         total: 1.5,
         observations: crate::Map2RewardObservations {
             hero_damage_dealt: 50,
             mana_spent: 75,
             lane_observed_ticks: 3,
+            fountain_wait_ticks: 60,
+            fountain_wait_charged_ticks: 31,
+            fountain_wait_refunds: 1,
             ..crate::Map2RewardObservations::default()
         },
     };
@@ -129,11 +137,23 @@ fn actor_report_merge_preserves_map2_reward_components_and_raw_observations() {
     assert_eq!(aggregate.map2_reward.mana_spent, -0.5);
     assert_eq!(aggregate.map2_reward.tower_health, 0.5);
     assert_eq!(aggregate.map2_reward.lane_pressure, 1.0);
+    assert_eq!(aggregate.map2_reward.pregame_movement, 0.25);
+    assert_eq!(aggregate.map2_reward.fountain_wait, -0.5);
+    assert_eq!(aggregate.map2_reward.fountain_wait_refund, 0.25);
     assert_eq!(aggregate.map2_reward.terminal, 2.0);
     assert_eq!(aggregate.map2_reward.total, 3.0);
     assert_eq!(aggregate.map2_reward.observations.hero_damage_dealt, 100);
     assert_eq!(aggregate.map2_reward.observations.mana_spent, 150);
     assert_eq!(aggregate.map2_reward.observations.lane_observed_ticks, 6);
+    assert_eq!(aggregate.map2_reward.observations.fountain_wait_ticks, 120);
+    assert_eq!(
+        aggregate
+            .map2_reward
+            .observations
+            .fountain_wait_charged_ticks,
+        62
+    );
+    assert_eq!(aggregate.map2_reward.observations.fountain_wait_refunds, 2);
 }
 
 #[cfg(feature = "builtin")]
@@ -146,6 +166,57 @@ fn actor_report_rejection_delta_does_not_recount_prior_updates() {
             .expect_err("counter regression")
             .to_string(),
         "invalid PPO transition: arena rejection counter regressed"
+    );
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn actor_report_merges_progress_costs_counters_and_reason_bits_without_double_counting_bits() {
+    let mut aggregate = crate::PpoSmokeReport {
+        map2_reward: crate::Map2TrainingReward {
+            stagnation_base: -0.02,
+            stagnation_ticks_cost: -0.000002,
+            total: -0.020002,
+            observations: crate::Map2RewardObservations {
+                structure_damage_dealt: 7,
+                creep_kills: 2,
+                creep_denies: 1,
+                stagnation_active_ticks: 30,
+                stagnation_idle_ticks: 10,
+                stagnation_charged_ticks: 1,
+                stagnation_base_charges: 1,
+                stagnation_repaid_ticks: 90,
+                progress_reasons: crate::MAP2_PROGRESS_HERO_DAMAGE
+                    | crate::MAP2_PROGRESS_FOUNTAIN_AURA,
+                ..crate::Map2RewardObservations::default()
+            },
+            ..crate::Map2TrainingReward::default()
+        },
+        ..crate::PpoSmokeReport::default()
+    };
+    let mut other = aggregate;
+    other.map2_reward.observations.progress_reasons =
+        crate::MAP2_PROGRESS_FOUNTAIN_AURA | crate::MAP2_PROGRESS_PURCHASE;
+
+    crate::merge_actor_report_for_test(&mut aggregate, other).unwrap();
+
+    let reward = aggregate.map2_reward;
+    assert_eq!(reward.stagnation_base, -0.04);
+    assert_eq!(reward.stagnation_ticks_cost, -0.000004);
+    assert!((reward.total + 0.040004).abs() < 1.0e-12);
+    assert_eq!(reward.observations.structure_damage_dealt, 14);
+    assert_eq!(reward.observations.creep_kills, 4);
+    assert_eq!(reward.observations.creep_denies, 2);
+    assert_eq!(reward.observations.stagnation_active_ticks, 60);
+    assert_eq!(reward.observations.stagnation_idle_ticks, 20);
+    assert_eq!(reward.observations.stagnation_charged_ticks, 2);
+    assert_eq!(reward.observations.stagnation_base_charges, 2);
+    assert_eq!(reward.observations.stagnation_repaid_ticks, 180);
+    assert_eq!(
+        reward.observations.progress_reasons,
+        crate::MAP2_PROGRESS_HERO_DAMAGE
+            | crate::MAP2_PROGRESS_FOUNTAIN_AURA
+            | crate::MAP2_PROGRESS_PURCHASE
     );
 }
 
@@ -192,8 +263,8 @@ fn rollout_compacts_sparse_tokens_and_bit_packs_behavioral_masks_losslessly() {
 
 #[test]
 fn ppo_schema_and_rules_audit_are_stable() {
-    assert_eq!(PPO_SCHEMA_VERSION, 30);
-    assert_eq!(PPO_RULES_AUDIT_VERSION, 25);
+    assert_eq!(PPO_SCHEMA_VERSION, 32);
+    assert_eq!(PPO_RULES_AUDIT_VERSION, 27);
     assert_eq!(
         PPO_SCHEMA_HASH,
         super::map2_checkpoint::schema_hash(

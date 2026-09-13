@@ -33,19 +33,19 @@ WEIGHTS_SHA = "6348fe57a128ebd521dba68da0949ceb7378d3e0d6b7d6a7ce9a5fb6446547ab"
 BINARY_SHA = "64ba25ebb10e6beabc26ff667a3e3bddeb40dbf391110d4f0e31db6478500a2b"
 CURRENT_METADATA = {
     "action_schema_hash": "10658390830565586343",
-    "feature_schema_hash": "1861607613534772372",
-    "model_schema_hash": "13592057279889489276",
-    "ppo_schema_version": "30",
-    "ppo_schema_hash": "16275284022255703821",
-    "ppo_rules_audit_version": "25",
-    "map2_reward_schema_version": "1",
-    "map2_reward_schema_hash": "798798703797057220",
+    "feature_schema_hash": "4298252436472980484",
+    "model_schema_hash": "7182549121935768714",
+    "ppo_schema_version": "32",
+    "ppo_schema_hash": "9056229782321552319",
+    "ppo_rules_audit_version": "27",
+    "map2_reward_schema_version": "3",
+    "map2_reward_schema_hash": "11643768462079275437",
 }
 
 
 def rust_descriptor(module, name):
     source = (ROOT / f"drysua/src/{module}.rs").read_text()
-    match = re.search(rf"pub const {name}: &str = concat!\((.*?)\n\);", source, re.S)
+    match = re.search(rf"pub(?:\(crate\))? const {name}: &str = concat!\((.*?)\n\);", source, re.S)
     assert match is not None, name
     strings = re.findall(r'"(?:[^"\\]|\\.)*"', match[1])
     assert strings, name
@@ -768,7 +768,7 @@ class LauncherTests(unittest.TestCase):
         self.launch(weights=False, DISPLAY="")
         error = self.preflight_failure("legacy F12/M14 human-review weights are incompatible")
         self.assertIn("--weights-directory", error)
-        self.assertIn("F15/M17", error)
+        self.assertIn("F17/M19", error)
         self.assertIn("no Map2 model has been trained or promoted", error)
 
     def test_missing_weights_checked_before_missing_executables_and_display(self):
@@ -813,6 +813,44 @@ class LauncherTests(unittest.TestCase):
 
 
 class RuntimeWeightsTests(unittest.TestCase):
+    def test_progress_reward_v3_rejects_frozen_m18_metadata_without_source_rewrite(self):
+        self.assertEqual(self.module.CURRENT_METADATA["ppo_schema_version"], "32")
+        self.assertEqual(self.module.CURRENT_METADATA["ppo_rules_audit_version"], "27")
+        self.assertEqual(self.module.CURRENT_METADATA["map2_reward_schema_version"], "3")
+        old = {
+            "action_schema_hash": "10658390830565586343",
+            "feature_schema_hash": "17888785275670453418",
+            "model_schema_hash": "3900982062969752096",
+            "ppo_schema_version": "31", "ppo_schema_hash": "15379677344330093698",
+            "ppo_rules_audit_version": "26", "map2_reward_schema_version": "2",
+            "map2_reward_schema_hash": "699687995158557285",
+            "map2_reward_schema_descriptor": rust_descriptor(
+                "checkpoint_legacy_reward", "MAP2_REWARD_V2_DESCRIPTOR"),
+        }
+        source = header_fixture(old)
+        self.path.write_bytes(source)
+        with self.assertRaisesRegex(RuntimeError, "expected exact nine-key F17/M19, A5, PPO32/rules27"):
+            self.module.read_runtime_metadata(self.directory)
+        self.assertEqual(self.path.read_bytes(), source)
+
+    def test_current_reward_requires_f17_m19_and_never_accepts_m17_runtime(self):
+        self.assertEqual(self.module.CURRENT_METADATA["ppo_schema_version"], "32")
+        self.assertEqual(self.module.CURRENT_METADATA["ppo_rules_audit_version"], "27")
+        self.assertEqual(self.module.CURRENT_METADATA["map2_reward_schema_version"], "3")
+        self.assertEqual(self.module.CURRENT_METADATA["map2_reward_schema_hash"], "11643768462079275437")
+        old = dict(zip(("action_schema_hash", "feature_schema_hash", "model_schema_hash",
+                        "ppo_schema_version", "ppo_schema_hash", "ppo_rules_audit_version",
+                        "map2_reward_schema_version", "map2_reward_schema_hash"),
+                       ("10658390830565586343", "1861607613534772372", "13592057279889489276",
+                        "30", "16275284022255703821", "25", "1", "798798703797057220")))
+        old["map2_reward_schema_descriptor"] = rust_descriptor(
+            "checkpoint_legacy_reward", "MAP2_REWARD_V1_DESCRIPTOR")
+        source = header_fixture(old)
+        self.path.write_bytes(source)
+        with self.assertRaisesRegex(RuntimeError, "expected exact nine-key F17/M19, A5, PPO32/rules27"):
+            self.module.read_runtime_metadata(self.directory)
+        self.assertEqual(self.path.read_bytes(), source)
+
     def setUp(self):
         self.module = importlib.import_module("play_weights")
         TEMPORARY.mkdir(parents=True, exist_ok=True)
@@ -834,11 +872,14 @@ class RuntimeWeightsTests(unittest.TestCase):
         metadata = dict(metadata_fixture(), action_schema_hash="281345351372519059",
                         feature_schema_hash="16612223928593971806",
                         model_schema_hash="16105106472474017042", ppo_schema_version="29",
-                        ppo_schema_hash="6915425029811947603", ppo_rules_audit_version="24")
+                        ppo_schema_hash="6915425029811947603", ppo_rules_audit_version="24",
+                        map2_reward_schema_version="1", map2_reward_schema_hash="798798703797057220",
+                        map2_reward_schema_descriptor=rust_descriptor(
+                            "checkpoint_legacy_reward", "MAP2_REWARD_V1_DESCRIPTOR"))
         original = header_fixture(metadata)
         self.path.write_bytes(original)
 
-        with self.assertRaisesRegex(RuntimeError, "expected exact nine-key F15/M17, A5, PPO30/rules25"):
+        with self.assertRaisesRegex(RuntimeError, "expected exact nine-key F17/M19, A5, PPO32/rules27"):
             self.module.read_runtime_metadata(self.directory)
 
         self.assertEqual(self.path.read_bytes(), original)
@@ -853,7 +894,7 @@ class RuntimeWeightsTests(unittest.TestCase):
                     changed[key] = replacement
                 self.path.write_bytes(header_fixture(changed))
                 with self.subTest(key=key, replacement=replacement), \
-                        self.assertRaisesRegex(RuntimeError, "incompatible runtime weights metadata.*F15/M17"):
+                        self.assertRaisesRegex(RuntimeError, "incompatible runtime weights metadata.*F17/M19"):
                     self.module.read_runtime_metadata(self.directory)
 
     def test_extra_metadata_and_self_consistent_wrong_reward_hash_are_rejected(self):
@@ -866,12 +907,14 @@ class RuntimeWeightsTests(unittest.TestCase):
 
     def test_malformed_header_json_never_escapes_as_unbounded_or_ambiguous_input(self):
         valid = json.dumps({"__metadata__": metadata_fixture()}).encode()
+        version = b'"ppo_schema_version": ' + json.dumps(CURRENT_METADATA["ppo_schema_version"]).encode()
         headers = (b"[]", b"{}", b"null", b"\xff", b"{", b" " + valid,
-                   valid.replace(b'"30"', b"NaN"),
-                   valid.replace(b'"30"', b'"30", "ppo_schema_version": "30"'),
+                   valid.replace(version, b'"ppo_schema_version": NaN'),
+                   valid.replace(version, version + b", " + version),
                    valid[:-1] + b', "__metadata__": {}}',
                    b'{"nested":' + b"[" * 2000 + b"0" + b"]" * 2000 + b"}")
         for header in headers:
+            self.assertNotEqual(header, valid, "malformed fixture must actually change the current metadata")
             self.path.write_bytes(struct.pack("<Q", len(header)) + header)
             with self.subTest(header=header[:40]), self.assertRaisesRegex(RuntimeError, "runtime weights"):
                 self.module.read_runtime_metadata(self.directory)
@@ -924,10 +967,10 @@ class RuntimeWeightsTests(unittest.TestCase):
                 value = ((value ^ byte) * 0x100000001b3) & (2**64 - 1)
             return value
 
-        contracts = (("map2_reward", 1, ()), ("action", 5, ()),
-                     ("feature", 15, ("action", "map2_reward")),
-                     ("model", 17, ("action", "feature", "map2_reward")),
-                     ("ppo", 30, ("action", "feature", "model", "map2_reward")))
+        contracts = (("map2_reward", 3, ()), ("action", 5, ()),
+                     ("feature", 17, ("action", "map2_reward")),
+                     ("model", 19, ("action", "feature", "map2_reward")),
+                     ("ppo", 32, ("action", "feature", "model", "map2_reward")))
         for name, version, links in contracts:
             source = (ROOT / f"drysua/src/{name}.rs").read_text()
             self.assertRegex(source, rf"pub const {name.upper()}_SCHEMA_VERSION: u32 = {version};")
@@ -939,7 +982,7 @@ class RuntimeWeightsTests(unittest.TestCase):
             identities[name] = version, digest
         self.assertEqual(self.module.fnv1a(reward), identities["map2_reward"][1])
         source = (ROOT / "drysua/src/ppo.rs").read_text()
-        self.assertIn("pub const PPO_RULES_AUDIT_VERSION: u32 = 25;", source)
+        self.assertIn("pub const PPO_RULES_AUDIT_VERSION: u32 = 27;", source)
         source = (ROOT / "drysua/src/checkpoint.rs").read_text()
         metadata = source.split("fn runtime_tensor_metadata()", 1)[1].split("\n}", 1)[0]
         self.assertEqual(set(re.findall(r'"([a-z0-9_]+)"', metadata)), set(metadata_fixture()))
