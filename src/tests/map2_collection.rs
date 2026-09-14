@@ -3,6 +3,70 @@ use crate::Map2RewardEnd;
 use bota_proto::{DamageKind, EntityId, Vec2};
 
 #[test]
+fn curriculum_weak_and_mixed_complete_batches_preserve_terminal_reward_and_retention() {
+    let model = stop_model();
+    let settings = crate::cli::training_settings_for_test(&[
+        "--opponent-schedule",
+        "weak-warmup-v1",
+        "--environments",
+        "6",
+        "--rollout",
+        "1163",
+        "--minibatch",
+        "512",
+    ])
+    .expect("curriculum");
+    for update in [0, 2] {
+        let mut arenas: Vec<_> = (0..6)
+            .map(|stream| {
+                fixture_environment(
+                    TICK_CAP - 24,
+                    stream % 2,
+                    scheduled_opponent(&settings, update, stream),
+                )
+            })
+            .collect();
+        assert_eq!(
+            collection_opponents(&arenas),
+            if update == 0 {
+                ("Weak", 6, 0)
+            } else {
+                ("Mixed", 4, 2)
+            }
+        );
+        let mut random = PpoRng::new(9914200);
+        let mut rollout = PpoRollout::new(
+            6 * RETAINED_PER_EPISODE,
+            model.policy_identity().expect("identity"),
+        )
+        .expect("rollout");
+        let mut report = PpoSmokeReport::default();
+        collect(
+            &model,
+            &mut random,
+            &mut arenas,
+            &settings,
+            update,
+            &mut rollout,
+            &mut report,
+        )
+        .expect("complete batch");
+        assert_eq!(report.terminal_draws, 6);
+        assert_eq!(report.rejected_orders, 0);
+        assert_eq!(report.map2_reward.terminal, 0.0);
+        assert_eq!(report.map2_reward.ticks, 6 * 24);
+        assert_eq!(rollout.len(), 6);
+        let batch = rollout.finish(settings.ppo).expect("usable terminal batch");
+        for index in 0..6 {
+            let sample = batch.sample(index).expect("retained sample");
+            assert!(sample.transition.terminal);
+            assert_eq!(sample.transition.next_value, 0.0);
+            assert!(sample.return_value().is_finite());
+        }
+    }
+}
+
+#[test]
 fn map2_collection_defaults_and_budget_match_the_native_cap() {
     let settings = crate::cli::training_settings_for_test(&[]).expect("Map2 defaults");
     assert_eq!(settings.map, MapId(2));

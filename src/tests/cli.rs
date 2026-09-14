@@ -600,11 +600,13 @@ fn cli_all_training_commands_default_to_map2_and_reject_other_maps_before_execut
             .expect_err("help is not execution")
             .to_string();
         let map_help = help.split("--map <MAP>").nth(1).expect("map option");
-        assert!(
+        assert_eq!(
             map_help
                 .lines()
-                .take(2)
-                .any(|line| line.contains("[default: 2]"))
+                .take_while(|line| !line.trim_start().starts_with('-'))
+                .filter(|line| line.contains("[default: 2]"))
+                .count(),
+            1
         );
         for map in ["0", "1", "3", "65535"] {
             let mut arguments = vec!["drysua", operation, "--map", map];

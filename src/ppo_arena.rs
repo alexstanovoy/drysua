@@ -126,6 +126,8 @@ pub struct PpoSmokeReport {
 /// Bounded, resumable production PPO settings.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TrainingJobConfig {
+    /// Full-episode opponent schedule, persisted in the canonical checkpoint run command.
+    pub opponent_schedule: crate::TrainingOpponentSchedule,
     /// Legacy override retained for explicit rejection; Map2 requires zero.
     pub episode_time_cost: f32,
     /// Legacy override retained for explicit rejection; Map2 requires comprehensive reward.
@@ -2725,6 +2727,10 @@ fn training_checkpoint_run(
         command_line.push_str(" --complete-episodes");
     } else {
         command_line.push_str(" --complete-episodes=false");
+    }
+    if settings.opponent_schedule != crate::TrainingOpponentSchedule::Teacher {
+        command_line.push_str(" --opponent-schedule ");
+        command_line.push_str(settings.opponent_schedule.as_str());
     }
     if settings.terminal_only {
         command_line.push_str(" --terminal-only");

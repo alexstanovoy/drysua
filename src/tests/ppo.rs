@@ -1294,6 +1294,7 @@ fn assert_production_resume_matches_uninterrupted(overrides: Option<crate::Train
     let uninterrupted_directory = training_test_directory("production-uninterrupted");
     let resumed_directory = training_test_directory("production-resumed");
     let mut settings = crate::TrainingJobConfig {
+        opponent_schedule: crate::TrainingOpponentSchedule::Teacher,
         episode_time_cost: 0.0,
         terminal_only: false,
         complete_episodes: false,
@@ -1402,6 +1403,7 @@ fn assert_production_artifact_training_state_equal(
 fn training_job_checkpoints_and_resumes_from_the_next_update() {
     let directory = training_test_directory("resume");
     let mut settings = crate::TrainingJobConfig {
+        opponent_schedule: crate::TrainingOpponentSchedule::Teacher,
         episode_time_cost: 0.0,
         terminal_only: false,
         complete_episodes: false,
@@ -1523,6 +1525,7 @@ fn fresh_training_loads_the_requested_runtime_weights_before_the_first_update() 
         .expect("initial snapshot")
         .fingerprint();
     let settings = crate::TrainingJobConfig {
+        opponent_schedule: crate::TrainingOpponentSchedule::Teacher,
         episode_time_cost: 0.0,
         terminal_only: false,
         complete_episodes: false,
@@ -1565,6 +1568,7 @@ fn production_training_rejects_an_unpaired_environment_count() {
     let directory = training_test_directory("odd-environments");
     let error = crate::run_training_job_on(
         crate::TrainingJobConfig {
+            opponent_schedule: crate::TrainingOpponentSchedule::Teacher,
             episode_time_cost: 0.0,
             terminal_only: false,
             complete_episodes: false,
@@ -1603,6 +1607,7 @@ fn production_training_rejects_an_unpaired_environment_count() {
 fn resumed_training_rejects_an_initial_weights_directory() {
     let directory = training_test_directory("resume-with-initial");
     let settings = crate::TrainingJobConfig {
+        opponent_schedule: crate::TrainingOpponentSchedule::Teacher,
         episode_time_cost: 0.0,
         terminal_only: false,
         complete_episodes: false,
@@ -1653,6 +1658,7 @@ fn training_job_rejects_a_checkpoint_directory_locked_by_another_writer() {
     lock.lock().expect("hold training lock");
     let error = crate::run_training_job_on(
         crate::TrainingJobConfig {
+            opponent_schedule: crate::TrainingOpponentSchedule::Teacher,
             episode_time_cost: 0.0,
             terminal_only: false,
             complete_episodes: false,
@@ -2278,6 +2284,7 @@ fn training_job_rejects_targets_that_cannot_fit_shuffle_rng_counters() {
     let directory = training_test_directory("counter-bound");
     let error = crate::run_training_job_on(
         crate::TrainingJobConfig {
+            opponent_schedule: crate::TrainingOpponentSchedule::Teacher,
             episode_time_cost: 0.0,
             terminal_only: false,
             complete_episodes: false,

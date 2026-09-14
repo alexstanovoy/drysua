@@ -6,6 +6,10 @@
 use super::*;
 
 #[cfg(test)]
+#[path = "../tests/opponent_curriculum.rs"]
+mod curriculum_tests;
+
+#[cfg(test)]
 #[path = "../tests/map2_collection.rs"]
 mod map2_tests;
 
@@ -48,6 +52,11 @@ pub(crate) fn validate(settings: &TrainingJobConfig) -> Result<(), PpoError> {
         ));
     }
     if !settings.complete_episodes {
+        if settings.opponent_schedule != crate::TrainingOpponentSchedule::Teacher {
+            return Err(PpoError::InvalidConfig(
+                "opponent curriculum requires complete episodes",
+            ));
+        }
         return Ok(());
     }
     if !matches!(settings.ppo.environments, 2 | 4 | 6)
@@ -118,10 +127,49 @@ pub(super) fn environments(
                 settings.map,
                 stream % 2,
                 0,
-                OpponentSpec::Teacher,
+                scheduled_opponent(settings, update, stream),
             )
         })
         .collect()
+}
+
+fn scheduled_opponent(settings: &TrainingJobConfig, update: u64, stream: usize) -> OpponentSpec {
+    assert!(settings.complete_episodes);
+    assert!(stream < settings.ppo.environments);
+    if settings.opponent_schedule.is_teacher(update, stream / 2) {
+        OpponentSpec::Teacher
+    } else {
+        OpponentSpec::Weak
+    }
+}
+
+fn opponent_name(opponent: &OpponentRuntime) -> &'static str {
+    match opponent {
+        OpponentRuntime::Teacher => "Teacher",
+        OpponentRuntime::Weak => "Weak",
+        OpponentRuntime::Policy { .. } => "Policy",
+    }
+}
+
+fn collection_opponents(environments: &[TrainingEnvironment]) -> (&'static str, usize, usize) {
+    assert!(matches!(environments.len(), 2 | 4 | 6));
+    let weak = environments
+        .iter()
+        .filter(|arena| matches!(arena.opponent, OpponentRuntime::Weak))
+        .count();
+    let teacher = environments
+        .iter()
+        .filter(|arena| matches!(arena.opponent, OpponentRuntime::Teacher))
+        .count();
+    assert_eq!(weak + teacher, environments.len());
+    let name = if weak == 0 {
+        "Teacher"
+    } else if teacher == 0 {
+        "Weak"
+    } else {
+        "Mixed"
+    };
+    (name, weak, teacher)
 }
 
 pub(super) fn collect(
@@ -143,10 +191,12 @@ pub(super) fn collect(
     let mut random = actor_stream_rngs(sampling, environments.len())?;
     let mut streams = streams_for_collection(settings, update)?;
     let retained_bytes_bound = environments.len() * RETAINED_BYTES_PER_ENVIRONMENT;
+    let (opponent, weak_environments, teacher_environments) = collection_opponents(environments);
     eprintln!(
-        "collection: complete-episodes map=2 reward=map2_full gamma_tick=1 opponent=Teacher actor_ticks={} retention_stride={RETENTION_STRIDE} retention_phase=random_episode_independent_rng tick_cap={TICK_CAP} environments={} retained_bytes_bound={retained_bytes_bound}",
+        "collection: complete-episodes map=2 reward=map2_full gamma_tick=1 opponent={opponent} actor_ticks={} retention_stride={RETENTION_STRIDE} retention_phase=random_episode_independent_rng tick_cap={TICK_CAP} environments={} retained_bytes_bound={retained_bytes_bound} opponent_schedule={} update_index={update} weak_environments={weak_environments} teacher_environments={teacher_environments}",
         config.decision_interval_ticks,
         environments.len(),
+        settings.opponent_schedule.as_str(),
     );
     for _ in 0..ACTOR_DECISIONS {
         let active: Vec<_> = (0..streams.len())
@@ -460,7 +510,14 @@ fn finish_advance(
         flush(model, environment, state, stream, state.done, rollout)?;
     }
     if state.done {
-        record_episode(stream, completed.end_tick, state, completed.outcome, report)?;
+        record_episode(
+            stream,
+            completed.end_tick,
+            state,
+            completed.outcome,
+            report,
+            &environment.opponent,
+        )?;
     }
     Ok(())
 }
@@ -697,8 +754,15 @@ fn assert_unsampled_short_episode_for_test(choice: &PpoPolicyChoice) {
     assert!(state.choice.is_none());
     assert_eq!(state.interval.steps, 0);
     let mut report = PpoSmokeReport::default();
-    record_episode(0, 4, &state, Some(PpoTerminalOutcome::Win), &mut report)
-        .expect("complete outcome");
+    record_episode(
+        0,
+        4,
+        &state,
+        Some(PpoTerminalOutcome::Win),
+        &mut report,
+        &OpponentRuntime::Teacher,
+    )
+    .expect("complete outcome");
     assert_eq!(report.terminal_wins, 1);
     assert_eq!(report.map2_reward, state.map2_reward);
     assert_eq!(state.retained, 0);
@@ -800,6 +864,7 @@ fn record_episode(
     state: &EpisodeStream,
     outcome: Option<PpoTerminalOutcome>,
     report: &mut PpoSmokeReport,
+    opponent: &OpponentRuntime,
 ) -> Result<(), PpoError> {
     assert!(state.done);
     assert!(tick <= TICK_CAP);
@@ -811,8 +876,9 @@ fn record_episode(
     };
     *counter = counter.checked_add(1).ok_or(PpoError::CounterOverflow)?;
     report.map2_reward.merge(state.map2_reward)?;
+    let opponent = opponent_name(opponent);
     eprintln!(
-        "episode: stream={stream} map=2 opponent=Teacher tick={tick} outcome={label} actor_decisions={} retained={} terminal_sample={} raw_return={:.9} discounted_return={:.9} terminal_reward={} shaping_return={:.9} actions={:?} noncontinue={} retention_phase={}",
+        "episode: stream={stream} map=2 opponent={opponent} tick={tick} outcome={label} actor_decisions={} retained={} terminal_sample={} raw_return={:.9} discounted_return={:.9} terminal_reward={} shaping_return={:.9} actions={:?} noncontinue={} retention_phase={}",
         state.decisions,
         state.retained,
         state.retained > 0,
@@ -826,7 +892,7 @@ fn record_episode(
     );
     crate::telemetry::PerformanceOutput::new(crate::telemetry::AsyncLogWriter::default()).emit(
         &format_args!(
-            "level=INFO event=map2_episode_reward stream={stream} tick={tick} outcome={label} {}",
+            "level=INFO event=map2_episode_reward stream={stream} tick={tick} outcome={label} opponent={opponent} {}",
             state.map2_reward
         ),
     );

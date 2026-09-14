@@ -668,6 +668,7 @@ fn provenance_migration_rejects_v13_v14_v15_without_rewriting_training_manifest(
     let path = directory.join("checkpoint.meta");
     let current = fs::read(&path).expect("manifest");
     let settings = crate::TrainingJobConfig {
+        opponent_schedule: crate::TrainingOpponentSchedule::Teacher,
         episode_time_cost: 0.0,
         terminal_only: false,
         complete_episodes: false,

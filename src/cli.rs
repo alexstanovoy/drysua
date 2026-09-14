@@ -139,9 +139,12 @@ struct TrainFullArgs {
     /// Legacy terminal-only reward; rejected because Map2 requires comprehensive reward.
     #[arg(long)]
     terminal_only: bool,
-    /// Collect paired Map2 episodes against Teacher; retain one of eight actions. Use =false for windows.
+    /// Collect paired Map2 episodes; retain one of eight actions. Use =false for windows.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
     complete_episodes: bool,
+    /// Full-episode opponents; nondefault schedules are versioned and checked on resume.
+    #[arg(long, value_enum, default_value_t = crate::TrainingOpponentSchedule::Teacher)]
+    opponent_schedule: crate::TrainingOpponentSchedule,
     /// Adam learning rate; must be finite and positive.
     #[arg(long, default_value_t = crate::PpoConfig::default().learning_rate)]
     learning_rate: f32,
@@ -616,6 +619,7 @@ impl TrainFullArgs {
         .map_err(std::io::Error::other)?;
         self.validate_map2_reward()?;
         let settings = crate::TrainingJobConfig {
+            opponent_schedule: self.opponent_schedule,
             episode_time_cost: self.episode_time_cost,
             terminal_only: self.terminal_only,
             complete_episodes: self.complete_episodes,

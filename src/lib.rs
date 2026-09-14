@@ -29,6 +29,7 @@ mod teacher;
 mod teacher_economy;
 mod telemetry;
 mod tracker;
+mod training_opponents;
 mod wire;
 
 pub use action::*;
@@ -59,6 +60,7 @@ pub use tactical::*;
 pub use tactical_training::*;
 pub use teacher::*;
 pub use tracker::*;
+pub use training_opponents::*;
 pub use wire::*;
 
 #[cfg(test)]
