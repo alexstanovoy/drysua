@@ -1130,7 +1130,7 @@ fn adam_rejects_invalid_config_nonfinite_and_extreme_updates_without_partial_sta
 
 #[test]
 fn model_schema_and_head_dimensions_are_stable() {
-    assert_eq!(MODEL_SCHEMA_VERSION, 22);
+    assert_eq!(MODEL_SCHEMA_VERSION, 24);
     assert!(crate::MODEL_SCHEMA_DESCRIPTOR.contains("linked_schemas=action,feature,map2_reward;"));
     assert_eq!(
         MODEL_SCHEMA_HASH,

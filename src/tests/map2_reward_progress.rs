@@ -6,12 +6,12 @@ use super::{advance, damage, death, id, match_info, own_hero, snapshot};
 use crate::{Map2Reward, Map2RewardEnd};
 
 #[test]
-fn progress_schema_preserves_lease_latch_under_reward_six() {
-    assert_eq!(crate::MAP2_REWARD_SCHEMA_VERSION, 6);
-    assert!(crate::MAP2_REWARD_SCHEMA_DESCRIPTOR.starts_with("drysua-map2-reward/v6;"));
+fn progress_schema_preserves_lease_latch_under_reward_seven() {
+    assert_eq!(crate::MAP2_REWARD_SCHEMA_VERSION, 7);
+    assert!(crate::MAP2_REWARD_SCHEMA_DESCRIPTOR.starts_with("drysua-map2-reward/v7;"));
     assert!(crate::MAP2_REWARD_SCHEMA_DESCRIPTOR.contains("progress_debt="));
     assert!(crate::MAP2_REWARD_SCHEMA_DESCRIPTOR.contains("progress_flags="));
-    assert!(crate::MAP2_REWARD_SCHEMA_DESCRIPTOR.contains("positive.445"));
+    assert!(crate::MAP2_REWARD_SCHEMA_DESCRIPTOR.contains("positive.645"));
     assert_ne!(crate::MAP2_REWARD_SCHEMA_HASH, 699_687_995_158_557_285);
 }
 
@@ -644,7 +644,7 @@ fn a_whole_native_episode_without_activity_has_one_base_and_bounded_unclipped_ti
     assert!(result.total - result.terminal >= -crate::MAP2_REWARD_DENSE_BOUND);
     assert_close(crate::MAP2_REWARD_STAGNATION_BOUND, 0.2158);
     assert_close(crate::MAP2_REWARD_DENSE_BOUND, 1.4488);
-    assert_close(crate::MAP2_REWARD_POSITIVE_BOUND, 0.845);
+    assert_close(crate::MAP2_REWARD_POSITIVE_BOUND, 1.045);
 }
 
 #[test]
@@ -698,12 +698,9 @@ fn terminal02_full_episode_bounds_allow_favorable_nonwins_above_stalled_adverse_
     }
     assert_close(
         crate::MAP2_REWARD_NATIVE_NEGATIVE_BOUND + crate::MAP2_REWARD_NATIVE_POSITIVE_BOUND,
-        1.4938,
+        1.6938,
     );
-    assert_close(
-        0.2 - crate::MAP2_REWARD_NATIVE_NEGATIVE_BOUND - crate::MAP2_REWARD_NATIVE_POSITIVE_BOUND,
-        -1.2938,
-    );
+    assert_close(0.2 - crate::MAP2_REWARD_NATIVE_NEGATIVE_BOUND, -0.8488);
 }
 
 fn full_episode(favorable: bool, end: Map2RewardEnd) -> f64 {

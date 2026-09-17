@@ -44,9 +44,9 @@ It is not a separate greedy evaluation gate and does not reinterpret `weak-warmu
 See [rolling-mastery.md](rolling-mastery.md) for flags, exact batch/ordering rules,
 persisted stage/window/counters, completion and budget behavior.
 
-The reward6 terminal change makes actual Draw terminal reward0; Loss and
+Reward7 adds a win-only victory-time bonus (full +0.2 through 5 native minutes, linear to 0 at 12). The terminal change makes actual Draw terminal reward0; Loss and
 completed-task TimeCap become-0.2, Win+0.2. Mastery still treats all three as nonwins. Current
-contracts are A5/F20/M22/PPO35/rules30/reward6/checkpoint10. Old M19/M20/M21 weights
+contracts are A5/F22/M24/PPO37/rules32/reward7/checkpoint12. Old M19/M20/M21 weights
 and checkpoints cannot be loaded by relabeling; the explicit pinned parameter
 initializer and migration limitations are documented in [reward-rebalance.md](reward-rebalance.md).
 

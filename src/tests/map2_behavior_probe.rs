@@ -8,7 +8,9 @@ use crate::{ActionTarget, ControlledUnit, PointIndex, ShopIndex, StructuredActio
 use bota_proto::{
     AbilitySlot, DamageKind, Fixed, ItemId, ItemSlot, UnitKind, UnitView, Vec2, WorldView,
 };
-use bota_server::game::{ItemStack, Level, Status, StatusKind, Statuses, UnitOrder, World, rules};
+use bota_server::game::{
+    ItemStack, Level, Modifier, ModifierKind, Modifiers, UnitOrder, World, rules,
+};
 
 #[path = "map2_behavior_probe_run.rs"]
 mod run;
@@ -97,7 +99,9 @@ fn configure(world: &mut World, family: Family, side: usize) {
         world.seats[index].gold = 0;
         world.seats[index].level = 3;
         world.level.insert(hero, Level(3));
-        world.statuses.remove(hero);
+        world
+            .modifiers
+            .insert(hero, bota_server::game::Modifiers::default());
         world.set_order(hero, UnitOrder::Stand);
         for slot in &mut world.abilities.get_mut(hero).expect("book").slots[..3] {
             slot.level = 1;
@@ -161,23 +165,24 @@ fn configure_targets(world: &mut World, family: Family, side: usize) {
         let direction = if side == 0 { 1 } else { -1 };
         world.transform.get_mut(enemy).expect("enemy position").pos =
             position + Vec2::from_ints(450 * direction, 0);
-        let mut statuses = Statuses::default();
-        statuses.put(Status {
-            kind: StatusKind::Shadowraze {
-                from: hero,
-                stacks: 2,
-            },
-            ticks_left: 240,
+        let mut modifiers = Modifiers::default();
+        modifiers.put(Modifier {
+            kind: ModifierKind::Shadowraze { stacks: 2 },
+            source: Some(hero),
+            ticks_left: Some(240),
         });
-        world.statuses.insert(enemy, statuses);
+        world.modifiers.insert(enemy, modifiers);
     }
     if family == Family::LaneIdle {
         for offset in [(-100, 0), (0, 100), (100, 0)] {
-            world.spawn_unit(
+            let creep = world.spawn_creep(
                 &bota_server::game::MELEE_CREEP,
                 world.seats[1 - side].team,
                 position + Vec2::from_ints(offset.0, offset.1),
+                0,
+                0,
             );
+            world.lane_ai.remove(creep);
         }
     }
     if family == Family::NeutralIdle {

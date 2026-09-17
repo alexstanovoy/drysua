@@ -18,15 +18,15 @@ fn ppo26_runtime_metadata() -> std::collections::HashMap<String, String> {
 
 #[test]
 fn training_contract_map2_versions_change_both_actor_and_training_identities() {
-    assert_eq!(crate::FEATURE_SCHEMA_VERSION, 20);
+    assert_eq!(crate::FEATURE_SCHEMA_VERSION, 22);
     assert_ne!(crate::FEATURE_SCHEMA_HASH, 1_577_122_233_561_586_211);
-    assert_eq!(crate::MODEL_SCHEMA_VERSION, 22);
+    assert_eq!(crate::MODEL_SCHEMA_VERSION, 24);
     assert_ne!(crate::MODEL_SCHEMA_HASH, 7_970_187_849_195_607_202);
-    assert_eq!(crate::IMITATION_RULES_AUDIT_VERSION, 20);
-    assert_eq!(crate::PPO_SCHEMA_VERSION, 35);
-    assert_eq!(crate::PPO_RULES_AUDIT_VERSION, 30);
-    assert_eq!(crate::LEAGUE_SCHEMA_VERSION, 35);
-    assert_eq!(crate::LEAGUE_RULES_AUDIT_VERSION, 30);
+    assert_eq!(crate::IMITATION_RULES_AUDIT_VERSION, 22);
+    assert_eq!(crate::PPO_SCHEMA_VERSION, 37);
+    assert_eq!(crate::PPO_RULES_AUDIT_VERSION, 32);
+    assert_eq!(crate::LEAGUE_SCHEMA_VERSION, 37);
+    assert_eq!(crate::LEAGUE_RULES_AUDIT_VERSION, 32);
     assert!(crate::PPO_SCHEMA_DESCRIPTOR.contains("observer=explicit_from_trajectory_start"));
     assert!(crate::LEAGUE_SCHEMA_DESCRIPTOR.contains("frozen_weights_not_legacy_execution"));
     assert_eq!(

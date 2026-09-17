@@ -42,7 +42,9 @@ fn finish_fixture_seeded(side: usize, distance: i32, seed: u64) -> (Arena, Vec<A
         }
         for (index, hero) in heroes.into_iter().enumerate() {
             world.seats[index].gold = 0;
-            world.statuses.remove(hero);
+            world
+                .modifiers
+                .insert(hero, bota_server::game::Modifiers::default());
             world.set_order(hero, UnitOrder::Stand);
             let position = world.transform.get_mut(hero).expect("hero transform");
             position.pos = Vec2::from_ints(8600 + index as i32 * distance, 8900);

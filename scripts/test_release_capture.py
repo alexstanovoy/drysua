@@ -250,7 +250,7 @@ class TailValidationTests(unittest.TestCase):
         cases = ((b"\x04\x65", "ACK exceeds observed snapshot or malformed ACK"),
                  (b"\x04\x64\x00", "ACK exceeds observed snapshot or malformed ACK"),
                  (b"\x03\x01\x00\x09", "truncated postcard byte"),
-                 (b"\x03\x01\x00\x0a", "unknown client order"),
+                 (b"\x03\x01\x00\x0b", "unknown client order"),
                  (b"\x03\x01\x00\x00\x03", "unknown client target"),
                  (b"\x03\x01\x00\x09\x00\x00", "trailing client message bytes"),
                  (b"\x06", "unknown client message"))

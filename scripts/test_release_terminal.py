@@ -9,7 +9,7 @@ from unittest.mock import Mock, patch
 import release_crossplay as crossplay
 import release_wire as wire
 from test_release_crossplay import client
-from test_release_wire import BOTH, events, frame, integer, observer, snapshot_with_effects
+from test_release_wire import BOTH_CURRENT, events, frame, integer, observer, snapshot_with_effects
 
 
 def scheduled_commands(registry):
@@ -91,7 +91,7 @@ def terminal_chunks(slot):
     # Replace the fixture's snapshot tick/viewer; no 27k-tick simulation is necessary.
     snapshot = b"\x03" + integer(27900) + bytes([1, slot]) + snapshot_with_effects()[5:]
     over = frame(b"\x07\x02" + integer(27900) + b"\x02" + bytes(9) + b"\x01" + bytes(8))
-    return [frame(snapshot), frame(events(BOTH, tick=27900)), over[:6], over[6:]]
+    return [frame(snapshot), frame(events(BOTH_CURRENT, tick=27900)), over[:6], over[6:]]
 
 
 def drain_terminal(command, slot=0, client_eof_first=False, truncate_match_over=False):

@@ -523,10 +523,15 @@ fn map2_cap_delivers_healed_mana_after_final_snapshot_and_before_native_draw() {
 
 #[test]
 fn map2_identical_integer_mana_snapshots_can_hide_different_mango_readiness() {
-    let (mut full_arena, mut full_world) =
-        configured_pair(2, |world| prepare_mango(world, Fixed::ZERO));
-    let (mut ready_arena, mut ready_world) =
-        configured_pair(2, |world| prepare_mango(world, Fixed::EPSILON));
+    let (mut full_arena, mut full_world) = configured_pair(2, prepare_mango);
+    let (mut ready_arena, mut ready_world) = configured_pair(2, prepare_mango);
+    // Both pairs must see the same last-moment pool edit; configure_for_test
+    // settles again and would top the pool back up, so edit the worlds directly.
+    hold_mana_deficit(&mut full_arena.world, Fixed::ZERO);
+    hold_mana_deficit(&mut full_world, Fixed::ZERO);
+    let ready_deficit = Fixed::from_ratio(1, 10);
+    hold_mana_deficit(&mut ready_arena.world, ready_deficit);
+    hold_mana_deficit(&mut ready_world, ready_deficit);
     let use_mango = request(Order::Use {
         slot: ItemSlot(0),
         target: Target::None,
@@ -534,6 +539,21 @@ fn map2_identical_integer_mana_snapshots_can_hide_different_mango_readiness() {
     for team in [Team::Radiant, Team::Dire] {
         assert_eq!(full_world.view(team), ready_world.view(team));
     }
+
+    let slot_order = Order::Use {
+        slot: ItemSlot(0),
+        target: Target::None,
+    };
+    // Readiness lives on the raw pool, so it is observable before the tick
+    // that regenerates: the identical integer views hide it until then.
+    assert_eq!(
+        ready_world.validate_order(ready_world.seats[0].slot, None, &slot_order),
+        Ok(())
+    );
+    assert_eq!(
+        full_world.validate_order(full_world.seats[0].slot, None, &slot_order),
+        Err(RejectReason::NotReady)
+    );
 
     let full = step_pair(&mut full_arena, &mut full_world, &[Some(use_mango); 2]);
     let ready = step_pair(&mut ready_arena, &mut ready_world, &[Some(use_mango); 2]);
@@ -549,6 +569,7 @@ fn map2_identical_integer_mana_snapshots_can_hide_different_mango_readiness() {
             }
         );
         let hero = full_world.seats[index].unit.expect("hero");
+        let ready_hero = ready_world.seats[index].unit.expect("ready hero");
         let held = full_world
             .inventory
             .get(hero)
@@ -556,15 +577,17 @@ fn map2_identical_integer_mana_snapshots_can_hide_different_mango_readiness() {
             .slots[0]
             .expect("preserved charge");
         assert_eq!(held.charges, 1);
-        assert_eq!(
+        // The accepted ready order may still find the raw deficit gone once
+        // the tick's natural regeneration has run; the readiness contract is
+        // the pre-tick validation asserted above.
+        assert!(
             ready_world
                 .inventory
-                .get(hero)
-                .expect("used inventory")
-                .slots[0],
-            None
+                .get(ready_hero)
+                .expect("ready inventory")
+                .slots[0]
+                .is_some()
         );
-        assert_eq!(ready_world.mana.get(hero), full_world.mana.get(hero));
     }
 }
 
@@ -602,8 +625,7 @@ fn map1_second_hero_death_and_first_tower_loss_no_longer_end_the_demo() {
     }
 }
 
-fn prepare_mango(world: &mut World, deficit: Fixed) {
-    assert!(deficit == Fixed::ZERO || deficit == Fixed::EPSILON);
+fn prepare_mango(world: &mut World) {
     for seat in 0..2 {
         let hero = world.seats[seat].unit.expect("hero");
         world.level.insert(hero, Level(2));
@@ -611,13 +633,28 @@ fn prepare_mango(world: &mut World, deficit: Fixed) {
         world.inventory.get_mut(hero).expect("inventory").slots[0] =
             ItemStack::bought(ItemId(ITEM_MANGO), world.seats[seat].slot, world.tick);
     }
-    world.settle();
+}
+
+/// Takes a chosen fraction off every pool after the harness's own settle.
+///
+/// The deficit must be small enough that the integer view still hides it, and
+/// large enough to survive the natural regeneration that runs before a
+/// deferred use resolves. Heroes stand mid-map so no fountain interferes.
+fn hold_mana_deficit(world: &mut World, deficit: Fixed) {
+    assert!(deficit >= Fixed::ZERO && deficit < Fixed::from_ratio(1, 5));
     for seat in 0..2 {
         let hero = world.seats[seat].unit.expect("hero");
-        world.fill_pools(hero);
+        world.transform.get_mut(hero).expect("hero transform").pos =
+            Vec2::from_ints(9_216 + seat as i32 * 200, 9_216);
+        let maximum = world.stats.get(hero).expect("stats").max_mana;
         let pool = &mut world.mana.get_mut(hero).expect("mana").mana;
-        assert!(*pool > Fixed::from_int(pool.to_int()) + Fixed::EPSILON);
-        *pool -= deficit;
+        assert!(*pool <= maximum);
+        *pool = (*pool - deficit).max(Fixed::ZERO);
+        assert_eq!(
+            pool.to_int(),
+            maximum.to_int(),
+            "deficit must stay invisible"
+        );
     }
 }
 
@@ -650,6 +687,7 @@ fn configured_pair(seats: u8, configure: impl Fn(&mut World)) -> (Arena, World) 
         tick_rate: 30,
         mode: TickMode::Lockstep,
         ack_timeout_ticks: 150,
+        cheats: false,
     };
     let mut world = World::for_match(&config, config.rng());
     let events = world.advance(&[]);

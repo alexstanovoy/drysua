@@ -1,4 +1,4 @@
-# Rolling training mastery (current reward6)
+# Rolling training mastery (current reward7)
 
 The mastery implementation introduced with reward4 is retained. The subsequent
 [reward5 rebalance](reward-rebalance.md) changes coefficients, Draw reward and two
@@ -13,7 +13,7 @@ v0.0.1..v0.0.4 compatibility adaptations remain external evaluation opponents.
 No new Weak strategy, Teacher override, policy input, critic, GAE, BC, mask or
 architecture change is part of mastery.
 
-Example configuration, after explicitly obtaining compatible M22 runtime weights:
+Example configuration, after explicitly obtaining compatible M23 runtime weights:
 
 ```sh
 drysua train-full --updates 2 --checkpoint-directory /new/empty/run \
@@ -111,21 +111,21 @@ Actual Map2 outcomes retain their labels, but terminal reward is now:
 
 Reward6 terminal values and unchanged reward5 dense/opening rules are in
 [reward-rebalance.md](reward-rebalance.md). Normal zero-initial-potential starts
-have dense bounds[-1.0488,+0.445]. General primed baselines have bounds[-1.4488,+0.845].
+have dense bounds[-1.0488,+0.645]. General primed baselines have bounds[-1.4488,+1.045]. Both include the win-only victory-time bonus.
 Neither has guaranteed winner-return dominance with the new terminal gaps0.2/0.4.
 Legacy non-Map2 reward profiles are not silently reinterpreted.
 
 | Contract | Version | Hash |
 |---|---:|---:|
 | Action | 5 | 10658390830565586343 |
-| Feature | 20 | 9233114641639769206 |
-| Model | 22 | 4891874295003631291 |
-| PPO | 35 | 13569352384922890857 |
-| League | 35 | 7630384836954837061 |
-| Checkpoint | 10 | 2382613649322819763 |
-| Map2 reward | 6 | 1084583101075978392 |
+| Feature | 22 | 10552563335950731440 |
+| Model | 24 | 12076707506725412686 |
+| PPO | 37 | 12793043235719775693 |
+| League | 37 | 6112261829501116662 |
+| Checkpoint | 12 | 5290231128294942086 |
+| Map2 reward | 7 | 7274660837025042530 |
 
-Rules audit30, imitation audit20. Dimensions are global92/unit84,
+Rules audit32, imitation audit22. Dimensions are global92/unit84,
 62 named tensors and1,700,020 F32 parameters. Mastery state is NOT a neural feature.
 
 ## Explicit old-parameter initialization only

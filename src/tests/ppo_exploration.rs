@@ -478,7 +478,7 @@ fn root() -> std::path::PathBuf {
 fn load_model(path: &Path) -> PolicyModel {
     let model = PolicyModel::fresh_on(10104200, PolicyDevice::Cpu).unwrap();
     TrainingArtifact::load_runtime_weights(&model, path).unwrap();
-    assert_eq!(crate::MODEL_SCHEMA_VERSION, 17);
+    assert_eq!(crate::MODEL_SCHEMA_VERSION, 24);
     assert_eq!(model.device(), PolicyDevice::Cpu);
     model
 }

@@ -1,4 +1,4 @@
-# Map2 reward6: reward5 dense terms with smaller terminal values
+# Map2 reward7: reward5 dense terms, smaller terminals and a victory-time bonus
 
 These coefficients are engineering choices, not a trained-model strength claim.
 Reward6 changes only terminal values. Reward5 dense coefficients and rolling mastery
@@ -31,6 +31,16 @@ creep-0.0058823529411764705, Tower-0.016666666666666666; creep/hero ratio is2 at
 prior C. Unknown/environment100 retains the old Other cost-0.0008333333333333334.
 
 ## Potentials and terminal results
+
+A win also pays `victory_time` (positive-only), computed from the native match
+tick at `MatchOver` on the same clock as reward ticks (the 900-tick pregame is
+included): `+0.2` for `t<=9000`, `+0.2*((21600-t)/12600)^2` for `9000<t<21600`,
+and `0` at or beyond `21600`. The decay is a low-order power
+(`MAP2_REWARD_VICTORY_TIME_POWER=2`, tunable in `1..=4`, `1` is the old linear
+profile) so the bot is pushed to finish faster. Boundaries are exact f64 from
+integer ticks: 12600 -> 0.2*(5/7)^2 = 0.10204081632653061, 15300 -> 0.05,
+18000 -> 0.2*(2/7)^2 = 0.016326530612244896. Loss, Draw and completed-task
+TimeCap are always exactly 0.
 
 - Tower potential is `0.3*(mean own HP fraction - mean enemy HP fraction)`.
 - Lane potential is `0.1*(mean own axis progress + mean enemy axis progress - 1)`.
@@ -85,7 +95,7 @@ opening negative bound0.1, fountain negative bound0.093, stagnation negative bou
 
 For a NORMAL full native start with **initial tower potential0 AND lane potential0**:
 
-- positive dense<=0.14+0.3+0.005 = **0.445**;
+- positive dense<=0.14+0.3+0.005+0.2 = **0.645** (including the victory-time bonus);
 - negative dense magnitude<=0.335+0.3+0.005+0.1+0.093+0.2158 = **1.0488**;
 - full lane net0; native zero initial potentials and the public wave period are
   verified in a small native fixture;
@@ -96,7 +106,7 @@ For a NORMAL full native start with **initial tower potential0 AND lane potentia
 For GENERAL allowed late/primed observation baselines, tower delta may span0.6 and
 terminal lane net may have magnitude0.1:
 
-- positive dense<=**0.845**;
+- positive dense<=**1.045** (including the victory-time bonus);
 - negative/absolute dense<=**1.4488**, INCLUDING a possible negative0.005 prewave hint.
 
 The generic APIs `MAP2_REWARD_DENSE_BOUND` and `MAP2_REWARD_POSITIVE_BOUND` expose
@@ -119,16 +129,16 @@ Current identities:
 | Contract | Version | Hash |
 |---|---:|---:|
 | Action | 5 | 10658390830565586343 |
-| Feature | 20 | 9233114641639769206 |
-| Model | 22 | 4891874295003631291 |
-| PPO | 35 | 13569352384922890857 |
-| League | 35 | 7630384836954837061 |
-| Checkpoint | 10 | 2382613649322819763 |
-| Reward | 6 | 1084583101075978392 |
+| Feature | 22 | 10552563335950731440 |
+| Model | 24 | 12076707506725412686 |
+| PPO | 37 | 12793043235719775693 |
+| League | 37 | 6112261829501116662 |
+| Checkpoint | 12 | 5290231128294942086 |
+| Reward | 7 | 7274660837025042530 |
 
-Rules30, imitation20. Checkpoint mastery codec, thresholds, window rules and all
+Rules32, imitation22. Checkpoint mastery codec, thresholds, window rules and all
 shapes are unchanged; new version/hash links bind the new reward meaning.
-Old M19/M20/M21 runtimes/checkpoints are not silently accepted or relabelled.
+Old M19/M20/M21 and pre-port F20/M22 runtimes/checkpoints are not silently accepted or relabelled.
 
 The explicit pinned M19/u162 API `initialize_selected_m19_for_nonwin_reward` still
 requires original runtime SHA9d0b88128bb4a74d636e0774ab53eeed2e2aea306c3ab0186a5698f41f92afea

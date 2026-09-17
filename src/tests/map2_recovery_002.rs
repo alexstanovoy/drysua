@@ -29,7 +29,7 @@ fn parent() -> PolicyModel {
         &Path::new(env!("CARGO_MANIFEST_DIR")).join(PARENT),
     )
     .unwrap();
-    assert_eq!(crate::MODEL_SCHEMA_VERSION, 17);
+    assert_eq!(crate::MODEL_SCHEMA_VERSION, 24);
     model
 }
 fn mango_physics() -> Physics {

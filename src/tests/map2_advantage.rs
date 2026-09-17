@@ -124,7 +124,9 @@ fn configure(world: &mut World, physics: Physics) {
         };
         world.seats[side].deaths = physics.deaths;
         world.level.insert(hero, Level(physics.level));
-        world.statuses.remove(hero);
+        world
+            .modifiers
+            .insert(hero, bota_server::game::Modifiers::default());
         world.set_order(hero, UnitOrder::Stand);
         let mut events = Vec::new();
         assert!(!world.learn(hero, 5, &mut events));
@@ -177,11 +179,14 @@ fn configure_enemy(world: &mut World, physics: Physics, position: Vec2) {
         Fixed::from_int(physics.reach),
     );
     if let Some(hp) = physics.creep_hp {
-        let creep = world.spawn_unit(
+        let creep = world.spawn_creep(
             &bota_server::game::MELEE_CREEP,
             world.seats[1 - physics.side].team,
             at,
+            0,
+            0,
         );
+        world.lane_ai.remove(creep);
         world.settle();
         world.health.get_mut(creep).unwrap().hp = Fixed::from_int(hp);
     } else {

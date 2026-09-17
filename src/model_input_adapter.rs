@@ -66,7 +66,7 @@ const M11_LAYOUT: [(&str, &[usize]); 62] = [
     ("point_query.bias", &[64]),
 ];
 
-const _: () = assert!(MODEL_SCHEMA_VERSION == 14);
+const _: () = assert!(MODEL_SCHEMA_VERSION == 24);
 const _: () = assert!(MODEL_PARAMETER_COUNT == M11_PARAMETERS + 4 * 64 + 8 * 512);
 
 impl PolicyModel {

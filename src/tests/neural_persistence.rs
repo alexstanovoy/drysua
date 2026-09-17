@@ -32,7 +32,9 @@ impl Fixture {
                 let hero = world.seats[side].unit.expect("hero");
                 world.transform.get_mut(hero).expect("position").pos =
                     Vec2::from_ints(8600 + side as i32 * 200, 8900);
-                world.statuses.remove(hero);
+                world
+                    .modifiers
+                    .insert(hero, bota_server::game::Modifiers::default());
             }
             let hero = world.seats[0].unit.expect("caster");
             world.abilities.get_mut(hero).expect("kit").slots[0].level = 1;

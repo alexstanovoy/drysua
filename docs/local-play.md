@@ -17,13 +17,16 @@ The GUI is for the human to launch from a desktop; agent verification was headle
 
 ## Default Neural mode still fails closed without explicit weights
 
-The current reward6/F20/M22 terminal change and explicit migration are documented in
+The current reward7/F22/M24 terminal and victory-time change and explicit migration are documented in
 [reward-rebalance.md](reward-rebalance.md). Win has terminal reward+0.2, Draw0,
 Loss and completed-task TimeCap-0.2. Dense terms are unchanged. Historical
 M19/M20/M21 models are not current-compatible without explicit initialization.
 
-Integration checks against bota `037c6a2` are recorded in
+Integration checks against the earlier bota rebase are recorded in
 [`artifacts/temp/bota-rebase-integration-20260910/RESULTS.md`](../artifacts/temp/bota-rebase-integration-20260910/RESULTS.md).
+The current wire rebase to bota `78427bb` (new `Missed` event, `Cheat` orders and
+`NoCheats` rejection, attack-time/bound/collision view fields) is recorded in
+[`artifacts/temp/bota-port-20260914/REPORT.md`](../artifacts/temp/bota-port-20260914/REPORT.md).
 These are compatibility checks, not a trained-model release or win-rate result.
 
 From an authorized Linux X11/Xwayland desktop terminal:
@@ -31,17 +34,17 @@ From an authorized Linux X11/Xwayland desktop terminal:
 ```sh
 # Requires an externally supplied compatible model; none is selected by default.
 /home/alexstanovoy/Workspace/bots/play.sh \
-  --weights-directory "/absolute/path/to/compatible M22 runtime weights"
+  --weights-directory "/absolute/path/to/compatible M23 runtime weights"
 # Human Dire, pure Neural bot Radiant. Either side option derives the other.
 /home/alexstanovoy/Workspace/bots/play.sh \
-  --weights-directory "/absolute/path/to/compatible M22 runtime weights" \
+  --weights-directory "/absolute/path/to/compatible M23 runtime weights" \
   --human-side dire --port 0 --seed 9000001 --no-build
 ```
 
 **No-argument play is not ready and fails closed.** No trained Map2 model has been
 supplied or promoted for this launcher. The old F12/M14 human-review checkpoint
 is incompatible with the current server/runtime. Supply `--weights-directory`
-containing compatible **A5/F20/M22/PPO35/rules30/reward6** `drysua.weights.safetensors`; do not relabel or
+containing compatible **A5/F22/M24/PPO37/rules32/reward7** `drysua.weights.safetensors`; do not relabel or
 copy old metadata to make a file pass. The launcher never creates, migrates,
 initializes, trains, promotes, or substitutes weights.
 
@@ -74,18 +77,18 @@ Exactly nine metadata keys are required; numeric values are decimal strings:
 | Key | Required value |
 | --- | --- |
 | `action_schema_hash` | `10658390830565586343` (A5) |
-| `feature_schema_hash` | `9233114641639769206` (F20) |
-| `model_schema_hash` | `4891874295003631291` (M22) |
-| `ppo_schema_version` | `35` |
-| `ppo_schema_hash` | `13569352384922890857` |
-| `ppo_rules_audit_version` | `30` |
+| `feature_schema_hash` | `10552563335950731440` (F21) |
+| `model_schema_hash` | `12076707506725412686` (M23) |
+| `ppo_schema_version` | `36` |
+| `ppo_schema_hash` | `12793043235719775693` |
+| `ppo_rules_audit_version` | `31` |
 | `map2_reward_schema_version` | `6` |
-| `map2_reward_schema_hash` | `1084583101075978392` |
+| `map2_reward_schema_hash` | `7274660837025042530` |
 | `map2_reward_schema_descriptor` | Full current descriptor matching that FNV-1a hash |
 
-M22 retains A5 navigation/action legality, wait/refund and progress-debt rules.
+M23 retains A5 navigation/action legality, wait/refund and progress-debt rules.
 Reward6 retains reward5 event/potential coefficients and one first-wave positioning
-cost, not a perpetual location penalty. F20 preserves all92 global positions including
+cost, not a perpetual location penalty. F21 preserves all92 global positions including
 Tower remaining90/opening pending91: global92, unit84,62 named tensors,
 1,700,020 F32 parameters. See the exact coefficient/bound table in reward-rebalance.md.
 
@@ -103,7 +106,7 @@ silently relabelled. No M18 weights were generated or added to the source
 whitelist. No-argument play still fails with the missing-model prompt, and
 never substitutes root M17 weights or a Teacher.
 
-Explicit M17-to-current-M22 **initialization only** is available through
+Explicit M17-to-current-M23 **initialization only** is available through
 `TrainingArtifact::initialize_selected_m17_for_map2_wait(directory, seed, device)`.
 The additional exact M19/u162 parameter-only initializer is documented in
 [reward-rebalance.md](reward-rebalance.md); it does not resume or relabel the old model.
@@ -184,10 +187,12 @@ compilation entirely. That option trusts the caller's build provenance; an
 existing target path alone does not prove freshness or compatibility.
 
 The protocol/slot mapping is for bota commit
-`037c6a2f8e5383beae9eea6da8cbbb1678f7b718`. Keep the server/client and current drysua
+`78427bb80eb716f851cb039ade33e2964bbf3c11`. Keep the server/client and current drysua
 builds together. This includes current unit effects (Guarded 13, Inspired 14,
-Shadowraze 15) and the `Healed` event's separate health/mana fields; the old wire
-and weights are not interchangeable with this protocol.
+Shadowraze 15), the `Healed` event's separate health/mana fields and the `Missed`
+event inserted after `Damaged`; the old wire, rules-audit30 weights and checkpoints
+are not interchangeable with this protocol. Cheat orders exist in the schema but
+drysua starts no match with cheats on and never issues one.
 The bot command includes `--addr <bot-relay> --name drysua --policy neural
 --weights-directory <absolute-current-weights>`.
 

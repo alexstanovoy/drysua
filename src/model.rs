@@ -44,7 +44,7 @@ use crate::{
 };
 
 /// Version of the fixed policy-model layout and linked candidate execution contract.
-pub const MODEL_SCHEMA_VERSION: u32 = 22;
+pub const MODEL_SCHEMA_VERSION: u32 = 24;
 /// Maximum frame count accepted by one public batch call.
 pub const MODEL_MAX_BATCH: usize = 8_192;
 /// Frame count evaluated by one bounded host inference tensor graph.
@@ -101,10 +101,10 @@ static NEXT_OPTIMIZER_LINEAGE: AtomicU64 = AtomicU64::new(1);
 
 /// Canonical model shapes, parameter order, and linked action/feature semantics.
 pub const MODEL_SCHEMA_DESCRIPTOR: &str = concat!(
-    "bota-drysua-model/v22;",
+    "bota-drysua-model/v24;",
     "linked_schemas=action,feature,map2_reward;linked_hash=fnv1a_descriptor_then_ordered_version_le32_hash_le64_then_map2_reward_descriptor_utf8;",
     "scope=map2_mid_only_cap27900_including900_pregame;candidate_execution=feature19_candidate_order_bookkeeping_action5_walkable_building_landing_move_only_mango_unchanged;layout=62_named_tensors_1700020_f32;transfer=explicit_pinned_m14_u4_or_initial_or_m16_initial_and_advantage_or_m17_initial05e78663_and_recovery004107e19e6_or_m19_u162_9d0b8812_new_owned_model_fresh_optimizer_progress_mastery_rng_league_not_resume_or_old_gameplay_compatibility,no_m18_or_m20_source_pin;model13_reserved_isolated_wide_experiment;",
-    "map2_inputs=global92_unit84_unchanged_from_m21;reward6=terminal_only_change_dense_wait_opening_and_progress_rules_unchanged;initialization_padding=m14_unit.0.weight_rows73..84_positive_zero_trunk.0.weight_rows72..92_positive_zero_shift20,m16_m17_trunk.0.weight_rows85..92_positive_zero_shift7,m19_trunk.0.weight_rows90..92_positive_zero_shift2_all_other_parameter_bits_unchanged;m21u300_same_shape_all_parameter_bits_preserved_no_critic_or_actor_rescaling;",
+    "map2_inputs=global92_unit84_unchanged_from_m21,wire_rebase_unit_bound_and_collision_and_attack_time;reward7=terminal_values_and_victory_time_bonus_dense_wait_opening_and_progress_rules_unchanged;initialization_padding=m14_unit.0.weight_rows73..84_positive_zero_trunk.0.weight_rows72..92_positive_zero_shift20,m16_m17_trunk.0.weight_rows85..92_positive_zero_shift7,m19_trunk.0.weight_rows90..92_positive_zero_shift2_all_other_parameter_bits_unchanged;m21u300_same_shape_all_parameter_bits_preserved_no_critic_or_actor_rescaling;",
     "dtype=f32;device=cpu_actor,cpu_cuda_or_metal_learner,one_learner_per_device;architecture=deepsets;activations=relu_after_every_encoder_and_trunk_linear;",
     "input_conditioning=host_before_tensor_after_presence_mask,feature_v9_unchanged;category_divisors=global10:5,12:3,32:16,55:12;policy_history3:16;unit5:12;ability1:2,2:8,11:5;item1:5,2:64,9:5,13:3;point10:8,12:8,16:12;semantic_ids=ability5_and_projectile6:ln1p(x)/ln(65548),item4_and_loot1:ln1p(x)/ln(65537);all_other_features_identity;",
     "output_initialization=all_linear_outside_relu_mlps_including_value_and_pointer_queries:he_uniform_times0.01,bias_zero,no_extra_rng_draws;pointer_scaling=dot_div_sqrt_embedding_width_all_actor_batch_and_training_paths;",
@@ -129,7 +129,7 @@ pub const MODEL_SCHEMA_DESCRIPTOR: &str = concat!(
     "runtime_identity=checked_process_local_nonzero_model_lineage_plus_monotonic_parameter_revision,immutable_cpu_actor_snapshot_preserves_identity_and_forbids_optimizer,one_internal_learner_optimizer_lineage_bound_to_exact_policy_identity,raw_import_advances_revision_and_unbinds_optimizer,evidence_never_enters_tensors;",
     "updates=single_model_rwlock,all_inference_and_export_reads_hold_one_shared_lock,training_output_owns_shared_lock_for_full_forward_loss_backward_lifetime,named_backward_requires_same_model_guarded_output_and_returns62_stable_named_optional_gradient_tensors,no_unlocked_vars_exposed,parameter_import_deep_copies_originals_and_builds_and_replaces_all62_vars_under_one_exclusive_lock_with_exact_rollback_on_failure,readers_observe_complete_old_or_complete_new_parameter_set;",
     "parameter_order=unit_mlp,ability_mlp,item_mlp,point_mlp,projectile_mlp,loot_mlp,trunk,value,kind,kind_embedding,unit_embedding,ability_embedding,item_embedding,unit_head,ability_head,item_head,swap_head,learn_head,shop_head,loot_head,target_mode_head,put_mode_head,entity_query,point_query;",
-    "reward6=win.2_loss_neg.2_draw0_completed_taskcap_neg.2_architecture_unchanged;mastery_configuration_and_window_never_model_inputs;m19_initialization_1698996_to1700020_f32_with1024_positive_zeros_all_old_parameter_bits_preserved_no_reward_or_gameplay_equivalence;"
+    "reward7=win.2_loss_neg.2_draw0_completed_taskcap_neg.2_win_only_victory_time_bonus_architecture_unchanged;mastery_configuration_and_window_never_model_inputs;m19_initialization_1698996_to1700020_f32_with1024_positive_zeros_all_old_parameter_bits_preserved_no_reward_or_gameplay_equivalence;"
 );
 
 const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
@@ -177,7 +177,7 @@ const fn linear_parameters(input: usize, output: usize) -> usize {
 /// Exact number of F32 parameters in the M21 policy model.
 pub const MODEL_PARAMETER_COUNT: usize = 1_700_020;
 
-const _: () = assert!(FEATURE_SCHEMA_VERSION == 20);
+const _: () = assert!(FEATURE_SCHEMA_VERSION == 22);
 const _: () = assert!(crate::ACTION_SCHEMA_VERSION == 5);
 const _: () = assert!(GLOBAL_FEATURES == 92);
 const _: () = assert!(UNIT_FEATURES == 84);

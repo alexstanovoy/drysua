@@ -398,6 +398,7 @@ fn teacher_tcp_cli_plays_map_one_without_weights() {
                 seed: 70_006,
                 map: MapId(1),
                 ack_timeout_ticks: 150,
+                cheats: false,
             },
         );
         finished.send(result).expect("server completion receiver");
@@ -859,6 +860,7 @@ fn neural_tcp_match(map: MapId, directory: &std::path::Path) {
                 seed: 70_010,
                 map,
                 ack_timeout_ticks: 150,
+                cheats: false,
             },
         );
         finished.send(result).expect("completion receiver");

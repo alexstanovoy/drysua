@@ -78,7 +78,7 @@ pub(crate) fn consume(
 ) -> io::Result<()> {
     let mut next = interval;
     let mut written = 0;
-    let mut previous = [0.0; 17];
+    let mut previous = [0.0; 18];
     for _ in 0..MAX_MESSAGES {
         let Some(message) = read_message(input)? else {
             return if observer.ended {
@@ -141,8 +141,8 @@ pub(crate) struct Observer {
     pending: bool,
     ended: bool,
     outcome: Option<Map2RewardEnd>,
-    totals: [f64; 17],
-    counts: [u64; 31],
+    totals: [f64; 18],
+    counts: [u64; 32],
     pub(crate) last_interval: Map2RewardBreakdown,
 }
 
@@ -157,8 +157,8 @@ impl Observer {
             pending: false,
             ended: false,
             outcome: None,
-            totals: [0.0; 17],
-            counts: [0; 31],
+            totals: [0.0; 18],
+            counts: [0; 32],
             last_interval: Map2RewardBreakdown::default(),
         }
     }
@@ -348,8 +348,8 @@ impl Observer {
         )
     }
 
-    fn timeline(&self, previous: &[f64; 17]) -> String {
-        let delta: [f64; 17] = std::array::from_fn(|index| self.totals[index] - previous[index]);
+    fn timeline(&self, previous: &[f64; 18]) -> String {
+        let delta: [f64; 18] = std::array::from_fn(|index| self.totals[index] - previous[index]);
         format!(
             concat!(
                 "{{\"kind\":\"interval\",\"status\":\"partial\",\"profile_version\":{},",
@@ -366,7 +366,7 @@ impl Observer {
     }
 }
 
-const COMPONENTS: [&str; 17] = [
+const COMPONENTS: [&str; 18] = [
     "gold",
     "experience",
     "hero_damage",
@@ -384,9 +384,10 @@ const COMPONENTS: [&str; 17] = [
     "stagnation_base",
     "stagnation_ticks_cost",
     "terminal",
+    "victory_time",
 ];
 
-fn components(value: &Map2RewardBreakdown) -> [f64; 17] {
+fn components(value: &Map2RewardBreakdown) -> [f64; 18] {
     [
         value.gold,
         value.experience,
@@ -405,12 +406,14 @@ fn components(value: &Map2RewardBreakdown) -> [f64; 17] {
         value.stagnation_base,
         value.stagnation_ticks_cost,
         value.terminal,
+        value.victory_time,
     ]
 }
 
-const COUNTS: [&str; 31] = [
+const COUNTS: [&str; 32] = [
     "tower_damage_taken",
     "opening_position_checks",
+    "victory_time_ticks",
     "own_gold_earned",
     "enemy_gold_earned",
     "own_xp_gained",
@@ -442,11 +445,12 @@ const COUNTS: [&str; 31] = [
     "progress_reasons",
 ];
 
-fn counts(value: &Map2RewardBreakdown) -> [u64; 31] {
+fn counts(value: &Map2RewardBreakdown) -> [u64; 32] {
     let value = value.observations;
     [
         value.tower_damage_taken,
         value.opening_position_checks,
+        value.victory_time_ticks,
         value.own_gold_earned,
         value.enemy_gold_earned,
         value.own_xp_gained,

@@ -27,6 +27,7 @@ pub struct Map2TrainingReward {
     pub stagnation_base: f64,
     pub stagnation_ticks_cost: f64,
     pub terminal: f64,
+    pub victory_time: f64,
     pub total: f64,
     pub observations: Map2RewardObservations,
 }
@@ -65,6 +66,7 @@ impl Map2TrainingReward {
             stagnation_base: interval.stagnation_base,
             stagnation_ticks_cost: interval.stagnation_ticks_cost,
             terminal: interval.terminal,
+            victory_time: interval.victory_time,
             total: interval.total,
             observations: interval.observations,
         })
@@ -98,6 +100,7 @@ impl Map2TrainingReward {
             stagnation_base: self.stagnation_base + other.stagnation_base,
             stagnation_ticks_cost: self.stagnation_ticks_cost + other.stagnation_ticks_cost,
             terminal: self.terminal + other.terminal,
+            victory_time: self.victory_time + other.victory_time,
             total: self.total + other.total,
             observations: merge_observations(self.observations, other.observations)?,
         };
@@ -110,7 +113,7 @@ impl Map2TrainingReward {
         Ok(())
     }
 
-    pub(super) fn components(&self) -> [f64; 18] {
+    pub(super) fn components(&self) -> [f64; 19] {
         [
             self.tower_damage_taken,
             self.opening_position,
@@ -129,6 +132,7 @@ impl Map2TrainingReward {
             self.stagnation_base,
             self.stagnation_ticks_cost,
             self.terminal,
+            self.victory_time,
             self.total,
         ]
     }
@@ -142,6 +146,7 @@ fn merge_observations(
     Ok(Map2RewardObservations {
         tower_damage_taken: add(left.tower_damage_taken, right.tower_damage_taken)?,
         opening_position_checks: add(left.opening_position_checks, right.opening_position_checks)?,
+        victory_time_ticks: add(left.victory_time_ticks, right.victory_time_ticks)?,
         own_gold_earned: add(left.own_gold_earned, right.own_gold_earned)?,
         enemy_gold_earned: add(left.enemy_gold_earned, right.enemy_gold_earned)?,
         own_xp_gained: add(left.own_xp_gained, right.own_xp_gained)?,
@@ -190,15 +195,16 @@ impl std::fmt::Display for Map2TrainingReward {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
-            "reward_tower_taken={:.9} reward_opening_position={:.9} tower_damage_taken={} opening_position_checks={} ",
+            "reward_tower_taken={:.9} reward_opening_position={:.9} tower_damage_taken={} opening_position_checks={} victory_time_ticks={} ",
             self.tower_damage_taken,
             self.opening_position,
             self.observations.tower_damage_taken,
-            self.observations.opening_position_checks
+            self.observations.opening_position_checks,
+            self.observations.victory_time_ticks
         )?;
         write!(
             formatter,
-            "reward_ticks={} reward_total={:.9} reward_gold={:.9} reward_xp={:.9} reward_hero_damage={:.9} reward_hero_taken={:.9} reward_creep_taken={:.9} reward_other_taken={:.9} reward_mana={:.9} reward_towers={:.9} reward_lane={:.9} reward_pregame_movement={:.9} reward_fountain_wait={:.9} reward_fountain_wait_refund={:.9} reward_stagnation_base={:.9} reward_stagnation_ticks_cost={:.9} reward_terminal={:.9}",
+            "reward_ticks={} reward_total={:.9} reward_gold={:.9} reward_xp={:.9} reward_hero_damage={:.9} reward_hero_taken={:.9} reward_creep_taken={:.9} reward_other_taken={:.9} reward_mana={:.9} reward_towers={:.9} reward_lane={:.9} reward_pregame_movement={:.9} reward_fountain_wait={:.9} reward_fountain_wait_refund={:.9} reward_stagnation_base={:.9} reward_stagnation_ticks_cost={:.9} reward_terminal={:.9} reward_victory_time={:.9}",
             self.ticks,
             self.total,
             self.gold,
@@ -215,7 +221,8 @@ impl std::fmt::Display for Map2TrainingReward {
             self.fountain_wait_refund,
             self.stagnation_base,
             self.stagnation_ticks_cost,
-            self.terminal
+            self.terminal,
+            self.victory_time
         )?;
         let raw = self.observations;
         write!(

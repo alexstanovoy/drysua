@@ -108,10 +108,12 @@ fn map2_reward_merge_fixture() -> crate::Map2TrainingReward {
         stagnation_base: 0.0,
         stagnation_ticks_cost: 0.0,
         terminal: 1.0,
-        total: 1.375,
+        victory_time: 0.25,
+        total: 1.625,
         observations: crate::Map2RewardObservations {
             tower_damage_taken: 15,
             opening_position_checks: 1,
+            victory_time_ticks: 9_000,
             hero_damage_dealt: 50,
             mana_spent: 75,
             lane_observed_ticks: 3,
@@ -149,7 +151,8 @@ fn actor_report_merge_preserves_map2_reward_components_and_raw_observations() {
     assert_eq!(aggregate.map2_reward.fountain_wait, -0.5);
     assert_eq!(aggregate.map2_reward.fountain_wait_refund, 0.25);
     assert_eq!(aggregate.map2_reward.terminal, 2.0);
-    assert_eq!(aggregate.map2_reward.total, 2.75);
+    assert_eq!(aggregate.map2_reward.victory_time, 0.5);
+    assert_eq!(aggregate.map2_reward.total, 3.25);
     assert_eq!(aggregate.map2_reward.tower_damage_taken, -0.125);
     assert_eq!(aggregate.map2_reward.opening_position, -0.125);
     assert_eq!(aggregate.map2_reward.observations.tower_damage_taken, 30);
@@ -278,8 +281,8 @@ fn rollout_compacts_sparse_tokens_and_bit_packs_behavioral_masks_losslessly() {
 
 #[test]
 fn ppo_schema_and_rules_audit_are_stable() {
-    assert_eq!(PPO_SCHEMA_VERSION, 35);
-    assert_eq!(PPO_RULES_AUDIT_VERSION, 30);
+    assert_eq!(PPO_SCHEMA_VERSION, 37);
+    assert_eq!(PPO_RULES_AUDIT_VERSION, 32);
     assert_eq!(
         PPO_SCHEMA_HASH,
         super::map2_checkpoint::schema_hash(

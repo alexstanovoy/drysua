@@ -2,14 +2,14 @@ use super::*;
 
 #[path = "map2_recovery_004_audit.rs"]
 mod audit;
-#[path = "map2_recovery_004_tests.rs"]
-mod tests;
 #[path = "map2_recovery_004_data.rs"]
 mod data;
-#[path = "map2_recovery_004_fit.rs"]
-mod fit;
 #[path = "map2_recovery_004_eval.rs"]
 mod evaluation;
+#[path = "map2_recovery_004_fit.rs"]
+mod fit;
+#[path = "map2_recovery_004_tests.rs"]
+mod tests;
 #[path = "map2_recovery_004_witness.rs"]
 mod witness4;
 
@@ -198,6 +198,6 @@ fn initial() -> PolicyModel {
     );
     let model = PolicyModel::fresh_on(10102999, PolicyDevice::Cpu).unwrap();
     TrainingArtifact::load_runtime_weights(&model, &root3().join("weights")).unwrap();
-    assert_eq!(crate::MODEL_SCHEMA_VERSION, 17);
+    assert_eq!(crate::MODEL_SCHEMA_VERSION, 24);
     model
 }

@@ -471,8 +471,10 @@ impl ArenaWire<'_> {
         if self.scenario != Scenario::VisibilityGap || ![3, 8].contains(&tick) {
             return;
         }
+        // Ancient sight grew to 2600 in this simulator, so the old
+        // 13000,13000 corner on the demo map is watched; hide farther south.
         let position = if tick == 3 {
-            Vec2::from_ints(13_000, 13_000)
+            Vec2::from_ints(4_000, 13_000)
         } else {
             Vec2::from_ints(8_700, 8_900)
         };
@@ -577,7 +579,9 @@ fn configure_scene(world: &mut World, side: usize, scenario: Scenario) {
         assert!(world.despawn(entity));
     }
     for (index, hero) in heroes.into_iter().enumerate() {
-        world.statuses.remove(hero);
+        world
+            .modifiers
+            .insert(hero, bota_server::game::Modifiers::default());
         world.set_order(hero, UnitOrder::Stand);
         let transform = world.transform.get_mut(hero).expect("hero transform");
         transform.pos = match (scenario, index) {

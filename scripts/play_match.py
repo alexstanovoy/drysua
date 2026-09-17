@@ -112,7 +112,7 @@ def parse_arguments(arguments):
     parser.add_argument("--bot-side", choices=("radiant", "dire"),
                         help="Opponent side (default: dire, or opposite --human-side)")
     parser.add_argument("--weights-directory", type=Path,
-                        help="Compatible current F20/M22 runtime weights; required for Neural, forbidden for Teacher")
+                        help="Compatible current F22/M24 runtime weights; required for Neural, forbidden for Teacher")
     result = parser.parse_args(arguments)
     if result.opponent == "teacher" and result.weights_directory is not None:
         parser.error("--opponent teacher forbids --weights-directory")
@@ -160,8 +160,8 @@ def transport_arguments(arguments):
 def current_paths(root, weights_directory):
     if weights_directory is None:
         raise RuntimeError("legacy F12/M14 human-review weights are incompatible with current Map2; "
-                           "provide --weights-directory with compatible F20/M22 runtime weights; "
-                           "no compatible M22 model is selected by default; no Teacher fallback")
+                           "provide --weights-directory with compatible F22/M24 runtime weights; "
+                           "no compatible M23 model is selected by default; no Teacher fallback")
     weights = weights_directory.resolve()
     read_runtime_metadata(weights)
     return root / "drysua/target/release/drysua", weights
@@ -391,7 +391,7 @@ class Supervisor:
 
     def run(self, root, arguments):
         binary, weights = opponent_paths(root, arguments)
-        label = "pure Neural F20/M22" if arguments.opponent == "neural" else "explicit Teacher (no model)"
+        label = "pure Neural F22/M24" if arguments.opponent == "neural" else "explicit Teacher (no model)"
         print(f"play: current Map2 {label}; weights: {weights}; executable: {binary}", flush=True)
         if not arguments.no_build:
             command = ["cargo", "build", "--release", "--locked", "--quiet",

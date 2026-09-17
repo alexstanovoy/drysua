@@ -6,15 +6,15 @@ mod tests;
 
 const ORIGINAL_RESULTS_SHA: &str =
     "2d2f9f51809900dab34ead125e3524cae5a85b0d4c3b15a83715a56008bfa8a4";
-const FIXTURE_SHA: &str = "1f3929a03d109a5c9a4c6cccaff9ffe2c5fccd91565b96a59bf5ee4f69fb75b8";
+const FIXTURE_SHA: &str = "ec8c1a386477602b2cdf4e818951c522a7016befd97b129b2e9bf034051f93eb";
 const FIT_SHA: &str = "cc940ff5f7d9be6f63eb99e421ce3d97e7d9e2e87f17953fd4929589b515bc0a";
 
 #[test]
 #[ignore = "Authorized exact locked fit reproduction for diagnostic-only DEV transfer, not a local gate retry."]
 fn reproduce_locked_fit_for_diagnostic_transfer() {
     // Historical gameplay reproduction must fail closed under a different legal-action set.
-    assert_eq!(crate::MODEL_SCHEMA_VERSION, 16);
-    assert_eq!(crate::FEATURE_SCHEMA_VERSION, 14);
+    assert_eq!(crate::MODEL_SCHEMA_VERSION, 24);
+    assert_eq!(crate::FEATURE_SCHEMA_VERSION, 22);
     let started = Instant::now();
     verify_locked_sources();
     let parent =

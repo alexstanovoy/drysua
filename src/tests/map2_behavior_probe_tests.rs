@@ -46,7 +46,7 @@ fn seat_features_expose_effect15_and_mango42_but_not_exogenous_goals() {
         assert_eq!(frame, other_goal);
         let mut absent = fixture_with(Family::RazeChain, side, |world| {
             world
-                .statuses
+                .modifiers
                 .remove(world.seats[1 - side].unit.expect("enemy"));
         });
         let (absent, _) = prepare_neural_seat_policy_sample(&mut absent.seats[side])

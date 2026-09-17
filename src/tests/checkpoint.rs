@@ -885,7 +885,7 @@ fn legacy_anchor_runtime_and_pre_migration_probe_training_reject_without_mutatio
 
 #[test]
 fn checkpoint_schema_hash_is_stable() {
-    assert_eq!(crate::CHECKPOINT_SCHEMA_VERSION, 10);
+    assert_eq!(crate::CHECKPOINT_SCHEMA_VERSION, 12);
     assert_eq!(
         crate::CHECKPOINT_SCHEMA_HASH,
         super::map2_checkpoint::schema_hash(

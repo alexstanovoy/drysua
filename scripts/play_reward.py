@@ -173,7 +173,7 @@ def print_overview(pipes):
         reports.append((pipe.role, report))
     if reports:
         print("reward category".ljust(26) + " ".join(role.rjust(16) for role, _ in reports), flush=True)
-        names = list(reports[0][1].get("components", {}))[:17] + ["total_without_terminal", "total"]
+        names = list(reports[0][1].get("components", {}))[:18] + ["total_without_terminal", "total"]
         for name in names:
             values = [report.get("components", {}).get(name, report.get(name, 0)) for _, report in reports]
             print(name.ljust(26) + " ".join(f"{value:16.9f}" for value in values), flush=True)

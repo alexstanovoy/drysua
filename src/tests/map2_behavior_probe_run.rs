@@ -86,7 +86,7 @@ fn initial_m16_bounded_behavior_artifact() {
         .map(|byte| format!("{byte:02x}"))
         .collect();
     assert_eq!(digest, INITIAL_SHA);
-    assert_eq!(crate::MODEL_SCHEMA_VERSION, 16);
+    assert_eq!(crate::MODEL_SCHEMA_VERSION, 24);
     let model = PolicyModel::fresh_on(10091601, PolicyDevice::Cpu).expect("small CPU actor");
     TrainingArtifact::load_runtime_weights(&model, weights).expect("strict current M16 weights");
     let output = root.join("artifacts/temp/map2-learning-20260911/behavior/initial-m16-probe-v1");

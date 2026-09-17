@@ -32,7 +32,9 @@ fn transcript(side: usize) -> Vec<ServerMsg> {
         for (index, hero) in heroes.into_iter().enumerate() {
             world.transform.get_mut(hero).expect("position").pos =
                 bota_proto::Vec2::from_ints(8600 + index as i32 * 200, 8900);
-            world.statuses.remove(hero);
+            world
+                .modifiers
+                .insert(hero, bota_server::game::Modifiers::default());
             world.abilities.get_mut(hero).expect("kit").slots[0].level = 1;
         }
     });

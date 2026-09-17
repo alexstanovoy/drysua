@@ -2,6 +2,23 @@ use super::*;
 use safetensors::tensor::{Dtype, TensorView, serialize};
 
 #[test]
+fn reward6_and_reward7_descriptors_are_frozen_side_by_side() {
+    let hash = |text: &str| {
+        text.bytes().fold(0xcbf29ce484222325u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+        })
+    };
+    assert_eq!(hash(reward_v5::DESCRIPTOR), 10_775_256_611_790_261_869);
+    assert_eq!(hash(reward_v6::DESCRIPTOR), 1_084_583_101_075_978_392);
+    assert_eq!(
+        hash(crate::MAP2_REWARD_SCHEMA_DESCRIPTOR),
+        crate::MAP2_REWARD_SCHEMA_HASH
+    );
+    assert!(!reward_v6::DESCRIPTOR.contains("victory_time"));
+    assert!(crate::MAP2_REWARD_SCHEMA_DESCRIPTOR.contains("victory_time"));
+}
+
+#[test]
 fn terminal02_m21_source_metadata_and_reward5_descriptor_are_frozen() {
     let hash = reward_v5::DESCRIPTOR
         .bytes()

@@ -438,6 +438,7 @@ pub(super) fn replay_teacher_observation(
 
 fn sent_kind(order: Order) -> ActionKind {
     match order {
+        Order::Cheat { .. } => panic!("a drysua seat never issues cheat orders"),
         Order::Move {
             target: Target::None,
         } => ActionKind::Stop,

@@ -48,19 +48,19 @@ fn navigation_ancestry_targets_wait_progress_schema_with_five_zero_global_rows()
         crate::MAP2_REWARD_SCHEMA_HASH
     );
     assert_eq!(crate::ACTION_SCHEMA_VERSION, 5);
-    assert_eq!(crate::FEATURE_SCHEMA_VERSION, 20);
-    assert_eq!(crate::MODEL_SCHEMA_VERSION, 22);
-    assert_eq!(crate::PPO_SCHEMA_VERSION, 35);
-    assert_eq!(crate::PPO_RULES_AUDIT_VERSION, 30);
-    assert_eq!(crate::LEAGUE_SCHEMA_VERSION, 35);
-    assert_eq!(crate::LEAGUE_RULES_AUDIT_VERSION, 30);
-    assert_eq!(crate::CHECKPOINT_SCHEMA_VERSION, 10);
-    assert_eq!(crate::IMITATION_RULES_AUDIT_VERSION, 20);
+    assert_eq!(crate::FEATURE_SCHEMA_VERSION, 22);
+    assert_eq!(crate::MODEL_SCHEMA_VERSION, 24);
+    assert_eq!(crate::PPO_SCHEMA_VERSION, 37);
+    assert_eq!(crate::PPO_RULES_AUDIT_VERSION, 32);
+    assert_eq!(crate::LEAGUE_SCHEMA_VERSION, 37);
+    assert_eq!(crate::LEAGUE_RULES_AUDIT_VERSION, 32);
+    assert_eq!(crate::CHECKPOINT_SCHEMA_VERSION, 12);
+    assert_eq!(crate::IMITATION_RULES_AUDIT_VERSION, 22);
     assert_eq!(crate::GLOBAL_FEATURES, 92);
     assert_eq!(crate::UNIT_FEATURES, 84);
     assert_eq!(crate::MODEL_PARAMETER_COUNT, M16_PARAMETERS + 3584);
-    assert_eq!(crate::MAP2_REWARD_SCHEMA_VERSION, 6);
-    assert_eq!(crate::MAP2_REWARD_SCHEMA_HASH, 1_084_583_101_075_978_392);
+    assert_eq!(crate::MAP2_REWARD_SCHEMA_VERSION, 7);
+    assert_eq!(crate::MAP2_REWARD_SCHEMA_HASH, 7_274_660_837_025_042_530);
 }
 
 #[test]
@@ -387,7 +387,7 @@ fn navigation_initialization_whitelists_only_two_exact_m16_digests_and_disclaims
         for field in [
             format!("INITIALIZATION_ONLY source_m16_sha256={digest}"),
             "source_f=14 source_a=4 source_m=16 source_ppo=29 source_rules=24".to_owned(),
-            "target_f=20 target_a=5 target_m=22 target_ppo=35 target_rules=30".to_owned(),
+            "target_f=22 target_a=5 target_m=24 target_ppo=37 target_rules=32".to_owned(),
             "parameter_bits_preserved=true named_tensors=62 new_weights=3584_positive_zero".to_owned(),
             "optimizer_progress_rng_league=fresh GAMEPLAY_EQUIVALENCE=false new_legal_actions_change_behavior=true qualification=false".to_owned(),
         ] { assert!(text.contains(&field), "missing {field}"); }

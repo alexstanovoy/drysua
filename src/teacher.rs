@@ -3,6 +3,7 @@ use bota_proto::{
     Team, UnitKind, UnitView, Vec2,
 };
 
+use crate::feature::attack_interval_ticks;
 use crate::teacher_economy::{self, EconomyObservation, attack_damage_against, holds_item};
 use crate::{
     ActionError, ActionSpace, ActionTarget, ControlledUnit, EntityIndex, EntityRelation,
@@ -885,7 +886,7 @@ impl Teacher {
         }
         if ratio_at_most(hero.hp, hero.max_hp, RETREAT_HEALTH_PERCENT)
             || self.attack_last_hit(tracker, space).is_some()
-            || enemy_tower_danger(tracker, hero.pos, hero.radius)
+            || enemy_tower_danger(tracker, hero.pos, hero.bound)
         {
             return None;
         }
@@ -1317,7 +1318,7 @@ impl Teacher {
     fn harass(&self, tracker: &StateTracker, space: &ActionSpace) -> Option<StructuredAction> {
         let hero = tracker.own_hero()?;
         if best_attack_creep(tracker, space, EntityRelation::Enemy, false).is_some()
-            || enemy_tower_danger(tracker, hero.pos, hero.radius)
+            || enemy_tower_danger(tracker, hero.pos, hero.bound)
         {
             return None;
         }
@@ -1451,8 +1452,8 @@ fn tactical_features(
         ready.min(3) as f32 / 3.0,
         tactical_ratio(tactical_burst(hero, enemy, Some(space)), enemy.hp),
         tactical_ratio(tactical_burst(enemy, hero, None), hero.hp),
-        f32::from(enemy_tower_danger(tracker, hero.pos, hero.radius)),
-        f32::from(enemy_tower_danger(tracker, enemy.pos, hero.radius)),
+        f32::from(enemy_tower_danger(tracker, hero.pos, hero.bound)),
+        f32::from(enemy_tower_danger(tracker, enemy.pos, hero.bound)),
         tactical_ratio(visible_pressure(tracker, hero), hero.hp),
         f32::from(allied_creep_near(tracker, hero.pos, 750)),
         f32::from(last_hit),
@@ -1565,8 +1566,7 @@ fn tower_corridor_safe(
                 unit.kind == UnitKind::Tower && unit.team != tracker.team() && unit.hp > 0
             })
             .all(|tower| {
-                let radius =
-                    Fixed::from_int(700) + hero.radius + tower.radius + movement_guard(hero);
+                let radius = Fixed::from_int(700) + hero.bound + tower.bound + movement_guard(hero);
                 let outward = (i128::from(hero.pos.x.raw) - i128::from(tower.pos.x.raw))
                     * horizontal
                     + (i128::from(hero.pos.y.raw) - i128::from(tower.pos.y.raw)) * vertical;
@@ -1827,7 +1827,7 @@ fn best_hero_raze(
 }
 
 fn safe_kill_opportunity(tracker: &StateTracker, space: &ActionSpace, hero: &UnitView) -> bool {
-    if enemy_tower_danger(tracker, hero.pos, hero.radius)
+    if enemy_tower_danger(tracker, hero.pos, hero.bound)
         || visible_pressure(tracker, hero).saturating_mul(2) >= hero.hp
     {
         return false;
@@ -1855,7 +1855,7 @@ fn finish_estimated_ticks(hero: &UnitView, enemy: &UnitView) -> u32 {
     let distance = isqrt(hero.pos.distance_squared(enemy.pos) as u64);
     let travel =
         distance.div_ceil((Fixed::ONE.raw * ATTACK_PROJECTILE_UNITS_PER_TICK) as u64) as u32;
-    hero.attack_interval
+    attack_interval_ticks(hero.attack_time)
         .div_ceil(2)
         .max(turn)
         .max(1)
@@ -1878,7 +1878,7 @@ fn finish_risk_acceptable(
         | bota_proto::StatusFlags::DISARMED
         | bota_proto::StatusFlags::DOT
         | bota_proto::StatusFlags::CHANNELLING;
-    let reach = hero.attack_range + hero.radius + enemy.radius - movement_guard(enemy);
+    let reach = hero.attack_range + hero.bound + enemy.bound - movement_guard(enemy);
     // Keep restoration separate from the wire-truncation and natural-regeneration margin.
     let health_margin = (2 + ticks.div_ceil(10) as i32)
         .saturating_add(finish_item_restoration(tracker, enemy, ticks));
@@ -2103,14 +2103,15 @@ fn finish_reply_estimate(view: &bota_proto::WorldView, hero: &UnitView, ticks: u
                 && hero.pos.within(
                     source.pos,
                     source.attack_range
-                        + source.radius
-                        + hero.radius
+                        + source.bound
+                        + hero.bound
                         + movement_guard(source)
                         + Fixed::from_int(ATTACK_RANGE_LEEWAY),
                 )
         })
         .fold(0i32, |damage, source| {
-            let replies = 1 + ticks.saturating_sub(1) / source.attack_interval.max(1);
+            let replies =
+                1 + ticks.saturating_sub(1) / attack_interval_ticks(source.attack_time).max(1);
             damage.saturating_add(
                 physical_damage(source.attack_damage, hero.armor).saturating_mul(replies as i32),
             )
@@ -2203,7 +2204,7 @@ fn courier_threatened(tracker: &StateTracker, courier: &UnitView) -> bool {
                 && unit.attack_damage > 0
                 && courier
                     .pos
-                    .within(unit.pos, unit.attack_range + unit.radius + courier.radius)
+                    .within(unit.pos, unit.attack_range + unit.bound + courier.bound)
         })
     })
 }
@@ -2228,7 +2229,7 @@ fn visible_pressure(tracker: &StateTracker, hero: &UnitView) -> i32 {
                 && unit.attack_damage > 0
                 && hero
                     .pos
-                    .within(unit.pos, unit.attack_range + unit.radius + hero.radius)
+                    .within(unit.pos, unit.attack_range + unit.bound + hero.bound)
         })
         .fold(0, |sum, unit| {
             sum.saturating_add(physical_damage(unit.attack_damage, hero.armor))
@@ -2314,7 +2315,7 @@ fn attack_landing_ticks(hero: &UnitView, target: &UnitView) -> u32 {
     let distance_raw = isqrt(hero.pos.distance_squared(target.pos) as u64);
     let distance = distance_raw.div_ceil(u64::from(Fixed::ONE.raw as u32));
     let travel = distance.div_ceil(ATTACK_PROJECTILE_UNITS_PER_TICK as u64) as u32;
-    hero.attack_interval
+    attack_interval_ticks(hero.attack_time)
         .saturating_add(turn)
         .saturating_add(ATTACK_POINT_TICKS)
         .saturating_add(travel)
@@ -2322,13 +2323,13 @@ fn attack_landing_ticks(hero: &UnitView, target: &UnitView) -> u32 {
 
 fn in_attack_reach(hero: &UnitView, target: &UnitView) -> bool {
     hero.pos
-        .within(target.pos, hero.attack_range + hero.radius + target.radius)
+        .within(target.pos, hero.attack_range + hero.bound + target.bound)
 }
 
 fn in_attack_reach_with_leeway(hero: &UnitView, target: &UnitView) -> bool {
     hero.pos.within(
         target.pos,
-        hero.attack_range + hero.radius + target.radius + Fixed::from_int(ATTACK_RANGE_LEEWAY),
+        hero.attack_range + hero.bound + target.bound + Fixed::from_int(ATTACK_RANGE_LEEWAY),
     )
 }
 
@@ -2468,7 +2469,7 @@ fn requiem_damage(level: u8, souls: u32) -> i32 {
 }
 
 fn unsafe_tower_without_wave(tracker: &StateTracker, hero: &UnitView) -> bool {
-    enemy_tower_danger(tracker, hero.pos, hero.radius) && !allied_creep_near(tracker, hero.pos, 750)
+    enemy_tower_danger(tracker, hero.pos, hero.bound) && !allied_creep_near(tracker, hero.pos, 750)
 }
 
 fn enemy_tower_danger(tracker: &StateTracker, position: Vec2, radius: Fixed) -> bool {
@@ -2477,7 +2478,7 @@ fn enemy_tower_danger(tracker: &StateTracker, position: Vec2, radius: Fixed) -> 
             unit.kind == UnitKind::Tower
                 && unit.team != tracker.team()
                 && unit.hp > 0
-                && position.within(unit.pos, Fixed::from_int(700) + radius + unit.radius)
+                && position.within(unit.pos, Fixed::from_int(700) + radius + unit.bound)
         })
     })
 }
@@ -2516,7 +2517,7 @@ fn best_safe_point(
             mask.get(*index) == Some(&true)
                 && (!require_progress || point.position.distance_squared(wanted) < current)
                 && tower_corridor_safe(tracker, hero, point.position, true)
-                && (!enemy_tower_danger(tracker, point.position, hero.radius)
+                && (!enemy_tower_danger(tracker, point.position, hero.bound)
                     || allied_creep_near(tracker, point.position, 750))
         })
         .min_by_key(|(_, point)| point.position.distance_squared(wanted))

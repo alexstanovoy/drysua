@@ -144,7 +144,9 @@ pub(super) fn configure(world: &mut World, spec: Spec) {
         world.seats[side].level = 3;
         world.seats[side].xp = rules::XP_THRESHOLDS[2];
         world.level.insert(hero, Level(3));
-        world.statuses.remove(hero);
+        world
+            .modifiers
+            .insert(hero, bota_server::game::Modifiers::default());
         world.set_order(hero, UnitOrder::Stand);
         for ability in &mut world.abilities.get_mut(hero).unwrap().slots[..5] {
             ability.level = 1;
@@ -219,11 +221,15 @@ fn configure_target(world: &mut World, spec: Spec) {
         return;
     }
     let target = if matches!(spec.kind, Kind::CreepLastHit | Kind::CreepHealthy) {
-        world.spawn_unit(
+        let creep = world.spawn_creep(
             &bota_server::game::MELEE_CREEP,
             world.seats[1 - spec.side].team,
             position,
-        )
+            0,
+            0,
+        );
+        world.lane_ai.remove(creep);
+        creep
     } else {
         world.seats[1 - spec.side].unit.unwrap()
     };

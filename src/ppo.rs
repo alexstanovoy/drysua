@@ -28,19 +28,20 @@ pub const PPO_SHAPING_BUDGET: f32 = 100.0 / PPO_REWARD_SCALE;
 pub const PPO_TERMINAL_REWARD: f32 = 1.0;
 const _: () = assert!(PPO_TERMINAL_REWARD > PPO_SHAPING_BUDGET);
 /// Version of rollout, GAE, objective, optimizer, and reward semantics.
-pub const PPO_SCHEMA_VERSION: u32 = 35;
+pub const PPO_SCHEMA_VERSION: u32 = 37;
 /// Audited simulator and learner rules required by stage-nine rollouts.
-pub const PPO_RULES_AUDIT_VERSION: u32 = 30;
+pub const PPO_RULES_AUDIT_VERSION: u32 = 32;
 /// Canonical stage-nine learner contract covered by [`PPO_SCHEMA_HASH`].
 pub const PPO_SCHEMA_DESCRIPTOR: &str = concat!(
-    "bota-drysua-ppo/v35;",
-    "linked_schemas=action,feature,model,map2_reward;linked_hash=fnv1a_descriptor_then_ordered_version_le32_hash_le64_then_map2_reward_descriptor_utf8;rules_audit=29;",
+    "bota-drysua-ppo/v37;",
+    "linked_schemas=action,feature,model,map2_reward;linked_hash=fnv1a_descriptor_then_ordered_version_le32_hash_le64_then_map2_reward_descriptor_utf8;rules_audit=32;",
     "scope=map2_mid_only_dota_geometry_mid_waves_second_hero_death_or_first_tower_loss_simultaneous_draw_cap27900_including900_pregame_cap_tick_draw;",
     "candidate_order=feature19_live_neural_ppo_learner_and_current_m21_policy_sharedpolicy_opponents_including_current_accepted_new_run_historical_snapshots_and_restart,frozen_weights_not_legacy_execution;observer=explicit_from_trajectory_start,effective_directive_ledger_follows_all_actual_sends_complete_snapshot_events_lifecycle_rejections_even_without_retained_rows,never_deduplicates_transport,never_sends_labels_or_claims_successful_execution;teacher=original_strategy_no_learner_override;prediction=observer_only_never_execution_opt_in,no_role_bit_in_tensors;reconstruction=explicit_role_observations_actual_sends_rejections_bounded_ledgers,late_enable_after_actual_send_rejected,no_enriched_history;artifacts=no_old_runtime_or_training_resume,explicit_pinned_m14_m16_m17_or_m19u162_global_padding_initializers_with_new_provenance_fresh_optimizer_progress_mastery_rng_league_no_gameplay_or_reward_equivalence_or_qualification;",
     "warmup=map2_raw_neural_greedy_actions,no_learner_teacher_override_or_send_sync,independent_scheduled_opponent,frozen_policy_opponents_raw_neural_sampling;",
     "bounds=rollout32768,streams1280,environments128,decisions16384,epochs16,minibatch8192,microbatch64;",
     "complete_episodes=map2_paired_sides,retain_original_action_logprob_exact_elapsed_ticks_and_all_intervening_reward,terminal_zero_bootstrap_partial_flush,no_synthetic_zero_tick_samples,empty_optimizer_batch_rejected,natural_episode_checkpoint_boundary;lambda1=full_monte_carlo_f64_return_recurrence;",
-    "terminal=win.2_loss-.2_draw0_timecap-.2,draw_and_timecap_are_nonwins_distinct_labels,infrastructure_failure_invalidates_not_fabricated_outcome;legacy_reward_profiles=not_map2_comprehensive_reward;",
+    "terminal=win.2_loss-.2_draw0_timecap-.2,victory_time=win_only_native_ticks_full.2_to9000_linear_to0_at21600,draw_and_timecap_are_nonwins_distinct_labels,infrastructure_failure_invalidates_not_fabricated_outcome;legacy_reward_profiles=not_map2_comprehensive_reward;",
+    "wire_rebase=bota78427bb_missed_event_ignored_without_damage_or_healing_cheat_order_never_issued_or_honoured_NoCheats_rejected_without_reward,attack_time_ms_converted_to_ticks,bound_combat_and_collision_clearance_no_terminal_or_shaping_change;",
     "actor=frozen_exact_policy_identity,batch_max64_single_shared_trunk_forward,independent_per_environment_rng_seeded_from_checkpointed_master,transactional_batch_rng,legal_masked_gumbel_max_open_f64_uniform,exact_autoregressive_log_probability_and_entropy;",
     "gae=map2_gamma_tick1_required,lambda0.98,terminal_reset,bootstrap_collector_truncation_not_task_terminal,normalized_advantages;",
     "objective=clipped_surrogate0.2,value_mse0.5,entropy0.01,target_kl0.02;",
@@ -54,7 +55,7 @@ pub const PPO_SCHEMA_DESCRIPTOR: &str = concat!(
     "teacher_economy=custom_bota_wraith_band_tango_boots_optional_stick_gloves_belt_once_only;",
     "historical_evidence=map0_map1_weights_binaries_results_unchanged_not_map2_qualification,no_old_corpus_relabel;",
     "pipeline=bounded_cpu_worker_endpoints,smoke_and_league_persistent_actor_thread,production_actor_uses_same_identity_learner_device_model_then_serial_learner_update,immutable_identity_bound_actor_lease,exactly_two_fixed_capacity_buffer_permits,one_generation_lag_allowed,two_generation_lag_rejected,live_generation_read_guard_held_through_optimizer_update,ragged_feature_arenas,bit_packed_behavioral_masks,padding_only_per_minibatch,explicit_cpu_cuda_metal_learner_selection;",
-    "current_contract=feature20_model22_reward6;prior_feature19_model21_reward5_and_older_not_runtime_or_resume_compatible;explicit_pinned_m21u300_parameter_only_or_m19u162_parameter_padding_initialization_fresh_optimizer_mastery_rng;",
+    "current_contract=feature22_model24_reward7;prior_feature19_model21_reward5_and_older_not_runtime_or_resume_compatible;explicit_pinned_m21u300_parameter_only_or_m19u162_parameter_padding_initialization_fresh_optimizer_mastery_rng;",
     "mastery_v1=opt_in_weak_then_teacher_same_opponent_full_batch,ordered_completed_training_games_by_terminal_tick_then_stream,last_window_default50_max1024_min_full_window,integer_100wins_ge_percent_times_window_default80_per_opponent_overrides1to100,evict_oldest_no_alltime_or_streak,draw_loss_taskcap_nonwins_errors_not_games;promotion=once_after_successful_PPO_batch_next_stage_window_empty,completed_retains_qualifying_teacher_window_forced_coherent_checkpoint_and_normal_stop,update_and_resource_budgets_remain,no_separate_eval_gate,no_stage_feature;checkpoint9=unchanged_mastery_codec_typed_config_current_stage_entire_ordered_window_with_parameters_Adam_RNG_progress;teacher_default_and_weak_warmup_v1_selection_unchanged;"
 );
 
@@ -73,9 +74,9 @@ pub const PPO_SCHEMA_HASH: u64 = crate::model::linked_schema_hash(
 );
 
 const _: () = assert!(ACTION_SCHEMA_VERSION == 5);
-const _: () = assert!(FEATURE_SCHEMA_VERSION == 20);
-const _: () = assert!(MODEL_SCHEMA_VERSION == 22);
-const _: () = assert!(PPO_RULES_AUDIT_VERSION == 30);
+const _: () = assert!(FEATURE_SCHEMA_VERSION == 22);
+const _: () = assert!(MODEL_SCHEMA_VERSION == 24);
+const _: () = assert!(PPO_RULES_AUDIT_VERSION == 32);
 
 /// Stage-nine PPO hyperparameters and bounded rollout dimensions.
 #[derive(Clone, Copy, Debug, PartialEq)]

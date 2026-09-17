@@ -1252,6 +1252,8 @@ impl StateTracker {
                     entity.visible = false;
                 }
             }
+            // A miss is not damage and carries no health, mana or death facts.
+            EventKind::Missed { .. } => {}
             EventKind::AbilityCast { .. } => {}
             EventKind::LevelUp { .. }
             | EventKind::ItemBought { .. }

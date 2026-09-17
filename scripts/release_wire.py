@@ -6,8 +6,20 @@ import struct
 import threading
 
 
-CURRENT_SIMULATOR = "037c6a2f8e5383beae9eea6da8cbbb1678f7b718"
+CURRENT_SIMULATOR = "78427bb80eb716f851cb039ade33e2964bbf3c11"
+PREVIOUS_SIMULATOR = "037c6a2f8e5383beae9eea6da8cbbb1678f7b718"
 HISTORICAL_SIMULATOR = "18db0f62d9a2b94e755c43fd29a959db204cc20b"
+SUPPORTED_SIMULATORS = (CURRENT_SIMULATOR, PREVIOUS_SIMULATOR, HISTORICAL_SIMULATOR)
+# EventKind declaration order per pinned simulator contract. The current
+# contract inserted Missed after Damaged; older pins keep their own order.
+EVENT_LAYOUTS = {
+    CURRENT_SIMULATOR: dict(damaged=0, missed=1, healed=2, died=3, cast=4, level=5,
+                            bought=6, structure=7, heal_mana=True),
+    PREVIOUS_SIMULATOR: dict(damaged=0, missed=None, healed=1, died=2, cast=3, level=4,
+                             bought=5, structure=6, heal_mana=True),
+    HISTORICAL_SIMULATOR: dict(damaged=0, missed=None, healed=1, died=2, cast=3, level=4,
+                               bought=5, structure=6, heal_mana=False),
+}
 FRAME_LIMIT = 4 * 1024 * 1024
 SERVER_BYTE_LIMIT = 512 * 1024 * 1024
 CLIENT_BYTE_LIMIT = 64 * 1024 * 1024
@@ -74,32 +86,40 @@ class Postcard:
 
 
 def verify_event(cursor, simulator_commit):
+    layout = EVENT_LAYOUTS[simulator_commit]
     kind = cursor.integer()
-    if kind in (0, 1):
+    if kind == layout["damaged"]:
         cursor.optional_entity()
         cursor.entity()
         cursor.integer()  # Signed i32 uses a zigzag-encoded u32.
-        if kind == 0:
-            if cursor.integer() > 2:
-                raise ValueError("invalid damage kind")
-            cursor.flag("bool")
-        elif simulator_commit == CURRENT_SIMULATOR:
+        if cursor.integer() > 2:
+            raise ValueError("invalid damage kind")
+        cursor.flag("bool")
+    elif kind == layout["missed"]:
+        # A miss is not damage and carries no amount, kind or crit.
+        cursor.optional_entity()
+        cursor.entity()
+    elif kind == layout["healed"]:
+        cursor.optional_entity()
+        cursor.entity()
+        cursor.integer()  # Signed i32 uses a zigzag-encoded u32.
+        if layout["heal_mana"]:
             cursor.integer()  # Mana is present even for an HP-only heal.
-    elif kind == 2:
+    elif kind == layout["died"]:
         cursor.entity()
         cursor.optional_entity()
         cursor.flag("bool")
         cursor.integer()
-    elif kind == 3:
+    elif kind == layout["cast"]:
         cursor.entity()
         cursor.integer(16)
-    elif kind == 4:
+    elif kind == layout["level"]:
         cursor.entity()
         cursor.byte()
-    elif kind == 5:
+    elif kind == layout["bought"]:
         cursor.byte()
         cursor.integer(16)
-    elif kind == 6:
+    elif kind == layout["structure"]:
         cursor.entity()
         if cursor.integer() > 2:
             raise ValueError("invalid event team")
@@ -109,7 +129,7 @@ def verify_event(cursor, simulator_commit):
 
 def verify_events(payload, simulator_commit=CURRENT_SIMULATOR):
     """Validate a complete ServerMsg::Events payload and return its u32 tick."""
-    if simulator_commit not in (CURRENT_SIMULATOR, HISTORICAL_SIMULATOR):
+    if simulator_commit not in SUPPORTED_SIMULATORS:
         raise ValueError("unsupported simulator wire contract")
     cursor = Postcard(payload)
     if cursor.integer() != 4:
@@ -125,8 +145,10 @@ def verify_events(payload, simulator_commit=CURRENT_SIMULATOR):
     return tick
 
 
-def verify_client_message(payload):
-    """Validate the shared current/historical client schema; return kind and optional ACK tick."""
+def verify_client_message(payload, simulator_commit=CURRENT_SIMULATOR):
+    """Validate the pinned client schema; return kind and optional ACK tick."""
+    if simulator_commit not in SUPPORTED_SIMULATORS:
+        raise ValueError("unsupported simulator wire contract")
     cursor = Postcard(payload)
     kind, tick = cursor.integer(), None
     if kind == 0:
@@ -148,7 +170,7 @@ def verify_client_message(payload):
     elif kind == 3:
         cursor.integer()
         cursor.optional_entity()
-        verify_client_order(cursor)
+        verify_client_order(cursor, simulator_commit)
     elif kind == 4:
         tick = cursor.integer()
     elif kind == 5:
@@ -163,8 +185,25 @@ def verify_client_message(payload):
     return kind, tick
 
 
-def verify_client_order(cursor):
+def verify_client_order(cursor, simulator_commit=CURRENT_SIMULATOR):
+    if simulator_commit not in SUPPORTED_SIMULATORS:
+        raise ValueError("unsupported simulator wire contract")
     kind = cursor.integer()
+    if kind == 10:
+        # Cheat orders exist only in the current contract and are never issued
+        # or honoured by any drysua seat; they are still decoded structurally.
+        if simulator_commit != CURRENT_SIMULATOR:
+            raise ValueError("unknown client order")
+        cheat = cursor.integer()
+        if cheat == 0:  # Gold: signed i32 zigzag.
+            cursor.integer()
+        elif cheat == 1:  # Levels: u8.
+            cursor.byte()
+        elif cheat == 3:  # Item: ItemId u16.
+            cursor.integer(16)
+        elif cheat != 2:  # Refresh has no payload.
+            raise ValueError("unknown cheat")
+        return
     if kind > 9:
         raise ValueError("unknown client order")
     if kind in (2, 3, 4, 7, 9):
@@ -188,7 +227,7 @@ class Relay:
 
     def __init__(self, port, timeout, tick_limit, expected_map=None, expected_seed=None,
                  byte_limit=SERVER_BYTE_LIMIT, simulator_commit=CURRENT_SIMULATOR):
-        if simulator_commit not in (CURRENT_SIMULATOR, HISTORICAL_SIMULATOR):
+        if simulator_commit not in SUPPORTED_SIMULATORS:
             raise ValueError("unsupported simulator wire contract")
         self.simulator_commit = simulator_commit
         self.port = port
@@ -324,7 +363,7 @@ class Relay:
             self.client_frames += 1
             if self.client_frames > self.tick_limit * 4 + 1000:
                 raise ValueError("client wire frame limit exceeded")
-            kind, tick = verify_client_message(frame[4:])
+            kind, tick = verify_client_message(frame[4:], getattr(self, "simulator_commit", CURRENT_SIMULATOR))
             if kind == 4:
                 if tick > self.observed.get("last_snapshot", 0):
                     raise ValueError("ACK exceeds observed snapshot or malformed ACK")

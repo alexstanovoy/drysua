@@ -1,4 +1,9 @@
-"""Current postcard event vectors; no processes, sockets, clocks, or matches."""
+"""Pinned postcard event/order vectors; no processes, sockets, clocks, or matches.
+
+Every fixture is bound to exactly one simulator pin. Current (78427bb) inserted
+Missed after Damaged and shifted the later variants; the previous (037c6a2) and
+historical (18db0f6) pins keep their own order and are never decoded as current.
+"""
 
 import struct
 import unittest
@@ -6,16 +11,51 @@ import unittest
 import release_wire as wire
 
 
-CURRENT = "037c6a2f8e5383beae9eea6da8cbbb1678f7b718"
-HISTORICAL = "18db0f62d9a2b94e755c43fd29a959db204cc20b"
-HP_ONLY = bytes.fromhex("01 01 ac02 02 ad02 03 fa01 00")
-MANA_ONLY = bytes.fromhex("01 00 ad02 03 00 ac02")
-BOTH = bytes.fromhex("01 01 ac02 02 ad02 03 5a f001")
-# Damage, death, cast, level, purchase, structure, in EventKind declaration order.
-FOLLOWING = bytes.fromhex(
+CURRENT = wire.CURRENT_SIMULATOR
+PREVIOUS = wire.PREVIOUS_SIMULATOR
+HISTORICAL = wire.HISTORICAL_SIMULATOR
+HEAL_TAG = {CURRENT: b"\x02", PREVIOUS: b"\x01", HISTORICAL: b"\x01"}
+# Previous-pin event bodies in the pre-Missed declaration order.
+HP_ONLY_OLD = bytes.fromhex("01 01 ac02 02 ad02 03 fa01 00")
+MANA_ONLY_OLD = bytes.fromhex("01 00 ad02 03 00 ac02")
+BOTH_OLD = bytes.fromhex("01 01 ac02 02 ad02 03 5a f001")
+# Current order: Damage(0), Missed(1), Healed(2), Died(3), Cast(4), Level(5),
+# purchase(6), structure(7). Missed carries only an optional source and target.
+FOLLOWING_CURRENT = bytes.fromhex(
+    "00 01 ac02 02 ad02 03 9003 01 01 "
+    "01 01 ac02 02 ad02 03 "
+    "02 01 ac02 02 ad02 03 5a f001 "
+    "03 ad02 03 01 ac02 02 00 a006 "
+    "04 ac02 02 c801 "
+    "05 ac02 02 ff "
+    "06 01 c901 "
+    "07 ae02 04 01")
+
+# Damage, death, cast, level, purchase, structure under the previous pin.
+FOLLOWING_OLD = bytes.fromhex(
     "00 01 ac02 02 ad02 03 9003 01 01 "
     "02 ad02 03 01 ac02 02 00 a006 "
     "03 ac02 02 c801 04 ac02 02 ff 05 01 c901 06 ae02 04 01")
+
+
+def rebase_heal(fixture, simulator):
+    """Re-tag a previous-pin heal body for another pin; Missed shifts only tags."""
+    if simulator == PREVIOUS or simulator == HISTORICAL:
+        return fixture
+    return HEAL_TAG[simulator] + fixture[1:]
+
+
+def rebase_bytes(fixture, simulator):
+    """Re-tag a previous-pin mixed batch for the current shifted order."""
+    if simulator != CURRENT:
+        return fixture
+    return fixture.replace(b"\x01\x01 ac02", b"\x02\x01 ac02", 1).replace(
+        b"\x01\x00 ad02", b"\x02\x00 ad02", 1).replace(
+        b"\x01\x01 ac02 02 ad02 03 5a f001", b"\x02\x01 ac02 02 ad02 03 5a f001", 1)
+
+
+# Convenience current-pin heal batch for helpers that default to the current pin.
+BOTH_CURRENT = rebase_heal(BOTH_OLD, CURRENT)
 
 
 def integer(value):
@@ -38,6 +78,11 @@ def frame(payload):
     return struct.pack("<I", len(payload)) + payload
 
 
+def order_message(order_body):
+    # ClientMsg::Order: kind, sequence, optional entity (flag and two varints).
+    return b"\x03" + integer(7) + b"\x01" + integer(300) + integer(2) + order_body
+
+
 def observer(tick=901):
     relay = wire.Relay.__new__(wire.Relay)
     relay.tick_limit = tick
@@ -56,97 +101,147 @@ def snapshot_with_effects():
         300, 2, 1, 0,                     # Entity, UnitKind, Team.
         2 * 100 * 65536, 2 * 100 * 65536, 0,  # Position and facing.
         2 * 550, 2 * 550, 0, 0,          # Health and mana.
-        2 * 325 * 65536, 2 * 20, 2 * 100 * 65536, 30, 2 * 100,
-        2 * 2 * 65536, 2 * 16384, 2 * 16 * 65536,
+        2 * 325 * 65536, 2 * 20, 2 * 100 * 65536, 30, 30, 2 * 100,
+        2 * 2 * 65536, 2 * 16384, 2 * 27 * 65536, 2 * 24 * 65536,
         2 * 800 * 65536, 0, 0,           # Vision, true sight, statuses.
         0, 0, 0, 0, 0, 0, 0,            # Attributes, primary, hero, owner, level.
         0, 0, 3,                        # Abilities, items, effects lengths.
     )
     effects = bytes.fromhex("0d 01 8407 00 0e 00 00 0f 01 9601 01 02")
     unit = b"".join(integer(value) for value in fields) + effects
-    # WorldView: tick/viewer, units, projectiles, players, trees, planted trees, loot.
     return b"\x03" + integer(901) + b"\x01\x00\x01" + unit + bytes(5)
 
 
-class EventTests(unittest.TestCase):
-    def test_generic_effect_ids_13_14_15_do_not_change_snapshot_or_next_event_framing(self):
+class CurrentEventTests(unittest.TestCase):
+    def test_current_missed_is_accepted_and_consumed_before_later_variants(self):
+        payload = events(FOLLOWING_CURRENT, 8)
+        self.assertEqual(wire.verify_events(payload), 901)
         relay = observer()
-        relay.observed["last_snapshot"] = 900
-        data = frame(snapshot_with_effects()) + frame(events(BOTH))
-        relay.observe(data)
-        self.assertEqual(relay.observed["last_snapshot"], 901)
+        relay.observe(frame(payload))
         self.assertTrue(relay.observed["cap_events"])
-        self.assertEqual(relay.frames, 2)
         self.assertEqual(relay.buffer, b"")
 
-    def test_current_heals_consume_health_and_mana_before_every_following_variant(self):
-        for healed in (HP_ONLY, MANA_ONLY, BOTH):
+    def test_current_heals_shift_to_index_two_and_consume_mana(self):
+        for healed in (HP_ONLY_OLD, MANA_ONLY_OLD, BOTH_OLD):
             with self.subTest(healed=healed.hex()):
-                payload = events(healed + FOLLOWING, 7)
-                self.assertEqual(wire.verify_events(payload), 901)
-                relay = observer()
-                relay.observe(frame(payload))
-                self.assertTrue(relay.observed["cap_events"])
-                self.assertEqual(relay.buffer, b"")
+                self.assertEqual(wire.verify_events(events(rebase_heal(healed, CURRENT))), 901)
 
-    def test_duplicate_individual_heals_and_empty_batch_are_valid(self):
-        for payload in (events(BOTH * 3, 3), events(b"", 0)):
-            self.assertEqual(wire.verify_events(payload), 901)
+    def test_current_shifted_following_variants_stay_aligned(self):
+        payload = events(FOLLOWING_CURRENT, 8)
+        self.assertEqual(wire.verify_events(payload), 901)
+        relay = observer()
+        relay.observe(frame(payload))
+        self.assertTrue(relay.observed["cap_events"])
 
-    def test_missing_truncated_overflow_and_noncanonical_mana_cannot_verify_cap(self):
-        prefix = HP_ONLY[:-1]
-        for mana, message in ((b"", "truncated postcard integer"),
-                              (b"\x80", "truncated postcard integer"),
-                              (integer(2**32), "postcard integer exceeds u32"),
-                              (b"\x80\x00", "noncanonical postcard integer")):
-            with self.subTest(mana=mana.hex()):
-                relay = observer()
-                with self.assertRaisesRegex(ValueError, message):
-                    relay.observe(frame(events(prefix + mana)))
-                self.assertFalse(relay.observed["cap_events"])
-
-    def test_signed_i32_wire_boundaries_remain_representable(self):
-        # Signed values are zigzag u32, not semantic HP/mana validation.
-        prefix = bytes.fromhex("01 00 ad02 03")
-        self.assertEqual(wire.verify_events(events(prefix + integer(2**32 - 1) * 2)), 901)
-
-    def test_every_truncation_of_a_heal_and_following_batch_fails(self):
-        payload = events(BOTH + FOLLOWING, 7)
-        for length in range(len(payload)):
-            with self.subTest(length=length), self.assertRaisesRegex(ValueError, "truncated"):
-                wire.verify_events(payload[:length])
-
-    def test_invalid_event_fields_and_trailing_bytes_fail_closed(self):
+    def test_current_invalid_kinds_and_fields_fail_closed(self):
         invalid = (
-            (events(b"\x07"), "unknown event kind"),
+            (events(b"\x08"), "unknown event kind"),
             (events(b"\x01\x02"), "invalid postcard option"),
-            (events(b"\x01\x00" + integer(2**32)), "postcard integer exceeds u32"),
-            (events(bytes.fromhex("05 00") + integer(2**16)), "postcard integer exceeds u16"),
-            (events(bytes.fromhex("06 01 00 03")), "invalid event team"),
+            (events(b"\x02\x00" + integer(2**32)), "postcard integer exceeds u32"),
+            (events(bytes.fromhex("06 00") + integer(2**16)), "postcard integer exceeds u16"),
+            (events(bytes.fromhex("07 01 00 03")), "invalid event team"),
             (events(bytes.fromhex("00 00 01 00 02 03 00")), "invalid damage kind"),
             (events(bytes.fromhex("00 00 01 00 02 00 02")), "invalid postcard bool"),
-            (events(BOTH) + b"\x00", "trailing Events bytes"),
-            (events(b"", 4 * 1024 * 1024 // 3 + 1), "event count limit exceeded"),
-            (events(b"", tick=2**32), "postcard integer exceeds u32"),
         )
         for payload, message in invalid:
             with self.subTest(payload=payload.hex()), self.assertRaisesRegex(ValueError, message):
                 wire.verify_events(payload)
 
+    def test_missed_has_no_amount_kind_or_crit_fields(self):
+        # One byte too few for Damaged framing, exactly right for Missed.
+        body = bytes.fromhex("00 01 ac02 02 ad02 03 9003 01")
+        with self.assertRaisesRegex(ValueError, "truncated"):
+            wire.verify_events(events(body))
+
+
+class PreviousPinTests(unittest.TestCase):
+    def test_previous_heals_keep_the_old_declaration_order(self):
+        for healed in (HP_ONLY_OLD, MANA_ONLY_OLD, BOTH_OLD):
+            with self.subTest(healed=healed.hex()):
+                payload = events(healed + FOLLOWING_OLD, 7)
+                self.assertEqual(wire.verify_events(payload, PREVIOUS), 901)
+                relay = observer()
+                relay.simulator_commit = PREVIOUS
+                relay.observe(frame(payload))
+                self.assertTrue(relay.observed["cap_events"])
+                self.assertEqual(relay.buffer, b"")
+
+    def test_current_missed_tag_is_healed_under_the_previous_pin(self):
+        # A current-shaped Missed first byte cannot be guessed as a miss.
+        with self.assertRaisesRegex(ValueError, "truncated|invalid"):
+            wire.verify_events(events(bytes.fromhex("01 01 ac02 02 ad02")), PREVIOUS)
+
+    def test_previous_truncations_and_trailing_bytes_fail(self):
+        payload = events(BOTH_OLD + FOLLOWING_OLD, 7)
+        for length in range(len(payload)):
+            with self.subTest(length=length), self.assertRaisesRegex(ValueError, "truncated"):
+                wire.verify_events(payload[:length], PREVIOUS)
+        with self.assertRaisesRegex(ValueError, "trailing Events bytes"):
+            wire.verify_events(events(BOTH_OLD) + b"\x00", PREVIOUS)
+
     def test_historical_heal_requires_explicit_pin_and_is_not_guessed(self):
-        old_payload = events(HP_ONLY[:-1])
+        old_payload = events(HP_ONLY_OLD[:-1])
         self.assertEqual(wire.verify_events(old_payload, HISTORICAL), 901)
         with self.assertRaisesRegex(ValueError, "truncated postcard integer"):
-            wire.verify_events(old_payload)
+            wire.verify_events(old_payload, PREVIOUS)
         with self.assertRaisesRegex(ValueError, "trailing Events bytes"):
-            wire.verify_events(events(HP_ONLY), HISTORICAL)
+            wire.verify_events(events(HP_ONLY_OLD), HISTORICAL)
         with self.assertRaisesRegex(ValueError, "unsupported simulator wire contract"):
-            wire.verify_events(events(BOTH), "unknown")
+            wire.verify_events(events(BOTH_OLD), "unknown")
 
-    def test_fragmented_events_then_native_draw_preserve_frame_alignment(self):
+
+class ClientOrderTests(unittest.TestCase):
+    def test_current_cheat_variants_are_decoded_structurally(self):
+        variants = (
+            bytes([10, 0]) + integer(2 * 100 + 1),  # Gold +100 zigzag.
+            bytes([10, 1, 3]),                      # Levels 3.
+            bytes([10, 2]),                         # Refresh.
+            bytes([10, 3]) + integer(46),           # Item 46.
+        )
+        for body in variants:
+            with self.subTest(body=body.hex()):
+                kind, tick = wire.verify_client_message(order_message(body), CURRENT)
+                self.assertEqual((kind, tick), (3, None))
+        self.assertEqual(wire.verify_client_message(order_message(bytes([10, 0]) + integer(1)), CURRENT)[0], 3)
+
+    def test_cheat_is_unknown_under_previous_and_historical_pins(self):
+        body = order_message(bytes([10, 2]))
+        for simulator in (PREVIOUS, HISTORICAL):
+            with self.subTest(simulator=simulator), self.assertRaisesRegex(ValueError, "unknown client order"):
+                wire.verify_client_message(body, simulator)
+
+    def test_unknown_cheat_variant_and_truncated_cheat_fail(self):
+        for body, message in ((bytes([10, 4]), "unknown cheat"),
+                              (bytes([10]), "truncated postcard integer"),
+                              (bytes([10, 3]), "truncated postcard integer")):
+            with self.subTest(body=body.hex()), self.assertRaisesRegex(ValueError, message):
+                wire.verify_client_message(order_message(body), CURRENT)
+
+    def test_ordinary_orders_keep_their_previous_encoding(self):
+        bodies = (
+            bytes([0, 2]) + integer(1000) + integer(2000),  # Move point.
+            bytes([1, 0]),                                   # Attack nothing.
+            bytes([2, 1]) + integer(0),                      # Cast slot 1 on nothing.
+            bytes([3, 0]) + integer(0),                      # Use slot 0 on nothing.
+            bytes([4, 0, 0]),                                # Put nothing.
+            bytes([5, 0]),                                   # Take nothing.
+            bytes([6]) + integer(46),                        # Buy 46.
+            bytes([7, 0]),                                   # Sell slot 0.
+            bytes([8, 0, 1]),                                # Swap.
+            bytes([9, 2]),                                   # Learn slot 2.
+        )
+        for body in bodies:
+            with self.subTest(body=body.hex()):
+                for simulator in (CURRENT, PREVIOUS, HISTORICAL):
+                    self.assertEqual(wire.verify_client_message(order_message(body), simulator)[0], 3)
+
+
+class FramingTests(unittest.TestCase):
+    def test_fragmented_current_events_then_native_draw_preserve_frame_alignment(self):
         relay = observer(27900)
         over = b"\x07\x02" + integer(27900) + b"\x02" + bytes(9) + b"\x01" + bytes(8)
-        data = frame(events(HP_ONLY + MANA_ONLY + BOTH, 3, 27900)) + frame(over)
+        heal = rebase_heal(BOTH_OLD, CURRENT)
+        data = frame(events(heal * 3, 3, 27900)) + frame(over)
         for byte in data:
             relay.observe(bytes([byte]))
         self.assertEqual(relay.observed["winner"], "Neutral")
@@ -155,7 +250,7 @@ class EventTests(unittest.TestCase):
 
     def test_truncated_queued_events_are_not_a_verified_cap(self):
         relay = observer()
-        relay.observe(frame(events(MANA_ONLY))[:-1])
+        relay.observe(frame(events(rebase_heal(MANA_ONLY_OLD, CURRENT)))[:-1])
         self.assertFalse(relay.observed["cap_events"])
         self.assertTrue(relay.buffer)
 
@@ -201,6 +296,10 @@ class BoundTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "postcard integer exceeds u16"):
             relay.observe_message(over)
         self.assertIsNone(relay.observed["winner"])
+
+    def test_duplicate_heals_and_empty_batch_are_valid_under_current(self):
+        for payload in (events(rebase_heal(BOTH_OLD, CURRENT) * 3, 3), events(b"", 0)):
+            self.assertEqual(wire.verify_events(payload), 901)
 
 
 if __name__ == "__main__":

@@ -31,7 +31,9 @@ pub(crate) fn transcript(side: usize) -> Vec<ServerMsg> {
             let hero = world.seats[index].unit.expect("hero");
             world.transform.get_mut(hero).expect("position").pos =
                 Vec2::from_ints(8600 + index as i32 * 200, 8900);
-            world.statuses.remove(hero);
+            world
+                .modifiers
+                .insert(hero, bota_server::game::Modifiers::default());
             world.abilities.get_mut(hero).expect("kit").slots[0].level = 1;
         }
     });

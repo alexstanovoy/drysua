@@ -408,7 +408,9 @@ fn primed_arena(side: usize) -> (Arena, Vec<ServerMsg>, EventKind) {
     let projected = arena.configure_for_test(|world| {
         world.tick = MAP2_TICK_CAP - 1;
         let unit = world.seats[side].unit.expect("assigned hero");
-        world.statuses.remove(unit);
+        world
+            .modifiers
+            .insert(unit, bota_server::game::Modifiers::default());
         world.transform.get_mut(unit).expect("position").pos = Vec2::from_ints(9_216, 9_216);
         hero = Some(bota_server::game::wire_id(unit));
         world.push_hit(None, unit, 1, DamageKind::Pure);

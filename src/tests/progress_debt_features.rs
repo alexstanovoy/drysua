@@ -11,7 +11,7 @@ use bota_proto::{EffectId, EffectView, EventKind, ItemId, MapId, SlotId, Team, W
 
 #[test]
 fn progress_debt_schema_adds_only_three_accounting_globals_after_wait_inputs() {
-    assert_eq!(crate::FEATURE_SCHEMA_VERSION, 20);
+    assert_eq!(crate::FEATURE_SCHEMA_VERSION, 22);
     assert_eq!(crate::GLOBAL_FEATURES, 92);
     assert_eq!(crate::UNIT_FEATURES, 84);
     assert_eq!(global_feature::MAP2_STAGNATION_TICKS, 87);

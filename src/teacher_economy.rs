@@ -353,8 +353,8 @@ fn drink_safe(tracker: &StateTracker, hero: &UnitView) -> bool {
                 raw: enemy
                     .attack_range
                     .raw
-                    .saturating_add(enemy.radius.raw)
-                    .saturating_add(hero.radius.raw)
+                    .saturating_add(enemy.bound.raw)
+                    .saturating_add(hero.bound.raw)
                     .max(Fixed::from_int(700).raw),
             };
             hero.pos.within(enemy.pos, reach)

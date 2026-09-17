@@ -20,7 +20,7 @@ fn wait_source_metadata_keeps_original_reward1_descriptor_independent_of_current
     assert_eq!(metadata["map2_reward_schema_version"], "1");
     assert!(descriptor.starts_with("drysua-map2-reward/v1;"));
     assert_ne!(descriptor, crate::MAP2_REWARD_SCHEMA_DESCRIPTOR);
-    assert_eq!(crate::MAP2_REWARD_SCHEMA_HASH, 1_084_583_101_075_978_392);
+    assert_eq!(crate::MAP2_REWARD_SCHEMA_HASH, 7_274_660_837_025_042_530);
 }
 
 #[test]
@@ -183,8 +183,8 @@ fn wait_pinned_provenance_accepts_only_exact_initial_and_recovery004_digests() {
             text,
             "INITIALIZATION_ONLY",
             "source_reward_version=1",
-            "reward_version=6",
-            "target_f=20 target_a=5 target_m=22 target_ppo=35 target_rules=30",
+            "reward_version=7",
+            "target_f=22 target_a=5 target_m=24 target_ppo=37 target_rules=32",
             "new_weights=3584_positive_zero",
             "optimizer_progress_rng_league=fresh",
             "GAMEPLAY_EQUIVALENCE=false",
@@ -226,13 +226,13 @@ fn assert_source_error(directory: &Directory, bytes: Vec<u8>, expected: Checkpoi
 
 #[test]
 fn wait_schemas_change_actor_and_training_identity_without_changing_actions_or_units() {
-    assert_eq!(crate::FEATURE_SCHEMA_VERSION, 20);
-    assert_eq!(crate::MODEL_SCHEMA_VERSION, 22);
-    assert_eq!(crate::PPO_SCHEMA_VERSION, 35);
-    assert_eq!(crate::PPO_RULES_AUDIT_VERSION, 30);
-    assert_eq!(crate::LEAGUE_SCHEMA_VERSION, 35);
-    assert_eq!(crate::CHECKPOINT_SCHEMA_VERSION, 10);
-    assert_eq!(crate::IMITATION_RULES_AUDIT_VERSION, 20);
+    assert_eq!(crate::FEATURE_SCHEMA_VERSION, 22);
+    assert_eq!(crate::MODEL_SCHEMA_VERSION, 24);
+    assert_eq!(crate::PPO_SCHEMA_VERSION, 37);
+    assert_eq!(crate::PPO_RULES_AUDIT_VERSION, 32);
+    assert_eq!(crate::LEAGUE_SCHEMA_VERSION, 37);
+    assert_eq!(crate::CHECKPOINT_SCHEMA_VERSION, 12);
+    assert_eq!(crate::IMITATION_RULES_AUDIT_VERSION, 22);
     assert_eq!(crate::ACTION_SCHEMA_HASH, 10_658_390_830_565_586_343);
     assert_eq!(crate::MODEL_PARAMETER_COUNT, 1_700_020);
 }

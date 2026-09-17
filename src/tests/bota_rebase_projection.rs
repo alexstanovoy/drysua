@@ -1,7 +1,7 @@
 use super::feature::encode;
 use crate::{FeatureFrame, LocalPolicyState, StateTracker, unit_feature};
 use bota_proto::{EffectId, EventKind, Fixed, MapId, ServerMsg, SlotId, Target};
-use bota_server::game::{Status, StatusKind, wire_id};
+use bota_server::game::{Modifier, ModifierKind, wire_id};
 
 #[test]
 fn rebased_upstream_effect_catalog_and_15_minute_cap_match_inference_contract() {
@@ -167,21 +167,22 @@ fn put_visible_effects(
     body: bota_server::game::Entity,
     source: bota_server::game::Entity,
 ) {
-    let mut statuses = world.statuses.remove(body).unwrap_or_default();
+    let mut modifiers = world.modifiers.remove(body).unwrap_or_default();
     for kind in [
-        StatusKind::Guarded {
+        ModifierKind::Guarded {
             armor: 2,
             hp_per_second: 1,
         },
-        StatusKind::Inspired { hp_per_second: 2 },
+        ModifierKind::Inspired { hp_per_second: 2 },
     ] {
-        statuses.put(Status {
+        modifiers.put(Modifier {
             kind,
-            ticks_left: 15,
+            source: Some(source),
+            ticks_left: Some(15),
         });
     }
-    statuses.stack_raze(source);
-    world.statuses.insert(body, statuses);
+    modifiers.stack_raze(source);
+    world.modifiers.insert(body, modifiers);
     let view = world.view(world.team.get(body).copied().expect("team"));
     let unit = view
         .units

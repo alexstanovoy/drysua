@@ -145,14 +145,11 @@ fn rebalance_raw_fixed_radius_edges_dead_flags_clone_and_complete_pair_are_prese
 fn rebalance_general_bounds_do_not_claim_win_dominance_for_nonzero_primed_potentials() {
     close(crate::MAP2_REWARD_EVENT_POSITIVE_BOUND, 0.14);
     close(crate::MAP2_REWARD_EVENT_NEGATIVE_BOUND, 0.335);
-    close(crate::MAP2_REWARD_NATIVE_POSITIVE_BOUND, 0.445);
+    close(crate::MAP2_REWARD_NATIVE_POSITIVE_BOUND, 0.645);
     close(crate::MAP2_REWARD_NATIVE_NEGATIVE_BOUND, 1.0488);
-    close(crate::MAP2_REWARD_POSITIVE_BOUND, 0.845);
+    close(crate::MAP2_REWARD_POSITIVE_BOUND, 1.045);
     close(crate::MAP2_REWARD_DENSE_BOUND, 1.4488);
-    close(
-        0.2 - crate::MAP2_REWARD_NATIVE_POSITIVE_BOUND - crate::MAP2_REWARD_NATIVE_NEGATIVE_BOUND,
-        -1.2938,
-    );
+    close(0.2 - crate::MAP2_REWARD_NATIVE_NEGATIVE_BOUND, -0.8488);
     let win = primed_episode(true, Map2RewardEnd::Win);
     let draw = primed_episode(false, Map2RewardEnd::Draw);
     assert!(
@@ -379,4 +376,35 @@ fn close(actual: f64, expected: f64) {
         (actual - expected).abs() < 1.0e-12,
         "actual={actual}, expected={expected}"
     );
+}
+
+#[test]
+fn wire_rebase_missed_is_not_damage_healing_or_a_terminal_and_changes_no_counter() {
+    let mut reward = initialized();
+    let baseline = advance(&mut reward, &snapshot(2), &[]);
+    let before = reward.state();
+    let missed = bota_proto::EventKind::Missed {
+        source: Some(id(1)),
+        target: id(2),
+    };
+    let result = advance(&mut reward, &snapshot(3), &[missed]);
+
+    assert_eq!(baseline.total, 0.0);
+    assert_eq!(result.total, 0.0);
+    assert_eq!(result.gold, 0.0);
+    assert_eq!(result.experience, 0.0);
+    assert_eq!(result.hero_damage, 0.0);
+    assert_eq!(result.hero_damage_taken, 0.0);
+    assert_eq!(result.creep_damage_taken, 0.0);
+    assert_eq!(result.other_damage_taken, 0.0);
+    assert_eq!(result.tower_damage_taken, 0.0);
+    assert_eq!(result.mana_spent, 0.0);
+    assert_eq!(result.terminal, 0.0);
+    assert!(result.end.is_none());
+    assert_eq!(result.observations.hero_damage_dealt, 0);
+    assert_eq!(result.observations.hero_damage_taken, 0);
+    assert_eq!(result.observations.unattributed_damage_events, 0);
+    assert_eq!(reward.state().remaining, before.remaining);
+    assert_eq!(reward.state().tower_potential, before.tower_potential);
+    assert_eq!(reward.state().lane_potential, before.lane_potential);
 }

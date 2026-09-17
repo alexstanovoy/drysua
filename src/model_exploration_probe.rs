@@ -30,7 +30,7 @@ pub(crate) struct ActorSoftening {
 
 impl PolicyModel {
     pub(crate) fn softened_actor_parameters(&self) -> Result<ActorSoftening, ModelError> {
-        assert_eq!(MODEL_SCHEMA_VERSION, 22);
+        assert_eq!(MODEL_SCHEMA_VERSION, 24);
         let _guard = self.read_parameter_lock()?;
         let tensors = self.parameters();
         assert_eq!(tensors.len(), 62);

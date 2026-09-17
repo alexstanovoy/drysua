@@ -20,7 +20,7 @@ use potential::Tower;
 pub use progress::*;
 
 /// Independent metadata version for the Map2 reward profile.
-pub const MAP2_REWARD_SCHEMA_VERSION: u32 = 6;
+pub const MAP2_REWARD_SCHEMA_VERSION: u32 = 7;
 /// Maximum events consumed atomically in one seat-visible tick.
 pub const MAP2_REWARD_MAX_EVENTS: usize = 4096;
 /// Maximum visible units accepted in one snapshot.
@@ -41,6 +41,15 @@ pub const MAP2_REWARD_OPENING_POSITION_BOUND: f64 = 0.1;
 pub const MAP2_REWARD_GAMMA_TICK: f32 = 1.0;
 /// Maximum pre-wave center-distance potential, in reward units.
 pub const MAP2_REWARD_PREGAME_CENTER_SCALE: f64 = 0.005;
+/// Full victory-time bonus for a win at or before five native minutes.
+pub const MAP2_REWARD_VICTORY_TIME_FULL_TICKS: u32 = 9_000;
+/// Native tick from which the victory-time bonus has fallen to zero.
+pub const MAP2_REWARD_VICTORY_TIME_NONE_TICKS: u32 = 21_600;
+/// Largest positive victory-time bonus.
+pub const MAP2_REWARD_VICTORY_TIME_BONUS: f64 = 0.2;
+/// Decay order of the victory-time interpolation: an integer low order,
+/// tunable in `1..=4`; `1` reproduces the old linear profile.
+pub const MAP2_REWARD_VICTORY_TIME_POWER: u32 = 2;
 /// Complete stationary/full fountain intervals before the initial wait charge.
 pub const MAP2_REWARD_FOUNTAIN_GRACE_TICKS: u32 = crate::MAP2_TICK_RATE;
 /// Initial fountain wait cost at the grace boundary, in reward units.
@@ -80,8 +89,10 @@ pub const MAP2_REWARD_EVENT_POSITIVE_BOUND: f64 = BUDGETS[0] + BUDGETS[2] + BUDG
 pub const MAP2_REWARD_EVENT_NEGATIVE_BOUND: f64 =
     BUDGETS[1] + BUDGETS[3] + BUDGETS[5] + BUDGETS[6] + BUDGETS[7] + BUDGETS[8] + BUDGETS[9];
 /// Positive full-episode bound ONLY when initial tower and lane potentials are zero.
-pub const MAP2_REWARD_NATIVE_POSITIVE_BOUND: f64 =
-    MAP2_REWARD_EVENT_POSITIVE_BOUND + TOWER_SCALE + MAP2_REWARD_PREGAME_CENTER_SCALE;
+pub const MAP2_REWARD_NATIVE_POSITIVE_BOUND: f64 = MAP2_REWARD_EVENT_POSITIVE_BOUND
+    + TOWER_SCALE
+    + MAP2_REWARD_PREGAME_CENTER_SCALE
+    + MAP2_REWARD_VICTORY_TIME_BONUS;
 /// Negative full-episode bound ONLY when initial tower and lane potentials are zero.
 pub const MAP2_REWARD_NATIVE_NEGATIVE_BOUND: f64 = MAP2_REWARD_EVENT_NEGATIVE_BOUND
     + TOWER_SCALE
@@ -97,7 +108,7 @@ pub const MAP2_REWARD_POSITIVE_BOUND: f64 =
     MAP2_REWARD_NATIVE_POSITIVE_BOUND + TOWER_SCALE + LANE_SCALE;
 /// Exact accounting and calibration contract; coefficients are engineering choices.
 pub const MAP2_REWARD_SCHEMA_DESCRIPTOR: &str = concat!(
-    "drysua-map2-reward/v6;map2_1v1_seat_snapshot_events_contiguous_tick_complete;",
+    "drysua-map2-reward/v7;map2_1v1_seat_snapshot_events_contiguous_tick_complete;",
     "units4096_events4096_identities8192_towers64_tick27900_amount1000000_xp1000000000;",
     "public_metadata=map2_rate30_terrain_axis1to512_pregame0to27900;",
     "identity_opaque_full_generation_public_scoreboard_heroes_retained_other_metadata480ticks;",
@@ -126,12 +137,12 @@ pub const MAP2_REWARD_SCHEMA_DESCRIPTOR: &str = concat!(
     "progress_penalty=base.02_at_first2700_no_rate_same_tick_latch_until_debt0_subsequent_inactive_ticks_at2700_cost.000002_partial_repay_preserves_latch_no_refund_no_reward_clipping;",
     "progress_state=stagnation_ticks_u32_activity_ticks_left_u32_stagnation_base_charged_bool_only;progress_purchase=lease_only_never_debt_reset_independent_of_unchanged_v2_fountain_full_refund;",
     "opening_position=one_shot_first_own_live_not_dead_lane_creep_within1500inclusive_of_center9216_9216_during_public_pregame_to_pregame_plus900_exclusive_else_fallback_at_pregame_plus900_checked_u32_not_clamped_to_earlier_native_cap;first_complete_baseline_free_already_due_or_approaching_baseline_resolves_without_deferred_charge;cost=.1_times_clamp((Euclidean_hero_distance-1500)/1500,0,1)_negative_exact_raw_fixed_1500_and3000_boundaries_missing_or_dead_body_full_cost;resolve_including_zero_never_rearm_on_body_or_purchase_or_wait_changes_finish_cancels_pending_without_cost_no_later_retreat_penalty;state=opening_position_pending_bool;raw=opening_position_checks;",
-    "terminal_win.2_loss-.2_draw0_timecap-.2_distinct_outcome_labels_lane_zero_tower_final_retained;infrastructure_errors_never_terminal_rewards;",
+    "terminal_win.2_loss-.2_draw0_timecap-.2_distinct_outcome_labels_lane_zero_tower_final_retained;infrastructure_errors_never_terminal_rewards;victory_time_win_only_native_ticks_including900_pregame:+.2_if_t<=9000_else+.2*((21600-t)/12600)^2_while_9000<t<21600_else0_continuous_f64_no_rounding_positive_only_low_order_power2_tunable1to4_power1_is_linear;",
     "finish_preserves_pregame_hint_wait_and_stagnation_totals_no_extra_charge_repayment_or_refund;",
     "v2_dense_bound=.4_v1+.005_center+.0001_times27900over30=.498,wait_rate_le_base_refund_le_charged_current_period_no_wait_clipping;",
     "progress_bounds=max_base_charges1plus27900minus2700_over2700plus900=8_cost_bound8times.02_plus27900times.000002=.2158;",
-    "bounds=event_positive.14_event_negative.335_center_abs.005_opening_negative.1_wait_negative.093_stagnation_negative.2158;normal_full_native_start_requires_initial_tower_phi0_lane_phi0_terminal_lane_net0_positive.445_negative1.0488_sum1.4938_exceeds_win_draw_gap.2_and_win_loss_gap.4_no_terminal_dominance;",
-    "general_allowed_primed_baseline_tower_delta_abs.6_terminal_lane_abs.1_positive.845_negative1.4488_no_unconditional_terminal_dominance_no_clipping_or_budget_shrinking;"
+    "bounds=event_positive.14_event_negative.335_center_abs.005_opening_negative.1_wait_negative.093_stagnation_negative.2158;normal_full_native_start_requires_initial_tower_phi0_lane_phi0_terminal_lane_net0_positive.645_including_victory_time.2_negative1.0488_no_terminal_dominance;",
+    "general_allowed_primed_baseline_tower_delta_abs.6_terminal_lane_abs.1_positive1.045_including_victory_time.2_negative1.4488_no_unconditional_terminal_dominance_no_clipping_or_budget_shrinking;"
 );
 /// Stable FNV-1a hash of the complete independent reward descriptor.
 pub const MAP2_REWARD_SCHEMA_HASH: u64 = schema_hash(MAP2_REWARD_SCHEMA_DESCRIPTOR.as_bytes());
@@ -166,6 +177,14 @@ const _: () = assert!(MAP2_REWARD_STAGNATION_MAX_BASE_CHARGES == 8);
 const _: () = assert!(MAP2_REWARD_STAGNATION_BASE_COST > 0.0);
 const _: () = assert!(MAP2_REWARD_STAGNATION_TICK_COST > 0.0);
 const _: () = assert!(MAP2_REWARD_NATIVE_NEGATIVE_BOUND + MAP2_REWARD_NATIVE_POSITIVE_BOUND > 0.4);
+const _: () = assert!(MAP2_REWARD_VICTORY_TIME_FULL_TICKS == 5 * 60 * crate::MAP2_TICK_RATE);
+const _: () = assert!(MAP2_REWARD_VICTORY_TIME_NONE_TICKS == 12 * 60 * crate::MAP2_TICK_RATE);
+const _: () =
+    assert!(MAP2_REWARD_VICTORY_TIME_NONE_TICKS - MAP2_REWARD_VICTORY_TIME_FULL_TICKS == 12_600);
+const _: () = assert!(MAP2_REWARD_VICTORY_TIME_BONUS == 0.2);
+const _: () = assert!(MAP2_REWARD_VICTORY_TIME_POWER >= 1 && MAP2_REWARD_VICTORY_TIME_POWER <= 4);
+const _: () = assert!(MAP2_REWARD_VICTORY_TIME_POWER == 2);
+const _: () = assert!(MAP2_REWARD_VICTORY_TIME_FULL_TICKS < MAP2_REWARD_VICTORY_TIME_NONE_TICKS);
 const _: () = assert!(MAP2_REWARD_DENSE_BOUND >= MAP2_REWARD_POSITIVE_BOUND);
 const _: () = assert!(MAP2_REWARD_TOWER_CHANNEL == MAP2_REWARD_LEGACY_CHANNELS);
 const _: () = assert!(MAP2_REWARD_TOWER_CHANNEL + 1 == MAP2_REWARD_CHANNELS);
@@ -189,6 +208,8 @@ pub struct Map2RewardObservations {
     pub tower_damage_taken: u64,
     /// Postbaseline one-shot opening assessments, including zero-cost assessments.
     pub opening_position_checks: u64,
+    /// Native ticks at a win; zero for every non-win outcome.
+    pub victory_time_ticks: u64,
     pub own_gold_earned: u64,
     pub enemy_gold_earned: u64,
     pub own_xp_gained: u64,
@@ -257,6 +278,8 @@ pub struct Map2RewardBreakdown {
     pub stagnation_base: f64,
     pub stagnation_ticks_cost: f64,
     pub terminal: f64,
+    /// Positive-only reward for winning inside the native duration window.
+    pub victory_time: f64,
     pub total: f64,
     pub end: Option<Map2RewardEnd>,
     pub observations: Map2RewardObservations,
@@ -464,6 +487,14 @@ impl Map2Reward {
             Map2RewardEnd::Loss | Map2RewardEnd::TimeCap => -0.2,
             Map2RewardEnd::Draw => 0.0,
         };
+        let completed = self
+            .current
+            .as_ref()
+            .expect("complete interval has a completed tick")
+            .tick;
+        self.interval.victory_time = victory_time_bonus(end, completed);
+        self.interval.observations.victory_time_ticks =
+            u64::from(end == Map2RewardEnd::Win) * u64::from(completed);
         self.interval.end = Some(end);
         self.interval.retotal();
         self.ended = true;
@@ -574,10 +605,29 @@ impl Map2RewardBreakdown {
             + self.fountain_wait_refund
             + self.stagnation_base
             + self.stagnation_ticks_cost
-            + self.terminal;
+            + self.terminal
+            + self.victory_time;
         assert!(self.total.is_finite());
         assert!(self.ticks <= MAX_TICK);
     }
+}
+
+/// Positive-only bonus for a win at `tick` native ticks: full through five
+/// minutes, linear to zero at twelve, absent after that.
+fn victory_time_bonus(end: Map2RewardEnd, tick: u32) -> f64 {
+    if end != Map2RewardEnd::Win || tick >= MAP2_REWARD_VICTORY_TIME_NONE_TICKS {
+        return 0.0;
+    }
+    if tick <= MAP2_REWARD_VICTORY_TIME_FULL_TICKS {
+        return MAP2_REWARD_VICTORY_TIME_BONUS;
+    }
+    let remaining = f64::from(MAP2_REWARD_VICTORY_TIME_NONE_TICKS - tick);
+    let span = f64::from(MAP2_REWARD_VICTORY_TIME_NONE_TICKS - MAP2_REWARD_VICTORY_TIME_FULL_TICKS);
+    let fraction = remaining / span;
+    let bonus =
+        MAP2_REWARD_VICTORY_TIME_BONUS * fraction.powi(MAP2_REWARD_VICTORY_TIME_POWER as i32);
+    assert!((0.0..=MAP2_REWARD_VICTORY_TIME_BONUS).contains(&bonus));
+    bonus
 }
 
 fn invalid<T>(message: &'static str) -> Result<T, Map2RewardError> {

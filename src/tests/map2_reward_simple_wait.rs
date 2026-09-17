@@ -5,8 +5,8 @@ use crate::{Map2Reward, Map2RewardEnd};
 
 #[test]
 fn reward_schema_preserves_simple_wait_refund_semantics_with_progress_debt() {
-    assert_eq!(crate::MAP2_REWARD_SCHEMA_VERSION, 6);
-    assert!(crate::MAP2_REWARD_SCHEMA_DESCRIPTOR.starts_with("drysua-map2-reward/v6;"));
+    assert_eq!(crate::MAP2_REWARD_SCHEMA_VERSION, 7);
+    assert!(crate::MAP2_REWARD_SCHEMA_DESCRIPTOR.starts_with("drysua-map2-reward/v7;"));
     assert!(crate::MAP2_REWARD_SCHEMA_DESCRIPTOR.contains("fountain_wait="));
     assert!(crate::MAP2_REWARD_SCHEMA_DESCRIPTOR.contains("fountain_purchase="));
     assert_ne!(crate::MAP2_REWARD_SCHEMA_HASH, 798_798_703_797_057_220);

@@ -10,13 +10,13 @@ FILE_LIMIT = 256 * 1024 * 1024
 HEADER_LIMIT = 64 * 1024
 CURRENT_METADATA = {
     "action_schema_hash": "10658390830565586343",
-    "feature_schema_hash": "9233114641639769206",
-    "model_schema_hash": "4891874295003631291",
-    "ppo_schema_version": "35",
-    "ppo_schema_hash": "13569352384922890857",
-    "ppo_rules_audit_version": "30",
-    "map2_reward_schema_version": "6",
-    "map2_reward_schema_hash": "1084583101075978392",
+    "feature_schema_hash": "10552563335950731440",
+    "model_schema_hash": "12076707506725412686",
+    "ppo_schema_version": "37",
+    "ppo_schema_hash": "12793043235719775693",
+    "ppo_rules_audit_version": "32",
+    "map2_reward_schema_version": "7",
+    "map2_reward_schema_hash": "7274660837025042530",
 }
 REWARD_DESCRIPTOR_KEY = "map2_reward_schema_descriptor"
 assert len(CURRENT_METADATA) == 8
@@ -38,16 +38,16 @@ def read_runtime_metadata(directory):
                 or any(metadata.get(key) != value for key, value in CURRENT_METADATA.items())
                 or not isinstance(metadata.get(REWARD_DESCRIPTOR_KEY), str)):
             raise ValueError("incompatible runtime weights metadata: expected exact nine-key "
-                              "F20/M22, A5, PPO35/rules30, Map2 reward v6 identity")
+                              "F22/M24, A5, PPO37/rules32, Map2 reward v6 identity")
         descriptor = metadata[REWARD_DESCRIPTOR_KEY].encode("utf-8")
         if fnv1a(descriptor) != int(CURRENT_METADATA["map2_reward_schema_hash"]):
-            raise ValueError("incompatible runtime weights metadata: F20/M22 Map2 reward descriptor mismatch")
+            raise ValueError("incompatible runtime weights metadata: F22/M24 Map2 reward descriptor mismatch")
         assert len(metadata) == 9
         assert len(header) <= HEADER_LIMIT
         return metadata
     except (OSError, ValueError, RecursionError) as error:
         raise RuntimeError(f"runtime weights preflight failed: {path}: {error}; provide --weights-directory "
-                            "with compatible F20/M22 runtime weights; no migration or Teacher fallback") from error
+                            "with compatible F22/M24 runtime weights; no migration or Teacher fallback") from error
 
 
 def read_header(path):

@@ -238,6 +238,7 @@ fn actual_tcp_neural_orders_match_builtin_neural_orders_without_teacher_override
                 seed,
                 map: MapId(2),
                 ack_timeout_ticks: 300,
+                cheats: false,
             },
         )
     });

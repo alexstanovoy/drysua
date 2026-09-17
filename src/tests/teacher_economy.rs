@@ -660,8 +660,8 @@ fn equip(view: &mut WorldView, slot: usize, id: u16, charges: Option<u8>) {
         mute_left: 0,
         mode: def.mode,
         mana_cost: def.mana_cost,
-        range: def.active.map_or(0, bota_server::game::item_range),
-        aim: def.active.map(bota_server::game::item_aim),
+        range: def.range,
+        aim: def.aim,
         for_sale: false,
     });
 }
@@ -677,7 +677,8 @@ fn add_source(view: &mut WorldView, kind: UnitKind, distance: i32) -> EntityId {
     source.owner = None;
     source.pos.x += Fixed::from_int(distance);
     source.attack_range = Fixed::from_int(500);
-    source.radius = Fixed::from_int(24);
+    source.collision = Fixed::from_int(24);
+    source.bound = Fixed::from_int(24);
     source.abilities.clear();
     let id = source.id;
     view.units.push(source);

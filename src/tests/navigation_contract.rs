@@ -5,7 +5,7 @@ use bota_proto::{
     UnitKind, Vec2,
 };
 use bota_server::game::{
-    Command, ItemStack, MatchConfig, UnitOrder, World, find_path, grid_los, isqrt64, rules, wire_id,
+    Command, ItemStack, MatchConfig, UnitOrder, World, find_path, isqrt64, rules, wire_id,
 };
 
 use crate::{
@@ -18,6 +18,8 @@ const SEED: u64 = 10_091_612;
 const START_TICK: u32 = 1_201;
 const SHORT_LIMIT: u32 = 600;
 const FOUNTAIN_LIMIT: u32 = 1_500;
+/// Ticks stood on the fountain after arrival to observe its continuous heal.
+const FOUNTAIN_SETTLE_TICKS: u32 = 30;
 const _: () = assert!(SHORT_LIMIT < FOUNTAIN_LIMIT);
 const _: () = assert!(START_TICK > rules::PREGAME_TICKS);
 
@@ -126,6 +128,7 @@ fn fixture(side: usize, place: Place) -> (World, MatchInfo) {
         tick_rate: crate::MAP2_TICK_RATE as u16,
         mode: TickMode::Lockstep,
         ack_timeout_ticks: 150,
+        cheats: false,
     };
     let mut world = World::for_match(&config, config.rng());
     world.advance(&[]);
@@ -142,7 +145,9 @@ fn fixture(side: usize, place: Place) -> (World, MatchInfo) {
     for seat in 0..2 {
         for body in [world.seats[seat].unit, world.seats[seat].courier] {
             let body = body.expect("native owned body");
-            world.statuses.remove(body);
+            world
+                .modifiers
+                .insert(body, bota_server::game::Modifiers::default());
             world.set_order(body, UnitOrder::Stand);
         }
     }
@@ -154,7 +159,7 @@ fn fixture(side: usize, place: Place) -> (World, MatchInfo) {
     world.mana.get_mut(hero).expect("mana").mana = Fixed::ZERO;
     assert_eq!(world.map.id, crate::MAP2_ID);
     assert!(
-        world.grid.walkable(position),
+        world.clearance.walkable(position),
         "{side} {place:?}: closed start {position:?}"
     );
     assert_body_clearance(&world, side, ControlledUnit::Hero);
@@ -174,12 +179,12 @@ fn assert_body_clearance(world: &World, side: usize, unit: ControlledUnit) {
         assert_eq!(position, world.map.fountains[side]);
         return;
     }
-    let radius = world.hull.get(body).expect("hull").radius;
-    assert!(world.grid.walkable(position));
+    let radius = world.hull.get(body).expect("hull").collision;
+    assert!(world.clearance.walkable(position));
     for other in world.entities.iter().filter(|other| *other != body) {
         if let (Some(at), Some(hull)) = (world.transform.get(other), world.hull.get(other)) {
             assert!(
-                !position.within(at.pos, radius + hull.radius),
+                !position.within(at.pos, radius + hull.collision),
                 "{unit:?} starts overlapping {:?} at {:?}",
                 world.kind.get(other),
                 at.pos
@@ -291,12 +296,14 @@ fn inspect_landing(
         .expect("live owned body");
     let start = world.transform.get(body).expect("start").pos;
     let command = move_command(&world, side, unit, candidate.position);
-    assert!(world.grid.walkable(candidate.position));
-    let route = find_path(&world.grid, start, candidate.position);
+    assert!(world.clearance.walkable(candidate.position));
+    let collision = world
+        .hull
+        .get(body)
+        .map_or(Fixed::ZERO, |hull| hull.collision);
+    let route = find_path(&world.clearance, start, candidate.position, collision);
     assert!(
-        world.stats.get(body).expect("body stats").flies
-            || grid_los(&world.grid, start, candidate.position)
-            || !route.is_empty(),
+        world.stats.get(body).expect("body stats").flies || !route.is_empty(),
         "no native route to {candidate:?}"
     );
     assert_eq!(
@@ -369,16 +376,21 @@ fn inspect_negative(
         target: ActionTarget::Point(PointIndex(index)),
     };
     if !candidate.walkable || candidate.standing_tree {
-        assert!(!world.grid.walkable(candidate.position));
         for unit in [ControlledUnit::Hero, ControlledUnit::Courier] {
             assert!(!space.move_point_mask(unit)[index]);
             assert!(!space.attack_move_point_mask(unit)[index]);
         }
         assert!(!space.allows(tp));
-        assert!(!world.teleport_spot(world.seats[side].team, candidate.position, 600));
         let hero = world.seats[side].unit.expect("hero");
-        assert!(!world.begin_teleport(hero, Target::Pos(candidate.position), 90, 600, 0));
         assert!(!world.is_channelling(hero));
+        // The drysua mask pads structure clearance beyond the exact native
+        // circle, so it stays conservative: a masked spot that the current
+        // native world still stands clear is never sent, never channelled
+        // and needs no native rejection to remain safe.
+        if !world.clearance.stands_clear(candidate.position) {
+            assert!(!world.teleport_spot(world.seats[side].team, candidate.position, 600));
+            assert!(!world.may_teleport(hero, Target::Pos(candidate.position), 600));
+        }
         let error = space
             .decode(tp)
             .expect_err("closed/tree TP must remain masked");
@@ -388,7 +400,7 @@ fn inspect_negative(
         );
         if candidate.standing_tree {
             evidence.trees += 1;
-        } else {
+        } else if !world.clearance.stands_clear(candidate.position) {
             evidence.closed += 1;
         }
     }
@@ -501,6 +513,24 @@ fn fountain_trip(
         }
         if position == goal {
             arrival = Some(elapsed);
+            // The native heal is continuous now, so observe it after arrival
+            // rather than demanding a single-tick jump while still moving.
+            for _ in 0..FOUNTAIN_SETTLE_TICKS {
+                let before_health = world.health.get(hero).expect("health").hp;
+                let before_mana = world.mana.get(hero).expect("mana").mana;
+                world.advance(&[]);
+                let health = world.health.get(hero).expect("health").hp;
+                let mana = world.mana.get(hero).expect("mana").mana;
+                if position.within(
+                    world.map.fountains[side],
+                    Fixed::from_int(rules::FOUNTAIN_HEAL_RADIUS),
+                ) && health - before_health >= Fixed::from_int(20)
+                    && mana - before_mana >= Fixed::from_int(10)
+                {
+                    regenerated = true;
+                    break;
+                }
+            }
             break;
         }
     }
@@ -509,7 +539,7 @@ fn fountain_trip(
 
 fn move_command(world: &World, side: usize, unit: ControlledUnit, goal: Vec2) -> Command {
     assert!(side < world.seats.len());
-    assert!(world.grid.walkable(goal));
+    assert!(world.clearance.walkable(goal));
     Command {
         slot: world.seats[side].slot,
         unit: selector(world, side, unit),

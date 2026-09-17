@@ -104,9 +104,23 @@ fn mastery_native_cap_draw_batch_keeps_draw_labels_zero_terminal_and_nonwinning_
         .finish(settings.ppo)
         .expect("usable all-draw PPO batch");
     assert_eq!(batch.len(), 6);
+    let mut any_negative = false;
     for index in 0..batch.len() {
-        assert!(batch.sample(index).expect("sample").return_value() < 0.0);
+        let sample = batch.sample(index).expect("sample");
+        // A completed learner task with no cost at all may legitimately return
+        // exactly zero; a nonwin must never return a positive value.
+        assert!(
+            sample.return_value() <= 0.0,
+            "index={index} return={} raw={}",
+            sample.return_value(),
+            sample.transition.reward
+        );
+        any_negative |= sample.return_value() < 0.0;
     }
+    assert!(
+        any_negative,
+        "the all-draw batch still carries real dense cost"
+    );
 }
 
 #[test]
@@ -169,7 +183,10 @@ fn curriculum_weak_and_mixed_complete_batches_preserve_terminal_reward_and_reten
             assert!(sample.transition.terminal);
             assert_eq!(sample.transition.next_value, 0.0);
             assert!(sample.return_value().is_finite());
-            assert!(sample.return_value() < 0.0);
+            assert!(
+                sample.return_value() <= 0.0,
+                "nonwin must not return a positive value"
+            );
         }
     }
 }

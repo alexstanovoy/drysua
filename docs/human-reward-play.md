@@ -1,8 +1,8 @@
 # Human vs Teacher with current RL reward
 
-Current scoring is reward6: Win+0.2, Loss-0.2, Draw0, with all reward5 dense terms
+Current scoring is reward7: Win+0.2 (plus a win-only victory-time bonus up to +0.2), Loss-0.2, Draw0, with all reward5 dense terms
 unchanged. Earlier human/native reports below used reward5 and remain historical;
-their saved numbers and profile identities are never rewritten as reward6.
+their saved numbers and profile identities are never rewritten as reward6 or reward7.
 
 **Verified with the current native server in headless fixtures on both sides.**
 The graphical client was not launched by the agent; launch from your desktop.
@@ -20,7 +20,7 @@ Use `--human-side dire` for the other seat. `--bot-side` still selects the oppos
 human seat; specifying both requires opposite sides. Teacher is explicitly selected
 with `--policy teacher`, needs no model, and rejects `--weights-directory` rather
 than ignoring it. Without `--opponent`, the launcher still requires compatible
-explicit F20/M22 weights and runs **pure Neural**, never a Teacher fallback.
+explicit F22/M24 weights and runs **pure Neural**, never a Teacher fallback.
 
 **`--reward-report` uses native Lockstep, paced at a maximum of 30 ticks per second,
 not native Realtime.** Both ordinary clients still create their own ACKs. The shared

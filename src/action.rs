@@ -1141,10 +1141,11 @@ fn validate_dynamic_schema(
     shop: &[bota_proto::ShopEntry],
 ) -> Result<(), ActionError> {
     for unit in units {
-        if unit.radius.raw < 0
-            || unit.radius.raw > Fixed::MAX.raw - Fixed::from_int(STRUCTURE_CLEARANCE).raw
-        {
-            return Err(ActionError::InvalidSchema("UnitView radius"));
+        let clearance_limit = Fixed::MAX.raw - Fixed::from_int(STRUCTURE_CLEARANCE).raw;
+        for hull in [unit.collision, unit.bound] {
+            if hull.raw < 0 || hull.raw > clearance_limit {
+                return Err(ActionError::InvalidSchema("UnitView collision or bound"));
+            }
         }
         for ability in &unit.abilities {
             if !(0..=Fixed::MAX.to_int()).contains(&ability.range) || ability.mana_cost < 0 {
@@ -1265,7 +1266,7 @@ fn reconstruct_static_passability(
         }
     }
     for structure in current.units.iter().filter(|unit| is_structure(unit.kind)) {
-        let clearance_raw = structure.radius.raw + Fixed::from_int(STRUCTURE_CLEARANCE).raw;
+        let clearance_raw = structure.collision.raw + Fixed::from_int(STRUCTURE_CLEARANCE).raw;
         passability.block_circle(structure.pos, Fixed { raw: clearance_raw });
     }
     Ok(passability)
@@ -1440,11 +1441,13 @@ fn compare_units(tracker: &StateTracker, left: &UnitView, right: &UnitView) -> s
         .then_with(|| left.move_speed.cmp(&right.move_speed))
         .then_with(|| left.attack_damage.cmp(&right.attack_damage))
         .then_with(|| left.attack_range.cmp(&right.attack_range))
-        .then_with(|| left.attack_interval.cmp(&right.attack_interval))
+        .then_with(|| left.attack_time.cmp(&right.attack_time))
+        .then_with(|| left.attack_point.cmp(&right.attack_point))
         .then_with(|| left.attack_speed.cmp(&right.attack_speed))
         .then_with(|| left.armor.cmp(&right.armor))
         .then_with(|| left.magic_resist.cmp(&right.magic_resist))
-        .then_with(|| left.radius.cmp(&right.radius))
+        .then_with(|| left.bound.cmp(&right.bound))
+        .then_with(|| left.collision.cmp(&right.collision))
         .then_with(|| left.vision_radius.cmp(&right.vision_radius))
         .then_with(|| left.true_sight_radius.cmp(&right.true_sight_radius))
         .then_with(|| left.statuses.cmp(&right.statuses))

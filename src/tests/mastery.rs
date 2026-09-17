@@ -41,33 +41,33 @@ fn mastery_codec_is_retained_with_exact_reward5_linked_identities_and_appended_i
     );
     assert_eq!(
         (crate::FEATURE_SCHEMA_VERSION, crate::FEATURE_SCHEMA_HASH),
-        (20, 9_233_114_641_639_769_206)
+        (22, 10_552_563_335_950_731_440)
     );
     assert_eq!(
         (crate::MODEL_SCHEMA_VERSION, crate::MODEL_SCHEMA_HASH),
-        (22, 4_891_874_295_003_631_291)
+        (24, 12_076_707_506_725_412_686)
     );
     assert_eq!(
         (crate::PPO_SCHEMA_VERSION, crate::PPO_SCHEMA_HASH),
-        (35, 13_569_352_384_922_890_857)
+        (37, 12_793_043_235_719_775_693)
     );
     assert_eq!(
         (crate::LEAGUE_SCHEMA_VERSION, crate::LEAGUE_SCHEMA_HASH),
-        (35, 7_630_384_836_954_837_061)
+        (37, 6_112_261_829_501_116_662)
     );
     assert_eq!(
         (
             crate::CHECKPOINT_SCHEMA_VERSION,
             crate::CHECKPOINT_SCHEMA_HASH
         ),
-        (10, 2_382_613_649_322_819_763)
+        (12, 5_290_231_128_294_942_086)
     );
     assert_eq!(
         (
             crate::MAP2_REWARD_SCHEMA_VERSION,
             crate::MAP2_REWARD_SCHEMA_HASH
         ),
-        (6, 1_084_583_101_075_978_392)
+        (7, 7_274_660_837_025_042_530)
     );
     assert_eq!(crate::MODEL_PARAMETER_COUNT, 1_700_020);
     assert_eq!(crate::GLOBAL_FEATURES, 92);

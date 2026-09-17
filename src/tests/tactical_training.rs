@@ -780,7 +780,9 @@ fn tactical_replay_arena() -> (Arena, crate::ArenaStart) {
         for index in 0..2 {
             let hero = world.seats[index].unit.expect("hero");
             world.seats[index].gold = 0;
-            world.statuses.remove(hero);
+            world
+                .modifiers
+                .insert(hero, bota_server::game::Modifiers::default());
             world.set_order(hero, bota_server::game::UnitOrder::Stand);
             world.transform.get_mut(hero).expect("hero position").pos =
                 bota_proto::Vec2::from_ints(8_600 + index as i32 * 440, 8_900);

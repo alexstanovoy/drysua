@@ -129,9 +129,9 @@ class CompleteNativeRewardTests(NativeFixtureMixin, unittest.TestCase):
                 self.assertEqual(report["ticks"], result["ticks"])
                 self.assertEqual(report["reward_ticks"], result["ticks"] - 1)
                 self.assertFalse(report["pending_events"])
-                self.assertEqual(len(report["components"]), 17)
-                self.assertEqual(report["profile_version"], 6)
-                self.assertEqual(report["profile_hash"], "1084583101075978392")
+                self.assertEqual(len(report["components"]), 18)
+                self.assertEqual(report["profile_version"], 7)
+                self.assertEqual(report["profile_hash"], "7274660837025042530")
                 self.assertEqual(report["team"], ("Radiant", "Dire")[report["slot"]])
                 outcome = "Draw" if result["winner"] == 2 else (
                     "Win" if report["slot"] == result["winner"] else "Loss")

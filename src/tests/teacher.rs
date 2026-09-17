@@ -2384,6 +2384,7 @@ fn combat_world() -> (
         tick_rate: 30,
         mode: TickMode::Lockstep,
         ack_timeout_ticks: 150,
+        cheats: false,
     };
     let mut world = World::for_match(&config, config.rng());
     world.advance(&[Command {
@@ -2402,7 +2403,9 @@ fn combat_world() -> (
         world.transform.get_mut(hero).expect("hero position").pos =
             Vec2::from_ints(8_600 - index as i32 * 100, 8_900);
         world.set_order(hero, UnitOrder::Stand);
-        world.statuses.remove(hero);
+        world
+            .modifiers
+            .insert(hero, bota_server::game::Modifiers::default());
         world.seats[index].gold = 0;
     }
     let enemy_creep =
@@ -2432,16 +2435,17 @@ fn combat_world_creep(
     ranged: bool,
 ) -> bota_server::game::Entity {
     use bota_server::game::{LaneAi, MELEE_CREEP, RANGED_CREEP};
-    let entity = world.spawn_unit(
+    let entity = world.spawn_creep(
         if ranged { &RANGED_CREEP } else { &MELEE_CREEP },
         team,
         position,
+        0,
+        0,
     );
     world.march.remove(entity);
     world.lane_ai.insert(
         entity,
         LaneAi {
-            anchor: None,
             last_seen: None,
             keep_until: 0,
             roused_by: None,
@@ -3163,7 +3167,7 @@ fn finish_one_auto_declines_leeway_healing_disables_and_lethal_replies() {
                 enemy.mana = 75;
                 enemy.abilities = vec![ability(13, 2, 75, false)];
             }
-            _ => own_hero_mut(&mut view).attack_interval = 255,
+            _ => own_hero_mut(&mut view).attack_time = 8500,
         }
         let tracker = tracker(view);
 
@@ -3869,10 +3873,11 @@ fn finish_one_auto_budgets_a_possible_tower_windup_beyond_acquisition_range() {
         .iter_mut()
         .find(|unit| unit.id == entity(12, 1))
         .expect("tower");
-    tower.radius = Fixed::from_int(40);
+    tower.collision = Fixed::from_int(40);
+    tower.bound = Fixed::from_int(40);
     tower.attack_range = Fixed::from_int(700);
     tower.attack_damage = 110;
-    tower.attack_interval = 29;
+    tower.attack_time = 967;
     tower.move_speed = Fixed::ZERO;
     let tracker = tracker(view);
 
@@ -3923,7 +3928,7 @@ fn one_auto_view() -> WorldView {
         let hero = body(&mut view);
         hero.max_hp = 516;
         hero.attack_damage = 45;
-        hero.attack_interval = 42;
+        hero.attack_time = 1400;
         hero.attack_speed = 120;
         hero.armor = Fixed::from_ratio(20, 6);
         hero.magic_resist = Fixed::from_ratio(25, 100);
@@ -4144,11 +4149,13 @@ fn unit(id: EntityId, kind: UnitKind, team: Team, x: i32, y: i32) -> UnitView {
         move_speed: Fixed::from_int(300),
         attack_damage: 50,
         attack_range: Fixed::from_int(500),
-        attack_interval: 51,
+        attack_time: 1700,
+        attack_point: 0,
         attack_speed: 100,
         armor: Fixed::ZERO,
         magic_resist: Fixed::ZERO,
-        radius: Fixed::from_int(24),
+        collision: Fixed::from_int(24),
+        bound: Fixed::from_int(24),
         vision_radius: Fixed::from_int(1_800),
         true_sight_radius: Fixed::ZERO,
         statuses: StatusFlags { bits: 0 },

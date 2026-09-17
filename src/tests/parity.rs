@@ -62,6 +62,7 @@ fn server_options(seed: u64, map: MapId) -> ServerOpts {
         seed,
         map,
         ack_timeout_ticks: 300,
+        cheats: false,
     }
 }
 

@@ -554,9 +554,11 @@ fn world_view(
         1_500,
         1_500,
     );
-    fountain.radius = Fixed::from_int(60);
+    fountain.collision = Fixed::from_int(60);
+    fountain.bound = Fixed::from_int(60);
     let mut tower = unit(entity(32, 1), UnitKind::Tower, Team::Radiant, 2_500, 2_000);
-    tower.radius = Fixed::from_int(40);
+    tower.collision = Fixed::from_int(40);
+    tower.bound = Fixed::from_int(40);
     let mut units = vec![hero, courier, fountain, tower];
     units.sort_by_key(|unit| unit.id);
     WorldView {
@@ -620,11 +622,13 @@ fn unit(id: EntityId, kind: UnitKind, team: Team, x: i32, y: i32) -> UnitView {
         move_speed: Fixed::from_int(300),
         attack_damage: 0,
         attack_range: Fixed::from_int(500),
-        attack_interval: 30,
+        attack_time: 1000,
+        attack_point: 0,
         attack_speed: 100,
         armor: Fixed::ZERO,
         magic_resist: Fixed::ZERO,
-        radius: Fixed::from_int(24),
+        collision: Fixed::from_int(24),
+        bound: Fixed::from_int(24),
         vision_radius: Fixed::from_int(1_800),
         true_sight_radius: Fixed::ZERO,
         statuses: StatusFlags { bits: 0 },

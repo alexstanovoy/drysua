@@ -9,6 +9,8 @@ mod progress;
 mod rebalance;
 #[path = "map2_reward_simple_wait.rs"]
 mod simple_wait;
+#[path = "victory_time.rs"]
+mod victory_time;
 
 use bota_proto::{
     Angle, Attributes, DamageKind, EntityId, EventKind, Fixed, HeroId, MapId, MatchInfo, Pick,
@@ -31,10 +33,12 @@ fn terminal02_values_change_only_terminal_component_and_keep_dense_budgets() {
         assert_eq!(finished.terminal, expected);
         assert_eq!(finished.end, Some(end));
         assert!((dense.tower_damage_taken + 0.1 * 100.0 / 600.0).abs() < 1.0e-12);
-        assert_eq!(finished.total, expected);
+        let victory = if end == Map2RewardEnd::Win { 0.2 } else { 0.0 };
+        assert_eq!(finished.victory_time, victory);
+        assert_eq!(finished.total, expected + victory);
     }
     assert!((crate::MAP2_REWARD_NATIVE_NEGATIVE_BOUND - 1.0488).abs() < 1.0e-12);
-    assert!((crate::MAP2_REWARD_NATIVE_POSITIVE_BOUND - 0.445).abs() < 1.0e-12);
+    assert!((crate::MAP2_REWARD_NATIVE_POSITIVE_BOUND - 0.645).abs() < 1.0e-12);
     assert!((crate::MAP2_REWARD_DENSE_BOUND - 1.4488).abs() < 1.0e-12);
 }
 
@@ -377,9 +381,28 @@ fn terminal02_win_can_have_negative_return_after_opposing_tower_progress() {
     let lost = loss.finish(Map2RewardEnd::Loss).unwrap();
 
     assert_eq!(won.terminal, 0.2);
+    assert_eq!(won.victory_time, 0.2);
     assert_eq!(lost.terminal, -0.2);
-    assert!(won.total < 0.0);
-    assert!(lost.total < 0.0);
+    assert_eq!(lost.victory_time, 0.0);
+    let dense = won.gold
+        + won.experience
+        + won.hero_damage
+        + won.hero_damage_taken
+        + won.creep_damage_taken
+        + won.other_damage_taken
+        + won.tower_damage_taken
+        + won.opening_position
+        + won.mana_spent
+        + won.tower_health
+        + won.lane_pressure
+        + won.pregame_movement
+        + won.fountain_wait
+        + won.fountain_wait_refund
+        + won.stagnation_base
+        + won.stagnation_ticks_cost;
+    assert_eq!(won.total, won.terminal + won.victory_time + dense);
+    assert_eq!(lost.victory_time, 0.0, "no bonus for a loss");
+    assert!(lost.total.is_finite());
 }
 
 #[test]
@@ -563,11 +586,13 @@ pub(super) fn unit(index: u32, kind: UnitKind, team: Team, x: i32) -> UnitView {
         move_speed: Fixed::from_int(300),
         attack_damage: 50,
         attack_range: Fixed::from_int(500),
-        attack_interval: 30,
+        attack_time: 1000,
+        attack_point: 0,
         attack_speed: 100,
         armor: Fixed::ZERO,
         magic_resist: Fixed::ZERO,
-        radius: Fixed::from_int(24),
+        collision: Fixed::from_int(24),
+        bound: Fixed::from_int(24),
         vision_radius: Fixed::from_int(1800),
         true_sight_radius: Fixed::ZERO,
         statuses: StatusFlags { bits: 0 },

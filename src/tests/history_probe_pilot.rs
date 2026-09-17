@@ -70,10 +70,10 @@ fn probe_matched_kind_conditioning() {
         output.join("experiment-manifest.json").is_file(),
         "freeze source/binary first"
     );
-    assert_eq!(crate::FEATURE_SCHEMA_VERSION, 12);
-    assert_eq!(crate::MODEL_SCHEMA_VERSION, 14);
-    assert_eq!(crate::PPO_SCHEMA_VERSION, 27);
-    assert_eq!(crate::PPO_RULES_AUDIT_VERSION, 22);
+    assert_eq!(crate::FEATURE_SCHEMA_VERSION, 22);
+    assert_eq!(crate::MODEL_SCHEMA_VERSION, 24);
+    assert_eq!(crate::PPO_SCHEMA_VERSION, 37);
+    assert_eq!(crate::PPO_RULES_AUDIT_VERSION, 32);
     assert_eq!(
         file_sha256(&root.join(INITIAL).join("drysua.weights.safetensors")),
         INITIAL_SHA256
@@ -667,11 +667,11 @@ impl ConditioningCycle {
 #[test]
 #[ignore = "Predeclared eight-game matched BC/history pilot; only baseline F12 weights exported"]
 fn probe_matched_history_after_training_contract() {
-    assert_eq!(crate::FEATURE_SCHEMA_VERSION, 12);
-    assert_eq!(crate::MODEL_SCHEMA_VERSION, 14);
-    assert_eq!(crate::PPO_SCHEMA_VERSION, 27);
-    assert_eq!(crate::PPO_RULES_AUDIT_VERSION, 22);
-    assert_eq!(IMITATION_RULES_AUDIT_VERSION, 13);
+    assert_eq!(crate::FEATURE_SCHEMA_VERSION, 22);
+    assert_eq!(crate::MODEL_SCHEMA_VERSION, 24);
+    assert_eq!(crate::PPO_SCHEMA_VERSION, 37);
+    assert_eq!(crate::PPO_RULES_AUDIT_VERSION, 32);
+    assert_eq!(IMITATION_RULES_AUDIT_VERSION, 22);
     let output =
         std::env::var_os("DRYSUA_MATCHED_HISTORY_OUTPUT").expect("explicit NEW run directory");
     let output = Path::new(&output);

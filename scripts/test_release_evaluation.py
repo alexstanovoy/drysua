@@ -11,7 +11,7 @@ from release_build import SIMULATOR
 from test_release_crossplay import client
 
 
-CURRENT = "037c6a2f8e5383beae9eea6da8cbbb1678f7b718"
+CURRENT = "78427bb80eb716f851cb039ade33e2964bbf3c11"
 LOG_LIMIT = 1024 * 1024
 
 

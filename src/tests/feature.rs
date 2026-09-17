@@ -29,7 +29,7 @@ mod feature_facts;
 
 #[test]
 fn feature_schema_dimensions_and_hash_are_stable() {
-    assert_eq!(FEATURE_SCHEMA_VERSION, 20);
+    assert_eq!(FEATURE_SCHEMA_VERSION, 22);
     assert!(
         FEATURE_SCHEMA_DESCRIPTOR.contains("action_schema_version=5;action_schema_hash=linked;")
     );
@@ -321,6 +321,21 @@ fn maximum_semantic_identifiers_stay_exact_and_inside_schema_ranges() {
         65_547.0
     );
     assert_eq!(frame.loot[0][loot_feature::ITEM_TOKEN], 65_536.0);
+}
+
+#[test]
+fn wire_rebase_radius_feature_follows_bound_and_ignores_collision() {
+    let mut view = world_view(Team::Radiant, 1);
+    let hero_index = unit_index(&view, HERO);
+    view.units[hero_index].collision = Fixed::from_int(120);
+    view.units[hero_index].bound = Fixed::from_int(24);
+    let frame = encoded_frame(Team::Radiant, view);
+    assert_eq!(
+        frame.units[0][unit_feature::RADIUS],
+        24.0 / (AXIS * crate::TERRAIN_CELL_SIZE as u32) as f32,
+        "bound is the combat edge the radius feature has always described"
+    );
+    assert_eq!(frame.units[0][unit_feature::ATTACK_INTERVAL], 30.0 / 600.0);
 }
 
 #[test]
@@ -2391,8 +2406,9 @@ fn capacity_creep(team: Team, id: EntityId, canonical: Vec2) -> UnitView {
     unit.max_hp = 500;
     unit.attack_damage = 20;
     unit.attack_range = Fixed::from_int(100);
-    unit.attack_interval = 40;
-    unit.radius = Fixed::from_int(20);
+    unit.attack_time = 1334;
+    unit.collision = Fixed::from_int(20);
+    unit.bound = Fixed::from_int(20);
     unit.vision_radius = Fixed::from_int(600);
     unit
 }
@@ -2613,11 +2629,12 @@ fn hero(team: Team, position: Vec2) -> UnitView {
     unit.max_mana = 400;
     unit.attack_damage = 60;
     unit.attack_range = Fixed::from_int(500);
-    unit.attack_interval = 30;
+    unit.attack_time = 1000;
     unit.attack_speed = 110;
     unit.armor = Fixed::from_int(3);
     unit.magic_resist = Fixed::from_ratio(1, 4);
-    unit.radius = Fixed::from_int(24);
+    unit.collision = Fixed::from_int(24);
+    unit.bound = Fixed::from_int(24);
     unit.vision_radius = Fixed::from_int(1_800);
     unit.attributes = Attributes::all(20);
     unit.primary = Some(Attribute::Agility);
@@ -2634,7 +2651,8 @@ fn courier(team: Team, position: Vec2) -> UnitView {
     unit.hp = 250;
     unit.max_hp = 250;
     unit.move_speed = Fixed::from_int(380);
-    unit.radius = Fixed::from_int(16);
+    unit.collision = Fixed::from_int(16);
+    unit.bound = Fixed::from_int(16);
     unit.vision_radius = Fixed::from_int(500);
     unit.owner = Some(SlotId(0));
     unit.abilities = (8..=12)
@@ -2652,8 +2670,9 @@ fn enemy_hero(team: Team, position: Vec2) -> UnitView {
     unit.max_mana = 400;
     unit.attack_damage = 55;
     unit.attack_range = Fixed::from_int(500);
-    unit.attack_interval = 32;
-    unit.radius = Fixed::from_int(24);
+    unit.attack_time = 1067;
+    unit.collision = Fixed::from_int(24);
+    unit.bound = Fixed::from_int(24);
     unit.vision_radius = Fixed::from_int(1_800);
     unit.hero = Some(SHADOW_FIEND);
     unit.owner = Some(SlotId(1));
@@ -2669,8 +2688,9 @@ fn creep(id: EntityId, x: i32, y: i32) -> UnitView {
     unit.max_hp = 500;
     unit.attack_damage = 20;
     unit.attack_range = Fixed::from_int(100);
-    unit.attack_interval = 40;
-    unit.radius = Fixed::from_int(20);
+    unit.attack_time = 1334;
+    unit.collision = Fixed::from_int(20);
+    unit.bound = Fixed::from_int(20);
     unit.vision_radius = Fixed::from_int(600);
     unit
 }
@@ -2681,8 +2701,9 @@ fn building(id: EntityId, team: Team, kind: UnitKind, position: Vec2) -> UnitVie
     unit.max_hp = 1_000;
     unit.attack_damage = 100;
     unit.attack_range = Fixed::from_int(700);
-    unit.attack_interval = 30;
-    unit.radius = Fixed::from_int(80);
+    unit.attack_time = 1000;
+    unit.collision = Fixed::from_int(80);
+    unit.bound = Fixed::from_int(80);
     unit.vision_radius = Fixed::from_int(1_800);
     unit
 }
@@ -2701,11 +2722,13 @@ fn base_unit(id: EntityId, kind: UnitKind, team: Team, pos: Vec2) -> UnitView {
         move_speed: Fixed::from_int(300),
         attack_damage: 0,
         attack_range: Fixed::ZERO,
-        attack_interval: 0,
+        attack_time: 0,
+        attack_point: 0,
         attack_speed: 100,
         armor: Fixed::ZERO,
         magic_resist: Fixed::ZERO,
-        radius: Fixed::ZERO,
+        collision: Fixed::ZERO,
+        bound: Fixed::ZERO,
         vision_radius: Fixed::ZERO,
         true_sight_radius: Fixed::ZERO,
         statuses: StatusFlags { bits: 0 },

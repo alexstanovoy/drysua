@@ -148,6 +148,6 @@ fn optimize(
 pub(super) fn fitted() -> PolicyModel {
     let model = PolicyModel::fresh_on(10102999, PolicyDevice::Cpu).unwrap();
     TrainingArtifact::load_runtime_weights(&model, &root4().join("weights")).unwrap();
-    assert_eq!(crate::MODEL_SCHEMA_VERSION, 17);
+    assert_eq!(crate::MODEL_SCHEMA_VERSION, 24);
     model
 }

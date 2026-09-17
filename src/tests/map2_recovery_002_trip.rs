@@ -104,7 +104,9 @@ fn configure(world: &mut World, setup: Setup) {
         world.seats[side].level = level;
         world.seats[side].xp = rules::XP_THRESHOLDS[level as usize - 1];
         world.level.insert(hero, Level(level));
-        world.statuses.remove(hero);
+        world
+            .modifiers
+            .insert(hero, bota_server::game::Modifiers::default());
         world.set_order(hero, UnitOrder::Stand);
         assert!(world.learn(hero, 0, &mut Vec::new()));
         if level == 3 {
@@ -153,15 +155,15 @@ fn configure(world: &mut World, setup: Setup) {
 fn assert_start_clear(world: &World, hero: bota_server::game::Entity) {
     let position = world.transform.get(hero).unwrap().pos;
     assert!(
-        world.grid.walkable(position),
+        world.clearance.walkable(position),
         "trip fixture starts on blocked terrain"
     );
-    let radius = world.hull.get(hero).unwrap().radius;
+    let radius = world.hull.get(hero).unwrap().collision;
     for entity in world.entities.iter().filter(|entity| *entity != hero) {
         if let (Some(transform), Some(hull)) = (world.transform.get(entity), world.hull.get(entity))
         {
             assert!(
-                !position.within(transform.pos, radius + hull.radius),
+                !position.within(transform.pos, radius + hull.collision),
                 "trip fixture starts inside another body"
             );
         }

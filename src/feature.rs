@@ -22,7 +22,7 @@ use crate::{
 };
 
 /// Version of the policy feature layout and candidate input-state semantics.
-pub const FEATURE_SCHEMA_VERSION: u32 = 20;
+pub const FEATURE_SCHEMA_VERSION: u32 = 22;
 /// Number of scalar global features.
 pub const GLOBAL_FEATURES: usize = 92;
 /// Number of scalar features in one global-history sample.
@@ -75,6 +75,15 @@ const MAX_HP: i64 = 100_000;
 const MAX_MANA: i64 = 20_000;
 const MAX_DAMAGE: i64 = 10_000;
 const MAX_ATTACK_INTERVAL: i64 = 600;
+
+/// Whole ticks of an attack cadence the wire reports in milliseconds.
+///
+/// The native wire reports attack speed-scaled cadence in milliseconds; the
+/// feature contract keeps the historical whole-tick unit. Tick rate is pinned
+/// to the validated 30 by every accepted match.
+pub(crate) fn attack_interval_ticks(attack_time_ms: u32) -> u32 {
+    ((u64::from(attack_time_ms) * 30) / 1000) as u32
+}
 const MAX_SPEED: i64 = 2_000;
 const MAX_ARMOR_RAW: i64 = 100 << Fixed::FRAC_BITS;
 const MAX_LEVEL: i64 = 30;
@@ -407,7 +416,7 @@ pub mod loot_feature {
 
 /// Canonical schema text covered by [`FEATURE_SCHEMA_HASH`].
 pub const FEATURE_SCHEMA_DESCRIPTOR: &str = concat!(
-    "bota-drysua-feature/v20;",
+    "bota-drysua-feature/v22;",
     "action_schema_version=5;action_schema_hash=linked;",
     "navigation_contract=existing_walkable_building_landing_move_pointers_allowed,attack_move_veto_and_tp_provenance_unchanged;frame_legality_and_action_space_provenance=new_contract,raw_dimensions_field_ids_point_order_and_sources_unchanged,no_old_frame_or_corpus_relabel;",
     "shapes=global:92,history:7x24,policy_history:16x4,unit:96x84,own_unit:2x84,remembered_unit:32x84,point:48x32,ability:14x24,item:85x28,projectile:32x20,loot:16x16,map:96;",
@@ -422,7 +431,7 @@ pub const FEATURE_SCHEMA_DESCRIPTOR: &str = concat!(
     "role_category=Carry1,Mid2,Offlane3,Support4,HardSupport5;lane_category=Safe1,Mid2,Offlane3;body_category=Hero1,Courier2;item_location=hero2,stash3,courier4,shop5;slots=zero_based_plus_one;",
     "unit_leading_when_present=own-hero-then-own-courier;item_fixed=hero9,stash6,courier6,shop64;",
     "unit_candidates=current_visible_live_only,cap96,priority:own_body_then_hero_then_structure_then_within1200_then_other,distance_then_relation_then_owner_relation_then_canonical_model_semantics_then_entity_id_only_for_semantically_identical_ties;",
-    "unit_semantic_order=kind,canonical_position,canonical_facing,hp,max_hp,mana,max_mana,move_speed,attack_damage,attack_range,attack_interval,attack_speed,armor,magic_resistance,radius,vision,true_sight,statuses,item_slot_count,free_item_slots,item_capacity_available,canonical_velocity,hp_delta,mana_delta,recent_damage,recent_cast,recent_attack;",
+    "unit_semantic_order=kind,canonical_position,canonical_facing,hp,max_hp,mana,max_mana,move_speed,attack_damage,attack_range,attack_time,attack_point,attack_speed,armor,magic_resistance,bound,collision,vision,true_sight,statuses,item_slot_count,free_item_slots,item_capacity_available,canonical_velocity,hp_delta,mana_delta,recent_damage,recent_cast,recent_attack;",
     "unit_memory=units_exact_current_pointer_order,own_units_fixed_hero_courier_current_or_remembered,remembered_units_nonown_hidden_cap32_lexicographic_complete_encoded_token,tracker_cap4096_evict_complete_oldest_invisible_last_seen_tick_cohorts,no_target_handles;",
     "point_candidates=cap48,deduplicate_position_keep_first_source,canonical_team_directions,generate:tactical_radii200_600_1200_in_E_NE_N_NW_W_SW_S_SE_order_then_allied_building_landings_then_nearest8_visible_or_static-baseline_trees_then_own_fountain_enemy_fountain_own_tower_enemy_tower_then_predicted_units;",
     "point_features=exact_action_pointer_prefix,present,pointer_valid,canonical_position,relative_position,distance,direction,source_category,direction_radius_kind_relation_parameters,walkable,standing_tree,allied_building;",
@@ -430,7 +439,7 @@ pub const FEATURE_SCHEMA_DESCRIPTOR: &str = concat!(
     "loot_candidates=current_visible,cap16,order:item_then_charges_then_position_then_entity_id_only_for_semantically_identical_ties;",
     "projectile_order=lexicographic_encoded_semantics,select_first32,feature_identical_ties_indistinguishable;",
     "projectile_history=continuous_full_handle_observation,cap4096,first_age,second_velocity,closest_approach,disappearance_or_generation_resets;loot_history=continuous_full_handle_observation,cap16,visible_age,duplicate_current_semantics_suppress_identity_age;",
-    "mutual_attack_range=distance_squared_le_square_attack_range_plus_both_hull_radii,fixed_saturating_sum,inclusive,no_continuation_leeway;",
+    "mutual_attack_range=distance_squared_le_square_attack_range_plus_both_bound_radii,fixed_saturating_sum,inclusive,no_continuation_leeway;",
     "observation_journal=16_states,strictly_increasing_observe,exact_tracker_lineage_slot_static_snapshot_predecessor_and_tracker_history_provenance,rollback_at_or_before,eviction_horizon_exact_error_and_atomic,reset_empty,failed_observe_and_encode_atomic;",
     "loot_path=static-terrain-and-static-tree-grid;",
     "map_rays=E_NE_N_NW_W_SW_S_SE,20_cells,64_world_units_per_step,first_nonwalkable_water_opaque_tree_and_endpoint_elevation_walkability;",
@@ -481,7 +490,8 @@ pub const FEATURE_SCHEMA_DESCRIPTOR: &str = concat!(
     "wait_accounting_append=global85:open_fountain_wait_ticks_div27900,86:open_refundable_cost_div.093,range0to1,legacy_maps_zero;reward2=prewave_center_hint_only_before_first_wave_no_new_postspawn_hero_constraint,any_movement_or_resource_break_resets_wait,any_own_purchase_refunds_open_period_including_drained_cost,only_two_new_accounting_facts_no_intent_price_or_antiabuse_conditions;",
     "progress_accounting_append=global87:stagnation_ticks_div2700,88:activity_ticks_left_div30,89:stagnation_base_charged_0or1;invariants=debt0..2700_lease0..29_latch_implies_positive_debt,off_map2_zero,complete_snapshot_events_only,drains_clone_provenance_include_all_three_facts;reward3=independent_progress_debt_baseline_free_inactive_add1_including_death_active_repay3_refresh30_consumes_current_base.02_once_at2700_then_inactive_cap_rate.000002_rearm_only_debt0_no_refund;effect3_positive_ticks_direct_even_full_or_lingering,purchase_only_partial_activity_lease_plus_unchanged_v2_full_open_wait_refund,no_strategy_or_antiabuse_additions;",
     "mango=item42_category43_existing_item_and_loot_token_fields,no_new_item_rows;map2_geometry=map0_public_geometry_no_metadata_relabel;",
-    "reward6=unchanged_reward5_dense_channels_and_potentials_terminal_win.2_loss_neg.2_draw0_taskcap_neg.2;global90:tower_damage_channel9_remaining_fraction,91:opening_position_pending_bool;all_global0to91_indices_preserved_nine_remaining73to81_not_overwritten_by_tenth_channel;opening_pending_lifetime_clone_complete_pair_provenance_and_finish_expiry_no_ids_or_forced_actions;mastery_stage_thresholds_and_rolling_window_excluded_from_features;"
+    "wire_rebase=bota78427bb_damaged_then_missed_then_healed_died_cast_level_bought_structure_event_order_shift,missed_is_not_damage_or_healing_and_never_scores,cheat_orders_decoded_structurally_and_never_issued_by_any_seat,NoCheats_rejection_has_no_reward_effect,unit_attack_time_and_attack_point_milliseconds_after_speed_converted_to_historical_whole_ticks_at_30,attack_interval_feature_unchanged_in_ticks,unit_collision_and_bound_split_from_the_old_radius,bound_feeds_every_combat_range_and_area_and_the_radius_feature,collision_feeds_movement_clearance_and_walkability_no_hidden_radius;",
+    "reward7=unchanged_reward5_dense_channels_and_potentials_terminal_win.2_loss_neg.2_draw0_taskcap_neg.2_win_only_victory_time_bonus;global90:tower_damage_channel9_remaining_fraction,91:opening_position_pending_bool;all_global0to91_indices_preserved_nine_remaining73to81_not_overwritten_by_tenth_channel;opening_pending_lifetime_clone_complete_pair_provenance_and_finish_expiry_no_ids_or_forced_actions;mastery_stage_thresholds_and_rolling_window_excluded_from_features;"
 );
 
 /// FNV-1a of the descriptor, action/reward version-le32/hash-le64 pairs, and reward descriptor.
@@ -1872,7 +1882,7 @@ impl FeatureEncoder {
         let (sine, cosine) = radians.sin_cos();
         token[unit_feature::FACING_COS] = cosine;
         token[unit_feature::FACING_SIN] = sine;
-        token[unit_feature::RADIUS] = raw_distance_ratio(unit.radius.raw, self.extent_raw);
+        token[unit_feature::RADIUS] = raw_distance_ratio(unit.bound.raw, self.extent_raw);
         if let Some(origin) = origin {
             token[unit_feature::ORIGIN_PRESENT] = 1.0;
             let delta = self.canonical_delta(team, unit.pos, origin);
@@ -2849,8 +2859,11 @@ fn encode_unit_combat(token: &mut [f32; UNIT_FEATURES], unit: &UnitView) {
     token[unit_feature::ATTACK_DAMAGE] = signed_ratio(i64::from(unit.attack_damage), MAX_DAMAGE);
     token[unit_feature::ATTACK_RANGE] =
         raw_distance_ratio_i64(i64::from(unit.attack_range.raw), i64::from(Fixed::MAX.raw));
-    token[unit_feature::ATTACK_INTERVAL] =
-        ratio(i64::from(unit.attack_interval), 0, MAX_ATTACK_INTERVAL);
+    token[unit_feature::ATTACK_INTERVAL] = ratio(
+        i64::from(attack_interval_ticks(unit.attack_time)),
+        0,
+        MAX_ATTACK_INTERVAL,
+    );
     token[unit_feature::ATTACK_SPEED] = signed_ratio(i64::from(unit.attack_speed), MAX_SPEED);
     token[unit_feature::MOVE_SPEED] = signed_ratio(
         i64::from(unit.move_speed.raw),
@@ -2900,7 +2913,7 @@ fn encode_unit_tactics(
             .unwrap_or(i64::MAX);
         token[unit_feature::TIME_TO_REACH] = ratio(ticks, 0, i64::from(MAX_AGE));
     }
-    let hulls = hero.radius + unit.radius;
+    let hulls = hero.bound + unit.bound;
     token[unit_feature::OWN_IN_ATTACK_RANGE] =
         bool_feature(distance_squared <= (hero.attack_range + hulls).squared_raw());
     token[unit_feature::UNIT_IN_ATTACK_RANGE] =
@@ -2925,11 +2938,12 @@ fn encode_unit_recent(
         return;
     };
     let age = current_tick - attack_tick;
-    if age > track.unit.attack_interval {
+    let interval = attack_interval_ticks(track.unit.attack_time).max(1);
+    if age > interval {
         return;
     }
     token[unit_feature::ATTACK_PHASE_PRESENT] = 1.0;
-    token[unit_feature::ATTACK_PHASE] = unit_ratio(age, track.unit.attack_interval.max(1));
+    token[unit_feature::ATTACK_PHASE] = unit_ratio(age, interval);
 }
 
 fn encode_ability_history(

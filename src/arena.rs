@@ -262,6 +262,8 @@ fn match_config(settings: ArenaConfig) -> MatchConfig {
         tick_rate: ARENA_TICK_RATE,
         mode: TickMode::Lockstep,
         ack_timeout_ticks: 150,
+        // Cheats are never available to a learner or opponent seat.
+        cheats: false,
     }
 }
 

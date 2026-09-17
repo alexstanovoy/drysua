@@ -16,9 +16,9 @@ fn probe_active_target_summary() {
         output.join("experiment-manifest.json").is_file(),
         "freeze before execution"
     );
-    assert_eq!(crate::FEATURE_SCHEMA_VERSION, 12);
-    assert_eq!(crate::MODEL_SCHEMA_VERSION, 14);
-    assert_eq!(IMITATION_RULES_AUDIT_VERSION, 13);
+    assert_eq!(crate::FEATURE_SCHEMA_VERSION, 22);
+    assert_eq!(crate::MODEL_SCHEMA_VERSION, 24);
+    assert_eq!(IMITATION_RULES_AUDIT_VERSION, 22);
     assert_eq!(
         file_sha256(&root.join(INITIAL).join("drysua.weights.safetensors")),
         INITIAL_SHA256
