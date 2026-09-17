@@ -1,5 +1,8 @@
 /// Maximum complete-episode training streams; even counts up to this are valid.
-pub const MAX_TRAINING_ENVIRONMENTS: usize = 16;
+/// Twenty-six is the largest even count admitted by the retained-frame and
+/// rollout-capacity invariants; 28 exceeds the retained bound, and 30 exceeds
+/// the rollout capacity as well.
+pub const MAX_TRAINING_ENVIRONMENTS: usize = 26;
 
 /// Even environment counts up to the training maximum; mastery codec and
 /// checkpoint scope share this predicate with the collector.

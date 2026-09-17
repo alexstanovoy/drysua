@@ -795,6 +795,75 @@ fn town_portal_landings_allow_move_but_not_attack_move_and_keep_tp_provenance() 
 }
 
 #[test]
+fn landing_cell_direct_grid_scan_matches_cell_centre_reference_on_synthetic_grids() {
+    let cell = crate::TERRAIN_CELL_SIZE;
+    for axis in [1usize, 2, 7, 16] {
+        let mut open = vec![true; axis * axis];
+        for (index, walkable) in open.iter_mut().enumerate() {
+            // Deterministic asymmetric pattern: blocked cells are not mirrored
+            // onto each other, so the two teams must resolve different cells.
+            *walkable = (index * 37 + index / axis * 11) % 9 != 0;
+        }
+        for cell_y in 0..=axis {
+            for cell_x in 0..=axis {
+                for offset_x in [0, 5, 31, 32, 63] {
+                    for offset_y in [0, 17, 32, 63] {
+                        let center = Vec2::from_ints(
+                            cell_x as i32 * cell + offset_x,
+                            cell_y as i32 * cell + offset_y,
+                        );
+                        for team in [Team::Radiant, Team::Dire] {
+                            let (expected, actual) =
+                                crate::action::nearest_landing_cell_pair_for_test(
+                                    axis,
+                                    open.clone(),
+                                    center,
+                                    team,
+                                );
+                            assert_eq!(
+                                actual, expected,
+                                "axis {axis} center {center:?} team {team:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn landing_cell_direct_grid_scan_keeps_ties_and_out_of_grid_centers_exact() {
+    let cell = crate::TERRAIN_CELL_SIZE;
+    // An all-open grid maximizes exact distance ties, where the canonical cell
+    // index decides; an odd axis keeps the centre on an actual cell.
+    let axis = 9usize;
+    let open = vec![true; axis * axis];
+    let center = Vec2::from_ints(4 * cell + cell, 4 * cell + cell);
+    for team in [Team::Radiant, Team::Dire] {
+        let (expected, actual) =
+            crate::action::nearest_landing_cell_pair_for_test(axis, open.clone(), center, team);
+        assert_eq!(actual, expected, "tie center team {team:?}");
+    }
+    // Centers outside the grid have no landing cell at all.
+    for center in [Vec2::from_ints(-1, 0), Vec2::from_ints(-cell, -cell)] {
+        for team in [Team::Radiant, Team::Dire] {
+            let (expected, actual) =
+                crate::action::nearest_landing_cell_pair_for_test(axis, open.clone(), center, team);
+            assert_eq!(expected, None, "out-of-grid reference center {center:?}");
+            assert_eq!(actual, None, "out-of-grid center {center:?} team {team:?}");
+        }
+    }
+    // A center exactly on a cell boundary resolves to the cell that owns it.
+    let boundary = Vec2::from_ints(2 * cell, 3 * cell);
+    for team in [Team::Radiant, Team::Dire] {
+        let (expected, actual) =
+            crate::action::nearest_landing_cell_pair_for_test(axis, open.clone(), boundary, team);
+        assert_eq!(actual, expected, "boundary center team {team:?}");
+    }
+}
+
+#[test]
 fn building_landing_moves_keep_dead_stunned_rooted_gates_but_item_mute_only_blocks_tp() {
     for status in [
         0,

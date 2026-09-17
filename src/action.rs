@@ -1330,11 +1330,36 @@ impl StaticPassability {
         let start_y = center_y.saturating_sub(span);
         let end_x = center_x.saturating_add(span).min(self.axis - 1);
         let end_y = center_y.saturating_add(span).min(self.axis - 1);
+        // Same `within` test as before, evaluated row by row: the squared
+        // radius limit lets every cell of an out-of-range row be skipped
+        // without computing its centre, and each in-range row walks the
+        // cell centres incrementally instead of rebuilding them per cell.
+        let limit = radius.squared_raw();
+        let center_raw_x = i64::from(center.x.raw);
+        let center_raw_y = i64::from(center.y.raw);
+        // Cell centres in raw Q16.16 units, as `Vec2::from_ints` builds them.
+        let step = i64::from(TERRAIN_CELL_SIZE) << Fixed::FRAC_BITS;
+        let half = i64::from(TERRAIN_CELL_SIZE / 2) << Fixed::FRAC_BITS;
+        let first_raw = |cell: usize| -> i64 {
+            ((i64::from(i32::try_from(cell).unwrap_or(i32::MAX)) * i64::from(TERRAIN_CELL_SIZE))
+                << Fixed::FRAC_BITS)
+                + half
+        };
         for cell_y in start_y..=end_y {
+            let delta_y = first_raw(cell_y) - center_raw_y;
+            let delta_y_squared = delta_y * delta_y;
+            if delta_y_squared > limit {
+                continue;
+            }
+            let remaining = limit - delta_y_squared;
+            let row = cell_y * self.axis;
+            let mut cell_raw_x = first_raw(start_x);
             for cell_x in start_x..=end_x {
-                if self.cell_center(cell_x, cell_y).within(center, radius) {
-                    self.open[cell_y * self.axis + cell_x] = false;
+                let delta_x = cell_raw_x - center_raw_x;
+                if delta_x * delta_x <= remaining {
+                    self.open[row + cell_x] = false;
                 }
+                cell_raw_x += step;
             }
         }
     }
@@ -1634,6 +1659,91 @@ fn add_building_landing_points(
 
 fn nearest_landing_cell(passability: &StaticPassability, center: Vec2, team: Team) -> Option<Vec2> {
     let (center_x, center_y) = passability.cell_of(center)?;
+    let start_y = center_y.saturating_sub(LANDING_SEARCH_CELLS);
+    let start_x = center_x.saturating_sub(LANDING_SEARCH_CELLS);
+    let end_y = center_y
+        .saturating_add(LANDING_SEARCH_CELLS)
+        .min(passability.axis - 1);
+    let end_x = center_x
+        .saturating_add(LANDING_SEARCH_CELLS)
+        .min(passability.axis - 1);
+    // Direct grid scan with the same window, order, and `(distance, canonical
+    // cell index)` tie-break as `nearest_landing_cell_reference`. Cell raw
+    // coordinates and their squared distances from the center advance
+    // incrementally, so no `Vec2` is rebuilt and no coordinate is divided per
+    // cell; the winning cell is canonicalized once at the end.
+    let step = i64::from(TERRAIN_CELL_SIZE) << Fixed::FRAC_BITS;
+    let half = i64::from(TERRAIN_CELL_SIZE / 2) << Fixed::FRAC_BITS;
+    // A Dire canonical cell position is the mirrored cell center minus one raw
+    // unit, as `canonical_cell_position` builds it.
+    let dire_shift = if team == Team::Dire { 1 } else { 0 };
+    let center_raw_x = i64::from(center.x.raw);
+    let center_raw_y = i64::from(center.y.raw);
+    let first_raw = |cell: usize| -> i64 {
+        ((i64::from(i32::try_from(cell).unwrap_or(i32::MAX)) * i64::from(TERRAIN_CELL_SIZE))
+            << Fixed::FRAC_BITS)
+            + half
+            - dire_shift
+    };
+    let mut best: Option<(i64, usize, usize, usize)> = None;
+    for cell_y in start_y..=end_y {
+        let delta_y = first_raw(cell_y) - center_raw_y;
+        let delta_y_squared = delta_y * delta_y;
+        let row = cell_y * passability.axis;
+        let mut cell_raw_x = first_raw(start_x);
+        for cell_x in start_x..=end_x {
+            let delta_x = cell_raw_x - center_raw_x;
+            cell_raw_x += step;
+            if !passability.open[row + cell_x] {
+                continue;
+            }
+            let distance = delta_x * delta_x + delta_y_squared;
+            let canonical_index = if team == Team::Dire {
+                passability.axis * passability.axis - 1 - (row + cell_x)
+            } else {
+                row + cell_x
+            };
+            if best.is_none_or(|current| (distance, canonical_index) < (current.0, current.1)) {
+                best = Some((distance, canonical_index, cell_x, cell_y));
+            }
+        }
+    }
+    best.map(|(_, _, cell_x, cell_y)| canonical_cell_position(passability, cell_x, cell_y, team))
+}
+
+fn canonical_cell_position(
+    passability: &StaticPassability,
+    cell_x: usize,
+    cell_y: usize,
+    team: Team,
+) -> Vec2 {
+    if team != Team::Dire {
+        return passability.cell_center(cell_x, cell_y);
+    }
+    let canonical =
+        passability.cell_center(passability.axis - 1 - cell_x, passability.axis - 1 - cell_y);
+    let maximum = i64::try_from(passability.axis).expect("validated terrain axis")
+        * i64::from(TERRAIN_CELL_SIZE)
+        * i64::from(Fixed::ONE.raw)
+        - 1;
+    Vec2 {
+        x: Fixed {
+            raw: i32::try_from(maximum - i64::from(canonical.x.raw)).expect("validated map extent"),
+        },
+        y: Fixed {
+            raw: i32::try_from(maximum - i64::from(canonical.y.raw)).expect("validated map extent"),
+        },
+    }
+}
+
+/// The pre-optimization cell-centre landing scan, kept as the differential oracle.
+#[cfg(test)]
+fn nearest_landing_cell_reference(
+    passability: &StaticPassability,
+    center: Vec2,
+    team: Team,
+) -> Option<Vec2> {
+    let (center_x, center_y) = passability.cell_of(center)?;
     let mut best: Option<(i64, usize, Vec2)> = None;
     let start_y = center_y.saturating_sub(LANDING_SEARCH_CELLS);
     let start_x = center_x.saturating_sub(LANDING_SEARCH_CELLS);
@@ -1664,29 +1774,21 @@ fn nearest_landing_cell(passability: &StaticPassability, center: Vec2, team: Tea
     best.map(|(_, _, position)| position)
 }
 
-fn canonical_cell_position(
-    passability: &StaticPassability,
-    cell_x: usize,
-    cell_y: usize,
+/// Runs the direct-grid scan and the reference scan on one synthetic grid.
+#[cfg(test)]
+pub(crate) fn nearest_landing_cell_pair_for_test(
+    axis: usize,
+    open: Vec<bool>,
+    center: Vec2,
     team: Team,
-) -> Vec2 {
-    if team != Team::Dire {
-        return passability.cell_center(cell_x, cell_y);
-    }
-    let canonical =
-        passability.cell_center(passability.axis - 1 - cell_x, passability.axis - 1 - cell_y);
-    let maximum = i64::try_from(passability.axis).expect("validated terrain axis")
-        * i64::from(TERRAIN_CELL_SIZE)
-        * i64::from(Fixed::ONE.raw)
-        - 1;
-    Vec2 {
-        x: Fixed {
-            raw: i32::try_from(maximum - i64::from(canonical.x.raw)).expect("validated map extent"),
-        },
-        y: Fixed {
-            raw: i32::try_from(maximum - i64::from(canonical.y.raw)).expect("validated map extent"),
-        },
-    }
+) -> (Option<Vec2>, Option<Vec2>) {
+    assert!(axis > 0);
+    assert_eq!(open.len(), axis * axis);
+    let passability = StaticPassability { axis, open };
+    (
+        nearest_landing_cell_reference(&passability, center, team),
+        nearest_landing_cell(&passability, center, team),
+    )
 }
 
 fn add_tree_points(

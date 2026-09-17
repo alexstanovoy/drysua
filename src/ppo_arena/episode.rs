@@ -243,14 +243,80 @@ enum StreamReply {
 struct AdvancedReply {
     state: EpisodeStream,
     completed: CompletedAdvance,
-    /// Flush-next value evaluated on the owning worker, so the collector's
-    /// finish loop never blocks on a single-frame GPU round trip.
-    value: Option<f32>,
+    /// Reply slot receiving the flush-next value from the dedicated evaluator.
+    /// The value is the exact batch-1 evaluation of `frame`, only moved off the
+    /// worker's critical path.
+    value: Option<FlushValue>,
     opponent: &'static str,
     /// Frame and space for the next decision, built by the worker after the
     /// world step so the next sampling round never waits for a separate
     /// prepare barrier.
     prepared: Option<Box<(FeatureFrame, ActionSpace)>>,
+}
+
+/// One queued retained-interval flush request: the next frame plus the slot
+/// receiving its batch-1 value evaluation.
+type FlushRequest = (
+    FeatureFrame,
+    std::sync::mpsc::SyncSender<Result<f32, PpoError>>,
+);
+
+/// Receiver half of a queued flush value.
+type FlushValue = std::sync::mpsc::Receiver<Result<f32, PpoError>>;
+
+/// Bounded single-thread evaluator for retained-interval next values.
+///
+/// Retained intervals close on the owning stream worker, where the exact
+/// batch-1 evaluation serializes the whole collector behind the slowest
+/// worker's single-frame CUDA round trip. This dedicated thread overlaps that
+/// same evaluation with the workers' world steps; the collector blocks on the
+/// value only when the transition is pushed.
+struct FlushEvaluator {
+    sender: std::sync::Mutex<Option<std::sync::mpsc::SyncSender<FlushRequest>>>,
+}
+
+impl FlushEvaluator {
+    fn submit(
+        &self,
+        frame: FeatureFrame,
+        reply: std::sync::mpsc::SyncSender<Result<f32, PpoError>>,
+    ) -> Result<(), PpoError> {
+        let sender = self
+            .sender
+            .lock()
+            .map_err(|_| PpoError::InvalidConfig("flush evaluator lock"))?
+            .clone()
+            .ok_or(PpoError::InvalidConfig("flush evaluator closed"))?;
+        sender
+            .send((frame, reply))
+            .map_err(|_| PpoError::InvalidConfig("flush evaluator channel"))
+    }
+
+    /// Drops the sender so the evaluator loop finishes after the queued work.
+    fn shutdown(&self) {
+        if let Ok(mut sender) = self.sender.lock() {
+            *sender = None;
+        }
+    }
+}
+
+/// Drains queued flush requests until every sender is dropped.
+fn flush_evaluator_loop(model: &PolicyModel, receiver: &std::sync::mpsc::Receiver<FlushRequest>) {
+    while let Ok((frame, reply)) = receiver.recv() {
+        let value = model
+            .evaluate_batch(std::slice::from_ref(&frame))
+            .map_err(model_error)
+            .and_then(|output| {
+                output
+                    .into_iter()
+                    .next()
+                    .map(|output| output.value)
+                    .ok_or(PpoError::InvalidTransition("episode flush value"))
+            });
+        // A dropped receiver means the collector no longer needs this value;
+        // the evaluator keeps draining so later requests still complete.
+        let _ = reply.send(value);
+    }
 }
 
 pub(super) fn collect(
@@ -279,7 +345,29 @@ pub(super) fn collect(
         environments.len(),
         settings.opponent_schedule.as_str(),
     );
+    let (flush_sender, flush_receiver) =
+        std::sync::mpsc::sync_channel::<FlushRequest>(MAX_EPISODE_ENVIRONMENTS);
+    let flush_evaluator = FlushEvaluator {
+        sender: std::sync::Mutex::new(Some(flush_sender)),
+    };
+    struct FlushThreadGuard<'a>(&'a FlushEvaluator);
+    impl Drop for FlushThreadGuard<'_> {
+        fn drop(&mut self) {
+            // Closing the only sender ends the evaluator loop on every path,
+            // including early errors, before the scope joins the thread.
+            self.0.shutdown();
+        }
+    }
     std::thread::scope(|scope| -> Result<(), PpoError> {
+        std::thread::Builder::new()
+            .name("ppo-flush-eval".to_owned())
+            .spawn_scoped(scope, move || flush_evaluator_loop(model, &flush_receiver))
+            .map_err(|error| PpoError::EpisodeWorker {
+                stream: 0,
+                cause: error.to_string(),
+            })?;
+        let _flush_guard = FlushThreadGuard(&flush_evaluator);
+        let flush_evaluator_ref = &flush_evaluator;
         let workers =
             super::parallel::StreamWorkers::spawn(scope, environments, |_, environment, job| {
                 match job {
@@ -295,27 +383,18 @@ pub(super) fn collect(
                             advance_cpu(environment, &mut state, choice, space, config)?;
                         // A terminal flush uses a zero next value and never
                         // encodes a frame, exactly like the serial collector.
-                        // A terminal flush uses a zero next value and never
-                        // uses an encoded frame, exactly like the serial
-                        // collector.
-                        let value = if state.should_flush() && !state.done {
-                            let frame = encode_next_frame(environment)?;
-                            Some(
-                                model
-                                    .evaluate_batch(std::slice::from_ref(&frame))
-                                    .map_err(model_error)?[0]
-                                    .value,
-                            )
+                        // A non-terminal flush queues the exact next frame for
+                        // the dedicated evaluator; the frame is reused as the
+                        // next decision's prepared sample.
+                        let (value, prepared) = if state.done {
+                            (None, None)
+                        } else if state.should_flush() {
+                            let sample = prepare_policy_sample(environment)?;
+                            let (value_sender, value_receiver) = std::sync::mpsc::sync_channel(1);
+                            flush_evaluator_ref.submit(sample.0.clone(), value_sender)?;
+                            (Some(value_receiver), Some(Box::new(sample)))
                         } else {
-                            None
-                        };
-                        // The next decision's frame is built here, after the
-                        // flush frame, so operation order per stream matches
-                        // the barrier collector exactly.
-                        let prepared = if state.done {
-                            None
-                        } else {
-                            Some(Box::new(prepare_policy_sample(environment)?))
+                            (None, Some(Box::new(prepare_policy_sample(environment)?)))
                         };
                         let opponent = opponent_name(&environment.opponent);
                         Ok(StreamReply::Advanced(Box::new(AdvancedReply {
@@ -330,10 +409,12 @@ pub(super) fn collect(
             })?;
         // Bootstrap: every stream builds its first frame before any action.
         let mut prepared = prepare_all_workers(&workers, streams.len())?;
+        // Reused across decisions: the active set never changes shape between
+        // rounds, only membership.
+        let mut active: Vec<usize> = Vec::with_capacity(streams.len());
         for _ in 0..ACTOR_DECISIONS {
-            let active: Vec<_> = (0..streams.len())
-                .filter(|&stream| !streams[stream].done)
-                .collect();
+            active.clear();
+            active.extend((0..streams.len()).filter(|&stream| !streams[stream].done));
             if active.is_empty() {
                 break;
             }
@@ -371,11 +452,20 @@ pub(super) fn collect(
                 streams[stream] = std::mem::take(&mut reply.state);
                 prepared[stream] = reply.prepared.map(|sample| *sample);
                 assert_eq!(prepared[stream].is_none(), streams[stream].done);
+                let value = match reply.value {
+                    Some(receiver) => {
+                        let value = receiver.recv().map_err(|_| {
+                            PpoError::InvalidConfig("episode flush evaluator reply")
+                        })?;
+                        Some(value?)
+                    }
+                    None => None,
+                };
                 finish_advance_from_parts(
                     &mut streams[stream],
                     stream,
                     reply.completed,
-                    reply.value,
+                    value,
                     reply.opponent,
                     rollout,
                     report,

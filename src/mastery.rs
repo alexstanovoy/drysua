@@ -238,7 +238,7 @@ impl MasteryProgress {
             return Err("mastery already completed");
         }
         if outcomes.is_empty() || outcomes.len() > crate::MAX_TRAINING_ENVIRONMENTS {
-            return Err("mastery batch must contain 1..=16 completed games");
+            return Err("mastery batch must contain 1..=26 completed games");
         }
         let games = self
             .games

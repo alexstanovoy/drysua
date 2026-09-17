@@ -2334,14 +2334,19 @@ impl FeatureEncoder {
             }
         }
         assert!(self.axis <= 1 << 16);
-        // Reset only the cells visited by the previous fill; the queue is the
-        // exact visited list, so untouched cells stay at their sentinel.
-        for &packed in &self.path_queue {
+        let axis = self.axis;
+        // Work on local buffers for the whole fill: the compiler keeps the
+        // grid pointers in registers instead of reloading `self` fields, and
+        // the queue is the exact visited list used for the reset below.
+        let mut distances = std::mem::take(&mut self.path_distances);
+        let mut queue = std::mem::take(&mut self.path_queue);
+        let impassable = std::mem::take(&mut self.path_impassable);
+        for &packed in &queue {
             let x = packed & 0xffff;
             let y = packed >> 16;
-            self.path_distances[y * self.axis + x] = u32::MAX;
+            distances[y * axis + x] = u32::MAX;
         }
-        self.path_queue.clear();
+        queue.clear();
         self.path_origin = Some(origin);
         self.path_targets.clear();
         self.path_targets
@@ -2350,40 +2355,63 @@ impl FeatureEncoder {
         self.path_targets.dedup();
         let mut pending = self.path_targets.len();
         self.path_exhausted = false;
-        let origin_x = origin % self.axis;
-        let origin_y = origin / self.axis;
-        self.path_distances[origin] = 0;
-        self.path_queue.push((origin_y << 16) | origin_x);
+        let origin_x = origin % axis;
+        let origin_y = origin / axis;
+        distances[origin] = 0;
+        queue.push((origin_y << 16) | origin_x);
         let mut cursor = 0usize;
-        while cursor < self.path_queue.len() && pending > 0 {
-            let packed = self.path_queue[cursor];
-            cursor += 1;
-            if pending > 0 && self.path_targets.binary_search(&(packed as u32)).is_ok() {
-                pending -= 1;
-            }
-            let x = (packed & 0xffff) as isize;
-            let y = (packed >> 16) as isize;
-            let cell = y as usize * self.axis + x as usize;
-            let next_distance = self.path_distances[cell].saturating_add(1);
-            for (delta_x, delta_y) in MAP_DIRECTIONS {
-                let next_x = x + isize::try_from(delta_x).expect("map direction fits isize");
-                let next_y = y + isize::try_from(delta_y).expect("map direction fits isize");
-                if next_x < 0 || next_y < 0 {
-                    continue;
+        if pending > 0 {
+            // Neighbour order matches [`MAP_DIRECTIONS`] exactly; the deltas
+            // are row strides computed once, so the inner loop needs one add
+            // per neighbour instead of a multiply.
+            let row = axis as isize;
+            const DIRECTIONS: [(isize, isize); 8] = [
+                (1, 0),
+                (1, 1),
+                (0, 1),
+                (-1, 1),
+                (-1, 0),
+                (-1, -1),
+                (0, -1),
+                (1, -1),
+            ];
+            let deltas: [isize; 8] = [1, row + 1, row, row - 1, -1, -row - 1, -row, -row + 1];
+            while cursor < queue.len() && pending > 0 {
+                let packed = queue[cursor];
+                cursor += 1;
+                let x = (packed & 0xffff) as isize;
+                let y = (packed >> 16) as isize;
+                let cell = y as usize * axis + x as usize;
+                if pending > 0 && self.path_targets.binary_search(&(cell as u32)).is_ok() {
+                    pending -= 1;
                 }
-                let (next_x, next_y) = (next_x as usize, next_y as usize);
-                if next_x >= self.axis || next_y >= self.axis {
-                    continue;
+                let next_distance = distances[cell].saturating_add(1);
+                for (index, (delta_x, delta_y)) in DIRECTIONS.iter().enumerate() {
+                    let next_x = x + delta_x;
+                    let next_y = y + delta_y;
+                    if next_x < 0 || next_y < 0 {
+                        continue;
+                    }
+                    let (next_x, next_y) = (next_x as usize, next_y as usize);
+                    if next_x >= axis || next_y >= axis {
+                        continue;
+                    }
+                    let next = (cell as isize + deltas[index]) as usize;
+                    if impassable[next] || distances[next] != u32::MAX {
+                        continue;
+                    }
+                    distances[next] = next_distance;
+                    queue.push((next_y << 16) | next_x);
                 }
-                let next = next_y * self.axis + next_x;
-                if self.path_impassable[next] || self.path_distances[next] != u32::MAX {
-                    continue;
-                }
-                self.path_distances[next] = next_distance;
-                self.path_queue.push((next_y << 16) | next_x);
             }
         }
-        self.path_exhausted = cursor == self.path_queue.len() && pending == 0;
+        // An exhausted queue proves the whole reachable component is known;
+        // with pending targets settled the field is complete for them too.
+        self.path_exhausted =
+            pending == 0 && !self.path_targets.is_empty() && cursor == queue.len();
+        self.path_distances = distances;
+        self.path_queue = queue;
+        self.path_impassable = impassable;
     }
 
     fn path_steps(&self, position: Vec2) -> Option<u32> {

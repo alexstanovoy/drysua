@@ -192,8 +192,8 @@ fn curriculum_weak_and_mixed_complete_batches_preserve_terminal_reward_and_reten
 }
 
 #[test]
-fn eight_and_sixteen_environment_complete_batches_collect_and_qualify() {
-    for environments in [8usize, 16] {
+fn eight_sixteen_twenty_four_and_twenty_six_environment_complete_batches_collect_and_qualify() {
+    for environments in [8usize, 16, 24, 26] {
         let model = stop_model();
         let settings = crate::cli::training_settings_for_test(&[
             "--opponent-schedule",

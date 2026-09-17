@@ -15,6 +15,79 @@ fn parallel_collection_preserves_actor_rng_frames_outcomes_and_ordering() {
 }
 
 #[test]
+fn flush_evaluator_matches_direct_single_frame_values_in_submission_order() {
+    let model = PolicyModel::fresh(9952123).expect("model");
+    let settings = parity_settings_for_test();
+    let mut arenas = environments(&settings, 0).expect("worlds");
+    let frames: Vec<FeatureFrame> = arenas
+        .iter_mut()
+        .map(|arena| prepare_policy_sample(arena).expect("prepared").0)
+        .collect();
+    let expected: Vec<u32> = frames
+        .iter()
+        .map(|frame| {
+            model
+                .evaluate_batch(std::slice::from_ref(frame))
+                .expect("direct value")[0]
+                .value
+                .to_bits()
+        })
+        .collect();
+    let (sender, receiver) =
+        std::sync::mpsc::sync_channel::<FlushRequest>(MAX_EPISODE_ENVIRONMENTS);
+    let evaluator = FlushEvaluator {
+        sender: std::sync::Mutex::new(Some(sender)),
+    };
+    std::thread::scope(|scope| {
+        scope.spawn(move || flush_evaluator_loop(&model, &receiver));
+        let replies: Vec<_> = frames
+            .into_iter()
+            .map(|frame| {
+                let (value_sender, value_receiver) = std::sync::mpsc::sync_channel(1);
+                evaluator.submit(frame, value_sender).expect("submit");
+                value_receiver
+            })
+            .collect();
+        for (reply, expected) in replies.into_iter().zip(expected) {
+            let value = reply.recv().expect("value reply").expect("value result");
+            assert_eq!(value.to_bits(), expected);
+        }
+        evaluator.shutdown();
+    });
+}
+
+#[test]
+fn flush_evaluator_reports_frame_errors_and_keeps_draining() {
+    let model = PolicyModel::fresh(9952124).expect("model");
+    let settings = parity_settings_for_test();
+    let mut arenas = environments(&settings, 0).expect("worlds");
+    let good = prepare_policy_sample(&mut arenas[0]).expect("prepared").0;
+    let mut bad = good.clone();
+    bad.global[0] = f32::NAN;
+    let expected_good = model
+        .evaluate_batch(std::slice::from_ref(&good))
+        .expect("direct value")[0]
+        .value
+        .to_bits();
+    let (sender, receiver) =
+        std::sync::mpsc::sync_channel::<FlushRequest>(MAX_EPISODE_ENVIRONMENTS);
+    let evaluator = FlushEvaluator {
+        sender: std::sync::Mutex::new(Some(sender)),
+    };
+    std::thread::scope(|scope| {
+        scope.spawn(move || flush_evaluator_loop(&model, &receiver));
+        let (bad_sender, bad_receiver) = std::sync::mpsc::sync_channel(1);
+        evaluator.submit(bad, bad_sender).expect("submit bad");
+        assert!(bad_receiver.recv().expect("bad reply").is_err());
+        let (good_sender, good_receiver) = std::sync::mpsc::sync_channel(1);
+        evaluator.submit(good, good_sender).expect("submit good");
+        let value = good_receiver.recv().expect("good reply").expect("value");
+        assert_eq!(value.to_bits(), expected_good);
+        evaluator.shutdown();
+    });
+}
+
+#[test]
 #[ignore = "Bounded full-game CUDA profiling uses the retained M12 reference artifact"]
 #[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
 fn profile_parallel_full_episode_collection() {

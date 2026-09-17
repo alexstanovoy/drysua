@@ -103,6 +103,9 @@ pub struct MatchMetadata {
 /// Exact bounded static inputs used by policy components.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct StaticTrackerProvenance {
+    /// Owner identity: static inputs are immutable for one tracker, so equal
+    /// lineages prove equal static data without comparing every field.
+    lineage: NonZeroU64,
     slot: SlotId,
     team: Team,
     metadata: MatchMetadata,
@@ -914,6 +917,7 @@ impl StateTracker {
         };
         let (terrain, opaque) = decode_terrain(info);
         let static_provenance_cache = Arc::new(StaticTrackerProvenance {
+            lineage,
             slot,
             team,
             metadata,
@@ -2454,6 +2458,9 @@ fn is_own_courier(tracker: &StateTracker, unit: &UnitView) -> bool {
 
 impl StaticTrackerProvenance {
     pub(crate) fn matches(&self, tracker: &StateTracker) -> bool {
+        if self.lineage == tracker.lineage {
+            return true;
+        }
         self.slot == tracker.slot
             && self.team == tracker.team
             && self.metadata == tracker.metadata

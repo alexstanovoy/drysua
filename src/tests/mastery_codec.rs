@@ -97,9 +97,9 @@ fn mastery_checkpoint_stage_game_counters_must_match_completed_batches() {
 }
 
 #[test]
-fn checkpoint_mastery_scope_accepts_even_counts_up_to_sixteen() {
+fn checkpoint_mastery_scope_accepts_even_counts_up_to_twenty_six() {
     let config = MasteryConfig::new(50, 100, &[]).expect("config");
-    for environments in [2usize, 6, 8, 16] {
+    for environments in [2usize, 6, 8, 16, 18, 20, 22, 24, 26] {
         let mut progress = MasteryProgress::default();
         progress
             .record_batch(config, &vec![Outcome::Win; environments])
@@ -110,7 +110,7 @@ fn checkpoint_mastery_scope_accepts_even_counts_up_to_sixteen() {
     progress
         .record_batch(config, &[Outcome::Win; 6])
         .expect("batch");
-    for environments in [0usize, 7, 18] {
+    for environments in [0usize, 7, 28] {
         assert!(validate_scope(Some(config), Some(&progress), 1, environments).is_err());
     }
 }

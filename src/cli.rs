@@ -181,7 +181,7 @@ struct TrainFullArgs {
     /// Total PPO update target, including updates restored from a checkpoint.
     #[arg(long)]
     updates: u64,
-    /// Independent CPU arenas: 2, 4, or 6 for complete episodes; at most 16 for windows.
+    /// Independent CPU arenas: even counts up to 26 for complete episodes; at most 16 for windows.
     #[arg(long, default_value_t = 4)]
     environments: usize,
     /// Window decisions or per-episode retained capacity.

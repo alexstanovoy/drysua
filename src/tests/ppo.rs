@@ -2639,7 +2639,7 @@ fn map2_e6_capacity_and_lambda_one_are_explicit_and_bounded() {
         "invalid PPO config field: samples per update"
     );
     let mut invalid = settings.clone();
-    invalid.ppo.environments = 18;
+    invalid.ppo.environments = 28;
     assert_eq!(
         crate::ppo_arena::episode::validate(&invalid)
             .expect_err("unbounded complete-episode environment count")

@@ -2713,24 +2713,154 @@ impl PolicyModel {
 
     fn forward_frames(&self, frames: &[FeatureFrame]) -> Result<ForwardState, ModelError> {
         let batch = frames.len();
-        let units = encode_units(self, frames)?;
-        let own_units = encode_own_units(self, frames)?;
+        let device = self.tensor_device();
+        let units = stage_units(frames);
+        let (own_values, own_mask) = stage_own_units(frames);
+        let (ability_values, ability_mask) = stage_tokens(frames, TokenField::Ability);
+        let (item_values, item_mask) = stage_tokens(frames, TokenField::Item);
+        let (point_values, point_mask) = stage_tokens(frames, TokenField::Point);
+        let (projectile_values, projectile_mask) = stage_tokens(frames, TokenField::Projectile);
+        let (loot_values, loot_mask) = stage_tokens(frames, TokenField::Loot);
+        let scalars = stage_scalars(frames);
+        let mut parts: Vec<&[f32]> = Vec::with_capacity(3 + UNIT_GROUPS + 12);
+        parts.push(&units.values);
+        parts.push(&units.presence);
+        for group in &units.groups {
+            parts.push(group);
+        }
+        parts.push(&own_values);
+        parts.push(&own_mask);
+        for values in [
+            &ability_values,
+            &ability_mask,
+            &item_values,
+            &item_mask,
+            &point_values,
+            &point_mask,
+            &projectile_values,
+            &projectile_mask,
+            &loot_values,
+            &loot_mask,
+            &scalars,
+        ] {
+            parts.push(values);
+        }
+        let views = upload_parts(&parts, device)?;
+        let mut views = views.into_iter();
+        let unit_rows = views
+            .next()
+            .expect("unit rows view")
+            .reshape((batch * ENCODER_UNIT_TOKENS, UNIT_FEATURES))?;
+        let unit_presence =
+            views
+                .next()
+                .expect("unit presence view")
+                .reshape((batch, ENCODER_UNIT_TOKENS, 1))?;
+        let mut unit_groups = Vec::with_capacity(UNIT_GROUPS);
+        for _ in 0..UNIT_GROUPS {
+            unit_groups.push(views.next().expect("unit group view").reshape((
+                batch,
+                ENCODER_UNIT_TOKENS,
+                1,
+            ))?);
+        }
+        let own_rows = views
+            .next()
+            .expect("own rows view")
+            .reshape((batch * OWN_UNIT_FEATURE_TOKENS, UNIT_FEATURES))?;
+        let own_mask =
+            views
+                .next()
+                .expect("own mask view")
+                .reshape((batch, OWN_UNIT_FEATURE_TOKENS, 1))?;
+        let ability_rows = views
+            .next()
+            .expect("ability rows view")
+            .reshape((batch * ABILITY_FEATURE_TOKENS, ABILITY_FEATURES))?;
+        let ability_presence = views.next().expect("ability presence view").reshape((
+            batch,
+            ABILITY_FEATURE_TOKENS,
+            1,
+        ))?;
+        let item_rows = views
+            .next()
+            .expect("item rows view")
+            .reshape((batch * ITEM_FEATURE_TOKENS, ITEM_FEATURES))?;
+        let item_presence =
+            views
+                .next()
+                .expect("item presence view")
+                .reshape((batch, ITEM_FEATURE_TOKENS, 1))?;
+        let point_rows = views
+            .next()
+            .expect("point rows view")
+            .reshape((batch * POINT_FEATURE_TOKENS, POINT_FEATURES))?;
+        let point_presence =
+            views
+                .next()
+                .expect("point presence view")
+                .reshape((batch, POINT_FEATURE_TOKENS, 1))?;
+        let projectile_rows = views
+            .next()
+            .expect("projectile rows view")
+            .reshape((batch * PROJECTILE_FEATURE_TOKENS, PROJECTILE_FEATURES))?;
+        let projectile_presence = views.next().expect("projectile presence view").reshape((
+            batch,
+            PROJECTILE_FEATURE_TOKENS,
+            1,
+        ))?;
+        let loot_rows = views
+            .next()
+            .expect("loot rows view")
+            .reshape((batch * LOOT_FEATURE_TOKENS, LOOT_FEATURES))?;
+        let loot_presence =
+            views
+                .next()
+                .expect("loot presence view")
+                .reshape((batch, LOOT_FEATURE_TOKENS, 1))?;
+        let scalars = views
+            .next()
+            .expect("scalars view")
+            .reshape((batch, ENCODER_SCALARS))?;
+        assert!(views.next().is_none());
+
+        let units = encode_units(self, &unit_rows, &unit_presence, &unit_groups, batch)?;
+        let own_units = encode_own_units(self, &own_rows, &own_mask, batch)?;
         let abilities = encode_tokens(
-            frames,
-            TokenField::Ability,
             &self.ability,
-            self.tensor_device(),
+            &ability_rows,
+            &ability_presence,
+            ABILITY_FEATURE_TOKENS,
+            batch,
         )?;
-        let items = encode_tokens(frames, TokenField::Item, &self.item, self.tensor_device())?;
-        let points = encode_tokens(frames, TokenField::Point, &self.point, self.tensor_device())?;
+        let items = encode_tokens(
+            &self.item,
+            &item_rows,
+            &item_presence,
+            ITEM_FEATURE_TOKENS,
+            batch,
+        )?;
+        let points = encode_tokens(
+            &self.point,
+            &point_rows,
+            &point_presence,
+            POINT_FEATURE_TOKENS,
+            batch,
+        )?;
         let projectiles = encode_tokens(
-            frames,
-            TokenField::Projectile,
             &self.projectile,
-            self.tensor_device(),
+            &projectile_rows,
+            &projectile_presence,
+            PROJECTILE_FEATURE_TOKENS,
+            batch,
         )?;
-        let loot = encode_tokens(frames, TokenField::Loot, &self.loot, self.tensor_device())?;
-        let scalars = scalar_tensor(frames, self.tensor_device())?;
+        let loot = encode_tokens(
+            &self.loot,
+            &loot_rows,
+            &loot_presence,
+            LOOT_FEATURE_TOKENS,
+            batch,
+        )?;
         let trunk_input = Tensor::cat(
             &[
                 &scalars,
@@ -4434,15 +4564,31 @@ pub(crate) fn condition_rows(
     }
 }
 
-fn encode_units(model: &PolicyModel, frames: &[FeatureFrame]) -> Result<UnitEncoding, ModelError> {
-    let tokens = UNIT_FEATURE_TOKENS + REMEMBERED_UNIT_FEATURE_TOKENS;
+/// Scalar encoder input width for one frame.
+const ENCODER_SCALARS: usize = GLOBAL_FEATURES
+    + HISTORY_SAMPLES * HISTORY_FEATURES
+    + MAX_POLICY_HISTORY * POLICY_HISTORY_FEATURES
+    + MAP_FEATURES;
+
+/// Unit encoder input rows for one frame.
+const ENCODER_UNIT_TOKENS: usize = UNIT_FEATURE_TOKENS + REMEMBERED_UNIT_FEATURE_TOKENS;
+
+/// Host-side unit inputs for one batch before the single device upload.
+struct StagedUnits {
+    values: Vec<f32>,
+    presence: Vec<f32>,
+    groups: Vec<Vec<f32>>,
+}
+
+fn stage_units(frames: &[FeatureFrame]) -> StagedUnits {
+    let tokens = ENCODER_UNIT_TOKENS;
     let mut values = Vec::with_capacity(frames.len() * tokens * UNIT_FEATURES);
-    let mut masks = (0..UNIT_GROUPS)
+    let mut groups = (0..UNIT_GROUPS)
         .map(|_| Vec::with_capacity(frames.len() * tokens))
         .collect::<Vec<_>>();
     for frame in frames {
-        append_unit_rows(&mut values, &mut masks, &frame.units);
-        append_unit_rows(&mut values, &mut masks, &frame.remembered_units);
+        append_unit_rows(&mut values, &mut groups, &frame.units);
+        append_unit_rows(&mut values, &mut groups, &frame.remembered_units);
     }
     condition_rows(
         &mut values,
@@ -4450,59 +4596,19 @@ fn encode_units(model: &PolicyModel, frames: &[FeatureFrame]) -> Result<UnitEnco
         &[(unit_feature::KIND_TOKEN, 12.0)],
         None,
     );
-    let rows = Tensor::from_vec(
-        values,
-        (frames.len() * tokens, UNIT_FEATURES),
-        model.tensor_device(),
-    )?;
-    let encoded = model
-        .unit
-        .forward(&rows)?
-        .reshape((frames.len(), tokens, UNIT_EMBEDDING))?;
     let presence = (0..frames.len() * tokens)
-        .map(|index| masks.iter().any(|mask| mask[index] == 1.0) as u8 as f32)
+        .map(|index| groups.iter().any(|mask| mask[index] == 1.0) as u8 as f32)
         .collect::<Vec<_>>();
-    let presence = Tensor::from_vec(presence, (frames.len(), tokens, 1), model.tensor_device())?;
-    let encoded = encoded.broadcast_mul(&presence)?;
-    let pooled = pool_groups(&encoded, &masks, frames.len(), tokens, UNIT_EMBEDDING)?;
-    let current = encoded.narrow(1, 0, UNIT_FEATURE_TOKENS)?;
-    Ok(UnitEncoding { pooled, current })
-}
-
-fn append_unit_rows<const TOKENS: usize>(
-    values: &mut Vec<f32>,
-    masks: &mut [Vec<f32>],
-    rows: &[[f32; UNIT_FEATURES]; TOKENS],
-) {
-    for row in rows {
-        let present = row[unit_feature::TOKEN_PRESENT] == 1.0;
-        if present {
-            values.extend(row);
-        } else {
-            values.resize(values.len() + UNIT_FEATURES, 0.0);
-        }
-        let group = unit_group(row[unit_feature::KIND_TOKEN]);
-        for (index, mask) in masks.iter_mut().enumerate() {
-            mask.push((present && group == Some(index)) as u8 as f32);
-        }
+    assert_eq!(values.len(), frames.len() * tokens * UNIT_FEATURES);
+    assert_eq!(presence.len(), frames.len() * tokens);
+    StagedUnits {
+        values,
+        presence,
+        groups,
     }
 }
 
-pub(crate) fn unit_group(kind: f32) -> Option<usize> {
-    match kind as u8 {
-        1 => Some(0),
-        2..=5 => Some(1),
-        7..=10 => Some(2),
-        6 => Some(3),
-        11 | 12 => Some(4),
-        _ => None,
-    }
-}
-
-fn encode_own_units(
-    model: &PolicyModel,
-    frames: &[FeatureFrame],
-) -> Result<OwnUnitEncoding, ModelError> {
+fn stage_own_units(frames: &[FeatureFrame]) -> (Vec<f32>, Vec<f32>) {
     let mut values = Vec::with_capacity(frames.len() * OWN_UNIT_FEATURE_TOKENS * UNIT_FEATURES);
     let mut mask = Vec::with_capacity(frames.len() * OWN_UNIT_FEATURE_TOKENS);
     for frame in frames {
@@ -4519,71 +4625,15 @@ fn encode_own_units(
         &[(unit_feature::KIND_TOKEN, 12.0)],
         None,
     );
-    let rows = Tensor::from_vec(
-        values,
-        (frames.len() * OWN_UNIT_FEATURE_TOKENS, UNIT_FEATURES),
-        model.tensor_device(),
-    )?;
-    let encoded = model.unit.forward(&rows)?.reshape((
-        frames.len(),
-        OWN_UNIT_FEATURE_TOKENS,
-        UNIT_EMBEDDING,
-    ))?;
-    let mask = Tensor::from_vec(
-        mask,
-        (frames.len(), OWN_UNIT_FEATURE_TOKENS, 1),
-        model.tensor_device(),
-    )?;
-    let fixed = encoded.broadcast_mul(&mask)?.flatten_from(1)?;
-    Ok(OwnUnitEncoding { fixed })
+    assert_eq!(
+        values.len(),
+        frames.len() * OWN_UNIT_FEATURE_TOKENS * UNIT_FEATURES
+    );
+    assert_eq!(mask.len(), frames.len() * OWN_UNIT_FEATURE_TOKENS);
+    (values, mask)
 }
 
-enum TokenField {
-    Ability,
-    Item,
-    Point,
-    Projectile,
-    Loot,
-}
-
-impl TokenField {
-    const fn shape(&self) -> (usize, usize, usize) {
-        match self {
-            Self::Ability => (
-                ABILITY_FEATURE_TOKENS,
-                ABILITY_FEATURES,
-                ability_feature::TOKEN_PRESENT,
-            ),
-            Self::Item => (
-                ITEM_FEATURE_TOKENS,
-                ITEM_FEATURES,
-                item_feature::TOKEN_PRESENT,
-            ),
-            Self::Point => (
-                POINT_FEATURE_TOKENS,
-                POINT_FEATURES,
-                point_feature::TOKEN_PRESENT,
-            ),
-            Self::Projectile => (
-                PROJECTILE_FEATURE_TOKENS,
-                PROJECTILE_FEATURES,
-                projectile_feature::TOKEN_PRESENT,
-            ),
-            Self::Loot => (
-                LOOT_FEATURE_TOKENS,
-                LOOT_FEATURES,
-                loot_feature::TOKEN_PRESENT,
-            ),
-        }
-    }
-}
-
-fn encode_tokens(
-    frames: &[FeatureFrame],
-    field: TokenField,
-    encoder: &Mlp,
-    device: &Device,
-) -> Result<TokenEncoding, ModelError> {
+fn stage_tokens(frames: &[FeatureFrame], field: TokenField) -> (Vec<f32>, Vec<f32>) {
     let (tokens, features, presence) = field.shape();
     let mut values = Vec::with_capacity(frames.len() * tokens * features);
     let mut mask = Vec::with_capacity(frames.len() * tokens);
@@ -4635,13 +4685,197 @@ fn encode_tokens(
             Some((loot_feature::ITEM_TOKEN, 65_536.0)),
         ),
     }
-    let rows = Tensor::from_vec(values, (frames.len() * tokens, features), device)?;
+    assert_eq!(values.len(), frames.len() * tokens * features);
+    assert_eq!(mask.len(), frames.len() * tokens);
+    (values, mask)
+}
+
+fn stage_scalars(frames: &[FeatureFrame]) -> Vec<f32> {
+    let mut values = Vec::with_capacity(frames.len() * ENCODER_SCALARS);
+    for frame in frames {
+        let mut global = frame.global;
+        condition_rows(
+            &mut global,
+            GLOBAL_FEATURES,
+            &[
+                (crate::global_feature::ROLE_TOKEN, 5.0),
+                (crate::global_feature::LANE_TOKEN, 3.0),
+                (crate::global_feature::ACTIVE_ORDER_KIND, 16.0),
+                (crate::global_feature::ACTIVE_TARGET_KIND_TOKEN, 12.0),
+            ],
+            None,
+        );
+        values.extend(global);
+        values.extend(frame.history.iter().flatten().copied());
+        for mut row in frame.policy_history {
+            condition_rows(&mut row, POLICY_HISTORY_FEATURES, &[(3, 16.0)], None);
+            values.extend(row);
+        }
+        values.extend(frame.map);
+    }
+    assert_eq!(values.len(), frames.len() * ENCODER_SCALARS);
+    values
+}
+
+/// Uploads every encoder input part with one device allocation and copy.
+///
+/// Each part becomes a contiguous 1-D view of the same allocation. The host
+/// values and every downstream op are unchanged; only the number of device
+/// allocations and host-to-device copies shrinks from one per part to one per
+/// forward.
+fn upload_parts(parts: &[&[f32]], device: &Device) -> Result<Vec<Tensor>, ModelError> {
+    let total = parts.iter().try_fold(0usize, |total, part| {
+        total
+            .checked_add(part.len())
+            .ok_or(ModelError::InvalidModelState("staged input overflow"))
+    })?;
+    if parts.is_empty() || total == 0 {
+        return Err(ModelError::InvalidModelState("staged input empty"));
+    }
+    let mut host = Vec::with_capacity(total);
+    for part in parts {
+        host.extend_from_slice(part);
+    }
+    let flat = Tensor::from_vec(host, total, device)?;
+    let mut offset = 0usize;
+    let mut views = Vec::with_capacity(parts.len());
+    for part in parts {
+        views.push(flat.narrow(0, offset, part.len())?);
+        offset += part.len();
+    }
+    assert_eq!(offset, total);
+    assert_eq!(views.len(), parts.len());
+    Ok(views)
+}
+
+fn encode_units(
+    model: &PolicyModel,
+    rows: &Tensor,
+    presence: &Tensor,
+    groups: &[Tensor],
+    batch: usize,
+) -> Result<UnitEncoding, ModelError> {
+    let tokens = ENCODER_UNIT_TOKENS;
+    assert_eq!(rows.dims(), [batch * tokens, UNIT_FEATURES]);
+    assert_eq!(presence.dims(), [batch, tokens, 1]);
+    let encoded = model
+        .unit
+        .forward(rows)?
+        .reshape((batch, tokens, UNIT_EMBEDDING))?;
+    let encoded = encoded.broadcast_mul(presence)?;
+    let pooled = pool_groups(&encoded, groups, batch, tokens, UNIT_EMBEDDING)?;
+    let current = encoded.narrow(1, 0, UNIT_FEATURE_TOKENS)?;
+    Ok(UnitEncoding { pooled, current })
+}
+
+fn append_unit_rows<const TOKENS: usize>(
+    values: &mut Vec<f32>,
+    masks: &mut [Vec<f32>],
+    rows: &[[f32; UNIT_FEATURES]; TOKENS],
+) {
+    for row in rows {
+        let present = row[unit_feature::TOKEN_PRESENT] == 1.0;
+        if present {
+            values.extend(row);
+        } else {
+            values.resize(values.len() + UNIT_FEATURES, 0.0);
+        }
+        let group = unit_group(row[unit_feature::KIND_TOKEN]);
+        for (index, mask) in masks.iter_mut().enumerate() {
+            mask.push((present && group == Some(index)) as u8 as f32);
+        }
+    }
+}
+
+pub(crate) fn unit_group(kind: f32) -> Option<usize> {
+    match kind as u8 {
+        1 => Some(0),
+        2..=5 => Some(1),
+        7..=10 => Some(2),
+        6 => Some(3),
+        11 | 12 => Some(4),
+        _ => None,
+    }
+}
+
+fn encode_own_units(
+    model: &PolicyModel,
+    rows: &Tensor,
+    mask: &Tensor,
+    batch: usize,
+) -> Result<OwnUnitEncoding, ModelError> {
+    assert_eq!(
+        rows.dims(),
+        [batch * OWN_UNIT_FEATURE_TOKENS, UNIT_FEATURES]
+    );
+    assert_eq!(mask.dims(), [batch, OWN_UNIT_FEATURE_TOKENS, 1]);
+    let encoded =
+        model
+            .unit
+            .forward(rows)?
+            .reshape((batch, OWN_UNIT_FEATURE_TOKENS, UNIT_EMBEDDING))?;
+    let fixed = encoded.broadcast_mul(mask)?.flatten_from(1)?;
+    Ok(OwnUnitEncoding { fixed })
+}
+
+enum TokenField {
+    Ability,
+    Item,
+    Point,
+    Projectile,
+    Loot,
+}
+
+impl TokenField {
+    const fn shape(&self) -> (usize, usize, usize) {
+        match self {
+            Self::Ability => (
+                ABILITY_FEATURE_TOKENS,
+                ABILITY_FEATURES,
+                ability_feature::TOKEN_PRESENT,
+            ),
+            Self::Item => (
+                ITEM_FEATURE_TOKENS,
+                ITEM_FEATURES,
+                item_feature::TOKEN_PRESENT,
+            ),
+            Self::Point => (
+                POINT_FEATURE_TOKENS,
+                POINT_FEATURES,
+                point_feature::TOKEN_PRESENT,
+            ),
+            Self::Projectile => (
+                PROJECTILE_FEATURE_TOKENS,
+                PROJECTILE_FEATURES,
+                projectile_feature::TOKEN_PRESENT,
+            ),
+            Self::Loot => (
+                LOOT_FEATURE_TOKENS,
+                LOOT_FEATURES,
+                loot_feature::TOKEN_PRESENT,
+            ),
+        }
+    }
+}
+
+fn encode_tokens(
+    encoder: &Mlp,
+    rows: &Tensor,
+    presence: &Tensor,
+    tokens: usize,
+    batch: usize,
+) -> Result<TokenEncoding, ModelError> {
     let encoded = encoder
-        .forward(&rows)?
-        .reshape((frames.len(), tokens, TOKEN_EMBEDDING))?;
-    let presence = Tensor::from_vec(mask.clone(), (frames.len(), tokens, 1), device)?;
-    let encoded = encoded.broadcast_mul(&presence)?;
-    let pooled = pool_groups(&encoded, &[mask], frames.len(), tokens, TOKEN_EMBEDDING)?;
+        .forward(rows)?
+        .reshape((batch, tokens, TOKEN_EMBEDDING))?;
+    let encoded = encoded.broadcast_mul(presence)?;
+    let pooled = pool_groups(
+        &encoded,
+        std::slice::from_ref(presence),
+        batch,
+        tokens,
+        TOKEN_EMBEDDING,
+    )?;
     Ok(TokenEncoding { pooled, encoded })
 }
 
@@ -4680,16 +4914,17 @@ fn append_present_rows<const TOKENS: usize, const FEATURES: usize>(
 
 fn pool_groups(
     encoded: &Tensor,
-    masks: &[Vec<f32>],
+    masks: &[Tensor],
     batch: usize,
     tokens: usize,
     width: usize,
 ) -> Result<Tensor, ModelError> {
+    assert!(!masks.is_empty());
     let mut pools = Vec::with_capacity(masks.len() * 2);
     let device = encoded.device();
-    for values in masks {
-        let mask = Tensor::from_vec(values.clone(), (batch, tokens, 1), device)?;
-        let masked = encoded.broadcast_mul(&mask)?;
+    for mask in masks {
+        assert_eq!(mask.dims(), [batch, tokens, 1]);
+        let masked = encoded.broadcast_mul(mask)?;
         let counts = mask.sum(1)?;
         let denominator = counts.clamp(1.0f32, tokens as f32)?;
         let mean = masked.sum(1)?.broadcast_div(&denominator)?;
@@ -4712,6 +4947,20 @@ fn pool_groups(
 }
 
 #[cfg(test)]
+fn test_mask_tensors(masks: &[Vec<bool>], tokens: usize) -> Result<Vec<Tensor>, ModelError> {
+    masks
+        .iter()
+        .map(|mask| {
+            let values = mask
+                .iter()
+                .map(|value| *value as u8 as f32)
+                .collect::<Vec<_>>();
+            Ok(Tensor::from_vec(values, (1, tokens, 1), &Device::Cpu)?)
+        })
+        .collect()
+}
+
+#[cfg(test)]
 pub(crate) fn pool_groups_for_test(
     encoded: &[Vec<f32>],
     masks: &[Vec<bool>],
@@ -4726,10 +4975,7 @@ pub(crate) fn pool_groups_for_test(
     }
     let values = encoded.iter().flatten().copied().collect::<Vec<_>>();
     let tensor = Tensor::from_vec(values, (1, tokens, width), &Device::Cpu)?;
-    let masks = masks
-        .iter()
-        .map(|mask| mask.iter().map(|value| *value as u8 as f32).collect())
-        .collect::<Vec<_>>();
+    let masks = test_mask_tensors(masks, tokens)?;
     Ok(pool_groups(&tensor, &masks, 1, tokens, width)?
         .flatten_all()?
         .to_vec1()?)
@@ -4751,10 +4997,7 @@ pub(crate) fn pool_max_gradient_for_test(
     let values = encoded.iter().flatten().copied().collect::<Vec<_>>();
     let tensor = Tensor::from_vec(values, (1, tokens, width), &Device::Cpu)?;
     let variable = Var::from_tensor(&tensor)?;
-    let masks = masks
-        .iter()
-        .map(|mask| mask.iter().map(|value| *value as u8 as f32).collect())
-        .collect::<Vec<_>>();
+    let masks = test_mask_tensors(masks, tokens)?;
     let pooled = pool_groups(variable.as_tensor(), &masks, 1, tokens, width)?;
     let loss = pooled.narrow(1, width, width)?.sum_all()?;
     let gradients = loss.backward()?;
@@ -4762,36 +5005,6 @@ pub(crate) fn pool_max_gradient_for_test(
         .get(variable.as_tensor())
         .ok_or(ModelError::InvalidModelState("pool gradient"))?;
     Ok(gradient.flatten_all()?.to_vec1()?)
-}
-
-fn scalar_tensor(frames: &[FeatureFrame], device: &Device) -> Result<Tensor, ModelError> {
-    const SCALARS: usize = GLOBAL_FEATURES
-        + HISTORY_SAMPLES * HISTORY_FEATURES
-        + MAX_POLICY_HISTORY * POLICY_HISTORY_FEATURES
-        + MAP_FEATURES;
-    let mut values = Vec::with_capacity(frames.len() * SCALARS);
-    for frame in frames {
-        let mut global = frame.global;
-        condition_rows(
-            &mut global,
-            GLOBAL_FEATURES,
-            &[
-                (crate::global_feature::ROLE_TOKEN, 5.0),
-                (crate::global_feature::LANE_TOKEN, 3.0),
-                (crate::global_feature::ACTIVE_ORDER_KIND, 16.0),
-                (crate::global_feature::ACTIVE_TARGET_KIND_TOKEN, 12.0),
-            ],
-            None,
-        );
-        values.extend(global);
-        values.extend(frame.history.iter().flatten().copied());
-        for mut row in frame.policy_history {
-            condition_rows(&mut row, POLICY_HISTORY_FEATURES, &[(3, 16.0)], None);
-            values.extend(row);
-        }
-        values.extend(frame.map);
-    }
-    Ok(Tensor::from_vec(values, (frames.len(), SCALARS), device)?)
 }
 
 /// Fixed scripted logits used to verify the real legality decoder.

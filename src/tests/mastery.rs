@@ -75,16 +75,16 @@ fn mastery_codec_is_retained_with_exact_reward5_linked_identities_and_appended_i
 }
 
 #[test]
-fn mastery_accepts_batches_up_to_sixteen_and_rejects_larger_or_empty() {
+fn mastery_accepts_batches_up_to_twenty_six_and_rejects_larger_or_empty() {
     let config = MasteryConfig::new(50, 100, &[]).expect("config");
     let mut state = MasteryProgress::default();
     state
-        .record_batch(config, &[Outcome::Win; 16])
-        .expect("sixteen games");
-    assert_eq!(state.games(), 16);
+        .record_batch(config, &[Outcome::Win; 26])
+        .expect("twenty-six games");
+    assert_eq!(state.games(), 26);
     let before = state.clone();
     assert!(state.record_batch(config, &[]).is_err());
-    assert!(state.record_batch(config, &[Outcome::Win; 17]).is_err());
+    assert!(state.record_batch(config, &[Outcome::Win; 27]).is_err());
     assert_eq!(state, before);
 }
 
@@ -296,11 +296,11 @@ fn mastery_corrupt_state_and_invalid_batch_do_not_mutate_progress() {
     let before = state.clone();
     assert_eq!(
         state.record_batch(config, &[]),
-        Err("mastery batch must contain 1..=16 completed games")
+        Err("mastery batch must contain 1..=26 completed games")
     );
     assert_eq!(
-        state.record_batch(config, &[Outcome::Win; 17]),
-        Err("mastery batch must contain 1..=16 completed games")
+        state.record_batch(config, &[Outcome::Win; 27]),
+        Err("mastery batch must contain 1..=26 completed games")
     );
     assert_eq!(state, before);
 }
