@@ -5,7 +5,7 @@ use crate::TrainingGameOutcome;
 /// At most one completed outcome per full-episode stream, sorted by tick then stream.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CompletedTrainingEpisodes {
-    entries: [Option<(u32, usize, TrainingGameOutcome)>; 6],
+    entries: [Option<(u32, usize, TrainingGameOutcome)>; crate::MAX_TRAINING_ENVIRONMENTS],
 }
 
 impl CompletedTrainingEpisodes {
@@ -32,7 +32,7 @@ impl CompletedTrainingEpisodes {
 
     pub fn ordered_outcomes(&self) -> Vec<TrainingGameOutcome> {
         let mut entries: Vec<_> = self.entries.iter().flatten().copied().collect();
-        assert!(entries.len() <= 6);
+        assert!(entries.len() <= crate::MAX_TRAINING_ENVIRONMENTS);
         entries.sort_by_key(|entry| (entry.0, entry.1));
         entries.into_iter().map(|entry| entry.2).collect()
     }

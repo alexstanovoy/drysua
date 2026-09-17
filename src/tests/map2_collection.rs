@@ -192,6 +192,63 @@ fn curriculum_weak_and_mixed_complete_batches_preserve_terminal_reward_and_reten
 }
 
 #[test]
+fn eight_and_sixteen_environment_complete_batches_collect_and_qualify() {
+    for environments in [8usize, 16] {
+        let model = stop_model();
+        let settings = crate::cli::training_settings_for_test(&[
+            "--opponent-schedule",
+            "mastery-v1",
+            "--mastery-window",
+            "3",
+            "--environments",
+            &environments.to_string(),
+            "--rollout",
+            "1163",
+            "--minibatch",
+            "512",
+        ])
+        .expect("settings");
+        let mut arenas: Vec<_> = (0..environments)
+            .map(|stream| fixture_environment(TICK_CAP - 24, stream % 2, OpponentSpec::Weak))
+            .collect();
+        let mut rollout = PpoRollout::new(
+            environments * RETAINED_PER_EPISODE,
+            model.policy_identity().expect("identity"),
+        )
+        .expect("rollout");
+        let mut report = PpoSmokeReport::default();
+        collect(
+            &model,
+            &mut PpoRng::new(9140300),
+            &mut arenas,
+            &settings,
+            0,
+            &mut rollout,
+            &mut report,
+        )
+        .expect("native cap batch");
+        assert_eq!(report.terminal_draws, environments as u64);
+        assert_eq!(report.map2_reward.terminal, 0.0);
+        let mut mastery = crate::MasteryProgress::default();
+        mastery
+            .record_batch(
+                settings.mastery_config.expect("config"),
+                &report.completed_episodes.ordered_outcomes(),
+            )
+            .expect("record");
+        assert_eq!(mastery.games(), environments as u64);
+        let batch = rollout.finish(settings.ppo).expect("usable batch");
+        // Near-cap fixtures emit one retained sample per stream.
+        assert_eq!(batch.len(), environments);
+        for index in 0..batch.len() {
+            let sample = batch.sample(index).expect("sample");
+            assert!(sample.return_value().is_finite());
+            assert!(sample.return_value() <= 0.0);
+        }
+    }
+}
+
+#[test]
 fn map2_collection_defaults_and_budget_match_the_native_cap() {
     let settings = crate::cli::training_settings_for_test(&[]).expect("Map2 defaults");
     assert_eq!(settings.map, MapId(2));

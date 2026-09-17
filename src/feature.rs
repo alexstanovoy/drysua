@@ -1358,11 +1358,13 @@ struct LootObservation {
 #[derive(Clone, Debug, PartialEq)]
 struct FeatureObservationState {
     tick: Option<u32>,
-    provenance: Option<TrackerProvenance>,
-    projectiles: Box<[Option<ProjectileObservation>; MAX_PROJECTILES]>,
-    projectile_count: usize,
-    loot: [Option<LootObservation>; MAX_LOOT],
-    loot_count: usize,
+    /// Shared structural proof; every clone is an Arc bump.
+    provenance: Option<std::sync::Arc<TrackerProvenance>>,
+    /// One entry per live projectile in wire order; bounded by
+    /// [`MAX_PROJECTILES`].
+    projectiles: Vec<ProjectileObservation>,
+    /// One entry per live loot crate in wire order; bounded by [`MAX_LOOT`].
+    loot: Vec<LootObservation>,
 }
 
 impl FeatureObservationState {
@@ -1370,10 +1372,8 @@ impl FeatureObservationState {
         Self {
             tick: None,
             provenance: None,
-            projectiles: Box::new([None; MAX_PROJECTILES]),
-            projectile_count: 0,
-            loot: [None; MAX_LOOT],
-            loot_count: 0,
+            projectiles: Vec::new(),
+            loot: Vec::new(),
         }
     }
 }
@@ -1387,7 +1387,7 @@ impl FeatureObservationState {
 pub struct FeatureEncoder {
     audit: FeatureAuditConfig,
     map: bota_proto::MapId,
-    static_provenance: StaticTrackerProvenance,
+    static_provenance: std::sync::Arc<StaticTrackerProvenance>,
     lineage: NonZeroU64,
     axis: usize,
     extent_raw: i64,
@@ -1397,8 +1397,17 @@ pub struct FeatureEncoder {
     path_distances: Vec<u32>,
     path_queue: Vec<usize>,
     path_origin: Option<usize>,
-    observation: FeatureObservationState,
-    observation_history: [Option<FeatureObservationState>; MAX_FEATURE_OBSERVATION_HISTORY],
+    /// Target cells of the last flood fill; with `path_exhausted` this decides
+    /// whether the cached distances answer a new query without refilling.
+    path_targets: Vec<u32>,
+    path_exhausted: bool,
+    /// Static impassability table for the loot path flood fill: non-walkable
+    /// terrain or a static tree. Built once because terrain and the static
+    /// tree index never change for an encoder.
+    path_impassable: Vec<bool>,
+    observation: std::sync::Arc<FeatureObservationState>,
+    observation_history:
+        [Option<std::sync::Arc<FeatureObservationState>>; MAX_FEATURE_OBSERVATION_HISTORY],
     observation_history_count: usize,
     earliest_observation_rollback_tick: Option<u32>,
 }
@@ -1432,6 +1441,15 @@ impl FeatureEncoder {
             }
         }
         static_tree_index.sort_unstable();
+        let mut path_impassable = vec![false; axis * axis];
+        for (cell, _) in &static_tree_index {
+            path_impassable[*cell] = true;
+        }
+        for (cell, terrain_byte) in terrain.iter().enumerate() {
+            if terrain_byte & 0x80 == 0 {
+                path_impassable[cell] = true;
+            }
+        }
         Self {
             audit,
             map: tracker.metadata().map,
@@ -1445,7 +1463,10 @@ impl FeatureEncoder {
             path_distances: vec![u32::MAX; axis * axis],
             path_queue: Vec::with_capacity(axis * axis),
             path_origin: None,
-            observation: FeatureObservationState::new(),
+            path_targets: Vec::new(),
+            path_exhausted: false,
+            path_impassable,
+            observation: std::sync::Arc::new(FeatureObservationState::new()),
             observation_history: std::array::from_fn(|_| None),
             observation_history_count: 0,
             earliest_observation_rollback_tick: None,
@@ -1509,14 +1530,14 @@ impl FeatureEncoder {
             .iter()
             .rev()
             .find_map(|entry| entry.clone())
-            .unwrap_or_else(FeatureObservationState::new);
+            .unwrap_or_else(|| std::sync::Arc::new(FeatureObservationState::new()));
         self.path_origin = None;
         Ok(())
     }
 
     /// Clears all dynamic observations while retaining the static map allocation.
     pub fn reset(&mut self) {
-        self.observation = FeatureObservationState::new();
+        self.observation = std::sync::Arc::new(FeatureObservationState::new());
         self.observation_history.fill(None);
         self.observation_history_count = 0;
         self.earliest_observation_rollback_tick = None;
@@ -1607,7 +1628,7 @@ impl FeatureEncoder {
         Ok(())
     }
 
-    fn push_observation(&mut self, observation: FeatureObservationState) {
+    fn push_observation(&mut self, observation: std::sync::Arc<FeatureObservationState>) {
         if self.observation_history_count == MAX_FEATURE_OBSERVATION_HISTORY {
             self.earliest_observation_rollback_tick = self.observation_history[1]
                 .as_ref()
@@ -1616,7 +1637,7 @@ impl FeatureEncoder {
             self.observation_history[MAX_FEATURE_OBSERVATION_HISTORY - 1] = None;
             self.observation_history_count -= 1;
         }
-        self.observation = observation.clone();
+        self.observation = std::sync::Arc::clone(&observation);
         self.observation_history[self.observation_history_count] = Some(observation);
         self.observation_history_count += 1;
         self.path_origin = None;
@@ -2103,7 +2124,15 @@ impl FeatureEncoder {
         if let Some(origin) = origin
             && !current.loot.is_empty()
         {
-            self.prepare_path_distances(origin);
+            // Impassable targets can never be settled, so excluding them from
+            // the pending set keeps the bounded fill from exhausting the map.
+            let targets: Vec<usize> = action_space
+                .loot_candidates()
+                .iter()
+                .filter_map(|candidate| self.cell(candidate.position))
+                .filter(|target| !self.path_impassable[*target])
+                .collect();
+            self.prepare_path_distances(origin, &targets);
         }
         for (candidate_index, candidate) in action_space.loot_candidates().iter().enumerate() {
             let loot = current
@@ -2146,17 +2175,17 @@ impl FeatureEncoder {
     }
 
     fn projectile_observation(&self, id: bota_proto::EntityId) -> Option<ProjectileObservation> {
-        self.observation.projectiles[..self.observation.projectile_count]
+        self.observation
+            .projectiles
             .iter()
-            .flatten()
             .find(|history| history.id == id)
             .copied()
     }
 
     fn loot_observation(&self, id: bota_proto::EntityId) -> Option<LootObservation> {
-        self.observation.loot[..self.observation.loot_count]
+        self.observation
+            .loot
             .iter()
-            .flatten()
             .find(|history| history.id == id)
             .copied()
     }
@@ -2289,67 +2318,77 @@ impl FeatureEncoder {
                 .any(|tree| same_cell(self, tree, position))
     }
 
-    fn prepare_path_distances(&mut self, origin: Vec2) {
+    fn prepare_path_distances(&mut self, origin: Vec2, targets: &[usize]) {
         let Some(origin) = self.cell(origin) else {
             self.path_origin = None;
             return;
         };
         if self.path_origin == Some(origin) {
-            return;
+            let cached = self.path_exhausted
+                || targets.iter().all(|target| {
+                    let packed = *target as u32;
+                    self.path_targets.binary_search(&packed).is_ok()
+                });
+            if cached {
+                return;
+            }
         }
-        self.path_distances.fill(u32::MAX);
+        assert!(self.axis <= 1 << 16);
+        // Reset only the cells visited by the previous fill; the queue is the
+        // exact visited list, so untouched cells stay at their sentinel.
+        for &packed in &self.path_queue {
+            let x = packed & 0xffff;
+            let y = packed >> 16;
+            self.path_distances[y * self.axis + x] = u32::MAX;
+        }
         self.path_queue.clear();
         self.path_origin = Some(origin);
+        self.path_targets.clear();
+        self.path_targets
+            .extend(targets.iter().map(|target| *target as u32));
+        self.path_targets.sort_unstable();
+        self.path_targets.dedup();
+        let mut pending = self.path_targets.len();
+        self.path_exhausted = false;
+        let origin_x = origin % self.axis;
+        let origin_y = origin / self.axis;
         self.path_distances[origin] = 0;
-        self.path_queue.push(origin);
+        self.path_queue.push((origin_y << 16) | origin_x);
         let mut cursor = 0usize;
-        while cursor < self.path_queue.len() {
-            let cell = self.path_queue[cursor];
+        while cursor < self.path_queue.len() && pending > 0 {
+            let packed = self.path_queue[cursor];
             cursor += 1;
-            self.visit_path_neighbors(cell);
-        }
-    }
-
-    fn visit_path_neighbors(&mut self, cell: usize) {
-        let x = cell % self.axis;
-        let y = cell / self.axis;
-        let next_distance = self.path_distances[cell].saturating_add(1);
-        for (delta_x, delta_y) in MAP_DIRECTIONS {
-            let delta_x = isize::try_from(delta_x).expect("map direction fits isize");
-            let delta_y = isize::try_from(delta_y).expect("map direction fits isize");
-            let Some(next_x) = x.checked_add_signed(delta_x) else {
-                continue;
-            };
-            let Some(next_y) = y.checked_add_signed(delta_y) else {
-                continue;
-            };
-            if next_x >= self.axis || next_y >= self.axis {
-                continue;
+            if pending > 0 && self.path_targets.binary_search(&(packed as u32)).is_ok() {
+                pending -= 1;
             }
-            let next = next_y * self.axis + next_x;
-            if self.terrain[next] & 0x80 == 0
-                || self.static_tree_at_cell(next)
-                || self.path_distances[next] != u32::MAX
-            {
-                continue;
+            let x = (packed & 0xffff) as isize;
+            let y = (packed >> 16) as isize;
+            let cell = y as usize * self.axis + x as usize;
+            let next_distance = self.path_distances[cell].saturating_add(1);
+            for (delta_x, delta_y) in MAP_DIRECTIONS {
+                let next_x = x + isize::try_from(delta_x).expect("map direction fits isize");
+                let next_y = y + isize::try_from(delta_y).expect("map direction fits isize");
+                if next_x < 0 || next_y < 0 {
+                    continue;
+                }
+                let (next_x, next_y) = (next_x as usize, next_y as usize);
+                if next_x >= self.axis || next_y >= self.axis {
+                    continue;
+                }
+                let next = next_y * self.axis + next_x;
+                if self.path_impassable[next] || self.path_distances[next] != u32::MAX {
+                    continue;
+                }
+                self.path_distances[next] = next_distance;
+                self.path_queue.push((next_y << 16) | next_x);
             }
-            self.path_distances[next] = next_distance;
-            self.path_queue.push(next);
         }
+        self.path_exhausted = cursor == self.path_queue.len() && pending == 0;
     }
 
     fn path_steps(&self, position: Vec2) -> Option<u32> {
         let distance = self.path_distances[self.cell(position)?];
         (distance != u32::MAX).then_some(distance)
-    }
-
-    fn static_tree_at_cell(&self, cell: usize) -> bool {
-        let start = self
-            .static_tree_index
-            .partition_point(|(tree_cell, _)| *tree_cell < cell);
-        self.static_tree_index
-            .get(start)
-            .is_some_and(|(tree_cell, _)| *tree_cell == cell)
     }
 
     fn canonical_position(&self, team: Team, position: Vec2) -> Vec2 {
@@ -2501,18 +2540,19 @@ fn next_observation_state(
     previous: &FeatureObservationState,
     tracker: &StateTracker,
     current: &bota_proto::WorldView,
-) -> FeatureObservationState {
+) -> std::sync::Arc<FeatureObservationState> {
     assert!(current.projectiles.len() <= MAX_PROJECTILES);
-    assert!(previous.projectile_count <= MAX_PROJECTILES);
+    assert!(current.loot.len() <= MAX_LOOT);
     let mut next = FeatureObservationState::new();
     next.tick = Some(current.tick);
-    next.provenance = Some(tracker.provenance());
+    next.provenance = Some(std::sync::Arc::new(tracker.provenance()));
+    next.projectiles.reserve(current.projectiles.len());
     for projectile in &current.projectiles {
-        let prior = previous.projectiles[..previous.projectile_count]
+        let prior = previous
+            .projectiles
             .iter()
-            .flatten()
             .find(|entry| entry.id == projectile.id);
-        let observation = prior.map_or(
+        next.projectiles.push(prior.map_or(
             ProjectileObservation {
                 id: projectile.id,
                 first_tick: current.tick,
@@ -2529,24 +2569,22 @@ fn next_observation_state(
                 position: projectile.pos,
                 previous_position: entry.position,
             },
-        );
-        next.projectiles[next.projectile_count] = Some(observation);
-        next.projectile_count += 1;
+        ));
     }
+    next.loot.reserve(current.loot.len());
     for loot in &current.loot {
-        let first_tick = previous.loot[..previous.loot_count]
+        let first_tick = previous
+            .loot
             .iter()
-            .flatten()
             .find(|entry| entry.id == loot.id)
             .map_or(current.tick, |entry| entry.first_tick);
-        next.loot[next.loot_count] = Some(LootObservation {
+        next.loot.push(LootObservation {
             id: loot.id,
             first_tick,
             last_tick: current.tick,
         });
-        next.loot_count += 1;
     }
-    next
+    std::sync::Arc::new(next)
 }
 
 fn encode_score_advantages(global: &mut [f32; GLOBAL_FEATURES], summary: &crate::GlobalSummary) {

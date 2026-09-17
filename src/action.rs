@@ -10,9 +10,11 @@ use crate::tracker::{
     COURIER_ITEM_SLOTS as COURIER_BAG_SLOTS, HERO_ITEM_SLOTS as HERO_BAG_SLOTS,
     STASH_ITEM_SLOTS as STASH_SLOTS, TrackerProvenance, is_structure,
 };
+use smallvec::SmallVec;
+
 use crate::{
-    ItemReadiness, MAX_ABILITY_SLOTS, MAX_POINT_CANDIDATES, StateTracker, TERRAIN_CELL_SIZE,
-    UNIT_TOKENS,
+    ItemReadiness, MAX_ABILITY_SLOTS, MAX_LOOT, MAX_POINT_CANDIDATES, MAX_SHOP_ITEMS, StateTracker,
+    TERRAIN_CELL_SIZE, UNIT_TOKENS,
 };
 /// Distance at which drysua permits stash swaps around the own fountain.
 pub const STASH_ACCESS_RANGE: i32 = 1_000;
@@ -434,8 +436,10 @@ impl ControlledUnitMask {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TargetMask {
     none: bool,
-    entities: Vec<bool>,
-    points: Vec<bool>,
+    /// One bool per entity candidate; inline for the bounded candidate cap.
+    entities: SmallVec<[bool; UNIT_TOKENS]>,
+    /// One bool per point candidate; inline for the bounded candidate cap.
+    points: SmallVec<[bool; MAX_POINT_CANDIDATES]>,
 }
 
 impl TargetMask {
@@ -549,7 +553,8 @@ struct StaticPassability {
 #[derive(Clone, Debug)]
 struct PutPointMask {
     underfoot: bool,
-    points: Vec<bool>,
+    /// One bool per point candidate; inline for the bounded candidate cap.
+    points: SmallVec<[bool; MAX_POINT_CANDIDATES]>,
 }
 
 impl PutPointMask {
@@ -561,20 +566,20 @@ impl PutPointMask {
 #[derive(Clone, Debug)]
 struct ControlledMasks {
     stop: bool,
-    move_points: Vec<bool>,
-    follow_entities: Vec<bool>,
+    move_points: SmallVec<[bool; MAX_POINT_CANDIDATES]>,
+    follow_entities: SmallVec<[bool; UNIT_TOKENS]>,
     hold: bool,
-    attack_move_points: Vec<bool>,
-    attack_entities: Vec<bool>,
-    casts: Vec<TargetMask>,
-    uses: Vec<TargetMask>,
-    put_points: Vec<PutPointMask>,
-    put_units: Vec<Vec<bool>>,
-    take: Vec<bool>,
-    buy: Vec<bool>,
+    attack_move_points: SmallVec<[bool; MAX_POINT_CANDIDATES]>,
+    attack_entities: SmallVec<[bool; UNIT_TOKENS]>,
+    casts: SmallVec<[TargetMask; MAX_ABILITY_SLOTS]>,
+    uses: SmallVec<[TargetMask; MAX_ABILITY_SLOTS]>,
+    put_points: SmallVec<[PutPointMask; HERO_BAG_SLOTS]>,
+    put_units: SmallVec<[SmallVec<[bool; UNIT_TOKENS]>; HERO_BAG_SLOTS]>,
+    take: SmallVec<[bool; MAX_LOOT]>,
+    buy: SmallVec<[bool; MAX_SHOP_ITEMS]>,
     sell: [bool; WIRE_ITEM_SLOTS],
     swap: [[bool; WIRE_ITEM_SLOTS]; WIRE_ITEM_SLOTS],
-    learn: Vec<bool>,
+    learn: SmallVec<[bool; MAX_ABILITY_SLOTS]>,
 }
 
 impl ControlledMasks {
@@ -584,22 +589,26 @@ impl ControlledMasks {
         loot_count: usize,
         shop_count: usize,
     ) -> Self {
+        assert!(entity_count <= UNIT_TOKENS);
+        assert!(point_count <= MAX_POINT_CANDIDATES);
+        assert!(loot_count <= MAX_LOOT);
+        assert!(shop_count <= MAX_SHOP_ITEMS);
         Self {
             stop: false,
-            move_points: vec![false; point_count],
-            follow_entities: vec![false; entity_count],
+            move_points: SmallVec::from_elem(false, point_count),
+            follow_entities: SmallVec::from_elem(false, entity_count),
             hold: false,
-            attack_move_points: vec![false; point_count],
-            attack_entities: vec![false; entity_count],
-            casts: Vec::new(),
-            uses: Vec::new(),
-            put_points: Vec::new(),
-            put_units: Vec::new(),
-            take: vec![false; loot_count],
-            buy: vec![false; shop_count],
+            attack_move_points: SmallVec::from_elem(false, point_count),
+            attack_entities: SmallVec::from_elem(false, entity_count),
+            casts: SmallVec::new(),
+            uses: SmallVec::new(),
+            put_points: SmallVec::new(),
+            put_units: SmallVec::new(),
+            take: SmallVec::from_elem(false, loot_count),
+            buy: SmallVec::from_elem(false, shop_count),
             sell: [false; WIRE_ITEM_SLOTS],
             swap: [[false; WIRE_ITEM_SLOTS]; WIRE_ITEM_SLOTS],
-            learn: Vec::new(),
+            learn: SmallVec::new(),
         }
     }
 
@@ -864,7 +873,7 @@ impl ActionSpace {
         self.masks[unit.index()]
             .put_units
             .get(usize::from(source.0))
-            .map(Vec::as_slice)
+            .map(SmallVec::as_slice)
     }
 
     /// Target mask after selecting a controlled unit and ability slot.
@@ -1172,10 +1181,15 @@ fn validate_shop_recipes(shop: &[ShopEntry]) -> Result<(), ActionError> {
     {
         return Err(ActionError::InvalidSchema("duplicate shop item"));
     }
-    let mut colors = vec![0u8; shop.len()];
+    // Both scratch arrays are bounded by the native shop limits
+    // (`MAX_SHOP_ITEMS` entries, one visit per entry), so
+    // the whole validation runs without touching the heap.
+    assert!(shop.len() <= MAX_SHOP_ITEMS);
+    let mut colors = [0u8; MAX_SHOP_ITEMS];
+    let colors = &mut colors[..shop.len()];
     for root in 0..shop.len() {
         if colors[root] == 0 {
-            validate_recipe_from(shop, root, &mut colors)?;
+            validate_recipe_from(shop, root, colors)?;
         }
     }
     Ok(())
@@ -1186,13 +1200,21 @@ fn validate_recipe_from(
     root: usize,
     colors: &mut [u8],
 ) -> Result<(), ActionError> {
-    let mut stack = vec![(root, 0usize)];
+    // Depth-first traversal bounded by the recipe depth cap: a component can
+    // only push a state that is still unvisited and each entry is visited
+    // once, so the stack never exceeds the shop size.
+    assert!(shop.len() <= MAX_SHOP_ITEMS);
+    let mut stack = [(0usize, 0usize); MAX_SHOP_ITEMS];
+    let mut depth = 1usize;
+    stack[0] = (root, 0);
     colors[root] = 1;
-    while let Some((entry_index, component_index)) = stack.last_mut() {
-        let components = &shop[*entry_index].components;
+    while depth > 0 {
+        let (entry_index, component_index) = &mut stack[depth - 1];
+        let entry_index = *entry_index;
+        let components = &shop[entry_index].components;
         if *component_index == components.len() {
-            colors[*entry_index] = 2;
-            stack.pop();
+            colors[entry_index] = 2;
+            depth -= 1;
             continue;
         }
         let component = components[*component_index];
@@ -1203,7 +1225,9 @@ fn validate_recipe_from(
         match colors[next] {
             0 => {
                 colors[next] = 1;
-                stack.push((next, 0));
+                assert!(depth < MAX_SHOP_ITEMS);
+                stack[depth] = (next, 0);
+                depth += 1;
             }
             1 => return Err(ActionError::InvalidSchema("cyclic shop recipe")),
             2 => {}
@@ -2046,12 +2070,16 @@ fn build_buy_requirements(
         .collect();
     let held_template = held.clone();
     let mut output = Vec::with_capacity(candidates.len());
+    // One reusable expansion stack for the whole catalog check: cleared and
+    // refilled per candidate, so only this single allocation remains.
+    let mut stack = Vec::new();
     for candidate in candidates {
         held.clone_from(&held_template);
         output.push(missing_buy_requirement(
             tracker.shop(),
             candidate.item,
             &mut held,
+            &mut stack,
         )?);
     }
     Ok(output)
@@ -2061,6 +2089,7 @@ fn missing_buy_requirement(
     shop: &[ShopEntry],
     item: ItemId,
     held: &mut Vec<ItemId>,
+    stack: &mut Vec<ItemId>,
 ) -> Result<BuyRequirement, ActionError> {
     let root = shop_entry(shop, item)?;
     if root.components.is_empty() {
@@ -2070,7 +2099,8 @@ fn missing_buy_requirement(
             first_missing: Some(item),
         });
     }
-    let mut stack = root.components.iter().rev().copied().collect();
+    stack.clear();
+    stack.extend(root.components.iter().rev().copied());
     let edge_count = shop.iter().try_fold(0usize, |count, entry| {
         count
             .checked_add(entry.components.len())
@@ -2079,7 +2109,7 @@ fn missing_buy_requirement(
     let expansion_limit = (MAX_PURCHASE_SLOTS + held.len() + 1)
         .checked_mul(shop.len() + edge_count + 1)
         .ok_or(ActionError::Arithmetic("recipe expansion limit"))?;
-    expand_missing_parts(shop, held, &mut stack, expansion_limit)
+    expand_missing_parts(shop, held, stack, expansion_limit)
 }
 
 fn expand_missing_parts(
@@ -2328,7 +2358,7 @@ fn fill_put_masks(
         let held = state.unit.items.get(source).is_some_and(Option::is_some);
         masks.put_points.push(PutPointMask {
             underfoot: held && underfoot,
-            points: vec![false; space.points.len()],
+            points: SmallVec::from_elem(false, space.points.len()),
         });
         masks.put_units.push(
             space
@@ -2512,8 +2542,8 @@ fn allows_put_unit(masks: &ControlledMasks, source: ItemSlot, target: EntityInde
 fn empty_target_mask(space: &ActionSpace) -> TargetMask {
     TargetMask {
         none: false,
-        entities: vec![false; space.entities.len()],
-        points: vec![false; space.points.len()],
+        entities: SmallVec::from_elem(false, space.entities.len()),
+        points: SmallVec::from_elem(false, space.points.len()),
     }
 }
 

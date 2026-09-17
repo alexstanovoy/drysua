@@ -16,6 +16,8 @@ candle-core = { version = "0.11.0", default-features = false }
 clap = { version = "4.6.6", default-features = false, features = ["derive", "error-context", "help", "std", "suggestions", "usage"] }
 safetensors = { version = "0.8.0", default-features = false, features = ["std"] }
 sha2 = { version = "0.11.0", default-features = false }
+# Inline storage for small bounded candidate/mask collections (hot action path).
+smallvec = { version = "1.15.2", default-features = false, features = ["const_generics"] }
 
 [target.'cfg(any(target_os = "linux", target_os = "windows"))'.dependencies]
 candle-cuda-feature = { path = "crates/candle-cuda-feature", default-features = false, optional = true }
@@ -47,3 +49,11 @@ required-features = ["builtin"]
 
 [lints.clippy]
 float_arithmetic = "deny"
+
+# Tests always run optimized: the project requires O2 for every test target,
+# and the dev profile they inherit must not silently fall back to O0.
+[profile.dev]
+opt-level = 2
+
+[profile.test]
+opt-level = 2

@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 use std::fmt;
 
 use bota_proto::{EntityId, EventKind, MatchInfo, SlotId};
-use observation::{Identity, Role, SnapshotFacts};
+use observation::{Identity, Role, SnapshotFacts, UnitFact};
 use potential::Tower;
 
 pub use progress::*;
@@ -351,6 +351,8 @@ pub struct Map2Reward {
     pregame_ticks: u32,
     current: Option<SnapshotFacts>,
     pending: Option<SnapshotFacts>,
+    /// Retired snapshot unit facts, refilled in place by the next snapshot.
+    units_scratch: Vec<UnitFact>,
     identities: BTreeMap<EntityId, Identity>,
     towers: BTreeMap<EntityId, Tower>,
     counts: [u64; MAP2_REWARD_CHANNELS],
@@ -386,6 +388,7 @@ impl Map2Reward {
             pregame_ticks: info.pregame_ticks,
             current: None,
             pending: None,
+            units_scratch: Vec::new(),
             identities: BTreeMap::new(),
             towers: BTreeMap::new(),
             counts: [0; MAP2_REWARD_CHANNELS],
@@ -417,7 +420,8 @@ impl Map2Reward {
         {
             return invalid("Snapshot ticks must be contiguous");
         }
-        let pending = observation::snapshot(view, self.roles)?;
+        let pending =
+            observation::snapshot_into(view, self.roles, std::mem::take(&mut self.units_scratch))?;
         self.check_snapshot_progress(&pending)?;
         self.check_identity_capacity(&pending)?;
         self.check_tower_capacity(&pending)?;
@@ -457,6 +461,10 @@ impl Map2Reward {
         self.observe_progress(&pending, events, previous_interval);
         if self.current.is_some() {
             self.interval.ticks += 1;
+        }
+        let mut retired = self.current.take();
+        if let Some(retired) = retired.as_mut() {
+            self.units_scratch = std::mem::take(&mut retired.units);
         }
         self.current = Some(pending);
         self.interval.retotal();

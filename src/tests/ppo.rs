@@ -2639,20 +2639,23 @@ fn map2_e6_capacity_and_lambda_one_are_explicit_and_bounded() {
         "invalid PPO config field: samples per update"
     );
     let mut invalid = settings.clone();
-    invalid.ppo.environments = 8;
+    invalid.ppo.environments = 18;
     assert_eq!(
         crate::ppo_arena::episode::validate(&invalid)
             .expect_err("unbounded complete-episode environment count")
             .to_string(),
-        "invalid PPO config field: complete episodes require Map2, two/four/six environments, and three-tick actions"
+        "invalid PPO config field: complete episodes require Map2, an even environment count up to the training maximum, and three-tick actions"
     );
+    let mut odd = settings.clone();
+    odd.ppo.environments = 7;
+    assert!(crate::ppo_arena::episode::validate(&odd).is_err());
     invalid = settings;
     invalid.ppo.decision_interval_ticks = 4;
     assert_eq!(
         crate::ppo_arena::episode::validate(&invalid)
             .expect_err("non-three-tick episode actions")
             .to_string(),
-        "invalid PPO config field: complete episodes require Map2, two/four/six environments, and three-tick actions"
+        "invalid PPO config field: complete episodes require Map2, an even environment count up to the training maximum, and three-tick actions"
     );
 }
 

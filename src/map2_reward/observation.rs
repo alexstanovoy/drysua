@@ -105,9 +105,12 @@ pub(super) fn roles(slot: SlotId, info: &MatchInfo) -> Result<[Role; 2], Map2Rew
     ])
 }
 
-pub(super) fn snapshot(
+/// Snapshot facts into a reusable buffer; `units` is cleared and refilled so
+/// the steady state allocates nothing.
+pub(super) fn snapshot_into(
     view: &WorldView,
     roles: [Role; 2],
+    mut units: Vec<UnitFact>,
 ) -> Result<SnapshotFacts, Map2RewardError> {
     if view.viewer != Some(roles[0].team) {
         return invalid("Snapshot viewer does not match own team");
@@ -126,7 +129,8 @@ pub(super) fn snapshot(
     }
     let mut mana = None;
     let mut fountain_aura = false;
-    let mut units = Vec::with_capacity(view.units.len());
+    units.clear();
+    units.reserve(view.units.len().saturating_sub(units.capacity()));
     for unit in &view.units {
         validate_unit(unit)?;
         if unit.kind == UnitKind::Hero {

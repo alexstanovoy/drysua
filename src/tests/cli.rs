@@ -723,12 +723,24 @@ fn train_full_map2_retention_capacity_accepts_1163_and_rejects_1162_for_paired_e
 #[cfg(feature = "builtin")]
 #[test]
 fn train_full_map2_complete_episodes_reject_unpaired_or_excess_environment_counts() {
-    for environments in ["1", "3", "5", "8", "16"] {
+    for environments in ["1", "3", "5", "7"] {
         let error = crate::cli::training_settings_for_test(&["--environments", environments])
-            .expect_err("complete episodes require two, four, or six environments");
+            .expect_err("complete episodes require an even count up to sixteen");
         assert_eq!(
             error.to_string(),
-            "invalid PPO config field: complete episodes require Map2, two/four/six environments, and three-tick actions"
+            "invalid PPO config field: complete episodes require Map2, an even environment count up to the training maximum, and three-tick actions"
+        );
+    }
+    for environments in ["18", "32"] {
+        crate::cli::training_settings_for_test(&["--environments", environments])
+            .expect_err("excess environments must fail before collection");
+    }
+    for environments in ["2", "4", "6", "8", "16"] {
+        let settings = crate::cli::training_settings_for_test(&["--environments", environments])
+            .expect("supported even environment count");
+        assert_eq!(
+            settings.ppo.environments,
+            environments.parse::<usize>().unwrap()
         );
     }
 }

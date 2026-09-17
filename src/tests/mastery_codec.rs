@@ -1,4 +1,5 @@
 use super::*;
+use crate::TrainingGameOutcome as Outcome;
 
 #[test]
 fn mastery_codec_rejects_corrupt_stage_flag_window_and_counter() {
@@ -93,4 +94,23 @@ fn mastery_checkpoint_stage_game_counters_must_match_completed_batches() {
             "mastery configuration/state mismatch"
         ))
     );
+}
+
+#[test]
+fn checkpoint_mastery_scope_accepts_even_counts_up_to_sixteen() {
+    let config = MasteryConfig::new(50, 100, &[]).expect("config");
+    for environments in [2usize, 6, 8, 16] {
+        let mut progress = MasteryProgress::default();
+        progress
+            .record_batch(config, &vec![Outcome::Win; environments])
+            .expect("batch");
+        validate_scope(Some(config), Some(&progress), 1, environments).expect("even scope");
+    }
+    let mut progress = MasteryProgress::default();
+    progress
+        .record_batch(config, &[Outcome::Win; 6])
+        .expect("batch");
+    for environments in [0usize, 7, 18] {
+        assert!(validate_scope(Some(config), Some(&progress), 1, environments).is_err());
+    }
 }

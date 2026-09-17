@@ -90,7 +90,7 @@ pub(super) fn validate_scope(
             progress
                 .validate(config)
                 .map_err(CheckpointError::InvalidManifest)?;
-            if !matches!(environments, 2 | 4 | 6) {
+            if !crate::valid_environment_count(environments) {
                 return Err(CheckpointError::InvalidManifest(
                     "mastery environment count",
                 ));

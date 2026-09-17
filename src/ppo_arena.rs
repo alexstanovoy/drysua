@@ -74,7 +74,7 @@ use crate::{
 };
 use crate::{MAP2_REWARD_GAMMA_TICK, Map2RewardBreakdown, Map2RewardEnd};
 
-const TRAINING_MAX_ENVIRONMENTS: usize = 16;
+pub(crate) use crate::map2_contract::MAX_TRAINING_ENVIRONMENTS as TRAINING_MAX_ENVIRONMENTS;
 const READINESS_ORDER_HISTORY: usize = 32;
 const _: () = assert!(PPO_MAX_ROLLOUT_DECISIONS <= crate::PPO_MAX_SAMPLES);
 
@@ -4955,7 +4955,7 @@ fn advance_interval(
         }
         for (index, (seat, messages)) in environment.seats.iter_mut().zip(step.messages).enumerate()
         {
-            let observed = observe_messages(seat, &messages)?;
+            let observed = observe_messages_owned(seat, messages)?;
             if index > 0 && observed != winner {
                 return Err(PpoError::InvalidTransition(
                     "arena seats disagree on MatchOver",
@@ -5012,23 +5012,33 @@ fn restart_environment(environment: &mut TrainingEnvironment) -> Result<(), PpoE
     Ok(())
 }
 
+#[cfg(test)]
 fn observe_messages(
     seat: &mut ArenaSeatPolicy,
     messages: &[ServerMsg],
 ) -> Result<Option<Team>, PpoError> {
+    observe_messages_owned(seat, messages.to_vec())
+}
+
+/// Owned variant used by the production tick loop: snapshot views move into
+/// the tracker instead of being cloned.
+fn observe_messages_owned(
+    seat: &mut ArenaSeatPolicy,
+    messages: Vec<ServerMsg>,
+) -> Result<Option<Team>, PpoError> {
     if seat.tracker.metadata().map == MapId(2) {
-        validate_arena_tick_messages(messages)?;
+        validate_arena_tick_messages(&messages)?;
     }
     let mut winner = None;
     for message in messages {
         match message {
             ServerMsg::OrderRejected { seq, reason } => {
-                seat.persistence.observe_rejection(*seq);
-                seat.order_bookkeeping.observe_rejection(*seq);
-                seat.readiness.note_rejected(*seq);
-                seat.teacher.note_rejected(*seq);
+                seat.persistence.observe_rejection(seq);
+                seat.order_bookkeeping.observe_rejection(seq);
+                seat.readiness.note_rejected(seq);
+                seat.teacher.note_rejected(seq);
                 if let Some((pending, previous)) = seat.pending_active
-                    && pending == *seq
+                    && pending == seq
                 {
                     let tick = seat
                         .tracker
@@ -5046,11 +5056,11 @@ fn observe_messages(
                     .rejections
                     .checked_add(1)
                     .ok_or(PpoError::CounterOverflow)?;
-                seat.last_rejection = Some((*seq, *reason));
+                seat.last_rejection = Some((seq, reason));
             }
-            ServerMsg::Snapshot { view } => observe_arena_snapshot(seat, view)?,
-            ServerMsg::Events { tick, events } => observe_arena_events(seat, *tick, events)?,
-            ServerMsg::MatchOver { winner: result, .. } => winner = Some(*result),
+            ServerMsg::Snapshot { view } => observe_arena_snapshot_owned(seat, view)?,
+            ServerMsg::Events { tick, events } => observe_arena_events(seat, tick, &events)?,
+            ServerMsg::MatchOver { winner: result, .. } => winner = Some(result),
             ServerMsg::MatchStart { .. }
             | ServerMsg::Welcome { .. }
             | ServerMsg::LobbyState { .. }
@@ -5106,20 +5116,23 @@ fn observe_arena_events(
         .map_err(|error| PpoError::Model(error.to_string()))
 }
 
-fn observe_arena_snapshot(
+/// Owned variant: moves the snapshot into the tracker and keeps its tick for
+/// the body-change bookkeeping.
+fn observe_arena_snapshot_owned(
     seat: &mut ArenaSeatPolicy,
-    view: &bota_proto::WorldView,
+    view: bota_proto::WorldView,
 ) -> Result<(), PpoError> {
+    let tick = view.tick;
     let previous = seat.tracker.own_hero().map(|hero| hero.id);
     seat.tracker
-        .observe_snapshot(view)
+        .observe_snapshot_owned(view)
         .map_err(|error| PpoError::Model(error.to_string()))?;
     let current = seat.tracker.own_hero().map(|hero| hero.id);
     if previous != current {
         seat.persistence.clear_body_for(None);
         seat.order_bookkeeping.clear_body_for(None);
         seat.local
-            .set_active_order(view.tick, None)
+            .set_active_order(tick, None)
             .map_err(|error| PpoError::Model(error.to_string()))?;
         seat.pending_active = None;
         assert!(seat.persistence.active_body_sequence_for(None).is_none());

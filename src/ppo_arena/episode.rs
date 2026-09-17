@@ -28,10 +28,11 @@ const RETENTION_DOMAIN: u64 = 0x7265_7465_6e74_696f;
 const RETENTION_STREAM_DOMAIN: u64 = 0x7068_6173_655f_726e;
 const _: () = assert!(RETENTION_STRIDE.is_power_of_two());
 const RETAINED_PER_EPISODE: usize = crate::MAP2_RETAINED_DECISIONS;
-const MAX_EPISODE_ENVIRONMENTS: usize = 6;
+const MAX_EPISODE_ENVIRONMENTS: usize = super::TRAINING_MAX_ENVIRONMENTS;
 const RETAINED_BYTES_PER_ENVIRONMENT: usize = 3
     * RETAINED_PER_EPISODE
     * (std::mem::size_of::<FeatureFrame>() + std::mem::size_of::<crate::BehavioralTarget>());
+const _: () = assert!(MAX_EPISODE_ENVIRONMENTS.is_multiple_of(2));
 const _: () =
     assert!(MAX_EPISODE_ENVIRONMENTS * RETAINED_BYTES_PER_ENVIRONMENT < 6 * 1024 * 1024 * 1024);
 const _: () = assert!(MAX_EPISODE_ENVIRONMENTS * RETAINED_PER_EPISODE <= crate::PPO_MAX_SAMPLES);
@@ -70,11 +71,11 @@ pub(crate) fn validate(settings: &TrainingJobConfig) -> Result<(), PpoError> {
         }
         return Ok(());
     }
-    if !matches!(settings.ppo.environments, 2 | 4 | 6)
+    if !valid_environment_count(settings.ppo.environments)
         || settings.ppo.decision_interval_ticks != crate::MAP2_DECISION_INTERVAL_TICKS
     {
         return Err(PpoError::InvalidConfig(
-            "complete episodes require Map2, two/four/six environments, and three-tick actions",
+            "complete episodes require Map2, an even environment count up to the training maximum, and three-tick actions",
         ));
     }
     if settings.ppo.rollout_decisions < RETAINED_PER_EPISODE {
@@ -83,8 +84,15 @@ pub(crate) fn validate(settings: &TrainingJobConfig) -> Result<(), PpoError> {
         ));
     }
     assert!(settings.ppo.environments * RETAINED_BYTES_PER_ENVIRONMENT < 6 * 1024 * 1024 * 1024);
+    assert!(valid_environment_count(settings.ppo.environments));
     settings.ppo.validate()?;
     Ok(())
+}
+
+/// Even stream counts up to the training maximum keep pair seeding and the
+/// mastery batch math simple; odd counts have no paired policy seat.
+pub(super) fn valid_environment_count(count: usize) -> bool {
+    (2..=super::TRAINING_MAX_ENVIRONMENTS).contains(&count) && count.is_multiple_of(2)
 }
 
 #[cfg(test)]
@@ -190,7 +198,7 @@ fn opponent_name(opponent: &OpponentRuntime) -> &'static str {
 }
 
 fn collection_opponents(environments: &[TrainingEnvironment]) -> (&'static str, usize, usize) {
-    assert!(matches!(environments.len(), 2 | 4 | 6));
+    assert!(valid_environment_count(environments.len()));
     let weak = environments
         .iter()
         .filter(|arena| matches!(arena.opponent, OpponentRuntime::Weak))
@@ -210,6 +218,41 @@ fn collection_opponents(environments: &[TrainingEnvironment]) -> (&'static str, 
     (name, weak, teacher)
 }
 
+/// One request in a worker's bounded queue.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "Boxing the advance state would add one heap allocation per stream and decision"
+)]
+enum StreamJob {
+    /// Build the policy frame and action space for the next decision.
+    Prepare,
+    /// Apply one chosen action and advance the owned world three ticks.
+    Advance {
+        state: EpisodeStream,
+        choice: PpoPolicyChoice,
+        space: ActionSpace,
+    },
+}
+
+/// One ordered reply from a stream worker.
+enum StreamReply {
+    Prepared(Box<(FeatureFrame, ActionSpace)>),
+    Advanced(Box<AdvancedReply>),
+}
+
+struct AdvancedReply {
+    state: EpisodeStream,
+    completed: CompletedAdvance,
+    /// Flush-next value evaluated on the owning worker, so the collector's
+    /// finish loop never blocks on a single-frame GPU round trip.
+    value: Option<f32>,
+    opponent: &'static str,
+    /// Frame and space for the next decision, built by the worker after the
+    /// world step so the next sampling round never waits for a separate
+    /// prepare barrier.
+    prepared: Option<Box<(FeatureFrame, ActionSpace)>>,
+}
+
 pub(super) fn collect(
     model: &PolicyModel,
     sampling: &mut PpoRng,
@@ -221,7 +264,7 @@ pub(super) fn collect(
 ) -> Result<(), PpoError> {
     let config = settings.ppo;
     validate(settings)?;
-    assert!(matches!(environments.len(), 2 | 4 | 6));
+    assert!(valid_environment_count(environments.len()));
     assert_eq!(
         config.decision_interval_ticks,
         crate::MAP2_DECISION_INTERVAL_TICKS
@@ -236,44 +279,112 @@ pub(super) fn collect(
         environments.len(),
         settings.opponent_schedule.as_str(),
     );
-    for _ in 0..ACTOR_DECISIONS {
-        let active: Vec<_> = (0..streams.len())
-            .filter(|&stream| !streams[stream].done)
-            .collect();
-        if active.is_empty() {
-            break;
-        }
-        let (choices, spaces) = sample_active(model, &mut random, environments, &active)?;
-        let mut samples = choices.into_iter().zip(spaces);
-        let jobs = streams
-            .iter_mut()
-            .enumerate()
-            .filter(|(stream, _)| active.contains(stream))
-            .map(|(stream, state)| {
+    std::thread::scope(|scope| -> Result<(), PpoError> {
+        let workers =
+            super::parallel::StreamWorkers::spawn(scope, environments, |_, environment, job| {
+                match job {
+                    StreamJob::Prepare => prepare_policy_sample(environment)
+                        .map(|sample| StreamReply::Prepared(Box::new(sample))),
+                    StreamJob::Advance {
+                        state,
+                        choice,
+                        space,
+                    } => {
+                        let mut state = state;
+                        let completed =
+                            advance_cpu(environment, &mut state, choice, space, config)?;
+                        // A terminal flush uses a zero next value and never
+                        // encodes a frame, exactly like the serial collector.
+                        // A terminal flush uses a zero next value and never
+                        // uses an encoded frame, exactly like the serial
+                        // collector.
+                        let value = if state.should_flush() && !state.done {
+                            let frame = encode_next_frame(environment)?;
+                            Some(
+                                model
+                                    .evaluate_batch(std::slice::from_ref(&frame))
+                                    .map_err(model_error)?[0]
+                                    .value,
+                            )
+                        } else {
+                            None
+                        };
+                        // The next decision's frame is built here, after the
+                        // flush frame, so operation order per stream matches
+                        // the barrier collector exactly.
+                        let prepared = if state.done {
+                            None
+                        } else {
+                            Some(Box::new(prepare_policy_sample(environment)?))
+                        };
+                        let opponent = opponent_name(&environment.opponent);
+                        Ok(StreamReply::Advanced(Box::new(AdvancedReply {
+                            state,
+                            completed,
+                            value,
+                            opponent,
+                            prepared,
+                        })))
+                    }
+                }
+            })?;
+        // Bootstrap: every stream builds its first frame before any action.
+        let mut prepared = prepare_all_workers(&workers, streams.len())?;
+        for _ in 0..ACTOR_DECISIONS {
+            let active: Vec<_> = (0..streams.len())
+                .filter(|&stream| !streams[stream].done)
+                .collect();
+            if active.is_empty() {
+                break;
+            }
+            let mut frames = Vec::with_capacity(active.len());
+            let mut spaces = Vec::with_capacity(active.len());
+            for &stream in &active {
+                let sample = prepared[stream]
+                    .take()
+                    .ok_or(PpoError::InvalidTransition("episode prepared frame"))?;
+                frames.push(sample.0);
+                spaces.push(sample.1);
+            }
+            let (choices, spaces) = sample_choices(model, &mut random, &active, frames, spaces)?;
+            let mut samples = choices.into_iter().zip(spaces);
+            for &stream in &active {
                 let (choice, space) = samples.next().expect("one sample per active stream");
-                (stream, (state, choice, space))
-            })
-            .collect();
-        let completed = super::parallel::ordered_active(
-            environments,
-            jobs,
-            |_, environment, (state, choice, space)| {
-                advance_cpu(environment, state, choice, space, config)
-            },
-        )?;
-        assert!(samples.next().is_none());
-        for (stream, completed) in active.into_iter().zip(completed) {
-            finish_advance(
-                model,
-                &mut environments[stream],
-                &mut streams[stream],
-                stream,
-                completed,
-                rollout,
-                report,
-            )?;
+                let state = std::mem::take(&mut streams[stream]);
+                workers.submit(
+                    stream,
+                    StreamJob::Advance {
+                        state,
+                        choice,
+                        space,
+                    },
+                )?;
+            }
+            assert!(samples.next().is_none());
+            let replies = workers.receive(&active)?;
+            assert_eq!(replies.len(), active.len());
+            for (stream, reply) in active.iter().copied().zip(replies) {
+                let StreamReply::Advanced(reply) = reply else {
+                    return Err(PpoError::InvalidConfig("stream worker reply"));
+                };
+                let mut reply = *reply;
+                streams[stream] = std::mem::take(&mut reply.state);
+                prepared[stream] = reply.prepared.map(|sample| *sample);
+                assert_eq!(prepared[stream].is_none(), streams[stream].done);
+                finish_advance_from_parts(
+                    &mut streams[stream],
+                    stream,
+                    reply.completed,
+                    reply.value,
+                    reply.opponent,
+                    rollout,
+                    report,
+                )?;
+            }
         }
-    }
+        workers.finish()?;
+        Ok(())
+    })?;
     assert!(streams.iter().all(|stream| stream.done));
     assert!(streams.iter().all(|stream| stream.choice.is_none()));
     report.rejected_orders = environment_rejections(environments)?;
@@ -326,26 +437,62 @@ fn retention_phase(seed: u64, update: u64, stream: usize) -> Result<usize, PpoEr
     Ok(phase)
 }
 
-fn sample_active(
+/// Bootstrap barrier: every stream prepares its first decision frame.
+fn prepare_all_workers<'scope>(
+    workers: &super::parallel::StreamWorkers<'scope, TrainingEnvironment, StreamJob, StreamReply>,
+    stream_count: usize,
+) -> Result<Vec<Option<(FeatureFrame, ActionSpace)>>, PpoError> {
+    assert!(stream_count >= 2);
+    let active: Vec<usize> = (0..stream_count).collect();
+    for &stream in &active {
+        workers.submit(stream, StreamJob::Prepare)?;
+    }
+    let prepared: Vec<StreamReply> = workers.receive(&active)?;
+    assert_eq!(prepared.len(), stream_count);
+    let mut samples = Vec::with_capacity(stream_count);
+    for reply in prepared {
+        let StreamReply::Prepared(sample) = reply else {
+            return Err(PpoError::InvalidConfig("stream worker reply"));
+        };
+        samples.push(Some(*sample));
+    }
+    Ok(samples)
+}
+
+/// One batched policy forward and sampled choice set per active stream.
+fn sample_choices(
     model: &PolicyModel,
     random: &mut [PpoRng],
-    environments: &mut [TrainingEnvironment],
     active: &[usize],
+    frames: Vec<FeatureFrame>,
+    spaces: Vec<ActionSpace>,
 ) -> Result<(Vec<PpoPolicyChoice>, Vec<ActionSpace>), PpoError> {
+    validate_active(random, active)?;
+    assert_eq!(frames.len(), active.len());
+    assert_eq!(spaces.len(), active.len());
+    select_choices(model, random, active, frames, spaces)
+}
+
+fn validate_active(random: &[PpoRng], active: &[usize]) -> Result<(), PpoError> {
     assert!(!active.is_empty());
     assert!(active.len() <= MAX_EPISODE_ENVIRONMENTS);
-    if random.len() != environments.len()
-        || active.iter().any(|index| *index >= environments.len())
+    if active.iter().any(|index| *index >= random.len())
         || active.windows(2).any(|pair| pair[0] >= pair[1])
     {
         return Err(PpoError::InvalidConfig("episode active streams"));
     }
-    let prepared = super::parallel::ordered_active(
-        environments,
-        active.iter().map(|&stream| (stream, ())).collect(),
-        |_, environment, ()| prepare_policy_sample(environment),
-    )?;
-    let (frames, spaces): (Vec<_>, Vec<_>) = prepared.into_iter().unzip();
+    Ok(())
+}
+
+fn select_choices(
+    model: &PolicyModel,
+    random: &mut [PpoRng],
+    active: &[usize],
+    frames: Vec<FeatureFrame>,
+    spaces: Vec<ActionSpace>,
+) -> Result<(Vec<PpoPolicyChoice>, Vec<ActionSpace>), PpoError> {
+    assert_eq!(frames.len(), active.len());
+    assert_eq!(spaces.len(), active.len());
     let mut selected_random: Vec<_> = active
         .iter()
         .map(|&stream| random[stream].clone())
@@ -356,7 +503,27 @@ fn sample_active(
     for (&stream, state) in active.iter().zip(selected_random) {
         random[stream] = state;
     }
+    assert_eq!(choices.len(), spaces.len());
     Ok((choices, spaces))
+}
+
+/// Test-only single-batch sampler: one spawn per call, same choices as the
+/// persistent workers because the sampling itself is unchanged.
+#[cfg(test)]
+fn sample_active(
+    model: &PolicyModel,
+    random: &mut [PpoRng],
+    environments: &mut [TrainingEnvironment],
+    active: &[usize],
+) -> Result<(Vec<PpoPolicyChoice>, Vec<ActionSpace>), PpoError> {
+    validate_active(random, active)?;
+    let prepared = super::parallel::ordered_active(
+        environments,
+        active.iter().map(|&stream| (stream, ())).collect(),
+        |_, environment, ()| prepare_policy_sample(environment),
+    )?;
+    let (frames, spaces) = prepared.into_iter().unzip();
+    select_choices(model, random, active, frames, spaces)
 }
 
 #[derive(Default)]
@@ -531,6 +698,7 @@ fn advance_cpu(
     })
 }
 
+#[cfg(test)]
 fn finish_advance(
     model: &PolicyModel,
     environment: &mut TrainingEnvironment,
@@ -554,7 +722,45 @@ fn finish_advance(
             state,
             completed.outcome,
             report,
-            &environment.opponent,
+            opponent_name(&environment.opponent),
+        )?;
+    }
+    Ok(())
+}
+
+/// Worker-thread variant: the next value and opponent name were prepared on
+/// the owning stream worker, so no environment access is needed here.
+#[allow(clippy::too_many_arguments)]
+fn finish_advance_from_parts(
+    state: &mut EpisodeStream,
+    stream: usize,
+    completed: CompletedAdvance,
+    value: Option<f32>,
+    opponent: &'static str,
+    rollout: &mut PpoRollout,
+    report: &mut PpoSmokeReport,
+) -> Result<(), PpoError> {
+    report.elapsed_ticks = report
+        .elapsed_ticks
+        .checked_add(u64::from(completed.ticks))
+        .ok_or(PpoError::CounterOverflow)?;
+    if state.should_flush() {
+        let terminal = state.done;
+        let next_value = if terminal {
+            0.0
+        } else {
+            value.ok_or(PpoError::InvalidTransition("episode flush value"))?
+        };
+        flush_value(state, stream, terminal, next_value, rollout)?;
+    }
+    if state.done {
+        record_episode(
+            stream,
+            completed.end_tick,
+            state,
+            completed.outcome,
+            report,
+            opponent,
         )?;
     }
     Ok(())
@@ -798,7 +1004,7 @@ fn assert_unsampled_short_episode_for_test(choice: &PpoPolicyChoice) {
         &state,
         Some(PpoTerminalOutcome::Win),
         &mut report,
-        &OpponentRuntime::Teacher,
+        "Teacher",
     )
     .expect("complete outcome");
     assert_eq!(report.terminal_wins, 1);
@@ -867,6 +1073,7 @@ fn observe_reward(
     Ok(emitted)
 }
 
+#[cfg(test)]
 fn flush(
     model: &PolicyModel,
     environment: &mut TrainingEnvironment,
@@ -875,7 +1082,6 @@ fn flush(
     terminal: bool,
     rollout: &mut PpoRollout,
 ) -> Result<(), PpoError> {
-    assert!(state.retained < RETAINED_PER_EPISODE as u32);
     let next_value = if terminal {
         0.0
     } else {
@@ -884,6 +1090,17 @@ fn flush(
             .map_err(model_error)?[0]
             .value
     };
+    flush_value(state, stream, terminal, next_value, rollout)
+}
+
+fn flush_value(
+    state: &mut EpisodeStream,
+    stream: usize,
+    terminal: bool,
+    next_value: f32,
+    rollout: &mut PpoRollout,
+) -> Result<(), PpoError> {
+    assert!(state.retained < RETAINED_PER_EPISODE as u32);
     let choice = state
         .choice
         .take()
@@ -902,7 +1119,7 @@ fn record_episode(
     state: &EpisodeStream,
     outcome: Option<PpoTerminalOutcome>,
     report: &mut PpoSmokeReport,
-    opponent: &OpponentRuntime,
+    opponent: &'static str,
 ) -> Result<(), PpoError> {
     assert!(state.done);
     assert!(tick <= TICK_CAP);
@@ -924,7 +1141,6 @@ fn record_episode(
             None => crate::TrainingGameOutcome::TimeCap,
         },
     )?;
-    let opponent = opponent_name(opponent);
     eprintln!(
         "episode: stream={stream} map=2 opponent={opponent} tick={tick} outcome={label} actor_decisions={} retained={} terminal_sample={} raw_return={:.9} discounted_return={:.9} terminal_reward={} shaping_return={:.9} actions={:?} noncontinue={} retention_phase={}",
         state.decisions,
