@@ -12,12 +12,19 @@ use sha2::{Digest, Sha256};
 
 #[path = "checkpoint_legacy_reward.rs"]
 pub(crate) mod legacy_reward;
+#[path = "checkpoint_mastery.rs"]
+mod mastery;
 #[path = "checkpoint_navigation.rs"]
 mod navigation;
+#[path = "checkpoint_nonwin.rs"]
+mod nonwin;
+#[path = "checkpoint_terminal.rs"]
+mod terminal;
 #[path = "checkpoint_wait.rs"]
 mod wait;
 
 pub use navigation::Map2NavigationInitializationProvenance;
+pub use nonwin::Map2NonwinInitializationProvenance;
 pub use wait::Map2WaitInitializationProvenance;
 
 use crate::{
@@ -30,9 +37,16 @@ use crate::{
 
 const CHECKPOINT_MAGIC: &[u8; 8] = b"DRYCKP18";
 /// Version of the strict on-disk tensor and manifest contract.
-pub const CHECKPOINT_SCHEMA_VERSION: u32 = 7;
+pub const CHECKPOINT_SCHEMA_VERSION: u32 = 10;
 /// Canonical strict checkpoint contract descriptor.
-pub const CHECKPOINT_SCHEMA_DESCRIPTOR: &str = "bota-drysua-checkpoint/v7;linked_schemas=action,feature,model,ppo,map2_reward;linked_hash=fnv1a_descriptor_then_ordered_version_le32_hash_le64_then_map2_reward_descriptor_utf8;files=checkpoint.safetensors,checkpoint.meta,drysua.weights.safetensors,immutable_sha256_tensor_generation;tensors=model.parameters,adam.first_moment,adam.second_moment;dtype=f32;runtime_metadata=action_feature_model_ppo_schema_hashes,ppo_schema_version,ppo_rules_audit_version,map2_reward_schema_version,map2_reward_schema_hash,map2_reward_schema_descriptor;load=exact_names_shapes_dtype_finite_schema_sha256,no_legacy_runtime_or_resume,canonical_tensor_fallback;initialization=explicit_pinned_m14_inputs_or_m16_initial1739d280_advantagefdd4d3f2_or_m17_initial05e78663_recovery004107e19e6_frozen_original_source_metadata_and_reward1_descriptor_full_sha_finite62_tensor_Candle_zero_new_rows_old_bits_preserved_new_provenance_no_gameplay_equivalence_fresh_optimizer_progress_rng_league,no_m18_source_pin;manifest=git_simulator_features_map2_scope_cap27900_including900_pregame_seed_device_batch_command_rules27_progress_rng_curriculum_league;observation=feature17_action5_unchanged_legal_set_global90_unit84_wait_facts_plus_debt2700_lease30_base_latch;reward3=full_v2_plus_independent_stagnation_base_and_tick_cost_partial_repayment_rearm_only_zero_no_stagnation_refund;save=immutable_generation,canonical_copy,recoverable_manifest_commit_last,file_and_directory_fsync;";
+pub const CHECKPOINT_SCHEMA_DESCRIPTOR: &str = concat!(
+    "bota-drysua-checkpoint/v10;linked_schemas=action,feature,model,ppo,map2_reward;linked_hash=fnv1a_descriptor_then_ordered_version_le32_hash_le64_then_map2_reward_descriptor_utf8;files=checkpoint.safetensors,checkpoint.meta,drysua.weights.safetensors,immutable_sha256_tensor_generation;",
+    "tensors=model.parameters,adam.first_moment,adam.second_moment;dtype=f32;runtime_metadata=action_feature_model_ppo_schema_hashes,ppo_schema_version,ppo_rules_audit_version,map2_reward_schema_version,map2_reward_schema_hash,map2_reward_schema_descriptor;load=exact_names_shapes_dtype_finite_schema_sha256,no_legacy_runtime_or_resume,canonical_tensor_fallback;",
+    "initialization=explicit_pinned_m14_m16_m17_original_metadata_reward1_and_padding_or_m19u162_9d0b8812_original_metadata_frozen_reward3_full_SHA_finite62_tensor_Candle_append_global_rows90to92_1024_positive_zeros_or_m21u300_b29752ac_original_metadata_frozen_reward5_full_SHA_same_shape1700020_all_bits_preserved_no_critic_or_actor_rescaling_new_provenance_no_gameplay_or_reward_equivalence_fresh_optimizer_progress_mastery_rng_league,no_m18_or_m20_source_pin;",
+    "manifest=git_simulator_features_map2_scope_cap27900_including900_pregame_seed_device_batch_command_rules30_progress_rng_curriculum_league;mastery_config=after_run_rules_presence_u8_then_window_u32_weak_percent_u8_teacher_percent_u8_window1to1024_percent1to100;mastery_progress=after_league_references_presence_u8_then_stage_u8_0weak1teacher2completed_stage_games_u64_count_u32_and_oldest_to_newest_bool_u8_flags_count_equals_min_stage_games_config_window,exact_config_state_pairing,active_window_not_qualified_completed_window_full_qualified;",
+    "mastery_counters=stage_games_bounded_and_multiple_of_environments2or4or6_weak_games_equal_updates_times_environments_later_stages_require_prior_full_batch_rounded_window;mastery_scope=typed_config_and_canonical_run_before_tensor_read_or_mutation_Git_migration_cannot_change_config,no_fake_rng_states;observation=feature20_action5_unchanged_legal_set_global92_unit84_all_indices_preserved_tower_remaining90_opening_pending91_no_mastery_inputs;",
+    "reward6=terminal_win.2_loss_neg.2_draw0_taskcap_neg.2_dense_unchanged_distinct_outcomes_errors_not_rewards_no_terminal_dominance;save=immutable_generation,canonical_copy,recoverable_manifest_commit_last,file_and_directory_fsync;"
+);
 /// FNV-1a of the descriptor, ordered linked identities, and reward descriptor.
 pub const CHECKPOINT_SCHEMA_HASH: u64 = crate::model::linked_schema_hash(
     CHECKPOINT_SCHEMA_DESCRIPTOR,
@@ -118,6 +132,8 @@ pub enum CheckpointDevice {
 /// Immutable run provenance required for strict artifact compatibility.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CheckpointRun {
+    /// Typed mastery thresholds/window; None for nonmastery training.
+    pub mastery_config: Option<crate::MasteryConfig>,
     pub git_commit: String,
     pub simulator_commit: String,
     pub enabled_features: String,
@@ -173,6 +189,8 @@ impl RngCheckpoint {
 /// Scheduler, curriculum, rollout, evaluation, league, and RNG resume state.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CheckpointProgress {
+    /// Current mastery stage and complete ordered recent window, or None outside mastery.
+    pub mastery: Option<crate::MasteryProgress>,
     pub global_update: u64,
     pub policy_version: u64,
     pub scheduler_step: u64,
@@ -324,6 +342,12 @@ impl TrainingArtifact {
     ) -> Result<Self, CheckpointError> {
         validate_run(&run, model, trainer.config())?;
         validate_progress(&progress, trainer.updates())?;
+        mastery::validate_scope(
+            run.mastery_config,
+            progress.mastery.as_ref(),
+            progress.global_update,
+            trainer.config().environments,
+        )?;
         let snapshot = trainer
             .checkpoint_snapshot(model)
             .map_err(|error| CheckpointError::Model(error.to_string()))?;
@@ -560,6 +584,12 @@ impl TrainingArtifact {
     fn validate(&self) -> Result<(), CheckpointError> {
         validate_run_without_model(&self.run, self.config)?;
         validate_progress(&self.progress, self.trainer_updates)?;
+        mastery::validate_scope(
+            self.run.mastery_config,
+            self.progress.mastery.as_ref(),
+            self.progress.global_update,
+            self.config.environments,
+        )?;
         self.config
             .validate()
             .map_err(|_| CheckpointError::InvalidManifest("PPO config"))?;
@@ -1098,9 +1128,17 @@ fn decode_manifest(bytes: &[u8]) -> Result<TrainingArtifact, CheckpointError> {
     }
     decode_schema(&mut reader)?;
     let run = decode_run(&mut reader)?;
-    let progress = decode_progress(&mut reader)?;
+    let progress = decode_progress(&mut reader, run.mastery_config)?;
     let config = decode_config(&mut reader)?;
+    mastery::validate_scope(
+        run.mastery_config,
+        progress.mastery.as_ref(),
+        progress.global_update,
+        config.environments,
+    )?;
     let trainer_updates = reader.u64()?;
+    validate_run_without_model(&run, config)?;
+    validate_progress(&progress, trainer_updates)?;
     let step = reader.u64()?;
     let shuffle = (reader.u64()?, reader.u64()?);
     let tensor_hash = reader.array_32()?;
@@ -1163,6 +1201,7 @@ fn encode_run(writer: &mut ManifestWriter, run: &CheckpointRun) -> Result<(), Ch
             .map_err(|_| CheckpointError::InvalidManifest("batch size"))?,
     );
     writer.u32(run.rules_audit_version);
+    mastery::encode_config(writer, run.mastery_config);
     Ok(())
 }
 
@@ -1178,6 +1217,7 @@ fn decode_run(reader: &mut ManifestReader<'_>) -> Result<CheckpointRun, Checkpoi
         device: decode_device(reader)?,
         batch_size: reader.u32()? as usize,
         rules_audit_version: reader.u32()?,
+        mastery_config: mastery::decode_config(reader)?,
     })
 }
 
@@ -1229,10 +1269,14 @@ fn encode_progress(
     for reference in &progress.league_references {
         writer.u64(*reference);
     }
+    mastery::encode_progress(writer, progress.mastery.as_ref());
     Ok(())
 }
 
-fn decode_progress(reader: &mut ManifestReader<'_>) -> Result<CheckpointProgress, CheckpointError> {
+fn decode_progress(
+    reader: &mut ManifestReader<'_>,
+    mastery_config: Option<crate::MasteryConfig>,
+) -> Result<CheckpointProgress, CheckpointError> {
     let global_update = reader.u64()?;
     let policy_version = reader.u64()?;
     let scheduler_step = reader.u64()?;
@@ -1254,6 +1298,7 @@ fn decode_progress(reader: &mut ManifestReader<'_>) -> Result<CheckpointProgress
         league_references.push(reader.u64()?);
     }
     Ok(CheckpointProgress {
+        mastery: mastery::decode_progress(reader, mastery_config)?,
         global_update,
         policy_version,
         scheduler_step,

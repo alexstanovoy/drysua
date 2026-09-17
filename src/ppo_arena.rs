@@ -107,6 +107,7 @@ impl Default for PpoSmokeConfig {
 /// Aggregate result of a short real-simulator PPO run.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct PpoSmokeReport {
+    pub completed_episodes: crate::CompletedTrainingEpisodes,
     pub map2_reward: Map2TrainingReward,
     pub episode_timeouts: u64,
     pub updates: u32,
@@ -126,6 +127,8 @@ pub struct PpoSmokeReport {
 /// Bounded, resumable production PPO settings.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TrainingJobConfig {
+    /// Resolved mastery window/thresholds; present only for mastery-v1.
+    pub mastery_config: Option<crate::MasteryConfig>,
     /// Full-episode opponent schedule, persisted in the canonical checkpoint run command.
     pub opponent_schedule: crate::TrainingOpponentSchedule,
     /// Legacy override retained for explicit rejection; Map2 requires zero.
@@ -183,6 +186,7 @@ pub struct TrainingCheckpointReport {
 /// Final durable progress and gameplay telemetry from the current bounded invocation.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct TrainingJobReport {
+    pub mastery_completed: bool,
     pub map2_reward: Map2TrainingReward,
     pub episode_timeouts: u64,
     pub starting_policy_fingerprint: u64,
@@ -2064,24 +2068,27 @@ where
             },
         )?;
     }
-    let started = Instant::now();
-    let mut checkpoint_schedule = TrainingCheckpointSchedule::new(settings.checkpoint_cadence)?;
-    for update in start..settings.updates {
-        let report = session.train_update(&settings, update, config, capacity)?;
-        let elapsed = started.elapsed();
-        let final_update = report.completed_updates == settings.updates;
-        if checkpoint_schedule.is_due(report.completed_updates, elapsed) || final_update {
-            let durable = time_training_checkpoint(session.completed_updates, || {
-                session.save(checkpoint_directory, report)
-            })?;
-            checkpointed(durable);
-            checkpoint_schedule.mark_committed(started.elapsed())?;
-        }
-    }
+    session.run_updates(
+        &settings,
+        config,
+        capacity,
+        checkpoint_directory,
+        &mut checkpointed,
+    )?;
     Ok(session.report())
 }
 
+struct RestoredTrainingSession {
+    trainer: PpoTrainer,
+    sampling: PpoRng,
+    completed_updates: u64,
+    rollout_samples: u64,
+    migrated_provenance: bool,
+    mastery: Option<crate::MasteryProgress>,
+}
+
 struct TrainingSession {
+    mastery: Option<crate::MasteryProgress>,
     map2_reward: Map2TrainingReward,
     episode_timeouts: u64,
     model: PolicyModel,
@@ -2101,6 +2108,42 @@ struct TrainingSession {
 }
 
 impl TrainingSession {
+    fn run_updates(
+        &mut self,
+        settings: &TrainingJobConfig,
+        config: PpoConfig,
+        capacity: usize,
+        directory: &Path,
+        checkpointed: &mut impl FnMut(TrainingCheckpointReport),
+    ) -> Result<(), PpoError> {
+        let started = Instant::now();
+        let mut schedule = TrainingCheckpointSchedule::new(settings.checkpoint_cadence)?;
+        for update in self.completed_updates..settings.updates {
+            if self
+                .mastery
+                .as_ref()
+                .is_some_and(crate::MasteryProgress::completed)
+            {
+                break;
+            }
+            let stage = self.mastery.as_ref().map(crate::MasteryProgress::stage);
+            let report = self.train_update(settings, update, config, capacity)?;
+            let changed = stage != self.mastery.as_ref().map(crate::MasteryProgress::stage);
+            let final_update = report.completed_updates == settings.updates;
+            if schedule.is_due(report.completed_updates, started.elapsed())
+                || final_update
+                || changed
+            {
+                let durable = time_training_checkpoint(self.completed_updates, || {
+                    self.save(directory, report)
+                })?;
+                checkpointed(durable);
+                schedule.mark_committed(started.elapsed())?;
+            }
+        }
+        Ok(())
+    }
+
     fn initialize(
         settings: &TrainingJobConfig,
         device: PolicyDevice,
@@ -2115,27 +2158,37 @@ impl TrainingSession {
             TrainingArtifact::load_runtime_weights(&model, initial_weights_directory)
                 .map_err(checkpoint_error)?;
         }
-        let (trainer, sampling, completed_updates, rollout_samples, migrated_provenance) = if resume
-        {
+        let restored = if resume {
             restore_training_session(&model, directory, &run, config, settings.resume_provenance)?
         } else {
             let trainer = PpoTrainer::new(&model, config, settings.seed ^ 0x51a9)?;
-            (trainer, PpoRng::new(settings.seed ^ 0xa17e), 0, 0, false)
+            RestoredTrainingSession {
+                trainer,
+                sampling: PpoRng::new(settings.seed ^ 0xa17e),
+                completed_updates: 0,
+                rollout_samples: 0,
+                migrated_provenance: false,
+                mastery: settings
+                    .mastery_config
+                    .map(|_| crate::MasteryProgress::default()),
+            }
         };
-        let starting_policy_fingerprint = PolicySnapshot::capture(&model, completed_updates)
-            .map_err(league_error)?
-            .fingerprint();
+        let starting_policy_fingerprint =
+            PolicySnapshot::capture(&model, restored.completed_updates)
+                .map_err(league_error)?
+                .fingerprint();
         Ok(Self {
+            mastery: restored.mastery,
             model,
-            trainer,
+            trainer: restored.trainer,
             map2_reward: Map2TrainingReward::default(),
             episode_timeouts: 0,
-            sampling,
+            sampling: restored.sampling,
             run,
-            completed_updates,
-            rollout_samples,
+            completed_updates: restored.completed_updates,
+            rollout_samples: restored.rollout_samples,
             latest: PpoUpdateReport::default(),
-            migrated_provenance,
+            migrated_provenance: restored.migrated_provenance,
             starting_policy_fingerprint,
             terminal_wins: 0,
             terminal_losses: 0,
@@ -2162,33 +2215,26 @@ impl TrainingSession {
         assert_eq!(self.completed_updates, self.trainer.updates());
         let mut rollout =
             PpoRollout::new(capacity, self.model.policy_identity().map_err(model_error)?)?;
-        let mut environments = build_training_environments(settings, update, config, &self.model)?;
+        let mut environments = build_training_environments(
+            settings,
+            update,
+            config,
+            &self.model,
+            self.mastery.as_ref(),
+        )?;
         let mut actor_report = PpoSmokeReport::default();
         timing.enter(TrainingStage::Collection);
-        let collected = if settings.complete_episodes {
-            episode::collect(
-                &self.model,
-                &mut self.sampling,
-                &mut environments,
-                settings,
-                update,
-                &mut rollout,
-                &mut actor_report,
-            )
-        } else {
-            collect_update(
-                &self.model,
-                &mut self.sampling,
-                &mut environments,
-                config,
-                config.rollout_decisions,
-                &mut rollout,
-                &mut actor_report,
-            )
-        };
+        let collected = self.collect_rollout(
+            settings,
+            update,
+            &mut environments,
+            &mut rollout,
+            &mut actor_report,
+        );
         timing.set_samples(rollout.len());
         timing.observe_result(collected)?;
         timing.enter(TrainingStage::BatchPreparation);
+        let next_mastery = self.next_mastery(settings, &actor_report)?;
         self.accumulate_actor_counters(&actor_report)?;
         let samples = rollout.len();
         if !settings.complete_episodes {
@@ -2200,15 +2246,48 @@ impl TrainingSession {
         let optimized = self.trainer.train_update(&self.model, &batch);
         timing.set_optimizer_step(self.trainer.optimizer_step());
         self.latest = timing.observe_result(optimized)?;
+        self.mastery = next_mastery;
         timing.enter(TrainingStage::Finalization);
         self.completed_updates = self.trainer.updates();
         self.rollout_samples = self
             .rollout_samples
             .checked_add(samples as u64)
             .ok_or(PpoError::CounterOverflow)?;
+        self.log_mastery_progress();
         let report = self.checkpoint_report(None);
         timing.complete();
         Ok(report)
+    }
+
+    fn collect_rollout(
+        &mut self,
+        settings: &TrainingJobConfig,
+        update: u64,
+        environments: &mut [TrainingEnvironment],
+        rollout: &mut PpoRollout,
+        actor_report: &mut PpoSmokeReport,
+    ) -> Result<(), PpoError> {
+        if settings.complete_episodes {
+            episode::collect(
+                &self.model,
+                &mut self.sampling,
+                environments,
+                settings,
+                update,
+                rollout,
+                actor_report,
+            )
+        } else {
+            collect_update(
+                &self.model,
+                &mut self.sampling,
+                environments,
+                settings.ppo,
+                settings.ppo.rollout_decisions,
+                rollout,
+                actor_report,
+            )
+        }
     }
 
     fn accumulate_actor_counters(&mut self, actor_report: &PpoSmokeReport) -> Result<(), PpoError> {
@@ -2240,6 +2319,39 @@ impl TrainingSession {
         Ok(())
     }
 
+    fn next_mastery(
+        &self,
+        settings: &TrainingJobConfig,
+        report: &PpoSmokeReport,
+    ) -> Result<Option<crate::MasteryProgress>, PpoError> {
+        let Some(mut progress) = self.mastery.clone() else {
+            return Ok(None);
+        };
+        let config = settings
+            .mastery_config
+            .ok_or(PpoError::InvalidConfig("missing mastery config"))?;
+        let outcomes = report.completed_episodes.ordered_outcomes();
+        if outcomes.len() != settings.ppo.environments || report.rejected_orders != 0 {
+            return Err(PpoError::InvalidTransition(
+                "mastery requires a complete unrejected batch",
+            ));
+        }
+        progress
+            .record_batch(config, &outcomes)
+            .map_err(PpoError::InvalidTransition)?;
+        Ok(Some(progress))
+    }
+
+    fn log_mastery_progress(&self) {
+        if let (Some(config), Some(progress)) = (self.run.mastery_config, &self.mastery) {
+            crate::telemetry::PerformanceOutput::new(crate::telemetry::AsyncLogWriter::default()).emit(
+                &format_args!("level=INFO event=training_mastery_progress updates={} stage={:?} stage_games={} recent_games={} recent_wins={} window={} win_percent={} completed={}",
+                    self.completed_updates, progress.stage(), progress.games(), progress.recent().len(),
+                    progress.wins(), config.window(), config.threshold(progress.stage()), progress.completed()),
+            );
+        }
+    }
+
     fn save(
         &self,
         directory: &Path,
@@ -2247,6 +2359,7 @@ impl TrainingSession {
     ) -> Result<TrainingCheckpointReport, PpoError> {
         let (state, draws) = self.sampling.checkpoint();
         let progress = CheckpointProgress {
+            mastery: self.mastery.clone(),
             global_update: self.completed_updates,
             policy_version: self.completed_updates,
             scheduler_step: self.completed_updates,
@@ -2296,6 +2409,10 @@ impl TrainingSession {
 
     fn report(&self) -> TrainingJobReport {
         TrainingJobReport {
+            mastery_completed: self
+                .mastery
+                .as_ref()
+                .is_some_and(crate::MasteryProgress::completed),
             map2_reward: self.map2_reward,
             episode_timeouts: self.episode_timeouts,
             starting_policy_fingerprint: self.starting_policy_fingerprint,
@@ -2732,6 +2849,9 @@ fn training_checkpoint_run(
         command_line.push_str(" --opponent-schedule ");
         command_line.push_str(settings.opponent_schedule.as_str());
     }
+    if let Some(config) = settings.mastery_config {
+        command_line.push_str(&config.canonical_suffix());
+    }
     if settings.terminal_only {
         command_line.push_str(" --terminal-only");
     }
@@ -2742,6 +2862,7 @@ fn training_checkpoint_run(
         ));
     }
     Ok(CheckpointRun {
+        mastery_config: settings.mastery_config,
         git_commit: settings.git_commit.clone(),
         simulator_commit: settings.simulator_commit.clone(),
         enabled_features: compiled_features(),
@@ -2761,7 +2882,7 @@ fn restore_training_session(
     run: &CheckpointRun,
     config: PpoConfig,
     provenance: ResumeProvenance,
-) -> Result<(PpoTrainer, PpoRng, u64, u64, bool), PpoError> {
+) -> Result<RestoredTrainingSession, PpoError> {
     let (artifact, restore_run, migrated) = match provenance {
         ResumeProvenance::Strict => (
             TrainingArtifact::load_compatible(directory, run).map_err(checkpoint_error)?,
@@ -2790,14 +2911,16 @@ fn restore_training_session(
     let sampling = restore_sampling_rng(&progress.rng_states)?;
     let completed_updates = progress.global_update;
     let rollout_samples = progress.rollout_samples;
+    let mastery = progress.mastery.clone();
     let (trainer, _, _) = restored.into_parts();
-    Ok((
+    Ok(RestoredTrainingSession {
         trainer,
         sampling,
         completed_updates,
         rollout_samples,
-        migrated,
-    ))
+        migrated_provenance: migrated,
+        mastery,
+    })
 }
 
 fn validate_provenance_migration(
@@ -2915,9 +3038,14 @@ fn build_training_environments(
     update: u64,
     config: PpoConfig,
     model: &PolicyModel,
+    mastery: Option<&crate::MasteryProgress>,
 ) -> Result<Vec<TrainingEnvironment>, PpoError> {
     if settings.complete_episodes {
-        return episode::environments(settings, update);
+        return if mastery.is_some() {
+            episode::environments_with_mastery(settings, update, mastery)
+        } else {
+            episode::environments(settings, update)
+        };
     }
     let decision = update
         .checked_mul(config.rollout_decisions as u64)

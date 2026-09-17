@@ -9,8 +9,8 @@ use bota_proto::{EventKind, ItemId, MapId, SlotId, Team, UnitKind, WorldView};
 
 #[test]
 fn wait_feature_columns_stay_fixed_before_the_three_new_progress_fields() {
-    assert_eq!(crate::FEATURE_SCHEMA_VERSION, 17);
-    assert_eq!(crate::GLOBAL_FEATURES, 90);
+    assert_eq!(crate::FEATURE_SCHEMA_VERSION, 20);
+    assert_eq!(crate::GLOBAL_FEATURES, 92);
     assert_eq!(crate::UNIT_FEATURES, 84);
     assert_eq!(global_feature::MAP2_FOUNTAIN_WAIT_TICKS, 85);
     assert_eq!(global_feature::MAP2_FOUNTAIN_WAIT_REFUNDABLE_COST, 86);

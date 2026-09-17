@@ -1,0 +1,39 @@
+#[cfg(any(feature = "builtin", test))]
+use crate::PpoError;
+use crate::TrainingGameOutcome;
+
+/// At most one completed outcome per full-episode stream, sorted by tick then stream.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CompletedTrainingEpisodes {
+    entries: [Option<(u32, usize, TrainingGameOutcome)>; 6],
+}
+
+impl CompletedTrainingEpisodes {
+    #[cfg(any(feature = "builtin", test))]
+    pub(crate) fn record(
+        &mut self,
+        tick: u32,
+        stream: usize,
+        outcome: TrainingGameOutcome,
+    ) -> Result<(), PpoError> {
+        if tick == 0 || tick > crate::MAP2_TICK_CAP || stream >= self.entries.len() {
+            return Err(PpoError::InvalidTransition(
+                "completed episode tick or stream",
+            ));
+        }
+        if self.entries[stream].is_some() {
+            return Err(PpoError::InvalidTransition(
+                "duplicate completed episode stream",
+            ));
+        }
+        self.entries[stream] = Some((tick, stream, outcome));
+        Ok(())
+    }
+
+    pub fn ordered_outcomes(&self) -> Vec<TrainingGameOutcome> {
+        let mut entries: Vec<_> = self.entries.iter().flatten().copied().collect();
+        assert!(entries.len() <= 6);
+        entries.sort_by_key(|entry| (entry.0, entry.1));
+        entries.into_iter().map(|entry| entry.2).collect()
+    }
+}

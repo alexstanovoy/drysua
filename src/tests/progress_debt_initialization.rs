@@ -4,17 +4,17 @@ use crate::{CheckpointError, PolicyModel, TrainingArtifact};
 use std::collections::HashMap;
 
 #[test]
-fn progress_debt_versions_and_shapes_change_without_new_action_or_source_pins() {
-    assert_eq!(crate::FEATURE_SCHEMA_VERSION, 17);
-    assert_eq!(crate::MODEL_SCHEMA_VERSION, 19);
-    assert_eq!(crate::PPO_SCHEMA_VERSION, 32);
-    assert_eq!(crate::PPO_RULES_AUDIT_VERSION, 27);
-    assert_eq!(crate::LEAGUE_SCHEMA_VERSION, 32);
-    assert_eq!(crate::CHECKPOINT_SCHEMA_VERSION, 7);
-    assert_eq!(crate::IMITATION_RULES_AUDIT_VERSION, 17);
-    assert_eq!(crate::MODEL_PARAMETER_COUNT, 1_698_996);
+fn current_progress_debt_shapes_and_action_contract_remain_unchanged() {
+    assert_eq!(crate::FEATURE_SCHEMA_VERSION, 20);
+    assert_eq!(crate::MODEL_SCHEMA_VERSION, 22);
+    assert_eq!(crate::PPO_SCHEMA_VERSION, 35);
+    assert_eq!(crate::PPO_RULES_AUDIT_VERSION, 30);
+    assert_eq!(crate::LEAGUE_SCHEMA_VERSION, 35);
+    assert_eq!(crate::CHECKPOINT_SCHEMA_VERSION, 10);
+    assert_eq!(crate::IMITATION_RULES_AUDIT_VERSION, 20);
+    assert_eq!(crate::MODEL_PARAMETER_COUNT, 1_700_020);
     assert_eq!(crate::ACTION_SCHEMA_HASH, 10_658_390_830_565_586_343);
-    assert_eq!(crate::MAP2_REWARD_SCHEMA_HASH, 11_643_768_462_079_275_437);
+    assert_eq!(crate::MAP2_REWARD_SCHEMA_HASH, 1_084_583_101_075_978_392);
 }
 
 #[test]
@@ -62,7 +62,7 @@ fn progress_debt_resume_rejects_checkpoint6_before_tensor_access() {
 }
 
 #[test]
-fn progress_debt_padding_from_m17_zeroes_five_global_rows_and_preserves_all_old_bits() {
+fn current_padding_from_m17_zeroes_seven_global_rows_and_preserves_all_old_bits() {
     let model = PolicyModel::fresh(9131901).expect("model");
     let mut source: Vec<_> = (0..1_696_436)
         .map(|index| f32::from_bits(0x3e00_0000 + index))
@@ -78,15 +78,15 @@ fn progress_debt_padding_from_m17_zeroes_five_global_rows_and_preserves_all_old_
     let widened = model
         .widen_map2_wait_parameters(&source)
         .expect("Candle padding");
-    assert_eq!(widened.len(), 1_698_996);
+    assert_eq!(widened.len(), 1_700_020);
     let prefix = 59_072 + 85 * 512;
     assert_bits(&widened[..prefix], &source[..prefix]);
     assert!(
-        widened[prefix..prefix + 2560]
+        widened[prefix..prefix + 3584]
             .iter()
             .all(|value| value.to_bits() == 0)
     );
-    assert_bits(&widened[prefix + 2560..], &source[prefix..]);
+    assert_bits(&widened[prefix + 3584..], &source[prefix..]);
     assert_eq!(
         model
             .parameter_schema()
@@ -95,7 +95,7 @@ fn progress_debt_padding_from_m17_zeroes_five_global_rows_and_preserves_all_old_
             .find(|(name, _)| *name == "trunk.0.weight")
             .expect("trunk")
             .1,
-        [2594, 512]
+        [2596, 512]
     );
 }
 

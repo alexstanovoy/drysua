@@ -11,8 +11,8 @@ use bota_proto::{EffectId, EffectView, EventKind, ItemId, MapId, SlotId, Team, W
 
 #[test]
 fn progress_debt_schema_adds_only_three_accounting_globals_after_wait_inputs() {
-    assert_eq!(crate::FEATURE_SCHEMA_VERSION, 17);
-    assert_eq!(crate::GLOBAL_FEATURES, 90);
+    assert_eq!(crate::FEATURE_SCHEMA_VERSION, 20);
+    assert_eq!(crate::GLOBAL_FEATURES, 92);
     assert_eq!(crate::UNIT_FEATURES, 84);
     assert_eq!(global_feature::MAP2_STAGNATION_TICKS, 87);
     assert_eq!(global_feature::MAP2_ACTIVITY_TICKS_LEFT, 88);
@@ -22,22 +22,22 @@ fn progress_debt_schema_adds_only_three_accounting_globals_after_wait_inputs() {
 #[test]
 fn progress_debt_baseline_is_free_and_idle_debt_is_normalized_at_threshold() {
     let (mut tracker, mut view) = fixture(Team::Radiant);
-    assert_eq!(&encoded(&tracker).global()[87..], &[0.0; 3]);
+    assert_eq!(&encoded(&tracker).global()[87..90], &[0.0; 3]);
     advance_to(&mut tracker, &mut view, 2700);
     assert_eq!(
-        &encoded(&tracker).global()[87..],
+        &encoded(&tracker).global()[87..90],
         &[2699.0 / 2700.0, 0.0, 0.0]
     );
     advance_to(&mut tracker, &mut view, 2701);
     let interval = tracker.take_map2_reward_interval().expect("threshold");
-    assert_eq!(&encoded(&tracker).global()[87..], &[1.0, 0.0, 1.0]);
+    assert_eq!(&encoded(&tracker).global()[87..90], &[1.0, 0.0, 1.0]);
     assert_eq!(interval.stagnation_base, -0.02);
     assert_eq!(interval.stagnation_ticks_cost, 0.0);
     advance_to(&mut tracker, &mut view, 2702);
     let interval = tracker.take_map2_reward_interval().expect("capped cost");
     assert_eq!(interval.stagnation_base, 0.0);
     assert_eq!(interval.stagnation_ticks_cost, -0.000002);
-    assert_eq!(&encoded(&tracker).global()[87..], &[1.0, 0.0, 1.0]);
+    assert_eq!(&encoded(&tracker).global()[87..90], &[1.0, 0.0, 1.0]);
 }
 
 #[test]
@@ -56,7 +56,10 @@ fn progress_purchase_refunds_open_fountain_wait_but_only_partially_repays_generi
     let refund = tracker.take_map2_reward_interval().expect("purchase");
     let frame = encoded(&tracker);
     assert_eq!(&frame.global()[85..87], &[0.0; 2]);
-    assert_eq!(&frame.global()[87..], &[2697.0 / 2700.0, 29.0 / 30.0, 1.0]);
+    assert_eq!(
+        &frame.global()[87..90],
+        &[2697.0 / 2700.0, 29.0 / 30.0, 1.0]
+    );
     assert_eq!(refund.fountain_wait_refund, -charged.fountain_wait);
     assert_eq!(refund.stagnation_base, 0.0);
     assert_eq!(refund.stagnation_ticks_cost, 0.0);
@@ -69,17 +72,17 @@ fn progress_single_activity_lease_counts_current_tick_and_expires_after_thirty()
     advance_to(&mut tracker, &mut view, 101);
     feed(&mut tracker, &mut view, &[purchase()]);
     assert_eq!(
-        &encoded(&tracker).global()[87..],
+        &encoded(&tracker).global()[87..90],
         &[97.0 / 2700.0, 29.0 / 30.0, 0.0]
     );
     advance_to(&mut tracker, &mut view, 131);
     assert_eq!(
-        &encoded(&tracker).global()[87..],
+        &encoded(&tracker).global()[87..90],
         &[10.0 / 2700.0, 0.0, 0.0]
     );
     advance_to(&mut tracker, &mut view, 132);
     assert_eq!(
-        &encoded(&tracker).global()[87..],
+        &encoded(&tracker).global()[87..90],
         &[11.0 / 2700.0, 0.0, 0.0]
     );
 }
@@ -96,11 +99,14 @@ fn progress_direct_fountain_aura_repays_full_pool_lingering_body_until_latch_rea
     // The body stays full and outside the observed fountain; effect3 alone qualifies.
     advance_to(&mut tracker, &mut view, 3600);
     assert_eq!(
-        &encoded(&tracker).global()[87..],
+        &encoded(&tracker).global()[87..90],
         &[3.0 / 2700.0, 29.0 / 30.0, 1.0]
     );
     advance_to(&mut tracker, &mut view, 3601);
-    assert_eq!(&encoded(&tracker).global()[87..], &[0.0, 29.0 / 30.0, 0.0]);
+    assert_eq!(
+        &encoded(&tracker).global()[87..90],
+        &[0.0, 29.0 / 30.0, 0.0]
+    );
 }
 
 #[test]
@@ -132,7 +138,7 @@ fn progress_movement_and_death_do_not_reset_inactive_debt() {
         12
     );
     assert_eq!(
-        &encoded(&tracker).global()[87..],
+        &encoded(&tracker).global()[87..90],
         &[12.0 / 2700.0, 0.0, 0.0]
     );
 }
@@ -178,7 +184,7 @@ fn progress_facts_are_off_map2_zero_and_side_handle_invariant() {
         tracker
             .observe_snapshot(&world_view(Team::Radiant, 1))
             .expect("snapshot");
-        assert_eq!(&encoded(&tracker).global()[87..], &[0.0; 3]);
+        assert_eq!(&encoded(&tracker).global()[87..90], &[0.0; 3]);
     }
     let mut frames = Vec::new();
     for side in [Team::Radiant, Team::Dire] {

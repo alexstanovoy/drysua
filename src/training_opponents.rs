@@ -7,6 +7,9 @@ pub enum TrainingOpponentSchedule {
     /// Two Weak updates, then one rotating Teacher pair out of every three pairs.
     #[value(name = "weak-warmup-v1")]
     WeakWarmupV1,
+    /// Weak then Teacher, advancing on the full rolling training-win window.
+    #[value(name = "mastery-v1")]
+    MasteryV1,
 }
 
 impl TrainingOpponentSchedule {
@@ -15,6 +18,7 @@ impl TrainingOpponentSchedule {
         match self {
             Self::Teacher => "teacher",
             Self::WeakWarmupV1 => "weak-warmup-v1",
+            Self::MasteryV1 => "mastery-v1",
         }
     }
 
@@ -26,6 +30,7 @@ impl TrainingOpponentSchedule {
             Self::Teacher => true,
             Self::WeakWarmupV1 if update < 2 => false,
             Self::WeakWarmupV1 => ((update - 2) % 3 + pair as u64).is_multiple_of(3),
+            Self::MasteryV1 => unreachable!("mastery opponent requires persisted stage"),
         }
     }
 }

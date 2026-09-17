@@ -189,10 +189,10 @@ fn map2_tracker_rejected_event_batch_does_not_count_a_valid_prefix() {
 #[test]
 fn map2_tracker_finish_is_seat_relative_exact_once_and_invalidates_frame_provenance() {
     for (end, terminal) in [
-        (Map2RewardEnd::Win, 1.0),
-        (Map2RewardEnd::Loss, -1.0),
+        (Map2RewardEnd::Win, 0.2),
+        (Map2RewardEnd::Loss, -0.2),
         (Map2RewardEnd::Draw, 0.0),
-        (Map2RewardEnd::TimeCap, 0.0),
+        (Map2RewardEnd::TimeCap, -0.2),
     ] {
         let mut tracker = tracker(Team::Radiant, world_view(Team::Radiant, 1));
         let before = tracker.provenance();
@@ -286,7 +286,7 @@ fn map2_features_export_accounting_state_and_drains_preserve_observation_provena
     assert_eq!(
         &frame.global()[global_feature::MAP2_REWARD_REMAINING_START
             ..global_feature::MAP2_REWARD_REMAINING_START + 9],
-        &state.remaining
+        &state.remaining[..9]
     );
     assert_eq!(
         frame.global()[global_feature::MAP2_TOWER_POTENTIAL],
@@ -308,7 +308,7 @@ fn legacy_features_leave_every_map2_global_zero() {
     let tracker = super::feature::tracker_with_view(Team::Radiant, world_view(Team::Radiant, 1));
     let frame = encode(&tracker, &LocalPolicyState::new(0));
 
-    assert_eq!(&frame.global()[72..], &[0.0; 18]);
+    assert_eq!(&frame.global()[72..], &[0.0; 20]);
 }
 
 #[test]

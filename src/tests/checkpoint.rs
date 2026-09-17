@@ -17,6 +17,8 @@ static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(1);
 const M11_PARAMETERS: usize = 1_684_724;
 #[path = "checkpoint_input_adapter.rs"]
 mod checkpoint_input_adapter;
+#[path = "checkpoint_mastery.rs"]
+mod checkpoint_mastery;
 #[path = "checkpoint_order_contract.rs"]
 mod checkpoint_order_contract;
 #[path = "checkpoint_training_contract.rs"]
@@ -668,6 +670,7 @@ fn provenance_migration_rejects_v13_v14_v15_without_rewriting_training_manifest(
     let path = directory.join("checkpoint.meta");
     let current = fs::read(&path).expect("manifest");
     let settings = crate::TrainingJobConfig {
+        mastery_config: None,
         opponent_schedule: crate::TrainingOpponentSchedule::Teacher,
         episode_time_cost: 0.0,
         terminal_only: false,
@@ -882,7 +885,7 @@ fn legacy_anchor_runtime_and_pre_migration_probe_training_reject_without_mutatio
 
 #[test]
 fn checkpoint_schema_hash_is_stable() {
-    assert_eq!(crate::CHECKPOINT_SCHEMA_VERSION, 7);
+    assert_eq!(crate::CHECKPOINT_SCHEMA_VERSION, 10);
     assert_eq!(
         crate::CHECKPOINT_SCHEMA_HASH,
         super::map2_checkpoint::schema_hash(
@@ -1253,6 +1256,7 @@ fn checkpoint_config() -> PpoConfig {
 
 fn run_metadata() -> CheckpointRun {
     CheckpointRun {
+        mastery_config: None,
         git_commit: "28e196f".to_owned(),
         simulator_commit: "b575129".to_owned(),
         enabled_features: crate::compiled_features(),
@@ -1268,6 +1272,7 @@ fn run_metadata() -> CheckpointRun {
 
 fn progress_metadata(global_update: u64) -> CheckpointProgress {
     CheckpointProgress {
+        mastery: None,
         global_update,
         policy_version: global_update,
         scheduler_step: 3,

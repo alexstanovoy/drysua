@@ -109,6 +109,7 @@ fn assert_source_bits(model: &PolicyModel, bytes: &[u8], parameters: &[f32]) {
 
 fn initialization_run(config: crate::PpoConfig, seed: u64, provenance: &str) -> CheckpointRun {
     CheckpointRun {
+        mastery_config: None,
         git_commit: std::env::var("DRYSUA_INITIALIZATION_GIT_COMMIT")
             .expect("actual source revision"),
         simulator_commit: std::env::var("DRYSUA_INITIALIZATION_SIMULATOR_COMMIT")
@@ -156,7 +157,7 @@ fn write_provenance(output: &Path, source: &Path, run: &CheckpointRun, provenanc
         .collect();
     assert_eq!(digest.len(), 64);
     let text = format!(
-        "{provenance}\nsource={}\noutput_sha256={digest}\ngit_commit={}\nsimulator_commit={}\nseed={}\nenabled_features={}\ntraining_updates=0\ngameplay_runs=0\nsource_unchanged=true\nparameters=1698996\nglobal_features=90\nunit_features=84\nold_parameter_bits_preserved=true\nnew_zero_trunk_rows=85..90\nruntime_and_checkpoint_reload_exact=true\n",
+        "{provenance}\nsource={}\noutput_sha256={digest}\ngit_commit={}\nsimulator_commit={}\nseed={}\nenabled_features={}\ntraining_updates=0\ngameplay_runs=0\nsource_unchanged=true\nparameters=1700020\nglobal_features=92\nunit_features=84\nold_parameter_bits_preserved=true\nnew_zero_trunk_rows=85..92\nruntime_and_checkpoint_reload_exact=true\n",
         source.display(),
         run.git_commit,
         run.simulator_commit,

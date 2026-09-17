@@ -54,7 +54,7 @@ pub(super) fn assert_padding(model: &PolicyModel, source: &[f32], target: &[f32]
     let schema = model.parameter_schema().expect("schema");
     assert_eq!(schema.len(), 62);
     assert_eq!(source.len(), M14_PARAMETERS);
-    assert_eq!(target.len(), M14_PARAMETERS + 9_920);
+    assert_eq!(target.len(), M14_PARAMETERS + 10_944);
     let mut source_offset = 0;
     let mut target_offset = 0;
     let mut inserted_total = 0;
@@ -66,8 +66,8 @@ pub(super) fn assert_padding(model: &PolicyModel, source: &[f32], target: &[f32]
                 (73 * 64, 11 * 64)
             }
             "trunk.0.weight" => {
-                assert_eq!(shape, [2594, 512]);
-                (72 * 512, 18 * 512)
+                assert_eq!(shape, [2596, 512]);
+                (72 * 512, 20 * 512)
             }
             _ => (count, 0),
         };
@@ -86,7 +86,7 @@ pub(super) fn assert_padding(model: &PolicyModel, source: &[f32], target: &[f32]
     }
     assert_eq!(source_offset, source.len());
     assert_eq!(target_offset, target.len());
-    assert_eq!(inserted_total, 9_920);
+    assert_eq!(inserted_total, 10_944);
 }
 
 #[test]

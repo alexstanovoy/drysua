@@ -6,6 +6,7 @@
 mod events;
 mod observation;
 mod opening;
+mod opening_position;
 mod potential;
 mod progress;
 
@@ -19,7 +20,7 @@ use potential::Tower;
 pub use progress::*;
 
 /// Independent metadata version for the Map2 reward profile.
-pub const MAP2_REWARD_SCHEMA_VERSION: u32 = 3;
+pub const MAP2_REWARD_SCHEMA_VERSION: u32 = 6;
 /// Maximum events consumed atomically in one seat-visible tick.
 pub const MAP2_REWARD_MAX_EVENTS: usize = 4096;
 /// Maximum visible units accepted in one snapshot.
@@ -27,7 +28,15 @@ pub const MAP2_REWARD_MAX_UNITS: usize = 4096;
 /// Maximum compact public identity records, including recently absent units.
 pub const MAP2_REWARD_MAX_IDENTITIES: usize = 8192;
 /// Number of independently diminishing event-credit and cost channels.
-pub const MAP2_REWARD_CHANNELS: usize = 9;
+pub const MAP2_REWARD_CHANNELS: usize = 10;
+/// Existing event channels retain their original feature positions.
+pub const MAP2_REWARD_LEGACY_CHANNELS: usize = 9;
+/// Appended independent received-Tower channel.
+pub const MAP2_REWARD_TOWER_CHANNEL: usize = 9;
+/// Public native interval from first to second wave, in ticks.
+pub const MAP2_REWARD_OPENING_WAVE_TICKS: u32 = 900;
+/// Maximum one-shot first-wave positioning cost.
+pub const MAP2_REWARD_OPENING_POSITION_BOUND: f64 = 0.1;
 /// Required per-tick discount for exact potential cancellation and the return bound.
 pub const MAP2_REWARD_GAMMA_TICK: f32 = 1.0;
 /// Maximum pre-wave center-distance potential, in reward units.
@@ -42,7 +51,7 @@ pub const MAP2_REWARD_FOUNTAIN_COST_PER_SECOND: f64 = 0.00005;
 pub const MAP2_REWARD_FOUNTAIN_WAIT_BOUND: f64 = MAP2_REWARD_FOUNTAIN_BASE_COST
     * crate::MAP2_TICK_CAP as f64
     / MAP2_REWARD_FOUNTAIN_GRACE_TICKS as f64;
-/// Unchanged v2 absolute dense bound, excluding stagnation and terminal reward.
+/// Historical v2 bound; not the current episode bound.
 pub const MAP2_REWARD_V2_DENSE_BOUND: f64 =
     V1_DENSE_BOUND + MAP2_REWARD_PREGAME_CENTER_SCALE + MAP2_REWARD_FOUNTAIN_WAIT_BOUND;
 /// Inactive debt threshold, clamped so sustained activity can always repay it.
@@ -65,18 +74,30 @@ pub const MAP2_REWARD_STAGNATION_MAX_BASE_CHARGES: u32 = 1
 pub const MAP2_REWARD_STAGNATION_BOUND: f64 = MAP2_REWARD_STAGNATION_MAX_BASE_CHARGES as f64
     * MAP2_REWARD_STAGNATION_BASE_COST
     + MAX_TICK as f64 * MAP2_REWARD_STAGNATION_TICK_COST;
-/// Upper bound on absolute undiscounted dense episode return, excluding terminal reward.
-pub const MAP2_REWARD_DENSE_BOUND: f64 = MAP2_REWARD_V2_DENSE_BOUND + MAP2_REWARD_STAGNATION_BOUND;
-/// Upper bound on positive dense return over a FULL episode including terminal lane closure.
-pub const MAP2_REWARD_POSITIVE_BOUND: f64 = BUDGETS[0]
-    + BUDGETS[2]
-    + BUDGETS[4]
-    + 2.0 * TOWER_SCALE
-    + LANE_SCALE
-    + MAP2_REWARD_PREGAME_CENTER_SCALE;
+/// Total positive diminishing event budgets, excluding potentials and terminal reward.
+pub const MAP2_REWARD_EVENT_POSITIVE_BOUND: f64 = BUDGETS[0] + BUDGETS[2] + BUDGETS[4];
+/// Total negative diminishing event budgets, excluding potentials and terminal reward.
+pub const MAP2_REWARD_EVENT_NEGATIVE_BOUND: f64 =
+    BUDGETS[1] + BUDGETS[3] + BUDGETS[5] + BUDGETS[6] + BUDGETS[7] + BUDGETS[8] + BUDGETS[9];
+/// Positive full-episode bound ONLY when initial tower and lane potentials are zero.
+pub const MAP2_REWARD_NATIVE_POSITIVE_BOUND: f64 =
+    MAP2_REWARD_EVENT_POSITIVE_BOUND + TOWER_SCALE + MAP2_REWARD_PREGAME_CENTER_SCALE;
+/// Negative full-episode bound ONLY when initial tower and lane potentials are zero.
+pub const MAP2_REWARD_NATIVE_NEGATIVE_BOUND: f64 = MAP2_REWARD_EVENT_NEGATIVE_BOUND
+    + TOWER_SCALE
+    + MAP2_REWARD_PREGAME_CENTER_SCALE
+    + MAP2_REWARD_OPENING_POSITION_BOUND
+    + MAP2_REWARD_FOUNTAIN_WAIT_BOUND
+    + MAP2_REWARD_STAGNATION_BOUND;
+/// General negative/absolute net dense bound, including arbitrary valid primed baselines.
+pub const MAP2_REWARD_DENSE_BOUND: f64 =
+    MAP2_REWARD_NATIVE_NEGATIVE_BOUND + TOWER_SCALE + LANE_SCALE;
+/// General positive net dense bound, including terminal closure of a nonzero initial lane potential.
+pub const MAP2_REWARD_POSITIVE_BOUND: f64 =
+    MAP2_REWARD_NATIVE_POSITIVE_BOUND + TOWER_SCALE + LANE_SCALE;
 /// Exact accounting and calibration contract; coefficients are engineering choices.
 pub const MAP2_REWARD_SCHEMA_DESCRIPTOR: &str = concat!(
-    "drysua-map2-reward/v3;map2_1v1_seat_snapshot_events_contiguous_tick_complete;",
+    "drysua-map2-reward/v6;map2_1v1_seat_snapshot_events_contiguous_tick_complete;",
     "units4096_events4096_identities8192_towers64_tick27900_amount1000000_xp1000000000;",
     "public_metadata=map2_rate30_terrain_axis1to512_pregame0to27900;",
     "identity_opaque_full_generation_public_scoreboard_heroes_retained_other_metadata480ticks;",
@@ -84,14 +105,14 @@ pub const MAP2_REWARD_SCHEMA_DESCRIPTOR: &str = concat!(
     "gold_observed_paid_died_own_minus_enemy_no_cash_networth_passive_sales_or_lh_double_payment;",
     "xp_public_positive_increments_own_minus_enemy;",
     "hero_damage_positive_reported_mitigated_own_hero_to_opposing_hero_no_creep_damage;",
-    "received_own_hero_from_hero_creep_other_unknown_separate_no_healing_reward;",
+    "received_own_hero_from_enemy_hero_lane_or_neutral_creep_exclusive_known_Tower_any_team_other_unknown_environment_separate_no_healing_reward;known_Tower_never_charges_other_Ancient_Barracks_Fountain_remain_other;",
     "mana_positive_same_body_same_capacity_previous_minus_current_no_request_cost_capacity_change_unobserved;",
-    "channels=own_gold:.03/300,enemy_gold:-.03/300,own_xp:.03/3000,enemy_xp:-.03/3000,",
-    "hero_dealt:.08/1600,hero_taken:-.025/1600,creep_taken:-.01/500,other_taken:-.005/500,mana:-.04/1200;",
+    "channels=own_gold:.03/300,enemy_gold:-.02/300,own_xp:.03/3000,enemy_xp:-.02/3000,",
+    "hero_dealt:.08/1600,hero_taken:-.05/1600,creep_taken:-.1/1600,other_taken:-.005/500,mana:-.04/1200,tower_taken:-.1/500;",
     "channel_payout=budget*scale*amount/((scale+prior_count)*(scale+prior_count+amount));",
     "nonreplenishing_separate_unsigned_counts_state_remaining_scale_over_scale_plus_count;",
-    "tower=.05*(mean_own_hp_fraction-mean_enemy_hp_fraction)_public_cached_no_absence_death;",
-    "lane=.01*(mean_own_creep_axis+mean_enemy_creep_axis-1)_fountain_axis_public_both_cohorts_else_hold;",
+    "tower=.3*(mean_own_hp_fraction-mean_enemy_hp_fraction)_public_cached_no_absence_death;",
+    "lane=.1*(mean_own_creep_axis+mean_enemy_creep_axis-1)_fountain_axis_public_both_cohorts_else_hold;",
     "potentials_exact_gamma1_deltas_not_budget_clipped_first_tick_resources_potentials_baseline_events_counted;",
     "pregame_movement=.005_times_one_minus_clamped_euclidean_distance_to9216_9216_over9216sqrt2,only_pending_tick_lt_public_pregame_ticks,first_complete_observed_body_baseline_free,missing_body_holds_last_observed_potential,reappearance_uses_observed_position,no_cutoff_or_terminal_reversal,no_postspawn_hero_position_reward;",
     "fountain_wait=own_live_full_projected_hp_mana_both_consecutive_snapshots_same_full_generation_raw_position_inside_observed_own_fountain1200_inclusive,first_eligible_elapsed0,grace30_at30_base.0001_then.00005_per_second_prorated_div30_per_tick,incremental_negative_cost,any_movement_or_condition_break_resets_without_refund;",
@@ -104,11 +125,13 @@ pub const MAP2_REWARD_SCHEMA_DESCRIPTOR: &str = concat!(
     "progress_debt=baseline_free_all_completed_ticks_including_dead_clamp0to2700_any_reason_refreshes30tick_lease_current_tick_included_no_stacking_active_repay_min3_then_consume1_lease_inactive_add1;",
     "progress_penalty=base.02_at_first2700_no_rate_same_tick_latch_until_debt0_subsequent_inactive_ticks_at2700_cost.000002_partial_repay_preserves_latch_no_refund_no_reward_clipping;",
     "progress_state=stagnation_ticks_u32_activity_ticks_left_u32_stagnation_base_charged_bool_only;progress_purchase=lease_only_never_debt_reset_independent_of_unchanged_v2_fountain_full_refund;",
-    "terminal_win1_loss-1_draw0_timecap0_distinct_lane_zero_tower_final_retained;",
+    "opening_position=one_shot_first_own_live_not_dead_lane_creep_within1500inclusive_of_center9216_9216_during_public_pregame_to_pregame_plus900_exclusive_else_fallback_at_pregame_plus900_checked_u32_not_clamped_to_earlier_native_cap;first_complete_baseline_free_already_due_or_approaching_baseline_resolves_without_deferred_charge;cost=.1_times_clamp((Euclidean_hero_distance-1500)/1500,0,1)_negative_exact_raw_fixed_1500_and3000_boundaries_missing_or_dead_body_full_cost;resolve_including_zero_never_rearm_on_body_or_purchase_or_wait_changes_finish_cancels_pending_without_cost_no_later_retreat_penalty;state=opening_position_pending_bool;raw=opening_position_checks;",
+    "terminal_win.2_loss-.2_draw0_timecap-.2_distinct_outcome_labels_lane_zero_tower_final_retained;infrastructure_errors_never_terminal_rewards;",
     "finish_preserves_pregame_hint_wait_and_stagnation_totals_no_extra_charge_repayment_or_refund;",
     "v2_dense_bound=.4_v1+.005_center+.0001_times27900over30=.498,wait_rate_le_base_refund_le_charged_current_period_no_wait_clipping;",
     "progress_bounds=max_base_charges1plus27900minus2700_over2700plus900=8_cost_bound8times.02_plus27900times.000002=.2158;",
-    "gamma1_only_full_episode_negative_absolute_bound.7138_positive_bound.255_from_positive_budgets.14_tower.1_terminal_lane.01_center.005_sum.9688_lt1_no_strategy_masks_or_teacher_inputs;"
+    "bounds=event_positive.14_event_negative.335_center_abs.005_opening_negative.1_wait_negative.093_stagnation_negative.2158;normal_full_native_start_requires_initial_tower_phi0_lane_phi0_terminal_lane_net0_positive.445_negative1.0488_sum1.4938_exceeds_win_draw_gap.2_and_win_loss_gap.4_no_terminal_dominance;",
+    "general_allowed_primed_baseline_tower_delta_abs.6_terminal_lane_abs.1_positive.845_negative1.4488_no_unconditional_terminal_dominance_no_clipping_or_budget_shrinking;"
 );
 /// Stable FNV-1a hash of the complete independent reward descriptor.
 pub const MAP2_REWARD_SCHEMA_HASH: u64 = schema_hash(MAP2_REWARD_SCHEMA_DESCRIPTOR.as_bytes());
@@ -119,16 +142,17 @@ const MAX_AMOUNT: i32 = 1_000_000;
 const MAX_XP: i32 = 1_000_000_000;
 const IDENTITY_AGE: u32 = 480;
 const MAX_TOWERS: usize = 64;
-const TOWER_SCALE: f64 = 0.05;
-const LANE_SCALE: f64 = 0.01;
+const TOWER_SCALE: f64 = 0.3;
+const LANE_SCALE: f64 = 0.1;
 const BUDGETS: [f64; MAP2_REWARD_CHANNELS] =
-    [0.03, 0.03, 0.03, 0.03, 0.08, 0.025, 0.01, 0.005, 0.04];
+    [0.03, 0.02, 0.03, 0.02, 0.08, 0.05, 0.1, 0.005, 0.04, 0.1];
 const SCALES: [f64; MAP2_REWARD_CHANNELS] = [
-    300.0, 300.0, 3000.0, 3000.0, 1600.0, 1600.0, 500.0, 500.0, 1200.0,
+    300.0, 300.0, 3000.0, 3000.0, 1600.0, 1600.0, 1600.0, 500.0, 1200.0, 500.0,
 ];
 const _: () = assert!(MAP2_REWARD_MAX_IDENTITIES >= 2 * MAP2_REWARD_MAX_UNITS);
 const _: () = assert!(
-    event_budget_total() + 2.0 * TOWER_SCALE + 2.0 * LANE_SCALE <= V1_DENSE_BOUND + 1.0e-12
+    event_budget_total()
+        <= MAP2_REWARD_EVENT_POSITIVE_BOUND + MAP2_REWARD_EVENT_NEGATIVE_BOUND + 1.0e-12
 );
 const _: () = assert!(MAX_TICK == 27_900);
 const _: () = assert!(MAP2_REWARD_FOUNTAIN_GRACE_TICKS == 30);
@@ -141,7 +165,11 @@ const _: () = assert!(MAP2_REWARD_STAGNATION_REPAY_PER_TICK > 0);
 const _: () = assert!(MAP2_REWARD_STAGNATION_MAX_BASE_CHARGES == 8);
 const _: () = assert!(MAP2_REWARD_STAGNATION_BASE_COST > 0.0);
 const _: () = assert!(MAP2_REWARD_STAGNATION_TICK_COST > 0.0);
-const _: () = assert!(MAP2_REWARD_DENSE_BOUND + MAP2_REWARD_POSITIVE_BOUND < 1.0);
+const _: () = assert!(MAP2_REWARD_NATIVE_NEGATIVE_BOUND + MAP2_REWARD_NATIVE_POSITIVE_BOUND > 0.4);
+const _: () = assert!(MAP2_REWARD_DENSE_BOUND >= MAP2_REWARD_POSITIVE_BOUND);
+const _: () = assert!(MAP2_REWARD_TOWER_CHANNEL == MAP2_REWARD_LEGACY_CHANNELS);
+const _: () = assert!(MAP2_REWARD_TOWER_CHANNEL + 1 == MAP2_REWARD_CHANNELS);
+const _: () = assert!(MAX_TICK <= u32::MAX - MAP2_REWARD_OPENING_WAVE_TICKS);
 const _: () = assert!(
     (MAX_TICK as u64) * (MAP2_REWARD_MAX_EVENTS as u64) * (MAX_AMOUNT as u64) < u64::MAX / 2
 );
@@ -158,6 +186,9 @@ pub enum Map2RewardEnd {
 /// Raw seat-visible measurements accumulated over a decision interval.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Map2RewardObservations {
+    pub tower_damage_taken: u64,
+    /// Postbaseline one-shot opening assessments, including zero-cost assessments.
+    pub opening_position_checks: u64,
     pub own_gold_earned: u64,
     pub enemy_gold_earned: u64,
     pub own_xp_gained: u64,
@@ -207,6 +238,8 @@ pub struct Map2RewardObservations {
 /// Normalized f64 components; `total` is their sum and `ticks` excludes the initial baseline.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Map2RewardBreakdown {
+    pub tower_damage_taken: f64,
+    pub opening_position: f64,
     pub ticks: u32,
     pub gold: f64,
     pub experience: f64,
@@ -232,11 +265,13 @@ pub struct Map2RewardBreakdown {
 /// ID-free observable accounting state for a policy/critic input or diagnostic log.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Map2RewardState {
+    /// One-shot first-wave assessment remains armed; false after resolution or episode end.
+    pub opening_position_pending: bool,
     /// Unspent fraction in descriptor channel order, each in `(0, 1]`.
     pub remaining: [f32; MAP2_REWARD_CHANNELS],
-    /// Current bounded public building-health potential, in `[-0.05, 0.05]`.
+    /// Current bounded public building-health potential, in `[-0.3, 0.3]`.
     pub tower_potential: f32,
-    /// Current bounded observed wave potential, in `[-0.01, 0.01]`.
+    /// Current bounded observed wave potential, in `[-0.1, 0.1]`.
     pub lane_potential: f32,
     pub lane_observed: bool,
     /// Full stationary intervals in the open own-fountain wait period.
@@ -287,6 +322,8 @@ impl std::error::Error for Map2RewardError {}
 /// Complete-tick reward accounting for one Map2 seat; no simulator state or strategic actions.
 #[derive(Clone, Debug)]
 pub struct Map2Reward {
+    opening_position_pending: bool,
+    opening_position_deadline: u32,
     roles: [Role; 2],
     pregame_ticks: u32,
     current: Option<SnapshotFacts>,
@@ -311,9 +348,17 @@ impl Map2Reward {
     /// Starts a Map2 1v1 observer; match identity, seeds and private economy are not stored.
     pub fn new(slot: SlotId, info: &MatchInfo) -> Result<Self, Map2RewardError> {
         let roles = observation::roles(slot, info)?;
+        let opening_position_deadline = info
+            .pregame_ticks
+            .checked_add(MAP2_REWARD_OPENING_WAVE_TICKS)
+            .ok_or(Map2RewardError::Invalid(
+                "opening position deadline overflow",
+            ))?;
         assert_ne!(roles[0].team, roles[1].team);
         assert_ne!(roles[0].slot, roles[1].slot);
         Ok(Self {
+            opening_position_pending: true,
+            opening_position_deadline,
             roles,
             pregame_ticks: info.pregame_ticks,
             current: None,
@@ -384,6 +429,7 @@ impl Map2Reward {
         }
         self.observe_potentials(&pending);
         self.observe_pregame_movement(&pending);
+        self.observe_opening_position(&pending);
         self.observe_fountain_wait(&pending, events);
         self.observe_progress(&pending, events, previous_interval);
         if self.current.is_some() {
@@ -414,13 +460,14 @@ impl Map2Reward {
         self.lane_potential = 0.0;
         self.lane_observed = false;
         self.interval.terminal = match end {
-            Map2RewardEnd::Win => 1.0,
-            Map2RewardEnd::Loss => -1.0,
-            Map2RewardEnd::Draw | Map2RewardEnd::TimeCap => 0.0,
+            Map2RewardEnd::Win => 0.2,
+            Map2RewardEnd::Loss | Map2RewardEnd::TimeCap => -0.2,
+            Map2RewardEnd::Draw => 0.0,
         };
         self.interval.end = Some(end);
         self.interval.retotal();
         self.ended = true;
+        self.opening_position_pending = false;
         let result = std::mem::take(&mut self.interval);
         assert!(result.total.is_finite());
         assert!(result.end.is_some());
@@ -435,6 +482,7 @@ impl Map2Reward {
         assert!(remaining.iter().all(|value| *value > 0.0));
         assert!(remaining.iter().all(|value| *value <= 1.0));
         Map2RewardState {
+            opening_position_pending: self.opening_position_pending,
             remaining,
             tower_potential: self.tower_potential as f32,
             lane_potential: self.lane_potential as f32,
@@ -516,6 +564,8 @@ impl Map2RewardBreakdown {
             + self.hero_damage_taken
             + self.creep_damage_taken
             + self.other_damage_taken
+            + self.tower_damage_taken
+            + self.opening_position
             + self.mana_spent
             + self.tower_health
             + self.lane_pressure

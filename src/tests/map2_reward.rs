@@ -5,6 +5,8 @@
 
 #[path = "map2_reward_progress.rs"]
 mod progress;
+#[path = "reward_rebalance.rs"]
+mod rebalance;
 #[path = "map2_reward_simple_wait.rs"]
 mod simple_wait;
 
@@ -14,6 +16,51 @@ use bota_proto::{
 };
 
 use crate::{Map2Reward, Map2RewardBreakdown, Map2RewardEnd};
+
+#[test]
+fn terminal02_values_change_only_terminal_component_and_keep_dense_budgets() {
+    for (end, expected) in [
+        (Map2RewardEnd::Win, 0.2),
+        (Map2RewardEnd::Loss, -0.2),
+        (Map2RewardEnd::Draw, 0.0),
+        (Map2RewardEnd::TimeCap, -0.2),
+    ] {
+        let mut reward = initialized();
+        let dense = advance(&mut reward, &snapshot(2), &[damage(4, 1, 100)]);
+        let finished = reward.finish(end).unwrap();
+        assert_eq!(finished.terminal, expected);
+        assert_eq!(finished.end, Some(end));
+        assert!((dense.tower_damage_taken + 0.1 * 100.0 / 600.0).abs() < 1.0e-12);
+        assert_eq!(finished.total, expected);
+    }
+    assert!((crate::MAP2_REWARD_NATIVE_NEGATIVE_BOUND - 1.0488).abs() < 1.0e-12);
+    assert!((crate::MAP2_REWARD_NATIVE_POSITIVE_BOUND - 0.445).abs() < 1.0e-12);
+    assert!((crate::MAP2_REWARD_DENSE_BOUND - 1.4488).abs() < 1.0e-12);
+}
+
+#[test]
+fn mastery_nonwins_keep_loss_and_task_costs_with_zero_reward_for_actual_draw() {
+    for outcome in [Map2RewardEnd::Loss, Map2RewardEnd::TimeCap] {
+        let mut reward = initialized();
+        let finished = reward.finish(outcome).expect("completed task");
+        assert_eq!(finished.terminal, -0.2);
+        assert_eq!(finished.end, Some(outcome));
+    }
+    assert_eq!(
+        initialized()
+            .finish(Map2RewardEnd::Draw)
+            .expect("draw")
+            .terminal,
+        0.0
+    );
+    assert_eq!(
+        initialized()
+            .finish(Map2RewardEnd::Win)
+            .expect("win")
+            .terminal,
+        0.2
+    );
+}
 
 #[test]
 fn empty_raze_mana_spend_is_worse_than_continue_without_a_cast_request() {
@@ -93,7 +140,7 @@ fn lethal_finish_outscores_running_despite_modest_creep_damage_taken() {
     let run = advance(&mut run, &snapshot(2), &[]);
 
     assert!(result.total > run.total);
-    assert!(result.total > 0.5);
+    assert!(result.total > 0.2);
     assert!(result.creep_damage_taken < 0.0);
 }
 
@@ -311,7 +358,7 @@ fn missing_tower_is_not_destroyed_until_a_visible_destruction_event() {
 }
 
 #[test]
-fn terminal_win_and_loss_dominate_opposing_tower_progress() {
+fn terminal02_win_can_have_negative_return_after_opposing_tower_progress() {
     let mut win = initialized();
     let mut loss = initialized();
     let mut won_view = snapshot(2);
@@ -329,8 +376,10 @@ fn terminal_win_and_loss_dominate_opposing_tower_progress() {
     let won = win.finish(Map2RewardEnd::Win).unwrap();
     let lost = loss.finish(Map2RewardEnd::Loss).unwrap();
 
-    assert!(won.total > 0.5);
-    assert!(lost.total < -0.5);
+    assert_eq!(won.terminal, 0.2);
+    assert_eq!(lost.terminal, -0.2);
+    assert!(won.total < 0.0);
+    assert!(lost.total < 0.0);
 }
 
 #[test]

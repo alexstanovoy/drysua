@@ -15,7 +15,7 @@ fn diagnostic_export_preserves_current_parameters_and_failed_gate_provenance() {
     let manifest = std::fs::read_to_string(target.join("MANIFEST.txt")).unwrap();
     assert!(manifest.contains("diagnostic_only=true\nlocal_gate_passed=false\nqualified=false\n"));
     assert!(manifest.contains("export_reason=authorized_transfer_diagnosis_of_failed_local_gate"));
-    assert!(manifest.contains("model_schema=19\nfeature_schema=17\naction_schema=5\n"));
+    assert!(manifest.contains("model_schema=22\nfeature_schema=20\naction_schema=5\n"));
     assert!(manifest.contains(&format!(
         "weights_sha256={}",
         file_hash(&target.join("drysua.weights.safetensors"))

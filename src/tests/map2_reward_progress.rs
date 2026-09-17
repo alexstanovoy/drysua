@@ -6,12 +6,12 @@ use super::{advance, damage, death, id, match_info, own_hero, snapshot};
 use crate::{Map2Reward, Map2RewardEnd};
 
 #[test]
-fn progress_schema_declares_version_three_lease_latch_and_asymmetric_bounds() {
-    assert_eq!(crate::MAP2_REWARD_SCHEMA_VERSION, 3);
-    assert!(crate::MAP2_REWARD_SCHEMA_DESCRIPTOR.starts_with("drysua-map2-reward/v3;"));
+fn progress_schema_preserves_lease_latch_under_reward_six() {
+    assert_eq!(crate::MAP2_REWARD_SCHEMA_VERSION, 6);
+    assert!(crate::MAP2_REWARD_SCHEMA_DESCRIPTOR.starts_with("drysua-map2-reward/v6;"));
     assert!(crate::MAP2_REWARD_SCHEMA_DESCRIPTOR.contains("progress_debt="));
     assert!(crate::MAP2_REWARD_SCHEMA_DESCRIPTOR.contains("progress_flags="));
-    assert!(crate::MAP2_REWARD_SCHEMA_DESCRIPTOR.contains("positive_bound.255"));
+    assert!(crate::MAP2_REWARD_SCHEMA_DESCRIPTOR.contains("positive.445"));
     assert_ne!(crate::MAP2_REWARD_SCHEMA_HASH, 699_687_995_158_557_285);
 }
 
@@ -640,10 +640,11 @@ fn a_whole_native_episode_without_activity_has_one_base_and_bounded_unclipped_ti
     );
     assert_eq!(result.observations.stagnation_base_charges, 1);
     assert_eq!(reward.state().stagnation_ticks, 2700);
-    assert!(result.total >= -crate::MAP2_REWARD_DENSE_BOUND);
+    assert_eq!(result.terminal, -0.2);
+    assert!(result.total - result.terminal >= -crate::MAP2_REWARD_DENSE_BOUND);
     assert_close(crate::MAP2_REWARD_STAGNATION_BOUND, 0.2158);
-    assert_close(crate::MAP2_REWARD_DENSE_BOUND, 0.7138);
-    assert_close(crate::MAP2_REWARD_POSITIVE_BOUND, 0.255);
+    assert_close(crate::MAP2_REWARD_DENSE_BOUND, 1.4488);
+    assert_close(crate::MAP2_REWARD_POSITIVE_BOUND, 0.845);
 }
 
 #[test]
@@ -664,7 +665,9 @@ fn fastest_full_repayments_and_rearms_stay_within_the_derived_base_count_bound()
         base_count += interval.observations.stagnation_base_charges;
         total += interval.total;
     }
-    total += reward.finish(Map2RewardEnd::Draw).unwrap().total;
+    let terminal = reward.finish(Map2RewardEnd::Draw).unwrap();
+    assert_eq!(terminal.terminal, 0.0);
+    total += terminal.total - terminal.terminal;
 
     assert!(base_count > 1);
     assert!(base_count <= u64::from(crate::MAP2_REWARD_STAGNATION_MAX_BASE_CHARGES));
@@ -673,29 +676,33 @@ fn fastest_full_repayments_and_rearms_stay_within_the_derived_base_count_bound()
 }
 
 #[test]
-fn full_episode_asymmetric_bounds_keep_stalled_adverse_wins_above_favorable_nonwins() {
+fn terminal02_full_episode_bounds_allow_favorable_nonwins_above_stalled_adverse_wins() {
     let adverse_win = full_episode(false, Map2RewardEnd::Win);
-    assert!(adverse_win >= 1.0 - crate::MAP2_REWARD_DENSE_BOUND);
+    assert!(adverse_win >= 0.2 - crate::MAP2_REWARD_NATIVE_NEGATIVE_BOUND);
     for end in [
         Map2RewardEnd::Draw,
         Map2RewardEnd::TimeCap,
         Map2RewardEnd::Loss,
     ] {
         let favorable = full_episode(true, end);
-        let terminal = if end == Map2RewardEnd::Loss {
-            -1.0
-        } else {
+        let terminal = if end == Map2RewardEnd::Draw {
             0.0
+        } else {
+            -0.2
         };
-        assert!(favorable - terminal <= crate::MAP2_REWARD_POSITIVE_BOUND);
+        assert!(favorable - terminal <= crate::MAP2_REWARD_NATIVE_POSITIVE_BOUND);
         assert!(
-            adverse_win > favorable,
+            adverse_win < favorable,
             "win={adverse_win} other={favorable}"
         );
     }
     assert_close(
-        crate::MAP2_REWARD_DENSE_BOUND + crate::MAP2_REWARD_POSITIVE_BOUND,
-        0.9688,
+        crate::MAP2_REWARD_NATIVE_NEGATIVE_BOUND + crate::MAP2_REWARD_NATIVE_POSITIVE_BOUND,
+        1.4938,
+    );
+    assert_close(
+        0.2 - crate::MAP2_REWARD_NATIVE_NEGATIVE_BOUND - crate::MAP2_REWARD_NATIVE_POSITIVE_BOUND,
+        -1.2938,
     );
 }
 
@@ -704,6 +711,8 @@ fn full_episode(favorable: bool, end: Map2RewardEnd) -> f64 {
     own_hero(&mut view).mana = 1_000_000;
     own_hero(&mut view).max_mana = 1_000_000;
     let mut reward = observer(&view);
+    assert_eq!(reward.state().tower_potential, 0.0);
+    assert_eq!(reward.state().lane_potential, 0.0);
     let victim = if favorable { 6 } else { 5 };
     view.units.retain(|unit| unit.id != id(victim));
     view.players[usize::from(!favorable)].xp = 1_000_000_000;

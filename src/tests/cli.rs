@@ -175,17 +175,9 @@ fn selected_weights_cannot_escape_the_artifact_directory() {
 
 #[test]
 fn cli_teacher_reaches_connection_validation_without_loading_weights() {
-    let error = crate::cli::run_from_for_test([
-        "drysua",
-        "play",
-        "--policy",
-        "teacher",
-        "--name",
-        "",
-        "--weights-directory",
-        "artifacts/temp/nonexistent-teacher-weights",
-    ])
-    .expect_err("empty name must fail before connecting");
+    let error =
+        crate::cli::run_from_for_test(["drysua", "play", "--policy", "teacher", "--name", ""])
+            .expect_err("empty name must fail before connecting");
 
     assert_eq!(error.to_string(), "bot name must not be empty");
 }

@@ -15,15 +15,14 @@ nondefault opponent schedules require `--complete-episodes`.
   pair then two Weak pairs. No new RNG draws, seed-dependent difficulty, performance
   threshold, live-policy fallback or simulator-private policy input is introduced.
 
-The schedule is **training run configuration**, not a model/feature/action/reward
-change: F17/M19/A5/PPO32/reward3 and runtime weights remain unchanged. Its versioned
+The schedule itself is **training run configuration**, not a model input. Its versioned
 identity is added to the canonical `CheckpointRun.command_line` for nondefault
 schedules. Strict checkpoint compatibility already compares this before reading
 tensor payloads or installing parameters/optimizer state, so changing the schedule
 cannot silently resume. Explicit/default Teacher use the same legacy command,
 without a new suffix. Git provenance compatibility remains strict independently.
 
-Phase is derived from the persisted `global_update`, not invocation-local progress.
+For `weak-warmup-v1`, phase is derived from the persisted `global_update`, not invocation-local progress.
 The generic reserved `curriculum_stage` field stays0; no duplicate phase counter is
 needed. A future schedule with different semantics must have a new versioned name,
 not reinterpret `weak-warmup-v1` checkpoints. To compare schedules experimentally,
@@ -34,6 +33,22 @@ Collection telemetry reports schedule, global update, actual Weak/Teacher counts
 and batch label. Each episode and reward record names its actual runtime opponent.
 Weak victories are not evidence of improved play against Teacher or predecessors;
 assess candidates on the same unchanged opponents and paired evaluation seeds.
+
+## Rolling training mastery
+
+`--opponent-schedule mastery-v1` is a separate opt-in mode: Weak then Teacher,
+one current opponent for each entire batch. It advances only after a full rolling
+window of completed TRAINING matches meets the current opponent's win percentage.
+Defaults are80% of the last50 games; both window and thresholds are configurable.
+It is not a separate greedy evaluation gate and does not reinterpret `weak-warmup-v1`.
+See [rolling-mastery.md](rolling-mastery.md) for flags, exact batch/ordering rules,
+persisted stage/window/counters, completion and budget behavior.
+
+The reward6 terminal change makes actual Draw terminal reward0; Loss and
+completed-task TimeCap become-0.2, Win+0.2. Mastery still treats all three as nonwins. Current
+contracts are A5/F20/M22/PPO35/rules30/reward6/checkpoint10. Old M19/M20/M21 weights
+and checkpoints cannot be loaded by relabeling; the explicit pinned parameter
+initializer and migration limitations are documented in [reward-rebalance.md](reward-rebalance.md).
 
 ## Initial short pilot
 

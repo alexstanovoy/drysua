@@ -33,19 +33,19 @@ WEIGHTS_SHA = "6348fe57a128ebd521dba68da0949ceb7378d3e0d6b7d6a7ce9a5fb6446547ab"
 BINARY_SHA = "64ba25ebb10e6beabc26ff667a3e3bddeb40dbf391110d4f0e31db6478500a2b"
 CURRENT_METADATA = {
     "action_schema_hash": "10658390830565586343",
-    "feature_schema_hash": "4298252436472980484",
-    "model_schema_hash": "7182549121935768714",
-    "ppo_schema_version": "32",
-    "ppo_schema_hash": "9056229782321552319",
-    "ppo_rules_audit_version": "27",
-    "map2_reward_schema_version": "3",
-    "map2_reward_schema_hash": "11643768462079275437",
+    "feature_schema_hash": "9233114641639769206",
+    "model_schema_hash": "4891874295003631291",
+    "ppo_schema_version": "35",
+    "ppo_schema_hash": "13569352384922890857",
+    "ppo_rules_audit_version": "30",
+    "map2_reward_schema_version": "6",
+    "map2_reward_schema_hash": "1084583101075978392",
 }
 
 
 def rust_descriptor(module, name):
     source = (ROOT / f"drysua/src/{module}.rs").read_text()
-    match = re.search(rf"pub(?:\(crate\))? const {name}: &str = concat!\((.*?)\n\);", source, re.S)
+    match = re.search(rf"pub(?:\((?:crate|super)\))? const {name}: &str = concat!\((.*?)\n\);", source, re.S)
     assert match is not None, name
     strings = re.findall(r'"(?:[^"\\]|\\.)*"', match[1])
     assert strings, name
@@ -330,7 +330,7 @@ class LauncherTests(unittest.TestCase):
         (self.root / "drysua/scripts").mkdir()
         shutil.copy(ROOT / "play.sh", self.root / "play.sh")
         shutil.copy(ROOT / "drysua/scripts/play_match.py", self.root / "drysua/scripts")
-        for name in ("play_admission.py", "play_weights.py", "release_wire.py"):
+        for name in ("play_admission.py", "play_weights.py", "play_reward.py", "play_pacing.py", "release_wire.py"):
             source = ROOT / "drysua/scripts" / name
             if source.exists():
                 shutil.copy(source, self.root / "drysua/scripts")
@@ -448,6 +448,26 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(self.process.returncode, 1, output.decode())
         self.assertIn(b"DISPLAY", error)
         self.assertFalse(list((self.root / "drysua/artifacts/temp").glob("play-*")))
+
+    def test_explicit_teacher_without_weights_preserves_admission_and_cleanup(self):
+        for side, slot in (("radiant", 0), ("dire", 1)):
+            with self.subTest(side=side):
+                self.launch("--no-build", "--port", "0", "--opponent", "teacher",
+                            "--human-side", side, weights=False)
+                self.send("bota-server", b"R")
+                self.assertIn("port", self.record("bota-server"))
+                for name in ("bota-client", "drysua"):
+                    self.assertEqual(self.record(name), {"connected": True})
+                for _ in range(2):
+                    self.assertIn("hello", self.record("bota-server"))
+                self.assertEqual(self.record("bota-client"), {"slot": slot})
+                self.assertEqual(self.record("drysua"), {"slot": 1 - slot})
+                arguments = self.child("drysua")["arguments"]
+                self.assertEqual(arguments[-2:], ["--policy", "teacher"])
+                self.assertNotIn("--weights-directory", arguments)
+                self.send("bota-client", b"0")
+                self.finish(0)
+                self.assert_children_stopped()
 
     def test_help_is_available_without_display(self):
         self.launch("--help", DISPLAY="")
@@ -768,8 +788,8 @@ class LauncherTests(unittest.TestCase):
         self.launch(weights=False, DISPLAY="")
         error = self.preflight_failure("legacy F12/M14 human-review weights are incompatible")
         self.assertIn("--weights-directory", error)
-        self.assertIn("F17/M19", error)
-        self.assertIn("no Map2 model has been trained or promoted", error)
+        self.assertIn("F20/M22", error)
+        self.assertIn("no compatible M22 model is selected by default", error)
 
     def test_missing_weights_checked_before_missing_executables_and_display(self):
         (self.weights / "drysua.weights.safetensors").unlink()
@@ -813,10 +833,54 @@ class LauncherTests(unittest.TestCase):
 
 
 class RuntimeWeightsTests(unittest.TestCase):
-    def test_progress_reward_v3_rejects_frozen_m18_metadata_without_source_rewrite(self):
-        self.assertEqual(self.module.CURRENT_METADATA["ppo_schema_version"], "32")
-        self.assertEqual(self.module.CURRENT_METADATA["ppo_rules_audit_version"], "27")
-        self.assertEqual(self.module.CURRENT_METADATA["map2_reward_schema_version"], "3")
+    def test_reward_v6_rejects_frozen_m21_reward5_without_source_change(self):
+        descriptor = rust_descriptor("checkpoint_reward_v5", "DESCRIPTOR")
+        self.assertEqual(self.module.fnv1a(descriptor.encode()), 10775256611790261869)
+        old = dict(CURRENT_METADATA, feature_schema_hash="11343334068766071417", model_schema_hash="13521186719558157260",
+                   ppo_schema_version="34", ppo_schema_hash="12153447298094992077", ppo_rules_audit_version="29",
+                   map2_reward_schema_version="5", map2_reward_schema_hash="10775256611790261869", map2_reward_schema_descriptor=descriptor)
+        original = header_fixture(old)
+        self.path.write_bytes(original)
+        with self.assertRaisesRegex(RuntimeError, "expected exact nine-key F20/M22"):
+            self.module.read_runtime_metadata(self.directory)
+        self.assertEqual(self.path.read_bytes(), original)
+
+    def test_reward_v6_rejects_frozen_m20_reward4_without_source_change(self):
+        descriptor = rust_descriptor("checkpoint_legacy_reward", "MAP2_REWARD_V3_DESCRIPTOR")
+        descriptor = descriptor.replace("drysua-map2-reward/v3;", "drysua-map2-reward/v4;", 1)
+        descriptor = descriptor.replace("terminal_win1_loss-1_draw0_timecap0_distinct_lane_zero_tower_final_retained;",
+            "terminal_win1_loss-1_draw-1_timecap-1_distinct_outcome_labels_lane_zero_tower_final_retained;infrastructure_errors_never_terminal_rewards;", 1)
+        descriptor += "terminal_dominance=win1_minus_nonwin_neg1_minus_negative_dense.7138_minus_positive_dense.255=1.0312_gt0;"
+        self.assertEqual(self.module.fnv1a(descriptor.encode()), 14419233923370975736)
+        old = dict(CURRENT_METADATA, feature_schema_hash="5307034649837880808", model_schema_hash="17593713929660069669",
+            ppo_schema_version="33", ppo_schema_hash="3388911021249010403", ppo_rules_audit_version="28",
+            map2_reward_schema_version="4", map2_reward_schema_hash="14419233923370975736", map2_reward_schema_descriptor=descriptor)
+        original = header_fixture(old)
+        self.path.write_bytes(original)
+        with self.assertRaisesRegex(RuntimeError, "expected exact nine-key F20/M22"):
+            self.module.read_runtime_metadata(self.directory)
+        self.assertEqual(self.path.read_bytes(), original)
+
+    def test_reward_v6_rejects_exact_m19_reward3_without_relabel_or_source_change(self):
+        old = {
+            "action_schema_hash": "10658390830565586343",
+            "feature_schema_hash": "4298252436472980484",
+            "model_schema_hash": "7182549121935768714",
+            "ppo_schema_version": "32", "ppo_schema_hash": "9056229782321552319",
+            "ppo_rules_audit_version": "27", "map2_reward_schema_version": "3",
+            "map2_reward_schema_hash": "11643768462079275437",
+            "map2_reward_schema_descriptor": rust_descriptor("checkpoint_legacy_reward", "MAP2_REWARD_V3_DESCRIPTOR"),
+        }
+        source = header_fixture(old)
+        self.path.write_bytes(source)
+        with self.assertRaisesRegex(RuntimeError, "expected exact nine-key F20/M22, A5, PPO35/rules30"):
+            self.module.read_runtime_metadata(self.directory)
+        self.assertEqual(self.path.read_bytes(), source)
+
+    def test_reward_v6_rejects_frozen_m18_metadata_without_source_rewrite(self):
+        self.assertEqual(self.module.CURRENT_METADATA["ppo_schema_version"], "35")
+        self.assertEqual(self.module.CURRENT_METADATA["ppo_rules_audit_version"], "30")
+        self.assertEqual(self.module.CURRENT_METADATA["map2_reward_schema_version"], "6")
         old = {
             "action_schema_hash": "10658390830565586343",
             "feature_schema_hash": "17888785275670453418",
@@ -829,15 +893,15 @@ class RuntimeWeightsTests(unittest.TestCase):
         }
         source = header_fixture(old)
         self.path.write_bytes(source)
-        with self.assertRaisesRegex(RuntimeError, "expected exact nine-key F17/M19, A5, PPO32/rules27"):
+        with self.assertRaisesRegex(RuntimeError, "expected exact nine-key F20/M22, A5, PPO35/rules30"):
             self.module.read_runtime_metadata(self.directory)
         self.assertEqual(self.path.read_bytes(), source)
 
-    def test_current_reward_requires_f17_m19_and_never_accepts_m17_runtime(self):
-        self.assertEqual(self.module.CURRENT_METADATA["ppo_schema_version"], "32")
-        self.assertEqual(self.module.CURRENT_METADATA["ppo_rules_audit_version"], "27")
-        self.assertEqual(self.module.CURRENT_METADATA["map2_reward_schema_version"], "3")
-        self.assertEqual(self.module.CURRENT_METADATA["map2_reward_schema_hash"], "11643768462079275437")
+    def test_current_reward_requires_f19_m21_and_never_accepts_m17_runtime(self):
+        self.assertEqual(self.module.CURRENT_METADATA["ppo_schema_version"], "35")
+        self.assertEqual(self.module.CURRENT_METADATA["ppo_rules_audit_version"], "30")
+        self.assertEqual(self.module.CURRENT_METADATA["map2_reward_schema_version"], "6")
+        self.assertEqual(self.module.CURRENT_METADATA["map2_reward_schema_hash"], "1084583101075978392")
         old = dict(zip(("action_schema_hash", "feature_schema_hash", "model_schema_hash",
                         "ppo_schema_version", "ppo_schema_hash", "ppo_rules_audit_version",
                         "map2_reward_schema_version", "map2_reward_schema_hash"),
@@ -847,7 +911,7 @@ class RuntimeWeightsTests(unittest.TestCase):
             "checkpoint_legacy_reward", "MAP2_REWARD_V1_DESCRIPTOR")
         source = header_fixture(old)
         self.path.write_bytes(source)
-        with self.assertRaisesRegex(RuntimeError, "expected exact nine-key F17/M19, A5, PPO32/rules27"):
+        with self.assertRaisesRegex(RuntimeError, "expected exact nine-key F20/M22, A5, PPO35/rules30"):
             self.module.read_runtime_metadata(self.directory)
         self.assertEqual(self.path.read_bytes(), source)
 
@@ -879,7 +943,7 @@ class RuntimeWeightsTests(unittest.TestCase):
         original = header_fixture(metadata)
         self.path.write_bytes(original)
 
-        with self.assertRaisesRegex(RuntimeError, "expected exact nine-key F17/M19, A5, PPO32/rules27"):
+        with self.assertRaisesRegex(RuntimeError, "expected exact nine-key F20/M22, A5, PPO35/rules30"):
             self.module.read_runtime_metadata(self.directory)
 
         self.assertEqual(self.path.read_bytes(), original)
@@ -894,7 +958,7 @@ class RuntimeWeightsTests(unittest.TestCase):
                     changed[key] = replacement
                 self.path.write_bytes(header_fixture(changed))
                 with self.subTest(key=key, replacement=replacement), \
-                        self.assertRaisesRegex(RuntimeError, "incompatible runtime weights metadata.*F17/M19"):
+                        self.assertRaisesRegex(RuntimeError, "incompatible runtime weights metadata.*F20/M22"):
                     self.module.read_runtime_metadata(self.directory)
 
     def test_extra_metadata_and_self_consistent_wrong_reward_hash_are_rejected(self):
@@ -967,10 +1031,10 @@ class RuntimeWeightsTests(unittest.TestCase):
                 value = ((value ^ byte) * 0x100000001b3) & (2**64 - 1)
             return value
 
-        contracts = (("map2_reward", 3, ()), ("action", 5, ()),
-                     ("feature", 17, ("action", "map2_reward")),
-                     ("model", 19, ("action", "feature", "map2_reward")),
-                     ("ppo", 32, ("action", "feature", "model", "map2_reward")))
+        contracts = (("map2_reward", 6, ()), ("action", 5, ()),
+                     ("feature", 20, ("action", "map2_reward")),
+                     ("model", 22, ("action", "feature", "map2_reward")),
+                     ("ppo", 35, ("action", "feature", "model", "map2_reward")))
         for name, version, links in contracts:
             source = (ROOT / f"drysua/src/{name}.rs").read_text()
             self.assertRegex(source, rf"pub const {name.upper()}_SCHEMA_VERSION: u32 = {version};")
@@ -982,7 +1046,7 @@ class RuntimeWeightsTests(unittest.TestCase):
             identities[name] = version, digest
         self.assertEqual(self.module.fnv1a(reward), identities["map2_reward"][1])
         source = (ROOT / "drysua/src/ppo.rs").read_text()
-        self.assertIn("pub const PPO_RULES_AUDIT_VERSION: u32 = 27;", source)
+        self.assertIn("pub const PPO_RULES_AUDIT_VERSION: u32 = 30;", source)
         source = (ROOT / "drysua/src/checkpoint.rs").read_text()
         metadata = source.split("fn runtime_tensor_metadata()", 1)[1].split("\n}", 1)[0]
         self.assertEqual(set(re.findall(r'"([a-z0-9_]+)"', metadata)), set(metadata_fixture()))
@@ -1333,7 +1397,7 @@ class TerminalLifecycleTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="play-terminal-", dir=TEMPORARY) as temporary:
             supervisor = self.launcher.Supervisor(Path(temporary))
             self.addCleanup(supervisor.close)
-            supervisor.admission = SimpleNamespace(relays=[relay], welcomed=True, pump=relay.pump, close=relay.close)
+            supervisor.admission = SimpleNamespace(pacer=None, relays=[relay], welcomed=True, pump=relay.pump, close=relay.close)
             server = SimpleNamespace(name="server", exit_status=lambda: 0)
             bot = SimpleNamespace(name="bot", exit_status=lambda: 0)
             client = SimpleNamespace(name="client", exit_status=lambda: None)
@@ -1367,7 +1431,7 @@ class TerminalLifecycleTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="play-poll-", dir=TEMPORARY) as temporary:
             supervisor = self.launcher.Supervisor(Path(temporary))
             self.addCleanup(supervisor.close)
-            supervisor.admission = SimpleNamespace(pump=relay.pump, close=relay.close)
+            supervisor.admission = SimpleNamespace(pacer=None, pump=relay.pump, close=relay.close)
             with patch.object(supervisor.selector, "select", side_effect=lambda timeout: waits.append(timeout) or []):
                 for _ in range(2):
                     supervisor.pump(0.01)
@@ -1385,7 +1449,7 @@ class TerminalLifecycleTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="play-poll-", dir=TEMPORARY) as temporary:
             supervisor = self.launcher.Supervisor(Path(temporary))
             self.addCleanup(supervisor.close)
-            supervisor.admission = SimpleNamespace(pump=Mock(return_value=False), close=Mock())
+            supervisor.admission = SimpleNamespace(pacer=None, pump=Mock(return_value=False), close=Mock())
             with patch.object(supervisor.selector, "select", return_value=[]) as selector:
                 supervisor.pump(0.01)
             selector.assert_called_once_with(0.01)

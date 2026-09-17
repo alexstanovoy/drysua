@@ -88,9 +88,10 @@ fn actor_report_merge_retains_all_terminal_telemetry() {
 }
 
 #[cfg(feature = "builtin")]
-#[test]
-fn actor_report_merge_preserves_map2_reward_components_and_raw_observations() {
-    let source = crate::Map2TrainingReward {
+fn map2_reward_merge_fixture() -> crate::Map2TrainingReward {
+    crate::Map2TrainingReward {
+        tower_damage_taken: -0.0625,
+        opening_position: -0.0625,
         ticks: 3,
         gold: 0.5,
         experience: 0.25,
@@ -107,8 +108,10 @@ fn actor_report_merge_preserves_map2_reward_components_and_raw_observations() {
         stagnation_base: 0.0,
         stagnation_ticks_cost: 0.0,
         terminal: 1.0,
-        total: 1.5,
+        total: 1.375,
         observations: crate::Map2RewardObservations {
+            tower_damage_taken: 15,
+            opening_position_checks: 1,
             hero_damage_dealt: 50,
             mana_spent: 75,
             lane_observed_ticks: 3,
@@ -117,9 +120,14 @@ fn actor_report_merge_preserves_map2_reward_components_and_raw_observations() {
             fountain_wait_refunds: 1,
             ..crate::Map2RewardObservations::default()
         },
-    };
+    }
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn actor_report_merge_preserves_map2_reward_components_and_raw_observations() {
     let actor = crate::PpoSmokeReport {
-        map2_reward: source,
+        map2_reward: map2_reward_merge_fixture(),
         elapsed_ticks: 3,
         ..crate::PpoSmokeReport::default()
     };
@@ -141,7 +149,14 @@ fn actor_report_merge_preserves_map2_reward_components_and_raw_observations() {
     assert_eq!(aggregate.map2_reward.fountain_wait, -0.5);
     assert_eq!(aggregate.map2_reward.fountain_wait_refund, 0.25);
     assert_eq!(aggregate.map2_reward.terminal, 2.0);
-    assert_eq!(aggregate.map2_reward.total, 3.0);
+    assert_eq!(aggregate.map2_reward.total, 2.75);
+    assert_eq!(aggregate.map2_reward.tower_damage_taken, -0.125);
+    assert_eq!(aggregate.map2_reward.opening_position, -0.125);
+    assert_eq!(aggregate.map2_reward.observations.tower_damage_taken, 30);
+    assert_eq!(
+        aggregate.map2_reward.observations.opening_position_checks,
+        2
+    );
     assert_eq!(aggregate.map2_reward.observations.hero_damage_dealt, 100);
     assert_eq!(aggregate.map2_reward.observations.mana_spent, 150);
     assert_eq!(aggregate.map2_reward.observations.lane_observed_ticks, 6);
@@ -263,8 +278,8 @@ fn rollout_compacts_sparse_tokens_and_bit_packs_behavioral_masks_losslessly() {
 
 #[test]
 fn ppo_schema_and_rules_audit_are_stable() {
-    assert_eq!(PPO_SCHEMA_VERSION, 32);
-    assert_eq!(PPO_RULES_AUDIT_VERSION, 27);
+    assert_eq!(PPO_SCHEMA_VERSION, 35);
+    assert_eq!(PPO_RULES_AUDIT_VERSION, 30);
     assert_eq!(
         PPO_SCHEMA_HASH,
         super::map2_checkpoint::schema_hash(
@@ -1294,6 +1309,7 @@ fn assert_production_resume_matches_uninterrupted(overrides: Option<crate::Train
     let uninterrupted_directory = training_test_directory("production-uninterrupted");
     let resumed_directory = training_test_directory("production-resumed");
     let mut settings = crate::TrainingJobConfig {
+        mastery_config: None,
         opponent_schedule: crate::TrainingOpponentSchedule::Teacher,
         episode_time_cost: 0.0,
         terminal_only: false,
@@ -1403,6 +1419,7 @@ fn assert_production_artifact_training_state_equal(
 fn training_job_checkpoints_and_resumes_from_the_next_update() {
     let directory = training_test_directory("resume");
     let mut settings = crate::TrainingJobConfig {
+        mastery_config: None,
         opponent_schedule: crate::TrainingOpponentSchedule::Teacher,
         episode_time_cost: 0.0,
         terminal_only: false,
@@ -1525,6 +1542,7 @@ fn fresh_training_loads_the_requested_runtime_weights_before_the_first_update() 
         .expect("initial snapshot")
         .fingerprint();
     let settings = crate::TrainingJobConfig {
+        mastery_config: None,
         opponent_schedule: crate::TrainingOpponentSchedule::Teacher,
         episode_time_cost: 0.0,
         terminal_only: false,
@@ -1568,6 +1586,7 @@ fn production_training_rejects_an_unpaired_environment_count() {
     let directory = training_test_directory("odd-environments");
     let error = crate::run_training_job_on(
         crate::TrainingJobConfig {
+            mastery_config: None,
             opponent_schedule: crate::TrainingOpponentSchedule::Teacher,
             episode_time_cost: 0.0,
             terminal_only: false,
@@ -1607,6 +1626,7 @@ fn production_training_rejects_an_unpaired_environment_count() {
 fn resumed_training_rejects_an_initial_weights_directory() {
     let directory = training_test_directory("resume-with-initial");
     let settings = crate::TrainingJobConfig {
+        mastery_config: None,
         opponent_schedule: crate::TrainingOpponentSchedule::Teacher,
         episode_time_cost: 0.0,
         terminal_only: false,
@@ -1658,6 +1678,7 @@ fn training_job_rejects_a_checkpoint_directory_locked_by_another_writer() {
     lock.lock().expect("hold training lock");
     let error = crate::run_training_job_on(
         crate::TrainingJobConfig {
+            mastery_config: None,
             opponent_schedule: crate::TrainingOpponentSchedule::Teacher,
             episode_time_cost: 0.0,
             terminal_only: false,
@@ -2284,6 +2305,7 @@ fn training_job_rejects_targets_that_cannot_fit_shuffle_rng_counters() {
     let directory = training_test_directory("counter-bound");
     let error = crate::run_training_job_on(
         crate::TrainingJobConfig {
+            mastery_config: None,
             opponent_schedule: crate::TrainingOpponentSchedule::Teacher,
             episode_time_cost: 0.0,
             terminal_only: false,

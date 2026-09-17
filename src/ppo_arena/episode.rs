@@ -10,6 +10,10 @@ use super::*;
 mod curriculum_tests;
 
 #[cfg(test)]
+#[path = "../tests/mastery_training.rs"]
+mod mastery_tests;
+
+#[cfg(test)]
 #[path = "../tests/map2_collection.rs"]
 mod map2_tests;
 
@@ -33,6 +37,13 @@ const _: () =
 const _: () = assert!(MAX_EPISODE_ENVIRONMENTS * RETAINED_PER_EPISODE <= crate::PPO_MAX_SAMPLES);
 
 pub(crate) fn validate(settings: &TrainingJobConfig) -> Result<(), PpoError> {
+    if (settings.opponent_schedule == crate::TrainingOpponentSchedule::MasteryV1)
+        != settings.mastery_config.is_some()
+    {
+        return Err(PpoError::InvalidConfig(
+            "mastery-v1 requires mastery config; other schedules forbid it",
+        ));
+    }
     if settings.map != MapId(2) {
         return Err(PpoError::InvalidConfig("production training requires Map2"));
     }
@@ -111,8 +122,31 @@ pub(super) fn environments(
     settings: &TrainingJobConfig,
     update: u64,
 ) -> Result<Vec<TrainingEnvironment>, PpoError> {
+    environments_with_mastery(settings, update, None)
+}
+
+pub(super) fn environments_with_mastery(
+    settings: &TrainingJobConfig,
+    update: u64,
+    mastery: Option<&crate::MasteryProgress>,
+) -> Result<Vec<TrainingEnvironment>, PpoError> {
     validate(settings)?;
     assert!(settings.complete_episodes);
+    let mastery_teacher = match (settings.mastery_config, mastery) {
+        (None, None) => None,
+        (Some(config), Some(progress)) => {
+            progress.validate(config).map_err(PpoError::InvalidConfig)?;
+            if progress.completed() {
+                return Err(PpoError::InvalidConfig("mastery already completed"));
+            }
+            Some(progress.stage() == crate::MasteryStage::Teacher)
+        }
+        _ => {
+            return Err(PpoError::InvalidConfig(
+                "mastery configuration/state mismatch",
+            ));
+        }
+    };
     let first_pair = update
         .checked_mul((settings.ppo.environments / 2) as u64)
         .ok_or(PpoError::CounterOverflow)?;
@@ -127,7 +161,11 @@ pub(super) fn environments(
                 settings.map,
                 stream % 2,
                 0,
-                scheduled_opponent(settings, update, stream),
+                match mastery_teacher {
+                    Some(true) => OpponentSpec::Teacher,
+                    Some(false) => OpponentSpec::Weak,
+                    None => scheduled_opponent(settings, update, stream),
+                },
             )
         })
         .collect()
@@ -876,6 +914,16 @@ fn record_episode(
     };
     *counter = counter.checked_add(1).ok_or(PpoError::CounterOverflow)?;
     report.map2_reward.merge(state.map2_reward)?;
+    report.completed_episodes.record(
+        tick,
+        stream,
+        match outcome {
+            Some(PpoTerminalOutcome::Win) => crate::TrainingGameOutcome::Win,
+            Some(PpoTerminalOutcome::Loss) => crate::TrainingGameOutcome::Loss,
+            Some(PpoTerminalOutcome::Draw) => crate::TrainingGameOutcome::Draw,
+            None => crate::TrainingGameOutcome::TimeCap,
+        },
+    )?;
     let opponent = opponent_name(opponent);
     eprintln!(
         "episode: stream={stream} map=2 opponent={opponent} tick={tick} outcome={label} actor_decisions={} retained={} terminal_sample={} raw_return={:.9} discounted_return={:.9} terminal_reward={} shaping_return={:.9} actions={:?} noncontinue={} retention_phase={}",
@@ -957,8 +1005,8 @@ pub(crate) fn assert_reset_loses_terminal_credit_for_test() {
     ])
     .expect("windows");
     let model = PolicyModel::fresh(9911000).expect("model");
-    let mut initial =
-        build_training_environments(&settings, 0, settings.ppo, &model).expect("first windows");
+    let mut initial = build_training_environments(&settings, 0, settings.ppo, &model, None)
+        .expect("first windows");
     let start_tick = initial[0].seats[0].tracker.current().expect("start").tick;
     advance_interval(&mut initial[0], vec![None, None], 3).expect("progress");
     let progressed_tick = initial[0].seats[0]
@@ -967,7 +1015,7 @@ pub(crate) fn assert_reset_loses_terminal_credit_for_test() {
         .expect("progressed")
         .tick;
     let rebuilt =
-        build_training_environments(&settings, 8, settings.ppo, &model).expect("new windows");
+        build_training_environments(&settings, 8, settings.ppo, &model, None).expect("new windows");
     assert_eq!(
         rebuilt[0].seats[0].tracker.current().expect("rebuilt").tick,
         start_tick
@@ -1063,13 +1111,14 @@ pub(crate) fn assert_checkpoint_scope_for_test(mut settings: TrainingJobConfig, 
         ResumeProvenance::Strict,
     )
     .expect("restore");
-    assert_eq!(restored.0.config(), config);
-    assert_eq!(restored.1, session.sampling);
+    assert_eq!(restored.trainer.config(), config);
+    assert_eq!(restored.sampling, session.sampling);
     for stream in 0..settings.ppo.environments {
         assert_eq!(
             retention_phase(settings.seed, session.completed_updates, stream)
                 .expect("original phase"),
-            retention_phase(settings.seed, restored.2, stream).expect("resumed phase")
+            retention_phase(settings.seed, restored.completed_updates, stream)
+                .expect("resumed phase")
         );
     }
     settings.complete_episodes = false;

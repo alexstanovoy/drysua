@@ -29,7 +29,7 @@ mod feature_facts;
 
 #[test]
 fn feature_schema_dimensions_and_hash_are_stable() {
-    assert_eq!(FEATURE_SCHEMA_VERSION, 17);
+    assert_eq!(FEATURE_SCHEMA_VERSION, 20);
     assert!(
         FEATURE_SCHEMA_DESCRIPTOR.contains("action_schema_version=5;action_schema_hash=linked;")
     );
@@ -46,7 +46,7 @@ fn feature_schema_dimensions_and_hash_are_stable() {
             ],
         )
     );
-    assert_eq!(GLOBAL_FEATURES, 90);
+    assert_eq!(GLOBAL_FEATURES, 92);
     assert_eq!((HISTORY_SAMPLES, HISTORY_FEATURES), (7, 24));
     assert_eq!((MAX_POLICY_HISTORY, POLICY_HISTORY_FEATURES), (16, 4));
     assert_eq!((UNIT_FEATURE_TOKENS, UNIT_FEATURES), (96, 84));

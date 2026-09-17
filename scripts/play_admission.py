@@ -8,6 +8,7 @@ import struct
 import time
 
 from release_wire import varint
+from play_pacing import PacedClock
 
 
 HANDSHAKE_TIMEOUT = 30
@@ -26,16 +27,19 @@ assert HANDSHAKE_TIMEOUT < SESSION_TIMEOUT
 class Admission:
     """Two loopback relays; slot one cannot reach the server before Welcome zero."""
 
-    def __init__(self, port, human_side, mode=0):
+    def __init__(self, port, human_side, mode=0, *, paced=False, clock=time.monotonic):
         assert 1 <= port <= 65535
         assert human_side in ("radiant", "dire")
         assert mode in (0, 1)
+        if paced and mode != 1:
+            raise ValueError("pacing requires native Lockstep mode")
+        self.pacer = PacedClock(clock) if paced else None
         self.relays = []
         self.deadline = time.monotonic() + SESSION_TIMEOUT
         roles = ("human", "bot") if human_side == "radiant" else ("bot", "human")
         try:
             for slot, role in enumerate(roles):
-                self.relays.append(SeatRelay(port, slot, role, mode))
+                self.relays.append(SeatRelay(port, slot, role, mode, pacer=self.pacer))
         except BaseException:
             self.close()
             raise
@@ -50,6 +54,8 @@ class Admission:
         if time.monotonic() >= self.deadline:
             raise RuntimeError(f"relay session exceeded {SESSION_TIMEOUT} seconds")
         progressed = False
+        if self.pacer is not None:
+            self.pacer.check_deadline()
         for relay in self.relays:
             relay.check_deadlines()
             # A queued TCP connection/Hello on listener one is not a server admission.
@@ -145,12 +151,14 @@ class Endpoint:
 
 
 class SeatRelay:
-    def __init__(self, port, slot, role, mode):
+    def __init__(self, port, slot, role, mode, *, pacer=None):
         assert slot in (0, 1)
         assert role in ("human", "bot")
         self.port, self.slot, self.role, self.mode = port, slot, role, mode
+        self.pacer = pacer
         self.hello = self.welcomed = False
         self.match_over = False
+        self.observer = None
         self.upstream_error = None
         self.upstream_deadline = 0
         self.endpoints = []
@@ -186,13 +194,15 @@ class SeatRelay:
                 return True
             return False
         readers, writers = [], []
+        # A held ACK must be retried on its clock deadline even without a new socket read.
+        paced_progress = self.forward_frames(0) if self.pacer is not None else False
         for index, endpoint in enumerate(self.endpoints):
             target = self.endpoints[1 - index]
             if not endpoint.connecting and not endpoint.eof and self.read_budget(index):
                 readers.append(endpoint.connection)
             if endpoint.connecting or (endpoint.outgoing and not endpoint.write_closed):
                 writers.append(endpoint.connection)
-            elif target.eof and not endpoint.write_closed:
+            elif target.eof and not target.incoming and not endpoint.write_closed:
                 try:
                     endpoint.connection.shutdown(socket.SHUT_WR)
                 except OSError as error:
@@ -210,7 +220,7 @@ class SeatRelay:
         client, server = self.endpoints
         if server.eof and not self.match_over and not client.eof:
             raise ValueError("server disconnected before verified MatchOver")
-        return bool(readable or writable)
+        return bool(readable or writable or paced_progress)
 
     def write_endpoint(self, index):
         endpoint = self.endpoints[index]
@@ -246,9 +256,11 @@ class SeatRelay:
                 raise ValueError("client reset before final-frame drain") from error
             data = b""
         if not data:
-            if source.incoming:
+            if source.incoming and not (index == 0 and self.pacer is not None):
                 raise ValueError("truncated relay frame at EOF")
             source.eof = True
+            if index == 0 and self.pacer is not None:
+                self.forward_frames(0)
             return
         source.received += len(data)
         limit = SERVER_BYTE_LIMIT if index else CLIENT_BYTE_LIMIT
@@ -263,8 +275,10 @@ class SeatRelay:
     def forward_frames(self, index):
         source, target = self.endpoints[index], self.endpoints[1 - index]
         buffer, offset = source.incoming, 0
+        incomplete = False
         for _ in range(READ_CHUNK // 5 + 2):
             if len(buffer) - offset < 4:
+                incomplete = len(buffer) != offset
                 break
             length = struct.unpack_from("<I", buffer, offset)[0]
             first = not (self.welcomed if index else self.hello)
@@ -273,21 +287,34 @@ class SeatRelay:
                 raise ValueError(f"invalid relay frame length {length}; limit {limit}")
             end = offset + 4 + length
             if len(buffer) < end:
+                incomplete = True
+                break
+            payload = bytes(buffer[offset + 4:end])
+            if (index == 0 and self.pacer is not None and not (self.match_over or self.upstream_error)
+                    and not self.pacer.allow_ack(self.slot, payload)):
                 break
             source.frames += 1
             if source.frames > FRAME_COUNT_LIMIT:
                 raise ValueError("relay frame count limit exceeded")
-            self.observe(bytes(buffer[offset + 4:end]), index)
+            self.observe(payload, index)
+            if index == 1 and self.pacer is not None:
+                self.pacer.observe_server(self.slot, payload)
+            if index == 1 and self.observer is not None:
+                self.observer(bytes(buffer[offset:end]))
             if index == 1 or not (self.match_over or self.upstream_error):
                 if not target.outgoing:
                     target.write_progress = time.monotonic()
                 target.outgoing.extend(buffer[offset:end])
             offset = end
         else:
-            raise ValueError("relay frame batch limit exceeded")
+            if self.pacer is None:
+                raise ValueError("relay frame batch limit exceeded")
         if offset:
             del buffer[:offset]
             source.read_started = time.monotonic()
+        if source.eof and incomplete:
+            raise ValueError("truncated relay frame at EOF")
+        return bool(offset)
 
     def observe(self, payload, index):
         if index == 0 and not self.hello:

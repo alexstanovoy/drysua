@@ -18,7 +18,8 @@ const RECOVERY_SOURCE: [u8; 32] = [
     0x10, 0x7e, 0x19, 0xe6, 0x17, 0x94, 0xc4, 0x57, 0xce, 0x8e, 0xc6, 0xad, 0xc2, 0xb3, 0xe6, 0x6c,
     0xcc, 0xe0, 0x8e, 0xe5, 0xb6, 0x54, 0x4c, 0xb2, 0x00, 0x59, 0x64, 0xf3, 0xe7, 0xdf, 0xed, 0xc8,
 ];
-const _: () = assert!(M17_PARAMETERS + 5 * 512 == crate::MODEL_PARAMETER_COUNT);
+const _: () =
+    assert!(M17_PARAMETERS + (crate::GLOBAL_FEATURES - 85) * 512 == crate::MODEL_PARAMETER_COUNT);
 
 /// Pinned M17 ancestry of a fresh wait/progress-reward policy, never a resume or release identity.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -70,7 +71,7 @@ impl Map2WaitInitializationProvenance {
             .collect();
         assert_eq!(digest.len(), 64);
         let description = format!(
-            "INITIALIZATION_ONLY source_m17_sha256={digest} source_f=15 source_a=5 source_m=17 source_ppo=30 source_rules=25 source_reward_version=1 source_reward_hash=798798703797057220 target_f={} target_a={} target_m={} target_ppo={} target_rules={} reward_version={} reward_hash={} parameter_bits_preserved=true named_tensors=62 new_weights=2560_positive_zero trunk_insertion_rows=85..90 optimizer_progress_rng_league=fresh GAMEPLAY_EQUIVALENCE=false qualification=false",
+            "INITIALIZATION_ONLY source_m17_sha256={digest} source_f=15 source_a=5 source_m=17 source_ppo=30 source_rules=25 source_reward_version=1 source_reward_hash=798798703797057220 target_f={} target_a={} target_m={} target_ppo={} target_rules={} reward_version={} reward_hash={} parameter_bits_preserved=true named_tensors=62 new_weights={}_positive_zero trunk_insertion_rows=85..{} optimizer_progress_rng_league=fresh GAMEPLAY_EQUIVALENCE=false qualification=false",
             crate::FEATURE_SCHEMA_VERSION,
             crate::ACTION_SCHEMA_VERSION,
             crate::MODEL_SCHEMA_VERSION,
@@ -78,6 +79,8 @@ impl Map2WaitInitializationProvenance {
             crate::PPO_RULES_AUDIT_VERSION,
             crate::MAP2_REWARD_SCHEMA_VERSION,
             crate::MAP2_REWARD_SCHEMA_HASH,
+            (crate::GLOBAL_FEATURES - 85) * 512,
+            crate::GLOBAL_FEATURES,
         );
         assert!(description.len() < 4096);
         description

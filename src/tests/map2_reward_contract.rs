@@ -490,7 +490,7 @@ fn draw_and_time_cap_are_explicit_distinct_non_wins_and_end_the_accumulator() {
     let error = cap.observe_snapshot(&snapshot(2)).unwrap_err();
 
     assert_eq!(drawn.terminal, 0.0);
-    assert_eq!(capped.terminal, 0.0);
+    assert_eq!(capped.terminal, -0.2);
     assert_ne!(drawn.end, capped.end);
     assert_eq!(error.to_string(), "Map2 reward: episode already ended");
 }
@@ -531,7 +531,8 @@ fn repeated_damage_and_distinct_paid_creep_deaths_never_exceed_dense_episode_bou
 
     let terminal = reward.finish(Map2RewardEnd::Draw).unwrap();
 
-    assert!(total + terminal.total < 0.4);
+    assert_eq!(terminal.terminal, 0.0);
+    assert!(total + terminal.total - terminal.terminal < 0.4);
     assert!(
         reward
             .state()

@@ -9,6 +9,8 @@ use crate::{Map2RewardBreakdown, Map2RewardObservations, PpoError};
 /// Tick counters include unretained actor intervals, but exclude setup/warmup baselines.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Map2TrainingReward {
+    pub tower_damage_taken: f64,
+    pub opening_position: f64,
     pub ticks: u64,
     pub gold: f64,
     pub experience: f64,
@@ -45,6 +47,8 @@ impl Map2TrainingReward {
 
     pub(super) fn record(&mut self, interval: Map2RewardBreakdown) -> Result<(), PpoError> {
         self.merge(Self {
+            tower_damage_taken: interval.tower_damage_taken,
+            opening_position: interval.opening_position,
             ticks: u64::from(interval.ticks),
             gold: interval.gold,
             experience: interval.experience,
@@ -73,6 +77,8 @@ impl Map2TrainingReward {
             return Err(PpoError::NonFinite("Map2 reward telemetry"));
         }
         let merged = Self {
+            tower_damage_taken: self.tower_damage_taken + other.tower_damage_taken,
+            opening_position: self.opening_position + other.opening_position,
             ticks: self
                 .ticks
                 .checked_add(other.ticks)
@@ -104,8 +110,10 @@ impl Map2TrainingReward {
         Ok(())
     }
 
-    pub(super) fn components(&self) -> [f64; 16] {
+    pub(super) fn components(&self) -> [f64; 18] {
         [
+            self.tower_damage_taken,
+            self.opening_position,
             self.gold,
             self.experience,
             self.hero_damage,
@@ -132,6 +140,8 @@ fn merge_observations(
 ) -> Result<Map2RewardObservations, PpoError> {
     let add = |left: u64, right: u64| left.checked_add(right).ok_or(PpoError::CounterOverflow);
     Ok(Map2RewardObservations {
+        tower_damage_taken: add(left.tower_damage_taken, right.tower_damage_taken)?,
+        opening_position_checks: add(left.opening_position_checks, right.opening_position_checks)?,
         own_gold_earned: add(left.own_gold_earned, right.own_gold_earned)?,
         enemy_gold_earned: add(left.enemy_gold_earned, right.enemy_gold_earned)?,
         own_xp_gained: add(left.own_xp_gained, right.own_xp_gained)?,
@@ -178,6 +188,14 @@ fn merge_observations(
 
 impl std::fmt::Display for Map2TrainingReward {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "reward_tower_taken={:.9} reward_opening_position={:.9} tower_damage_taken={} opening_position_checks={} ",
+            self.tower_damage_taken,
+            self.opening_position,
+            self.observations.tower_damage_taken,
+            self.observations.opening_position_checks
+        )?;
         write!(
             formatter,
             "reward_ticks={} reward_total={:.9} reward_gold={:.9} reward_xp={:.9} reward_hero_damage={:.9} reward_hero_taken={:.9} reward_creep_taken={:.9} reward_other_taken={:.9} reward_mana={:.9} reward_towers={:.9} reward_lane={:.9} reward_pregame_movement={:.9} reward_fountain_wait={:.9} reward_fountain_wait_refund={:.9} reward_stagnation_base={:.9} reward_stagnation_ticks_cost={:.9} reward_terminal={:.9}",

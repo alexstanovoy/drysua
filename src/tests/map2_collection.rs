@@ -3,6 +3,113 @@ use crate::Map2RewardEnd;
 use bota_proto::{DamageKind, EntityId, Vec2};
 
 #[test]
+fn rebalance_new_reward_counters_reject_overflow_without_mutating_aggregate() {
+    for tower in [false, true] {
+        let mut observations = crate::Map2RewardObservations::default();
+        if tower {
+            observations.tower_damage_taken = u64::MAX;
+        } else {
+            observations.opening_position_checks = u64::MAX;
+        }
+        let mut aggregate = Map2TrainingReward {
+            observations,
+            ..Map2TrainingReward::default()
+        };
+        let before = aggregate;
+        let mut next = crate::Map2RewardBreakdown::default();
+        if tower {
+            next.observations.tower_damage_taken = 1;
+        } else {
+            next.observations.opening_position_checks = 1;
+        }
+        assert_eq!(aggregate.record(next), Err(PpoError::CounterOverflow));
+        assert_eq!(aggregate, before);
+    }
+}
+
+#[test]
+fn rebalance_native_wave_clock_and_zero_initial_potentials_support_only_conditional_bounds() {
+    assert_eq!(
+        crate::MAP2_REWARD_OPENING_WAVE_TICKS,
+        bota_server::game::rules::WAVE_PERIOD_TICKS
+    );
+    let settings =
+        crate::cli::training_settings_for_test(&["--environments", "2"]).expect("settings");
+    let arenas = environments(&settings, 0).expect("native initial arenas");
+    for arena in arenas {
+        let tracker = &arena.seats[arena.policy_seat].tracker;
+        let pregame = tracker.metadata().pregame_ticks;
+        assert_eq!(pregame, bota_server::game::rules::FIRST_WAVE_TICK);
+        assert_eq!(bota_server::game::wave_at(pregame), Some(1));
+        assert_eq!(
+            bota_server::game::wave_at(pregame + crate::MAP2_REWARD_OPENING_WAVE_TICKS),
+            Some(2)
+        );
+        let reward = tracker.map2_reward_state().expect("initial state");
+        assert_eq!(reward.tower_potential, 0.0);
+        assert_eq!(reward.lane_potential, 0.0);
+    }
+}
+
+#[test]
+fn mastery_native_cap_draw_batch_keeps_draw_labels_zero_terminal_and_nonwinning_window() {
+    let model = stop_model();
+    let settings = crate::cli::training_settings_for_test(&[
+        "--opponent-schedule",
+        "mastery-v1",
+        "--mastery-window",
+        "3",
+        "--environments",
+        "6",
+        "--rollout",
+        "1163",
+        "--minibatch",
+        "512",
+    ])
+    .expect("settings");
+    let mut arenas: Vec<_> = (0..6)
+        .map(|stream| fixture_environment(TICK_CAP - 24, stream % 2, OpponentSpec::Weak))
+        .collect();
+    let mut rollout = PpoRollout::new(
+        6 * RETAINED_PER_EPISODE,
+        model.policy_identity().expect("identity"),
+    )
+    .expect("rollout");
+    let mut report = PpoSmokeReport::default();
+    collect(
+        &model,
+        &mut PpoRng::new(9140300),
+        &mut arenas,
+        &settings,
+        0,
+        &mut rollout,
+        &mut report,
+    )
+    .expect("native cap batch");
+    assert_eq!(report.terminal_draws, 6);
+    assert_eq!(report.terminal_losses, 0);
+    assert_eq!(report.episode_timeouts, 0);
+    assert_eq!(report.map2_reward.terminal, 0.0);
+    let mut mastery = crate::MasteryProgress::default();
+    mastery
+        .record_batch(
+            settings.mastery_config.expect("config"),
+            &report.completed_episodes.ordered_outcomes(),
+        )
+        .expect("record");
+    assert_eq!(mastery.stage(), crate::MasteryStage::Weak);
+    assert_eq!(mastery.games(), 6);
+    assert_eq!(mastery.wins(), 0);
+    let batch = rollout
+        .finish(settings.ppo)
+        .expect("usable all-draw PPO batch");
+    assert_eq!(batch.len(), 6);
+    for index in 0..batch.len() {
+        assert!(batch.sample(index).expect("sample").return_value() < 0.0);
+    }
+}
+
+#[test]
 fn curriculum_weak_and_mixed_complete_batches_preserve_terminal_reward_and_retention() {
     let model = stop_model();
     let settings = crate::cli::training_settings_for_test(&[
@@ -62,6 +169,7 @@ fn curriculum_weak_and_mixed_complete_batches_preserve_terminal_reward_and_reten
             assert!(sample.transition.terminal);
             assert_eq!(sample.transition.next_value, 0.0);
             assert!(sample.return_value().is_finite());
+            assert!(sample.return_value() < 0.0);
         }
     }
 }
@@ -277,6 +385,8 @@ fn map2_final_damage_is_rewarded_before_draw_finish_in_window_collection() {
     assert_eq!(pending.len(), 1);
     assert_eq!(pending[0].ticks, 1);
     assert_eq!(pending[0].terminal_outcome, Some(PpoTerminalOutcome::Draw));
+    assert_eq!(pending[0].map2_reward.expect("Map2 reward").terminal, 0.0);
+    assert!(pending[0].map2_reward.expect("Map2 reward").hero_damage > 0.0);
     assert!(pending[0].reward > 0.0);
     assert!(pending[0].terminal);
     assert!(pending.remove(0).next_frame.is_none());
@@ -357,7 +467,7 @@ fn map2_wait_refund_crosses_retention_drains_and_preserves_ppo_component_sum() {
     {
         assert!((actual - expected).abs() < 1e-12);
     }
-    assert!((aggregate.components()[..15].iter().sum::<f64>() - aggregate.total).abs() < 1e-12);
+    assert!((aggregate.components()[..17].iter().sum::<f64>() - aggregate.total).abs() < 1e-12);
 }
 
 #[test]
@@ -417,7 +527,7 @@ fn map2_progress_debt_survives_ppo_drains_and_purchase_refund_with_reason_or_mer
     {
         assert!((actual - expected).abs() < 1e-12);
     }
-    assert!((aggregate.components()[..15].iter().sum::<f64>() - aggregate.total).abs() < 1e-12);
+    assert!((aggregate.components()[..17].iter().sum::<f64>() - aggregate.total).abs() < 1e-12);
     assert_eq!(whole.map2_reward_state(), split.map2_reward_state());
 }
 
@@ -601,7 +711,7 @@ fn map2_learner_time_cap_finishes_reward_and_zero_bootstraps_without_inventing_m
     validate_episode_batch(&rollout, &report).expect("task deadline is valid optimizer data");
     assert_eq!(report.episode_timeouts, 1);
     assert_eq!(report.terminal_draws, 0);
-    assert_eq!(state.map2_reward.terminal, 0.0);
+    assert_eq!(state.map2_reward.terminal, -0.2);
     assert_eq!(rollout.len(), 1);
     let config = PpoConfig {
         environments: 1,
@@ -709,10 +819,12 @@ fn map2_training_reward_aggregation_rejects_overflow_and_nonfinite_values_atomic
 #[test]
 fn map2_training_reward_new_components_are_aggregated_and_checked_for_nonfinites() {
     let interval = crate::Map2RewardBreakdown {
+        tower_damage_taken: -0.01,
+        opening_position: -0.05,
         pregame_movement: 0.003,
         fountain_wait: -0.0001,
         fountain_wait_refund: 0.00005,
-        total: 0.00295,
+        total: -0.05705,
         ..crate::Map2RewardBreakdown::default()
     };
     let mut report = super::super::Map2TrainingReward::default();
@@ -722,13 +834,15 @@ fn map2_training_reward_new_components_are_aggregated_and_checked_for_nonfinites
     assert!(
         (components[..components.len() - 1].iter().sum::<f64>() - report.total).abs() < 1.0e-12
     );
-    for index in 0..3 {
+    for index in 0..5 {
         for invalid in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
             let mut bad = crate::Map2RewardBreakdown::default();
             match index {
                 0 => bad.pregame_movement = invalid,
                 1 => bad.fountain_wait = invalid,
-                _ => bad.fountain_wait_refund = invalid,
+                2 => bad.fountain_wait_refund = invalid,
+                3 => bad.tower_damage_taken = invalid,
+                _ => bad.opening_position = invalid,
             }
             let before = report;
             assert_eq!(

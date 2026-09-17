@@ -409,16 +409,7 @@ fn teacher_tcp_cli_plays_map_one_without_weights() {
     let opponent = thread::spawn(move || play_idle_on(&mut idle, idle_seat, Some(1_010)));
 
     crate::cli::run_from_for_test([
-        "drysua",
-        "play",
-        "--policy",
-        "teacher",
-        "--addr",
-        &address,
-        "--limit",
-        "1000",
-        "--weights-directory",
-        "artifacts/temp/nonexistent-teacher-weights",
+        "drysua", "play", "--policy", "teacher", "--addr", &address, "--limit", "1000",
     ])
     .expect("weights-free CLI plays real Map1 TCP match");
 

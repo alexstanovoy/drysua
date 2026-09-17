@@ -20,7 +20,7 @@ fn wait_source_metadata_keeps_original_reward1_descriptor_independent_of_current
     assert_eq!(metadata["map2_reward_schema_version"], "1");
     assert!(descriptor.starts_with("drysua-map2-reward/v1;"));
     assert_ne!(descriptor, crate::MAP2_REWARD_SCHEMA_DESCRIPTOR);
-    assert_eq!(crate::MAP2_REWARD_SCHEMA_HASH, 11_643_768_462_079_275_437);
+    assert_eq!(crate::MAP2_REWARD_SCHEMA_HASH, 1_084_583_101_075_978_392);
 }
 
 #[test]
@@ -183,9 +183,9 @@ fn wait_pinned_provenance_accepts_only_exact_initial_and_recovery004_digests() {
             text,
             "INITIALIZATION_ONLY",
             "source_reward_version=1",
-            "reward_version=3",
-            "target_f=17 target_a=5 target_m=19 target_ppo=32 target_rules=27",
-            "new_weights=2560_positive_zero",
+            "reward_version=6",
+            "target_f=20 target_a=5 target_m=22 target_ppo=35 target_rules=30",
+            "new_weights=3584_positive_zero",
             "optimizer_progress_rng_league=fresh",
             "GAMEPLAY_EQUIVALENCE=false",
             "qualification=false",
@@ -226,15 +226,15 @@ fn assert_source_error(directory: &Directory, bytes: Vec<u8>, expected: Checkpoi
 
 #[test]
 fn wait_schemas_change_actor_and_training_identity_without_changing_actions_or_units() {
-    assert_eq!(crate::FEATURE_SCHEMA_VERSION, 17);
-    assert_eq!(crate::MODEL_SCHEMA_VERSION, 19);
-    assert_eq!(crate::PPO_SCHEMA_VERSION, 32);
-    assert_eq!(crate::PPO_RULES_AUDIT_VERSION, 27);
-    assert_eq!(crate::LEAGUE_SCHEMA_VERSION, 32);
-    assert_eq!(crate::CHECKPOINT_SCHEMA_VERSION, 7);
-    assert_eq!(crate::IMITATION_RULES_AUDIT_VERSION, 17);
+    assert_eq!(crate::FEATURE_SCHEMA_VERSION, 20);
+    assert_eq!(crate::MODEL_SCHEMA_VERSION, 22);
+    assert_eq!(crate::PPO_SCHEMA_VERSION, 35);
+    assert_eq!(crate::PPO_RULES_AUDIT_VERSION, 30);
+    assert_eq!(crate::LEAGUE_SCHEMA_VERSION, 35);
+    assert_eq!(crate::CHECKPOINT_SCHEMA_VERSION, 10);
+    assert_eq!(crate::IMITATION_RULES_AUDIT_VERSION, 20);
     assert_eq!(crate::ACTION_SCHEMA_HASH, 10_658_390_830_565_586_343);
-    assert_eq!(crate::MODEL_PARAMETER_COUNT, 1_698_996);
+    assert_eq!(crate::MODEL_PARAMETER_COUNT, 1_700_020);
 }
 
 #[test]
@@ -284,23 +284,23 @@ fn wait_initialization_preserves_every_m17_bit_and_inserts_positive_zero_at_glob
 
 pub(super) fn assert_wait_padding(model: &PolicyModel, source: &[f32], target: &[f32]) {
     assert_eq!(source.len(), M17_PARAMETERS);
-    assert_eq!(target.len(), M17_PARAMETERS + 2560);
+    assert_eq!(target.len(), M17_PARAMETERS + 3584);
     let mut old_offset = 0;
     let mut new_offset = 0;
     for (name, shape) in model.parameter_schema().expect("named layout") {
         let count = shape.iter().product::<usize>();
-        let inserted = usize::from(name == "trunk.0.weight") * 2560;
+        let inserted = usize::from(name == "trunk.0.weight") * 3584;
         let old = &source[old_offset..old_offset + count - inserted];
         let new = &target[new_offset..new_offset + count];
         if inserted > 0 {
-            assert_eq!(shape, [2594, 512]);
+            assert_eq!(shape, [2596, 512]);
             assert_bits(&new[..85 * 512], &old[..85 * 512]);
             assert!(
-                new[85 * 512..90 * 512]
+                new[85 * 512..92 * 512]
                     .iter()
                     .all(|value| value.to_bits() == 0)
             );
-            assert_bits(&new[90 * 512..], &old[85 * 512..]);
+            assert_bits(&new[92 * 512..], &old[85 * 512..]);
         } else {
             assert_bits(new, old);
         }

@@ -29,11 +29,12 @@ fn whole_episode_dense_return_is_bounded_for_both_signs_and_all_channels() {
     assert!(cost.hero_damage_taken < 0.0);
     assert!(cost.creep_damage_taken < 0.0);
     assert!(cost.other_damage_taken < 0.0);
+    assert!(cost.tower_damage_taken < 0.0);
     assert!(cost.mana_spent < 0.0);
 }
 
 #[test]
-fn adverse_win_outranks_favorable_draw_time_cap_and_loss_across_interval_drains() {
+fn terminal02_adverse_win_can_rank_below_favorable_nonwins_without_dense_rescaling() {
     let (win, _) = extreme_profile(true, Map2RewardEnd::Win);
 
     for end in [
@@ -42,9 +43,9 @@ fn adverse_win_outranks_favorable_draw_time_cap_and_loss_across_interval_drains(
         Map2RewardEnd::Loss,
     ] {
         let (other, _) = extreme_profile(false, end);
-        assert!(win > other, "win={win}, {end:?}={other}");
+        assert!(win < other, "win={win}, {end:?}={other}");
     }
-    assert!(win >= 1.0 - MAP2_REWARD_DENSE_BOUND);
+    assert!(win >= 0.2 - crate::MAP2_REWARD_NATIVE_NEGATIVE_BOUND);
 }
 
 #[test]
@@ -81,9 +82,10 @@ fn terminal_keeps_final_tower_health_progress_instead_of_canceling_it() {
 
     let terminal = reward.finish(Map2RewardEnd::Draw).unwrap();
 
-    assert!((interval.tower_health - 0.025).abs() < 1.0e-12);
+    assert!((interval.tower_health - 0.15).abs() < 1.0e-12);
     assert_eq!(terminal.tower_health, 0.0);
-    assert!((interval.total + terminal.total - 0.025).abs() < 1.0e-12);
+    assert_eq!(terminal.terminal, 0.0);
+    assert!((interval.total + terminal.total - terminal.terminal - 0.15).abs() < 1.0e-12);
 }
 
 #[test]
@@ -268,6 +270,8 @@ fn extreme_profile(adverse: bool, end: Map2RewardEnd) -> (f64, Map2RewardBreakdo
     view.units
         .push(unit(10, UnitKind::CreepMelee, Team::Dire, 550));
     advance(&mut reward, &view, &[]);
+    assert_eq!(reward.state().tower_potential, 0.0);
+    assert_eq!(reward.state().lane_potential, 0.0);
     view.tick = 2;
     let victim = if adverse { 5 } else { 6 };
     view.units.retain(|unit| unit.id != id(victim));
@@ -289,6 +293,7 @@ fn extreme_profile(adverse: bool, end: Map2RewardEnd) -> (f64, Map2RewardBreakdo
             damage(2, 1, 1_000_000),
             damage(6, 1, 1_000_000),
             damage(4, 1, 1_000_000),
+            damage(8, 1, 1_000_000),
             death(5, 2, 1_000_000),
         ]
     } else {

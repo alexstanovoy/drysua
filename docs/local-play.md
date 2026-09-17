@@ -1,8 +1,26 @@
-# Local play: current Map2 Neural integration
+# Local play: current Map2 Teacher or Neural integration
 
-The current reward3/F17/M19 progress-debt rules and verification are recorded in
-[`progress-debt-reward-20260913/integration/REPORT.md`](../artifacts/temp/progress-debt-reward-20260913/integration/REPORT.md).
-No model has been trained or promoted under that new reward yet.
+## Human vs Teacher with exact current reward
+
+```sh
+/home/alexstanovoy/Workspace/bots/play.sh --opponent teacher --reward-report \
+  --human-side radiant --seed 9000001 --port 0 --no-build
+```
+
+Explicit Teacher needs no weights; Teacher plus `--weights-directory` is rejected.
+Reward-report mode uses native **Lockstep paced at at most 30 Hz**, not coalescing
+Realtime. The two passive observers reuse production Map2Reward and save per-seat
+JSON plus bounded interval deltas under the announced play-run directory. A slower
+renderer slows simulation. See [human-reward-play.md](human-reward-play.md) for
+components, completeness flags, public raw paid-gold nets and verified native examples.
+The GUI is for the human to launch from a desktop; agent verification was headless.
+
+## Default Neural mode still fails closed without explicit weights
+
+The current reward6/F20/M22 terminal change and explicit migration are documented in
+[reward-rebalance.md](reward-rebalance.md). Win has terminal reward+0.2, Draw0,
+Loss and completed-task TimeCap-0.2. Dense terms are unchanged. Historical
+M19/M20/M21 models are not current-compatible without explicit initialization.
 
 Integration checks against bota `037c6a2` are recorded in
 [`artifacts/temp/bota-rebase-integration-20260910/RESULTS.md`](../artifacts/temp/bota-rebase-integration-20260910/RESULTS.md).
@@ -13,23 +31,24 @@ From an authorized Linux X11/Xwayland desktop terminal:
 ```sh
 # Requires an externally supplied compatible model; none is selected by default.
 /home/alexstanovoy/Workspace/bots/play.sh \
-  --weights-directory "/absolute/path/to/compatible M19 runtime weights"
+  --weights-directory "/absolute/path/to/compatible M22 runtime weights"
 # Human Dire, pure Neural bot Radiant. Either side option derives the other.
 /home/alexstanovoy/Workspace/bots/play.sh \
-  --weights-directory "/absolute/path/to/compatible M19 runtime weights" \
+  --weights-directory "/absolute/path/to/compatible M22 runtime weights" \
   --human-side dire --port 0 --seed 9000001 --no-build
 ```
 
 **No-argument play is not ready and fails closed.** No trained Map2 model has been
 supplied or promoted for this launcher. The old F12/M14 human-review checkpoint
 is incompatible with the current server/runtime. Supply `--weights-directory`
-containing compatible **A5/F17/M19/PPO32/rules27/reward3** `drysua.weights.safetensors`; do not relabel or
+containing compatible **A5/F20/M22/PPO35/rules30/reward6** `drysua.weights.safetensors`; do not relabel or
 copy old metadata to make a file pass. The launcher never creates, migrates,
 initializes, trains, promotes, or substitutes weights.
 
 With explicit weights, the default sides remain human Radiant / pure Neural bot
 Dire. Both side options can be explicit; equal sides are rejected before startup.
-The bot always receives **`--policy neural`**, never Hybrid or a Teacher fallback.
+With the default `--opponent neural`, the bot receives **`--policy neural`**, never
+Hybrid or a Teacher fallback. Non-report play retains native Realtime.
 The core binary's repository-selected default remains **Teacher**, unchanged in
 `src/default_deployment.rs`; that is a separate CLI default, not launcher behavior.
 
@@ -55,20 +74,20 @@ Exactly nine metadata keys are required; numeric values are decimal strings:
 | Key | Required value |
 | --- | --- |
 | `action_schema_hash` | `10658390830565586343` (A5) |
-| `feature_schema_hash` | `4298252436472980484` (F17) |
-| `model_schema_hash` | `7182549121935768714` (M19) |
-| `ppo_schema_version` | `32` |
-| `ppo_schema_hash` | `9056229782321552319` |
-| `ppo_rules_audit_version` | `27` |
-| `map2_reward_schema_version` | `3` |
-| `map2_reward_schema_hash` | `11643768462079275437` |
+| `feature_schema_hash` | `9233114641639769206` (F20) |
+| `model_schema_hash` | `4891874295003631291` (M22) |
+| `ppo_schema_version` | `35` |
+| `ppo_schema_hash` | `13569352384922890857` |
+| `ppo_rules_audit_version` | `30` |
+| `map2_reward_schema_version` | `6` |
+| `map2_reward_schema_hash` | `1084583101075978392` |
 | `map2_reward_schema_descriptor` | Full current descriptor matching that FNV-1a hash |
 
-M19 retains A5 navigation and all action legality unchanged. Reward3 adds a
-second, independent progress-debt penalty; the v2 pre-wave movement hint and
-simple fountain waiting/refund rules are unchanged. F17 appends debt/2700,
-remaining activity lease/30 and its base-charge latch: global90, unit84,
-62 named tensors, 1,698,996 F32 parameters.
+M22 retains A5 navigation/action legality, wait/refund and progress-debt rules.
+Reward6 retains reward5 event/potential coefficients and one first-wave positioning
+cost, not a perpetual location penalty. F20 preserves all92 global positions including
+Tower remaining90/opening pending91: global92, unit84,62 named tensors,
+1,700,020 F32 parameters. See the exact coefficient/bound table in reward-rebalance.md.
 
 Inactive ticks, including death, add one debt tick up to2700. Useful activity
 refreshes a30-tick lease including the current tick; active ticks repay3 debt.
@@ -79,21 +98,23 @@ Any own purchase still fully refunds the open v2 fountain wait, but grants only
 a partial generic activity lease, not a generic debt reset. No strategy mask,
 Teacher override or extra anti-abuse condition is added.
 
-M17/M18 runtime and old checkpoint resumes are incompatible; metadata is not
+M17/M18/M19/M20/M21 runtime and old checkpoint resumes are incompatible; metadata is not
 silently relabelled. No M18 weights were generated or added to the source
 whitelist. No-argument play still fails with the missing-model prompt, and
 never substitutes root M17 weights or a Teacher.
 
-Explicit M17-to-current-M19 **initialization only** is available through
+Explicit M17-to-current-M22 **initialization only** is available through
 `TrainingArtifact::initialize_selected_m17_for_map2_wait(directory, seed, device)`.
+The additional exact M19/u162 parameter-only initializer is documented in
+[reward-rebalance.md](reward-rebalance.md); it does not resume or relabel the old model.
 Only these full-file SHA256 sources and their exact original nine-key reward1
 metadata are accepted:
 
 - Initial: `05e78663dd45ac23ad6c0242a69d8b8e45c163f7861c59154e3f3fd81de9ab1f`
 - Recovery004: `107e19e61794c457ce8ec6adc2b3e66ccce08ee5b6544cb2005964f3e7dfedc8`
 
-Five positive-zero rows are inserted at row85 of `trunk.0.weight` (2589x512 to
-2594x512); every source parameter bit is retained. This creates fresh model and
+Seven positive-zero rows are inserted at row85 of `trunk.0.weight` (2589x512 to
+2596x512); every source parameter bit is retained. This creates fresh model and
 optimizer/progress ancestry, not runtime/resume compatibility, equivalent
 gameplay, or a qualified release. The launcher never calls this API.
 

@@ -20,12 +20,14 @@ from typing import BinaryIO
 
 from play_admission import Admission
 from play_weights import read_runtime_metadata
+from play_reward import start_observers, pump_observers, finish_observers, print_interval
+from play_pacing import ACK_TIMEOUT_TICKS
 
 
 ARTIFACT_LIMIT = 256 * 1024 * 1024
 BUILD_TIMEOUT = 1200
 LOG_LIMIT = 16 * 1024 * 1024
-MAX_CHILDREN = 5
+MAX_CHILDREN = 7
 READ_CHUNK = 65536
 READINESS_LIMIT = 4096
 READINESS_TIMEOUT = 10
@@ -46,7 +48,7 @@ def main(arguments=None):
     supervisor, previous, mask = None, {}, None
     status = 1
     try:
-        _, arguments.weights_directory = current_paths(root, arguments.weights_directory)
+        _, arguments.weights_directory = opponent_paths(root, arguments)
         preflight(root, arguments.no_build)
         if arguments.no_build:
             release_executables(root)
@@ -66,6 +68,12 @@ def main(arguments=None):
         supervisor.run(root, arguments)
         status = 0
     except Exception as error:
+        if supervisor is not None and not isinstance(error, InterruptedError):
+            for pipe, _, _ in supervisor.reward_pipes:
+                try:
+                    pipe.fail(f"launcher interrupted observation: {error}")
+                except OSError as report_error:
+                    print(f"play: cannot save invalid observation marker: {report_error}", file=sys.stderr)
         if supervisor is None or not supervisor.stop_status:
             print(f"play: {error}", file=sys.stderr)
     finally:
@@ -87,7 +95,12 @@ def main(arguments=None):
 
 def parse_arguments(arguments):
     parser = argparse.ArgumentParser(
-        prog="play.sh", description="Current Map2 pure Neural play; compatible explicit weights required (no default model).")
+        prog="play.sh", description="Map2 human play: explicit Teacher without weights, or pure Neural with compatible explicit weights.")
+    parser.add_argument("--opponent", choices=("neural", "teacher"), default="neural")
+    parser.add_argument("--reward-report", action="store_true",
+                        help="Score both original streams using paced native Lockstep at 30 Hz; slow clients slow simulation")
+    parser.add_argument("--reward-interval", type=lambda value: reward_interval(value), default=300,
+                        help="Reward timeline interval in ticks, 30..27900 (default: 300)")
     parser.add_argument("--port", type=lambda value: integer(value, 65535), default=4455,
                         help="Server port, or 0 for an assigned port (default: 4455)")
     parser.add_argument("--seed", type=lambda value: integer(value, 2**64 - 1), default=9000001,
@@ -97,10 +110,12 @@ def parse_arguments(arguments):
     parser.add_argument("--human-side", choices=("radiant", "dire"),
                         help="Human side (default: radiant, or opposite --bot-side)")
     parser.add_argument("--bot-side", choices=("radiant", "dire"),
-                        help="Neural bot side (default: dire, or opposite --human-side)")
+                        help="Opponent side (default: dire, or opposite --human-side)")
     parser.add_argument("--weights-directory", type=Path,
-                        help="Directory with compatible current F17/M19 runtime weights; no trained Map2 default yet")
+                        help="Compatible current F20/M22 runtime weights; required for Neural, forbidden for Teacher")
     result = parser.parse_args(arguments)
+    if result.opponent == "teacher" and result.weights_directory is not None:
+        parser.error("--opponent teacher forbids --weights-directory")
     opposite = {"radiant": "dire", "dire": "radiant"}
     if result.human_side is None:
         result.human_side = opposite[result.bot_side] if result.bot_side else "radiant"
@@ -111,11 +126,42 @@ def parse_arguments(arguments):
     return result
 
 
+def reward_interval(value):
+    result = integer(value, 27900)
+    if result < 30:
+        raise argparse.ArgumentTypeError("reward interval must be in 30..27900 ticks")
+    return result
+
+
+def opponent_paths(root, arguments):
+    if arguments.opponent == "teacher":
+        if arguments.weights_directory is not None:
+            raise RuntimeError("--opponent teacher forbids --weights-directory")
+        return root / "drysua/target/release/drysua", None
+    return current_paths(root, arguments.weights_directory)
+
+
+def bot_command(binary, address, arguments, weights):
+    command = [str(binary), "--addr", address, "--name", "drysua", "--policy", arguments.opponent]
+    if arguments.opponent == "neural":
+        assert weights is not None
+        command.extend(["--weights-directory", str(weights)])
+    else:
+        assert arguments.opponent == "teacher" and weights is None
+    return command
+
+
+def transport_arguments(arguments):
+    if arguments.reward_report:
+        return ["--mode", "lockstep", "--ack-timeout-ticks", str(ACK_TIMEOUT_TICKS)]
+    return ["--mode", "realtime"]
+
+
 def current_paths(root, weights_directory):
     if weights_directory is None:
         raise RuntimeError("legacy F12/M14 human-review weights are incompatible with current Map2; "
-                           "provide --weights-directory with compatible F17/M19 runtime weights; "
-                           "no Map2 model has been trained or promoted; no Teacher fallback")
+                           "provide --weights-directory with compatible F20/M22 runtime weights; "
+                           "no compatible M22 model is selected by default; no Teacher fallback")
     weights = weights_directory.resolve()
     read_runtime_metadata(weights)
     return root / "drysua/target/release/drysua", weights
@@ -245,6 +291,8 @@ class Supervisor:
         self.stop_status = 0
         self.requested_port = 0
         self.admission = None
+        self.reward_pipes = []
+        self.reward_overview = False
 
     def request_stop(self, number, _frame):
         # A handler must not interrupt Popen before the new child has been registered.
@@ -255,13 +303,14 @@ class Supervisor:
         if self.stop_status:
             raise InterruptedError("shutdown requested")
 
-    def spawn(self, name, command, directory, environment=None):
+    def spawn(self, name, command, directory, environment=None, input_stream=None):
         self.check_stop()
         assert len(self.children) < MAX_CHILDREN
         assert not any(child.name == name for child in self.children)
         log = (self.directory / f"{name}.log").open("xb", buffering=0)
         try:
-            process = subprocess.Popen(command, cwd=directory, env=environment, stdin=subprocess.DEVNULL,
+            process = subprocess.Popen(command, cwd=directory, env=environment,
+                                       stdin=input_stream if input_stream is not None else subprocess.DEVNULL,
                                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
         except BaseException:
             log.close()
@@ -277,6 +326,8 @@ class Supervisor:
     def pump(self, timeout, final=False):
         if self.admission is not None and not final and self.admission.pump():
             timeout = 0
+        if self.admission is not None and not final and self.admission.pacer is not None:
+            timeout = self.admission.pacer.wait_timeout(timeout)
         events = self.selector.select(timeout)
         assert len(events) <= MAX_CHILDREN * 2
         for key, _ in events:
@@ -301,11 +352,14 @@ class Supervisor:
                 child.tail = (child.tail + data)[-32:]
             if final:
                 continue
+            if child.name.startswith("reward-") and stdout:
+                print_interval(child, data)
             if child.name == "server" and stdout and child.port is None:
                 child.banner.extend(data[:READINESS_LIMIT + 1 - len(child.banner)])
                 child.port = ready_port(child.banner, self.requested_port)
         if self.admission is not None and not final:
             self.admission.pump()
+            pump_observers(self)
         return len(events)
 
     def wait_build(self, child):
@@ -336,9 +390,9 @@ class Supervisor:
             self.pump(min(0.1, remaining))
 
     def run(self, root, arguments):
-        binary, weights = current_paths(root, arguments.weights_directory)
-        print(f"play: current Map2 pure Neural F17/M19; weights: {weights}; executable: {binary}; "
-              "metadata preflight only, Rust validates tensors before joining", flush=True)
+        binary, weights = opponent_paths(root, arguments)
+        label = "pure Neural F20/M22" if arguments.opponent == "neural" else "explicit Teacher (no model)"
+        print(f"play: current Map2 {label}; weights: {weights}; executable: {binary}", flush=True)
         if not arguments.no_build:
             command = ["cargo", "build", "--release", "--locked", "--quiet",
                        "--manifest-path", str(root / "bota/Cargo.toml"), "-p", "bota-server",
@@ -350,17 +404,21 @@ class Supervisor:
             self.wait_build(self.spawn("build-drysua", command, root / "drysua", environment))
         binaries = release_executables(root)
         assert binary == binaries[2]
-        server = self.spawn("server", [str(binaries[0]), "--port", str(arguments.port), "--mode", "realtime",
+        server = self.spawn("server", [str(binaries[0]), "--port", str(arguments.port), *transport_arguments(arguments),
                             "--players", "2", "--map", "2", "--seed", str(arguments.seed),
                             "--replay", str(self.directory / "match.brp")], root)
         resource.prlimit(server.process.pid, resource.RLIMIT_FSIZE, (REPLAY_LIMIT, REPLAY_LIMIT))
         port = self.wait_ready(server, arguments.port)
-        self.admission = Admission(port, arguments.human_side)
+        self.admission = Admission(port, arguments.human_side, mode=int(arguments.reward_report),
+                                   paced=arguments.reward_report)
+        if arguments.reward_report:
+            print("play: reward-report uses native LOCKSTEP paced at 30 ticks/s by delaying original ACKs; "
+                  "slow clients slow simulation, not snapshot delivery. No generated ACKs or orders.", flush=True)
+            start_observers(self, binary, root, arguments)
         client = self.spawn("client", [str(binaries[1]), "--addr", self.admission.addresses["human"],
                                       "--name", "human"], root)
-        bot = self.spawn("bot", [str(binary), "--addr", self.admission.addresses["bot"], "--name", "drysua",
-                                 "--policy", "neural", "--weights-directory", str(weights)], root)
-        print(f"play: requested human {arguments.human_side} / Neural bot {arguments.bot_side}; "
+        bot = self.spawn("bot", bot_command(binary, self.admission.addresses["bot"], arguments, weights), root)
+        print(f"play: requested human {arguments.human_side} / {arguments.opponent} bot {arguments.bot_side}; "
               "verifying server Welcome seats. Choose a hero (1/2/3), then R to ready. Ctrl+C stops all.",
               flush=True)
         self.wait_game(server, bot, client)
@@ -403,6 +461,13 @@ class Supervisor:
 
     def close(self):
         errors = []
+        try:
+            finish_observers(self)
+        except Exception as error:
+            errors.append(f"finalizing reward observation: {error}")
+        finally:
+            for pipe, _, _ in self.reward_pipes:
+                pipe.close()
         if self.admission is not None:
             try:
                 self.admission.close()

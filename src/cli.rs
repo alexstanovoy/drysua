@@ -15,6 +15,8 @@ struct Cli {
 /// Drysua operations.
 #[derive(Subcommand)]
 enum Operation {
+    /// Passively score copied native participant frames from stdin; never sends orders or ACKs.
+    RewardObserver(RewardObserverArgs),
     /// Evaluate greedy Neural on Map2 across baselines and sides, without Teacher overrides.
     Evaluate(EvaluateArgs),
     /// Run bounded stage-ten self-play league training and paired evaluation.
@@ -27,6 +29,16 @@ enum Operation {
     Train(TrainArgs),
     /// Run resumable PPO training with periodic strict checkpoints.
     TrainFull(TrainFullArgs),
+}
+
+#[derive(Args)]
+struct RewardObserverArgs {
+    /// New final JSON file; an adjacent JSONL file contains bounded interval deltas.
+    #[arg(long)]
+    output: std::path::PathBuf,
+    /// Complete ticks between diagnostic intervals.
+    #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u32).range(30..=27_900))]
+    interval_ticks: u32,
 }
 
 /// Options for Map2 teacher pretraining with a fixed Map2 deployment gate.
@@ -145,6 +157,15 @@ struct TrainFullArgs {
     /// Full-episode opponents; nondefault schedules are versioned and checked on resume.
     #[arg(long, value_enum, default_value_t = crate::TrainingOpponentSchedule::Teacher)]
     opponent_schedule: crate::TrainingOpponentSchedule,
+    /// Recent completed training games per mastery stage (default 50, at most 1024).
+    #[arg(long, value_parser = clap::value_parser!(u16).range(1..=1024))]
+    mastery_window: Option<u16>,
+    /// Default win percentage for all mastery opponents (default 80).
+    #[arg(long, value_parser = clap::value_parser!(u8).range(1..=100))]
+    mastery_win_percent: Option<u8>,
+    /// Per-opponent mastery override, e.g. weak=90 or teacher=80; no duplicates.
+    #[arg(long)]
+    opponent_win_percent: Vec<crate::OpponentWinPercent>,
     /// Adam learning rate; must be finite and positive.
     #[arg(long, default_value_t = crate::PpoConfig::default().learning_rate)]
     learning_rate: f32,
@@ -254,6 +275,9 @@ pub fn run_from_env() -> std::io::Result<()> {
 
 fn run(arguments: Cli) -> std::io::Result<()> {
     let play = match arguments.operation {
+        Some(Operation::RewardObserver(observer)) => {
+            return crate::reward_observer::run(&observer.output, observer.interval_ticks);
+        }
         Some(Operation::Evaluate(evaluate)) => return run_evaluate(evaluate),
         Some(Operation::League(league)) => return run_league(league),
         Some(Operation::Play(play)) => play,
@@ -311,6 +335,12 @@ fn resolve_play_deployment(
     play: &PlayArgs,
 ) -> std::io::Result<(PlayPolicy, Option<std::path::PathBuf>)> {
     if let Some(policy) = play.policy {
+        if policy == PlayPolicy::Teacher && play.weights_directory.is_some() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "teacher forbids --weights-directory",
+            ));
+        }
         return Ok((policy, play.weights_directory.clone()));
     }
     if play.weights_directory.is_some() {
@@ -566,6 +596,11 @@ fn run_train_full(arguments: TrainFullArgs) -> std::io::Result<()> {
     report
         .map2_reward
         .log("invocation", report.completed_updates);
+    if report.mastery_completed {
+        println!(
+            "training mastery complete: rolling training windows qualified through Teacher; not evaluation qualification"
+        );
+    }
     Ok(())
 }
 
@@ -598,6 +633,30 @@ fn report_training_checkpoint(checkpoint: crate::TrainingCheckpointReport) {
 
 #[cfg(feature = "builtin")]
 impl TrainFullArgs {
+    fn mastery_config(&self) -> std::io::Result<Option<crate::MasteryConfig>> {
+        if self.opponent_schedule != crate::TrainingOpponentSchedule::MasteryV1 {
+            if self.mastery_window.is_some()
+                || self.mastery_win_percent.is_some()
+                || !self.opponent_win_percent.is_empty()
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "mastery options require --opponent-schedule mastery-v1",
+                ));
+            }
+            return Ok(None);
+        }
+        crate::MasteryConfig::new(
+            self.mastery_window
+                .map_or(crate::MASTERY_DEFAULT_WINDOW, usize::from),
+            self.mastery_win_percent
+                .unwrap_or(crate::MASTERY_DEFAULT_WIN_PERCENT),
+            &self.opponent_win_percent,
+        )
+        .map(Some)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))
+    }
+
     fn training_settings(
         &self,
         git_commit: String,
@@ -619,6 +678,7 @@ impl TrainFullArgs {
         .map_err(std::io::Error::other)?;
         self.validate_map2_reward()?;
         let settings = crate::TrainingJobConfig {
+            mastery_config: self.mastery_config()?,
             opponent_schedule: self.opponent_schedule,
             episode_time_cost: self.episode_time_cost,
             terminal_only: self.terminal_only,

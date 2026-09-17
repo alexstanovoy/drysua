@@ -55,6 +55,7 @@ struct Game {
 }
 #[derive(Clone, Debug, Default)]
 struct Metrics {
+    tower_damage: u64,
     score: f64,
     mana: u64,
     damage: u64,
@@ -274,6 +275,7 @@ impl Metrics {
         self.damage += observed.hero_damage_dealt;
         self.received += observed.hero_damage_taken + observed.other_damage_taken;
         self.creep_damage += observed.creep_damage_taken;
+        self.tower_damage += observed.tower_damage_taken;
         self.gold += observed.own_gold_earned;
         self.xp += observed.own_xp_gained;
         self.last_hits += observed.lane_last_hits + observed.neutral_last_hits;

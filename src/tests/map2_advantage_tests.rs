@@ -142,7 +142,7 @@ fn empty_raze_has_lower_full_observed_return_and_pays_mana() {
 }
 
 #[test]
-fn active_attack_continue_is_not_worse_than_resending_attack_and_idle_loses_to_attack() {
+fn active_attack_continue_matches_resend_but_tower_exposed_last_hit_can_lose_to_idle() {
     let physics = Physics {
         mana: 0,
         creep_hp: Some(550),
@@ -169,10 +169,15 @@ fn active_attack_continue_is_not_worse_than_resending_attack_and_idle_loses_to_a
     let idle = holding_return(weak, StructuredAction::Continue, false);
     let attacked = holding_return(weak, attack_for(weak), false);
     assert!(
-        attacked.score > idle.score + 1e-4,
+        attacked.score < idle.score,
         "idle={idle:?} attacked={attacked:?}"
     );
     assert!(attacked.last_hits > 0);
+    assert!(attacked.tower_damage > 0);
+    let expected = 0.03 * attacked.gold as f64 / (300.0 + attacked.gold as f64)
+        + 0.03 * attacked.xp as f64 / (3000.0 + attacked.xp as f64)
+        - 0.1 * attacked.tower_damage as f64 / (500.0 + attacked.tower_damage as f64);
+    assert!((attacked.score - expected).abs() < 1e-9);
 }
 
 fn attack_for(physics: Physics) -> StructuredAction {
@@ -271,7 +276,7 @@ fn only_native_match_over_supplies_terminal_reward_not_horizon_or_demonstration_
     });
     lethal.action(cast(1));
     assert!(lethal.terminal);
-    assert!(lethal.total.score > 0.9);
+    assert!(lethal.total.score > 0.1);
 }
 
 #[test]

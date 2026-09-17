@@ -12,6 +12,7 @@ mod league;
 mod link;
 mod map2_contract;
 mod map2_reward;
+mod mastery;
 mod model;
 #[cfg(feature = "builtin")]
 mod neural_training;
@@ -21,6 +22,7 @@ mod ppo;
 #[cfg(feature = "builtin")]
 mod ppo_arena;
 mod readiness;
+mod reward_observer;
 mod seat;
 mod tactical;
 #[cfg(feature = "builtin")]
@@ -30,6 +32,7 @@ mod teacher_economy;
 mod telemetry;
 mod tracker;
 mod training_opponents;
+mod training_outcomes;
 mod wire;
 
 pub use action::*;
@@ -45,6 +48,7 @@ pub use league::*;
 pub use link::*;
 pub use map2_contract::*;
 pub use map2_reward::*;
+pub use mastery::*;
 pub use model::*;
 #[cfg(feature = "builtin")]
 pub use neural_training::*;
@@ -61,6 +65,7 @@ pub use tactical_training::*;
 pub use teacher::*;
 pub use tracker::*;
 pub use training_opponents::*;
+pub use training_outcomes::*;
 pub use wire::*;
 
 #[cfg(test)]

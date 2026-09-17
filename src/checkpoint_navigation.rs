@@ -19,7 +19,8 @@ const ADVANTAGE_SOURCE: [u8; 32] = [
     0xaa, 0xba, 0x8a, 0x8e, 0x31, 0x36, 0xe5, 0x1d, 0xab, 0x21, 0x52, 0x18, 0x1c, 0xdf, 0x63, 0xb7,
 ];
 
-const _: () = assert!(M16_PARAMETERS + 5 * 512 == crate::MODEL_PARAMETER_COUNT);
+const _: () =
+    assert!(M16_PARAMETERS + (crate::GLOBAL_FEATURES - 85) * 512 == crate::MODEL_PARAMETER_COUNT);
 
 /// Whitelisted M16 parameter ancestry for an unqualified, new-navigation policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -72,7 +73,7 @@ impl Map2NavigationInitializationProvenance {
             .collect();
         assert_eq!(digest.len(), 64);
         let description = format!(
-            "INITIALIZATION_ONLY source_m16_sha256={digest} source_f=14 source_a=4 source_m=16 source_ppo=29 source_rules=24 source_reward_version=1 source_reward_hash=798798703797057220 target_f={} target_a={} target_m={} target_ppo={} target_rules={} reward_version={} reward_hash={} parameter_bits_preserved=true named_tensors=62 new_weights=2560_positive_zero optimizer_progress_rng_league=fresh GAMEPLAY_EQUIVALENCE=false new_legal_actions_change_behavior=true qualification=false",
+            "INITIALIZATION_ONLY source_m16_sha256={digest} source_f=14 source_a=4 source_m=16 source_ppo=29 source_rules=24 source_reward_version=1 source_reward_hash=798798703797057220 target_f={} target_a={} target_m={} target_ppo={} target_rules={} reward_version={} reward_hash={} parameter_bits_preserved=true named_tensors=62 new_weights={}_positive_zero optimizer_progress_rng_league=fresh GAMEPLAY_EQUIVALENCE=false new_legal_actions_change_behavior=true qualification=false",
             crate::FEATURE_SCHEMA_VERSION,
             crate::ACTION_SCHEMA_VERSION,
             crate::MODEL_SCHEMA_VERSION,
@@ -80,6 +81,7 @@ impl Map2NavigationInitializationProvenance {
             crate::PPO_RULES_AUDIT_VERSION,
             crate::MAP2_REWARD_SCHEMA_VERSION,
             crate::MAP2_REWARD_SCHEMA_HASH,
+            (crate::GLOBAL_FEATURES - 85) * 512,
         );
         assert!(description.len() < 4_096);
         description

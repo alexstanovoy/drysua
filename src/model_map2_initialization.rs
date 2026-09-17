@@ -72,9 +72,9 @@ const GLOBAL_INSERTED: usize = super::GLOBAL_FEATURES - M14_GLOBAL_FEATURES;
 const UNIT_INSERTED: usize = super::UNIT_FEATURES - M14_UNIT_FEATURES;
 const _: () = assert!(super::GLOBAL_FEATURES > M14_GLOBAL_FEATURES);
 const _: () = assert!(super::UNIT_FEATURES > M14_UNIT_FEATURES);
-const _: () = assert!(super::GLOBAL_FEATURES == 90);
+const _: () = assert!(super::GLOBAL_FEATURES == 92);
 const _: () = assert!(super::UNIT_FEATURES == 84);
-const _: () = assert!(MODEL_PARAMETER_COUNT == 1_698_996);
+const _: () = assert!(MODEL_PARAMETER_COUNT == 1_700_020);
 const _: () = assert!(
     MODEL_PARAMETER_COUNT == M14_PARAMETER_COUNT + UNIT_INSERTED * 64 + GLOBAL_INSERTED * 512
 );
@@ -93,40 +93,69 @@ impl PolicyModel {
         &self,
         source: &[f32],
     ) -> Result<Vec<f32>, ModelError> {
-        const SOURCE_COUNT: usize = 1_696_436;
-        if source.len() != SOURCE_COUNT {
+        self.widen_map2_global_parameters(source, 85, 1_696_436)
+    }
+
+    /// Pads only the two appended global rows of a frozen M19 parameter layout.
+    pub(crate) fn widen_m19_reward_parameters(
+        &self,
+        source: &[f32],
+    ) -> Result<Vec<f32>, ModelError> {
+        self.widen_map2_global_parameters(source, 90, 1_698_996)
+    }
+
+    fn widen_map2_global_parameters(
+        &self,
+        source: &[f32],
+        source_globals: usize,
+        source_count: usize,
+    ) -> Result<Vec<f32>, ModelError> {
+        assert!(matches!(source_globals, 85 | 90));
+        assert_eq!(
+            source_count + (super::GLOBAL_FEATURES - source_globals) * 512,
+            MODEL_PARAMETER_COUNT
+        );
+        if source.len() != source_count {
             return Err(ModelError::ParameterLength {
                 actual: source.len(),
-                expected: SOURCE_COUNT,
+                expected: source_count,
             });
         }
         if let Some(index) = source.iter().position(|value| !value.is_finite()) {
             return Err(ModelError::NonFiniteParameter { index });
         }
         Self::validate_map2_parameter_schema(&self.parameter_schema()?)?;
-        let flat = Tensor::from_slice(source, SOURCE_COUNT, &super::Device::Cpu)?;
+        let flat = Tensor::from_slice(source, source_count, &super::Device::Cpu)?;
         let mut tensors = Vec::with_capacity(M14_LAYOUT.len());
         let mut offset = 0;
+        let trunk_shape = [
+            super::TRUNK_INPUT - super::GLOBAL_FEATURES + source_globals,
+            512,
+        ];
         for (name, old_shape) in M14_LAYOUT {
             let shape = match name {
                 "unit.0.weight" => &[84, 64][..],
-                "trunk.0.weight" => &[2589, 512][..],
+                "trunk.0.weight" => &trunk_shape[..],
                 _ => old_shape,
             };
             let count = shape.iter().product::<usize>();
             let tensor = flat.narrow(0, offset, count)?.reshape(shape)?;
             let padded = if name == "trunk.0.weight" {
-                insert_rows(&tensor, 85, super::GLOBAL_FEATURES - 85)?
+                insert_rows(
+                    &tensor,
+                    source_globals,
+                    super::GLOBAL_FEATURES - source_globals,
+                )?
             } else {
                 tensor
             };
             tensors.push(padded.flatten_all()?);
             offset += count;
         }
-        assert_eq!(offset, SOURCE_COUNT);
+        assert_eq!(offset, source_count);
         let target: Vec<f32> = Tensor::cat(&tensors, 0)?.to_vec1()?;
         super::validate_parameter_values(&target)?;
-        assert_eq!(target.len(), SOURCE_COUNT + 2560);
+        assert_eq!(target.len(), MODEL_PARAMETER_COUNT);
         Ok(target)
     }
 

@@ -167,6 +167,10 @@ impl Map2Reward {
                 self.interval.observations.creep_damage_taken += amount;
                 6
             }
+            Some(source) if source.kind == UnitKind::Tower => {
+                self.interval.observations.tower_damage_taken += amount;
+                super::MAP2_REWARD_TOWER_CHANNEL
+            }
             Some(_) => {
                 self.interval.observations.other_damage_taken += amount;
                 7
@@ -185,7 +189,8 @@ impl Map2Reward {
             5 => self.interval.hero_damage_taken -= cost,
             6 => self.interval.creep_damage_taken -= cost,
             7 => self.interval.other_damage_taken -= cost,
-            _ => unreachable!("received damage has three validated source classes"),
+            super::MAP2_REWARD_TOWER_CHANNEL => self.interval.tower_damage_taken -= cost,
+            _ => unreachable!("received damage has four validated source classes"),
         }
     }
 

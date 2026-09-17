@@ -22,9 +22,9 @@ use crate::{
 };
 
 /// Version of the policy feature layout and candidate input-state semantics.
-pub const FEATURE_SCHEMA_VERSION: u32 = 17;
+pub const FEATURE_SCHEMA_VERSION: u32 = 20;
 /// Number of scalar global features.
-pub const GLOBAL_FEATURES: usize = 90;
+pub const GLOBAL_FEATURES: usize = 92;
 /// Number of scalar features in one global-history sample.
 pub const HISTORY_FEATURES: usize = 24;
 /// Number of global-history samples.
@@ -179,6 +179,10 @@ pub mod global_feature {
     pub const MAP2_ACTIVITY_TICKS_LEFT: usize = 88;
     /// Base-charge latch, cleared only when generic progress debt reaches zero.
     pub const MAP2_STAGNATION_BASE_CHARGED: usize = 89;
+    /// Remaining fraction of the appended independent incoming-Tower budget.
+    pub const MAP2_TOWER_DAMAGE_REMAINING: usize = 90;
+    /// First-wave opening-position assessment is still pending.
+    pub const MAP2_OPENING_POSITION_PENDING: usize = 91;
 }
 
 /// Stable indices in each unit token.
@@ -403,10 +407,10 @@ pub mod loot_feature {
 
 /// Canonical schema text covered by [`FEATURE_SCHEMA_HASH`].
 pub const FEATURE_SCHEMA_DESCRIPTOR: &str = concat!(
-    "bota-drysua-feature/v17;",
+    "bota-drysua-feature/v20;",
     "action_schema_version=5;action_schema_hash=linked;",
     "navigation_contract=existing_walkable_building_landing_move_pointers_allowed,attack_move_veto_and_tp_provenance_unchanged;frame_legality_and_action_space_provenance=new_contract,raw_dimensions_field_ids_point_order_and_sources_unchanged,no_old_frame_or_corpus_relabel;",
-    "shapes=global:90,history:7x24,policy_history:16x4,unit:96x84,own_unit:2x84,remembered_unit:32x84,point:48x32,ability:14x24,item:85x28,projectile:32x20,loot:16x16,map:96;",
+    "shapes=global:92,history:7x24,policy_history:16x4,unit:96x84,own_unit:2x84,remembered_unit:32x84,point:48x32,ability:14x24,item:85x28,projectile:32x20,loot:16x16,map:96;",
     "scalar_ranges=presence_and_one_hot:[0,1],unsigned_continuous:[0,1],signed_continuous:[-1,1],category:positive_exact_integer,all_finite;",
     "history_ages=480,240,120,60,30,15,0;",
     "normalizers=tick:3600000,age:4800,history_age:480,gold_asset_item_cost:100000,score:1000,xp:100000,hp:100000,mana:20000,damage:10000,attack_interval:600,speed:2000,armor_raw:6553600,level:30,charges:255,cooldown:36000,structures:64;",
@@ -467,7 +471,7 @@ pub const FEATURE_SCHEMA_DESCRIPTOR: &str = concat!(
     "map_scalars=normalizers:elevation63_landmark_squared_extent_ray_step20,categories:direction_fixed_E_NE_N_NW_W_SW_S_SE_hit_kind_walkable_water_opaque_tree,reserved:14..15;",
     "unit_append_indices=69:invulnerable,70:channelling,71:facing_cos,72:facing_sin;unit_append_semantics=wire_status_bits9_10,last_observed_only_with_visible_remembered_age_provenance,canonical_facing_brads_times_TAU_div65536_f32_sin_cos,absent_token_zero;",
     "global_append_indices=64:own_ancient_present,65:own_ancient_relative_x,66:own_ancient_relative_y,67:own_ancient_distance,68:enemy_ancient_present,69:enemy_ancient_relative_x,70:enemy_ancient_relative_y,71:enemy_ancient_distance;ancient_geometry=seat_observed_current_or_remembered_Ancient_kind_exact_team,only_unique_known_position_per_team,requires_live_own_hero_origin,canonical_delta_extent_chebyshev_distance_extent,missing_or_ambiguous_all_zero,no_hidden_map_lookup_no_goal_priority;",
-    "map2_global_append=72:map2_present,73-81:reward_remaining_in_MAP2_REWARD_SCHEMA_channel_order,82:tower_potential_raw_f32_range[-.05,.05],83:lane_potential_raw_f32_range[-.01,.01],84:lane_observed;legacy_map0_map1_append_zero;",
+    "map2_global_append=72:map2_present,73-81:original_nine_reward_remaining_in_unchanged_channel_order,82:tower_potential_raw_f32_range[-.3,.3],83:lane_potential_raw_f32_range[-.1,.1],84:lane_observed;legacy_map0_map1_append_zero;",
     "map2_reward=only_map2_tracker_owned_complete_contiguous_seat_snapshot_events_before_event_journal_trim,full_lifetime_clone,no_hidden_world_inputs,complete_pair_required_before_observe_and_encode,remaining_and_potentials_and_completed_tick_in_provenance,drain_does_not_invalidate_features,finish_advances_revision;reward_schema=linked_version_hash_and_complete_descriptor;",
     "map2_audit=reward_state_includes_public_enemy_bounty_and_xp_budget_remaining_even_when_raw_enemy_scoreboard_disabled;no_hidden_enemy_economy;",
     "raze_append=73:anonymous_effect15_present,74:stacks_div255,75:ticks_left_div240;pair=max_lexicographic_valid_active_row_stacks_then_remaining_ticks,never_sum_or_source_attribution;valid_stacks1..255_ticks1..240;memory_timer=observed_ticks_minus_age_expired_zero,no_fog_refresh,known_death_clears;rows_order_independent;entity_sort_pair_before_opaque_id;absent_incomplete_out_of_range_rows_zero;",
@@ -476,7 +480,8 @@ pub const FEATURE_SCHEMA_DESCRIPTOR: &str = concat!(
     "map2_scope=cap27900_including900_pregame_15minute_gameplay;",
     "wait_accounting_append=global85:open_fountain_wait_ticks_div27900,86:open_refundable_cost_div.093,range0to1,legacy_maps_zero;reward2=prewave_center_hint_only_before_first_wave_no_new_postspawn_hero_constraint,any_movement_or_resource_break_resets_wait,any_own_purchase_refunds_open_period_including_drained_cost,only_two_new_accounting_facts_no_intent_price_or_antiabuse_conditions;",
     "progress_accounting_append=global87:stagnation_ticks_div2700,88:activity_ticks_left_div30,89:stagnation_base_charged_0or1;invariants=debt0..2700_lease0..29_latch_implies_positive_debt,off_map2_zero,complete_snapshot_events_only,drains_clone_provenance_include_all_three_facts;reward3=independent_progress_debt_baseline_free_inactive_add1_including_death_active_repay3_refresh30_consumes_current_base.02_once_at2700_then_inactive_cap_rate.000002_rearm_only_debt0_no_refund;effect3_positive_ticks_direct_even_full_or_lingering,purchase_only_partial_activity_lease_plus_unchanged_v2_full_open_wait_refund,no_strategy_or_antiabuse_additions;",
-    "mango=item42_category43_existing_item_and_loot_token_fields,no_new_item_rows;map2_geometry=map0_public_geometry_no_metadata_relabel;"
+    "mango=item42_category43_existing_item_and_loot_token_fields,no_new_item_rows;map2_geometry=map0_public_geometry_no_metadata_relabel;",
+    "reward6=unchanged_reward5_dense_channels_and_potentials_terminal_win.2_loss_neg.2_draw0_taskcap_neg.2;global90:tower_damage_channel9_remaining_fraction,91:opening_position_pending_bool;all_global0to91_indices_preserved_nine_remaining73to81_not_overwritten_by_tenth_channel;opening_pending_lifetime_clone_complete_pair_provenance_and_finish_expiry_no_ids_or_forced_actions;mastery_stage_thresholds_and_rolling_window_excluded_from_features;"
 );
 
 /// FNV-1a of the descriptor, action/reward version-le32/hash-le64 pairs, and reward descriptor.
@@ -495,10 +500,13 @@ const _: () = assert!(crate::ACTION_SCHEMA_VERSION == 5);
 const _: () = assert!(StatusFlags::INVULNERABLE == 1 << 9);
 const _: () = assert!(StatusFlags::CHANNELLING == 1 << 10);
 const _: () = assert!(
-    global_feature::MAP2_REWARD_REMAINING_START + crate::MAP2_REWARD_CHANNELS
+    global_feature::MAP2_REWARD_REMAINING_START + crate::MAP2_REWARD_LEGACY_CHANNELS
         == global_feature::MAP2_TOWER_POTENTIAL
 );
-const _: () = assert!(global_feature::MAP2_STAGNATION_BASE_CHARGED + 1 == GLOBAL_FEATURES);
+const _: () = assert!(
+    global_feature::MAP2_STAGNATION_BASE_CHARGED + 1 == global_feature::MAP2_TOWER_DAMAGE_REMAINING
+);
+const _: () = assert!(global_feature::MAP2_OPENING_POSITION_PENDING + 1 == GLOBAL_FEATURES);
 const _: () = assert!(crate::MAP2_REWARD_STAGNATION_THRESHOLD_TICKS == 2700);
 const _: () = assert!(crate::MAP2_REWARD_ACTIVITY_LEASE_TICKS == 30);
 const _: () = assert!(crate::MAP2_TICK_CAP == 27_900);
@@ -2395,7 +2403,12 @@ fn encode_map2_reward(tracker: &StateTracker, global: &mut [f32; GLOBAL_FEATURES
     );
     global[global_feature::MAP_TWO] = 1.0;
     let start = global_feature::MAP2_REWARD_REMAINING_START;
-    global[start..start + crate::MAP2_REWARD_CHANNELS].copy_from_slice(&state.remaining);
+    global[start..start + crate::MAP2_REWARD_LEGACY_CHANNELS]
+        .copy_from_slice(&state.remaining[..crate::MAP2_REWARD_LEGACY_CHANNELS]);
+    global[global_feature::MAP2_TOWER_DAMAGE_REMAINING] =
+        state.remaining[crate::MAP2_REWARD_TOWER_CHANNEL];
+    global[global_feature::MAP2_OPENING_POSITION_PENDING] =
+        bool_feature(state.opening_position_pending);
     global[global_feature::MAP2_TOWER_POTENTIAL] = state.tower_potential;
     global[global_feature::MAP2_LANE_POTENTIAL] = state.lane_potential;
     global[global_feature::MAP2_LANE_OBSERVED] = bool_feature(state.lane_observed);

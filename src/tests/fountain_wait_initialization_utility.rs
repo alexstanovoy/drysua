@@ -56,7 +56,7 @@ fn initialize_pinned_m17_wait_artifact_only() {
         .create_new(true)
         .open(output.join("INITIALIZATION.txt"))
         .expect("new audit record");
-    writeln!(record, "{}\nsource={}\nparameters={}\nglobal90_unit84\ntrunk.0.weight=2589x512_to2594x512_zero_rows85..90\nsource_unchanged=true\ntraining_updates=0\ngameplay_runs=0\ngit_commit={}\nsimulator_commit={}",
+    writeln!(record, "{}\nsource={}\nparameters={}\nglobal92_unit84\ntrunk.0.weight=2589x512_to2596x512_zero_rows85..92\nsource_unchanged=true\ntraining_updates=0\ngameplay_runs=0\ngit_commit={}\nsimulator_commit={}",
         provenance.description(), source.display(), target.len(), run.git_commit, run.simulator_commit).expect("audit");
     record.sync_all().expect("durable record");
     fs::File::open(&output)
@@ -100,6 +100,7 @@ fn old_parameters(bytes: &[u8]) -> Vec<f32> {
 
 fn initialization_run(config: crate::PpoConfig, seed: u64, provenance: &str) -> CheckpointRun {
     CheckpointRun {
+        mastery_config: None,
         git_commit: std::env::var("DRYSUA_INITIALIZATION_GIT_COMMIT")
             .expect("frozen source revision"),
         simulator_commit: std::env::var("DRYSUA_INITIALIZATION_SIMULATOR_COMMIT")

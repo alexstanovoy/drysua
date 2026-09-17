@@ -32,6 +32,7 @@ impl Identity {
 
 #[derive(Clone, Copy, Debug)]
 pub(super) struct UnitFact {
+    pub dead: bool,
     pub id: EntityId,
     pub kind: UnitKind,
     pub team: Team,
@@ -145,6 +146,7 @@ pub(super) fn snapshot(
             });
         }
         units.push(UnitFact {
+            dead: unit.statuses.bits & bota_proto::StatusFlags::DEAD != 0,
             id: unit.id,
             kind: unit.kind,
             team: unit.team,

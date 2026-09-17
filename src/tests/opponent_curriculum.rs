@@ -104,11 +104,13 @@ fn curriculum_resume_uses_persisted_update_and_rejects_changed_schedule_before_m
         ResumeProvenance::Strict,
     )
     .expect("strict restore");
-    assert_eq!(restored.2, 2);
-    assert_eq!(restored.0.rng_checkpoint(), (123, 7));
-    assert_eq!(restored.1.checkpoint(), (456, 12));
+    assert_eq!(restored.completed_updates, 2);
+    assert_eq!(restored.trainer.rng_checkpoint(), (123, 7));
+    assert_eq!(restored.sampling.checkpoint(), (456, 12));
     assert_eq!(
-        collection_opponents(&environments(&settings, restored.2).expect("restored phase")),
+        collection_opponents(
+            &environments(&settings, restored.completed_updates).expect("restored phase")
+        ),
         ("Mixed", 4, 2)
     );
     let mut changed = settings.clone();
@@ -149,6 +151,7 @@ fn checkpoint_fixture(settings: &TrainingJobConfig, run: CheckpointRun) -> Train
     )
     .expect("trainer");
     let progress = CheckpointProgress {
+        mastery: None,
         global_update: 2,
         policy_version: 2,
         scheduler_step: 2,

@@ -686,7 +686,7 @@ fn install_policy(model: &PolicyModel, policy: DiagnosticPolicy) {
         match (policy, name) {
             (DiagnosticPolicy::Constant(kind), "kind.bias") => values[kind.index()] = 10.0,
             (DiagnosticPolicy::ActiveOrderReadout, "trunk.0.weight") => {
-                assert_eq!(shape, [2594, 512]);
+                assert_eq!(shape, [2596, 512]);
                 values[global_feature::ACTIVE_ORDER_PRESENT * shape[1]] = 1.0;
             }
             (DiagnosticPolicy::ActiveOrderReadout, "trunk.1.weight" | "trunk.2.weight") => {
