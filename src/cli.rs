@@ -154,6 +154,9 @@ struct TrainFullArgs {
     /// Collect paired Map2 episodes; retain one of eight actions. Use =false for windows.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
     complete_episodes: bool,
+    /// Fixed collection groups (1, 2 or 4), each with its own decision barrier.
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=4))]
+    pipeline_groups: u8,
     /// Full-episode opponents; nondefault schedules are versioned and checked on resume.
     #[arg(long, value_enum, default_value_t = crate::TrainingOpponentSchedule::Teacher)]
     opponent_schedule: crate::TrainingOpponentSchedule,
@@ -683,6 +686,7 @@ impl TrainFullArgs {
             episode_time_cost: self.episode_time_cost,
             terminal_only: self.terminal_only,
             complete_episodes: self.complete_episodes,
+            pipeline_groups: usize::from(self.pipeline_groups),
             updates: self.updates,
             ppo,
             checkpoint_cadence: crate::TrainingCheckpointCadence::WallTime(

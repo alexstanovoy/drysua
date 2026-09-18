@@ -556,6 +556,39 @@ impl PpoRollout {
         Ok(())
     }
 
+    /// Appends every transition of `other` in its stored order.
+    ///
+    /// Pipeline groups own disjoint streams, so per-stream decision continuity
+    /// survives the merge; frames are copied through the validated
+    /// [`Self::push`] path instead of sharing arena rows, which keeps every
+    /// rollout invariant in one place. The caller merges in fixed group order,
+    /// so the resulting sample sequence is deterministic.
+    #[cfg(feature = "builtin")]
+    pub(crate) fn append(&mut self, other: Self) -> Result<(), PpoError> {
+        if other.policy != self.policy {
+            return Err(PpoError::PolicyMismatch);
+        }
+        let combined = self
+            .transitions
+            .len()
+            .checked_add(other.transitions.len())
+            .ok_or(PpoError::CounterOverflow)?;
+        if combined > self.capacity {
+            return Err(PpoError::RolloutFull {
+                capacity: self.capacity,
+            });
+        }
+        let PpoRollout {
+            transitions,
+            frames,
+            ..
+        } = other;
+        for compact in transitions {
+            self.push(expand_transition(&frames, &compact)?)?;
+        }
+        Ok(())
+    }
+
     pub fn len(&self) -> usize {
         self.transitions.len()
     }

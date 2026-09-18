@@ -76,12 +76,14 @@ fn mastery_native_cap_draw_batch_keeps_draw_labels_zero_terminal_and_nonwinning_
     )
     .expect("rollout");
     let mut report = PpoSmokeReport::default();
-    collect(
+    collect_bounded(
         &model,
         &mut PpoRng::new(9140300),
         &mut arenas,
         &settings,
         0,
+        ACTOR_DECISIONS,
+        true,
         &mut rollout,
         &mut report,
     )
@@ -162,12 +164,14 @@ fn curriculum_weak_and_mixed_complete_batches_preserve_terminal_reward_and_reten
         )
         .expect("rollout");
         let mut report = PpoSmokeReport::default();
-        collect(
+        collect_bounded(
             &model,
             &mut random,
             &mut arenas,
             &settings,
             update,
+            ACTOR_DECISIONS,
+            true,
             &mut rollout,
             &mut report,
         )
@@ -217,12 +221,14 @@ fn eight_sixteen_twenty_four_and_twenty_six_environment_complete_batches_collect
         )
         .expect("rollout");
         let mut report = PpoSmokeReport::default();
-        collect(
+        collect_bounded(
             &model,
             &mut PpoRng::new(9140300),
             &mut arenas,
             &settings,
             0,
+            ACTOR_DECISIONS,
+            true,
             &mut rollout,
             &mut report,
         )
@@ -245,6 +251,206 @@ fn eight_sixteen_twenty_four_and_twenty_six_environment_complete_batches_collect
             assert!(sample.return_value().is_finite());
             assert!(sample.return_value() <= 0.0);
         }
+    }
+}
+
+#[test]
+fn pipeline_group_ranges_partition_pairs_contiguously() {
+    assert_eq!(training_group_ranges(8, 1).expect("one group"), vec![0..8]);
+    assert_eq!(
+        training_group_ranges(8, 2).expect("two groups"),
+        vec![0..4, 4..8]
+    );
+    assert_eq!(
+        training_group_ranges(8, 4).expect("four groups"),
+        vec![0..2, 2..4, 4..6, 6..8]
+    );
+    assert_eq!(
+        training_group_ranges(16, 4).expect("four groups of sixteen"),
+        vec![0..4, 4..8, 8..12, 12..16]
+    );
+    assert_eq!(
+        training_group_ranges(26, 2).expect("two uneven groups"),
+        vec![0..14, 14..26]
+    );
+    assert_eq!(
+        training_group_ranges(26, 4).expect("four uneven groups"),
+        vec![0..8, 8..14, 14..20, 20..26]
+    );
+    for (environments, groups, message) in [
+        (8, 3, "invalid PPO config field: pipeline groups"),
+        (8, 0, "invalid PPO config field: pipeline groups"),
+        (
+            2,
+            2,
+            "invalid PPO config field: pipeline groups exceed paired environments",
+        ),
+        (
+            6,
+            4,
+            "invalid PPO config field: pipeline groups exceed paired environments",
+        ),
+        (
+            0,
+            1,
+            "invalid PPO config field: pipeline group environments",
+        ),
+        (
+            7,
+            1,
+            "invalid PPO config field: pipeline group environments",
+        ),
+    ] {
+        assert_eq!(
+            training_group_ranges(environments, groups)
+                .expect_err("invalid partition")
+                .to_string(),
+            message,
+            "environments={environments} groups={groups}"
+        );
+    }
+}
+
+#[test]
+fn grouped_complete_collection_matches_episode_counts_and_mastery() {
+    for (environments, groups) in [(8usize, 2usize), (8, 4), (16, 4), (26, 2)] {
+        let model = stop_model();
+        let settings = crate::cli::training_settings_for_test(&[
+            "--opponent-schedule",
+            "mastery-v1",
+            "--mastery-window",
+            "3",
+            "--environments",
+            &environments.to_string(),
+            "--pipeline-groups",
+            &groups.to_string(),
+            "--rollout",
+            "1163",
+            "--minibatch",
+            "512",
+        ])
+        .expect("settings");
+        let mut arenas: Vec<_> = (0..environments)
+            .map(|stream| fixture_environment(TICK_CAP - 24, stream % 2, OpponentSpec::Weak))
+            .collect();
+        let mut rollout = PpoRollout::new(
+            environments * RETAINED_PER_EPISODE,
+            model.policy_identity().expect("identity"),
+        )
+        .expect("rollout");
+        let mut report = PpoSmokeReport::default();
+        collect_groups_bounded(
+            &model,
+            &mut PpoRng::new(9140300),
+            &mut arenas,
+            &settings,
+            0,
+            groups,
+            ACTOR_DECISIONS,
+            true,
+            None,
+            &mut rollout,
+            &mut report,
+        )
+        .expect("grouped native cap batch");
+        assert_eq!(report.terminal_draws, environments as u64);
+        assert_eq!(report.terminal_losses, 0);
+        assert_eq!(report.episode_timeouts, 0);
+        assert_eq!(report.map2_reward.terminal, 0.0);
+        assert_eq!(report.map2_reward.ticks, (environments * 24) as u64);
+        assert_eq!(report.elapsed_ticks, (environments * 24) as u64);
+        assert_eq!(
+            report.completed_episodes.ordered_outcomes().len(),
+            environments
+        );
+        let mut mastery = crate::MasteryProgress::default();
+        mastery
+            .record_batch(
+                settings.mastery_config.expect("config"),
+                &report.completed_episodes.ordered_outcomes(),
+            )
+            .expect("record");
+        assert_eq!(mastery.games(), environments as u64);
+        assert_eq!(mastery.wins(), 0);
+        let batch = rollout
+            .finish(settings.ppo)
+            .expect("usable grouped terminal batch");
+        assert_eq!(batch.len(), environments);
+        for index in 0..batch.len() {
+            let sample = batch.sample(index).expect("sample");
+            assert!(sample.return_value().is_finite());
+            assert!(sample.return_value() <= 0.0);
+        }
+    }
+}
+
+#[test]
+fn grouped_collection_repeats_identical_policy_batches() {
+    let environments = 8usize;
+    let groups = 2usize;
+    let settings = crate::cli::training_settings_for_test(&[
+        "--opponent-schedule",
+        "mastery-v1",
+        "--mastery-window",
+        "3",
+        "--environments",
+        "8",
+        "--pipeline-groups",
+        "2",
+        "--rollout",
+        "1163",
+        "--minibatch",
+        "512",
+    ])
+    .expect("settings");
+    let run = || {
+        let model = stop_model();
+        let mut arenas: Vec<_> = (0..environments)
+            .map(|stream| fixture_environment(TICK_CAP - 24, stream % 2, OpponentSpec::Weak))
+            .collect();
+        let mut rollout = PpoRollout::new(
+            environments * RETAINED_PER_EPISODE,
+            model.policy_identity().expect("identity"),
+        )
+        .expect("rollout");
+        let mut report = PpoSmokeReport::default();
+        collect_groups_bounded(
+            &model,
+            &mut PpoRng::new(9140300),
+            &mut arenas,
+            &settings,
+            0,
+            groups,
+            ACTOR_DECISIONS,
+            true,
+            None,
+            &mut rollout,
+            &mut report,
+        )
+        .expect("grouped batch");
+        (model, report, rollout.finish(settings.ppo).expect("batch"))
+    };
+    let (_, first_report, first_batch) = run();
+    let (_, second_report, second_batch) = run();
+    assert_eq!(first_report, second_report);
+    assert_eq!(first_batch.len(), second_batch.len());
+    for index in 0..first_batch.len() {
+        let first = first_batch.sample(index).expect("first sample");
+        let second = second_batch.sample(index).expect("second sample");
+        assert_eq!(first.transition.stream, second.transition.stream);
+        assert_eq!(first.transition.decision, second.transition.decision);
+        assert_eq!(first.transition.ticks, second.transition.ticks);
+        assert_eq!(
+            first.transition.old_log_probability,
+            second.transition.old_log_probability
+        );
+        assert_eq!(first.transition.old_value, second.transition.old_value);
+        assert_eq!(first.transition.next_value, second.transition.next_value);
+        assert_eq!(first.transition.reward, second.transition.reward);
+        assert_eq!(first.transition.terminal, second.transition.terminal);
+        assert_eq!(first.transition.action, second.transition.action);
+        assert_eq!(first.advantage(), second.advantage());
+        assert_eq!(first.return_value(), second.return_value());
     }
 }
 
@@ -721,12 +927,14 @@ fn map2_complete_collection_accepts_only_draws_and_flushes_random_phase_partial_
     let mut rollout =
         PpoRollout::new(2, model.policy_identity().expect("identity")).expect("rollout");
     let mut report = PpoSmokeReport::default();
-    collect(
+    collect_bounded(
         &model,
         &mut PpoRng::new(982_009),
         &mut environments,
         &settings,
         0,
+        ACTOR_DECISIONS,
+        true,
         &mut rollout,
         &mut report,
     )

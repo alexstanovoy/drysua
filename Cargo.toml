@@ -30,6 +30,10 @@ windows-sys = { version = "0.61.2", default-features = false, features = ["Win32
 [target.'cfg(target_os = "macos")'.dependencies]
 candle-metal-feature = { path = "crates/candle-metal-feature", default-features = false, optional = true }
 
+[dev-dependencies]
+# Mirrors bota's workspace pin so the shared bench tooling version moves in lockstep.
+criterion = { version = "=0.8.2", default-features = false }
+
 [[bin]]
 name = "drysua"
 path = "src/main.rs"
@@ -47,6 +51,12 @@ required-features = ["builtin"]
 [[bin]]
 name = "train_neural"
 path = "src/bin/train_neural.rs"
+required-features = ["builtin"]
+
+[[bench]]
+name = "training"
+path = "benches/training.rs"
+harness = false
 required-features = ["builtin"]
 
 [lints.clippy]

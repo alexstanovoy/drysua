@@ -136,6 +136,10 @@ pub struct TrainingJobConfig {
     /// Legacy override retained for explicit rejection; Map2 requires comprehensive reward.
     pub terminal_only: bool,
     pub complete_episodes: bool,
+    /// Fixed complete-episode collection groups, one barrier each: 1 (default
+    /// global barrier), 2, or 4. Recorded in the canonical run scope because
+    /// batch composition differs from the one-group contract.
+    pub pipeline_groups: usize,
     pub updates: u64,
     /// Single source of truth for rollout dimensions and checkpointed hyperparameters.
     pub ppo: PpoConfig,
@@ -1960,6 +1964,370 @@ pub fn run_ppo_smoke_on(
     Ok(smoke)
 }
 
+/// Maximum decision rounds one [`TrainingCollectionSlice`] window can run.
+pub const TRAINING_COLLECTION_SLICE_MAX_ROUNDS: usize = episode::ACTOR_DECISIONS;
+
+/// Fixed settings for one bounded [`TrainingCollectionSlice`].
+///
+/// One environment selects the serial baseline; even counts from two to
+/// [`MAX_TRAINING_ENVIRONMENTS`](crate::MAX_TRAINING_ENVIRONMENTS) select the
+/// production worker pool. `update` seeds the opponent schedule and the
+/// retention phases exactly as a production update does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TrainingCollectionSliceConfig {
+    pub seed: u64,
+    pub environments: usize,
+    pub update: u64,
+    /// Decision rounds executed during construction, outside every measured
+    /// window; zero starts the first measured window at the first decision.
+    pub warmup_rounds: usize,
+    /// Fixed complete-episode collection groups: 1 is the global barrier,
+    /// 2/4 partition the same streams into independent pipelined batches.
+    pub pipeline_groups: usize,
+}
+
+/// Work performed by one bounded collection window.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TrainingCollectionSliceReport {
+    pub environments: usize,
+    pub warmup_rounds: usize,
+    pub rounds: usize,
+    pub decisions: u64,
+    pub ticks: u64,
+    pub start_tick: u32,
+    pub end_tick: u32,
+    pub retained_samples: usize,
+}
+
+/// Opt-in per-phase wall accounting for one bounded window.
+///
+/// `flush_wait_ns` is a subset of `apply_ns`; `prepare_ns`, `advance_ns` and
+/// `evaluator_ns` run concurrently with the orchestrator phases, so their sums
+/// are worker occupancy rather than wall time. Instrumentation only observes,
+/// so a phased window runs the identical collector operations as a fast one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TrainingCollectionPhaseReport {
+    pub prepare_ns: u64,
+    pub advance_ns: u64,
+    pub forward_ns: u64,
+    pub barrier_ns: u64,
+    pub apply_ns: u64,
+    pub flush_wait_ns: u64,
+    pub evaluator_ns: u64,
+}
+
+/// A bounded, self-contained slice of the real complete-episode collector.
+///
+/// Construction builds fresh Map2 worlds plus a fresh model and runs the
+/// optional warmup through the same collector that later measures, so warmup
+/// and window share one trajectory. [`Self::run`] then advances exactly the
+/// requested decision rounds and returns the work performed. The slice is
+/// single-use, which keeps criterion's batched setup and every measured window
+/// identical.
+///
+/// This is benchmark support code. Production training never constructs a
+/// slice, requires even paired stream counts, and keeps running whole
+/// episodes; the slice only exposes the same per-decision work under a caller
+/// owned bound. Opponents follow the production mastery-v1 schedule at its
+/// deterministic fresh stage (Weak), the only schedule valid across the full
+/// environment range.
+pub struct TrainingCollectionSlice {
+    settings: TrainingJobConfig,
+    model: PolicyModel,
+    environments: Vec<TrainingEnvironment>,
+    rollout: PpoRollout,
+    sampling: PpoRng,
+    update: u64,
+    warmup_rounds: usize,
+    report: PpoSmokeReport,
+    fresh: bool,
+}
+
+impl TrainingCollectionSlice {
+    /// Builds fresh worlds and model for one bounded collection slice.
+    pub fn new(
+        config: TrainingCollectionSliceConfig,
+        device: PolicyDevice,
+    ) -> Result<Self, PpoError> {
+        let settings = collection_slice_settings(config)?;
+        let model = PolicyModel::fresh_on(config.seed, device).map_err(model_error)?;
+        let mastery = crate::MasteryProgress::default();
+        let environments = if config.environments == 1 {
+            vec![episode::single_environment(
+                &settings,
+                config.update,
+                Some(&mastery),
+            )?]
+        } else {
+            episode::environments_with_mastery(&settings, config.update, Some(&mastery))?
+        };
+        assert_eq!(environments.len(), config.environments);
+        let capacity = config
+            .environments
+            .checked_mul(settings.ppo.rollout_decisions)
+            .ok_or(PpoError::InvalidConfig("collection slice capacity"))?;
+        let rollout = PpoRollout::new(capacity, model.policy_identity().map_err(model_error)?)?;
+        let mut slice = Self {
+            settings,
+            model,
+            environments,
+            rollout,
+            sampling: PpoRng::new(config.seed ^ 0x6265_6e63_686d_6172),
+            update: config.update,
+            warmup_rounds: config.warmup_rounds,
+            report: PpoSmokeReport::default(),
+            fresh: false,
+        };
+        if config.warmup_rounds > 0 {
+            // The warmup is its own window: a fresh rollout and report keep it
+            // out of the measured sample sequence, exactly as a production
+            // update would start one.
+            let mut warmup_rollout = PpoRollout::new(
+                capacity,
+                slice.model.policy_identity().map_err(model_error)?,
+            )?;
+            let mut warmup_report = PpoSmokeReport::default();
+            let mut warmup_phases = None;
+            let warmup = collection_advance(
+                &slice.settings,
+                &slice.model,
+                &mut slice.environments,
+                &mut slice.sampling,
+                slice.update,
+                config.warmup_rounds,
+                config.warmup_rounds,
+                &mut warmup_phases,
+                &mut warmup_rollout,
+                &mut warmup_report,
+            )?;
+            assert_eq!(warmup.rounds, config.warmup_rounds);
+        }
+        slice.fresh = true;
+        Ok(slice)
+    }
+
+    /// Advances one measured window of exactly `rounds` decision rounds.
+    pub fn run(&mut self, rounds: usize) -> Result<TrainingCollectionSliceReport, PpoError> {
+        assert!(self.fresh, "collection slice is single-use");
+        self.fresh = false;
+        let mut phases = None;
+        collection_advance(
+            &self.settings,
+            &self.model,
+            &mut self.environments,
+            &mut self.sampling,
+            self.update,
+            self.warmup_rounds,
+            rounds,
+            &mut phases,
+            &mut self.rollout,
+            &mut self.report,
+        )
+    }
+
+    /// Advances one measured window while recording per-phase wall time.
+    ///
+    /// The serial one-environment reference does not run the worker pool and
+    /// therefore has no phases to attribute.
+    pub fn run_phased(
+        &mut self,
+        rounds: usize,
+    ) -> Result<(TrainingCollectionSliceReport, TrainingCollectionPhaseReport), PpoError> {
+        assert!(self.fresh, "collection slice is single-use");
+        if self.environments.len() == 1 {
+            return Err(PpoError::InvalidConfig("collection slice phases"));
+        }
+        self.fresh = false;
+        let mut phases = Some(TrainingCollectionPhaseReport::default());
+        let report = collection_advance(
+            &self.settings,
+            &self.model,
+            &mut self.environments,
+            &mut self.sampling,
+            self.update,
+            self.warmup_rounds,
+            rounds,
+            &mut phases,
+            &mut self.rollout,
+            &mut self.report,
+        )?;
+        Ok((
+            report,
+            phases.expect("phase accounting stays enabled for the window"),
+        ))
+    }
+}
+
+/// Advances `rounds` decision rounds over the already warm environments.
+#[allow(clippy::too_many_arguments)]
+fn collection_advance(
+    settings: &TrainingJobConfig,
+    model: &PolicyModel,
+    environments: &mut [TrainingEnvironment],
+    sampling: &mut PpoRng,
+    update: u64,
+    warmup_rounds: usize,
+    rounds: usize,
+    phases: &mut Option<TrainingCollectionPhaseReport>,
+    rollout: &mut PpoRollout,
+    report: &mut PpoSmokeReport,
+) -> Result<TrainingCollectionSliceReport, PpoError> {
+    validate_slice_window(warmup_rounds, rounds)?;
+    let start_tick = slice_tick(environments)?;
+    let ticks_before = report.elapsed_ticks;
+    let retained_before = rollout.len();
+    let count = phases.is_some().then_some(settings.pipeline_groups);
+    let counters: Vec<episode::CollectionPhases> = (0..count.unwrap_or(0))
+        .map(|_| episode::CollectionPhases::default())
+        .collect();
+    if environments.len() == 1 {
+        episode::collect_serial_bounded(
+            model,
+            sampling,
+            &mut environments[0],
+            settings,
+            update,
+            rounds,
+            rollout,
+            report,
+        )?;
+    } else {
+        episode::collect_groups_bounded(
+            model,
+            sampling,
+            environments,
+            settings,
+            update,
+            settings.pipeline_groups,
+            rounds,
+            false,
+            (!counters.is_empty()).then_some(counters.as_slice()),
+            rollout,
+            report,
+        )?;
+    }
+    if let Some(phases) = phases {
+        for counter in &counters {
+            phases.prepare_ns += counter
+                .prepare_ns
+                .load(std::sync::atomic::Ordering::Relaxed);
+            phases.advance_ns += counter
+                .advance_ns
+                .load(std::sync::atomic::Ordering::Relaxed);
+            phases.forward_ns += counter
+                .forward_ns
+                .load(std::sync::atomic::Ordering::Relaxed);
+            phases.barrier_ns += counter
+                .barrier_ns
+                .load(std::sync::atomic::Ordering::Relaxed);
+            phases.apply_ns += counter.apply_ns.load(std::sync::atomic::Ordering::Relaxed);
+            phases.flush_wait_ns += counter
+                .flush_wait_ns
+                .load(std::sync::atomic::Ordering::Relaxed);
+            phases.evaluator_ns += counter
+                .evaluator_ns
+                .load(std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    let decisions = u64::try_from(rounds)
+        .ok()
+        .and_then(|rounds| rounds.checked_mul(environments.len() as u64))
+        .ok_or(PpoError::CounterOverflow)?;
+    let ticks = report
+        .elapsed_ticks
+        .checked_sub(ticks_before)
+        .ok_or(PpoError::CounterOverflow)?;
+    assert_eq!(
+        ticks,
+        decisions * u64::from(crate::MAP2_DECISION_INTERVAL_TICKS),
+        "bounded collection tick count"
+    );
+    assert_eq!(
+        report.terminal_wins
+            + report.terminal_losses
+            + report.terminal_draws
+            + report.episode_timeouts,
+        0,
+        "bounded collection ended an episode"
+    );
+    Ok(TrainingCollectionSliceReport {
+        environments: environments.len(),
+        warmup_rounds,
+        rounds,
+        decisions,
+        ticks,
+        start_tick,
+        end_tick: slice_tick(environments)?,
+        retained_samples: rollout.len() - retained_before,
+    })
+}
+
+fn slice_tick(environments: &[TrainingEnvironment]) -> Result<u32, PpoError> {
+    let environment = environments
+        .first()
+        .ok_or(PpoError::InvalidConfig("collection slice environments"))?;
+    Ok(environment.seats[environment.policy_seat]
+        .tracker
+        .current()
+        .ok_or(PpoError::InvalidTransition("collection slice snapshot"))?
+        .tick)
+}
+
+/// Bounds one slice window and its untimed warmup against the actor decision
+/// ceiling. Each window owns a fresh rollout, so the bounds are per window.
+fn validate_slice_window(warmup_rounds: usize, rounds: usize) -> Result<(), PpoError> {
+    if rounds == 0 || rounds > TRAINING_COLLECTION_SLICE_MAX_ROUNDS {
+        return Err(PpoError::InvalidConfig("collection slice rounds"));
+    }
+    if warmup_rounds > TRAINING_COLLECTION_SLICE_MAX_ROUNDS {
+        return Err(PpoError::InvalidConfig("collection slice warmup"));
+    }
+    Ok(())
+}
+
+fn collection_slice_settings(
+    config: TrainingCollectionSliceConfig,
+) -> Result<TrainingJobConfig, PpoError> {
+    if config.environments == 0 || config.environments > TRAINING_MAX_ENVIRONMENTS {
+        return Err(PpoError::InvalidConfig("collection slice environments"));
+    }
+    if config.environments > 1 && !episode::valid_environment_count(config.environments) {
+        return Err(PpoError::InvalidConfig(
+            "collection slice paired environment count",
+        ));
+    }
+    if config.warmup_rounds > TRAINING_COLLECTION_SLICE_MAX_ROUNDS {
+        return Err(PpoError::InvalidConfig("collection slice warmup"));
+    }
+    let settings = TrainingJobConfig {
+        mastery_config: Some(crate::MasteryConfig::default()),
+        opponent_schedule: crate::TrainingOpponentSchedule::MasteryV1,
+        episode_time_cost: 0.0,
+        terminal_only: false,
+        complete_episodes: true,
+        pipeline_groups: config.pipeline_groups,
+        updates: 1,
+        ppo: PpoConfig {
+            decision_interval_ticks: crate::MAP2_DECISION_INTERVAL_TICKS,
+            environments: config.environments,
+            rollout_decisions: crate::MAP2_RETAINED_DECISIONS,
+            epochs: 1,
+            minibatch: 512,
+            gamma_tick: MAP2_REWARD_GAMMA_TICK,
+            target_kl: 1.0,
+            ..PpoConfig::default()
+        },
+        checkpoint_cadence: TrainingCheckpointCadence::Updates(1),
+        resume_provenance: ResumeProvenance::Strict,
+        seed: config.seed,
+        map: MapId(2),
+        git_commit: String::new(),
+        simulator_commit: String::new(),
+    };
+    episode::validate_pipeline_groups(&settings)?;
+    Ok(settings)
+}
+
 /// Runs bounded PPO updates and commits exact, resumable state at fixed intervals.
 pub fn run_training_job_on<F>(
     settings: TrainingJobConfig,
@@ -2267,13 +2635,29 @@ impl TrainingSession {
         rollout: &mut PpoRollout,
         actor_report: &mut PpoSmokeReport,
     ) -> Result<(), PpoError> {
-        if settings.complete_episodes {
-            episode::collect(
+        if settings.complete_episodes && settings.pipeline_groups == 1 {
+            episode::collect_bounded(
                 &self.model,
                 &mut self.sampling,
                 environments,
                 settings,
                 update,
+                episode::ACTOR_DECISIONS,
+                true,
+                rollout,
+                actor_report,
+            )
+        } else if settings.complete_episodes {
+            episode::collect_groups_bounded(
+                &self.model,
+                &mut self.sampling,
+                environments,
+                settings,
+                update,
+                settings.pipeline_groups,
+                episode::ACTOR_DECISIONS,
+                true,
+                None,
                 rollout,
                 actor_report,
             )
@@ -2563,6 +2947,9 @@ fn merge_actor_report(
     aggregate: &mut PpoSmokeReport,
     actor: PpoSmokeReport,
 ) -> Result<(), PpoError> {
+    aggregate
+        .completed_episodes
+        .merge(&actor.completed_episodes)?;
     aggregate.map2_reward.merge(actor.map2_reward)?;
     aggregate.episode_timeouts = aggregate
         .episode_timeouts
@@ -2860,6 +3247,12 @@ fn training_checkpoint_run(
             " --episode-time-cost {}",
             settings.episode_time_cost
         ));
+    }
+    // The default one-group contract keeps the historical command line
+    // byte-identical; a grouped run is a distinct scope and cannot resume a
+    // default checkpoint (or the reverse) under strict provenance.
+    if settings.pipeline_groups > 1 {
+        command_line.push_str(&format!(" --pipeline-groups {}", settings.pipeline_groups));
     }
     Ok(CheckpointRun {
         mastery_config: settings.mastery_config,
@@ -5172,3 +5565,7 @@ fn league_error(error: crate::LeagueError) -> PpoError {
 #[cfg(test)]
 #[path = "tests/ppo_pregame.rs"]
 mod pregame_tests;
+
+#[cfg(test)]
+#[path = "tests/training_collection_slice.rs"]
+mod training_collection_slice_tests;

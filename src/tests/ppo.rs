@@ -1204,6 +1204,18 @@ fn bandit_batch(
 
 #[cfg(feature = "builtin")]
 #[test]
+fn rollout_append_rejects_a_foreign_policy_before_any_transition() {
+    let first = PolicyModel::fresh(23_081).expect("first model");
+    let second = PolicyModel::fresh(23_082).expect("second model");
+    let mut target =
+        PpoRollout::new(1, first.policy_identity().expect("first identity")).expect("target");
+    let other =
+        PpoRollout::new(1, second.policy_identity().expect("second identity")).expect("other");
+    assert_eq!(target.append(other), Err(crate::PpoError::PolicyMismatch));
+}
+
+#[cfg(feature = "builtin")]
+#[test]
 fn builtin_smoke_exercises_real_arena_rollout_and_one_ppo_update() {
     let report = crate::run_ppo_smoke(crate::PpoSmokeConfig {
         updates: 1,
@@ -1317,6 +1329,7 @@ fn assert_production_resume_matches_uninterrupted(overrides: Option<crate::Train
         episode_time_cost: 0.0,
         terminal_only: false,
         complete_episodes: false,
+        pipeline_groups: 1,
         updates: 2,
         ppo: crate::PpoConfig {
             environments: 2,
@@ -1427,6 +1440,7 @@ fn training_job_checkpoints_and_resumes_from_the_next_update() {
         episode_time_cost: 0.0,
         terminal_only: false,
         complete_episodes: false,
+        pipeline_groups: 1,
         updates: 1,
         ppo: crate::PpoConfig {
             environments: 2,
@@ -1550,6 +1564,7 @@ fn fresh_training_loads_the_requested_runtime_weights_before_the_first_update() 
         episode_time_cost: 0.0,
         terminal_only: false,
         complete_episodes: false,
+        pipeline_groups: 1,
         updates: 1,
         ppo: crate::PpoConfig {
             environments: 2,
@@ -1594,6 +1609,7 @@ fn production_training_rejects_an_unpaired_environment_count() {
             episode_time_cost: 0.0,
             terminal_only: false,
             complete_episodes: false,
+            pipeline_groups: 1,
             updates: 1,
             ppo: crate::PpoConfig {
                 environments: 1,
@@ -1634,6 +1650,7 @@ fn resumed_training_rejects_an_initial_weights_directory() {
         episode_time_cost: 0.0,
         terminal_only: false,
         complete_episodes: false,
+        pipeline_groups: 1,
         updates: 1,
         ppo: crate::PpoConfig {
             environments: 2,
@@ -1686,6 +1703,7 @@ fn training_job_rejects_a_checkpoint_directory_locked_by_another_writer() {
             episode_time_cost: 0.0,
             terminal_only: false,
             complete_episodes: false,
+            pipeline_groups: 1,
             updates: 1,
             ppo: crate::PpoConfig {
                 environments: 2,
@@ -2313,6 +2331,7 @@ fn training_job_rejects_targets_that_cannot_fit_shuffle_rng_counters() {
             episode_time_cost: 0.0,
             terminal_only: false,
             complete_episodes: false,
+            pipeline_groups: 1,
             updates: 1_000_000,
             ppo: crate::PpoConfig {
                 environments: 16,
@@ -2526,6 +2545,62 @@ fn complete_episode_cli_binds_map2_gamma_one_and_rejects_capacity_below_the_shar
 #[test]
 fn episode_sampling_replays_rng_and_retains_original_logprob_without_action_overrides() {
     crate::ppo_arena::episode::assert_rng_and_sample_provenance_for_test(&stop_policy_for_warmup());
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn pipeline_groups_require_complete_paired_configurations() {
+    for (arguments, message) in [
+        (
+            vec!["--environments", "8", "--pipeline-groups", "3"],
+            "invalid PPO config field: pipeline groups",
+        ),
+        (
+            vec!["--environments", "4", "--pipeline-groups", "4"],
+            "invalid PPO config field: pipeline groups exceed paired environments",
+        ),
+        (
+            vec![
+                "--environments",
+                "8",
+                "--pipeline-groups",
+                "2",
+                "--complete-episodes=false",
+            ],
+            "invalid PPO config field: pipeline groups require complete episodes",
+        ),
+    ] {
+        assert_eq!(
+            crate::cli::training_settings_for_test(&arguments)
+                .expect_err("invalid pipeline groups")
+                .to_string(),
+            message,
+            "arguments={arguments:?}"
+        );
+    }
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn episode_checkpoint_rejects_pipeline_group_scope_mismatch() {
+    let directory = training_test_directory("episode-groups-scope");
+    let settings = crate::cli::training_settings_for_test(&[
+        "--complete-episodes",
+        "--map",
+        "2",
+        "--environments",
+        "8",
+        "--pipeline-groups",
+        "2",
+        "--rollout",
+        &crate::MAP2_RETAINED_DECISIONS.to_string(),
+        "--minibatch",
+        "512",
+        "--gamma-per-tick",
+        "1",
+    ])
+    .expect("grouped settings");
+    crate::ppo_arena::episode::assert_pipeline_groups_scope_for_test(settings, &directory);
 }
 
 #[cfg(feature = "builtin")]

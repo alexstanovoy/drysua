@@ -68,11 +68,14 @@ impl<'scope, T: Send + 'scope, R: Send + 'scope, O: Send + 'scope> StreamWorkers
     pub(super) fn spawn(
         scope: &'scope std::thread::Scope<'scope, '_>,
         worlds: &'scope mut [T],
+        name_prefix: &str,
         operation: impl Fn(usize, &mut T, R) -> Result<O, PpoError> + Send + Sync + Copy + 'scope,
     ) -> Result<Self, PpoError> {
         if worlds.is_empty() || worlds.len() > super::TRAINING_MAX_ENVIRONMENTS {
             return Err(PpoError::InvalidConfig("stream worker environments"));
         }
+        assert!(!name_prefix.is_empty());
+        assert!(name_prefix.len() <= 32);
         let mut senders = Vec::with_capacity(worlds.len());
         let mut receivers = Vec::with_capacity(worlds.len());
         let mut handles = Vec::with_capacity(worlds.len());
@@ -80,7 +83,7 @@ impl<'scope, T: Send + 'scope, R: Send + 'scope, O: Send + 'scope> StreamWorkers
             let (request_tx, request_rx) = std::sync::mpsc::sync_channel::<R>(1);
             let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel::<Result<O, PpoError>>(1);
             let handle = std::thread::Builder::new()
-                .name(format!("ppo-env-{stream}"))
+                .name(format!("{name_prefix}-env-{stream}"))
                 .spawn_scoped(scope, move || {
                     for request in request_rx {
                         if reply_tx.send(operation(stream, world, request)).is_err() {

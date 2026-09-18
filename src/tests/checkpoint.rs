@@ -675,6 +675,7 @@ fn provenance_migration_rejects_v13_v14_v15_without_rewriting_training_manifest(
         episode_time_cost: 0.0,
         terminal_only: false,
         complete_episodes: false,
+        pipeline_groups: 1,
         updates: 1,
         ppo: crate::PpoConfig {
             gamma_tick: crate::MAP2_REWARD_GAMMA_TICK,

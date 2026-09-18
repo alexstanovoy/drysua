@@ -39,7 +39,7 @@ fn flush_evaluator_matches_direct_single_frame_values_in_submission_order() {
         sender: std::sync::Mutex::new(Some(sender)),
     };
     std::thread::scope(|scope| {
-        scope.spawn(move || flush_evaluator_loop(&model, &receiver));
+        scope.spawn(move || flush_evaluator_loop(&model, &receiver, None));
         let replies: Vec<_> = frames
             .into_iter()
             .map(|frame| {
@@ -75,7 +75,7 @@ fn flush_evaluator_reports_frame_errors_and_keeps_draining() {
         sender: std::sync::Mutex::new(Some(sender)),
     };
     std::thread::scope(|scope| {
-        scope.spawn(move || flush_evaluator_loop(&model, &receiver));
+        scope.spawn(move || flush_evaluator_loop(&model, &receiver, None));
         let (bad_sender, bad_receiver) = std::sync::mpsc::sync_channel(1);
         evaluator.submit(bad, bad_sender).expect("submit bad");
         assert!(bad_receiver.recv().expect("bad reply").is_err());

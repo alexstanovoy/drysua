@@ -30,6 +30,28 @@ impl CompletedTrainingEpisodes {
         Ok(())
     }
 
+    /// Copies every stream entry of `other`, rejecting duplicate streams.
+    ///
+    /// Pipeline groups own disjoint streams, so disjoint merges cover exactly
+    /// the same stream set as one global batch; ordering inside the ordered
+    /// outcome view is derived from the recorded ticks and streams.
+    #[cfg(any(feature = "builtin", test))]
+    pub(crate) fn merge(&mut self, other: &Self) -> Result<(), PpoError> {
+        for (stream, entry) in other.entries.iter().enumerate() {
+            let Some((tick, recorded_stream, outcome)) = entry else {
+                continue;
+            };
+            assert_eq!(*recorded_stream, stream);
+            if self.entries[stream].is_some() {
+                return Err(PpoError::InvalidTransition(
+                    "duplicate completed episode stream",
+                ));
+            }
+            self.entries[stream] = Some((*tick, *recorded_stream, *outcome));
+        }
+        Ok(())
+    }
+
     pub fn ordered_outcomes(&self) -> Vec<TrainingGameOutcome> {
         let mut entries: Vec<_> = self.entries.iter().flatten().copied().collect();
         assert!(entries.len() <= crate::MAX_TRAINING_ENVIRONMENTS);

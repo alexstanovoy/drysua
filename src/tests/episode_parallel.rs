@@ -106,14 +106,15 @@ fn empty_and_single_jobs_need_no_parallel_barrier() {
 fn stream_workers_keep_stream_order_and_survive_one_worker_error() {
     let mut worlds = [0u32; 4];
     std::thread::scope(|scope| {
-        let workers = StreamWorkers::spawn(scope, &mut worlds, |stream, world, request: u32| {
-            if request == 99 {
-                return Err(PpoError::InvalidConfig("worker failure"));
-            }
-            *world += request;
-            Ok((stream, *world))
-        })
-        .expect("stream workers");
+        let workers =
+            StreamWorkers::spawn(scope, &mut worlds, "ppo", |stream, world, request: u32| {
+                if request == 99 {
+                    return Err(PpoError::InvalidConfig("worker failure"));
+                }
+                *world += request;
+                Ok((stream, *world))
+            })
+            .expect("stream workers");
         workers.submit(0, 5).expect("submit");
         workers.submit(2, 7).expect("submit");
         workers.submit(1, 99).expect("submit");
@@ -144,7 +145,7 @@ fn stream_workers_match_the_one_shot_executor_on_identical_requests() {
     let expected = ordered_active(&mut one_shot, schedule.to_vec(), operation).expect("one shot");
     let mut worlds = [1u64, 2, 3, 4, 5, 6];
     let actual = std::thread::scope(|scope| {
-        let workers = StreamWorkers::spawn(scope, &mut worlds, operation).expect("workers");
+        let workers = StreamWorkers::spawn(scope, &mut worlds, "ppo", operation).expect("workers");
         for (stream, value) in schedule {
             workers.submit(stream, value).expect("submit");
         }
