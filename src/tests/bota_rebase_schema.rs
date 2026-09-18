@@ -4,10 +4,7 @@ use std::collections::HashMap;
 
 #[test]
 fn rebase_inference_versions_reject_old_effect_and_healing_interpretations() {
-    assert_eq!(crate::FEATURE_SCHEMA_VERSION, 22);
-    assert_eq!(crate::MODEL_SCHEMA_VERSION, 24);
-    assert_eq!(crate::PPO_SCHEMA_VERSION, 37);
-    assert_eq!(crate::PPO_RULES_AUDIT_VERSION, 32);
+    crate::tests::support::assert_frozen_schema_versions();
     assert_eq!(crate::LEAGUE_SCHEMA_VERSION, 37);
     assert_eq!(crate::CHECKPOINT_SCHEMA_VERSION, 12);
     assert_eq!(crate::GLOBAL_FEATURES, 92);

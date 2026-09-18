@@ -3,7 +3,6 @@
 import ctypes
 import contextlib
 import errno
-import hashlib
 import importlib
 import io
 import json
@@ -23,8 +22,6 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
-from release_crossplay import outcome_summary, read_client_output
-
 
 ROOT = Path(__file__).resolve().parents[2]
 TEMPORARY = ROOT / "drysua/artifacts/temp"
@@ -41,11 +38,86 @@ CURRENT_METADATA = {
     "map2_reward_schema_version": "7",
     "map2_reward_schema_hash": "7274660837025042530",
 }
+# Bounded native client-output assertions moved here from the archived historical
+# release evaluator when that harness left the tracked tree.
+SUMMARY = re.compile(r"played (\d+) ticks as Some\((Radiant|Dire)\); winner "
+                     r"(None|Some\((Radiant|Dire|Neutral)\)); "
+                     r"\d+ decisions, \d+ orders, (\d+) rejected orders\n?")
+CLIENT_OUTPUT_LIMIT = 1024 * 1024
+TELEMETRY_LINE_LIMIT = 4096
+POLICY_FIELD = r"policy=(?:teacher|hybrid|neural|tactical)"
+RECEIVE_FIELD = (r"receive_wait_scope=(?:socket_read|wire_hear_including_decode"
+                 r"|mixed_socket_read_and_wire_hear|unavailable)")
+SEAT_FIELDS = rf"slot=(?P<slot>[01]) {POLICY_FIELD} mode=(?:lockstep|realtime)"
+HISTOGRAM_FIELDS = "".join(
+    rf" {name}_count=\d+ {name}_total_ns=\d+ {name}_p50_upper_ns=(?:\d+|unknown)"
+    rf" {name}_p95_upper_ns=(?:\d+|unknown) {name}_max_ns=\d+"
+    for name in ("compute", "receive_wait", "decision", "order_send", "ack_send"))
+ASYNC_LOG_FIELDS = r"(?: dropped_logs=(?P<dropped_logs>0|[1-9][0-9]{0,19}))?"
+TELEMETRY = tuple(re.compile(pattern + ASYNC_LOG_FIELDS) for pattern in (
+    rf"level=INFO event=live_performance_start {SEAT_FIELDS} tick_rate=30 "
+    rf"report_every=\d+ debug_every=\d+ debug_limit=\d+ {RECEIVE_FIELD} "
+    r"compute_scope=internal_elapsed_excluding_receive_and_send",
+    r"level=(?:INFO|WARN) event=live_performance scope=(?:window|total) "
+    r"reason=(?:periodic|match_over|limit) updates=\d+ progress_ticks=\d+ elapsed_ns=\d+ "
+    r"updates_per_second=(?:\d+\.\d{3}|unknown) realtime_factor=(?:\d+\.\d{3}|unknown) "
+    r"tick_rate=30 budget_ns=\d+ compute_overruns=\d+ service_overruns=\d+ percentiles=log2_upper_bounds"
+    rf"{HISTOGRAM_FIELDS} pending_update=(?:true|false) saturated=false {SEAT_FIELDS} "
+    rf"{RECEIVE_FIELD} timing_valid=true",
+    rf"level=DEBUG event=live_decision slot=(?P<slot>[01]) {POLICY_FIELD} tick=\d+ "
+    r"decision_ns=(?:\d+|unknown) order_sent=(?:true|false) order_send_ns=(?:\d+|unknown) "
+    r"ack_send_ns=(?:\d+|unknown)",
+    r'level=INFO event=live_performance_config_defaulted reason="DRYSUA_PERF_DEBUG_EVERY must be '
+    r'(?:Unicode digits|an integer in 0\.\.=4294967295)"',
+))
+assert TELEMETRY_LINE_LIMIT < CLIENT_OUTPUT_LIMIT
+
+
+def outcome_summary(text, slot):
+    """Find exactly one summary amid known, bounded telemetry; retain the original log."""
+    assert slot in (0, 1)
+    if len(text) > CLIENT_OUTPUT_LIMIT or len(text.encode("utf-8")) > CLIENT_OUTPUT_LIMIT:
+        raise ValueError("client output limit exceeded")
+    summary = None
+    for line in text.splitlines():
+        if len(line) > TELEMETRY_LINE_LIMIT:
+            raise ValueError("client output line limit exceeded")
+        match = SUMMARY.fullmatch(line)
+        if match:
+            if summary is not None:
+                raise ValueError("duplicate client outcome")
+            summary = match
+            continue
+        records = [pattern.fullmatch(line) for pattern in TELEMETRY]
+        record = next((record for record in records if record is not None), None)
+        if record is None:
+            raise ValueError("invalid client telemetry or unexpected output")
+        if record.groupdict().get("slot") is not None and int(record["slot"]) != slot:
+            raise ValueError("invalid client telemetry or unexpected output")
+        if record["dropped_logs"] is not None and int(record["dropped_logs"]) > 2**64 - 1:
+            raise ValueError("invalid client dropped_logs counter")
+    return summary
+
+
+def read_client_output(path):
+    """Read at most one MiB of UTF-8 client output, detecting growth with a sentinel byte."""
+    with path.open("rb") as stream:
+        data = stream.read(CLIENT_OUTPUT_LIMIT + 1)
+    if len(data) > CLIENT_OUTPUT_LIMIT:
+        raise ValueError("client output limit exceeded")
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError as error:
+        raise ValueError("client output is not UTF-8") from error
 
 
 def rust_descriptor(module, name):
-    source = (ROOT / f"drysua/src/{module}.rs").read_text()
-    match = re.search(rf"pub(?:\((?:crate|super)\))? const {name}: &str = concat!\((.*?)\n\);", source, re.S)
+    pattern = rf"pub(?:\((?:crate|super)\))? const {name}: &str = concat!\((.*?)\n\);"
+    match = None
+    for relative in (f"drysua/src/{module}.rs", f"drysua/src/tests/{module}_test_support.rs"):
+        match = re.search(pattern, (ROOT / relative).read_text(), re.S)
+        if match is not None:
+            break
     assert match is not None, name
     strings = re.findall(r'"(?:[^"\\]|\\.)*"', match[1])
     assert strings, name
@@ -328,9 +400,8 @@ class LauncherTests(unittest.TestCase):
             (directory / "target/release").mkdir(parents=True)
             (directory / "Cargo.toml").write_text("[workspace]\n")
         (self.root / "drysua/scripts").mkdir()
-        shutil.copy(ROOT / "play.sh", self.root / "play.sh")
-        shutil.copy(ROOT / "drysua/scripts/play_match.py", self.root / "drysua/scripts")
-        for name in ("play_admission.py", "play_weights.py", "play_reward.py", "play_pacing.py", "release_wire.py"):
+        for name in ("play.sh", "play_match.py", "play_admission.py", "play_weights.py",
+                     "play_reward.py", "play_pacing.py", "release_wire.py"):
             source = ROOT / "drysua/scripts" / name
             if source.exists():
                 shutil.copy(source, self.root / "drysua/scripts")
@@ -341,15 +412,6 @@ class LauncherTests(unittest.TestCase):
                        self.root / "drysua/target/release/drysua"):
             binary.write_text(f"#!{sys.executable} -B\n" + FIXTURE)
             binary.chmod(0o700)
-        review = self.root / REVIEW
-        (review / "weights").mkdir(parents=True)
-        shutil.copy(self.root / "drysua/target/release/drysua", review / "drysua")
-        (review / "weights/drysua.weights.safetensors").write_bytes(b"fixture weights")
-        (review / "manifest.json").write_text('{"purpose": "human-review fixture"}\n')
-        launcher = self.root / "drysua/scripts/play_match.py"
-        launcher.write_text(launcher.read_text().replace(
-            BINARY_SHA, hashlib.sha256((review / "drysua").read_bytes()).hexdigest()).replace(
-            WEIGHTS_SHA, hashlib.sha256(b"fixture weights").hexdigest()))
         self.weights = self.root / "current metadata fixture"
         self.weights.mkdir()
         (self.weights / "drysua.weights.safetensors").write_bytes(header_fixture(metadata_fixture()))
@@ -372,7 +434,7 @@ class LauncherTests(unittest.TestCase):
         self.environment.update(environment)
         if weights and "--weights-directory" not in arguments:
             arguments = ("--weights-directory", str(self.weights), *arguments)
-        self.process = subprocess.Popen([str(self.root / "play.sh"), *arguments],
+        self.process = subprocess.Popen([str(self.root / "drysua/scripts/play.sh"), *arguments],
                                         cwd=self.temporary.name, env=self.environment,
                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                         start_new_session=True)
@@ -475,8 +537,8 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(self.process.returncode, 0, error.decode())
         self.assertIn(b"--no-build", output)
 
-    def test_explicit_weights_build_current_cpu_and_bota_and_launch_map2_pure_neural(self):
-        port = self.game()
+    def test_explicit_build_flag_rebuilds_both_workspaces_and_launches_map2_pure_neural(self):
+        port = self.game("--build")
         build = self.child("build-bota")
         self.assertEqual(build["target"], str(self.root / "bota/target"))
         self.assertEqual(build["arguments"], ["build", "--release", "--locked", "--quiet",
@@ -525,8 +587,26 @@ class LauncherTests(unittest.TestCase):
         self.send("bota-client", b"0")
         self.finish(0)
 
+    def test_default_uses_existing_release_binaries_without_building(self):
+        self.game()
+        self.assertNotIn("build-bota", self.children)
+        self.assertNotIn("build-drysua", self.children)
+        self.send("bota-client", b"0")
+        self.finish(0)
+        self.assert_children_stopped()
+
+    def test_default_builds_only_missing_release_workspace(self):
+        (self.root / "drysua/target/release/drysua").unlink()
+        self.launch()
+        self.child("build-drysua")
+        self.assertNotIn("build-bota", self.children)
+        # The mock cargo never materializes binaries; a still-missing bot must fail
+        # closed before the server starts, never fall back to a stale executable.
+        self.assertIn("release executable missing", self.finish(1))
+        self.assert_children_stopped()
+
     def test_interrupt_during_build_kills_children_and_term_ignoring_grandchildren(self):
-        self.launch(PLAY_TEST_BUILD="hold")
+        self.launch("--build", PLAY_TEST_BUILD="hold")
         self.send("build-bota", b"d")
         self.child("build-bota-child")
         self.child("build-bota-child-grandchild")
@@ -559,7 +639,7 @@ class LauncherTests(unittest.TestCase):
         self.assert_children_stopped()
 
     def test_term_escalates_when_build_ignores_term(self):
-        self.launch(PLAY_TEST_BUILD="hold")
+        self.launch("--build", PLAY_TEST_BUILD="hold")
         self.send("build-bota", b"i")
         self.assertEqual(json.loads(self.child("build-bota")["stream"].readline(8192)),
                          {"ignoring": True})
@@ -568,13 +648,13 @@ class LauncherTests(unittest.TestCase):
         self.assert_children_stopped()
 
     def test_build_failure_stops_before_server_and_reports_log(self):
-        self.launch(PLAY_TEST_BUILD="hold")
+        self.launch("--build", PLAY_TEST_BUILD="hold")
         self.send("build-bota", b"7")
         self.assertIn("build-bota exited", self.finish(1))
         self.assert_children_stopped()
 
-    def test_current_bot_build_failure_never_starts_server_or_uses_review_binary(self):
-        self.launch(PLAY_TEST_BUILD="build-drysua")
+    def test_current_bot_build_failure_never_starts_server_or_falls_back(self):
+        self.launch("--build", PLAY_TEST_BUILD="build-drysua")
         self.send("build-drysua", b"7")
         self.assertIn("build-drysua exited with status 7", self.finish(1))
         self.assertNotIn("bota-server", self.children)
@@ -651,15 +731,20 @@ class LauncherTests(unittest.TestCase):
                 self.assertIn(b"expected a decimal integer in 0..", error)
 
     def test_source_and_cargo_preflight_fail_before_artifacts(self):
+        module = importlib.import_module("play_match")
+        with patch("play_match.shutil.which", return_value=None), patch.dict(os.environ, DISPLAY=":fixture"):
+            # Existing release binaries make cargo unnecessary without --build.
+            self.assertIsNone(module.preflight(self.root, False, False))
+            with self.assertRaisesRegex(RuntimeError, "cargo is required"):
+                module.preflight(self.root, False, True)
         for target, message in ((self.tools / "cargo", b"cargo is required"),
                                 (self.root / "bota/Cargo.toml", b"source manifest missing")):
             with self.subTest(target=target), patch("play_match.shutil.which", return_value=None):
-                module = importlib.import_module("play_match")
                 if target.name != "cargo":
                     target.unlink()
                 with patch.dict(os.environ, DISPLAY=":fixture"):
                     with self.assertRaisesRegex(RuntimeError, message.decode()):
-                        module.preflight(self.root, False)
+                        module.preflight(self.root, False, True)
         self.assertFalse(list((self.root / "drysua/artifacts/temp").glob("play-*")))
 
     def test_faster_bot_waits_for_human_complete_welcome_before_server_admission(self):
@@ -749,31 +834,6 @@ class LauncherTests(unittest.TestCase):
         self.finish(143)
         self.assert_children_stopped()
         self.assert_relay_ports_closed()
-
-    def test_historical_review_utility_still_rejects_tampered_archive(self):
-        module = importlib.import_module("play_match")
-        review = self.root / REVIEW
-        with patch.object(module, "REVIEW_BINARY_SHA", hashlib.sha256((review / "drysua").read_bytes()).hexdigest()), \
-                patch.object(module, "REVIEW_WEIGHTS_SHA", hashlib.sha256(b"fixture weights").hexdigest()):
-            self.check_tampered_archive(module)
-
-    def check_tampered_archive(self, module):
-        for relative in ("weights/drysua.weights.safetensors", "drysua", "manifest.json"):
-            target = self.root / REVIEW / relative
-            original = target.read_bytes()
-            with self.subTest(file=relative):
-                try:
-                    target.write_bytes(b"corrupt")
-                    with self.assertRaisesRegex(RuntimeError, "review"):
-                        module.review_paths(self.root, None)
-                finally:
-                    target.write_bytes(original)
-
-    def test_missing_review_copy_does_not_affect_explicit_current_selection(self):
-        (self.root / REVIEW / "drysua").unlink()
-        self.game("--no-build")
-        self.send("bota-client", b"0")
-        self.finish(0)
 
     def preflight_failure(self, message):
         output, error = self.process.communicate(timeout=5)
@@ -1474,10 +1534,7 @@ class SupervisorTests(unittest.TestCase):
         TEMPORARY.mkdir(parents=True, exist_ok=True)
         self.module = importlib.import_module("play_match")
 
-    def test_review_pins_and_replay_limit_match_human_review_contract(self):
-        self.assertEqual(self.module.REVIEW_DIRECTORY, REVIEW)
-        self.assertEqual(self.module.REVIEW_BINARY_SHA, BINARY_SHA)
-        self.assertEqual(self.module.REVIEW_WEIGHTS_SHA, WEIGHTS_SHA)
+    def test_replay_limit_matches_bounded_local_budget(self):
         self.assertEqual(self.module.REPLAY_LIMIT, 2 * 1024**3)
 
     def test_no_arguments_select_human_radiant_bot_dire_and_no_weights_override(self):
@@ -1487,6 +1544,14 @@ class SupervisorTests(unittest.TestCase):
         self.assertIsNone(arguments.weights_directory)
         self.assertEqual(arguments.port, 4455)
         self.assertEqual(arguments.seed, 9000001)
+        self.assertFalse(arguments.build)
+        self.assertFalse(arguments.no_build)
+
+    def test_build_and_no_build_flags_are_mutually_exclusive(self):
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as raised:
+                self.module.parse_arguments(["--build", "--no-build"])
+        self.assertEqual(raised.exception.code, 2)
 
     def test_readiness_requires_complete_exact_line_and_valid_matching_port(self):
         parse = self.module.ready_port

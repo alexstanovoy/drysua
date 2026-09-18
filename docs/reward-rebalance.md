@@ -1,7 +1,7 @@
 # Map2 reward7: reward5 dense terms, smaller terminals and a victory-time bonus
 
 These coefficients are engineering choices, not a trained-model strength claim.
-Reward6 changes only terminal values. Reward5 dense coefficients and rolling mastery
+Reward6 changed only terminal values; reward7 adds the win-only victory-time bonus. Reward5 dense coefficients and rolling mastery
 scheduling/window semantics are unchanged. Historical reward5 reports remain unchanged.
 
 ## Diminishing event channels

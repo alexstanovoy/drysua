@@ -81,10 +81,6 @@ impl TacticalFeatures {
         }
         Ok(Self(values))
     }
-
-    pub const fn values(&self) -> &[f32; TACTICAL_FEATURES] {
-        &self.0
-    }
 }
 
 /// Immutable, allocation-free inference; no random or hidden state enters decisions.

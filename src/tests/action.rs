@@ -1,11 +1,12 @@
 use std::collections::BTreeSet;
 
 use bota_proto::{
-    AbilityId, AbilitySlot, AbilityView, Aim, Angle, Attribute, Attributes, EntityId, Fixed,
-    HeroId, ItemId, ItemSlot, ItemView, LootView, MapId, MatchInfo, Order, Pick, PlayerView,
-    ShopEntry, SlotId, StatusFlags, Target, Team, TickMode, UnitKind, UnitView, Vec2, WorldView,
+    AbilityId, AbilitySlot, AbilityView, Aim, Attribute, Attributes, EntityId, Fixed, HeroId,
+    ItemId, ItemSlot, ItemView, LootView, MapId, MatchInfo, Order, PlayerView, ShopEntry, SlotId,
+    StatusFlags, Target, Team, TickMode, UnitKind, UnitView, Vec2, WorldView,
 };
 
+use super::fixtures;
 use crate::{
     ActionError, ActionKind, ActionSpace, ActionTarget, ControlledUnit, EntityIndex,
     EntityRelation, LandmarkRelation, LootIndex, MAX_POINT_CANDIDATES, PointDirection, PointIndex,
@@ -1123,8 +1124,6 @@ fn inventory_economy_and_learning_masks_cover_positive_and_negative_boundaries()
     view.players[0].stash = Some(vec![Some(item(Some(Aim::Own), 0)); 6]);
     let full_stash = ActionSpace::from_tracker(&tracker_with_view(view.clone())).expect("space");
     assert!(full_stash.take_mask(ControlledUnit::Hero)[0]);
-    assert!(!full_stash.has_sell_ownership_uncertainty());
-    assert_eq!(full_stash.sell_ownership_uncertain_count(), 0);
     assert!(full_stash.sell_slot_mask(ControlledUnit::Hero)[0]);
     assert!(!full_stash.sell_slot_mask(ControlledUnit::Hero)[1]);
     assert!(
@@ -1170,7 +1169,6 @@ fn sell_requires_for_sale_as_prior_ownership_proof() {
 
     assert!(!space.sell_slot_mask(ControlledUnit::Hero)[0]);
     assert!(space.sell_slot_mask(ControlledUnit::Hero)[1]);
-    assert!(!space.has_sell_ownership_uncertainty());
 }
 
 #[test]
@@ -1869,33 +1867,16 @@ fn item_with_id(id: ItemId, aim: Option<Aim>, range: i32, for_sale: bool) -> Ite
 }
 
 fn match_info() -> MatchInfo {
-    MatchInfo {
-        match_id: 1,
-        map: MapId(0),
-        tick_rate: 30,
-        pregame_ticks: 90,
-        trees: vec![
+    fixtures::MatchInfoFixture::new(1, MapId(0), fixtures::two_seat_picks(Team::Radiant))
+        .pregame_ticks(90)
+        .trees(vec![
             Vec2::from_ints(2_050, 2_050),
             Vec2::from_ints(2_100, 2_100),
             Vec2::from_ints(2_200, 1_900),
-        ],
-        terrain_cells: 128,
-        terrain_rle: vec![(16_384, 0x80)],
-        opaque_cells: Vec::new(),
-        mode: TickMode::Lockstep,
-        picks: vec![
-            Pick {
-                slot: SlotId(0),
-                team: Team::Radiant,
-                hero: SHADOW_FIEND,
-            },
-            Pick {
-                slot: SlotId(1),
-                team: Team::Dire,
-                hero: SHADOW_FIEND,
-            },
-        ],
-        shop: vec![
+        ])
+        .terrain_cells(128)
+        .terrain_rle(vec![(16_384, 0x80)])
+        .shop(vec![
             ShopEntry {
                 id: ItemId(0),
                 cost: 50,
@@ -1906,8 +1887,8 @@ fn match_info() -> MatchInfo {
                 cost: 700,
                 components: Vec::new(),
             },
-        ],
-    }
+        ])
+        .build()
 }
 
 fn world_view(tick: u32) -> WorldView {
@@ -1979,38 +1960,21 @@ fn enemy_creep(id: EntityId, x: i32, y: i32) -> UnitView {
 }
 
 fn unit(id: EntityId, kind: UnitKind, team: Team, x: i32, y: i32) -> UnitView {
-    UnitView {
+    fixtures::UnitFixture {
         id,
         kind,
         team,
         pos: Vec2::from_ints(x, y),
-        facing: Angle { brads: 0 },
-        hp: 1_000,
-        max_hp: 1_000,
         mana: 0,
-        max_mana: 0,
-        move_speed: Fixed::from_int(300),
         attack_damage: 50,
-        attack_range: Fixed::from_int(500),
         attack_time: 1000,
-        attack_point: 0,
-        attack_speed: 100,
-        armor: Fixed::ZERO,
-        magic_resist: Fixed::ZERO,
-        collision: Fixed::from_int(24),
-        bound: Fixed::from_int(24),
-        vision_radius: Fixed::from_int(1_800),
-        true_sight_radius: Fixed::ZERO,
-        statuses: StatusFlags { bits: 0 },
         attributes: Attributes::all(20),
         primary: Some(Attribute::Agility),
         hero: (kind == UnitKind::Hero).then_some(HeroId(2)),
         owner: None,
         level: 0,
-        abilities: Vec::new(),
-        items: Vec::new(),
-        effects: Vec::new(),
     }
+    .build()
 }
 
 fn ability(aim: Aim, range: i32) -> AbilityView {

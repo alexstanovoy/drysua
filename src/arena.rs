@@ -2,6 +2,10 @@
 #[path = "tests/arena_map2.rs"]
 mod map2_tests;
 
+#[cfg(test)]
+#[path = "tests/arena_test_support.rs"]
+mod test_support;
+
 use core::fmt;
 
 use bota_proto::{EntityId, EventKind, MapId, Order, Pick, ServerMsg, SlotId, Team, TickMode};
@@ -188,17 +192,6 @@ impl Arena {
     /// Current simulation tick.
     pub fn tick(&self) -> u32 {
         self.world.tick
-    }
-
-    #[cfg(test)]
-    pub(crate) fn configure_for_test(&mut self, configure: impl FnOnce(&mut World)) -> ArenaStep {
-        configure(&mut self.world);
-        self.world.settle();
-        self.world.lay_passability();
-        let mut messages = vec![Vec::new(); self.picks.len()];
-        self.append_tick_messages(&mut messages, &[]);
-        assert_eq!(messages.len(), self.seat_count());
-        ArenaStep { messages }
     }
 
     fn append_tick_messages(&self, messages: &mut [Vec<ServerMsg>], events: &[Event]) {

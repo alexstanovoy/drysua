@@ -38,7 +38,7 @@ def read_runtime_metadata(directory):
                 or any(metadata.get(key) != value for key, value in CURRENT_METADATA.items())
                 or not isinstance(metadata.get(REWARD_DESCRIPTOR_KEY), str)):
             raise ValueError("incompatible runtime weights metadata: expected exact nine-key "
-                              "F22/M24, A5, PPO37/rules32, Map2 reward v6 identity")
+                              "F22/M24, A5, PPO37/rules32, Map2 reward v7 identity")
         descriptor = metadata[REWARD_DESCRIPTOR_KEY].encode("utf-8")
         if fnv1a(descriptor) != int(CURRENT_METADATA["map2_reward_schema_hash"]):
             raise ValueError("incompatible runtime weights metadata: F22/M24 Map2 reward descriptor mismatch")

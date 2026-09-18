@@ -1,9 +1,10 @@
 use bota_proto::{
-    AbilityId, AbilitySlot, AbilityView, Aim, Angle, Attribute, Attributes, EffectId, EffectView,
+    AbilityId, AbilitySlot, AbilityView, Aim, Attribute, Attributes, EffectId, EffectView,
     EntityId, Fixed, ItemId, ItemSlot, ItemView, MapId, MatchInfo, Order, Pick, PlayerView,
     ShopEntry, SlotId, StatusFlags, Target, Team, TickMode, UnitKind, UnitView, Vec2, WorldView,
 };
 
+use super::fixtures;
 use crate::{
     ActionError, ActionKind, ActionSpace, ActionTarget, ControlledUnit, EntityIndex, ItemReadiness,
     PointIndex, SHADOW_FIEND, ShopIndex, StateTracker, StructuredAction,
@@ -810,7 +811,7 @@ fn full_view() -> WorldView {
 }
 
 fn unit(index: u32, kind: UnitKind) -> UnitView {
-    UnitView {
+    fixtures::UnitFixture {
         id: EntityId {
             idx: index,
             generation: 1,
@@ -818,33 +819,16 @@ fn unit(index: u32, kind: UnitKind) -> UnitView {
         kind,
         team: Team::Radiant,
         pos: Vec2::from_ints(2_000, 2_000),
-        facing: Angle { brads: 0 },
-        hp: 1_000,
-        max_hp: 1_000,
         mana: 0,
-        max_mana: 0,
-        move_speed: Fixed::from_int(300),
         attack_damage: 50,
-        attack_range: Fixed::from_int(500),
         attack_time: 1000,
-        attack_point: 0,
-        attack_speed: 100,
-        armor: Fixed::ZERO,
-        magic_resist: Fixed::ZERO,
-        collision: Fixed::from_int(24),
-        bound: Fixed::from_int(24),
-        vision_radius: Fixed::from_int(1_800),
-        true_sight_radius: Fixed::ZERO,
-        statuses: StatusFlags { bits: 0 },
         attributes: Attributes::all(20),
         primary: Some(Attribute::Agility),
         hero: None,
         owner: None,
         level: 1,
-        abilities: Vec::new(),
-        items: Vec::new(),
-        effects: Vec::new(),
     }
+    .build()
 }
 
 fn player() -> PlayerView {

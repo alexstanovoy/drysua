@@ -10,12 +10,11 @@ mod bota_rebase_schema;
 mod checkpoint;
 mod cli;
 mod feature;
+mod fixtures;
 mod fountain_wait_features;
 mod fountain_wait_initialization;
 mod fountain_wait_initialization_utility;
 mod imitation;
-#[cfg(feature = "builtin")]
-mod laning;
 mod league;
 mod link;
 mod map2_actions;
@@ -35,6 +34,8 @@ mod navigation_initialization_utility;
 #[cfg(feature = "builtin")]
 mod neural_order_contract;
 #[cfg(feature = "builtin")]
+mod neural_order_seat;
+#[cfg(feature = "builtin")]
 mod neural_persistence;
 #[cfg(feature = "builtin")]
 mod parity;
@@ -46,6 +47,7 @@ mod progress_debt_initialization;
 mod readiness;
 mod reward_observer;
 mod seat;
+pub(crate) mod support;
 mod tactical;
 mod teacher;
 #[cfg(feature = "builtin")]

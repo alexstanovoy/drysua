@@ -210,17 +210,10 @@ fn initialize_authorized_u300_terminal02_artifact_only() {
 fn initialization_run(config: crate::PpoConfig, command_line: String) -> crate::CheckpointRun {
     assert!(!command_line.is_empty());
     assert_eq!(config.gamma_tick, 1.0);
-    crate::CheckpointRun {
-        mastery_config: None,
-        git_commit: std::env::var("DRYSUA_GIT_COMMIT").unwrap(),
-        simulator_commit: std::env::var("BOTA_GIT_COMMIT").unwrap(),
-        enabled_features: crate::compiled_features(),
+    crate::tests::support::initialization_run(
+        9142200,
+        config.minibatch,
         command_line,
-        run_seed: 9142200,
-        map: crate::MAP2_ID,
-        hero: crate::SHADOW_FIEND,
-        device: crate::CheckpointDevice::Cpu,
-        batch_size: config.minibatch,
-        rules_audit_version: crate::PPO_RULES_AUDIT_VERSION,
-    }
+        &crate::tests::support::TRAINING_PROVENANCE,
+    )
 }

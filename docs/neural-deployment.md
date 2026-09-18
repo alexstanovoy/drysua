@@ -40,7 +40,8 @@ No default promotion is part of this change.
 ## Evaluation identities
 
 Historical release crossplay remains Map1, with both seats for each registry seed
-(20 games per opponent for the current ten seeds):
+(20 games per opponent for the current ten seeds). **The harness itself is archived
+as of 2026-09-18** (`docs/release-crossplay.md`); the command below is historical:
 
 ```sh
 python3 scripts/release_crossplay.py \

@@ -1,35 +1,14 @@
 use std::collections::VecDeque;
 
-use bota_proto::{
-    EntityId, MapId, MatchInfo, Order, Pick, PlayerId, ServerMsg, SlotId, Team, TickMode, WorldView,
-};
+#[cfg(feature = "builtin")]
+use bota_proto::{EntityId, Order};
+use bota_proto::{MapId, MatchInfo, Pick, PlayerId, ServerMsg, SlotId, Team, TickMode, WorldView};
 
+use super::fixtures;
+use crate::tests::support::RecordingWire as MockWire;
 #[cfg(feature = "builtin")]
 use crate::{ActionKind, MODEL_PARAMETER_COUNT, PolicyModel};
-use crate::{SHADOW_FIEND, Seated, Wire, play_idle_on};
-
-struct MockWire {
-    messages: VecDeque<ServerMsg>,
-    acknowledgements: Vec<u32>,
-    orders: Vec<(Option<EntityId>, Order)>,
-}
-
-impl Wire for MockWire {
-    fn hear(&mut self) -> std::io::Result<Option<ServerMsg>> {
-        Ok(self.messages.pop_front())
-    }
-
-    fn order(&mut self, unit: Option<EntityId>, order: Order) -> std::io::Result<u32> {
-        self.orders.push((unit, order));
-        u32::try_from(self.orders.len())
-            .map_err(|_| std::io::Error::other("mock order sequence overflow"))
-    }
-
-    fn acknowledge(&mut self, tick: u32) -> std::io::Result<()> {
-        self.acknowledgements.push(tick);
-        Ok(())
-    }
-}
+use crate::{SHADOW_FIEND, Seated, play_idle_on};
 
 #[test]
 fn tactical_loader_rejects_wrong_length_schema_and_nonfinite_parameters() {
@@ -645,23 +624,17 @@ fn seated(mode: TickMode) -> Seated {
 }
 
 fn match_info(mode: TickMode) -> MatchInfo {
-    MatchInfo {
-        match_id: 7,
-        map: MapId(1),
-        tick_rate: 30,
-        pregame_ticks: 0,
-        trees: Vec::new(),
-        terrain_cells: 0,
-        terrain_rle: Vec::new(),
-        opaque_cells: Vec::new(),
-        mode,
-        picks: vec![Pick {
+    fixtures::MatchInfoFixture::new(
+        7,
+        MapId(1),
+        vec![Pick {
             slot: SlotId(0),
             team: Team::Radiant,
             hero: SHADOW_FIEND,
         }],
-        shop: Vec::new(),
-    }
+    )
+    .mode(mode)
+    .build()
 }
 
 fn world_view(tick: u32) -> WorldView {

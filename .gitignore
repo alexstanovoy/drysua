@@ -1,2 +1,6 @@
 /target/
 /artifacts/temp/
+/artifacts/runtimes-current/
+/heavy.lock
+__pycache__/
+*.py[cod]

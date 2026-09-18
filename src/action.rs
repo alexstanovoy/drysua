@@ -16,6 +16,13 @@ use crate::{
     ItemReadiness, MAX_ABILITY_SLOTS, MAX_LOOT, MAX_POINT_CANDIDATES, MAX_SHOP_ITEMS, StateTracker,
     TERRAIN_CELL_SIZE, UNIT_TOKENS,
 };
+
+#[cfg(test)]
+#[path = "tests/action_test_support.rs"]
+mod test_support;
+#[cfg(test)]
+pub(crate) use test_support::*;
+
 /// Distance at which drysua permits stash swaps around the own fountain.
 pub const STASH_ACCESS_RANGE: i32 = 1_000;
 /// Version of the append-only structured-action schema.
@@ -34,18 +41,10 @@ pub const ACTION_SCHEMA_DESCRIPTOR: &str = concat!(
     "entity_order=active_effect15_max_lexicographic_stacks_remaining_then_guarded13_inspired14_timers_then_prior_received_manual_hp_mana_report_semantics_before_opaque_id;",
 );
 /// Stable FNV-1a identity of [`ACTION_SCHEMA_DESCRIPTOR`].
-pub const ACTION_SCHEMA_HASH: u64 = action_schema_hash(ACTION_SCHEMA_DESCRIPTOR.as_bytes());
-
-const fn action_schema_hash(bytes: &[u8]) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    let mut index = 0usize;
-    while index < bytes.len() {
-        hash ^= bytes[index] as u64;
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-        index += 1;
-    }
-    hash
-}
+pub const ACTION_SCHEMA_HASH: u64 = crate::model::fnv1a_extend(
+    crate::model::FNV_OFFSET,
+    ACTION_SCHEMA_DESCRIPTOR.as_bytes(),
+);
 
 const ACTION_KIND_COUNT: usize = 16;
 const ACTIVE_ITEM_SLOTS: usize = 6;
@@ -241,9 +240,6 @@ pub enum StructuredAction {
         slot: AbilitySlot,
     },
 }
-
-/// Short public name for one strongly typed structured action.
-pub type Action = StructuredAction;
 
 impl StructuredAction {
     /// Top-level discriminator used by the kind mask.
@@ -795,21 +791,6 @@ impl ActionSpace {
     /// Static shop candidates in item-id order.
     pub fn shop_candidates(&self) -> &[ShopCandidate] {
         &self.shop
-    }
-
-    /// Number of allowed sell slots whose ownership cannot be proved on wire.
-    ///
-    /// Sell is masked unless `ItemView::for_sale` proves prior server acceptance,
-    /// so this compatibility diagnostic is always zero.
-    pub const fn sell_ownership_uncertain_count(&self) -> usize {
-        0
-    }
-
-    /// Whether any allowed sell action has wire-absent ownership.
-    ///
-    /// This compatibility diagnostic is always false.
-    pub const fn has_sell_ownership_uncertainty(&self) -> bool {
-        false
     }
 
     /// Ability-slot mask after selecting a controlled unit.
@@ -1736,61 +1717,6 @@ fn canonical_cell_position(
     }
 }
 
-/// The pre-optimization cell-centre landing scan, kept as the differential oracle.
-#[cfg(test)]
-fn nearest_landing_cell_reference(
-    passability: &StaticPassability,
-    center: Vec2,
-    team: Team,
-) -> Option<Vec2> {
-    let (center_x, center_y) = passability.cell_of(center)?;
-    let mut best: Option<(i64, usize, Vec2)> = None;
-    let start_y = center_y.saturating_sub(LANDING_SEARCH_CELLS);
-    let start_x = center_x.saturating_sub(LANDING_SEARCH_CELLS);
-    let end_y = center_y
-        .saturating_add(LANDING_SEARCH_CELLS)
-        .min(passability.axis - 1);
-    let end_x = center_x
-        .saturating_add(LANDING_SEARCH_CELLS)
-        .min(passability.axis - 1);
-    for cell_y in start_y..=end_y {
-        for cell_x in start_x..=end_x {
-            let position = canonical_cell_position(passability, cell_x, cell_y, team);
-            if !passability.walkable(position) {
-                continue;
-            }
-            let distance = center.distance_squared(position);
-            let cell_index = cell_y * passability.axis + cell_x;
-            let cell_index = if team == Team::Dire {
-                passability.axis * passability.axis - 1 - cell_index
-            } else {
-                cell_index
-            };
-            if best.is_none_or(|current| (distance, cell_index) < (current.0, current.1)) {
-                best = Some((distance, cell_index, position));
-            }
-        }
-    }
-    best.map(|(_, _, position)| position)
-}
-
-/// Runs the direct-grid scan and the reference scan on one synthetic grid.
-#[cfg(test)]
-pub(crate) fn nearest_landing_cell_pair_for_test(
-    axis: usize,
-    open: Vec<bool>,
-    center: Vec2,
-    team: Team,
-) -> (Option<Vec2>, Option<Vec2>) {
-    assert!(axis > 0);
-    assert_eq!(open.len(), axis * axis);
-    let passability = StaticPassability { axis, open };
-    (
-        nearest_landing_cell_reference(&passability, center, team),
-        nearest_landing_cell(&passability, center, team),
-    )
-}
-
 fn add_tree_points(
     tracker: &StateTracker,
     current: &WorldView,
@@ -1844,20 +1770,6 @@ fn add_tree_points(
         }
     }
     Ok(())
-}
-
-#[cfg(test)]
-pub(crate) fn tree_points_for_test(
-    tracker: &StateTracker,
-    mut points: Vec<PointCandidate>,
-) -> Vec<PointCandidate> {
-    assert!(points.len() <= MAX_POINT_CANDIDATES);
-    let current = tracker.current().expect("tree test snapshot");
-    let passability = reconstruct_static_passability(tracker, current).expect("tree passability");
-    let center = tracker.own_hero().expect("tree test hero").pos;
-    add_tree_points(tracker, current, &passability, center, &mut points).expect("tree points");
-    assert!(points.len() <= MAX_POINT_CANDIDATES);
-    points
 }
 
 fn add_landmark_points(

@@ -1,10 +1,11 @@
 use bota_proto::{
     AbilityId, AbilityView, Aim, Angle, Attribute, Attributes, DamageKind, EntityId, EventKind,
-    Fixed, ItemId, ItemSlot, ItemView, LootView, MapId, MatchInfo, Order, Pick, PlayerView,
-    ProjectileView, ShopEntry, SlotId, StatusFlags, Target, Team, TickMode, UnitKind, UnitView,
-    Vec2, WorldView,
+    Fixed, ItemId, ItemSlot, ItemView, LootView, MapId, MatchInfo, Order, PlayerView,
+    ProjectileView, ShopEntry, SlotId, StatusFlags, Target, Team, UnitKind, UnitView, Vec2,
+    WorldView,
 };
 
+use super::fixtures;
 use crate::feature::RaggedFeatureArena;
 use crate::{
     ABILITY_FEATURE_TOKENS, ABILITY_FEATURES, ActionKind, ActionSpace, FEATURE_SCHEMA_DESCRIPTOR,
@@ -1622,30 +1623,7 @@ fn projectile_capacity_view(count: u32) -> WorldView {
 }
 
 fn legacy_feature_values(frame: &FeatureFrame) -> impl Iterator<Item = f32> + '_ {
-    frame.global[..64]
-        .iter()
-        .copied()
-        .chain(frame.history.iter().flatten().copied())
-        .chain(frame.policy_history.iter().flatten().copied())
-        .chain(frame.units.iter().flat_map(|row| row[..69].iter().copied()))
-        .chain(
-            frame
-                .own_units
-                .iter()
-                .flat_map(|row| row[..69].iter().copied()),
-        )
-        .chain(
-            frame
-                .remembered_units
-                .iter()
-                .flat_map(|row| row[..69].iter().copied()),
-        )
-        .chain(frame.points.iter().flatten().copied())
-        .chain(frame.abilities.iter().flatten().copied())
-        .chain(frame.items.iter().flatten().copied())
-        .chain(frame.projectiles.iter().flatten().copied())
-        .chain(frame.loot.iter().flatten().copied())
-        .chain(frame.map.iter().copied())
+    fixtures::feature_values(frame, Some(64), Some(69))
 }
 
 #[test]
@@ -2532,7 +2510,6 @@ pub(super) fn tracker_with_view(team: Team, view: WorldView) -> StateTracker {
 }
 
 pub(super) fn match_info(team: Team) -> MatchInfo {
-    let enemy = opposing(team);
     let trees = canonical_positions(
         team,
         [Vec2::from_ints(2_100, 2_000), Vec2::from_ints(7_000, 7_000)],
@@ -2547,30 +2524,14 @@ pub(super) fn match_info(team: Team) -> MatchInfo {
             )
         })
         .collect();
-    MatchInfo {
-        match_id: 99,
-        map: MapId(0),
-        tick_rate: 30,
-        pregame_ticks: 90,
-        trees,
-        terrain_cells: AXIS,
-        terrain_rle: vec![((AXIS * AXIS) as u16, 0x80)],
-        opaque_cells,
-        mode: TickMode::Lockstep,
-        picks: vec![
-            Pick {
-                slot: SlotId(0),
-                team,
-                hero: SHADOW_FIEND,
-            },
-            Pick {
-                slot: SlotId(1),
-                team: enemy,
-                hero: SHADOW_FIEND,
-            },
-        ],
-        shop: shop(),
-    }
+    fixtures::MatchInfoFixture::new(99, MapId(0), fixtures::two_seat_picks(team))
+        .pregame_ticks(90)
+        .trees(trees)
+        .terrain_cells(AXIS)
+        .terrain_rle(vec![((AXIS * AXIS) as u16, 0x80)])
+        .opaque_cells(opaque_cells)
+        .shop(shop())
+        .build()
 }
 
 pub(super) fn world_view(team: Team, tick: u32) -> WorldView {
@@ -2923,21 +2884,7 @@ fn assert_field_ranges<const FIELDS: usize>(
 }
 
 fn all_values(frame: &FeatureFrame) -> impl Iterator<Item = f32> + '_ {
-    frame
-        .global
-        .iter()
-        .copied()
-        .chain(frame.history.iter().flatten().copied())
-        .chain(frame.policy_history.iter().flatten().copied())
-        .chain(frame.units.iter().flatten().copied())
-        .chain(frame.own_units.iter().flatten().copied())
-        .chain(frame.remembered_units.iter().flatten().copied())
-        .chain(frame.points.iter().flatten().copied())
-        .chain(frame.abilities.iter().flatten().copied())
-        .chain(frame.items.iter().flatten().copied())
-        .chain(frame.projectiles.iter().flatten().copied())
-        .chain(frame.loot.iter().flatten().copied())
-        .chain(frame.map.iter().copied())
+    fixtures::feature_values(frame, None, None)
 }
 
 fn present_unit_count(frame: &FeatureFrame) -> usize {

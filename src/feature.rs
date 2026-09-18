@@ -21,6 +21,10 @@ use crate::{
     SHADOW_FIEND_ABILITY_SLOTS, StateTracker, TERRAIN_CELL_SIZE, UNIT_TOKENS,
 };
 
+#[cfg(test)]
+#[path = "tests/feature_test_support.rs"]
+mod test_support;
+
 /// Version of the policy feature layout and candidate input-state semantics.
 pub const FEATURE_SCHEMA_VERSION: u32 = 22;
 /// Number of scalar global features.
@@ -749,13 +753,6 @@ pub(crate) struct RaggedFeatureHeader {
     loot: FeatureRowRange,
 }
 
-#[cfg(test)]
-impl RaggedFeatureHeader {
-    pub(crate) fn corrupt_unit_offset_for_test(&mut self) {
-        self.units.offset = u32::MAX;
-    }
-}
-
 pub(crate) struct RaggedFeatureArena {
     sample_capacity: usize,
     units: Vec<IndexedFeatureRow<UNIT_FEATURES>>,
@@ -873,17 +870,6 @@ impl RaggedFeatureArena {
         )?;
         restore_feature_rows(&self.loot, header.loot, &mut frame.loot)?;
         Ok(frame)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn stored_rows(&self) -> usize {
-        self.units.len()
-            + self.remembered_units.len()
-            + self.points.len()
-            + self.abilities.len()
-            + self.items.len()
-            + self.projectiles.len()
-            + self.loot.len()
     }
 }
 
@@ -2615,34 +2601,47 @@ fn next_observation_state(
     std::sync::Arc::new(next)
 }
 
+/// The seven scoreboard advantage values shared by the global and history layouts.
+fn advantage_values(summary: &crate::GlobalSummary) -> [f32; 7] {
+    [
+        signed_ratio(summary.allied.xp.saturating_sub(summary.enemy.xp), MAX_XP),
+        signed_ratio(
+            difference(summary.allied.levels, summary.enemy.levels),
+            MAX_SCORE,
+        ),
+        signed_ratio(
+            difference(summary.allied.kills, summary.enemy.kills),
+            MAX_SCORE,
+        ),
+        signed_ratio(
+            difference(summary.enemy.deaths, summary.allied.deaths),
+            MAX_SCORE,
+        ),
+        signed_ratio(
+            difference(summary.allied.assists, summary.enemy.assists),
+            MAX_SCORE,
+        ),
+        signed_ratio(
+            difference(summary.allied.last_hits, summary.enemy.last_hits),
+            MAX_SCORE,
+        ),
+        signed_ratio(
+            difference(summary.allied.denies, summary.enemy.denies),
+            MAX_SCORE,
+        ),
+    ]
+}
+
 fn encode_score_advantages(global: &mut [f32; GLOBAL_FEATURES], summary: &crate::GlobalSummary) {
     use global_feature as index;
-    global[index::KILL_ADVANTAGE] = signed_ratio(
-        difference(summary.allied.kills, summary.enemy.kills),
-        MAX_SCORE,
-    );
-    global[index::DEATH_ADVANTAGE] = signed_ratio(
-        difference(summary.enemy.deaths, summary.allied.deaths),
-        MAX_SCORE,
-    );
-    global[index::ASSIST_ADVANTAGE] = signed_ratio(
-        difference(summary.allied.assists, summary.enemy.assists),
-        MAX_SCORE,
-    );
-    global[index::XP_ADVANTAGE] =
-        signed_ratio(summary.allied.xp.saturating_sub(summary.enemy.xp), MAX_XP);
-    global[index::LEVEL_ADVANTAGE] = signed_ratio(
-        difference(summary.allied.levels, summary.enemy.levels),
-        MAX_SCORE,
-    );
-    global[index::LAST_HIT_ADVANTAGE] = signed_ratio(
-        difference(summary.allied.last_hits, summary.enemy.last_hits),
-        MAX_SCORE,
-    );
-    global[index::DENY_ADVANTAGE] = signed_ratio(
-        difference(summary.allied.denies, summary.enemy.denies),
-        MAX_SCORE,
-    );
+    let values = advantage_values(summary);
+    global[index::KILL_ADVANTAGE] = values[2];
+    global[index::DEATH_ADVANTAGE] = values[3];
+    global[index::ASSIST_ADVANTAGE] = values[4];
+    global[index::XP_ADVANTAGE] = values[0];
+    global[index::LEVEL_ADVANTAGE] = values[1];
+    global[index::LAST_HIT_ADVANTAGE] = values[5];
+    global[index::DENY_ADVANTAGE] = values[6];
 }
 
 fn encode_assignment(local: &LocalPolicyState, global: &mut [f32; GLOBAL_FEATURES]) {
@@ -2773,32 +2772,14 @@ fn encode_history_sample(
 
 fn encode_history_advantages(output: &mut [f32; HISTORY_FEATURES], summary: crate::GlobalSummary) {
     use history_feature as index;
-    output[index::XP_ADVANTAGE] =
-        signed_ratio(summary.allied.xp.saturating_sub(summary.enemy.xp), MAX_XP);
-    output[index::LEVEL_ADVANTAGE] = signed_ratio(
-        difference(summary.allied.levels, summary.enemy.levels),
-        MAX_SCORE,
-    );
-    output[index::KILL_ADVANTAGE] = signed_ratio(
-        difference(summary.allied.kills, summary.enemy.kills),
-        MAX_SCORE,
-    );
-    output[index::DEATH_ADVANTAGE] = signed_ratio(
-        difference(summary.enemy.deaths, summary.allied.deaths),
-        MAX_SCORE,
-    );
-    output[index::ASSIST_ADVANTAGE] = signed_ratio(
-        difference(summary.allied.assists, summary.enemy.assists),
-        MAX_SCORE,
-    );
-    output[index::LAST_HIT_ADVANTAGE] = signed_ratio(
-        difference(summary.allied.last_hits, summary.enemy.last_hits),
-        MAX_SCORE,
-    );
-    output[index::DENY_ADVANTAGE] = signed_ratio(
-        difference(summary.allied.denies, summary.enemy.denies),
-        MAX_SCORE,
-    );
+    let values = advantage_values(&summary);
+    output[index::XP_ADVANTAGE] = values[0];
+    output[index::LEVEL_ADVANTAGE] = values[1];
+    output[index::KILL_ADVANTAGE] = values[2];
+    output[index::DEATH_ADVANTAGE] = values[3];
+    output[index::ASSIST_ADVANTAGE] = values[4];
+    output[index::LAST_HIT_ADVANTAGE] = values[5];
+    output[index::DENY_ADVANTAGE] = values[6];
 }
 
 fn encode_relation(token: &mut [f32; UNIT_FEATURES], relation: EntityRelation) {

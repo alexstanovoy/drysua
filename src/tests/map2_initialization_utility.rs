@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use sha2::{Digest, Sha256};
 
 use super::map2_checkpoint::{Directory, m14_metadata, progress, runtime_bytes};
-use super::map2_model_initialization::{assert_bits, assert_fresh_state, assert_padding};
+use super::map2_model_initialization::{assert_fresh_state, assert_padding};
 use crate::{CheckpointError, PolicyDevice, PolicyModel, TrainingArtifact};
 
 const INITIALIZATION_SEED: u64 = 10_091_500;
@@ -24,7 +24,7 @@ fn map2_initialize_pinned_m14_local_artifact_only() {
         PathBuf::from(std::env::var_os("DRYSUA_SELECTED_M14_SOURCE").expect("explicit source"))
             .canonicalize()
             .expect("existing source");
-    let output = new_output(&source);
+    let output = crate::tests::support::new_output("DRYSUA_MAP2_INITIALIZATION_OUTPUT", &source);
     let bytes = fs::read(source.join("drysua.weights.safetensors")).expect("source bytes");
     let source_sha256: [u8; 32] = Sha256::digest(&bytes).into();
     assert_legacy_rejected(&source);
@@ -48,7 +48,15 @@ fn map2_initialize_pinned_m14_local_artifact_only() {
     let trainer =
         crate::PpoTrainer::new(&model, config, INITIALIZATION_SEED).expect("fresh trainer");
     assert_fresh_state(&model, &trainer);
-    let run = initialization_run(config, &provenance.description());
+    let run = crate::tests::support::initialization_run(
+        INITIALIZATION_SEED,
+        config.minibatch,
+        format!(
+            "tests::map2_initialization_utility::map2_initialize_pinned_m14_local_artifact_only --exact --ignored; {}",
+            provenance.description()
+        ),
+        &crate::tests::support::INITIALIZATION_PROVENANCE,
+    );
     let artifact = TrainingArtifact::capture(&model, &trainer, run.clone(), progress())
         .expect("fresh capture");
     fs::create_dir(&output).expect("new output, never replace prior artifacts");
@@ -64,28 +72,6 @@ fn map2_initialize_pinned_m14_local_artifact_only() {
     );
     write_provenance(&output, &source, &run, &provenance.description());
     eprintln!("{} output={}", provenance.description(), output.display());
-}
-
-fn new_output(source: &Path) -> PathBuf {
-    let output = PathBuf::from(
-        std::env::var_os("DRYSUA_MAP2_INITIALIZATION_OUTPUT").expect("explicit output"),
-    );
-    assert!(!output.exists(), "never overwrite an output");
-    let parent = output
-        .parent()
-        .expect("parent")
-        .canonicalize()
-        .expect("existing parent");
-    assert!(
-        !parent.starts_with(source),
-        "do not create anything inside the historical source"
-    );
-    let output = parent.join(output.file_name().expect("new directory name"));
-    assert!(
-        fs::symlink_metadata(&output)
-            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
-    );
-    output
 }
 
 fn source_parameters(bytes: &[u8]) -> Vec<f32> {
@@ -140,54 +126,14 @@ fn assert_paired_digest_rejected(parameters: &[f32], version: u32) {
     );
 }
 
-fn initialization_run(config: crate::PpoConfig, provenance: &str) -> crate::CheckpointRun {
-    crate::CheckpointRun {
-        mastery_config: None,
-        git_commit: std::env::var("DRYSUA_INITIALIZATION_GIT_COMMIT")
-            .expect("actual source revision"),
-        simulator_commit: std::env::var("DRYSUA_INITIALIZATION_SIMULATOR_COMMIT")
-            .expect("actual simulator revision"),
-        enabled_features: crate::compiled_features(),
-        command_line: format!(
-            "tests::map2_initialization_utility::map2_initialize_pinned_m14_local_artifact_only --exact --ignored; {provenance}"
-        ),
-        run_seed: INITIALIZATION_SEED,
-        map: bota_proto::MapId(2),
-        hero: crate::SHADOW_FIEND,
-        device: crate::CheckpointDevice::Cpu,
-        batch_size: config.minibatch,
-        rules_audit_version: crate::PPO_RULES_AUDIT_VERSION,
-    }
-}
-
 fn verify_output(output: &Path, run: &crate::CheckpointRun, parameters: &[f32]) {
-    let runtime = PolicyModel::fresh(2).expect("runtime");
-    TrainingArtifact::load_runtime_weights(&runtime, output)
-        .expect("strict current runtime reload");
-    assert_bits(
-        &runtime.export_parameters().expect("runtime bits"),
-        parameters,
-    );
-    let checkpoint = TrainingArtifact::load_compatible(output, run).expect("new checkpoint reload");
-    assert_eq!(checkpoint.progress(), &progress());
-    let restored = PolicyModel::fresh(3).expect("checkpoint target");
-    let state = checkpoint
-        .restore(&restored, run)
-        .expect("new current checkpoint restore");
-    assert_fresh_state(&restored, state.trainer());
-    assert_bits(
-        &restored.export_parameters().expect("restored bits"),
-        parameters,
-    );
+    crate::tests::support::verify_initialized_output(output, run, parameters);
 }
 
 fn write_provenance(output: &Path, source: &Path, run: &crate::CheckpointRun, provenance: &str) {
     use std::io::Write;
     let bytes = fs::read(output.join("drysua.weights.safetensors")).expect("new runtime bytes");
-    let output_hash: String = Sha256::digest(&bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
+    let output_hash = crate::tests::support::sha256_hex(&bytes);
     let text = format!(
         "{provenance}\nsource={}\noutput_sha256={output_hash}\ngit_commit={}\nsimulator_commit={}\nenabled_features={}\nseed={INITIALIZATION_SEED}\ntraining_updates=0\ngameplay_runs=0\noptimizer_moments=positive_zero\nprogress=all_zero_no_evaluation_rng_history_or_league\nsource_unchanged=true\nnamed_tensors=62\nold_parameters=1689076\nnew_parameters=1700020\nunit.0.weight=73x64_to_84x64_insert_rows73..84\ntrunk.0.weight=2576x512_to_2596x512_insert_rows72..92\nall_other_tensors_bit_identical=true\nruntime_and_checkpoint_reload_exact=true\nfeature_hash={}\naction_hash={}\nmodel_hash={}\nppo_hash={}\nleague_hash={}\ncheckpoint_hash={}\nreward_descriptor={}\n",
         source.display(),

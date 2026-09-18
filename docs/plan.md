@@ -5,8 +5,8 @@
 Этот файл является основным планом разработки `drysua`. Решения по архитектуре,
 обучению, производительности и взаимодействию с симулятором фиксируются здесь.
 
-Пересмотр нейросетевого обучения Map0 от 2026-09-08 вынесен в
-[отдельный исследовательский план](neural_training_reset_plan.md): проверенные
+Пересмотр нейросетевого обучения Map0 от 2026-09-08 вынесен в отдельный
+исследовательский план (архивирован 2026-09-18, история git `41bc295`): проверенные
 ограничения, диагностические этапы, конкретные альтернативы и критерии остановки.
 Это предложение для обсуждения, не изменение release gate или разрешение на запуск.
 
@@ -238,7 +238,7 @@ StateTracker закрывает неполноту одного snapshot.
 | Recent events | 64 |
 | History | 480 ticks |
 
-Map0 repair: [4096 bounds, hull reach, and explicit training initialization](map0-feature10-initialization.md).
+Map0 repair: 4096 bounds, hull reach, and explicit training initialization (archived 2026-09-18, git history `41bc295`).
 The wire payload cap remains 4 MiB; selected model rows and numeric normalizers
 are unchanged. Hull-inclusive attack-reach facts are corrected. The linked schemas
 are now Feature v10, Model v11, PPO v19, League v20
@@ -788,7 +788,7 @@ Current PPO contract: schema v16, hash `11450737853127354910`, rules audit v15.
 Action v3 changes composite Buy legality and root/first-missing-leaf wire decoding.
 Feature v8/hash `10322490384647633864` binds that action-dependent legality; model
 v8/hash `3097714014199697774` binds the new action/feature contracts without changing
-tensor shapes or parameter order. See [PPO v16 migration](ppo-v16-migration.md).
+tensor shapes or parameter order. See PPO v16 migration (archived 2026-09-18, git history `41bc295`).
 PPO value regression detaches the value-head input and trains only that head, not shared
 actor features; this isolation does not alter BC, public training forward, parameter order
 or architecture. KL is checked before and after the candidate optimizer step. Post-step KL
@@ -801,7 +801,7 @@ post-step rejection reports contain candidate KL. This is not full-distribution 
 anchor-wide multi-update drift guarantee. Permanent critic isolation, LR `3e-6`, and reward
 normalization are conservative design/tuning decisions, not evidence that standard shared
 actor/critic gradients are incorrect or that learned strength improved. GAE is unchanged;
-the v15 reward contract is below. See [PPO v15 migration](ppo-v15-migration.md).
+the v15 reward contract is below. See PPO v15 migration (archived 2026-09-18, git history `41bc295`).
 
 ## 15. Reward
 

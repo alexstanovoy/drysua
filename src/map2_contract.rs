@@ -1,3 +1,7 @@
+#[cfg(test)]
+#[path = "tests/map2_contract_test_support.rs"]
+mod test_support;
+
 /// Maximum complete-episode training streams; even counts up to this are valid.
 /// Twenty-six is the largest even count admitted by the retained-frame and
 /// rollout-capacity invariants; 28 exceeds the retained bound, and 30 exceeds
@@ -44,20 +48,3 @@ const _: () = {
     assert!(MAP2_GAME_TICKS == bota_server::game::MAP2_GAME_TICKS);
     assert!(MAP2_TICK_CAP == bota_server::game::MAP2_TICK_CAP);
 };
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn map2_rebase_duration_cadence_and_retention_boundaries_are_exact() {
-        assert_eq!(MAP2_ID, bota_proto::MapId(2));
-        assert_eq!(MAP2_PREGAME_TICKS, 900);
-        assert_eq!(MAP2_GAME_TICKS, 27_000);
-        assert_eq!(MAP2_TICK_CAP, 27_900);
-        assert_eq!(MAP2_DECISION_INTERVAL_TICKS, 3);
-        assert_eq!(MAP2_ACTOR_DECISIONS, 9_300);
-        assert_eq!(MAP2_RETENTION_STRIDE, 8);
-        assert_eq!(MAP2_RETAINED_DECISIONS, 1_163);
-    }
-}

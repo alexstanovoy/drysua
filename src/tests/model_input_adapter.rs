@@ -59,7 +59,7 @@ fn assert_map2_and_retired_layout_errors(schema: &[(&str, Vec<usize>)], field: &
     assert_retired_m12_layout(schema);
 }
 
-fn assert_retired_m12_layout(schema: &[(&str, Vec<usize>)]) {
+pub(super) fn assert_retired_m12_layout(schema: &[(&str, Vec<usize>)]) {
     let error =
         PolicyModel::validate_m12_parameter_schema(schema).expect_err("retired M12 adapter");
     assert_eq!(
@@ -245,15 +245,11 @@ fn status_probe_labels_are_aliased_without_facts_and_per_family_masks_are_identi
 #[test]
 #[ignore = "read-only local M11 source audit; retired initialization must reject before any fact-learning probe"]
 fn retired_m11_local_source_cannot_initialize_a_fact_learning_probe() {
-    use sha2::{Digest, Sha256};
     let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("artifacts/temp/map0-ppo21-u010-u040-001/baseline-u010");
     let path = directory.join("drysua.weights.safetensors");
     let bytes = std::fs::read(&path).expect("historical source");
-    let digest: String = Sha256::digest(&bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
+    let digest = crate::tests::support::sha256_hex(&bytes);
     assert_eq!(
         digest,
         "5bbb8843fec88f3c6443618de9cabeba44ff9dbb0b7f9a9856c2c8936551e880"

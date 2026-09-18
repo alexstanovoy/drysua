@@ -116,9 +116,14 @@ fn assert_resume_stops(completed: bool) {
     let artifact = checkpoint_fixture(&settings, completed);
     artifact.save(&directory).expect("save");
     let before = std::fs::read(directory.join("checkpoint.meta")).expect("manifest");
-    let report = run_training_job_on(settings, PolicyDevice::Cpu, &directory, true, |_| {
-        panic!("no new checkpoint/update")
-    })
+    let report = run_training_job_on_with_initial_weights(
+        settings,
+        PolicyDevice::Cpu,
+        &directory,
+        true,
+        None,
+        |_| panic!("no new checkpoint/update"),
+    )
     .expect("bounded resume");
     assert_eq!(report.completed_updates, 2);
     assert_eq!(report.mastery_completed, completed);

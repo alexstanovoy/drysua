@@ -13,10 +13,11 @@ mod simple_wait;
 mod victory_time;
 
 use bota_proto::{
-    Angle, Attributes, DamageKind, EntityId, EventKind, Fixed, HeroId, MapId, MatchInfo, Pick,
-    PlayerView, SlotId, StatusFlags, Team, TickMode, UnitKind, UnitView, Vec2, WorldView,
+    Attributes, DamageKind, EntityId, EventKind, Fixed, HeroId, MapId, MatchInfo, PlayerView,
+    SlotId, StatusFlags, Team, UnitKind, UnitView, Vec2, WorldView,
 };
 
+use super::fixtures;
 use crate::{Map2Reward, Map2RewardBreakdown, Map2RewardEnd};
 
 #[test]
@@ -503,30 +504,10 @@ pub(super) fn own_hero(view: &mut WorldView) -> &mut UnitView {
 }
 
 pub(super) fn match_info() -> MatchInfo {
-    MatchInfo {
-        match_id: 1,
-        map: MapId(2),
-        tick_rate: 30,
-        pregame_ticks: 0,
-        trees: Vec::new(),
-        terrain_cells: 32,
-        terrain_rle: vec![(1024, 0x80)],
-        opaque_cells: Vec::new(),
-        mode: TickMode::Lockstep,
-        picks: vec![
-            Pick {
-                slot: SlotId(0),
-                team: Team::Radiant,
-                hero: HeroId(2),
-            },
-            Pick {
-                slot: SlotId(1),
-                team: Team::Dire,
-                hero: HeroId(2),
-            },
-        ],
-        shop: Vec::new(),
-    }
+    fixtures::MatchInfoFixture::new(1, MapId(2), fixtures::two_seat_picks(Team::Radiant))
+        .terrain_cells(32)
+        .terrain_rle(vec![(1_024, 0x80)])
+        .build()
 }
 
 pub(super) fn snapshot(tick: u32) -> WorldView {
@@ -573,36 +554,19 @@ fn player(slot: u8) -> PlayerView {
 
 pub(super) fn unit(index: u32, kind: UnitKind, team: Team, x: i32) -> UnitView {
     let hero = kind == UnitKind::Hero;
-    UnitView {
+    fixtures::UnitFixture {
         id: id(index),
         kind,
         team,
         pos: Vec2::from_ints(x, 0),
-        facing: Angle { brads: 0 },
-        hp: 1000,
-        max_hp: 1000,
         mana: if hero { 400 } else { 0 },
-        max_mana: if hero { 400 } else { 0 },
-        move_speed: Fixed::from_int(300),
         attack_damage: 50,
-        attack_range: Fixed::from_int(500),
         attack_time: 1000,
-        attack_point: 0,
-        attack_speed: 100,
-        armor: Fixed::ZERO,
-        magic_resist: Fixed::ZERO,
-        collision: Fixed::from_int(24),
-        bound: Fixed::from_int(24),
-        vision_radius: Fixed::from_int(1800),
-        true_sight_radius: Fixed::ZERO,
-        statuses: StatusFlags { bits: 0 },
         attributes: Attributes::ZERO,
         primary: None,
         hero: hero.then_some(HeroId(2)),
         owner: hero.then_some(SlotId(if team == Team::Radiant { 0 } else { 1 })),
         level: u8::from(hero),
-        abilities: Vec::new(),
-        items: Vec::new(),
-        effects: Vec::new(),
     }
+    .build()
 }

@@ -146,7 +146,10 @@ pub const MAP2_REWARD_SCHEMA_DESCRIPTOR: &str = concat!(
     "general_allowed_primed_baseline_tower_delta_abs.6_terminal_lane_abs.1_positive1.045_including_victory_time.2_negative1.4488_no_unconditional_terminal_dominance_no_clipping_or_budget_shrinking;"
 );
 /// Stable FNV-1a hash of the complete independent reward descriptor.
-pub const MAP2_REWARD_SCHEMA_HASH: u64 = schema_hash(MAP2_REWARD_SCHEMA_DESCRIPTOR.as_bytes());
+pub const MAP2_REWARD_SCHEMA_HASH: u64 = crate::model::fnv1a_extend(
+    crate::model::FNV_OFFSET,
+    MAP2_REWARD_SCHEMA_DESCRIPTOR.as_bytes(),
+);
 
 const MAX_TICK: u32 = crate::MAP2_TICK_CAP;
 const V1_DENSE_BOUND: f64 = 0.4;
@@ -664,15 +667,4 @@ const fn event_budget_total() -> f64 {
         index += 1;
     }
     total
-}
-
-const fn schema_hash(bytes: &[u8]) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    let mut index = 0;
-    while index < bytes.len() {
-        hash ^= bytes[index] as u64;
-        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-        index += 1;
-    }
-    hash
 }

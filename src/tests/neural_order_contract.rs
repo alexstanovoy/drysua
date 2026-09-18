@@ -790,9 +790,8 @@ fn messages_at(fixture: &CompletedFixture, tick: u32) -> Vec<ServerMsg> {
 }
 
 fn assert_candidate_training_replay(fixture: &CompletedFixture, scenario: Scenario) {
-    use crate::{
-        ActivePolicyOrder, ActivePolicyTarget, NeuralSeatOrderContractProbe, PpoOrderContractProbe,
-    };
+    use super::neural_order_seat::NeuralSeatOrderContractProbe;
+    use crate::{ActivePolicyOrder, ActivePolicyTarget, PpoOrderContractProbe};
     let start = messages_at(fixture, 1);
     let mut ppo = PpoOrderContractProbe::new(fixture.side, &start);
     let mut neural = NeuralSeatOrderContractProbe::new_historical(fixture.side, &start);
@@ -861,7 +860,8 @@ fn assert_candidate_training_replay(fixture: &CompletedFixture, scenario: Scenar
 
 #[test]
 fn noncandidate_training_seats_keep_legacy_cast_and_visibility_behavior() {
-    use crate::{NeuralSeatOrderContractProbe, PpoOrderContractProbe};
+    use super::neural_order_seat::NeuralSeatOrderContractProbe;
+    use crate::PpoOrderContractProbe;
     for scenario in [Scenario::OwnCast, Scenario::VisibilityGap] {
         let fixture = run_fixture(0, scenario, false);
         let start = messages_at(&fixture, 1);
@@ -903,7 +903,8 @@ fn noncandidate_training_seats_keep_legacy_cast_and_visibility_behavior() {
 
 #[test]
 fn candidate_training_paths_wait_for_current_tick_death_evidence_before_reconciling() {
-    use crate::{NeuralSeatOrderContractProbe, PpoOrderContractProbe};
+    use super::neural_order_seat::NeuralSeatOrderContractProbe;
+    use crate::PpoOrderContractProbe;
     let fixture = run_fixture(0, Scenario::NoCast, false);
     let start = messages_at(&fixture, 1);
     let mut ppo = PpoOrderContractProbe::new(0, &start);

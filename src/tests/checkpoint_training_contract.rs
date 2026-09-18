@@ -18,13 +18,10 @@ fn ppo26_runtime_metadata() -> std::collections::HashMap<String, String> {
 
 #[test]
 fn training_contract_map2_versions_change_both_actor_and_training_identities() {
-    assert_eq!(crate::FEATURE_SCHEMA_VERSION, 22);
+    crate::tests::support::assert_frozen_schema_versions();
     assert_ne!(crate::FEATURE_SCHEMA_HASH, 1_577_122_233_561_586_211);
-    assert_eq!(crate::MODEL_SCHEMA_VERSION, 24);
     assert_ne!(crate::MODEL_SCHEMA_HASH, 7_970_187_849_195_607_202);
     assert_eq!(crate::IMITATION_RULES_AUDIT_VERSION, 22);
-    assert_eq!(crate::PPO_SCHEMA_VERSION, 37);
-    assert_eq!(crate::PPO_RULES_AUDIT_VERSION, 32);
     assert_eq!(crate::LEAGUE_SCHEMA_VERSION, 37);
     assert_eq!(crate::LEAGUE_RULES_AUDIT_VERSION, 32);
     assert!(crate::PPO_SCHEMA_DESCRIPTOR.contains("observer=explicit_from_trajectory_start"));
@@ -387,13 +384,9 @@ fn training_contract_local_m14_runtime_resume_and_m12_initialization_reject_with
 }
 
 fn audit_ppo26_initialization(directory: &std::path::Path, expected_digest: &str) {
-    use sha2::{Digest, Sha256};
     let path = directory.join("drysua.weights.safetensors");
     let bytes = fs::read(&path).expect("immutable initialization");
-    let digest: String = Sha256::digest(&bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
+    let digest = crate::tests::support::sha256_hex(&bytes);
     assert_eq!(digest, expected_digest);
     let (_, metadata) = safetensors::SafeTensors::read_metadata(&bytes).expect("metadata");
     assert_eq!(
@@ -433,13 +426,9 @@ fn audit_ppo26_initialization(directory: &std::path::Path, expected_digest: &str
 }
 
 fn audit_selected_m12_initializer(source: &std::path::Path, expected: &str) {
-    use sha2::{Digest, Sha256};
     let path = source.join("drysua.weights.safetensors");
     let bytes = fs::read(&path).expect("immutable M12 source");
-    let digest: String = Sha256::digest(&bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
+    let digest = crate::tests::support::sha256_hex(&bytes);
     assert_eq!(digest, expected);
     let error = TrainingArtifact::initialize_selected_m12_for_training(
         source,

@@ -327,17 +327,20 @@ fn bounded_league_keeps_anchor_accepted_strongest_and_recent_entries() {
 #[cfg(feature = "builtin")]
 #[test]
 fn self_play_smoke_trains_against_scheduled_frozen_opponents_and_pairs_sides() {
-    let report = crate::run_league_smoke(crate::LeagueSmokeConfig {
-        updates: 1,
-        environments: 4,
-        rollout_decisions: 2,
-        epochs: 1,
-        minibatch: 8,
-        evaluation_pairs: 1,
-        evaluation_decisions: 2,
-        seed: 8_811,
-        map: bota_proto::MapId(2),
-    })
+    let report = crate::run_league_smoke_on(
+        crate::LeagueSmokeConfig {
+            updates: 1,
+            environments: 4,
+            rollout_decisions: 2,
+            epochs: 1,
+            minibatch: 8,
+            evaluation_pairs: 1,
+            evaluation_decisions: 2,
+            seed: 8_811,
+            map: bota_proto::MapId(2),
+        },
+        crate::PolicyDevice::Cpu,
+    )
     .expect("league smoke");
 
     assert_eq!(report.ppo.updates, 1);
@@ -353,17 +356,20 @@ fn self_play_smoke_trains_against_scheduled_frozen_opponents_and_pairs_sides() {
 #[cfg(feature = "builtin")]
 #[test]
 fn persistent_league_actor_double_buffers_three_policy_generations() {
-    let report = crate::run_league_smoke(crate::LeagueSmokeConfig {
-        updates: 3,
-        environments: 4,
-        rollout_decisions: 2,
-        epochs: 1,
-        minibatch: 8,
-        evaluation_pairs: 1,
-        evaluation_decisions: 2,
-        seed: 8_811,
-        map: bota_proto::MapId(2),
-    })
+    let report = crate::run_league_smoke_on(
+        crate::LeagueSmokeConfig {
+            updates: 3,
+            environments: 4,
+            rollout_decisions: 2,
+            epochs: 1,
+            minibatch: 8,
+            evaluation_pairs: 1,
+            evaluation_decisions: 2,
+            seed: 8_811,
+            map: bota_proto::MapId(2),
+        },
+        crate::PolicyDevice::Cpu,
+    )
     .expect("three-update league pipeline");
 
     assert_eq!(report.ppo.updates, 3);
@@ -384,8 +390,12 @@ fn runtime_checkpoint_evaluation_is_deterministic_and_covers_the_fixed_matrix() 
         seed: 88_302,
     };
 
-    let first = crate::evaluate_runtime_checkpoint(settings, &directory).expect("first report");
-    let second = crate::evaluate_runtime_checkpoint(settings, &directory).expect("second report");
+    let first =
+        crate::ppo_arena::evaluate_neural_map_two_checkpoint_cohort(settings, &directory, false)
+            .expect("first report");
+    let second =
+        crate::ppo_arena::evaluate_neural_map_two_checkpoint_cohort(settings, &directory, false)
+            .expect("second report");
 
     assert_eq!(first, second);
     assert_eq!(first.games.len(), 4);
@@ -568,17 +578,20 @@ fn quality_game(
 #[cfg(feature = "builtin")]
 #[test]
 fn promotion_gate_rejects_nonterminal_evaluation_horizons_as_timeouts() {
-    let report = crate::run_league_smoke(crate::LeagueSmokeConfig {
-        updates: 1,
-        environments: 1,
-        rollout_decisions: 1,
-        epochs: 1,
-        minibatch: 1,
-        evaluation_pairs: 20,
-        evaluation_decisions: 25,
-        seed: 8_812,
-        map: bota_proto::MapId(2),
-    })
+    let report = crate::run_league_smoke_on(
+        crate::LeagueSmokeConfig {
+            updates: 1,
+            environments: 1,
+            rollout_decisions: 1,
+            epochs: 1,
+            minibatch: 1,
+            evaluation_pairs: 20,
+            evaluation_decisions: 25,
+            seed: 8_812,
+            map: bota_proto::MapId(2),
+        },
+        crate::PolicyDevice::Cpu,
+    )
     .expect("promotion-gate smoke");
 
     assert_eq!(report.evaluation_actions, 1_200);

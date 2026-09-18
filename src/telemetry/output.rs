@@ -1,6 +1,10 @@
 use std::fmt;
 use std::io::Write;
 
+#[cfg(test)]
+#[path = "../tests/telemetry_output_test_support.rs"]
+mod test_support;
+
 pub(crate) struct PerformanceOutput<W> {
     writer: W,
     failed: bool,
@@ -25,15 +29,5 @@ impl<W: Write> PerformanceOutput<W> {
         if !self.failed && self.writer.flush().is_err() {
             self.failed = true;
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) const fn failed(&self) -> bool {
-        self.failed
-    }
-
-    #[cfg(test)]
-    pub(crate) fn into_inner(self) -> W {
-        self.writer
     }
 }

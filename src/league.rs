@@ -14,6 +14,10 @@ use crate::{
     PPO_SCHEMA_VERSION, PolicyModel, PpoRng,
 };
 
+#[cfg(test)]
+#[path = "tests/league_test_support.rs"]
+mod test_support;
+
 /// Initial and maximum retained historical policy count.
 pub const LEAGUE_MAX_POLICIES: usize = 32;
 /// Smallest league that can preserve every retention class.
@@ -150,23 +154,12 @@ impl PolicySnapshot {
     pub fn parameters(&self) -> &[f32] {
         &self.parameters
     }
-
-    #[cfg(test)]
-    pub(crate) fn from_parameters_for_test(
-        parameters: Vec<f32>,
-        generation: u64,
-    ) -> Result<Self, LeagueError> {
-        Self::from_parameters(parameters, generation)
-    }
 }
 
 fn parameter_fingerprint(parameters: &[f32]) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    let mut hash = crate::model::FNV_OFFSET;
     for value in parameters {
-        for byte in value.to_bits().to_le_bytes() {
-            hash ^= u64::from(byte);
-            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-        }
+        hash = crate::model::fnv1a_extend(hash, &value.to_bits().to_le_bytes());
     }
     hash
 }
@@ -747,16 +740,6 @@ impl League {
             .iter()
             .find(|entry| entry.snapshot.fingerprint == fingerprint)
             .expect("league fingerprint is retained")
-    }
-
-    #[cfg(test)]
-    pub(crate) fn insert_evaluated_for_test(
-        &mut self,
-        snapshot: PolicySnapshot,
-        score: f64,
-        profile: CrossPlayProfile,
-    ) -> Result<(), LeagueError> {
-        self.insert(snapshot, score, profile, false)
     }
 }
 

@@ -1767,11 +1767,7 @@ pub(crate) fn predicted_position(tracker: &StateTracker, unit: &UnitView) -> Vec
     let step = Fixed {
         raw: distance.min(unit.move_speed.raw.max(0) / 30),
     };
-    let maximum = (i64::from(tracker.metadata().terrain_cells)
-        * i64::from(crate::TERRAIN_CELL_SIZE)
-        * i64::from(Fixed::ONE.raw)
-        - 1)
-    .min(i64::from(i32::MAX)) as i32;
+    let maximum = crate::tracker::map_maximum_raw(tracker.metadata().terrain_cells) as i32;
     assert!(maximum > 0);
     let target = Vec2 {
         x: Fixed {
@@ -1796,6 +1792,16 @@ pub(crate) fn predicted_position(tracker: &StateTracker, unit: &UnitView) -> Vec
     predicted
 }
 
+/// Raze reach shrinks with the target's move speed uncertainty.
+fn raze_radius(unit: &UnitView) -> Fixed {
+    Fixed {
+        raw: Fixed::from_int(SHADOWRAZE_RADIUS)
+            .raw
+            .saturating_sub(unit.move_speed.raw.max(0) / 30)
+            .max(0),
+    }
+}
+
 fn best_hero_raze(
     tracker: &StateTracker,
     space: &ActionSpace,
@@ -1804,13 +1810,7 @@ fn best_hero_raze(
     facing: u16,
 ) -> Option<usize> {
     let predicted = predicted_position(tracker, enemy);
-    let uncertainty = enemy.move_speed.raw.max(0) / 30;
-    let radius = Fixed {
-        raw: Fixed::from_int(SHADOWRAZE_RADIUS)
-            .raw
-            .saturating_sub(uncertainty)
-            .max(0),
-    };
+    let radius = raze_radius(enemy);
     hero.abilities
         .iter()
         .enumerate()
@@ -1844,14 +1844,18 @@ fn safe_kill_opportunity(tracker: &StateTracker, space: &ActionSpace, hero: &Uni
 
 // This is a bounded trial estimate, not an observed attack phase. Half an interval
 // budgets unknown cooldown; the fixed deadline and range abort prevent an open-ended chase.
-fn finish_estimated_ticks(hero: &UnitView, enemy: &UnitView) -> u32 {
+/// Ticks needed to turn a hero's facing into attack alignment with a target.
+fn attack_turn_ticks(hero: &UnitView, target: &UnitView) -> u32 {
     let gap = u32::from(facing_gap(
         hero.facing.brads,
-        facing_towards(hero.pos, enemy.pos),
+        facing_towards(hero.pos, target.pos),
     ));
-    let turn = gap
-        .saturating_sub(u32::from(ATTACK_ANGLE_BRADS))
-        .div_ceil(TURN_RATE_BRADS);
+    gap.saturating_sub(u32::from(ATTACK_ANGLE_BRADS))
+        .div_ceil(TURN_RATE_BRADS)
+}
+
+fn finish_estimated_ticks(hero: &UnitView, enemy: &UnitView) -> u32 {
+    let turn = attack_turn_ticks(hero, enemy);
     let distance = isqrt(hero.pos.distance_squared(enemy.pos) as u64);
     let travel =
         distance.div_ceil((Fixed::ONE.raw * ATTACK_PROJECTILE_UNITS_PER_TICK) as u64) as u32;
@@ -2307,11 +2311,7 @@ fn predicted_hp(tracker: &StateTracker, unit: &UnitView, ticks: u32) -> i32 {
 }
 
 fn attack_landing_ticks(hero: &UnitView, target: &UnitView) -> u32 {
-    let wanted = facing_towards(hero.pos, target.pos);
-    let gap = u32::from(facing_gap(hero.facing.brads, wanted));
-    let turn = gap
-        .saturating_sub(u32::from(ATTACK_ANGLE_BRADS))
-        .div_ceil(TURN_RATE_BRADS);
+    let turn = attack_turn_ticks(hero, target);
     let distance_raw = isqrt(hero.pos.distance_squared(target.pos) as u64);
     let distance = distance_raw.div_ceil(u64::from(Fixed::ONE.raw as u32));
     let travel = distance.div_ceil(ATTACK_PROJECTILE_UNITS_PER_TICK as u64) as u32;
@@ -2399,12 +2399,7 @@ fn raze_contains(
     facing: u16,
     reach: i32,
 ) -> bool {
-    let radius = Fixed {
-        raw: Fixed::from_int(SHADOWRAZE_RADIUS)
-            .raw
-            .saturating_sub(target.move_speed.raw.max(0) / 30)
-            .max(0),
-    };
+    let radius = raze_radius(target);
     raze_center(hero.pos, facing, reach).within(predicted_position(tracker, target), radius)
 }
 

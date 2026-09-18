@@ -195,32 +195,50 @@ fn curriculum_weak_and_mixed_complete_batches_preserve_terminal_reward_and_reten
     }
 }
 
+fn mastery_collection_fixture(
+    environments: usize,
+    groups: Option<usize>,
+) -> (
+    PolicyModel,
+    Vec<TrainingEnvironment>,
+    crate::TrainingJobConfig,
+    PpoRollout,
+    PpoSmokeReport,
+) {
+    let model = stop_model();
+    let environments_text = environments.to_string();
+    let groups_text = groups.map(|groups| groups.to_string());
+    let mut arguments = vec![
+        "--opponent-schedule",
+        "mastery-v1",
+        "--mastery-window",
+        "3",
+        "--environments",
+        environments_text.as_str(),
+    ];
+    if let Some(groups_text) = groups_text.as_deref() {
+        arguments.push("--pipeline-groups");
+        arguments.push(groups_text);
+    }
+    arguments.extend(["--rollout", "1163", "--minibatch", "512"]);
+    let settings = crate::cli::training_settings_for_test(&arguments).expect("settings");
+    let arenas: Vec<_> = (0..environments)
+        .map(|stream| fixture_environment(TICK_CAP - 24, stream % 2, OpponentSpec::Weak))
+        .collect();
+    let rollout = PpoRollout::new(
+        environments * RETAINED_PER_EPISODE,
+        model.policy_identity().expect("identity"),
+    )
+    .expect("rollout");
+    let report = PpoSmokeReport::default();
+    (model, arenas, settings, rollout, report)
+}
+
 #[test]
 fn eight_sixteen_twenty_four_and_twenty_six_environment_complete_batches_collect_and_qualify() {
     for environments in [8usize, 16, 24, 26] {
-        let model = stop_model();
-        let settings = crate::cli::training_settings_for_test(&[
-            "--opponent-schedule",
-            "mastery-v1",
-            "--mastery-window",
-            "3",
-            "--environments",
-            &environments.to_string(),
-            "--rollout",
-            "1163",
-            "--minibatch",
-            "512",
-        ])
-        .expect("settings");
-        let mut arenas: Vec<_> = (0..environments)
-            .map(|stream| fixture_environment(TICK_CAP - 24, stream % 2, OpponentSpec::Weak))
-            .collect();
-        let mut rollout = PpoRollout::new(
-            environments * RETAINED_PER_EPISODE,
-            model.policy_identity().expect("identity"),
-        )
-        .expect("rollout");
-        let mut report = PpoSmokeReport::default();
+        let (model, mut arenas, settings, mut rollout, mut report) =
+            mastery_collection_fixture(environments, None);
         collect_bounded(
             &model,
             &mut PpoRng::new(9140300),
@@ -314,31 +332,8 @@ fn pipeline_group_ranges_partition_pairs_contiguously() {
 #[test]
 fn grouped_complete_collection_matches_episode_counts_and_mastery() {
     for (environments, groups) in [(8usize, 2usize), (8, 4), (16, 4), (26, 2)] {
-        let model = stop_model();
-        let settings = crate::cli::training_settings_for_test(&[
-            "--opponent-schedule",
-            "mastery-v1",
-            "--mastery-window",
-            "3",
-            "--environments",
-            &environments.to_string(),
-            "--pipeline-groups",
-            &groups.to_string(),
-            "--rollout",
-            "1163",
-            "--minibatch",
-            "512",
-        ])
-        .expect("settings");
-        let mut arenas: Vec<_> = (0..environments)
-            .map(|stream| fixture_environment(TICK_CAP - 24, stream % 2, OpponentSpec::Weak))
-            .collect();
-        let mut rollout = PpoRollout::new(
-            environments * RETAINED_PER_EPISODE,
-            model.policy_identity().expect("identity"),
-        )
-        .expect("rollout");
-        let mut report = PpoSmokeReport::default();
+        let (model, mut arenas, settings, mut rollout, mut report) =
+            mastery_collection_fixture(environments, Some(groups));
         collect_groups_bounded(
             &model,
             &mut PpoRng::new(9140300),

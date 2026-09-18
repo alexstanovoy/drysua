@@ -137,15 +137,11 @@ fn m10_training_initialization_rejects_nonfinite_parameters() {
 #[test]
 #[ignore = "requires DRYSUA_SELECTED_M10 directory containing the immutable b3802642 artifact"]
 fn selected_m10_retired_initialization_and_runtime_reject_without_source_mutation() {
-    use sha2::{Digest, Sha256};
     let directory =
         PathBuf::from(std::env::var_os("DRYSUA_SELECTED_M10").expect("selected fixture"));
     let path = directory.join("drysua.weights.safetensors");
     let bytes = fs::read(&path).expect("selected artifact");
-    let digest: String = Sha256::digest(&bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
+    let digest = crate::tests::support::sha256_hex(&bytes);
     assert_eq!(
         digest,
         "b3802642b34487d66fc3f0fe526e7f8b2a84df542793ac336b58ea046b8f8b53"
@@ -699,11 +695,12 @@ fn provenance_migration_rejects_v13_v14_v15_without_rewriting_training_manifest(
         bytes[ppo_offset + 4..ppo_offset + 12].copy_from_slice(&hash.to_le_bytes());
         fs::write(&path, &bytes).expect("prior manifest fixture");
 
-        let error = crate::run_training_job_on(
+        let error = crate::run_training_job_on_with_initial_weights(
             settings.clone(),
             PolicyDevice::Cpu,
             &directory,
             true,
+            None,
             |_| panic!("legacy migration must not train"),
         )
         .expect_err("old schema is not a provenance migration");

@@ -1,5 +1,13 @@
 # Release cross-play
 
+> **Archived 2026-09-18.** The historical Map1 TCP harness and Map0 challenge
+> (`scripts/release_crossplay.py`, `release_build.py`, `map0_challenge.py/json` and
+> their tests) left the tracked tree in the repo-slim audit. Exact contents:
+> `artifacts/temp/repo-slim-20260917/archive/scripts-historical.tar.gz` (workspace
+> root) and git history at `41bc295`. No live path imports them; current Map2
+> checkpoint qualification is `drysua evaluate`. `release_wire.py` stays because the
+> live relay imports its `varint`. The procedure below is retained as history.
+
 `releases.json` is the machine-readable historical release registry and evaluation
 contract. The initial weights-free Teacher release is the **annotated** `v0.0.1`
 tag at `2cd104c8b8f0c5d1bed9988dfad4ddf4defd23f6`. Simulator source is pinned to
@@ -83,8 +91,8 @@ decimal-string values for `action_schema_hash`, `feature_schema_hash`,
 `model_schema_hash`, `ppo_schema_hash`, `ppo_schema_version`, and
 `ppo_rules_audit_version`. The binary validates the exact metadata, tensor name,
 shape, dtype, and finite values. Metadata must match the current runtime contract
-exactly. Action v3 invalidated the former audited v13 exception; see
-`ppo-v16-migration.md`. Historical weights use their historical tagged runtimes.
+exactly. Action v3 invalidated the former audited v13 exception (PPO v16 migration archived
+2026-09-18, git history `41bc295`). Historical weights use their historical tagged runtimes.
 The runner never rewrites metadata to make old artifacts load.
 
 Before building opponents, the runner copies only that canonical file to

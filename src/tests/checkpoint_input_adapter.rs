@@ -161,7 +161,6 @@ fn approved_m11_initializes_zero_new_inputs_fresh_optimizer_and_runtime_rejects_
 }
 
 fn save_initialized_artifact(model: &PolicyModel) {
-    use sha2::{Digest, Sha256};
     let output = PathBuf::from(
         std::env::var_os("DRYSUA_M11_INITIALIZATION_OUTPUT").expect("explicit new output"),
     );
@@ -180,10 +179,7 @@ fn save_initialized_artifact(model: &PolicyModel) {
     );
     assert_eq!(loaded.parameter_count(), crate::MODEL_PARAMETER_COUNT);
     let bytes = fs::read(output.join("drysua.weights.safetensors")).expect("new weights");
-    let digest: String = Sha256::digest(bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
+    let digest = crate::tests::support::sha256_hex(&bytes);
     eprintln!(
         "initialized_model_version={} output={} sha256={digest}",
         crate::MODEL_SCHEMA_VERSION,

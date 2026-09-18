@@ -47,11 +47,7 @@ fn navigation_ancestry_targets_wait_progress_schema_with_five_zero_global_rows()
         crate::MAP2_REWARD_SCHEMA_VERSION,
         crate::MAP2_REWARD_SCHEMA_HASH
     );
-    assert_eq!(crate::ACTION_SCHEMA_VERSION, 5);
-    assert_eq!(crate::FEATURE_SCHEMA_VERSION, 22);
-    assert_eq!(crate::MODEL_SCHEMA_VERSION, 24);
-    assert_eq!(crate::PPO_SCHEMA_VERSION, 37);
-    assert_eq!(crate::PPO_RULES_AUDIT_VERSION, 32);
+    crate::tests::support::assert_frozen_schema_versions();
     assert_eq!(crate::LEAGUE_SCHEMA_VERSION, 37);
     assert_eq!(crate::LEAGUE_RULES_AUDIT_VERSION, 32);
     assert_eq!(crate::CHECKPOINT_SCHEMA_VERSION, 12);

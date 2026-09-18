@@ -1,9 +1,9 @@
 use bota_proto::{
-    Aim, Angle, Attribute, Attributes, EntityId, Fixed, HeroId, ItemSlot, ItemView, MapId,
-    MatchInfo, Order, Pick, PlayerView, ShopEntry, SlotId, StatusFlags, Team, TickMode, UnitKind,
-    UnitView, Vec2, WorldView,
+    Aim, Attribute, Attributes, EntityId, Fixed, HeroId, ItemSlot, ItemView, MapId, MatchInfo,
+    Order, PlayerView, ShopEntry, SlotId, Team, UnitKind, UnitView, Vec2, WorldView,
 };
 
+use super::fixtures;
 use crate::{
     ActionSpace, ActionTarget, BACKPACK_MUTE_TICKS, ControlledUnit, ItemReadiness,
     MAX_READINESS_TIMER_HISTORY, PointIndex, SHADOW_FIEND, SHARED_WAITS, StateTracker,
@@ -503,34 +503,16 @@ fn tracker_at(
 }
 
 fn match_info() -> MatchInfo {
-    MatchInfo {
-        match_id: 1,
-        map: MapId(0),
-        tick_rate: 30,
-        pregame_ticks: 90,
-        trees: Vec::new(),
-        terrain_cells: 128,
-        terrain_rle: vec![(16_384, 0x80)],
-        opaque_cells: Vec::new(),
-        mode: TickMode::Lockstep,
-        picks: vec![
-            Pick {
-                slot: SlotId(0),
-                team: Team::Radiant,
-                hero: SHADOW_FIEND,
-            },
-            Pick {
-                slot: SlotId(1),
-                team: Team::Dire,
-                hero: SHADOW_FIEND,
-            },
-        ],
-        shop: vec![ShopEntry {
+    fixtures::MatchInfoFixture::new(1, MapId(0), fixtures::two_seat_picks(Team::Radiant))
+        .pregame_ticks(90)
+        .terrain_cells(128)
+        .terrain_rle(vec![(16_384, 0x80)])
+        .shop(vec![ShopEntry {
             id: TOWN_PORTAL_SCROLL,
             cost: 100,
             components: Vec::new(),
-        }],
-    }
+        }])
+        .build()
 }
 
 fn world_view(
@@ -609,38 +591,21 @@ fn world_view(
 }
 
 fn unit(id: EntityId, kind: UnitKind, team: Team, x: i32, y: i32) -> UnitView {
-    UnitView {
+    fixtures::UnitFixture {
         id,
         kind,
         team,
         pos: Vec2::from_ints(x, y),
-        facing: Angle { brads: 0 },
-        hp: 1_000,
-        max_hp: 1_000,
         mana: 0,
-        max_mana: 0,
-        move_speed: Fixed::from_int(300),
         attack_damage: 0,
-        attack_range: Fixed::from_int(500),
         attack_time: 1000,
-        attack_point: 0,
-        attack_speed: 100,
-        armor: Fixed::ZERO,
-        magic_resist: Fixed::ZERO,
-        collision: Fixed::from_int(24),
-        bound: Fixed::from_int(24),
-        vision_radius: Fixed::from_int(1_800),
-        true_sight_radius: Fixed::ZERO,
-        statuses: StatusFlags { bits: 0 },
         attributes: Attributes::all(0),
         primary: Some(Attribute::Agility),
         hero: (kind == UnitKind::Hero).then_some(HeroId(2)),
         owner: None,
         level: 0,
-        abilities: Vec::new(),
-        items: Vec::new(),
-        effects: Vec::new(),
     }
+    .build()
 }
 
 fn usable_item() -> ItemView {

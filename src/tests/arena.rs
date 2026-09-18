@@ -79,11 +79,7 @@ fn arena_rejects_invalid_seats_before_validating_the_map() {
             .err()
             .expect("invalid seat count must fail admission");
 
-            assert_eq!(error, ArenaError::SeatCount { got: seats });
-            assert_eq!(
-                error.to_string(),
-                format!("arena seat count must be between 2 and 10, got {seats}")
-            );
+            assert_seat_count_rejected(error, seats);
         }
     }
 }
@@ -189,14 +185,8 @@ fn arena_rejects_invalid_seat_counts_with_exact_messages() {
     .err()
     .expect("eleven seats must fail");
 
-    assert_eq!(
-        too_few.to_string(),
-        "arena seat count must be between 2 and 10, got 1"
-    );
-    assert_eq!(
-        too_many.to_string(),
-        "arena seat count must be between 2 and 10, got 11"
-    );
+    assert_seat_count_rejected(too_few, 1);
+    assert_seat_count_rejected(too_many, 11);
 }
 
 #[test]
@@ -236,4 +226,12 @@ fn has_owned_hero(view: &bota_proto::WorldView, slot: SlotId) -> bool {
     view.units
         .iter()
         .any(|unit| unit.kind == UnitKind::Hero && unit.owner == Some(slot))
+}
+
+fn assert_seat_count_rejected(error: ArenaError, seats: u8) {
+    assert_eq!(error, ArenaError::SeatCount { got: seats });
+    assert_eq!(
+        error.to_string(),
+        format!("arena seat count must be between 2 and 10, got {seats}")
+    );
 }

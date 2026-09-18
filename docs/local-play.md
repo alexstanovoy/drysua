@@ -34,10 +34,10 @@ From an authorized Linux X11/Xwayland desktop terminal:
 ```sh
 # Requires an externally supplied compatible model; none is selected by default.
 /home/alexstanovoy/Workspace/bots/play.sh \
-  --weights-directory "/absolute/path/to/compatible M23 runtime weights"
+  --weights-directory "/absolute/path/to/compatible M24 runtime weights"
 # Human Dire, pure Neural bot Radiant. Either side option derives the other.
 /home/alexstanovoy/Workspace/bots/play.sh \
-  --weights-directory "/absolute/path/to/compatible M23 runtime weights" \
+  --weights-directory "/absolute/path/to/compatible M24 runtime weights" \
   --human-side dire --port 0 --seed 9000001 --no-build
 ```
 
@@ -77,18 +77,18 @@ Exactly nine metadata keys are required; numeric values are decimal strings:
 | Key | Required value |
 | --- | --- |
 | `action_schema_hash` | `10658390830565586343` (A5) |
-| `feature_schema_hash` | `10552563335950731440` (F21) |
-| `model_schema_hash` | `12076707506725412686` (M23) |
-| `ppo_schema_version` | `36` |
+| `feature_schema_hash` | `10552563335950731440` (F22) |
+| `model_schema_hash` | `12076707506725412686` (M24) |
+| `ppo_schema_version` | `37` |
 | `ppo_schema_hash` | `12793043235719775693` |
-| `ppo_rules_audit_version` | `31` |
-| `map2_reward_schema_version` | `6` |
+| `ppo_rules_audit_version` | `32` |
+| `map2_reward_schema_version` | `7` |
 | `map2_reward_schema_hash` | `7274660837025042530` |
 | `map2_reward_schema_descriptor` | Full current descriptor matching that FNV-1a hash |
 
-M23 retains A5 navigation/action legality, wait/refund and progress-debt rules.
-Reward6 retains reward5 event/potential coefficients and one first-wave positioning
-cost, not a perpetual location penalty. F21 preserves all92 global positions including
+M24 retains A5 navigation/action legality, wait/refund and progress-debt rules.
+Reward7 retains reward5 event/potential coefficients and one first-wave positioning
+cost, not a perpetual location penalty. F22 preserves all92 global positions including
 Tower remaining90/opening pending91: global92, unit84,62 named tensors,
 1,700,020 F32 parameters. See the exact coefficient/bound table in reward-rebalance.md.
 
@@ -106,7 +106,7 @@ silently relabelled. No M18 weights were generated or added to the source
 whitelist. No-argument play still fails with the missing-model prompt, and
 never substitutes root M17 weights or a Teacher.
 
-Explicit M17-to-current-M23 **initialization only** is available through
+Explicit M17-to-current-M24 **initialization only** is available through
 `TrainingArtifact::initialize_selected_m17_for_map2_wait(directory, seed, device)`.
 The additional exact M19/u162 parameter-only initializer is documented in
 [reward-rebalance.md](reward-rebalance.md); it does not resume or relabel the old model.
@@ -161,30 +161,37 @@ and do not replace files during launch.
 
 ## Build and launch contract
 
-With `root` the directory containing `play.sh`, explicit weights select
-`$root/drysua/target/release/drysua`, not a pinned historical executable. Unless
-`--no-build` is supplied, the launcher builds the bota server/client and then the
-current live **CPU-only, no-default-features** bot:
+The canonical tracked entry point is `drysua/scripts/play.sh`; the workspace-root
+`play.sh` remains a convenience shim that execs the same `play_match.py`. With
+`root` the workspace directory containing both repositories, explicit weights select
+`$root/drysua/target/release/drysua`, not a pinned historical executable.
+
+By default the launcher builds **only missing** release binaries: no cargo
+invocation runs when all three executables exist, and only the affected workspace is
+built when one is missing or not executable. `--build` forces the two release
+builds below before launching; `--no-build` never builds and checks **all three**
+existing release executables after weights preflight and before logs. `--build` and
+`--no-build` are mutually exclusive.
 
 ```sh
+# bota workspace: only for --build or a missing bota binary
 CARGO_TARGET_DIR="$root/bota/target" \
 cargo build --release --locked --quiet \
   --manifest-path "$root/bota/Cargo.toml" \
   -p bota-server -p bota-client --bin bota-server --bin bota-client
 
-# Working directory: "$root/drysua"
+# Working directory: "$root/drysua"; only for --build or a missing bot binary
 CARGO_TARGET_DIR="$root/drysua/target" \
 cargo build --release --locked --quiet --bin drysua --no-default-features
 ```
 
-Each build has a 20-minute deadline. `--no-build` checks **all three** existing
-release executables (server, client, and current drysua), after weights preflight
-and before logs. Inherited `CARGO_TARGET_DIR` does not redirect build or launch
-paths. There are no debug, builtin simulator, CUDA, training, or full-workspace
-bot builds. No historical frozen executable is overwritten. Cargo's normal
-release build can need its existing registry/cache; use `--no-build` to avoid
-compilation entirely. That option trusts the caller's build provenance; an
-existing target path alone does not prove freshness or compatibility.
+Each build has a 20-minute deadline. Inherited `CARGO_TARGET_DIR` does not redirect
+build or launch paths. There are no debug, builtin simulator, CUDA, training, or
+full-workspace bot builds. No historical frozen executable is overwritten. Cargo's
+normal release build can need its existing registry/cache. An existing target path
+alone does not prove freshness or compatibility: the default path deliberately
+reuses existing binaries and never recompiles; pass `--build` after source changes,
+or `--no-build` to forbid builds explicitly.
 
 The protocol/slot mapping is for bota commit
 `78427bb80eb716f851cb039ade33e2964bbf3c11`. Keep the server/client and current drysua
@@ -300,9 +307,11 @@ Run directories are retained for diagnosis and may be removed after use.
 ## Historical human-review archive and replay viewing
 
 The old **corrected-ppo-001/u4 F12/M14/PPO27/rules22** archive is historical,
-not current Map2 evidence. `review_paths` and its pinned SHA checks remain only as
-an archive utility in `scripts/play_match.py`; the current launcher never calls it,
-even with explicit weights. Archive locations and pins remain unchanged:
+not current Map2 evidence. The never-called `review_paths` utility and its pinned
+constants were removed from `scripts/play_match.py` on 2026-09-18; the archive and
+its pins below remain evidence-only, and no launcher code references them. The
+regression suite still hashes the archived review binary and weights directly when
+its native smokes run. Archive locations and pins remain unchanged:
 
 ```text
 drysua/artifacts/temp/human-review-20260909/current/
@@ -345,7 +354,7 @@ wheel zooms, and Escape closes. The initial -0:30 clock is the recorded pregame.
 ## Verification and GUI caveat
 
 ```sh
-bash -n /home/alexstanovoy/Workspace/bots/play.sh
+bash -n /home/alexstanovoy/Workspace/bots/drysua/scripts/play.sh
 python3 -B -m unittest discover \
   -s /home/alexstanovoy/Workspace/bots/drysua/scripts -p test_play_match.py -q
 ```

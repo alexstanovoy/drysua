@@ -130,4 +130,4 @@ include an asymmetric legal pregame advantage, so they cannot establish human sk
 
 The historical gate still applies to promotion. The proxy suite makes the user's
 reported lane behavior observable alongside it, rather than treating bot wins as
-the only definition of quality. See `laning-evaluation.md` for metric limitations.
+the only definition of quality. The public-seat laning diagnostic and its document were removed on 2026-09-18 (git history `41bc295`); its metric limitations remain historical.

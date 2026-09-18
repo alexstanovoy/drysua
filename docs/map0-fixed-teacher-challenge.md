@@ -1,5 +1,10 @@
 # Fixed-Teacher Map0 challenge
 
+> **Archived 2026-09-18.** `scripts/map0_challenge.py/json` and its tests left the
+> tracked tree in the repo-slim audit; exact contents are at
+> `artifacts/temp/repo-slim-20260917/archive/scripts-historical.tar.gz` (workspace
+> root) and in git history at `41bc295`. This page is retained as epoch history.
+
 This is **not** the historical Map1 release gate and does not promote a deployment
 default. No candidate is qualified by preparing this harness.
 

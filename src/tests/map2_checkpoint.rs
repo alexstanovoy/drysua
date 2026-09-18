@@ -66,9 +66,7 @@ pub(super) fn runtime_bytes(values: &[f32], metadata: HashMap<String, String>) -
 
 #[test]
 fn map2_semantic_versions_and_shapes_are_new_not_m14_relabels() {
-    assert_eq!(crate::MODEL_SCHEMA_VERSION, 24);
-    assert_eq!(crate::PPO_SCHEMA_VERSION, 37);
-    assert_eq!(crate::PPO_RULES_AUDIT_VERSION, 32);
+    crate::tests::support::assert_frozen_schema_versions();
     assert_eq!(crate::LEAGUE_SCHEMA_VERSION, 37);
     assert_eq!(crate::LEAGUE_RULES_AUDIT_VERSION, 32);
     assert_eq!(crate::CHECKPOINT_SCHEMA_VERSION, 12);

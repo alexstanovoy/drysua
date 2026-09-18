@@ -1,0 +1,545 @@
+use super::*;
+
+#[cfg(test)]
+pub(crate) struct PpoOrderContractProbe(ArenaSeatPolicy);
+
+#[cfg(test)]
+impl PpoOrderContractProbe {
+    pub(crate) fn new(side: usize, messages: &[ServerMsg]) -> Self {
+        Self(setup_seat(side, messages).expect("PPO order-contract seat"))
+    }
+
+    pub(crate) fn observe(&mut self, messages: &[ServerMsg]) {
+        assert!(
+            observe_messages(&mut self.0, messages)
+                .expect("PPO probe observations")
+                .is_none()
+        );
+    }
+
+    pub(crate) fn decide(
+        &mut self,
+        model: &PolicyModel,
+        candidate: bool,
+    ) -> (FeatureFrame, Option<Request>, Option<ActivePolicyOrder>) {
+        let (frame, space) = if candidate {
+            prepare_neural_seat_policy_sample(&mut self.0)
+        } else {
+            prepare_seat_policy_sample(&mut self.0)
+        }
+        .expect("PPO probe input");
+        let action = model
+            .choose(&frame, &space)
+            .expect("PPO probe choice")
+            .action;
+        let request = if candidate {
+            // Only the learner's request transport is tested; these placeholder
+            // statistics never enter a rollout, reward calculation or optimizer.
+            let choice = PpoPolicyChoice {
+                frame: frame.clone(),
+                action,
+                target: crate::BehavioralTarget::from_action(&frame, &space, action)
+                    .expect("probe target"),
+                policy: model.policy_identity().expect("probe policy"),
+                log_probability: 0.0,
+                entropy: 0.0,
+                value: 0.0,
+            };
+            policy_request_in_space(&mut self.0, &choice, &space).expect("PPO learner transport")
+        } else {
+            neural_policy_request_in_space(&mut self.0, action, &space)
+                .expect("legacy probe request")
+                .1
+        };
+        (frame, request, self.0.local.active_order())
+    }
+
+    pub(crate) fn legacy_persistence(&self) -> OrderPersistence {
+        self.0.persistence
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn pretraining_best_stage_for_test(agreements: &[(usize, usize)]) -> usize {
+    assert!(!agreements.is_empty());
+    assert!(agreements.len() <= PRETRAINING_DAGGER_SEEDS + 1);
+    let mut selected = 0usize;
+    for index in 1..agreements.len() {
+        let candidate = agreements[index];
+        let current = agreements[selected];
+        if candidate.1 > current.1 || (candidate.1 == current.1 && candidate.0 > current.0) {
+            selected = index;
+        }
+    }
+    selected
+}
+
+#[cfg(test)]
+pub(crate) fn pretraining_gameplay_stage_for_test(stages: &[PretrainingGameplay]) -> usize {
+    assert!(!stages.is_empty());
+    assert!(stages.len() <= PRETRAINING_DAGGER_SEEDS + 1);
+    let mut selected = 0usize;
+    for index in 1..stages.len() {
+        if pretraining_gameplay_better(stages[index], stages[selected]) {
+            selected = index;
+        }
+    }
+    selected
+}
+
+#[cfg(test)]
+pub(crate) const fn pretraining_gameplay_validation_seeds_for_test() -> [u64; 3] {
+    PRETRAINING_GAMEPLAY_VALIDATION_SEEDS
+}
+
+#[cfg(test)]
+pub(crate) fn validate_pretraining_gameplay_acceptance_for_test(
+    gameplay: PretrainingGameplay,
+) -> Result<(), PpoError> {
+    validate_pretraining_gameplay_acceptance(gameplay, &[])
+}
+
+#[cfg(test)]
+pub(crate) fn pretraining_gameplay_result_for_test(
+    game: &CheckpointEvaluationGame,
+) -> Result<PretrainingGameplay, PpoError> {
+    pretraining_gameplay_result(game)
+}
+
+#[cfg(test)]
+pub(crate) fn pretraining_gameplay_games_for_test(
+    model: &PolicyModel,
+    seed: u64,
+    decisions: usize,
+) -> Result<Vec<CheckpointEvaluationGame>, PpoError> {
+    assert!(decisions <= 8);
+    pretraining_gameplay_games(model, seed, decisions)
+}
+
+#[cfg(test)]
+pub(crate) fn validate_behavioral_pretraining_for_test(
+    settings: BehavioralPretrainingConfig,
+) -> Result<(), PpoError> {
+    validate_behavioral_pretraining(settings)
+}
+
+#[cfg(test)]
+pub(crate) const fn pretraining_dagger_baseline_for_test(
+    index: usize,
+) -> CheckpointEvaluationBaseline {
+    pretraining_dagger_baseline(index)
+}
+
+#[cfg(test)]
+pub(crate) fn collect_pretraining_pool_for_test(
+    seed: u64,
+    decisions: usize,
+) -> Result<ImitationPool, PpoError> {
+    assert!(decisions <= 8);
+    let collection =
+        collect_pretraining_samples(BehavioralPretrainingConfig { epochs: 8, seed }, decisions)?;
+    Ok(collection.pool)
+}
+
+#[cfg(test)]
+pub(crate) const fn pretraining_profile_for_test() -> (MapId, [usize; 3], usize) {
+    (
+        PRETRAINING_MAP,
+        [
+            PRETRAINING_DECISIONS,
+            PRETRAINING_DAGGER_DECISIONS,
+            PRETRAINING_GAMEPLAY_DECISIONS,
+        ],
+        PRETRAINING_SAMPLE_CAPACITY,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn pretraining_dagger_choice_for_test(
+    model: &PolicyModel,
+    side: usize,
+    messages: &[ServerMsg],
+) -> Result<(crate::ImitationSample, Option<Request>, bool), PpoError> {
+    assert!(side < 2);
+    let mut seat = setup_seat(side, messages)?;
+    let settings = BehavioralPretrainingConfig {
+        epochs: 8,
+        seed: 50_001,
+    };
+    let scope =
+        TrainingScope::new(PRETRAINING_MAP, IMITATION_RULES_AUDIT_VERSION).map_err(text_error)?;
+    let mut pool = ImitationPool::new(8, 50_001, pretraining_namespaces(settings)?, scope)
+        .map_err(text_error)?;
+    let retained = dagger_decision(
+        &mut seat,
+        model,
+        settings.seed,
+        0,
+        127,
+        &mut pool,
+        &mut [0; ActionKind::COUNT],
+        &mut [[[0; ActionKind::COUNT]; PRETRAINING_WINDOWS]; 2],
+    )?;
+    assert_eq!(retained, 1);
+    let request = dagger_learner_request(&mut seat, model)?;
+    let sample = pool
+        .get(0)
+        .ok_or(PpoError::InvalidTransition(
+            "pretraining DAgger fixture sample",
+        ))?
+        .clone();
+    Ok((sample, request, seat.order_bookkeeping.is_candidate()))
+}
+
+#[cfg(test)]
+pub(crate) const fn pretraining_window_for_test(decision: usize) -> usize {
+    pretraining_window(decision)
+}
+
+#[cfg(test)]
+pub(crate) const fn pretraining_retains_teacher_for_test(
+    namespace: SeedNamespace,
+    kind: ActionKind,
+    retained: u64,
+) -> bool {
+    pretraining_retains_teacher(namespace, kind, retained)
+}
+
+#[cfg(test)]
+pub(crate) const fn pretraining_retains_dagger_for_test(
+    agreement: bool,
+    decision: usize,
+    retained: u64,
+) -> bool {
+    pretraining_retains_dagger(agreement, decision, retained)
+}
+
+#[cfg(test)]
+pub(crate) fn validate_pretraining_agreement_for_test(
+    metrics: &crate::OfflineEvaluation,
+) -> Result<(), PpoError> {
+    validate_pretraining_agreement(metrics)
+}
+
+#[cfg(test)]
+pub(crate) fn merge_actor_report_for_test(
+    aggregate: &mut PpoSmokeReport,
+    actor: PpoSmokeReport,
+) -> Result<(), PpoError> {
+    merge_actor_report(aggregate, actor)
+}
+
+#[cfg(test)]
+pub(crate) const fn training_opponent_baseline_for_test(pair: u64) -> CheckpointEvaluationBaseline {
+    training_opponent_baseline(pair)
+}
+
+#[cfg(test)]
+pub(crate) const fn training_warmup_phase_index(stream: u64) -> usize {
+    (training_pair_index(stream) % 8) as usize
+}
+
+#[cfg(test)]
+pub(crate) fn assert_frozen_neural_opponent_for_test(model: &PolicyModel) {
+    let snapshot = PolicySnapshot::capture(model, 0).expect("frozen snapshot");
+    for map in [MapId(0), MapId(1), MapId(2)] {
+        let mut environment = build_environment(
+            23_090,
+            23_091,
+            map,
+            0,
+            0,
+            OpponentSpec::Policy(snapshot.clone()),
+        )
+        .expect("frozen opponent arena");
+        assert!(matches!(
+            environment.opponent,
+            OpponentRuntime::Policy { .. }
+        ));
+        for _ in 0..4 {
+            let (requests, kind) = requests_for_neural_greedy_decision(&mut environment, model)
+                .expect("pure requests");
+            assert_eq!(kind, ActionKind::Stop);
+            assert!(requests.iter().flatten().all(|request| matches!(
+                request.order,
+                bota_proto::Order::Move {
+                    target: bota_proto::Target::None
+                }
+            )));
+            advance_interval(&mut environment, requests, 3).expect("pure ticks");
+        }
+        assert_eq!(environment.seats[0].sequence, 1);
+        assert!((1..=4).contains(&environment.seats[1].sequence));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn assert_pure_warmup_ledger_for_test(model: &PolicyModel, kind: ActionKind) {
+    for map in [MapId(0), MapId(1), MapId(2)] {
+        for side in 0..2 {
+            let mut batched = vec![
+                build_environment(23_088, 23_089, map, side, 0, OpponentSpec::Teacher)
+                    .expect("arena"),
+            ];
+            let mut raw = build_environment(23_088, 23_089, map, side, 0, OpponentSpec::Teacher)
+                .expect("arena");
+            for _ in 0..4 {
+                let requests = requests_for_batched_greedy_decisions(&mut batched, &[0], model)
+                    .expect("warmup");
+                let (expected, action) =
+                    requests_for_neural_greedy_decision(&mut raw, model).expect("raw neural");
+                assert_eq!(action, kind);
+                assert_eq!(requests, vec![expected.clone()]);
+                advance_warmup_environments(&mut batched, &[0], requests, 3).expect("warmup ticks");
+                advance_interval(&mut raw, expected, 3).expect("raw ticks");
+                for seat in 0..2 {
+                    assert_eq!(batched[0].seats[seat].sequence, raw.seats[seat].sequence);
+                    assert_eq!(
+                        batched[0].seats[seat].tracker.latest_summary(),
+                        raw.seats[seat].tracker.latest_summary()
+                    );
+                    assert_eq!(batched[0].seats[seat].rejections, 0);
+                }
+            }
+            assert!(raw.seats[1 - side].sequence > 0);
+            assert!(raw.seats[side].sequence <= 1);
+        }
+    }
+}
+
+#[cfg(test)]
+fn run_warmup_decisions(
+    environment: &mut TrainingEnvironment,
+    model: &PolicyModel,
+    decisions: usize,
+    decision_interval_ticks: u32,
+) -> Result<(), PpoError> {
+    for _ in 0..decisions {
+        let (requests, _) = requests_for_neural_greedy_decision(environment, model)?;
+        let advanced = advance_interval(environment, requests, decision_interval_ticks)?;
+        reject_production_rejection(environment, "production warmup")?;
+        if advanced.winner.is_some() {
+            restart_environment(environment)?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(crate) fn production_warmup_order_counts_for_test(
+    model: &PolicyModel,
+    decisions: usize,
+) -> Result<[u32; 2], PpoError> {
+    let mut environment = build_environment(23_078, 23_079, MapId(1), 0, 0, OpponentSpec::Weak)?;
+    run_warmup_decisions(&mut environment, model, decisions, 3)?;
+    assert_eq!(environment.policy_seat, 0);
+    Ok([environment.seats[0].sequence, environment.seats[1].sequence])
+}
+
+#[cfg(test)]
+pub(crate) fn production_batched_warmup_order_counts_for_test(
+    model: &PolicyModel,
+    decisions: usize,
+) -> Result<[[u32; 2]; 2], PpoError> {
+    let mut environments = vec![
+        build_environment(23_082, 23_083, MapId(1), 0, 0, OpponentSpec::Weak)?,
+        build_environment(23_082, 23_083, MapId(1), 1, 0, OpponentSpec::Weak)?,
+    ];
+    for _ in 0..decisions {
+        let active = [0, 1];
+        let requests = requests_for_batched_greedy_decisions(&mut environments, &active, model)?;
+        advance_warmup_environments(&mut environments, &active, requests, 3)?;
+    }
+    Ok(std::array::from_fn(|environment| {
+        std::array::from_fn(|seat| environments[environment].seats[seat].sequence)
+    }))
+}
+
+#[cfg(test)]
+pub(crate) fn production_warmup_cleanup_preserves_readiness_for_test() -> Result<bool, PpoError> {
+    let mut environment = build_environment(23_080, 23_081, MapId(1), 0, 0, OpponentSpec::Weak)?;
+    for seat in &mut environment.seats {
+        seat.readiness
+            .note_shared_wait_for_test(crate::ControlledUnit::Hero, 7, 2_100);
+    }
+    let before = environment
+        .seats
+        .iter()
+        .map(|seat| seat.readiness)
+        .collect::<Vec<_>>();
+    clear_warmup_orders(&mut environment, 3)?;
+    Ok(environment
+        .seats
+        .iter()
+        .zip(before)
+        .all(|(seat, readiness)| seat.readiness == readiness))
+}
+
+#[cfg(test)]
+pub(crate) fn evaluate_checkpoint_game(
+    candidate: &PolicyModel,
+    settings: CheckpointEvaluationConfig,
+    map: MapId,
+    baseline: CheckpointEvaluationBaseline,
+    seed: u64,
+    candidate_seat: usize,
+) -> Result<CheckpointEvaluationGame, PpoError> {
+    evaluate_checkpoint_game_with_policy(
+        candidate,
+        settings,
+        map,
+        baseline,
+        seed,
+        candidate_seat,
+        false,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn evaluate_teacher_against_weak_for_test(
+    seed: u64,
+    decisions: usize,
+) -> Result<Vec<CheckpointEvaluationGame>, PpoError> {
+    validate_checkpoint_evaluation(CheckpointEvaluationConfig {
+        pairs: 1,
+        decisions,
+        seed,
+    })?;
+    let mut games = Vec::with_capacity(4);
+    for map in [MapId(0), MapId(1)] {
+        for teacher_seat in 0..2 {
+            games.push(evaluate_teacher_against_weak_game(
+                seed,
+                decisions,
+                map,
+                teacher_seat,
+            )?);
+        }
+    }
+    Ok(games)
+}
+
+#[cfg(test)]
+pub(crate) fn evaluate_teacher_against_weak_game(
+    seed: u64,
+    decision_limit: usize,
+    map: MapId,
+    teacher_seat: usize,
+) -> Result<CheckpointEvaluationGame, PpoError> {
+    let opponent_seed = derive_training_seed(
+        seed,
+        map.0 as u64,
+        baseline_domain(CheckpointEvaluationBaseline::Weak),
+    );
+    let mut environment = build_environment(
+        seed,
+        opponent_seed,
+        map,
+        teacher_seat,
+        0,
+        OpponentSpec::Weak,
+    )?;
+    let teacher_team = environment.seats[teacher_seat].tracker.team();
+    let mut action_counts = [0u32; ActionKind::COUNT];
+    let mut decisions = 0u32;
+    let mut elapsed_ticks = 0u32;
+    let mut winner = None;
+    for _ in 0..decision_limit {
+        let (requests, action) = requests_for_teacher_decision(&mut environment)?;
+        let advanced = advance_interval(&mut environment, requests, 3)?;
+        action_counts[action.index()] = action_counts[action.index()]
+            .checked_add(1)
+            .ok_or(PpoError::CounterOverflow)?;
+        decisions = decisions.checked_add(1).ok_or(PpoError::CounterOverflow)?;
+        elapsed_ticks = elapsed_ticks
+            .checked_add(advanced.ticks)
+            .ok_or(PpoError::CounterOverflow)?;
+        if advanced.winner.is_some() {
+            winner = advanced.winner;
+            break;
+        }
+    }
+    teacher_weak_game_report(
+        &environment,
+        map,
+        seed,
+        teacher_team,
+        winner,
+        decisions,
+        elapsed_ticks,
+        action_counts,
+    )
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn teacher_weak_game_report(
+    environment: &TrainingEnvironment,
+    map: MapId,
+    seed: u64,
+    teacher_team: Team,
+    winner: Option<Team>,
+    decisions: u32,
+    elapsed_ticks: u32,
+    action_counts: [u32; ActionKind::COUNT],
+) -> Result<CheckpointEvaluationGame, PpoError> {
+    let teacher = &environment.seats[environment.policy_seat];
+    let weak = &environment.seats[1 - environment.policy_seat];
+    Ok(CheckpointEvaluationGame {
+        map,
+        baseline: CheckpointEvaluationBaseline::Weak,
+        seed,
+        candidate_team: teacher_team,
+        outcome: checkpoint_evaluation_outcome(teacher_team, winner),
+        decisions,
+        wire_orders: teacher.sequence,
+        rejected_orders: u32::try_from(teacher.rejections)
+            .map_err(|_| PpoError::InvalidTransition("teacher rejection count"))?,
+        baseline_wire_orders: weak.sequence,
+        baseline_rejected_orders: u32::try_from(weak.rejections)
+            .map_err(|_| PpoError::InvalidTransition("weak rejection count"))?,
+        elapsed_ticks,
+        action_counts,
+        final_summary: teacher
+            .tracker
+            .latest_summary()
+            .ok_or(PpoError::InvalidTransition("teacher final summary"))?,
+    })
+}
+
+#[cfg(test)]
+pub(crate) fn rejection_delta_for_test(before: u64, after: u64) -> Result<u64, PpoError> {
+    rejection_delta(before, after)
+}
+
+#[cfg(test)]
+fn requests_for_teacher_decision(
+    environment: &mut TrainingEnvironment,
+) -> Result<(Vec<Option<Request>>, ActionKind), PpoError> {
+    let teacher_seat = environment.policy_seat;
+    let (action, mut teacher_request) =
+        teacher_request_with_action(&mut environment.seats[teacher_seat])?;
+    let mut requests = Vec::with_capacity(environment.seats.len());
+    for index in 0..environment.seats.len() {
+        let request = if index == teacher_seat {
+            teacher_request.take()
+        } else {
+            opponent_request(&mut environment.seats[index], &mut environment.opponent)?
+        };
+        requests.push(request);
+    }
+    Ok((requests, action))
+}
+
+#[cfg(test)]
+pub(crate) const fn deployment_uses_teacher_for_test(map: MapId) -> bool {
+    deployment_uses_teacher(map)
+}
+
+#[cfg(test)]
+pub(super) fn observe_messages(
+    seat: &mut ArenaSeatPolicy,
+    messages: &[ServerMsg],
+) -> Result<Option<Team>, PpoError> {
+    observe_messages_owned(seat, messages.to_vec())
+}

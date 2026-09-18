@@ -21,14 +21,18 @@ use crate::{
     TrainingSlot, global_feature,
 };
 
+#[cfg(test)]
+#[path = "tests/imitation_test_support.rs"]
+mod test_support;
+#[cfg(test)]
+pub(crate) use test_support::*;
+
 /// Maximum number of owned samples retained by one imitation pool.
 pub const MAX_IMITATION_SAMPLES: usize = 32_768;
 /// Maximum seed count in each training, validation, or promotion namespace.
 pub const MAX_SEED_NAMESPACE: usize = 8_192;
 /// Maximum epoch, optimizer-step, and global-update counter value.
 pub const MAX_TRAINING_COUNTER: u64 = 1_000_000_000;
-/// Minimum rollout action count accepted by the promotion gate.
-pub const MIN_PROMOTION_ROLLOUT_ACTIONS: u64 = 1_000;
 /// Current sample audit: F17 wait/progress-accounting globals with unchanged A5 legality.
 /// Prior samples and reports cannot be relabelled as reward-v3 observations.
 pub const IMITATION_RULES_AUDIT_VERSION: u32 = 22;
@@ -110,11 +114,6 @@ pub enum ImitationError {
         second: &'static str,
         seed: u64,
     },
-    NonFiniteEvaluation,
-    InvalidEvaluationCounts,
-    InvalidRolloutCounts,
-    InvalidGameplayReport(&'static str),
-    PolicyIdentityMismatch,
     InvalidTeacherCoverage,
     CheckpointState(&'static str),
     Rollback {
@@ -260,20 +259,6 @@ impl ImitationError {
 
     fn fmt_training_state(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NonFiniteEvaluation => {
-                formatter.write_str("imitation evaluation value is non-finite")
-            }
-            Self::InvalidEvaluationCounts => {
-                formatter.write_str("imitation evaluation counts are inconsistent")
-            }
-            Self::InvalidRolloutCounts => {
-                formatter.write_str("imitation rollout rejection counts are inconsistent")
-            }
-            Self::InvalidGameplayReport(field) => {
-                write!(formatter, "imitation paired gameplay {field} is invalid")
-            }
-            Self::PolicyIdentityMismatch => formatter
-                .write_str("imitation promotion evidence policy identity does not match candidate"),
             Self::InvalidTeacherCoverage => {
                 formatter.write_str("imitation teacher coverage counts are inconsistent")
             }
@@ -1364,11 +1349,6 @@ impl ImitationPool {
         &self.binding
     }
 
-    #[cfg(test)]
-    pub(crate) fn clear_identity_history_for_test(&mut self) {
-        self.seen_identities.clear();
-    }
-
     /// Returns shuffled indices of only Train samples without changing sample order.
     pub fn training_order(&self, shuffle: &mut ShuffleState) -> Result<Vec<usize>, ImitationError> {
         let mut order = self
@@ -1623,13 +1603,6 @@ fn pointer_target<const WIDTH: usize>(
     Ok(HeadTarget::active(padded_mask(mask)?, selected))
 }
 
-#[cfg(test)]
-pub(crate) fn padded_mask_for_test<const WIDTH: usize>(
-    mask: &[bool],
-) -> Result<[bool; WIDTH], ImitationError> {
-    padded_mask(mask)
-}
-
 fn required_mask(mask: Option<&[bool]>) -> Result<&[bool], ImitationError> {
     mask.ok_or(ImitationError::TargetEmptyMask { head: "pointer" })
 }
@@ -1741,15 +1714,6 @@ impl TeacherCoverage {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn record_represented(&mut self) -> Result<(), ImitationError> {
-        self.increment(true)
-    }
-
-    pub fn record_failed(&mut self) -> Result<(), ImitationError> {
-        self.increment(false)
-    }
-
     /// Records a successful teacher label for one exact sample identity.
     pub fn record_represented_for(
         &mut self,
@@ -1761,47 +1725,6 @@ impl TeacherCoverage {
     /// Records a failed teacher attempt for one exact state identity.
     pub fn record_failed_for(&mut self, identity: SampleIdentity) -> Result<(), ImitationError> {
         self.record_identity(identity, false, None)
-    }
-
-    /// Runs one complete teacher-decision/target-construction operation as one attempt.
-    #[cfg(test)]
-    pub(crate) fn collect<T, E>(
-        &mut self,
-        operation: impl FnOnce() -> Result<T, E>,
-    ) -> Result<T, CoverageError<E>> {
-        self.ensure_capacity().map_err(CoverageError::Capacity)?;
-        let result = operation();
-        self.attempted += 1;
-        if result.is_ok() {
-            self.represented += 1;
-        } else {
-            self.failed += 1;
-        }
-        result.map_err(CoverageError::Operation)
-    }
-
-    /// Performs one identity-bound teacher attempt while retaining failures.
-    #[cfg(test)]
-    fn collect_for<T, E>(
-        &mut self,
-        identity: SampleIdentity,
-        operation: impl FnOnce() -> Result<T, E>,
-    ) -> Result<T, CoverageError<E>> {
-        self.ensure_capacity().map_err(CoverageError::Capacity)?;
-        self.validate_identity_metadata(identity)
-            .map_err(CoverageError::Capacity)?;
-        let result = operation();
-        self.record_identity_after_capacity(identity, result.is_ok(), None);
-        result.map_err(CoverageError::Operation)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn collect_for_test<T, E>(
-        &mut self,
-        identity: SampleIdentity,
-        operation: impl FnOnce() -> Result<T, E>,
-    ) -> Result<T, CoverageError<E>> {
-        self.collect_for(identity, operation)
     }
 
     /// Runs `Teacher::decide` and exact target construction as one counted attempt.
@@ -1827,17 +1750,6 @@ impl TeacherCoverage {
         let instance = result.as_ref().ok().map(|sample| sample.instance);
         self.record_identity_after_capacity(identity, result.is_ok(), instance);
         result.map_err(CoverageError::Operation)
-    }
-
-    fn increment(&mut self, represented: bool) -> Result<(), ImitationError> {
-        self.ensure_capacity()?;
-        self.attempted += 1;
-        if represented {
-            self.represented += 1;
-        } else {
-            self.failed += 1;
-        }
-        Ok(())
     }
 
     fn record_identity(
@@ -2014,11 +1926,6 @@ impl EvaluationAggregate {
     pub fn teacher_coverage(&self) -> Option<f64> {
         (self.teacher_attempted != 0)
             .then(|| self.teacher_covered as f64 / self.teacher_attempted as f64)
-    }
-    pub fn continue_ratio(&self) -> Option<f64> {
-        (self.samples != 0).then(|| {
-            self.action_distribution[ActionKind::Continue.index()] as f64 / self.samples as f64
-        })
     }
 
     fn note(&mut self, sample: &ImitationSample, prediction: BehavioralPrediction) {
@@ -2231,423 +2138,6 @@ fn set_side_coverage(
     let (represented, attempted) = coverage.side_counts(side);
     aggregate.teacher_covered = represented;
     aggregate.teacher_attempted = attempted;
-}
-
-/// Learner outcome for one learner-versus-teacher match.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum LearnerMatchOutcome {
-    Win,
-    Loss,
-    Draw,
-}
-
-/// One finite learner-versus-teacher outcome and score pair.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct LearnerTeacherResult {
-    outcome: LearnerMatchOutcome,
-    learner_score: f64,
-    teacher_score: f64,
-}
-
-impl LearnerTeacherResult {
-    pub fn new(
-        outcome: LearnerMatchOutcome,
-        learner_score: f64,
-        teacher_score: f64,
-    ) -> Result<Self, ImitationError> {
-        if !learner_score.is_finite() || !teacher_score.is_finite() {
-            return Err(ImitationError::NonFiniteEvaluation);
-        }
-        Ok(Self {
-            outcome,
-            learner_score,
-            teacher_score,
-        })
-    }
-
-    pub const fn outcome(self) -> LearnerMatchOutcome {
-        self.outcome
-    }
-    pub const fn learner_score(self) -> f64 {
-        self.learner_score
-    }
-    pub const fn teacher_score(self) -> f64 {
-        self.teacher_score
-    }
-}
-
-/// One seed played once with the learner as Radiant and once as Dire.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct PairedSeedResult {
-    seed: u64,
-    radiant: LearnerTeacherResult,
-    dire: LearnerTeacherResult,
-}
-
-impl PairedSeedResult {
-    pub const fn new(seed: u64, radiant: LearnerTeacherResult, dire: LearnerTeacherResult) -> Self {
-        Self {
-            seed,
-            radiant,
-            dire,
-        }
-    }
-
-    pub const fn seed(self) -> u64 {
-        self.seed
-    }
-    pub const fn radiant(self) -> LearnerTeacherResult {
-        self.radiant
-    }
-    pub const fn dire(self) -> LearnerTeacherResult {
-        self.dire
-    }
-}
-
-/// Aggregate derived only from structural per-seed results for one side.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct SideMatchReport {
-    games: u32,
-    wins: u32,
-    losses: u32,
-    draws: u32,
-    learner_score: f64,
-    teacher_score: f64,
-}
-
-impl SideMatchReport {
-    const fn empty() -> Self {
-        Self {
-            games: 0,
-            wins: 0,
-            losses: 0,
-            draws: 0,
-            learner_score: 0.0,
-            teacher_score: 0.0,
-        }
-    }
-
-    fn note(&mut self, result: LearnerTeacherResult) -> Result<(), ImitationError> {
-        self.games += 1;
-        match result.outcome {
-            LearnerMatchOutcome::Win => self.wins += 1,
-            LearnerMatchOutcome::Loss => self.losses += 1,
-            LearnerMatchOutcome::Draw => self.draws += 1,
-        }
-        self.learner_score += result.learner_score;
-        self.teacher_score += result.teacher_score;
-        if !self.learner_score.is_finite() || !self.teacher_score.is_finite() {
-            return Err(ImitationError::NonFiniteEvaluation);
-        }
-        Ok(())
-    }
-
-    pub const fn games(self) -> u32 {
-        self.games
-    }
-    pub const fn wins(self) -> u32 {
-        self.wins
-    }
-    pub const fn losses(self) -> u32 {
-        self.losses
-    }
-    pub const fn draws(self) -> u32 {
-        self.draws
-    }
-    pub const fn learner_score(self) -> f64 {
-        self.learner_score
-    }
-    pub const fn teacher_score(self) -> f64 {
-        self.teacher_score
-    }
-    pub fn learner_win_rate(self) -> f64 {
-        f64::from(self.wins) / f64::from(self.games)
-    }
-}
-
-/// Bounded structural paired matches for one exact candidate policy.
-#[derive(Clone, Debug, PartialEq)]
-pub struct PairedGameplayReport {
-    candidate: crate::PolicyIdentity,
-    results: Vec<PairedSeedResult>,
-    paired_seeds: Vec<u64>,
-    radiant: SideMatchReport,
-    dire: SideMatchReport,
-}
-
-impl PairedGameplayReport {
-    pub fn new(
-        candidate: crate::PolicyIdentity,
-        mut results: Vec<PairedSeedResult>,
-    ) -> Result<Self, ImitationError> {
-        if results.is_empty() || results.len() > MAX_SEED_NAMESPACE {
-            return Err(ImitationError::InvalidGameplayReport("paired seed count"));
-        }
-        results.sort_unstable_by_key(|result| result.seed);
-        if results.windows(2).any(|pair| pair[0].seed >= pair[1].seed) {
-            return Err(ImitationError::InvalidGameplayReport(
-                "paired seed identity",
-            ));
-        }
-        let mut radiant = SideMatchReport::empty();
-        let mut dire = SideMatchReport::empty();
-        for result in &results {
-            radiant.note(result.radiant)?;
-            dire.note(result.dire)?;
-        }
-        let paired_seeds = results.iter().map(|result| result.seed).collect();
-        Ok(Self {
-            candidate,
-            results,
-            paired_seeds,
-            radiant,
-            dire,
-        })
-    }
-
-    pub const fn candidate(&self) -> crate::PolicyIdentity {
-        self.candidate
-    }
-    pub fn results(&self) -> &[PairedSeedResult] {
-        &self.results
-    }
-    pub fn paired_seeds(&self) -> &[u64] {
-        &self.paired_seeds
-    }
-    pub const fn radiant(&self) -> SideMatchReport {
-        self.radiant
-    }
-    pub const fn dire(&self) -> SideMatchReport {
-        self.dire
-    }
-
-    fn validate(&self) -> Result<(), ImitationError> {
-        let rebuilt = Self::new(self.candidate, self.results.clone())?;
-        if &rebuilt != self {
-            return Err(ImitationError::InvalidGameplayReport(
-                "derived paired aggregates",
-            ));
-        }
-        Ok(())
-    }
-
-    fn learner_not_worse(&self) -> bool {
-        let learner = self.radiant.learner_score + self.dire.learner_score;
-        let teacher = self.radiant.teacher_score + self.dire.teacher_score;
-        let radiant_has_score =
-            self.radiant.learner_score != 0.0 || self.radiant.teacher_score != 0.0;
-        let dire_has_score = self.dire.learner_score != 0.0 || self.dire.teacher_score != 0.0;
-        radiant_has_score
-            && dire_has_score
-            && learner.is_finite()
-            && teacher.is_finite()
-            && self.radiant.learner_score >= self.radiant.teacher_score
-            && self.dire.learner_score >= self.dire.teacher_score
-            && learner >= teacher
-    }
-}
-
-/// Bounded rollout rejection counts and mandatory safety audits.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct RolloutAudit {
-    candidate: crate::PolicyIdentity,
-    rejected_actions: u64,
-    total_actions: u64,
-    side_audit_passed: bool,
-    exploit_audit_passed: bool,
-}
-
-impl RolloutAudit {
-    pub fn new(
-        candidate: crate::PolicyIdentity,
-        rejected_actions: u64,
-        total_actions: u64,
-        side_audit_passed: bool,
-        exploit_audit_passed: bool,
-    ) -> Result<Self, ImitationError> {
-        if total_actions > MAX_TRAINING_COUNTER
-            || rejected_actions > MAX_TRAINING_COUNTER
-            || rejected_actions > total_actions
-        {
-            return Err(ImitationError::InvalidRolloutCounts);
-        }
-        Ok(Self {
-            candidate,
-            rejected_actions,
-            total_actions,
-            side_audit_passed,
-            exploit_audit_passed,
-        })
-    }
-
-    pub const fn candidate(self) -> crate::PolicyIdentity {
-        self.candidate
-    }
-    pub const fn rejected_actions(self) -> u64 {
-        self.rejected_actions
-    }
-    pub const fn total_actions(self) -> u64 {
-        self.total_actions
-    }
-}
-
-/// Typed held-out, paired-gameplay, and rollout inputs to the promotion gate.
-#[derive(Clone, Debug, PartialEq)]
-pub struct PromotionGateInput {
-    pub held_out: HeldOutEvaluation,
-    pub rollout: RolloutAudit,
-    pub gameplay: PairedGameplayReport,
-}
-
-/// Individual promotion requirements and their conjunction.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct PromotionGateResult {
-    pub full_agreement: bool,
-    pub teacher_coverage: bool,
-    pub rejection_rate: bool,
-    pub gameplay_score: bool,
-    pub both_sides: bool,
-    pub side_audit: bool,
-    pub exploit_audit: bool,
-    pub nontrivial_action_distribution: bool,
-    pub radiant_win_rate: f64,
-    pub dire_win_rate: f64,
-    pub passed: bool,
-}
-
-impl PromotionGateInput {
-    pub fn evaluate(&self, model: &PolicyModel) -> Result<PromotionGateResult, ImitationError> {
-        model.with_policy_identity(|candidate| self.evaluate_candidate(candidate))?
-    }
-
-    fn evaluate_candidate(
-        &self,
-        candidate: crate::PolicyIdentity,
-    ) -> Result<PromotionGateResult, ImitationError> {
-        self.validate_inputs(candidate)?;
-        let metrics = &self.held_out.metrics;
-        let full_agreement = metrics
-            .overall
-            .full_agreement()
-            .is_some_and(|value| value >= 0.95);
-        let teacher_coverage = self.held_out.coverage.ratio() == Some(1.0)
-            && self.held_out.coverage.represented == metrics.overall.samples;
-        let rejection = self.rollout.rejected_actions as f64 / self.rollout.total_actions as f64;
-        let rejection_rate = rejection < 0.001;
-        let gameplay_score = self.gameplay.learner_not_worse();
-        let both_sides = metrics.radiant.samples != 0 && metrics.dire.samples != 0;
-        let side_audit = self.rollout.side_audit_passed;
-        let exploit_audit = self.rollout.exploit_audit_passed;
-        let nontrivial_action_distribution = metrics
-            .overall
-            .action_distribution
-            .iter()
-            .filter(|count| **count != 0)
-            .count()
-            >= 2;
-        Ok(PromotionGateResult {
-            full_agreement,
-            teacher_coverage,
-            rejection_rate,
-            gameplay_score,
-            both_sides,
-            side_audit,
-            exploit_audit,
-            nontrivial_action_distribution,
-            radiant_win_rate: self.gameplay.radiant.learner_win_rate(),
-            dire_win_rate: self.gameplay.dire.learner_win_rate(),
-            passed: full_agreement
-                && teacher_coverage
-                && rejection_rate
-                && gameplay_score
-                && both_sides
-                && side_audit
-                && exploit_audit
-                && nontrivial_action_distribution,
-        })
-    }
-
-    fn validate_inputs(&self, candidate: crate::PolicyIdentity) -> Result<(), ImitationError> {
-        let metrics = &self.held_out.metrics;
-        validate_evaluation_aggregate(&metrics.overall)?;
-        validate_evaluation_aggregate(&metrics.radiant)?;
-        validate_evaluation_aggregate(&metrics.dire)?;
-        if metrics.radiant.samples.checked_add(metrics.dire.samples)
-            != Some(metrics.overall.samples)
-        {
-            return Err(ImitationError::InvalidEvaluationCounts);
-        }
-        validate_pool_binding(&self.held_out.pool)?;
-        validate_scope(self.held_out.pool.scope)?;
-        if self.held_out.candidate != candidate
-            || self.rollout.candidate != candidate
-            || self.gameplay.candidate != candidate
-        {
-            return Err(ImitationError::PolicyIdentityMismatch);
-        }
-        self.held_out.coverage.validate()?;
-        let coverage = &self.held_out.coverage;
-        if metrics.overall.teacher_covered != coverage.represented
-            || metrics.overall.teacher_attempted != coverage.attempted
-        {
-            return Err(ImitationError::InvalidTeacherCoverage);
-        }
-        for (aggregate, side) in [
-            (&metrics.radiant, ImitationSide::Radiant),
-            (&metrics.dire, ImitationSide::Dire),
-        ] {
-            let (represented, attempted) = coverage.side_counts(side);
-            if aggregate.teacher_covered != represented || aggregate.teacher_attempted != attempted
-            {
-                return Err(ImitationError::InvalidTeacherCoverage);
-            }
-        }
-        self.gameplay.validate()?;
-        if self.gameplay.paired_seeds != self.held_out.pool.seeds.promotion {
-            return Err(ImitationError::InvalidGameplayReport(
-                "promotion seed namespace",
-            ));
-        }
-        if self.rollout.total_actions < MIN_PROMOTION_ROLLOUT_ACTIONS
-            || self.rollout.total_actions > MAX_TRAINING_COUNTER
-            || self.rollout.rejected_actions > MAX_TRAINING_COUNTER
-            || self.rollout.rejected_actions > self.rollout.total_actions
-        {
-            return Err(ImitationError::InvalidRolloutCounts);
-        }
-        Ok(())
-    }
-}
-
-fn validate_evaluation_aggregate(aggregate: &EvaluationAggregate) -> Result<(), ImitationError> {
-    let family_total = aggregate
-        .families
-        .iter()
-        .map(|family| family.total)
-        .try_fold(0usize, usize::checked_add);
-    let distribution_total = aggregate
-        .action_distribution
-        .iter()
-        .copied()
-        .try_fold(0usize, usize::checked_add);
-    if aggregate.samples > MAX_IMITATION_SAMPLES
-        || aggregate.full.total != aggregate.samples
-        || aggregate.full.matching > aggregate.full.total
-        || aggregate.kind.matching > aggregate.kind.total
-        || aggregate.kind.total > aggregate.samples
-        || aggregate.teacher_covered > aggregate.teacher_attempted
-        || aggregate.teacher_attempted > MAX_IMITATION_SAMPLES
-        || family_total != Some(aggregate.samples)
-        || distribution_total != Some(aggregate.samples)
-    {
-        return Err(ImitationError::InvalidEvaluationCounts);
-    }
-    for family in aggregate.families {
-        if family.matching > family.total || family.total > aggregate.samples {
-            return Err(ImitationError::InvalidEvaluationCounts);
-        }
-    }
-    Ok(())
 }
 
 /// Sorted unique and pairwise-disjoint optimization/evaluation seed metadata.
@@ -2960,44 +2450,6 @@ impl BehavioralTrainer {
     }
     pub const fn shuffle_draws(&self) -> u64 {
         self.shuffle.draws
-    }
-
-    #[cfg(test)]
-    pub(crate) fn train_epoch_with_failure(
-        &mut self,
-        model: &PolicyModel,
-        pool: &ImitationPool,
-        update: usize,
-        rollback_failure: bool,
-    ) -> Result<TrainingEpochReport, ImitationError> {
-        self.train_epoch_atomic(model, pool, Some(update), rollback_failure)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn orchestration_state_for_test(&self) -> (ShuffleState, PoolBinding) {
-        (self.shuffle, self.pool.clone())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn set_shuffle_draws_for_test(&mut self, draws: u64) {
-        self.shuffle.draws = draws;
-    }
-
-    #[cfg(test)]
-    pub(crate) fn set_counters_for_test(
-        &mut self,
-        counters: TrainerCounters,
-    ) -> Result<(), ImitationError> {
-        let (first, second) = self.adam.moments();
-        self.adam = AdamState::from_parts(
-            self.adam.config(),
-            first.to_vec(),
-            second.to_vec(),
-            counters.global_update,
-            self.adam.binding(),
-        )?;
-        self.counters = counters;
-        Ok(())
     }
 }
 

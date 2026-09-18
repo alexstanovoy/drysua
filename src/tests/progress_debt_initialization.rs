@@ -5,10 +5,7 @@ use std::collections::HashMap;
 
 #[test]
 fn current_progress_debt_shapes_and_action_contract_remain_unchanged() {
-    assert_eq!(crate::FEATURE_SCHEMA_VERSION, 22);
-    assert_eq!(crate::MODEL_SCHEMA_VERSION, 24);
-    assert_eq!(crate::PPO_SCHEMA_VERSION, 37);
-    assert_eq!(crate::PPO_RULES_AUDIT_VERSION, 32);
+    crate::tests::support::assert_frozen_schema_versions();
     assert_eq!(crate::LEAGUE_SCHEMA_VERSION, 37);
     assert_eq!(crate::CHECKPOINT_SCHEMA_VERSION, 12);
     assert_eq!(crate::IMITATION_RULES_AUDIT_VERSION, 22);

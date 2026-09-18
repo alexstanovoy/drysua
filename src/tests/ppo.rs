@@ -767,43 +767,15 @@ fn synthetic_bandit_update_increases_rewarded_action_probability() {
 
 #[test]
 fn direct_trainer_rejects_rollout_one_policy_revision_behind() {
-    let (frame, space) = frame_and_space();
-    let model = PolicyModel::fresh(102).expect("model");
-    let policy = model.policy_identity().expect("policy");
-    let mut rollout = PpoRollout::new(2, policy).expect("rollout");
-    for stream in 0..2 {
-        rollout
-            .push(
-                choice(&model, &frame, &space, StructuredAction::Continue)
-                    .finish(PpoOutcome {
-                        stream,
-                        decision: 0,
-                        ticks: 3,
-                        next_value: 0.0,
-                        reward: stream as f32,
-                        terminal: true,
-                    })
-                    .expect("transition"),
-            )
-            .expect("push");
-    }
-    let config = smoke_config();
-    let batch = rollout.finish(config).expect("batch");
-    let parameters = model.export_parameters().expect("parameters");
-    model.import_parameters(&parameters).expect("new revision");
-    let mut trainer = PpoTrainer::new(&model, config, 5).expect("trainer");
-    let before = model.export_parameters().expect("before");
-    let error = trainer
-        .train_update(&model, &batch)
-        .expect_err("direct stale rollout");
-
-    assert_eq!(error.to_string(), "PPO rollout policy identity is stale");
-    assert_eq!(model.export_parameters().expect("after"), before);
-    assert_eq!(trainer.optimizer_step(), 0);
+    assert_stale_rollout_is_rejected(1);
 }
 
 #[test]
 fn rollout_two_policy_revisions_behind_is_rejected_before_optimizer_mutation() {
+    assert_stale_rollout_is_rejected(2);
+}
+
+fn assert_stale_rollout_is_rejected(revisions: u32) {
     let (frame, space) = frame_and_space();
     let model = PolicyModel::fresh(102).expect("model");
     let policy = model.policy_identity().expect("policy");
@@ -827,11 +799,13 @@ fn rollout_two_policy_revisions_behind_is_rejected_before_optimizer_mutation() {
     let config = smoke_config();
     let batch = rollout.finish(config).expect("batch");
     let parameters = model.export_parameters().expect("parameters");
-    model.import_parameters(&parameters).expect("revision one");
-    model.import_parameters(&parameters).expect("revision two");
+    for _ in 0..revisions {
+        model
+            .import_parameters(&parameters)
+            .expect("stale policy revision");
+    }
     let mut trainer = PpoTrainer::new(&model, config, 5).expect("trainer");
     let before = model.export_parameters().expect("before");
-
     let error = trainer
         .train_update(&model, &batch)
         .expect_err("stale rollout");
@@ -1217,15 +1191,18 @@ fn rollout_append_rejects_a_foreign_policy_before_any_transition() {
 #[cfg(feature = "builtin")]
 #[test]
 fn builtin_smoke_exercises_real_arena_rollout_and_one_ppo_update() {
-    let report = crate::run_ppo_smoke(crate::PpoSmokeConfig {
-        updates: 1,
-        environments: 1,
-        rollout_decisions: 2,
-        epochs: 1,
-        minibatch: 2,
-        seed: 77,
-        map: bota_proto::MapId(2),
-    })
+    let report = crate::run_ppo_smoke_on(
+        crate::PpoSmokeConfig {
+            updates: 1,
+            environments: 1,
+            rollout_decisions: 2,
+            epochs: 1,
+            minibatch: 2,
+            seed: 77,
+            map: bota_proto::MapId(2),
+        },
+        crate::PolicyDevice::Cpu,
+    )
     .expect("smoke PPO");
 
     assert_eq!(report.updates, 1);
@@ -1243,15 +1220,18 @@ fn builtin_smoke_exercises_real_arena_rollout_and_one_ppo_update() {
 #[cfg(feature = "builtin")]
 #[test]
 fn persistent_actor_refreshes_policy_after_waiting_for_a_recycled_buffer() {
-    let report = crate::run_ppo_smoke(crate::PpoSmokeConfig {
-        updates: 3,
-        environments: 2,
-        rollout_decisions: 2,
-        epochs: 1,
-        minibatch: 4,
-        seed: 3,
-        map: bota_proto::MapId(2),
-    })
+    let report = crate::run_ppo_smoke_on(
+        crate::PpoSmokeConfig {
+            updates: 3,
+            environments: 2,
+            rollout_decisions: 2,
+            epochs: 1,
+            minibatch: 4,
+            seed: 3,
+            map: bota_proto::MapId(2),
+        },
+        crate::PolicyDevice::Cpu,
+    )
     .expect("three-update pipeline");
 
     assert_eq!(report.updates, 3);
@@ -1320,17 +1300,15 @@ fn map2_gamma_one_resume_matches_uninterrupted_parameters_adam_and_rng() {
 }
 
 #[cfg(feature = "builtin")]
-fn assert_production_resume_matches_uninterrupted(overrides: Option<crate::TrainingJobConfig>) {
-    let uninterrupted_directory = training_test_directory("production-uninterrupted");
-    let resumed_directory = training_test_directory("production-resumed");
-    let mut settings = crate::TrainingJobConfig {
+fn training_settings(seed: u64) -> crate::TrainingJobConfig {
+    crate::TrainingJobConfig {
         mastery_config: None,
         opponent_schedule: crate::TrainingOpponentSchedule::Teacher,
         episode_time_cost: 0.0,
         terminal_only: false,
         complete_episodes: false,
         pipeline_groups: 1,
-        updates: 2,
+        updates: 1,
         ppo: crate::PpoConfig {
             environments: 2,
             rollout_decisions: 2,
@@ -1341,38 +1319,49 @@ fn assert_production_resume_matches_uninterrupted(overrides: Option<crate::Train
         },
         checkpoint_cadence: crate::TrainingCheckpointCadence::Updates(1),
         resume_provenance: crate::ResumeProvenance::Strict,
-        seed: 23_071,
+        seed,
         map: bota_proto::MapId(2),
         git_commit: "test-drysua-commit".to_owned(),
         simulator_commit: "test-bota-commit".to_owned(),
-    };
+    }
+}
+
+#[cfg(feature = "builtin")]
+fn assert_production_resume_matches_uninterrupted(overrides: Option<crate::TrainingJobConfig>) {
+    let uninterrupted_directory = training_test_directory("production-uninterrupted");
+    let resumed_directory = training_test_directory("production-resumed");
+    let mut settings = training_settings(23_071);
+    settings.updates = 2;
     if let Some(overrides) = overrides {
         settings.ppo = overrides.ppo;
         settings.map = overrides.map;
     }
-    crate::run_training_job_on(
+    crate::run_training_job_on_with_initial_weights(
         settings.clone(),
         crate::PolicyDevice::Cpu,
         &uninterrupted_directory,
         false,
+        None,
         |_| {},
     )
     .expect("uninterrupted production updates");
     settings.updates = 1;
-    crate::run_training_job_on(
+    crate::run_training_job_on_with_initial_weights(
         settings.clone(),
         crate::PolicyDevice::Cpu,
         &resumed_directory,
         false,
+        None,
         |_| {},
     )
     .expect("first production update");
     settings.updates = 2;
-    crate::run_training_job_on(
+    crate::run_training_job_on_with_initial_weights(
         settings,
         crate::PolicyDevice::Cpu,
         &resumed_directory,
         true,
+        None,
         |_| {},
     )
     .expect("resumed production update");
@@ -1434,35 +1423,14 @@ fn assert_production_artifact_training_state_equal(
 #[test]
 fn training_job_checkpoints_and_resumes_from_the_next_update() {
     let directory = training_test_directory("resume");
-    let mut settings = crate::TrainingJobConfig {
-        mastery_config: None,
-        opponent_schedule: crate::TrainingOpponentSchedule::Teacher,
-        episode_time_cost: 0.0,
-        terminal_only: false,
-        complete_episodes: false,
-        pipeline_groups: 1,
-        updates: 1,
-        ppo: crate::PpoConfig {
-            environments: 2,
-            rollout_decisions: 2,
-            epochs: 1,
-            minibatch: 2,
-            gamma_tick: 1.0,
-            ..crate::PpoConfig::default()
-        },
-        checkpoint_cadence: crate::TrainingCheckpointCadence::Updates(1),
-        resume_provenance: crate::ResumeProvenance::Strict,
-        seed: 23_071,
-        map: bota_proto::MapId(2),
-        git_commit: "test-drysua-commit".to_owned(),
-        simulator_commit: "test-bota-commit".to_owned(),
-    };
+    let mut settings = training_settings(23_071);
 
-    let first = crate::run_training_job_on(
+    let first = crate::run_training_job_on_with_initial_weights(
         settings.clone(),
         crate::PolicyDevice::Cpu,
         &directory,
         false,
+        None,
         |_| {},
     )
     .expect("first training update");
@@ -1477,11 +1445,12 @@ fn training_job_checkpoints_and_resumes_from_the_next_update() {
     );
 
     settings.updates = 2;
-    let resumed = crate::run_training_job_on(
+    let resumed = crate::run_training_job_on_with_initial_weights(
         settings.clone(),
         crate::PolicyDevice::Cpu,
         &directory,
         true,
+        None,
         |_| {},
     )
     .expect("resumed training update");
@@ -1498,11 +1467,12 @@ fn training_job_checkpoints_and_resumes_from_the_next_update() {
     settings.updates = 1;
     settings.git_commit = "test-drysua-next-commit".to_owned();
     settings.resume_provenance = crate::ResumeProvenance::MigrateGitCommit;
-    let error = crate::run_training_job_on(
+    let error = crate::run_training_job_on_with_initial_weights(
         settings.clone(),
         crate::PolicyDevice::Cpu,
         &directory,
         true,
+        None,
         |_| {},
     )
     .expect_err("migration target before restored update");
@@ -1521,11 +1491,12 @@ fn training_job_checkpoints_and_resumes_from_the_next_update() {
     settings.updates = 3;
     let mut incompatible = settings.clone();
     incompatible.simulator_commit = "different-bota-commit".to_owned();
-    let error = crate::run_training_job_on(
+    let error = crate::run_training_job_on_with_initial_weights(
         incompatible,
         crate::PolicyDevice::Cpu,
         &directory,
         true,
+        None,
         |_| {},
     )
     .expect_err("migration with a different simulator commit");
@@ -1533,9 +1504,15 @@ fn training_job_checkpoints_and_resumes_from_the_next_update() {
         error.to_string(),
         "invalid PPO config field: provenance migration scope"
     );
-    let migrated =
-        crate::run_training_job_on(settings, crate::PolicyDevice::Cpu, &directory, true, |_| {})
-            .expect("migrated training update");
+    let migrated = crate::run_training_job_on_with_initial_weights(
+        settings,
+        crate::PolicyDevice::Cpu,
+        &directory,
+        true,
+        None,
+        |_| {},
+    )
+    .expect("migrated training update");
     let migrated_artifact = crate::TrainingArtifact::load(&directory).expect("migrated checkpoint");
     assert_eq!(migrated.completed_updates, 3);
     assert_eq!(migrated_artifact.progress().global_update, 3);
@@ -1558,29 +1535,7 @@ fn fresh_training_loads_the_requested_runtime_weights_before_the_first_update() 
     let initial_fingerprint = crate::PolicySnapshot::capture(&initial_model, 0)
         .expect("initial snapshot")
         .fingerprint();
-    let settings = crate::TrainingJobConfig {
-        mastery_config: None,
-        opponent_schedule: crate::TrainingOpponentSchedule::Teacher,
-        episode_time_cost: 0.0,
-        terminal_only: false,
-        complete_episodes: false,
-        pipeline_groups: 1,
-        updates: 1,
-        ppo: crate::PpoConfig {
-            environments: 2,
-            rollout_decisions: 2,
-            epochs: 1,
-            minibatch: 2,
-            gamma_tick: 1.0,
-            ..crate::PpoConfig::default()
-        },
-        checkpoint_cadence: crate::TrainingCheckpointCadence::Updates(1),
-        resume_provenance: crate::ResumeProvenance::Strict,
-        seed: 23_075,
-        map: bota_proto::MapId(2),
-        git_commit: "test-drysua-commit".to_owned(),
-        simulator_commit: "test-bota-commit".to_owned(),
-    };
+    let settings = training_settings(23_075);
 
     let report = crate::run_training_job_on_with_initial_weights(
         settings,
@@ -1602,33 +1557,14 @@ fn fresh_training_loads_the_requested_runtime_weights_before_the_first_update() 
 #[test]
 fn production_training_rejects_an_unpaired_environment_count() {
     let directory = training_test_directory("odd-environments");
-    let error = crate::run_training_job_on(
-        crate::TrainingJobConfig {
-            mastery_config: None,
-            opponent_schedule: crate::TrainingOpponentSchedule::Teacher,
-            episode_time_cost: 0.0,
-            terminal_only: false,
-            complete_episodes: false,
-            pipeline_groups: 1,
-            updates: 1,
-            ppo: crate::PpoConfig {
-                environments: 1,
-                rollout_decisions: 2,
-                epochs: 1,
-                minibatch: 2,
-                gamma_tick: 1.0,
-                ..crate::PpoConfig::default()
-            },
-            checkpoint_cadence: crate::TrainingCheckpointCadence::Updates(1),
-            resume_provenance: crate::ResumeProvenance::Strict,
-            seed: 23_079,
-            map: bota_proto::MapId(2),
-            git_commit: "test-drysua-commit".to_owned(),
-            simulator_commit: "test-bota-commit".to_owned(),
-        },
+    let mut settings = training_settings(23_079);
+    settings.ppo.environments = 1;
+    let error = crate::run_training_job_on_with_initial_weights(
+        settings,
         crate::PolicyDevice::Cpu,
         &directory,
         false,
+        None,
         |_| {},
     )
     .expect_err("production arenas require complete side pairs");
@@ -1644,29 +1580,7 @@ fn production_training_rejects_an_unpaired_environment_count() {
 #[test]
 fn resumed_training_rejects_an_initial_weights_directory() {
     let directory = training_test_directory("resume-with-initial");
-    let settings = crate::TrainingJobConfig {
-        mastery_config: None,
-        opponent_schedule: crate::TrainingOpponentSchedule::Teacher,
-        episode_time_cost: 0.0,
-        terminal_only: false,
-        complete_episodes: false,
-        pipeline_groups: 1,
-        updates: 1,
-        ppo: crate::PpoConfig {
-            environments: 2,
-            rollout_decisions: 2,
-            epochs: 1,
-            minibatch: 2,
-            gamma_tick: 1.0,
-            ..crate::PpoConfig::default()
-        },
-        checkpoint_cadence: crate::TrainingCheckpointCadence::Updates(1),
-        resume_provenance: crate::ResumeProvenance::Strict,
-        seed: 23_076,
-        map: bota_proto::MapId(2),
-        git_commit: "test-drysua-commit".to_owned(),
-        simulator_commit: "test-bota-commit".to_owned(),
-    };
+    let settings = training_settings(23_076);
 
     let error = crate::run_training_job_on_with_initial_weights(
         settings,
@@ -1696,33 +1610,13 @@ fn training_job_rejects_a_checkpoint_directory_locked_by_another_writer() {
         .open(directory.join(".training.lock"))
         .expect("create training lock");
     lock.lock().expect("hold training lock");
-    let error = crate::run_training_job_on(
-        crate::TrainingJobConfig {
-            mastery_config: None,
-            opponent_schedule: crate::TrainingOpponentSchedule::Teacher,
-            episode_time_cost: 0.0,
-            terminal_only: false,
-            complete_episodes: false,
-            pipeline_groups: 1,
-            updates: 1,
-            ppo: crate::PpoConfig {
-                environments: 2,
-                rollout_decisions: 2,
-                epochs: 1,
-                minibatch: 2,
-                gamma_tick: 1.0,
-                ..crate::PpoConfig::default()
-            },
-            checkpoint_cadence: crate::TrainingCheckpointCadence::Updates(1),
-            resume_provenance: crate::ResumeProvenance::Strict,
-            seed: 23_072,
-            map: bota_proto::MapId(2),
-            git_commit: "test-drysua-commit".to_owned(),
-            simulator_commit: "test-bota-commit".to_owned(),
-        },
+    let settings = training_settings(23_072);
+    let error = crate::run_training_job_on_with_initial_weights(
+        settings,
         crate::PolicyDevice::Cpu,
         &directory,
         true,
+        None,
         |_| {},
     )
     .expect_err("second checkpoint writer");
@@ -2324,33 +2218,18 @@ fn frozen_neural_opponent_keeps_its_policy_identity_and_never_uses_teacher_order
 #[test]
 fn training_job_rejects_targets_that_cannot_fit_shuffle_rng_counters() {
     let directory = training_test_directory("counter-bound");
-    let error = crate::run_training_job_on(
-        crate::TrainingJobConfig {
-            mastery_config: None,
-            opponent_schedule: crate::TrainingOpponentSchedule::Teacher,
-            episode_time_cost: 0.0,
-            terminal_only: false,
-            complete_episodes: false,
-            pipeline_groups: 1,
-            updates: 1_000_000,
-            ppo: crate::PpoConfig {
-                environments: 16,
-                rollout_decisions: 64,
-                epochs: 1,
-                minibatch: 32,
-                gamma_tick: 1.0,
-                ..crate::PpoConfig::default()
-            },
-            checkpoint_cadence: crate::TrainingCheckpointCadence::Updates(5),
-            resume_provenance: crate::ResumeProvenance::Strict,
-            seed: 23_073,
-            map: bota_proto::MapId(2),
-            git_commit: "test-drysua-commit".to_owned(),
-            simulator_commit: "test-bota-commit".to_owned(),
-        },
+    let mut settings = training_settings(23_073);
+    settings.updates = 1_000_000;
+    settings.ppo.environments = 16;
+    settings.ppo.rollout_decisions = 64;
+    settings.ppo.minibatch = 32;
+    settings.checkpoint_cadence = crate::TrainingCheckpointCadence::Updates(5);
+    let error = crate::run_training_job_on_with_initial_weights(
+        settings,
         crate::PolicyDevice::Cpu,
         &directory,
         false,
+        None,
         |_| {},
     )
     .expect_err("uncheckpointable shuffle RNG target");
@@ -2402,11 +2281,12 @@ fn map2_cli_checkpoint_restores_exact_config_and_rejects_changed_hyperparameters
         "0.001",
     ])
     .expect("CLI training settings");
-    crate::run_training_job_on(
+    crate::run_training_job_on_with_initial_weights(
         settings.clone(),
         crate::PolicyDevice::Cpu,
         &directory,
         false,
+        None,
         |_| {},
     )
     .expect("first update");
@@ -2416,11 +2296,12 @@ fn map2_cli_checkpoint_restores_exact_config_and_rejects_changed_hyperparameters
         .restore(&model, artifact.run())
         .expect("restore trainer");
     assert_eq!(restored.trainer().config(), settings.ppo);
-    crate::run_training_job_on(
+    crate::run_training_job_on_with_initial_weights(
         settings.clone(),
         crate::PolicyDevice::Cpu,
         &directory,
         true,
+        None,
         |_| {},
     )
     .expect("same exact config resumes");
@@ -2433,9 +2314,15 @@ fn map2_cli_checkpoint_restores_exact_config_and_rejects_changed_hyperparameters
             3 => changed.ppo.entropy_coefficient = 0.01,
             _ => unreachable!(),
         }
-        let error =
-            crate::run_training_job_on(changed, crate::PolicyDevice::Cpu, &directory, true, |_| {})
-                .expect_err("changed hyperparameter must reject resume");
+        let error = crate::run_training_job_on_with_initial_weights(
+            changed,
+            crate::PolicyDevice::Cpu,
+            &directory,
+            true,
+            None,
+            |_| {},
+        )
+        .expect_err("changed hyperparameter must reject resume");
         let expected = if field == 1 {
             "invalid PPO config field: Map2 comprehensive reward requires gamma per tick one"
         } else {
@@ -2451,13 +2338,14 @@ fn runtime_map2_evaluation_uses_neural_stop_actions_on_both_sides_without_teache
     let directory = training_test_directory("pure-map2-evaluation");
     let model = stop_policy_for_warmup();
     crate::TrainingArtifact::save_runtime_weights(&model, &directory).expect("stop weights");
-    let report = crate::evaluate_runtime_checkpoint(
+    let report = crate::ppo_arena::evaluate_neural_map_two_checkpoint_cohort(
         crate::CheckpointEvaluationConfig {
             pairs: 1,
             decisions: 2,
             seed: 23_082,
         },
         &directory,
+        false,
     )
     .expect("pure neural evaluation");
     assert_eq!(report.games.len(), 4);

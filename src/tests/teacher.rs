@@ -4,6 +4,7 @@ use bota_proto::{
     ShopEntry, SlotId, StatusFlags, Target, Team, TickMode, UnitKind, UnitView, Vec2, WorldView,
 };
 
+use super::fixtures;
 use crate::{
     ActionError, ActionTarget, ControlledUnit, IssuedOrder, ItemReadiness, OrderPersistence,
     SHADOW_FIEND, StateTracker, StructuredAction, Teacher,
@@ -531,11 +532,7 @@ fn teacher_deployment_action_attacks_a_safe_in_range_enemy_structure() {
 #[test]
 fn teacher_attacks_an_enemy_creep_killable_at_projectile_landing() {
     let mut view = base_view();
-    let mut creep = unit(CREEP_ID, UnitKind::CreepMelee, Team::Dire, 3_300, 3_000);
-    creep.hp = 40;
-    creep.max_hp = 550;
-    view.units.push(creep);
-    sort_units(&mut view);
+    wounded_creep(&mut view, Team::Dire, 3_300, 550);
     let tracker = tracker(view);
 
     let (action, space) = decide(&tracker);
@@ -551,11 +548,7 @@ fn teacher_attacks_an_enemy_creep_killable_at_projectile_landing() {
 fn teacher_preserves_a_seat_visible_channel_instead_of_issuing_a_body_order() {
     let mut view = base_view();
     own_hero_mut(&mut view).statuses.bits = StatusFlags::CHANNELLING;
-    let mut creep = unit(CREEP_ID, UnitKind::CreepMelee, Team::Dire, 3_300, 3_000);
-    creep.hp = 40;
-    creep.max_hp = 550;
-    view.units.push(creep);
-    sort_units(&mut view);
+    wounded_creep(&mut view, Team::Dire, 3_300, 550);
     let tracker = tracker(view);
 
     let (action, space) = decide(&tracker);
@@ -747,11 +740,7 @@ fn teacher_casts_only_the_raze_whose_facing_circle_contains_enemy_hero() {
 #[test]
 fn teacher_denies_only_an_allied_creep_below_half_health() {
     let mut view = base_view();
-    let mut creep = unit(CREEP_ID, UnitKind::CreepMelee, Team::Radiant, 3_300, 3_000);
-    creep.hp = 40;
-    creep.max_hp = 100;
-    view.units.push(creep);
-    sort_units(&mut view);
+    wounded_creep(&mut view, Team::Radiant, 3_300, 100);
     let tracker = tracker(view);
 
     let (action, space) = decide(&tracker);
@@ -947,10 +936,7 @@ fn teacher_recollects_stash_items_returned_by_a_diverted_delivery() {
 fn teacher_continues_an_attack_through_the_remaining_attack_interval() {
     let mut view = base_view();
     view.tick = 45;
-    let mut creep = unit(CREEP_ID, UnitKind::CreepMelee, Team::Dire, 3_300, 3_000);
-    creep.hp = 40;
-    view.units.push(creep);
-    sort_units(&mut view);
+    wounded_creep(&mut view, Team::Dire, 3_300, 1_000);
     let tracker = tracker(view);
     let issued = IssuedOrder {
         unit: None,
@@ -975,10 +961,7 @@ fn teacher_continues_an_attack_through_the_remaining_attack_interval() {
 fn teacher_releases_an_old_out_of_range_attack_after_its_windup_commitment() {
     let mut view = base_view();
     view.tick = 200;
-    let mut creep = unit(CREEP_ID, UnitKind::CreepMelee, Team::Dire, 3_600, 3_000);
-    creep.hp = 40;
-    view.units.push(creep);
-    sort_units(&mut view);
+    wounded_creep(&mut view, Team::Dire, 3_600, 1_000);
     let tracker = tracker(view);
     let issued = IssuedOrder {
         unit: None,
@@ -1002,11 +985,7 @@ fn teacher_releases_an_old_out_of_range_attack_after_its_windup_commitment() {
 #[test]
 fn teacher_preempts_a_persistent_hold_to_last_hit_a_killable_creep() {
     let mut view = base_view();
-    let mut creep = unit(CREEP_ID, UnitKind::CreepMelee, Team::Dire, 3_300, 3_000);
-    creep.hp = 40;
-    creep.max_hp = 550;
-    view.units.push(creep);
-    sort_units(&mut view);
+    wounded_creep(&mut view, Team::Dire, 3_300, 550);
     let tracker = tracker(view);
     let issued = IssuedOrder {
         unit: None,
@@ -1454,10 +1433,7 @@ fn tactical_recover_disengages_above_teachers_emergency_threshold() {
 fn tactical_farm_takes_last_hit_instead_of_spending_mana_on_harassment() {
     let mut view = tactical_view(400, 1_000);
     own_hero_mut(&mut view).mana = 500;
-    let mut creep = unit(CREEP_ID, UnitKind::CreepMelee, Team::Dire, 3_300, 3_000);
-    creep.hp = 40;
-    view.units.push(creep);
-    sort_units(&mut view);
+    wounded_creep(&mut view, Team::Dire, 3_300, 1_000);
     let tracker = tracker(view);
 
     let (baseline, _) = decide(&tracker);
@@ -3973,52 +3949,37 @@ fn tracker(view: WorldView) -> StateTracker {
 }
 
 fn match_info() -> MatchInfo {
-    MatchInfo {
-        match_id: 1,
-        map: MapId(0),
-        tick_rate: 30,
-        pregame_ticks: 900,
-        trees: vec![Vec2::from_ints(3_100, 3_000)],
-        terrain_cells: 128,
-        terrain_rle: vec![(16_384, 0x80)],
-        opaque_cells: Vec::new(),
-        mode: TickMode::Lockstep,
-        picks: vec![
-            Pick {
-                slot: SlotId(0),
-                team: Team::Radiant,
-                hero: SHADOW_FIEND,
-            },
-            Pick {
-                slot: SlotId(1),
-                team: Team::Dire,
-                hero: SHADOW_FIEND,
-            },
-        ],
-        shop: [
-            (0, 500),
-            (1, 50),
-            (2, 110),
-            (7, 90),
-            (8, 100),
-            (13, 450),
-            (19, 450),
-            (24, 550),
-            (25, 175),
-            (26, 175),
-            (29, 1_400),
-            (33, 505),
-            (35, 200),
-            (36, 450),
-        ]
-        .into_iter()
-        .map(|(id, cost)| ShopEntry {
-            id: ItemId(id),
-            cost,
-            components: Vec::new(),
-        })
-        .collect(),
-    }
+    fixtures::MatchInfoFixture::new(1, MapId(0), fixtures::two_seat_picks(Team::Radiant))
+        .pregame_ticks(900)
+        .trees(vec![Vec2::from_ints(3_100, 3_000)])
+        .terrain_cells(128)
+        .terrain_rle(vec![(16_384, 0x80)])
+        .shop(
+            [
+                (0, 500),
+                (1, 50),
+                (2, 110),
+                (7, 90),
+                (8, 100),
+                (13, 450),
+                (19, 450),
+                (24, 550),
+                (25, 175),
+                (26, 175),
+                (29, 1_400),
+                (33, 505),
+                (35, 200),
+                (36, 450),
+            ]
+            .into_iter()
+            .map(|(id, cost)| ShopEntry {
+                id: ItemId(id),
+                cost,
+                components: Vec::new(),
+            })
+            .collect(),
+        )
+        .build()
 }
 
 fn base_view() -> WorldView {
@@ -4136,38 +4097,31 @@ fn enemy_player() -> PlayerView {
 }
 
 fn unit(id: EntityId, kind: UnitKind, team: Team, x: i32, y: i32) -> UnitView {
-    UnitView {
+    fixtures::UnitFixture {
         id,
         kind,
         team,
         pos: Vec2::from_ints(x, y),
-        facing: Angle { brads: 0 },
-        hp: 1_000,
-        max_hp: 1_000,
         mana: 0,
-        max_mana: 0,
-        move_speed: Fixed::from_int(300),
         attack_damage: 50,
-        attack_range: Fixed::from_int(500),
         attack_time: 1700,
-        attack_point: 0,
-        attack_speed: 100,
-        armor: Fixed::ZERO,
-        magic_resist: Fixed::ZERO,
-        collision: Fixed::from_int(24),
-        bound: Fixed::from_int(24),
-        vision_radius: Fixed::from_int(1_800),
-        true_sight_radius: Fixed::ZERO,
-        statuses: StatusFlags { bits: 0 },
         attributes: Attributes::all(20),
         primary: Some(Attribute::Agility),
         hero: (kind == UnitKind::Hero).then_some(HeroId(2)),
         owner: None,
         level: 0,
-        abilities: Vec::new(),
-        items: Vec::new(),
-        effects: Vec::new(),
     }
+    .build()
+}
+
+/// Pushes a melee creep at forty health; `max_hp` decides how the deny and
+/// last-hit rules see that health.
+fn wounded_creep(view: &mut WorldView, team: Team, x: i32, max_hp: i32) {
+    let mut creep = unit(CREEP_ID, UnitKind::CreepMelee, team, x, 3_000);
+    creep.hp = 40;
+    creep.max_hp = max_hp;
+    view.units.push(creep);
+    sort_units(view);
 }
 
 fn item(id: ItemId, aim: Option<Aim>, range: i32, charges: Option<u8>) -> ItemView {

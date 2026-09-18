@@ -149,11 +149,11 @@ impl ProvenanceBuffer {
     }
 }
 
-/// Bounded object pool of provenance buffers; `allocations` counts misses so
-/// tests can assert a zero-allocation steady state.
+/// Bounded object pool of provenance buffers.
 #[derive(Debug)]
 struct ProvenancePool {
     free: std::sync::Mutex<Vec<ProvenanceBuffer>>,
+    #[cfg(test)]
     allocations: AtomicU64,
 }
 
@@ -165,6 +165,7 @@ impl ProvenancePool {
     fn new() -> Self {
         Self {
             free: std::sync::Mutex::new(Vec::new()),
+            #[cfg(test)]
             allocations: AtomicU64::new(0),
         }
     }
@@ -172,6 +173,7 @@ impl ProvenancePool {
     fn take(self: &Arc<Self>) -> PooledProvenance {
         let buffer = self.free.lock().expect("provenance pool lock").pop();
         if buffer.is_none() {
+            #[cfg(test)]
             self.allocations.fetch_add(1, Ordering::Relaxed);
         }
         PooledProvenance(Arc::new(PooledProvenanceInner {
@@ -576,245 +578,186 @@ impl fmt::Display for TrackerError {
             Self::Map2RewardUnavailable => {
                 formatter.write_str("Map2 reward is unavailable outside MapId(2)")
             }
-            Self::LimitExceeded { .. }
-            | Self::LineageExhausted
-            | Self::UnsupportedMap(_)
-            | Self::ZeroTickRate
-            | Self::SeatCount(_)
-            | Self::OwnSlotOutOfRange(_)
-            | Self::MissingOwnPick(_)
-            | Self::WrongOwnHero(_)
-            | Self::InvalidOwnTeam(_)
-            | Self::DuplicatePickSlot(_)
-            | Self::PickSlotOutOfRange(_)
-            | Self::TerrainAxis(_)
-            | Self::TerrainCoverage { .. }
-            | Self::ZeroTerrainRun(_)
-            | Self::OpaqueCellOutOfRange { .. }
-            | Self::PositionOutOfMap { .. } => fmt_match_error(self, formatter),
-            Self::WrongViewer(_, _)
-            | Self::SnapshotTick { .. }
-            | Self::MissingOwnPlayer(_)
-            | Self::MissingOwnGold
-            | Self::MissingOwnStash
-            | Self::MissingOwnHero(_)
-            | Self::InvalidOwnHero(_)
-            | Self::AmbiguousOwnHero { .. }
-            | Self::AmbiguousOwnCourier { .. } => fmt_own_state_error(self, formatter),
-            Self::DuplicateUnit(_)
-            | Self::DuplicateProjectile(_)
-            | Self::DuplicateLoot(_)
-            | Self::DuplicatePlayer(_)
-            | Self::UnsortedPlayers
-            | Self::MissingRosterPlayer(_)
-            | Self::UnknownRosterPlayer(_)
-            | Self::WrongRosterTeam { .. }
-            | Self::WrongRosterHero { .. } => fmt_roster_error(self, formatter),
-            Self::UnsortedUnits
-            | Self::InvalidFelledTree(_)
-            | Self::PositionDeltaOverflow(_)
-            | Self::EventTickNotIncreasing { .. } => fmt_stream_error(self, formatter),
-        }
-    }
-}
-
-fn fmt_match_error(error: &TrackerError, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-    match error {
-        TrackerError::LimitExceeded {
-            field,
-            actual,
-            limit,
-        } => {
-            write!(formatter, "{field} has {actual} entries; limit is {limit}")
-        }
-        TrackerError::LineageExhausted => {
-            formatter.write_str("StateTracker lineage identity space is exhausted")
-        }
-        TrackerError::UnsupportedMap(map) => write!(
-            formatter,
-            "unsupported map MapId({map}); expected MapId(0), MapId(1), or MapId(2)"
-        ),
-        TrackerError::ZeroTickRate => formatter.write_str("MatchInfo.tick_rate must be positive"),
-        TrackerError::SeatCount(actual) => write!(
-            formatter,
-            "MatchInfo.picks has {actual} seats; expected 1..={MAX_SEATS}"
-        ),
-        TrackerError::OwnSlotOutOfRange(slot) => write!(
-            formatter,
-            "own SlotId({slot}) is outside supported seats 0..{MAX_SEATS}"
-        ),
-        TrackerError::MissingOwnPick(slot) => {
-            write!(formatter, "MatchInfo.picks has no own SlotId({slot})")
-        }
-        TrackerError::WrongOwnHero(hero) => write!(
-            formatter,
-            "own slot picked HeroId({}), expected Shadow Fiend HeroId({})",
-            hero.0, SHADOW_FIEND.0
-        ),
-        TrackerError::InvalidOwnTeam(team) => {
-            write!(formatter, "own slot has non-playable team {team:?}")
-        }
-        TrackerError::DuplicatePickSlot(slot) => {
-            write!(formatter, "MatchInfo.picks repeats SlotId({slot})")
-        }
-        TrackerError::PickSlotOutOfRange(slot) => write!(
-            formatter,
-            "MatchInfo.picks contains unsupported SlotId({slot})"
-        ),
-        TrackerError::TerrainAxis(cells) => write!(
-            formatter,
-            "MatchInfo.terrain_cells is {cells}; expected 1..={MAX_TERRAIN_AXIS}"
-        ),
-        TrackerError::TerrainCoverage { actual, expected } => write!(
-            formatter,
-            "MatchInfo.terrain_rle covers {actual} cells; expected {expected}"
-        ),
-        TrackerError::ZeroTerrainRun(index) => write!(
-            formatter,
-            "MatchInfo.terrain_rle entry {index} has zero run length"
-        ),
-        TrackerError::OpaqueCellOutOfRange { x, y, cells } => write!(
-            formatter,
-            "MatchInfo.opaque_cells contains ({x}, {y}) outside {cells}x{cells} terrain"
-        ),
-        TrackerError::PositionOutOfMap {
-            field,
-            index,
-            x_raw,
-            y_raw,
-            maximum_raw,
-        } => write!(
-            formatter,
-            "{field}[{index}] position raw ({x_raw}, {y_raw}) is outside 0..={maximum_raw}"
-        ),
-        _ => Err(fmt::Error),
-    }
-}
-
-fn fmt_own_state_error(error: &TrackerError, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-    match error {
-        TrackerError::WrongViewer(actual, expected) => write!(
-            formatter,
-            "snapshot viewer {actual:?} differs from tracker team {expected:?}"
-        ),
-        TrackerError::SnapshotTick { incoming, current } => write!(
-            formatter,
-            "snapshot tick {incoming} does not follow current tick {current}"
-        ),
-        TrackerError::MissingOwnPlayer(slot) => {
-            write!(formatter, "snapshot players has no own SlotId({slot})")
-        }
-        TrackerError::MissingOwnGold => {
-            formatter.write_str("own player gold is absent in seat-specific snapshot")
-        }
-        TrackerError::MissingOwnStash => {
-            formatter.write_str("own player stash is absent in seat-specific snapshot")
-        }
-        TrackerError::MissingOwnHero(id) => write!(
-            formatter,
-            "own live hero EntityId({}, {}) is absent from visible units",
-            id.idx, id.generation
-        ),
-        TrackerError::InvalidOwnHero(id) => write!(
-            formatter,
-            "own live hero EntityId({}, {}) has inconsistent kind, team, owner, or hero",
-            id.idx, id.generation
-        ),
-        TrackerError::AmbiguousOwnHero {
-            scoreboard,
-            visible,
-        } => match scoreboard {
-            Some(scoreboard) => write!(
+            Self::LimitExceeded {
+                field,
+                actual,
+                limit,
+            } => {
+                write!(formatter, "{field} has {actual} entries; limit is {limit}")
+            }
+            Self::LineageExhausted => {
+                formatter.write_str("StateTracker lineage identity space is exhausted")
+            }
+            Self::UnsupportedMap(map) => write!(
                 formatter,
-                "own slot has visible hero EntityId({}, {}) besides scoreboard hero EntityId({}, {})",
-                visible.idx, visible.generation, scoreboard.idx, scoreboard.generation
+                "unsupported map MapId({map}); expected MapId(0), MapId(1), or MapId(2)"
             ),
-            None => write!(
+            Self::ZeroTickRate => formatter.write_str("MatchInfo.tick_rate must be positive"),
+            Self::SeatCount(actual) => write!(
                 formatter,
-                "own slot has visible hero EntityId({}, {}) while scoreboard body is absent",
-                visible.idx, visible.generation
+                "MatchInfo.picks has {actual} seats; expected 1..={MAX_SEATS}"
             ),
-        },
-        TrackerError::AmbiguousOwnCourier { first, second } => write!(
-            formatter,
-            "own slot has ambiguous couriers EntityId({}, {}) and EntityId({}, {})",
-            first.idx, first.generation, second.idx, second.generation
-        ),
-        _ => Err(fmt::Error),
-    }
-}
+            Self::OwnSlotOutOfRange(slot) => write!(
+                formatter,
+                "own SlotId({slot}) is outside supported seats 0..{MAX_SEATS}"
+            ),
+            Self::MissingOwnPick(slot) => {
+                write!(formatter, "MatchInfo.picks has no own SlotId({slot})")
+            }
+            Self::WrongOwnHero(hero) => write!(
+                formatter,
+                "own slot picked HeroId({}), expected Shadow Fiend HeroId({})",
+                hero.0, SHADOW_FIEND.0
+            ),
+            Self::InvalidOwnTeam(team) => {
+                write!(formatter, "own slot has non-playable team {team:?}")
+            }
+            Self::DuplicatePickSlot(slot) => {
+                write!(formatter, "MatchInfo.picks repeats SlotId({slot})")
+            }
+            Self::PickSlotOutOfRange(slot) => write!(
+                formatter,
+                "MatchInfo.picks contains unsupported SlotId({slot})"
+            ),
+            Self::TerrainAxis(cells) => write!(
+                formatter,
+                "MatchInfo.terrain_cells is {cells}; expected 1..={MAX_TERRAIN_AXIS}"
+            ),
+            Self::TerrainCoverage { actual, expected } => write!(
+                formatter,
+                "MatchInfo.terrain_rle covers {actual} cells; expected {expected}"
+            ),
+            Self::ZeroTerrainRun(index) => write!(
+                formatter,
+                "MatchInfo.terrain_rle entry {index} has zero run length"
+            ),
+            Self::OpaqueCellOutOfRange { x, y, cells } => write!(
+                formatter,
+                "MatchInfo.opaque_cells contains ({x}, {y}) outside {cells}x{cells} terrain"
+            ),
+            Self::PositionOutOfMap {
+                field,
+                index,
+                x_raw,
+                y_raw,
+                maximum_raw,
+            } => write!(
+                formatter,
+                "{field}[{index}] position raw ({x_raw}, {y_raw}) is outside 0..={maximum_raw}"
+            ),
 
-fn fmt_roster_error(error: &TrackerError, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-    match error {
-        TrackerError::DuplicateUnit(id) => write!(
-            formatter,
-            "snapshot units repeats EntityId({}, {})",
-            id.idx, id.generation
-        ),
-        TrackerError::DuplicateProjectile(id) => write!(
-            formatter,
-            "snapshot projectiles repeats EntityId({}, {})",
-            id.idx, id.generation
-        ),
-        TrackerError::DuplicateLoot(id) => write!(
-            formatter,
-            "snapshot loot repeats EntityId({}, {})",
-            id.idx, id.generation
-        ),
-        TrackerError::DuplicatePlayer(slot) => {
-            write!(formatter, "snapshot players repeats SlotId({slot})")
-        }
-        TrackerError::UnsortedPlayers => {
-            formatter.write_str("snapshot players are not sorted by SlotId")
-        }
-        TrackerError::MissingRosterPlayer(slot) => write!(
-            formatter,
-            "snapshot players has no MatchInfo pick SlotId({slot})"
-        ),
-        TrackerError::UnknownRosterPlayer(slot) => write!(
-            formatter,
-            "snapshot players contains unknown SlotId({slot})"
-        ),
-        TrackerError::WrongRosterTeam {
-            slot,
-            actual,
-            expected,
-        } => write!(
-            formatter,
-            "snapshot player SlotId({slot}) team {actual:?} differs from MatchInfo pick {expected:?}"
-        ),
-        TrackerError::WrongRosterHero {
-            slot,
-            actual,
-            expected,
-        } => write!(
-            formatter,
-            "snapshot player SlotId({slot}) HeroId({}) differs from MatchInfo pick HeroId({})",
-            actual.0, expected.0
-        ),
-        _ => Err(fmt::Error),
-    }
-}
+            Self::WrongViewer(actual, expected) => write!(
+                formatter,
+                "snapshot viewer {actual:?} differs from tracker team {expected:?}"
+            ),
+            Self::SnapshotTick { incoming, current } => write!(
+                formatter,
+                "snapshot tick {incoming} does not follow current tick {current}"
+            ),
+            Self::MissingOwnPlayer(slot) => {
+                write!(formatter, "snapshot players has no own SlotId({slot})")
+            }
+            Self::MissingOwnGold => {
+                formatter.write_str("own player gold is absent in seat-specific snapshot")
+            }
+            Self::MissingOwnStash => {
+                formatter.write_str("own player stash is absent in seat-specific snapshot")
+            }
+            Self::MissingOwnHero(id) => write!(
+                formatter,
+                "own live hero EntityId({}, {}) is absent from visible units",
+                id.idx, id.generation
+            ),
+            Self::InvalidOwnHero(id) => write!(
+                formatter,
+                "own live hero EntityId({}, {}) has inconsistent kind, team, owner, or hero",
+                id.idx, id.generation
+            ),
+            Self::AmbiguousOwnHero {
+                scoreboard,
+                visible,
+            } => match scoreboard {
+                Some(scoreboard) => write!(
+                    formatter,
+                    "own slot has visible hero EntityId({}, {}) besides scoreboard hero EntityId({}, {})",
+                    visible.idx, visible.generation, scoreboard.idx, scoreboard.generation
+                ),
+                None => write!(
+                    formatter,
+                    "own slot has visible hero EntityId({}, {}) while scoreboard body is absent",
+                    visible.idx, visible.generation
+                ),
+            },
+            Self::AmbiguousOwnCourier { first, second } => write!(
+                formatter,
+                "own slot has ambiguous couriers EntityId({}, {}) and EntityId({}, {})",
+                first.idx, first.generation, second.idx, second.generation
+            ),
 
-fn fmt_stream_error(error: &TrackerError, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-    match error {
-        TrackerError::UnsortedUnits => {
-            formatter.write_str("snapshot units are not sorted by full EntityId")
+            Self::DuplicateUnit(id) => write!(
+                formatter,
+                "snapshot units repeats EntityId({}, {})",
+                id.idx, id.generation
+            ),
+            Self::DuplicateProjectile(id) => write!(
+                formatter,
+                "snapshot projectiles repeats EntityId({}, {})",
+                id.idx, id.generation
+            ),
+            Self::DuplicateLoot(id) => write!(
+                formatter,
+                "snapshot loot repeats EntityId({}, {})",
+                id.idx, id.generation
+            ),
+            Self::DuplicatePlayer(slot) => {
+                write!(formatter, "snapshot players repeats SlotId({slot})")
+            }
+            Self::UnsortedPlayers => {
+                formatter.write_str("snapshot players are not sorted by SlotId")
+            }
+            Self::MissingRosterPlayer(slot) => write!(
+                formatter,
+                "snapshot players has no MatchInfo pick SlotId({slot})"
+            ),
+            Self::UnknownRosterPlayer(slot) => write!(
+                formatter,
+                "snapshot players contains unknown SlotId({slot})"
+            ),
+            Self::WrongRosterTeam {
+                slot,
+                actual,
+                expected,
+            } => write!(
+                formatter,
+                "snapshot player SlotId({slot}) team {actual:?} differs from MatchInfo pick {expected:?}"
+            ),
+            Self::WrongRosterHero {
+                slot,
+                actual,
+                expected,
+            } => write!(
+                formatter,
+                "snapshot player SlotId({slot}) HeroId({}) differs from MatchInfo pick HeroId({})",
+                actual.0, expected.0
+            ),
+
+            Self::UnsortedUnits => {
+                formatter.write_str("snapshot units are not sorted by full EntityId")
+            }
+            Self::InvalidFelledTree(index) => write!(
+                formatter,
+                "snapshot felled tree index {index} is outside static tree list"
+            ),
+            Self::PositionDeltaOverflow(id) => write!(
+                formatter,
+                "position delta for EntityId({}, {}) exceeds Vec2 range",
+                id.idx, id.generation
+            ),
+            Self::EventTickNotIncreasing { incoming, previous } => write!(
+                formatter,
+                "event batch tick {incoming} must be greater than last event tick {previous}"
+            ),
         }
-        TrackerError::InvalidFelledTree(index) => write!(
-            formatter,
-            "snapshot felled tree index {index} is outside static tree list"
-        ),
-        TrackerError::PositionDeltaOverflow(id) => write!(
-            formatter,
-            "position delta for EntityId({}, {}) exceeds Vec2 range",
-            id.idx, id.generation
-        ),
-        TrackerError::EventTickNotIncreasing { incoming, previous } => write!(
-            formatter,
-            "event batch tick {incoming} must be greater than last event tick {previous}"
-        ),
-        _ => Err(fmt::Error),
     }
 }
 
@@ -2615,29 +2558,5 @@ pub(crate) fn recent_restoration_reports(
 }
 
 #[cfg(test)]
-mod allocation_pool_tests {
-    use super::*;
-
-    #[test]
-    fn provenance_pool_reuses_buffers_in_the_steady_state() {
-        let pool = Arc::new(ProvenancePool::new());
-        // Warm up to the number of captures a live history can hold at once.
-        let mut live: Vec<PooledProvenance> =
-            (0..PROVENANCE_POOL_LIMIT).map(|_| pool.take()).collect();
-        for handle in live.drain(..) {
-            drop(handle);
-        }
-        let warmed = pool.allocations.load(Ordering::Relaxed);
-        assert!(warmed > 0, "warm-up must allocate the bounded pool");
-        assert!(pool.free.lock().expect("pool lock").len() == PROVENANCE_POOL_LIMIT);
-        for _ in 0..10_000 {
-            let handle = pool.take();
-            drop(handle);
-        }
-        assert_eq!(
-            pool.allocations.load(Ordering::Relaxed),
-            warmed,
-            "steady-state provenance captures must reuse pooled buffers"
-        );
-    }
-}
+#[path = "tests/tracker_test_support.rs"]
+mod test_support;

@@ -13,6 +13,12 @@ use crate::{
     RaggedFeatureArena, RaggedFeatureHeader, StructuredAction,
 };
 
+#[cfg(test)]
+#[path = "tests/ppo_test_support.rs"]
+mod test_support;
+#[cfg(test)]
+pub(crate) use test_support::*;
+
 /// Maximum concurrently interleaved environment-seat rollout streams.
 pub const PPO_MAX_STREAMS: usize = 1_280;
 /// Maximum transitions retained for one policy update.
@@ -353,14 +359,6 @@ fn open_unit_from_bits(bits: u64) -> f64 {
     (bits as f64 + 0.5) / SCALE
 }
 
-#[cfg(test)]
-pub(crate) fn open_unit_bounds_for_test() -> (f64, f64) {
-    (
-        open_unit_from_bits(0),
-        open_unit_from_bits((1u64 << 52) - 1),
-    )
-}
-
 /// One sampled legal action before rewards and advantages are assembled.
 #[derive(Clone, Debug)]
 pub struct PpoTransition {
@@ -608,11 +606,6 @@ impl PpoRollout {
         let config = config.validate()?;
         prepare_batch(self.policy, self.transitions, self.frames, config)
     }
-
-    #[cfg(test)]
-    pub(crate) fn ragged_rows_for_test(&self) -> usize {
-        self.frames.stored_rows()
-    }
 }
 
 /// One transition with normalized GAE and lambda return.
@@ -750,11 +743,6 @@ impl PpoTrainer {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) const fn shuffle_draws_for_test(&self) -> u64 {
-        self.shuffle.draws()
-    }
-
     pub fn train_update(
         &mut self,
         model: &PolicyModel,
@@ -804,22 +792,6 @@ impl PpoTrainer {
             return Err(PpoError::PolicyMismatch);
         }
         Ok(generation)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn train_pipeline_update_with_barriers_for_test(
-        &mut self,
-        model: &PolicyModel,
-        pipeline: &crate::PipelineBatch,
-        entered: &std::sync::Barrier,
-        release: &std::sync::Barrier,
-    ) -> Result<PpoUpdateReport, PpoError> {
-        let generation = self.lock_pipeline_update(model, pipeline)?;
-        entered.wait();
-        release.wait();
-        let report = self.train_accepted_update(model, &pipeline.batch);
-        drop(generation);
-        report
     }
 
     fn train_accepted_update(
@@ -971,11 +943,6 @@ impl PpoBatch {
             });
         }
         Ok(output)
-    }
-
-    #[cfg(test)]
-    pub(crate) fn replace_advantage_for_test(&mut self, index: usize, value: f32) -> f32 {
-        std::mem::replace(&mut self.samples[index].advantage, value)
     }
 }
 

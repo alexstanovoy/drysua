@@ -245,29 +245,17 @@ impl ActorPolicyLease {
         })
     }
 
-    /// Transfers a completed rollout while retaining it when the ready slot is busy.
-    pub fn try_submit(self, buffer: ActorRolloutBuffer) -> Result<(), RejectedRollout> {
+    /// Transfers a completed rollout; the buffer returns to the pool on rejection.
+    pub fn try_submit(self, buffer: ActorRolloutBuffer) -> Result<(), PipelineError> {
         let ActorRolloutBuffer { rollout, permit } = buffer;
         let samples = rollout.len();
-        if let Err(error) = validate_samples(samples, self.sample_capacity) {
-            return Err(RejectedRollout::new(error, rollout, permit));
-        }
-        let policy = match self.model.policy_identity() {
-            Ok(policy) => policy,
-            Err(error) => {
-                return Err(RejectedRollout::new(
-                    PipelineError::Model(error.to_string()),
-                    rollout,
-                    permit,
-                ));
-            }
-        };
+        validate_samples(samples, self.sample_capacity)?;
+        let policy = self
+            .model
+            .policy_identity()
+            .map_err(|error| PipelineError::Model(error.to_string()))?;
         if rollout.policy() != policy {
-            return Err(RejectedRollout::new(
-                PipelineError::PolicyMismatch,
-                rollout,
-                permit,
-            ));
+            return Err(PipelineError::PolicyMismatch);
         }
         let submitted = SubmittedRollout {
             version: self.version,
@@ -276,16 +264,8 @@ impl ActorPolicyLease {
         };
         match self.sender.try_send(submitted) {
             Ok(()) => Ok(()),
-            Err(TrySendError::Full(submitted)) => Err(RejectedRollout {
-                error: PipelineError::QueueFull,
-                rollout: submitted.rollout,
-                permit: submitted.permit,
-            }),
-            Err(TrySendError::Disconnected(submitted)) => Err(RejectedRollout {
-                error: PipelineError::Disconnected,
-                rollout: submitted.rollout,
-                permit: submitted.permit,
-            }),
+            Err(TrySendError::Full(_)) => Err(PipelineError::QueueFull),
+            Err(TrySendError::Disconnected(_)) => Err(PipelineError::Disconnected),
         }
     }
 }
@@ -309,52 +289,6 @@ impl DerefMut for ActorRolloutBuffer {
         &mut self.rollout
     }
 }
-
-/// Rejected nonblocking submission, retaining ownership for retry or audit.
-pub struct RejectedRollout {
-    error: PipelineError,
-    rollout: Box<PpoRollout>,
-    permit: BufferPermit,
-}
-
-impl RejectedRollout {
-    fn new(error: PipelineError, rollout: Box<PpoRollout>, permit: BufferPermit) -> Self {
-        Self {
-            error,
-            rollout,
-            permit,
-        }
-    }
-
-    pub fn error(&self) -> &PipelineError {
-        &self.error
-    }
-
-    pub fn into_rollout(self) -> ActorRolloutBuffer {
-        ActorRolloutBuffer {
-            rollout: self.rollout,
-            permit: self.permit,
-        }
-    }
-}
-
-impl fmt::Debug for RejectedRollout {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("RejectedRollout")
-            .field("error", &self.error)
-            .field("samples", &self.rollout.len())
-            .finish()
-    }
-}
-
-impl fmt::Display for RejectedRollout {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.error.fmt(formatter)
-    }
-}
-
-impl Error for RejectedRollout {}
 
 /// Rollout accepted by the sole learner after a bounded generation-lag check.
 pub struct AcceptedRollout {

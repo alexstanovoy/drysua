@@ -1,10 +1,11 @@
 use bota_proto::{
     AbilityId, AbilityView, Aim, Angle, Attribute, Attributes, DamageKind, EffectId, EffectView,
     EntityId, EventKind, Fixed, HeroId, ItemId, ItemView, Kit, LootView, MapId, MatchInfo, Pick,
-    PlayerView, ProjectileView, ShopEntry, SlotId, StatusFlags, Team, TickMode, UnitKind, UnitView,
-    Vec2, WorldView,
+    PlayerView, ProjectileView, ShopEntry, SlotId, StatusFlags, Team, UnitKind, UnitView, Vec2,
+    WorldView,
 };
 
+use super::fixtures;
 use crate::tracker::is_structure;
 use crate::{
     HISTORY_AGES, HISTORY_TICKS, MAX_ABILITY_SLOTS, MAX_EFFECTS_PER_UNIT, MAX_EVENTS_PER_BATCH,
@@ -1375,30 +1376,14 @@ fn tracker_with_first_tick(tick: u32) -> StateTracker {
 }
 
 fn match_info() -> MatchInfo {
-    MatchInfo {
-        match_id: 77,
-        map: MapId(0),
-        tick_rate: 30,
-        pregame_ticks: 90,
-        trees: vec![Vec2::from_ints(4, 5)],
-        terrain_cells: 8,
-        terrain_rle: vec![(64, 0x80)],
-        opaque_cells: vec![(0, 0)],
-        mode: TickMode::Lockstep,
-        picks: vec![
-            Pick {
-                slot: SlotId(0),
-                team: Team::Radiant,
-                hero: SHADOW_FIEND,
-            },
-            Pick {
-                slot: SlotId(1),
-                team: Team::Dire,
-                hero: SHADOW_FIEND,
-            },
-        ],
-        shop: vec![shop_entry()],
-    }
+    fixtures::MatchInfoFixture::new(77, MapId(0), fixtures::two_seat_picks(Team::Radiant))
+        .pregame_ticks(90)
+        .trees(vec![Vec2::from_ints(4, 5)])
+        .terrain_cells(8)
+        .terrain_rle(vec![(64, 0x80)])
+        .opaque_cells(vec![(0, 0)])
+        .shop(vec![shop_entry()])
+        .build()
 }
 
 fn shop_entry() -> ShopEntry {

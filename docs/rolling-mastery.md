@@ -13,7 +13,7 @@ v0.0.1..v0.0.4 compatibility adaptations remain external evaluation opponents.
 No new Weak strategy, Teacher override, policy input, critic, GAE, BC, mask or
 architecture change is part of mastery.
 
-Example configuration, after explicitly obtaining compatible M23 runtime weights:
+Example configuration, after explicitly obtaining compatible M24 runtime weights:
 
 ```sh
 drysua train-full --updates 2 --checkpoint-directory /new/empty/run \
@@ -109,7 +109,7 @@ Actual Map2 outcomes retain their labels, but terminal reward is now:
 | Completed learner-task TimeCap | -0.2 | false |
 | Infrastructure failure/resource abort | no reward/game | not recorded |
 
-Reward6 terminal values and unchanged reward5 dense/opening rules are in
+Reward7 terminal values and unchanged reward5 dense/opening rules are in
 [reward-rebalance.md](reward-rebalance.md). Normal zero-initial-potential starts
 have dense bounds[-1.0488,+0.645]. General primed baselines have bounds[-1.4488,+1.045]. Both include the win-only victory-time bonus.
 Neither has guaranteed winner-return dominance with the new terminal gaps0.2/0.4.

@@ -47,17 +47,18 @@ pub const CHECKPOINT_SCHEMA_DESCRIPTOR: &str = concat!(
     "mastery_counters=stage_games_bounded_and_multiple_of_environments2or4or6_weak_games_equal_updates_times_environments_later_stages_require_prior_full_batch_rounded_window;mastery_scope=typed_config_and_canonical_run_before_tensor_read_or_mutation_Git_migration_cannot_change_config,no_fake_rng_states;observation=feature22_action5_unchanged_legal_set_global92_unit84_all_indices_preserved_tower_remaining90_opening_pending91_no_mastery_inputs;",
     "reward7=terminal_win.2_loss_neg.2_draw0_taskcap_neg.2_dense_unchanged_win_only_victory_time_bonus_continuous_native_clock_distinct_outcomes_errors_not_rewards_no_terminal_dominance;wire_rebase=bota78427bb_new_event_order_missed_ignored_cheat_never_issued_no_reward_effect_attack_time_ms_ticks_bound_collision_no_old_alias;save=immutable_generation,canonical_copy,recoverable_manifest_commit_last,file_and_directory_fsync;"
 );
+/// Ordered linked schema identities captured in every checkpoint manifest.
+const LINKED_SCHEMAS: [(u32, u64); 5] = [
+    (ACTION_SCHEMA_VERSION, ACTION_SCHEMA_HASH),
+    (FEATURE_SCHEMA_VERSION, FEATURE_SCHEMA_HASH),
+    (MODEL_SCHEMA_VERSION, MODEL_SCHEMA_HASH),
+    (PPO_SCHEMA_VERSION, PPO_SCHEMA_HASH),
+    (MAP2_REWARD_SCHEMA_VERSION, MAP2_REWARD_SCHEMA_HASH),
+];
+
 /// FNV-1a of the descriptor, ordered linked identities, and reward descriptor.
-pub const CHECKPOINT_SCHEMA_HASH: u64 = crate::model::linked_schema_hash(
-    CHECKPOINT_SCHEMA_DESCRIPTOR,
-    &[
-        (ACTION_SCHEMA_VERSION, ACTION_SCHEMA_HASH),
-        (FEATURE_SCHEMA_VERSION, FEATURE_SCHEMA_HASH),
-        (MODEL_SCHEMA_VERSION, MODEL_SCHEMA_HASH),
-        (PPO_SCHEMA_VERSION, PPO_SCHEMA_HASH),
-        (MAP2_REWARD_SCHEMA_VERSION, MAP2_REWARD_SCHEMA_HASH),
-    ],
-);
+pub const CHECKPOINT_SCHEMA_HASH: u64 =
+    crate::model::linked_schema_hash(CHECKPOINT_SCHEMA_DESCRIPTOR, &LINKED_SCHEMAS);
 const CHECKPOINT_TENSOR_FILE: &str = "checkpoint.safetensors";
 const CHECKPOINT_META_FILE: &str = "checkpoint.meta";
 const RUNTIME_TENSOR_FILE: &str = "drysua.weights.safetensors";
@@ -1160,26 +1161,14 @@ fn decode_manifest(bytes: &[u8]) -> Result<TrainingArtifact, CheckpointError> {
 }
 
 fn encode_schema(writer: &mut ManifestWriter) {
-    for (version, hash) in [
-        (ACTION_SCHEMA_VERSION, ACTION_SCHEMA_HASH),
-        (FEATURE_SCHEMA_VERSION, FEATURE_SCHEMA_HASH),
-        (MODEL_SCHEMA_VERSION, MODEL_SCHEMA_HASH),
-        (PPO_SCHEMA_VERSION, PPO_SCHEMA_HASH),
-        (MAP2_REWARD_SCHEMA_VERSION, MAP2_REWARD_SCHEMA_HASH),
-    ] {
+    for (version, hash) in LINKED_SCHEMAS {
         writer.u32(version);
         writer.u64(hash);
     }
 }
 
 fn decode_schema(reader: &mut ManifestReader<'_>) -> Result<(), CheckpointError> {
-    for (version, hash) in [
-        (ACTION_SCHEMA_VERSION, ACTION_SCHEMA_HASH),
-        (FEATURE_SCHEMA_VERSION, FEATURE_SCHEMA_HASH),
-        (MODEL_SCHEMA_VERSION, MODEL_SCHEMA_HASH),
-        (PPO_SCHEMA_VERSION, PPO_SCHEMA_HASH),
-        (MAP2_REWARD_SCHEMA_VERSION, MAP2_REWARD_SCHEMA_HASH),
-    ] {
+    for (version, hash) in LINKED_SCHEMAS {
         if reader.u32()? != version || reader.u64()? != hash {
             return Err(CheckpointError::SchemaMismatch);
         }

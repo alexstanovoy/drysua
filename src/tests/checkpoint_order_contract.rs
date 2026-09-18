@@ -1,5 +1,4 @@
 use super::*;
-use sha2::{Digest, Sha256};
 
 const SOURCES: [(u32, u64, u32, &str); 2] = [
     (
@@ -190,7 +189,7 @@ fn selected_m12_local_artifact_is_retired_without_writing_or_mutating_source() {
             .expect("source directory");
     let path = source.join("drysua.weights.safetensors");
     let bytes = fs::read(&path).expect("audited source");
-    let digest = hex_digest(&bytes);
+    let digest = crate::tests::support::sha256_hex(&bytes);
     let &(version, hash, rules, _) = SOURCES
         .iter()
         .find(|source| source.3 == digest)
@@ -224,7 +223,10 @@ fn selected_m12_local_artifact_is_retired_without_writing_or_mutating_source() {
             .all(|bytes| f32::from_le_bytes(*bytes).is_finite())
     );
     assert_eq!(fs::read(&path).expect("source unchanged"), bytes);
-    assert_eq!(hex_digest(&fs::read(&path).expect("source rehash")), digest);
+    assert_eq!(
+        crate::tests::support::sha256_hex(&fs::read(&path).expect("source rehash")),
+        digest
+    );
     verify_source_digest_and_tuple_are_paired(&bytes, version);
     eprintln!(
         "retired_m12 source_sha256={digest} initialization=rejected runtime=rejected source_unchanged=true outputs=none"
@@ -286,11 +288,4 @@ fn verify_source_digest_and_tuple_are_paired(bytes: &[u8], version: u32) {
         CheckpointError::TensorContract("selected M12 training source SHA-256"),
     );
     fs::remove_dir_all(directory).expect("cleanup");
-}
-
-fn hex_digest(bytes: &[u8]) -> String {
-    Sha256::digest(bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect()
 }

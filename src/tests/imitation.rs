@@ -10,12 +10,11 @@ use crate::model::{DecoderLogits, decode_with_logits};
 use crate::{
     ACTION_SCHEMA_HASH, ACTION_SCHEMA_VERSION, ActionKind, ActionSpace, AdamConfig,
     BehavioralTarget, BehavioralTrainer, DaggerStatistics, FeatureFrame, ImitationPool,
-    ImitationSample, ImitationSide, ImitationSplit, ItemReadiness, LearnerMatchOutcome,
-    LearnerTeacherResult, LocalPolicyState, MAX_IMITATION_SAMPLES, MAX_SEED_NAMESPACE,
-    MAX_TRAINING_COUNTER, MODEL_PARAMETER_COUNT, OfflineEvaluation, OrderPersistence,
-    PairedGameplayReport, PairedSeedResult, PolicyModel, PromotionGateInput, RolloutAudit,
-    SampleIdentity, SeedNamespace, SeedNamespaces, ShuffleState, StateTracker, StructuredAction,
-    Teacher, TeacherCoverage, TrainingScope,
+    ImitationSample, ImitationSide, ImitationSplit, ItemReadiness, LocalPolicyState,
+    MAX_IMITATION_SAMPLES, MAX_SEED_NAMESPACE, MAX_TRAINING_COUNTER, MODEL_PARAMETER_COUNT,
+    OfflineEvaluation, OrderPersistence, PolicyModel, SampleIdentity, SeedNamespace,
+    SeedNamespaces, ShuffleState, StateTracker, StructuredAction, Teacher, TeacherCoverage,
+    TrainingScope,
 };
 
 #[test]
@@ -589,30 +588,6 @@ fn second_trainer_owner_is_rejected_and_raw_import_invalidates_first_owner() {
 }
 
 #[test]
-fn paired_gameplay_aggregates_only_structural_per_seed_results() {
-    let model = PolicyModel::fresh(19).expect("model");
-    let identity = model.policy_identity().expect("identity");
-    let first = PairedSeedResult::new(
-        100,
-        LearnerTeacherResult::new(LearnerMatchOutcome::Win, 3.0, 2.0).expect("radiant"),
-        LearnerTeacherResult::new(LearnerMatchOutcome::Loss, 1.0, 2.0).expect("dire"),
-    );
-    let second = PairedSeedResult::new(
-        101,
-        LearnerTeacherResult::new(LearnerMatchOutcome::Draw, 2.0, 2.0).expect("radiant"),
-        LearnerTeacherResult::new(LearnerMatchOutcome::Win, 4.0, 3.0).expect("dire"),
-    );
-    let report = PairedGameplayReport::new(identity, vec![first, second]).expect("report");
-    assert_eq!(report.paired_seeds(), &[100, 101]);
-    assert_eq!(report.radiant().games(), 2);
-    assert_eq!(report.radiant().wins(), 1);
-    assert_eq!(report.dire().wins(), 1);
-    assert!(LearnerTeacherResult::new(LearnerMatchOutcome::Win, f64::NAN, 0.0).is_err());
-    assert!(PairedGameplayReport::new(identity, Vec::new()).is_err());
-    assert!(PairedGameplayReport::new(identity, vec![first, first]).is_err());
-}
-
-#[test]
 fn seed_namespaces_are_sorted_bounded_and_pairwise_disjoint() {
     let namespaces = SeedNamespaces::new(vec![3, 1], vec![4, 2], vec![6, 5]).expect("seeds");
     assert_eq!(namespaces.training(), &[1, 3]);
@@ -745,142 +720,6 @@ fn teacher_coverage_cannot_be_attached_to_a_different_sample_with_same_metadata(
         .expect("represented pool");
     OfflineEvaluation::evaluate_held_out(&zero_model(23), &represented_pool, coverage)
         .expect("exact represented sample");
-}
-
-#[test]
-fn robust_promotion_gate_requires_real_counts_both_sides_and_audits() {
-    let model = zero_model(11);
-    let input = passing_gate(&model);
-    let identity = model.policy_identity().expect("identity");
-    let result = input.evaluate(&model).expect("gate");
-    assert!(result.passed);
-    assert_eq!(result.radiant_win_rate, 0.5);
-    assert_eq!(result.dire_win_rate, 0.5);
-    let too_small = PromotionGateInput {
-        rollout: RolloutAudit::new(identity, 0, 999, true, true).expect("small rollout"),
-        ..input.clone()
-    };
-    assert!(too_small.evaluate(&model).is_err());
-    let exact_rejection = PromotionGateInput {
-        rollout: RolloutAudit::new(identity, 1, 1_000, true, true).expect("exact rollout"),
-        ..input.clone()
-    };
-    assert!(!exact_rejection.evaluate(&model).expect("boundary").passed);
-    let failed_audit = PromotionGateInput {
-        rollout: RolloutAudit::new(identity, 0, 1_000, true, false).expect("failed audit"),
-        ..input
-    };
-    assert!(!failed_audit.evaluate(&model).expect("audit").passed);
-    assert!(
-        !gate_with_mismatches(&model, 0)
-            .evaluate(&model)
-            .expect("trivial corpus")
-            .passed
-    );
-    let one_side = PromotionGateInput {
-        held_out: one_side_held_out(&model),
-        ..passing_gate(&model)
-    };
-    assert!(!one_side.evaluate(&model).expect("one side").passed);
-}
-
-#[test]
-fn promotion_agreement_and_real_coverage_boundaries_are_exact() {
-    let model = zero_model(12);
-    assert!(
-        gate_with_mismatches(&model, 5)
-            .evaluate(&model)
-            .expect("95 percent")
-            .passed
-    );
-    assert!(
-        !gate_with_mismatches(&model, 6)
-            .evaluate(&model)
-            .expect("94 percent")
-            .passed
-    );
-    let mut input = passing_gate(&model);
-    input.held_out = held_out_with_failed_coverage(&model);
-    assert!(!input.evaluate(&model).expect("failed coverage").passed);
-    let identity = model.policy_identity().expect("identity");
-    let below_rejection = PromotionGateInput {
-        rollout: RolloutAudit::new(identity, 1, 1_001, true, true).expect("rollout"),
-        held_out: passing_gate(&model).held_out,
-        ..input
-    };
-    assert!(
-        below_rejection
-            .evaluate(&model)
-            .expect("below rejection threshold")
-            .passed
-    );
-}
-
-#[test]
-fn paired_gameplay_rejects_missing_promotion_seed_and_zero_score() {
-    let model = zero_model(13);
-    let identity = model.policy_identity().expect("identity");
-    let mut missing = passing_gate(&model);
-    missing.gameplay = PairedGameplayReport::new(identity, paired_results(100..109, 0.2, 0.2))
-        .expect("missing seed report");
-    assert_eq!(
-        missing.evaluate(&model).unwrap_err().to_string(),
-        "imitation paired gameplay promotion seed namespace is invalid"
-    );
-    let mut zero_score = passing_gate(&model);
-    zero_score.gameplay = PairedGameplayReport::new(identity, paired_results(100..110, 0.0, 0.0))
-        .expect("zero score report");
-    assert!(!zero_score.evaluate(&model).expect("zero score").passed);
-}
-
-#[test]
-fn promotion_rejects_different_and_stale_policy_evidence() {
-    let model = zero_model(20);
-    let other = zero_model(21);
-    let input = passing_gate(&model);
-    assert_eq!(
-        input.evaluate(&other).unwrap_err().to_string(),
-        "imitation promotion evidence policy identity does not match candidate"
-    );
-    let mut mixed = input.clone();
-    mixed.rollout = RolloutAudit::new(
-        other.policy_identity().expect("other identity"),
-        0,
-        1_000,
-        true,
-        true,
-    )
-    .expect("mixed rollout");
-    assert!(mixed.evaluate(&model).is_err());
-    let mut mixed_gameplay = input.clone();
-    mixed_gameplay.gameplay = PairedGameplayReport::new(
-        other.policy_identity().expect("other identity"),
-        paired_results(100..110, 0.2, 0.2),
-    )
-    .expect("mixed gameplay");
-    assert!(mixed_gameplay.evaluate(&model).is_err());
-
-    let mut training_pool = pool(1, 119);
-    training_pool
-        .push(sample(
-            ImitationSplit::Train,
-            ImitationSide::Radiant,
-            ActionKind::Continue,
-            1,
-        ))
-        .expect("training sample");
-    let mut trainer = make_trainer(1, 4, &model, &training_pool);
-    trainer
-        .train_epoch(&model, &training_pool)
-        .expect("model update");
-    assert!(input.evaluate(&model).is_err());
-    let refreshed = passing_gate(&model);
-    let parameters = model.export_parameters().expect("parameters");
-    model.import_parameters(&parameters).expect("raw import");
-    assert_eq!(
-        refreshed.evaluate(&model).unwrap_err().to_string(),
-        "imitation promotion evidence policy identity does not match candidate"
-    );
 }
 
 #[test]
@@ -1054,101 +893,6 @@ fn tiny_repeated_bc_batch_reduces_loss_and_tracks_dagger_counts() {
     assert!(second.average_loss < first.average_loss);
 }
 
-fn passing_gate(model: &PolicyModel) -> PromotionGateInput {
-    gate_with_mismatches(model, 5)
-}
-
-fn gate_with_mismatches(model: &PolicyModel, mismatches: u64) -> PromotionGateInput {
-    let mut pool = gate_pool(100, 200);
-    for ordinal in 0..100 {
-        let side = if ordinal % 2 == 0 {
-            ImitationSide::Radiant
-        } else {
-            ImitationSide::Dire
-        };
-        let kind = if ordinal < mismatches {
-            ActionKind::Stop
-        } else {
-            ActionKind::Continue
-        };
-        pool.push(gate_sample(side, kind, ordinal))
-            .expect("held-out sample");
-    }
-    let mut coverage = TeacherCoverage::new();
-    record_held_out_coverage(&mut coverage, &pool);
-    let held_out = OfflineEvaluation::evaluate_held_out(model, &pool, coverage).expect("held out");
-    let identity = model.policy_identity().expect("identity");
-    PromotionGateInput {
-        held_out,
-        rollout: RolloutAudit::new(identity, 0, 1_000, true, true).expect("rollout"),
-        gameplay: PairedGameplayReport::new(identity, paired_results(100..110, 0.2, 0.2))
-            .expect("gameplay"),
-    }
-}
-
-fn held_out_with_failed_coverage(model: &PolicyModel) -> crate::HeldOutEvaluation {
-    let mut pool = gate_pool(99, 201);
-    for ordinal in 0..99 {
-        let side = if ordinal % 2 == 0 {
-            ImitationSide::Radiant
-        } else {
-            ImitationSide::Dire
-        };
-        pool.push(gate_sample(side, ActionKind::Continue, ordinal))
-            .expect("held-out sample");
-    }
-    let mut coverage = TeacherCoverage::new();
-    record_held_out_coverage(&mut coverage, &pool);
-    let failed_identity = SampleIdentity::from_frame(
-        SeedNamespace::Promotion,
-        100,
-        999,
-        10,
-        pool.get(0).expect("held-out sample").frame(),
-    )
-    .expect("failed identity");
-    coverage.record_failed_for(failed_identity).expect("failed");
-    let evaluation = OfflineEvaluation::evaluate_held_out(model, &pool, coverage)
-        .expect("typed held out with failed attempt");
-    assert_eq!(evaluation.metrics().overall.teacher_coverage(), Some(0.99));
-    evaluation
-}
-
-fn one_side_held_out(model: &PolicyModel) -> crate::HeldOutEvaluation {
-    let mut pool = gate_pool(100, 202);
-    for ordinal in 0..100 {
-        pool.push(gate_sample(
-            ImitationSide::Radiant,
-            ActionKind::Continue,
-            ordinal,
-        ))
-        .expect("held-out sample");
-    }
-    let mut coverage = TeacherCoverage::new();
-    record_held_out_coverage(&mut coverage, &pool);
-    OfflineEvaluation::evaluate_held_out(model, &pool, coverage).expect("held out")
-}
-
-fn paired_results(
-    seeds: impl Iterator<Item = u64>,
-    learner_score: f64,
-    teacher_score: f64,
-) -> Vec<PairedSeedResult> {
-    seeds
-        .enumerate()
-        .map(|(index, seed)| {
-            let outcome = match index {
-                0..=4 => LearnerMatchOutcome::Win,
-                5..=8 => LearnerMatchOutcome::Loss,
-                _ => LearnerMatchOutcome::Draw,
-            };
-            let result = LearnerTeacherResult::new(outcome, learner_score, teacher_score)
-                .expect("paired result");
-            PairedSeedResult::new(seed, result, result)
-        })
-        .collect()
-}
-
 #[derive(Debug, PartialEq)]
 struct TrainerObservation {
     parameters: Vec<f32>,
@@ -1201,26 +945,6 @@ fn make_trainer(
 
 fn pool(capacity: usize, lineage: u64) -> ImitationPool {
     ImitationPool::new(capacity, lineage, seeds(), scope()).expect("pool")
-}
-
-fn gate_pool(capacity: usize, lineage: u64) -> ImitationPool {
-    let seeds =
-        SeedNamespaces::new(vec![1], vec![2], (100..110).collect()).expect("gate seed namespaces");
-    ImitationPool::new(capacity, lineage, seeds, scope()).expect("gate pool")
-}
-
-fn gate_sample(side: ImitationSide, kind: ActionKind, ordinal: u64) -> ImitationSample {
-    let (frame, space) = complete_fixture_for(side);
-    let action = decode_with_logits(&space, &DecoderLogits::favor(kind)).expect("action");
-    let identity = SampleIdentity::from_frame(
-        SeedNamespace::Promotion,
-        100 + ordinal % 10,
-        ordinal,
-        10,
-        &frame,
-    )
-    .expect("gate identity");
-    ImitationSample::teacher(frame, &space, action, identity).expect("gate sample")
 }
 
 fn record_held_out_coverage(coverage: &mut TeacherCoverage, pool: &ImitationPool) {

@@ -1243,19 +1243,7 @@ fn retired_m11_adapter_preserves_length_and_finite_diagnostics_without_initializ
 #[test]
 fn retired_m12_adapter_rejects_current_layout_instead_of_relabelling_it() {
     let model = PolicyModel::fresh(409).expect("model");
-    let error =
-        PolicyModel::validate_m12_parameter_schema(&model.parameter_schema().expect("schema"))
-            .expect_err("retired M12 initialization");
-    assert_eq!(
-        error,
-        ModelError::InvalidModelState(
-            "M12 initialization retired; use pinned M14 Map2 initialization"
-        )
-    );
-    assert_eq!(
-        error.to_string(),
-        "model produced invalid M12 initialization retired; use pinned M14 Map2 initialization"
-    );
+    model_input_adapter::assert_retired_m12_layout(&model.parameter_schema().expect("schema"));
 }
 
 #[test]

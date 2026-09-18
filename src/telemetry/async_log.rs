@@ -4,6 +4,10 @@ use std::sync::{Arc, OnceLock, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
+#[cfg(test)]
+#[path = "../tests/telemetry_async_log_test_support.rs"]
+mod test_support;
+
 const LOG_LINE_CAPACITY: usize = 4096;
 const LOG_QUEUE_CAPACITY: usize = 8;
 const LOG_DRAIN_LIMIT: Duration = Duration::from_millis(50);
@@ -103,14 +107,6 @@ impl Write for AsyncLogWriter {
 }
 
 impl LogPublisher {
-    #[cfg(test)]
-    fn writer(&self) -> AsyncLogWriter {
-        AsyncLogWriter {
-            publisher: Some(self.clone()),
-            line: LogLine::default(),
-        }
-    }
-
     fn dropped(&self) -> u64 {
         self.dropped.load(Ordering::Relaxed)
     }
