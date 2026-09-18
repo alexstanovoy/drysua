@@ -14,6 +14,8 @@ bota-proto = { path = "../bota/crates/bota-proto", default-features = false }
 bota-server = { path = "../bota/crates/bota-server", default-features = false, optional = true }
 candle-core = { version = "0.11.0", default-features = false }
 clap = { version = "4.6.6", default-features = false, features = ["derive", "error-context", "help", "std", "suggestions", "usage"] }
+# Integer-key lookup maps where iteration order does not affect behavior.
+rustc-hash = { version = "2.1.3", default-features = false, features = ["std"] }
 safetensors = { version = "0.8.0", default-features = false, features = ["std"] }
 sha2 = { version = "0.11.0", default-features = false }
 # Inline storage for small bounded candidate/mask collections (hot action path).

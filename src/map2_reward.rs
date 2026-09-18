@@ -16,6 +16,7 @@ use std::fmt;
 use bota_proto::{EntityId, EventKind, MatchInfo, SlotId};
 use observation::{Identity, Role, SnapshotFacts, UnitFact};
 use potential::Tower;
+use rustc_hash::FxHashMap;
 
 pub use progress::*;
 
@@ -353,7 +354,7 @@ pub struct Map2Reward {
     pending: Option<SnapshotFacts>,
     /// Retired snapshot unit facts, refilled in place by the next snapshot.
     units_scratch: Vec<UnitFact>,
-    identities: BTreeMap<EntityId, Identity>,
+    identities: FxHashMap<EntityId, Identity>,
     towers: BTreeMap<EntityId, Tower>,
     counts: [u64; MAP2_REWARD_CHANNELS],
     tower_potential: f64,
@@ -389,7 +390,7 @@ impl Map2Reward {
             current: None,
             pending: None,
             units_scratch: Vec::new(),
-            identities: BTreeMap::new(),
+            identities: FxHashMap::default(),
             towers: BTreeMap::new(),
             counts: [0; MAP2_REWARD_CHANNELS],
             tower_potential: 0.0,
