@@ -304,6 +304,7 @@ fn opponent_name(opponent: &OpponentRuntime) -> &'static str {
     match opponent {
         OpponentRuntime::Teacher => "Teacher",
         OpponentRuntime::Weak => "Weak",
+        #[cfg(test)]
         OpponentRuntime::Policy { .. } => "Policy",
     }
 }

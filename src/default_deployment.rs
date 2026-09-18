@@ -21,7 +21,7 @@ pub(crate) struct DefaultDeployment {
 const _: () = {
     match DEFAULT_DEPLOYMENT.policy {
         PlayPolicy::Teacher => assert!(DEFAULT_DEPLOYMENT.weights_directory.is_none()),
-        PlayPolicy::Hybrid | PlayPolicy::Neural | PlayPolicy::Tactical => {
+        PlayPolicy::Hybrid | PlayPolicy::Neural => {
             assert!(DEFAULT_DEPLOYMENT.weights_directory.is_some());
         }
     }
@@ -35,7 +35,7 @@ impl DefaultDeployment {
     pub fn resolve(self) -> io::Result<(PlayPolicy, Option<PathBuf>)> {
         match (self.policy, self.weights_directory) {
             (PlayPolicy::Teacher, None) => Ok((self.policy, None)),
-            (PlayPolicy::Hybrid | PlayPolicy::Neural | PlayPolicy::Tactical, Some(directory)) => {
+            (PlayPolicy::Hybrid | PlayPolicy::Neural, Some(directory)) => {
                 let mut components = Path::new(directory).components();
                 if directory.len() > 256
                     || components.next() != Some(Component::Normal("artifacts".as_ref()))

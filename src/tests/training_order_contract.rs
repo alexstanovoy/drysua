@@ -1,5 +1,5 @@
 use super::*;
-use crate::{ActivePolicyTarget, ControlledUnit, StructuredAction, global_feature};
+use crate::{ControlledUnit, StructuredAction, global_feature};
 use bota_proto::{AbilitySlot, Order, Target, Vec2, WorldView};
 
 pub(crate) fn transcript(side: usize) -> Vec<ServerMsg> {
@@ -218,67 +218,6 @@ fn paired_dispatch(
 }
 
 #[test]
-fn training_contract_expert_sample_preserves_sent_cast_attack_without_changing_teacher() {
-    for side in 0..2 {
-        let initial = transcript(side);
-        let mut observer = setup_seat(side, &initial).expect("observer");
-        let mut reference = setup_seat(side, &initial).expect("legacy reference");
-        expert_sample_and_reference(&mut observer, &mut reference);
-        for cast in [false, true] {
-            assert_eq!(send(&mut observer, cast), send(&mut reference, cast));
-        }
-        let messages = packet(&initial, 2, |_| {});
-        observe_messages(&mut observer, &messages).expect("observer tick");
-        observe_messages(&mut reference, &messages).expect("reference tick");
-        let sample = expert_sample_and_reference(&mut observer, &mut reference);
-        assert_eq!(
-            sample.frame().global()[global_feature::ACTIVE_ORDER_PRESENT],
-            1.0
-        );
-        assert_eq!(
-            observer
-                .local
-                .active_order()
-                .expect("sent directive")
-                .target,
-            ActivePolicyTarget::Unit(snapshot(&initial).players[1 - side].unit.expect("enemy"))
-        );
-        assert_eq!(observer.persistence.active_body_order_for(None), None);
-        assert_eq!(send(&mut observer, false), send(&mut reference, false));
-        assert_eq!(observer.teacher, reference.teacher);
-    }
-}
-
-fn expert_sample_and_reference(
-    observer: &mut ArenaSeatPolicy,
-    reference: &mut ArenaSeatPolicy,
-) -> crate::ImitationSample {
-    let (action, _, sample) = pretraining_teacher_action(
-        observer,
-        SeedNamespace::Training,
-        10_093_000,
-        0,
-        0,
-        &[[[0; ActionKind::COUNT]; PRETRAINING_WINDOWS]; 2],
-        &mut TeacherCoverage::new(),
-    )
-    .expect("production expert sample");
-    let expected = reference
-        .teacher
-        .decide(
-            &reference.tracker,
-            &reference.persistence,
-            &reference.readiness,
-        )
-        .expect("unchanged Teacher")
-        .0;
-    assert_eq!(action, expected);
-    assert_eq!(observer.teacher, reference.teacher);
-    assert_eq!(observer.persistence, reference.persistence);
-    sample.expect("retained row")
-}
-
-#[test]
 fn training_contract_current_policy_resends_after_fog_on_both_sides() {
     for side in 0..2 {
         let model = constant_model(ActionKind::AttackUnit);
@@ -322,164 +261,6 @@ fn training_contract_current_policy_resends_after_fog_on_both_sides() {
             .expect("real reattack");
         assert_eq!(repeated.order, first.order);
         assert_eq!(repeated.seq, first.seq + 1);
-    }
-}
-
-#[test]
-fn training_contract_league_current_accepted_history_and_restart_keep_candidate_role() {
-    let initial =
-        PolicySnapshot::capture(&constant_model(ActionKind::Continue), 0).expect("initial");
-    let current = PolicySnapshot::capture(&constant_model(ActionKind::Hold), 2).expect("current");
-    let historical =
-        PolicySnapshot::capture(&constant_model(ActionKind::Stop), 1).expect("history");
-    let mut league = League::new(32, initial).expect("league");
-    league
-        .insert_historical(historical, 0.0, CrossPlayProfile::default())
-        .expect("history");
-    for (bucket, generation) in [(0, 2), (30, 0), (55, 1)] {
-        let opponent = league.select_bucket(bucket, &current).expect("selection");
-        assert_eq!(
-            opponent
-                .snapshot()
-                .expect("current-contract weights")
-                .generation(),
-            generation
-        );
-        let mut environment = build_environment(
-            10_093_000,
-            1,
-            MapId(0),
-            0,
-            0,
-            opponent_spec(&opponent).expect("spec"),
-        )
-        .expect("environment");
-        assert!(environment.seats[1].order_bookkeeping.is_candidate());
-        assert!(!environment.seats[0].order_bookkeeping.is_neural());
-        restart_environment(&mut environment).expect("restart");
-        assert!(environment.seats[1].order_bookkeeping.is_candidate());
-        assert_eq!(environment.seats[1].sequence, 0);
-    }
-}
-
-#[test]
-fn training_contract_observer_fog_and_rejection_keep_teacher_transport_legacy() {
-    for side in 0..2 {
-        let initial = transcript(side);
-        let target = snapshot(&initial).players[1 - side].unit.expect("target");
-        let mut observer = setup_seat(side, &initial).expect("observer");
-        let mut reference = setup_seat(side, &initial).expect("legacy");
-        prepare_neural_observer_sample(&mut observer).expect("observer from start");
-        assert_eq!(send(&mut observer, false), send(&mut reference, false));
-        for seat in [&mut observer, &mut reference] {
-            send_selected(
-                seat,
-                StructuredAction::Stop {
-                    unit: ControlledUnit::Hero,
-                },
-            )
-            .expect("sent Stop");
-        }
-        let mut messages = packet(&initial, 2, |view| {
-            view.units.retain(|unit| unit.id != target)
-        });
-        for seat in [&mut observer, &mut reference] {
-            observe_messages(seat, &messages).expect("fog");
-        }
-        messages = packet(&initial, 3, |view| {
-            view.units.retain(|unit| unit.id != target)
-        });
-        messages.insert(
-            0,
-            ServerMsg::OrderRejected {
-                seq: 2,
-                reason: RejectReason::UnknownTarget,
-            },
-        );
-        for seat in [&mut observer, &mut reference] {
-            observe_messages(seat, &messages).expect("rejection");
-        }
-        let sample = expert_sample_and_reference(&mut observer, &mut reference);
-        assert_eq!(
-            sample.frame().global()[global_feature::ACTIVE_TARGET_POINT],
-            1.0
-        );
-        assert_eq!(
-            observer
-                .local
-                .active_order()
-                .expect("rollback fallback")
-                .started_tick,
-            2
-        );
-        for seat in [&mut observer, &mut reference] {
-            observe_messages(seat, &packet(&initial, 4, |_| {})).expect("return");
-        }
-        let (frame, space) = prepare_neural_observer_sample(&mut observer).expect("observer frame");
-        assert_eq!(frame.global()[global_feature::ACTIVE_TARGET_UNIT], 0.0);
-        let action = attack_action(&observer.tracker, &space);
-        let issued = space.decode(action).expect("attack");
-        assert_eq!(
-            issue_request(&mut observer, issued, &space, action.kind(), true)
-                .expect("legacy suppression"),
-            None
-        );
-        assert_eq!(observer.persistence, reference.persistence);
-        assert_eq!(observer.teacher, reference.teacher);
-        assert_eq!(observer.sequence, reference.sequence);
-        assert_eq!(observer.readiness, reference.readiness);
-    }
-}
-
-#[test]
-fn training_contract_observer_hero_death_and_respawn_cannot_restore_old_body_orders() {
-    for side in 0..2 {
-        let initial = transcript(side);
-        let hero = snapshot(&initial).players[side].unit.expect("hero");
-        let mut observer = setup_seat(side, &initial).expect("observer");
-        let mut reference = setup_seat(side, &initial).expect("legacy");
-        prepare_neural_observer_sample(&mut observer).expect("from start");
-        for cast in [false, true] {
-            assert_eq!(send(&mut observer, cast), send(&mut reference, cast));
-        }
-        let messages = packet(&initial, 2, |view| {
-            view.players[side].unit = None;
-            view.units.retain(|unit| unit.id != hero);
-        });
-        for seat in [&mut observer, &mut reference] {
-            observe_messages(seat, &messages).expect("hero death");
-        }
-        assert_eq!(observer.local.active_order(), None);
-        assert_eq!(observer.pending_active, None);
-        let mut messages = packet(&initial, 3, |view| {
-            let mut replacement = hero;
-            replacement.generation += 1;
-            view.players[side].unit = Some(replacement);
-            view.units
-                .iter_mut()
-                .find(|unit| unit.id == hero)
-                .expect("hero")
-                .id = replacement;
-        });
-        messages.insert(
-            0,
-            ServerMsg::OrderRejected {
-                seq: 1,
-                reason: RejectReason::UnknownTarget,
-            },
-        );
-        for seat in [&mut observer, &mut reference] {
-            observe_messages(seat, &messages).expect("respawn");
-        }
-        let sample = expert_sample_and_reference(&mut observer, &mut reference);
-        assert_eq!(
-            sample.frame().global()[global_feature::ACTIVE_ORDER_PRESENT],
-            0.0
-        );
-        assert_eq!(observer.local.active_order(), None);
-        assert_eq!(observer.persistence, reference.persistence);
-        assert_eq!(observer.readiness, reference.readiness);
-        assert_eq!(observer.sequence, reference.sequence);
     }
 }
 
@@ -580,48 +361,6 @@ fn training_contract_observer_uses_same_tick_death_evidence_not_an_invented_poin
 }
 
 #[test]
-fn training_contract_rejected_own_cast_keeps_observer_attack_without_claiming_cast_success() {
-    let initial = transcript(0);
-    let mut observer = setup_seat(0, &initial).expect("observer");
-    let mut reference = setup_seat(0, &initial).expect("legacy");
-    prepare_neural_observer_sample(&mut observer).expect("from start");
-    for cast in [false, true] {
-        assert_eq!(send(&mut observer, cast), send(&mut reference, cast));
-    }
-    assert_eq!(
-        observer
-            .local
-            .active_order()
-            .expect("sent attack")
-            .started_tick,
-        1
-    );
-    let mut messages = packet(&initial, 2, |_| {});
-    messages.insert(
-        0,
-        ServerMsg::OrderRejected {
-            seq: 2,
-            reason: RejectReason::UnknownTarget,
-        },
-    );
-    for seat in [&mut observer, &mut reference] {
-        observe_messages(seat, &messages).expect("cast rejection");
-    }
-    let sample = expert_sample_and_reference(&mut observer, &mut reference);
-    assert_eq!(
-        sample.frame().global()[global_feature::ACTIVE_ORDER_PRESENT],
-        1.0
-    );
-    assert_eq!(
-        sample.frame().abilities()[0][crate::ability_feature::LAST_CAST_PRESENT],
-        0.0
-    );
-    assert_eq!(observer.rejections, 1);
-    assert_eq!(observer.sequence, 2);
-    assert_eq!(observer.readiness, reference.readiness);
-}
-
-#[test]
 fn training_contract_observer_collection_preserves_real_teacher_requests_and_complete_ticks() {
     let mut observed =
         build_environment(10_093_004, 1, MapId(0), 0, 0, OpponentSpec::Teacher).expect("observed");
@@ -676,8 +415,15 @@ fn labeled_teacher_requests(
     source: &mut ArenaSeatPolicy,
     target: &mut ArenaSeatPolicy,
 ) -> (Option<Request>, Option<Request>) {
-    let sample = expert_sample_and_reference(source, target);
-    let action = sample.teacher_action();
+    let (action, _) = source
+        .teacher
+        .decide(&source.tracker, &source.persistence, &source.readiness)
+        .expect("source teacher action");
+    let (reference_action, _) = target
+        .teacher
+        .decide(&target.tracker, &target.persistence, &target.readiness)
+        .expect("reference teacher action");
+    assert_eq!(action, reference_action);
     let request = send_selected(source, action);
     let reference = send_selected(target, action);
     assert_eq!(source.teacher, target.teacher);

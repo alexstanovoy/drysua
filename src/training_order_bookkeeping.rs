@@ -36,6 +36,7 @@ impl PolicyOrderBookkeeping {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn enable_observer(
         &mut self,
         legacy: &OrderPersistence,

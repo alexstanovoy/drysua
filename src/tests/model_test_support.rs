@@ -42,31 +42,6 @@ impl PolicyModel {
     }
 
     #[cfg(test)]
-    pub(crate) fn restore_snapshot_with_failure(
-        &self,
-        snapshot: &ModelAdamSnapshot,
-        adam: &mut AdamState,
-        expected: OptimizerBinding,
-    ) -> Result<OptimizerBinding, ModelError> {
-        self.restore_snapshot_inner(snapshot, adam, expected, Some(0))
-    }
-
-    #[cfg(test)]
-    pub(crate) fn behavioral_update_with_barrier(
-        &self,
-        examples: &[&ImitationSample],
-        adam: &mut AdamState,
-        entered: &std::sync::Barrier,
-        release: &std::sync::Barrier,
-    ) -> Result<ModelUpdateReport, ModelError> {
-        validate_behavioral_examples(examples)?;
-        let _guard = self.write_parameter_lock()?;
-        entered.wait();
-        release.wait();
-        self.behavioral_update_locked(examples, adam)
-    }
-
-    #[cfg(test)]
     pub(crate) fn ppo_update_with_microbatch_for_test(
         &self,
         examples: &[&PpoPreparedSample],
@@ -153,19 +128,6 @@ impl PolicyModel {
             .into_iter()
             .map(|gradient| (gradient.name, gradient.gradient.is_some()))
             .collect())
-    }
-
-    #[cfg(test)]
-    pub(crate) fn behavioral_loss_for_test(
-        &self,
-        examples: &[&ImitationSample],
-    ) -> Result<f64, ModelError> {
-        assert!(!examples.is_empty());
-        assert!(examples.len() <= MODEL_TRAINING_BATCH);
-        let _guard = self.read_parameter_lock()?;
-        let result = self.behavioral_microbatch_locked(examples)?;
-        assert!(result.gradients.iter().all(|value| value.is_finite()));
-        Ok(result.loss_sum / examples.len() as f64)
     }
 
     #[cfg(test)]

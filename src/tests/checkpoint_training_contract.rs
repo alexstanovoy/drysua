@@ -26,12 +26,6 @@ fn training_contract_map2_versions_change_both_actor_and_training_identities() {
     assert_eq!(crate::LEAGUE_RULES_AUDIT_VERSION, 32);
     assert!(crate::PPO_SCHEMA_DESCRIPTOR.contains("observer=explicit_from_trajectory_start"));
     assert!(crate::LEAGUE_SCHEMA_DESCRIPTOR.contains("frozen_weights_not_legacy_execution"));
-    assert_eq!(
-        crate::TrainingScope::new(MapId(0), 12)
-            .expect_err("old imitation scope")
-            .to_string(),
-        "imitation checkpoint has invalid rules audit version"
-    );
 }
 
 #[test]

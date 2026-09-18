@@ -1,8 +1,4 @@
-use std::{
-    io::{Read, Write},
-    path::Path,
-    time::Duration,
-};
+use std::{io::Write, path::Path, time::Duration};
 
 use bota_proto::{MatchInfo, RejectReason, ServerMsg, SlotId, Team, TickMode};
 
@@ -13,15 +9,12 @@ use crate::telemetry::{
 use crate::{
     ActionSpace, ActiveOrderUpdate, ActivePolicyOrder, FeatureEncoder, FeatureFrame, ItemReadiness,
     Link, LocalPolicyState, OrderPersistence, PolicyModel, SHADOW_FIEND, Seated, StateTracker,
-    StructuredAction, TACTICAL_FILE_BYTES, TacticalPolicy, Teacher, TrainingArtifact, Wire,
-    active_order_update_for_sent, record_sent_for_policy,
+    StructuredAction, Teacher, TrainingArtifact, Wire, active_order_update_for_sent,
+    record_sent_for_policy,
 };
 
 const MAX_MATCH_MESSAGES: usize = 16_777_216;
 const MAX_MESSAGES_WITHOUT_SNAPSHOT: usize = 4_096;
-
-/// Canonical deployment artifact for [`play_tactical`], distinct from Hybrid SafeTensors.
-pub const TACTICAL_FILE_NAME: &str = "drysua.tactical.bin";
 
 /// The result observed by drysua for one match.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -62,7 +55,6 @@ struct LivePolicy {
 enum LiveController<'model> {
     Hybrid(&'model PolicyModel),
     Neural(&'model PolicyModel),
-    Tactical(&'model TacticalPolicy),
     Teacher,
 }
 
@@ -71,60 +63,9 @@ impl LiveController<'_> {
         match self {
             Self::Hybrid(_) => "hybrid",
             Self::Neural(_) => "neural",
-            Self::Tactical(_) => "tactical",
             Self::Teacher => "teacher",
         }
     }
-}
-
-/// Loads bounded tactical weights before connecting, without constructing a tensor model.
-pub fn play_tactical(
-    address: &str,
-    name: &str,
-    limit: Option<u32>,
-    weights_directory: &Path,
-) -> std::io::Result<Outcome> {
-    let policy = load_tactical_policy(weights_directory)?;
-    let (mut link, seated) = Link::join(address, name)?;
-    play_tactical_on(&mut link, seated, limit, &policy)
-}
-
-/// Runs a checked tactical policy through the same live order/ACK state machine as Teacher.
-pub fn play_tactical_on(
-    wire: &mut impl Wire,
-    seated: Seated,
-    limit: Option<u32>,
-    policy: &TacticalPolicy,
-) -> std::io::Result<Outcome> {
-    play_controller_on(wire, seated, limit, LiveController::Tactical(policy))
-}
-
-fn load_tactical_policy(directory: &Path) -> std::io::Result<TacticalPolicy> {
-    let path = directory.join(TACTICAL_FILE_NAME);
-    let context = |error: std::io::Error| {
-        std::io::Error::new(
-            error.kind(),
-            format!("tactical weights {}: {error}", path.display()),
-        )
-    };
-    let metadata = std::fs::symlink_metadata(&path).map_err(context)?;
-    if !metadata.file_type().is_file() {
-        return Err(context(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "expected a regular non-symlink file",
-        )));
-    }
-    let mut bytes = Vec::with_capacity(TACTICAL_FILE_BYTES + 1);
-    std::fs::File::open(&path)
-        .map_err(context)?
-        .take((TACTICAL_FILE_BYTES + 1) as u64)
-        .read_to_end(&mut bytes)
-        .map_err(context)?;
-    assert!(bytes.len() <= TACTICAL_FILE_BYTES + 1);
-    let policy = TacticalPolicy::from_bytes(&bytes)
-        .map_err(|error| context(std::io::Error::new(std::io::ErrorKind::InvalidData, error)))?;
-    assert_eq!(bytes.len(), TACTICAL_FILE_BYTES);
-    Ok(policy)
 }
 
 /// Connects and runs the deterministic Teacher on any supported map without weights.
@@ -716,14 +657,6 @@ impl LivePolicy {
             LiveController::Neural(model) => {
                 assert!(self.teacher.is_none());
                 model
-            }
-            LiveController::Tactical(policy) => {
-                return self
-                    .teacher
-                    .as_mut()
-                    .expect("historical controller has Teacher")
-                    .decide_tactical(&self.tracker, &self.persistence, &self.readiness, policy)
-                    .map_err(std::io::Error::other);
             }
             LiveController::Hybrid(model)
                 if self.tracker.metadata().map != bota_proto::MapId(0) =>

@@ -18,13 +18,13 @@ use crate::model::{
 };
 use crate::{
     ActionKind, ActionSpace, ActionTarget, AdamConfig, ControlledUnit, FeatureFrame, HeadTarget,
-    ImitationSample, LocalPolicyState, MODEL_ABILITY_HEAD, MODEL_ENTITY_POINTER_HEAD,
-    MODEL_EVALUATION_MICROBATCH, MODEL_ITEM_HEAD, MODEL_KIND_HEAD, MODEL_LEARN_HEAD,
-    MODEL_LOOT_HEAD, MODEL_MAX_BATCH, MODEL_PARAMETER_COUNT, MODEL_POINT_POINTER_HEAD,
-    MODEL_SCHEMA_HASH, MODEL_SCHEMA_VERSION, MODEL_SHOP_HEAD, MODEL_SWAP_HEAD,
-    MODEL_TRAINING_BATCH, MODEL_UNIT_HEAD, ModelError, PolicyDevice, PolicyModel, PpoOutcome,
-    PpoPreparedSample, PpoRng, PutPointTarget, SampleIdentity, SeedNamespace, StructuredAction,
-    TrainingAbilitySlot, TrainingItemSlot, TrainingPrefix, TrainingSlot, unit_feature,
+    LocalPolicyState, MODEL_ABILITY_HEAD, MODEL_ENTITY_POINTER_HEAD, MODEL_EVALUATION_MICROBATCH,
+    MODEL_ITEM_HEAD, MODEL_KIND_HEAD, MODEL_LEARN_HEAD, MODEL_LOOT_HEAD, MODEL_MAX_BATCH,
+    MODEL_PARAMETER_COUNT, MODEL_POINT_POINTER_HEAD, MODEL_SCHEMA_HASH, MODEL_SCHEMA_VERSION,
+    MODEL_SHOP_HEAD, MODEL_SWAP_HEAD, MODEL_TRAINING_BATCH, MODEL_UNIT_HEAD, ModelError,
+    PolicyDevice, PolicyModel, PpoOutcome, PpoPreparedSample, PpoRng, PutPointTarget,
+    StructuredAction, TrainingAbilitySlot, TrainingItemSlot, TrainingPrefix, TrainingSlot,
+    unit_feature,
 };
 
 #[path = "model_input_adapter.rs"]
@@ -99,11 +99,6 @@ fn assert_fresh_policy_conditioning(device: PolicyDevice) {
     assert!(conditioned, "fresh policy heads must start near uniform");
 }
 
-#[test]
-fn full_model_overfits_fixed_batch_and_learns_unseen_observations() {
-    assert_fixed_batch_learning(PolicyDevice::Cpu);
-}
-
 fn assert_pointer_scale_and_gradient(device: &candle_core::Device) {
     for width in [64, 128] {
         let tokens = candle_core::Tensor::ones((1, 2, width), candle_core::DType::F32, device)
@@ -130,105 +125,6 @@ fn assert_pointer_scale_and_gradient(device: &candle_core::Device) {
             assert!((value - 2.0 / (width as f32).sqrt()).abs() < 1.0e-6);
         }
     }
-}
-
-#[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
-#[test]
-#[ignore = "requires a CUDA device"]
-fn cuda_full_model_overfits_fixed_batch_and_learns_unseen_observations() {
-    assert_fixed_batch_learning(PolicyDevice::Cuda { ordinal: 0 });
-}
-
-fn assert_fixed_batch_learning(device: PolicyDevice) {
-    let model = PolicyModel::fresh_on(503, device).expect("model");
-    let training = conditioning_learning_corpus(false);
-    let held_out = conditioning_learning_corpus(true);
-    let training = training.iter().collect::<Vec<_>>();
-    let held_out = held_out.iter().collect::<Vec<_>>();
-    let before = model
-        .behavioral_loss_for_test(&training)
-        .expect("initial loss");
-    let held_before = model
-        .behavioral_loss_for_test(&held_out)
-        .expect("held initial loss");
-    let mut adam = model
-        .claim_adam_for_test(AdamConfig {
-            learning_rate: 0.003,
-            ..AdamConfig::default()
-        })
-        .expect("Adam");
-    assert_ne!(
-        training[0].frame().global()[20],
-        training[1].frame().global()[20]
-    );
-    for _ in 0..192 {
-        let report = model.behavioral_update(&training, &mut adam).expect("step");
-        assert!(report.unclipped_norm.is_finite());
-        assert!(report.average_loss.is_finite());
-    }
-    let after = model
-        .behavioral_loss_for_test(&training)
-        .expect("final loss and gradients");
-    let held_after = model
-        .behavioral_loss_for_test(&held_out)
-        .expect("held final loss");
-    eprintln!(
-        "fixed_bc seed=503 steps=192 train={before}->{after} held={held_before}->{held_after}"
-    );
-    assert!(after < 0.05, "training loss {before} -> {after}");
-    assert!(held_after < 0.1, "held loss {held_before} -> {held_after}");
-    assert_actor_snapshot_sampling_parity(&model);
-    assert!(
-        model
-            .export_parameters()
-            .expect("weights")
-            .iter()
-            .all(|value| value.is_finite())
-    );
-    for (prediction, sample) in model
-        .behavioral_predictions(&held_out)
-        .expect("predictions")
-        .iter()
-        .zip(held_out)
-    {
-        assert_eq!(prediction.kind, sample.target().kind.selected);
-    }
-}
-
-fn conditioning_learning_corpus(held_out: bool) -> Vec<ImitationSample> {
-    [ActionKind::Cast, ActionKind::Swap]
-        .into_iter()
-        .enumerate()
-        .map(|(index, kind)| {
-            let tick = if held_out { 11 } else { 10 };
-            let mut view = world_view(Team::Radiant, tick);
-            let player = view
-                .players
-                .iter_mut()
-                .find(|player| player.slot == SlotId(0))
-                .expect("player");
-            player.gold = Some(if index == 0 {
-                100 + i32::from(held_out)
-            } else {
-                99_900 - i32::from(held_out)
-            });
-            let tracker = tracker_with_view(Team::Radiant, view);
-            let space = ActionSpace::from_tracker(&tracker).expect("space");
-            let frame = encode(&tracker, &LocalPolicyState::new(0));
-            let mut logits = DecoderLogits::favor(kind);
-            logits.target_mode[2] = 100.0;
-            let action = decode_with_logits(&space, &logits).expect("label");
-            assert_eq!(action.kind(), kind);
-            let namespace = if held_out {
-                SeedNamespace::Promotion
-            } else {
-                SeedNamespace::Training
-            };
-            let identity = SampleIdentity::from_frame(namespace, index as u64 + 1, 1, tick, &frame)
-                .expect("identity");
-            ImitationSample::teacher(frame, &space, action, identity).expect("sample")
-        })
-        .collect()
 }
 
 #[test]
@@ -777,236 +673,6 @@ fn unit_kind_tokens_enter_their_semantic_pool() {
 }
 
 #[test]
-fn behavioral_update_holds_one_exclusive_guard_against_parameter_import() {
-    let model = Arc::new(PolicyModel::fresh(501).expect("model"));
-    let sample = model_sample();
-    let entered = Arc::new(Barrier::new(2));
-    let release = Arc::new(Barrier::new(2));
-    let update_model = Arc::clone(&model);
-    let update_entered = Arc::clone(&entered);
-    let update_release = Arc::clone(&release);
-    let update = thread::spawn(move || {
-        let mut adam = update_model
-            .claim_adam_for_test(AdamConfig::default())
-            .expect("Adam");
-        update_model
-            .behavioral_update_with_barrier(&[&sample], &mut adam, &update_entered, &update_release)
-            .expect("update");
-        adam
-    });
-    entered.wait();
-    let replacement = vec![0.25; MODEL_PARAMETER_COUNT];
-    let import_model = Arc::clone(&model);
-    let (complete_tx, complete_rx) = mpsc::sync_channel(1);
-    let importer = thread::spawn(move || {
-        import_model
-            .import_parameters(&replacement)
-            .expect("import");
-        complete_tx.send(()).expect("complete");
-    });
-    assert!(!model.parameter_write_available_for_test());
-    assert!(complete_rx.try_recv().is_err());
-    release.wait();
-    update.join().expect("update thread");
-    complete_rx.recv().expect("serialized import");
-    importer.join().expect("import thread");
-    assert_eq!(
-        model.export_parameters().expect("parameters"),
-        vec![0.25; MODEL_PARAMETER_COUNT]
-    );
-}
-
-#[test]
-fn second_adam_and_stale_adam_after_raw_import_fail_without_mutation() {
-    let model = PolicyModel::fresh(506).expect("model");
-    let initial_identity = model.policy_identity().expect("initial identity");
-    let sample = model_sample();
-    let mut first = model
-        .claim_adam_for_test(AdamConfig::default())
-        .expect("first Adam");
-    let mut second = first.clone();
-    model
-        .behavioral_update(&[&sample], &mut first)
-        .expect("first update");
-    let identity_after_update = model.policy_identity().expect("identity after update");
-    assert_eq!(identity_after_update.lineage(), initial_identity.lineage());
-    assert_eq!(
-        identity_after_update.revision(),
-        initial_identity.revision() + 1
-    );
-    let before_second = model.export_parameters().expect("before second");
-    let identity_before_second = model.policy_identity().expect("before second identity");
-    let second_before = second.clone();
-    assert_eq!(
-        model
-            .behavioral_update(&[&sample], &mut second)
-            .unwrap_err()
-            .to_string(),
-        "model optimizer owner or parameter revision does not match"
-    );
-    assert_eq!(
-        model.export_parameters().expect("after second"),
-        before_second
-    );
-    assert_eq!(
-        model.policy_identity().expect("after second identity"),
-        identity_before_second
-    );
-    assert_eq!(second, second_before);
-
-    let mut invalid = before_second.clone();
-    invalid[0] = f32::NAN;
-    assert!(model.import_parameters(&invalid).is_err());
-    model
-        .behavioral_update(&[&sample], &mut first)
-        .expect("owner survives failed import");
-
-    let identity_before_import = model.policy_identity().expect("identity before import");
-    let current = model.export_parameters().expect("current parameters");
-    model
-        .import_parameters(&current)
-        .expect("raw parameter import");
-    assert_ne!(
-        model.policy_identity().expect("identity after import"),
-        identity_before_import
-    );
-    assert_eq!(
-        model.policy_identity().expect("import revision").revision(),
-        identity_before_import.revision() + 1
-    );
-    let before_stale = model.export_parameters().expect("before stale");
-    let identity_before_stale = model.policy_identity().expect("before stale identity");
-    let first_before = first.clone();
-    assert!(model.behavioral_update(&[&sample], &mut first).is_err());
-    assert_eq!(
-        model.export_parameters().expect("after stale"),
-        before_stale
-    );
-    assert_eq!(
-        model.policy_identity().expect("after stale identity"),
-        identity_before_stale
-    );
-    assert_eq!(first, first_before);
-}
-
-#[test]
-fn behavioral_update_rejects_nonfinite_in_inactive_illegal_head_atomically() {
-    let model = PolicyModel::fresh(502).expect("model");
-    let mut parameters = vec![0.0; MODEL_PARAMETER_COUNT];
-    set_named_parameter_range(&model, &mut parameters, "kind_embedding.weight", 0, 32, 1.0);
-    for input in 256..288 {
-        set_named_parameter_range(
-            &model,
-            &mut parameters,
-            "shop_head.weight",
-            input * 64,
-            64,
-            f32::MAX,
-        );
-    }
-    model
-        .import_parameters(&parameters)
-        .expect("finite parameters");
-    let before = model.export_parameters().expect("before");
-    let sample = model_sample();
-    assert_eq!(
-        model
-            .training_forward(
-                std::slice::from_ref(sample.frame()),
-                &[sample.target().prefix()],
-            )
-            .unwrap_err()
-            .to_string(),
-        "model shop output at batch 0 index 0 is non-finite"
-    );
-    let mut adam = model
-        .claim_adam_for_test(AdamConfig::default())
-        .expect("Adam");
-    let adam_before = adam.clone();
-    assert_eq!(
-        model
-            .behavioral_update(&[&sample], &mut adam)
-            .unwrap_err()
-            .to_string(),
-        "model shop output at batch 0 index 0 is non-finite"
-    );
-    assert_eq!(model.export_parameters().expect("after"), before);
-    assert_eq!(adam, adam_before);
-}
-
-#[test]
-fn behavioral_update_rejects_held_out_samples_before_mutation() {
-    let tracker = tracker_with_view(Team::Radiant, world_view(Team::Radiant, 10));
-    let space = ActionSpace::from_tracker(&tracker).expect("space");
-    let frame = encode(&tracker, &LocalPolicyState::new(0));
-    let identity =
-        SampleIdentity::from_frame(SeedNamespace::Promotion, 3, 1, 10, &frame).expect("identity");
-    let sample = ImitationSample::teacher(frame, &space, StructuredAction::Continue, identity)
-        .expect("held-out sample");
-    let model = PolicyModel::fresh(505).expect("model");
-    let before = model.export_parameters().expect("parameters");
-    let mut adam = model
-        .claim_adam_for_test(AdamConfig::default())
-        .expect("Adam");
-    let adam_before = adam.clone();
-    assert_eq!(
-        model
-            .behavioral_update(&[&sample], &mut adam)
-            .unwrap_err()
-            .to_string(),
-        "model behavioral training example 0 is not Train"
-    );
-    assert_eq!(model.export_parameters().expect("after"), before);
-    assert_eq!(adam, adam_before);
-}
-
-#[test]
-fn effective_batch_above_microbatch_boundary_matches_identical_single_example_update() {
-    let large_model = PolicyModel::fresh(503).expect("large model");
-    let single_model = PolicyModel::fresh(504).expect("single model");
-    let zero = vec![0.0; MODEL_PARAMETER_COUNT];
-    large_model.import_parameters(&zero).expect("large zero");
-    single_model.import_parameters(&zero).expect("single zero");
-    let sample = model_sample();
-    let examples = vec![&sample; MODEL_TRAINING_BATCH + 1];
-    let mut large_adam = large_model
-        .claim_adam_for_test(AdamConfig::default())
-        .expect("large Adam");
-    let mut single_adam = single_model
-        .claim_adam_for_test(AdamConfig::default())
-        .expect("single Adam");
-    let large = large_model
-        .behavioral_update(&examples, &mut large_adam)
-        .expect("large update");
-    let single = single_model
-        .behavioral_update(&[&sample], &mut single_adam)
-        .expect("single update");
-    assert!((large.average_loss - single.average_loss).abs() <= 1.0e-6);
-    let legal_kind_count = sample
-        .target()
-        .kind
-        .mask
-        .iter()
-        .filter(|allowed| **allowed)
-        .count();
-    assert!((large.average_loss - (legal_kind_count as f64).ln()).abs() <= 1.0e-6);
-    assert_eq!(large.active_head_counts[0], MODEL_TRAINING_BATCH + 1);
-    assert!(
-        large.active_head_counts[1..]
-            .iter()
-            .all(|count| *count == 0)
-    );
-    for (left, right) in large_model
-        .export_parameters()
-        .expect("large parameters")
-        .iter()
-        .zip(single_model.export_parameters().expect("single parameters"))
-    {
-        assert!((*left - right).abs() <= 1.0e-6);
-    }
-}
-
-#[test]
 fn masked_cross_entropy_is_invariant_to_representable_common_offsets() {
     let baseline = masked_cross_entropy_for_test(&[0.0, 1.0, 2.0], &[true, true, false], 1, true)
         .expect("baseline");
@@ -1325,41 +991,6 @@ fn initialization_is_seed_deterministic_for_parameters_and_outputs() {
 }
 
 #[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
-#[test]
-#[ignore = "requires a CUDA device"]
-fn cuda_model_runs_forward_backward_and_parameter_export_on_selected_device() {
-    let cpu = PolicyModel::fresh(17_002).expect("CPU model");
-    let gpu = PolicyModel::fresh_on(17_002, PolicyDevice::Cuda { ordinal: 0 }).expect("CUDA model");
-    let frame = populated_frame();
-
-    assert_eq!(gpu.device(), PolicyDevice::Cuda { ordinal: 0 });
-    assert_eq!(
-        cpu.export_parameters().expect("CPU parameters"),
-        gpu.export_parameters().expect("CUDA parameters")
-    );
-    assert_outputs_close(
-        &cpu.evaluate(&frame).expect("CPU output"),
-        &gpu.evaluate(&frame).expect("CUDA output"),
-        1.0e-4,
-    );
-
-    let sample = model_sample();
-    let mut adam = gpu
-        .claim_adam_for_test(AdamConfig::default())
-        .expect("CUDA Adam");
-    let report = gpu
-        .behavioral_update(&[&sample], &mut adam)
-        .expect("CUDA update");
-    assert_eq!(report.sample_count, 1);
-    assert_eq!(report.optimizer_step, 1);
-    assert!(
-        gpu.export_parameters()
-            .expect("updated CUDA parameters")
-            .iter()
-            .all(|value| value.is_finite())
-    );
-}
-
 #[test]
 fn single_and_batch_evaluation_are_equivalent_and_finite() {
     let model = PolicyModel::fresh(1).expect("model");
@@ -2268,15 +1899,6 @@ fn named_backward_rejects_output_from_another_model() {
 fn populated_frame() -> FeatureFrame {
     let tracker = tracker_with_view(Team::Radiant, world_view(Team::Radiant, 10));
     encode(&tracker, &LocalPolicyState::new(0))
-}
-
-fn model_sample() -> ImitationSample {
-    let tracker = tracker_with_view(Team::Radiant, world_view(Team::Radiant, 10));
-    let space = ActionSpace::from_tracker(&tracker).expect("space");
-    let frame = encode(&tracker, &LocalPolicyState::new(0));
-    let identity =
-        SampleIdentity::from_frame(SeedNamespace::Training, 1, 1, 10, &frame).expect("identity");
-    ImitationSample::teacher(frame, &space, StructuredAction::Continue, identity).expect("sample")
 }
 
 fn action_space_with_aims(ability_aim: Aim, item_aim: Aim) -> ActionSpace {

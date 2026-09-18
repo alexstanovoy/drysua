@@ -454,7 +454,6 @@ fn map2_collection_defaults_and_budget_match_the_native_cap() {
     let settings = crate::cli::training_settings_for_test(&[]).expect("Map2 defaults");
     assert_eq!(settings.map, MapId(2));
     assert_eq!(PpoSmokeConfig::default().map, MapId(2));
-    assert_eq!(LeagueSmokeConfig::default().map, MapId(2));
     assert_eq!(TICK_CAP, bota_server::game::MAP2_TICK_CAP);
     assert_eq!(ACTOR_DECISIONS, 9_300);
     assert_eq!(RETAINED_PER_EPISODE, 1_163);
@@ -479,10 +478,6 @@ fn map2_neutral_is_a_draw_for_candidate_opponent_and_evaluation() {
         assert_eq!(
             terminal_outcome(&environment, Some(Team::Neutral)),
             Some(PpoTerminalOutcome::Draw)
-        );
-        assert_eq!(
-            evaluation_result(&environment, Some(Team::Neutral)).expect("draw"),
-            LeagueMatchResult::Draw
         );
         assert_eq!(
             checkpoint_evaluation_outcome(

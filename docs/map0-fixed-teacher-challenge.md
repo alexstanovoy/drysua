@@ -4,6 +4,11 @@
 > tracked tree in the repo-slim audit; exact contents are at
 > `artifacts/temp/repo-slim-20260917/archive/scripts-historical.tar.gz` (workspace
 > root) and in git history at `41bc295`. This page is retained as epoch history.
+> The `artifacts/temp/map0-baseline-observationfix*` copies were released (deleted)
+> in the same audit on 2026-09-18; the manifest hashes below remain the historical
+> identity, and the derivative must be rebuilt from the archived observation patch
+> before the challenge can be rerun. `scripts/test_play_match.py` skips when the
+> pinned baseline is absent and never falls back to the root server.
 
 This is **not** the historical Map1 release gate and does not promote a deployment
 default. No candidate is qualified by preparing this harness.

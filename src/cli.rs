@@ -25,12 +25,8 @@ enum Operation {
     RewardObserver(RewardObserverArgs),
     /// Evaluate greedy Neural on Map2 across baselines and sides, without Teacher overrides.
     Evaluate(EvaluateArgs),
-    /// Run bounded stage-ten self-play league training and paired evaluation.
-    League(LeagueArgs),
     /// Connect to a server and play one match.
     Play(PlayArgs),
-    /// Clone bounded Map2 teacher trajectories and gate the pure Neural policy.
-    Pretrain(PretrainArgs),
     /// Run a bounded stage-nine PPO actor-to-learner smoke training.
     Train(TrainArgs),
     /// Run resumable PPO training with periodic strict checkpoints.
@@ -45,26 +41,6 @@ struct RewardObserverArgs {
     /// Complete ticks between diagnostic intervals.
     #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u32).range(30..=27_900))]
     interval_ticks: u32,
-}
-
-/// Options for Map2 teacher pretraining with a fixed Map2 deployment gate.
-#[derive(Args)]
-struct PretrainArgs {
-    /// Existing empty output directory.
-    #[arg(long)]
-    output_directory: std::path::PathBuf,
-    /// Complete behavioral passes: 8, 16, 24, or 32.
-    #[arg(long, default_value_t = 8)]
-    epochs: u32,
-    /// Deterministic dataset and optimizer seed.
-    #[arg(long, default_value_t = 50_001)]
-    seed: u64,
-    /// Tensor backend used by behavioral optimization.
-    #[arg(long, value_enum, default_value_t = LearnerDevice::Cpu)]
-    device: LearnerDevice,
-    /// CUDA or Metal device ordinal.
-    #[arg(long, default_value_t = 0)]
-    device_ordinal: usize,
 }
 
 /// Options for a fixed deterministic pure Neural Map2 evaluation matrix.
@@ -91,7 +67,7 @@ struct EvaluateArgs {
 /// Options for one server match.
 #[derive(Args)]
 struct PlayArgs {
-    /// Override the repository-selected default with Neural, Hybrid, Tactical, or Teacher.
+    /// Override the repository-selected default with Neural, Hybrid, or Teacher.
     #[arg(long, value_enum)]
     policy: Option<PlayPolicy>,
     /// Server socket address.
@@ -104,7 +80,7 @@ struct PlayArgs {
     #[arg(long, value_name = "TICKS")]
     limit: Option<u32>,
     /// Explicit experiment weights; without --policy this selects Hybrid. Defaults need no path.
-    #[arg(long, required_if_eq_any([("policy", "tactical"), ("policy", "neural")]))]
+    #[arg(long, required_if_eq("policy", "neural"))]
     weights_directory: Option<std::path::PathBuf>,
 }
 
@@ -112,7 +88,6 @@ struct PlayArgs {
 pub(crate) enum PlayPolicy {
     Hybrid,
     Neural,
-    Tactical,
     Teacher,
 }
 
@@ -232,44 +207,6 @@ struct TrainFullArgs {
     device_ordinal: usize,
 }
 
-/// Options for a short builtin self-play league verification run.
-#[derive(Args)]
-struct LeagueArgs {
-    /// PPO updates, bounded to ten for this smoke command.
-    #[arg(long, default_value_t = 1)]
-    updates: u32,
-    /// Independent CPU arenas, bounded to sixteen for desktop headroom.
-    #[arg(long, default_value_t = 4)]
-    environments: usize,
-    /// Decisions collected from each arena per update.
-    #[arg(long, default_value_t = 8)]
-    rollout: usize,
-    /// PPO passes over one rollout.
-    #[arg(long, default_value_t = 1)]
-    epochs: usize,
-    /// Effective Adam minibatch.
-    #[arg(long, default_value_t = 32)]
-    minibatch: usize,
-    /// Held-out seeds evaluated once from each side.
-    #[arg(long, default_value_t = 2)]
-    evaluation_pairs: usize,
-    /// Decisions made in each held-out match, bounded to 1024.
-    #[arg(long, default_value_t = 8)]
-    evaluation_decisions: usize,
-    /// Deterministic training seed.
-    #[arg(long, default_value_t = 10_001)]
-    seed: u64,
-    /// Simulator map id, restricted to Map2 (mid-only Dota).
-    #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u16).range(2..=2))]
-    map: u16,
-    /// Learner tensor backend; actors and simulation remain on CPU.
-    #[arg(long, value_enum, default_value_t = LearnerDevice::Cpu)]
-    device: LearnerDevice,
-    /// CUDA or Metal device ordinal.
-    #[arg(long, default_value_t = 0)]
-    device_ordinal: usize,
-}
-
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum LearnerDevice {
     Cpu,
@@ -288,9 +225,7 @@ fn run(arguments: Cli) -> std::io::Result<()> {
             return crate::reward_observer::run(&observer.output, observer.interval_ticks);
         }
         Some(Operation::Evaluate(evaluate)) => return run_evaluate(evaluate),
-        Some(Operation::League(league)) => return run_league(league),
         Some(Operation::Play(play)) => play,
-        Some(Operation::Pretrain(pretrain)) => return run_pretrain(pretrain),
         Some(Operation::Train(train)) => return run_train(train),
         Some(Operation::TrainFull(train)) => return run_train_full(train),
         None => arguments.play,
@@ -316,15 +251,6 @@ fn run(arguments: Cli) -> std::io::Result<()> {
                 )
             })?;
             crate::seat::play_neural(&play.addr, &play.name, play.limit, directory)?
-        }
-        PlayPolicy::Tactical => {
-            let directory = weights_directory.as_deref().ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "tactical requires --weights-directory",
-                )
-            })?;
-            crate::seat::play_tactical(&play.addr, &play.name, play.limit, directory)?
         }
         PlayPolicy::Teacher => crate::play_teacher(&play.addr, &play.name, play.limit)?,
     };
@@ -356,39 +282,6 @@ fn resolve_play_deployment(
         return Ok((PlayPolicy::Hybrid, play.weights_directory.clone()));
     }
     crate::default_deployment::DEFAULT_DEPLOYMENT.resolve()
-}
-
-#[cfg(feature = "builtin")]
-fn run_pretrain(arguments: PretrainArgs) -> std::io::Result<()> {
-    let device = arguments.device.policy_device(arguments.device_ordinal)?;
-    validate_checkpoint_directory(&arguments.output_directory, false)?;
-    let report = crate::run_behavioral_pretraining_on(
-        crate::BehavioralPretrainingConfig {
-            epochs: arguments.epochs,
-            seed: arguments.seed,
-        },
-        device,
-        &arguments.output_directory,
-    )
-    .map_err(std::io::Error::other)?;
-    println!(
-        "pretraining: map=2 policy=Neural samples={} validation={} held_out={} optimizer_steps={} loss={:.6} kind_agreement={:.6} full_agreement={:.6} gameplay_validation_games={} gameplay_validation_wins={} gameplay_validation_draws={} gameplay_validation_timeouts={} gameplay_validation_failures={} fingerprint={:016x} actions={:?}",
-        report.training_samples,
-        report.validation_samples,
-        report.held_out_samples,
-        report.optimizer_steps,
-        report.final_loss,
-        report.held_out_kind_agreement,
-        report.held_out_full_agreement,
-        report.gameplay_validation_games,
-        report.gameplay_validation_wins,
-        report.gameplay_validation_draws,
-        report.gameplay_validation_timeouts,
-        report.gameplay_validation_failures,
-        report.fingerprint,
-        report.action_counts,
-    );
-    Ok(())
 }
 
 #[cfg(feature = "builtin")]
@@ -474,59 +367,10 @@ fn print_evaluation_game(game: &crate::CheckpointEvaluationGame) {
     );
 }
 
-#[cfg(feature = "builtin")]
-fn run_league(arguments: LeagueArgs) -> std::io::Result<()> {
-    let device = arguments.device.policy_device(arguments.device_ordinal)?;
-    let report = crate::run_league_smoke_on(
-        crate::LeagueSmokeConfig {
-            updates: arguments.updates,
-            environments: arguments.environments,
-            rollout_decisions: arguments.rollout,
-            epochs: arguments.epochs,
-            minibatch: arguments.minibatch,
-            evaluation_pairs: arguments.evaluation_pairs,
-            evaluation_decisions: arguments.evaluation_decisions,
-            seed: arguments.seed,
-            map: bota_proto::MapId(arguments.map),
-        },
-        device,
-    )
-    .map_err(std::io::Error::other)?;
-    println!(
-        "league smoke: {} updates, {} transitions, opponents {:?}, {} paired seeds, {} policies, {} promotions, {} rejected evaluation actions",
-        report.ppo.updates,
-        report.ppo.transitions,
-        report.opponent_counts,
-        report.paired_evaluations,
-        report.league_policies,
-        report.promotions,
-        report.evaluation_rejections,
-    );
-    report
-        .ppo
-        .map2_reward
-        .log("league_smoke", u64::from(report.ppo.updates));
-    Ok(())
-}
-
-#[cfg(not(feature = "builtin"))]
-fn run_league(_: LeagueArgs) -> std::io::Result<()> {
-    Err(std::io::Error::other(
-        "self-play league requires cargo feature `builtin`",
-    ))
-}
-
 #[cfg(not(feature = "builtin"))]
 fn run_evaluate(_: EvaluateArgs) -> std::io::Result<()> {
     Err(std::io::Error::other(
         "checkpoint evaluation requires cargo feature `builtin`",
-    ))
-}
-
-#[cfg(not(feature = "builtin"))]
-fn run_pretrain(_: PretrainArgs) -> std::io::Result<()> {
-    Err(std::io::Error::other(
-        "teacher pretraining requires cargo feature `builtin`",
     ))
 }
 

@@ -21,15 +21,15 @@ pub(crate) use test_support::*;
 
 use crate::{
     ABILITY_FEATURE_TOKENS, ABILITY_FEATURES, ActionKind, ActionSpace, ActionTarget,
-    BehavioralPrediction, BehavioralTarget, ControlledUnit, EntityIndex, FEATURE_SCHEMA_HASH,
-    FEATURE_SCHEMA_VERSION, FeatureFrame, GLOBAL_FEATURES, HISTORY_FEATURES, HISTORY_SAMPLES,
-    HeadTarget, ITEM_FEATURE_TOKENS, ITEM_FEATURES, ImitationSample, ImitationSplit,
-    LOOT_FEATURE_TOKENS, LOOT_FEATURES, LootIndex, MAP_FEATURES, MAX_POLICY_HISTORY,
-    OWN_UNIT_FEATURE_TOKENS, POINT_FEATURE_TOKENS, POINT_FEATURES, POLICY_HISTORY_FEATURES,
-    PROJECTILE_FEATURE_TOKENS, PROJECTILE_FEATURES, PointIndex, PpoConfig, PpoMinibatchReport,
-    PpoPolicyChoice, PpoPreparedSample, PpoRng, PutPointTarget, REMEMBERED_UNIT_FEATURE_TOKENS,
-    ShopIndex, StructuredAction, UNIT_FEATURE_TOKENS, UNIT_FEATURES, ability_feature, item_feature,
-    loot_feature, point_feature, projectile_feature, unit_feature,
+    BehavioralTarget, ControlledUnit, EntityIndex, FEATURE_SCHEMA_HASH, FEATURE_SCHEMA_VERSION,
+    FeatureFrame, GLOBAL_FEATURES, HISTORY_FEATURES, HISTORY_SAMPLES, HeadTarget,
+    ITEM_FEATURE_TOKENS, ITEM_FEATURES, LOOT_FEATURE_TOKENS, LOOT_FEATURES, LootIndex,
+    MAP_FEATURES, MAX_POLICY_HISTORY, OWN_UNIT_FEATURE_TOKENS, POINT_FEATURE_TOKENS,
+    POINT_FEATURES, POLICY_HISTORY_FEATURES, PROJECTILE_FEATURE_TOKENS, PROJECTILE_FEATURES,
+    PointIndex, PpoConfig, PpoMinibatchReport, PpoPolicyChoice, PpoPreparedSample, PpoRng,
+    PutPointTarget, REMEMBERED_UNIT_FEATURE_TOKENS, ShopIndex, StructuredAction,
+    UNIT_FEATURE_TOKENS, UNIT_FEATURES, ability_feature, item_feature, loot_feature, point_feature,
+    projectile_feature, unit_feature,
 };
 
 /// Version of the fixed policy-model layout and linked candidate execution contract.
@@ -1639,7 +1639,6 @@ impl PolicyModel {
         )
     }
 
-    /// Evaluates one exact legal action path without sampling or mutation.
     pub fn action_statistics(
         &self,
         frame: &FeatureFrame,
@@ -1895,57 +1894,6 @@ impl PolicyModel {
             .collect())
     }
 
-    pub(crate) fn behavioral_update(
-        &self,
-        examples: &[&ImitationSample],
-        adam: &mut AdamState,
-    ) -> Result<ModelUpdateReport, ModelError> {
-        validate_behavioral_examples(examples)?;
-        let _guard = self.write_parameter_lock()?;
-        self.behavioral_update_locked(examples, adam)
-    }
-
-    fn behavioral_update_locked(
-        &self,
-        examples: &[&ImitationSample],
-        adam: &mut AdamState,
-    ) -> Result<ModelUpdateReport, ModelError> {
-        self.validate_optimizer_binding_locked(adam.binding)?;
-        validate_adam_parts(
-            adam.config,
-            &adam.first_moment,
-            &adam.second_moment,
-            adam.step,
-            MODEL_PARAMETER_COUNT,
-        )?;
-        let mut gradients = vec![0.0f32; MODEL_PARAMETER_COUNT];
-        let mut loss_sum = 0.0f64;
-        let mut active_head_counts = [0usize; MODEL_BEHAVIORAL_HEADS];
-        for microbatch in examples.chunks(MODEL_TRAINING_BATCH) {
-            let result = self.behavioral_microbatch_locked(microbatch)?;
-            loss_sum += result.loss_sum;
-            accumulate_gradients(&mut gradients, &result.gradients)?;
-            accumulate_head_counts(&mut active_head_counts, result.active_head_counts)?;
-        }
-        let divisor = examples.len() as f32;
-        for gradient in &mut gradients {
-            *gradient /= divisor;
-        }
-        let average_loss = loss_sum / examples.len() as f64;
-        if !average_loss.is_finite() {
-            return Err(ModelError::NonFiniteLoss);
-        }
-        let diagnostics = self.apply_adam_locked(adam, &gradients)?;
-        Ok(ModelUpdateReport {
-            average_loss,
-            active_head_counts,
-            unclipped_norm: diagnostics.unclipped_norm,
-            applied_scale: diagnostics.applied_scale,
-            sample_count: examples.len(),
-            optimizer_step: adam.step,
-        })
-    }
-
     pub(crate) fn ppo_update(
         &self,
         examples: &[&PpoPreparedSample],
@@ -2114,35 +2062,6 @@ impl PolicyModel {
         })
     }
 
-    fn behavioral_microbatch_locked(
-        &self,
-        examples: &[&ImitationSample],
-    ) -> Result<BehavioralMicrobatch, ModelError> {
-        let frames = examples
-            .iter()
-            .map(|sample| sample.frame().clone())
-            .collect::<Vec<_>>();
-        let prefixes = examples
-            .iter()
-            .map(|sample| sample.target().prefix())
-            .collect::<Vec<_>>();
-        validate_training_batch(&frames, &prefixes)?;
-        let output = self.training_forward_locked(&frames, &prefixes)?;
-        validate_training_tensors_finite(&output)?;
-        let (loss, active_head_counts) = behavioral_loss(&output, examples)?;
-        let loss_sum = loss.to_scalar::<f32>()?;
-        if !loss_sum.is_finite() {
-            return Err(ModelError::NonFiniteLoss);
-        }
-        let named = self.backward_named_locked(&loss)?;
-        let gradients = collect_host_gradients(named)?;
-        Ok(BehavioralMicrobatch {
-            loss_sum: f64::from(loss_sum),
-            gradients,
-            active_head_counts,
-        })
-    }
-
     fn apply_adam_locked(
         &self,
         adam: &mut AdamState,
@@ -2169,58 +2088,6 @@ impl PolicyModel {
             unclipped_norm: replacement.unclipped_norm,
             applied_scale: replacement.applied_scale,
         })
-    }
-
-    /// Returns greedy legal labels from real teacher-forced conditional tensors.
-    pub fn behavioral_predictions(
-        &self,
-        examples: &[&ImitationSample],
-    ) -> Result<Vec<BehavioralPrediction>, ModelError> {
-        self.behavioral_predictions_with_identity(examples)
-            .map(|(predictions, _)| predictions)
-    }
-
-    pub(crate) fn behavioral_predictions_with_identity(
-        &self,
-        examples: &[&ImitationSample],
-    ) -> Result<(Vec<BehavioralPrediction>, PolicyIdentity), ModelError> {
-        if examples.is_empty() || examples.len() > MODEL_MAX_BATCH {
-            return Err(ModelError::BehavioralExampleCount {
-                count: examples.len(),
-                maximum: MODEL_MAX_BATCH,
-            });
-        }
-        validate_behavioral_targets(examples)?;
-        let _guard = self.read_parameter_lock()?;
-        let identity = self.policy_identity_locked();
-        let mut predictions = Vec::with_capacity(examples.len());
-        for microbatch in examples.chunks(MODEL_TRAINING_BATCH) {
-            predictions.extend(self.behavioral_prediction_microbatch_locked(microbatch)?);
-        }
-        Ok((predictions, identity))
-    }
-
-    fn behavioral_prediction_microbatch_locked(
-        &self,
-        examples: &[&ImitationSample],
-    ) -> Result<Vec<BehavioralPrediction>, ModelError> {
-        let frames = examples
-            .iter()
-            .map(|sample| sample.frame().clone())
-            .collect::<Vec<_>>();
-        let prefixes = examples
-            .iter()
-            .map(|sample| sample.target().prefix())
-            .collect::<Vec<_>>();
-        validate_training_batch(&frames, &prefixes)?;
-        let output = self.training_forward_locked(&frames, &prefixes)?;
-        validate_training_tensors_finite(&output)?;
-        let logits = BehavioralHostLogits::from_tensors(&output)?;
-        examples
-            .iter()
-            .enumerate()
-            .map(|(index, sample)| logits.predict(index, sample.target()))
-            .collect()
     }
 
     fn sampling_base_logits(&self, state: &ForwardState) -> Result<SamplingBaseLogits, ModelError> {
@@ -2708,12 +2575,6 @@ impl PolicyModel {
     }
 }
 
-struct BehavioralMicrobatch {
-    loss_sum: f64,
-    gradients: Vec<f32>,
-    active_head_counts: [usize; MODEL_BEHAVIORAL_HEADS],
-}
-
 struct PpoMicrobatch {
     gradients: Vec<f32>,
     report: PpoMinibatchReport,
@@ -2778,37 +2639,6 @@ impl BehavioralHostLogits {
             put_mode: output.put_mode.to_vec2()?,
             entity_pointer: output.entity_pointer.to_vec2()?,
             point_pointer: output.point_pointer.to_vec2()?,
-        })
-    }
-
-    fn predict(
-        &self,
-        index: usize,
-        target: &BehavioralTarget,
-    ) -> Result<BehavioralPrediction, ModelError> {
-        Ok(BehavioralPrediction {
-            kind: select_active_head(self.row(&self.kind, index)?, &target.kind)?
-                .ok_or(ModelError::InvalidModelState("inactive kind target"))?,
-            controlled: select_active_head(self.row(&self.controlled, index)?, &target.controlled)?,
-            ability: select_active_head(self.row(&self.ability, index)?, &target.ability)?,
-            item: select_active_head(self.row(&self.item, index)?, &target.item)?,
-            swap: select_active_head(self.row(&self.swap, index)?, &target.swap)?,
-            learn: select_active_head(self.row(&self.learn, index)?, &target.learn)?,
-            shop: select_active_head(self.row(&self.shop, index)?, &target.shop)?,
-            loot: select_active_head(self.row(&self.loot, index)?, &target.loot)?,
-            target_mode: select_active_head(
-                self.row(&self.target_mode, index)?,
-                &target.target_mode,
-            )?,
-            put_mode: select_active_head(self.row(&self.put_mode, index)?, &target.put_mode)?,
-            entity_pointer: select_active_head(
-                self.row(&self.entity_pointer, index)?,
-                &target.entity_pointer,
-            )?,
-            point_pointer: select_active_head(
-                self.row(&self.point_pointer, index)?,
-                &target.point_pointer,
-            )?,
         })
     }
 
@@ -2887,75 +2717,6 @@ fn host_head_statistics<const WIDTH: usize>(
         })
         .sum();
     Ok((log_probability, entropy))
-}
-
-fn select_active_head<const WIDTH: usize>(
-    logits: &[f32],
-    target: &HeadTarget<WIDTH>,
-) -> Result<Option<usize>, ModelError> {
-    if !target.active {
-        return Ok(None);
-    }
-    Ok(Some(masked_argmax(logits, &target.mask)?))
-}
-
-fn validate_behavioral_examples(examples: &[&ImitationSample]) -> Result<(), ModelError> {
-    if examples.is_empty() || examples.len() > MODEL_MAX_BATCH {
-        return Err(ModelError::BehavioralExampleCount {
-            count: examples.len(),
-            maximum: MODEL_MAX_BATCH,
-        });
-    }
-    if let Some((index, _)) = examples
-        .iter()
-        .enumerate()
-        .find(|(_, sample)| sample.split() != ImitationSplit::Train)
-    {
-        return Err(ModelError::NonTrainingExample { index });
-    }
-    validate_behavioral_targets(examples)
-}
-
-fn validate_behavioral_targets(examples: &[&ImitationSample]) -> Result<(), ModelError> {
-    for (index, sample) in examples.iter().enumerate() {
-        if !sample.frame().is_finite() {
-            return Err(ModelError::NonFiniteFrame { index });
-        }
-        sample
-            .target()
-            .validate()
-            .map_err(|error| ModelError::Backend(error.to_string()))?;
-    }
-    Ok(())
-}
-
-fn behavioral_loss(
-    output: &PolicyTensorTensors,
-    examples: &[&ImitationSample],
-) -> Result<(Tensor, [usize; MODEL_BEHAVIORAL_HEADS]), ModelError> {
-    macro_rules! add_head {
-        ($loss:ident, $tensor:expr, $name:literal, $field:ident) => {
-            $loss = ($loss + masked_head_loss($tensor, examples, $name, |target| &target.$field)?)?;
-        };
-    }
-    let mut loss = masked_head_loss(&output.kind, examples, "kind", |target| &target.kind)?;
-    add_head!(loss, &output.controlled, "controlled", controlled);
-    add_head!(loss, &output.ability, "ability", ability);
-    add_head!(loss, &output.item, "item", item);
-    add_head!(loss, &output.swap, "swap", swap);
-    add_head!(loss, &output.learn, "learn", learn);
-    add_head!(loss, &output.shop, "shop", shop);
-    add_head!(loss, &output.loot, "loot", loot);
-    add_head!(loss, &output.target_mode, "target mode", target_mode);
-    add_head!(loss, &output.put_mode, "put mode", put_mode);
-    add_head!(
-        loss,
-        &output.entity_pointer,
-        "entity pointer",
-        entity_pointer
-    );
-    add_head!(loss, &output.point_pointer, "point pointer", point_pointer);
-    Ok((loss.sum_all()?, behavioral_head_counts(examples)))
 }
 
 fn ppo_loss(
@@ -3198,25 +2959,6 @@ fn masked_ppo_head_entropy_tensors<const WIDTH: usize>(
     })
 }
 
-fn masked_head_loss<const WIDTH: usize>(
-    logits: &Tensor,
-    examples: &[&ImitationSample],
-    name: &'static str,
-    target: fn(&BehavioralTarget) -> &HeadTarget<WIDTH>,
-) -> Result<Tensor, ModelError> {
-    if logits.dims() != [examples.len(), WIDTH] {
-        return Err(ModelError::InvalidModelState("behavioral head shape"));
-    }
-    let mut masks = Vec::with_capacity(examples.len() * WIDTH);
-    let mut labels = Vec::with_capacity(examples.len());
-    let mut active = Vec::with_capacity(examples.len());
-    for sample in examples {
-        let head = target(sample.target());
-        append_tensor_target(head, name, &mut masks, &mut labels, &mut active)?;
-    }
-    masked_loss_from_parts(logits, examples.len(), WIDTH, masks, labels, active)
-}
-
 fn append_tensor_target<const WIDTH: usize>(
     target: &HeadTarget<WIDTH>,
     name: &'static str,
@@ -3241,31 +2983,6 @@ fn append_tensor_target<const WIDTH: usize>(
         active.push(0.0);
     }
     Ok(())
-}
-
-fn behavioral_head_counts(examples: &[&ImitationSample]) -> [usize; MODEL_BEHAVIORAL_HEADS] {
-    let mut output = [0usize; MODEL_BEHAVIORAL_HEADS];
-    for sample in examples {
-        let target = sample.target();
-        let active = [
-            target.kind.active,
-            target.controlled.active,
-            target.ability.active,
-            target.item.active,
-            target.swap.active,
-            target.learn.active,
-            target.shop.active,
-            target.loot.active,
-            target.target_mode.active,
-            target.put_mode.active,
-            target.entity_pointer.active,
-            target.point_pointer.active,
-        ];
-        for (count, active) in output.iter_mut().zip(active) {
-            *count += usize::from(active);
-        }
-    }
-    output
 }
 
 fn collect_host_gradients(named: Vec<NamedPolicyGradient>) -> Result<Vec<f32>, ModelError> {
@@ -3358,20 +3075,6 @@ fn average_ppo_report(
         if !value.is_finite() {
             return Err(ModelError::InvalidModelState("PPO report finite"));
         }
-    }
-    Ok(())
-}
-
-fn accumulate_head_counts(
-    total: &mut [usize; MODEL_BEHAVIORAL_HEADS],
-    addition: [usize; MODEL_BEHAVIORAL_HEADS],
-) -> Result<(), ModelError> {
-    for (total, addition) in total.iter_mut().zip(addition) {
-        *total = total
-            .checked_add(addition)
-            .ok_or(ModelError::InvalidModelState(
-                "behavioral active-head count",
-            ))?;
     }
     Ok(())
 }

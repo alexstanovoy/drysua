@@ -8,7 +8,7 @@ use crate::teacher_economy::{self, EconomyObservation, attack_damage_against, ho
 use crate::{
     ActionError, ActionSpace, ActionTarget, ControlledUnit, EntityIndex, EntityRelation,
     IssuedOrder, ItemReadiness, OrderPersistence, PointIndex, PointSource, StateTracker,
-    StructuredAction, TOWN_PORTAL_SCROLL, TacticalFeatures, TacticalPolicy,
+    StructuredAction, TOWN_PORTAL_SCROLL,
 };
 
 const SHADOWRAZES: [(AbilityId, i32); 3] = [
@@ -42,7 +42,6 @@ const FOUNTAIN_RECOVERY_RADIUS: i32 = 1_200;
 const FOUNTAIN_RECOVERY_PERCENT: i32 = 95;
 const RETREAT_HEALTH_PERCENT: i32 = 40;
 const BACKOFF_DISTANCE: i32 = 200;
-const BACKOFF_THREAT_RANGE: i32 = 800;
 const COMBAT_PLAN_TICKS: u32 = 90;
 const AIM_PLAN_TICKS: u32 = 18;
 const NAVIGATION_STALL_TICKS: u32 = 18;
@@ -63,7 +62,6 @@ const _: () = assert!(FINISH_LIMIT_TICKS < 300);
 enum CombatPurpose {
     Retreat,
     Finish { target: EntityId, until: u32 },
-    Backoff(EntityId),
     Aim(EntityId),
     AggroClick { anchor: Vec2 },
     AggroPull,
@@ -168,31 +166,9 @@ impl Teacher {
         persistence: &OrderPersistence,
         readiness: &ItemReadiness,
     ) -> Result<(StructuredAction, ActionSpace), ActionError> {
-        self.decide_with_policy(tracker, persistence, readiness, None)
-    }
-
-    /// Applies a trained, seat-visible tactical residual without replacing economy or safety.
-    /// Call `note_sent` / `note_rejected` and maintain persistence exactly as for `decide`.
-    pub fn decide_tactical(
-        &mut self,
-        tracker: &StateTracker,
-        persistence: &OrderPersistence,
-        readiness: &ItemReadiness,
-        policy: &TacticalPolicy,
-    ) -> Result<(StructuredAction, ActionSpace), ActionError> {
-        self.decide_with_policy(tracker, persistence, readiness, Some(policy))
-    }
-
-    fn decide_with_policy(
-        &mut self,
-        tracker: &StateTracker,
-        persistence: &OrderPersistence,
-        readiness: &ItemReadiness,
-        policy: Option<&TacticalPolicy>,
-    ) -> Result<(StructuredAction, ActionSpace), ActionError> {
         let space = ActionSpace::from_tracker_with_readiness(tracker, readiness)?;
         self.prepare_decision(tracker);
-        let choice = self.priority_action(tracker, persistence, &space, policy);
+        let choice = self.priority_action(tracker, persistence, &space);
         let selected = self.stage_choice(tracker, &space, choice)?;
         let decoded = space.decode(selected)?;
         let action = if decoded.is_some() && persistence.should_send(decoded).is_none() {
@@ -364,7 +340,6 @@ impl Teacher {
         tracker: &StateTracker,
         persistence: &OrderPersistence,
         space: &ActionSpace,
-        policy: Option<&TacticalPolicy>,
     ) -> CombatChoice {
         if self.protects_channel(tracker, space) {
             return CombatChoice::plain(StructuredAction::Continue);
@@ -382,9 +357,7 @@ impl Teacher {
         if let Some(choice) = self.mandatory_choice(tracker, space) {
             return choice;
         }
-        if let Some(choice) = self.finish_aggro_click(tracker, space).or_else(|| {
-            policy.and_then(|policy| self.tactical_action(tracker, persistence, space, policy))
-        }) {
+        if let Some(choice) = self.finish_aggro_click(tracker, space) {
             return choice;
         }
         if let Some(action) = self
@@ -424,85 +397,6 @@ impl Teacher {
                 .or_else(|| self.hold_lane(tracker, space))
                 .unwrap_or(StructuredAction::Continue),
         )
-    }
-
-    fn tactical_action(
-        &self,
-        tracker: &StateTracker,
-        persistence: &OrderPersistence,
-        space: &ActionSpace,
-        policy: &TacticalPolicy,
-    ) -> Option<CombatChoice> {
-        let hero = tracker.own_hero().filter(|hero| hero.hp > 0)?;
-        let (target, enemy) = combat_victim(tracker, space, hero)?;
-        let last_hit = self.attack_last_hit(tracker, space);
-        let features = tactical_features(
-            tracker,
-            space,
-            hero,
-            enemy,
-            last_hit.is_some(),
-            &self.combat,
-        )?;
-        let active_attack = self.protects_active_unit_attack(tracker, persistence, space);
-        let fight = if active_attack {
-            None
-        } else {
-            self.tactical_fight(tracker, space, hero, enemy, target, last_hit.is_some())
-        };
-        let farm = if active_attack {
-            Some(CombatChoice::plain(StructuredAction::Continue))
-        } else {
-            last_hit
-                .map(CombatChoice::plain)
-                .or_else(|| self.raze_last_hit(tracker, space))
-                .or_else(|| self.deny(tracker, space).map(CombatChoice::plain))
-                .or_else(|| self.aggro_pull(tracker, space))
-                .or_else(|| self.hold_lane(tracker, space).map(CombatChoice::plain))
-                .or(Some(CombatChoice::plain(StructuredAction::Stop {
-                    unit: ControlledUnit::Hero,
-                })))
-        };
-        let recover = self.lane_backoff(tracker, space, hero, enemy);
-        let alternatives = [None, fight, recover, farm];
-        let mode = policy.choose(&features, alternatives.map(|action| action.is_some()));
-        let action = alternatives[mode.index()];
-        assert!(action.is_none_or(|choice| space.allows(choice.action)));
-        action
-    }
-
-    fn tactical_fight(
-        &self,
-        tracker: &StateTracker,
-        space: &ActionSpace,
-        hero: &UnitView,
-        enemy: &UnitView,
-        target: EntityIndex,
-        last_hit: bool,
-    ) -> Option<CombatChoice> {
-        let lethal = tactical_burst(hero, enemy, Some(space)) >= enemy.hp;
-        let approach = if in_attack_reach(hero, enemy) {
-            hero.pos
-        } else {
-            enemy.pos
-        };
-        if !tactical_chase_safe(tracker, hero, approach) || (!lethal && last_hit) {
-            return None;
-        }
-        if let Some(action) = self.requiem(tracker, space) {
-            return Some(CombatChoice::plain(action));
-        }
-        if let Some(choice) = self.aim_raze(tracker, space, hero, enemy, target) {
-            return Some(choice);
-        }
-        if !in_attack_reach(hero, enemy) && (!lethal || hero.move_speed < enemy.move_speed) {
-            return None;
-        }
-        let action = StructuredAction::AttackUnit {
-            unit: ControlledUnit::Hero,
-            target,
-        };
-        space.allows(action).then_some(CombatChoice::plain(action))
     }
 
     fn teacher_aim(&self, tracker: &StateTracker, space: &ActionSpace) -> Option<CombatChoice> {
@@ -731,8 +625,6 @@ impl Teacher {
         let invalid = match plan.purpose {
             CombatPurpose::Finish { until, .. } => space.tick() >= until,
             CombatPurpose::Retreat => self.retreat(tracker, space).is_none(),
-            CombatPurpose::Backoff(target) => !enemy_heroes(tracker)
-                .any(|enemy| enemy.id == target && backoff_needed(hero, enemy)),
             CombatPurpose::Aim(target) => {
                 elapsed >= AIM_PLAN_TICKS
                     || space.entity_index(target).is_none_or(|index| {
@@ -766,42 +658,6 @@ impl Teacher {
         (invalid || arrived || stalled || elapsed >= COMBAT_PLAN_TICKS)
             .then_some(stop)
             .filter(|action| space.allows(*action))
-    }
-
-    fn lane_backoff(
-        &self,
-        tracker: &StateTracker,
-        space: &ActionSpace,
-        hero: &UnitView,
-        enemy: &UnitView,
-    ) -> Option<CombatChoice> {
-        if !backoff_needed(hero, enemy) {
-            return None;
-        }
-        let away = Vec2 {
-            x: Fixed {
-                raw: hero
-                    .pos
-                    .x
-                    .raw
-                    .saturating_add(hero.pos.x.raw.saturating_sub(enemy.pos.x.raw)),
-            },
-            y: Fixed {
-                raw: hero
-                    .pos
-                    .y
-                    .raw
-                    .saturating_add(hero.pos.y.raw.saturating_sub(enemy.pos.y.raw)),
-            },
-        };
-        let point = short_lane_point(tracker, space, away, Some(enemy.pos))?;
-        Some(self.navigation_choice(
-            StructuredAction::MovePoint {
-                unit: ControlledUnit::Hero,
-                point,
-            },
-            CombatPurpose::Backoff(enemy.id),
-        ))
     }
 
     fn aim_raze(
@@ -1413,91 +1269,6 @@ impl Teacher {
     }
 }
 
-#[allow(
-    clippy::float_arithmetic,
-    reason = "normalized seat-visible neural features"
-)]
-fn tactical_features(
-    tracker: &StateTracker,
-    space: &ActionSpace,
-    hero: &UnitView,
-    enemy: &UnitView,
-    last_hit: bool,
-    combat: &CombatMemory,
-) -> Option<TacticalFeatures> {
-    let ready = hero
-        .abilities
-        .iter()
-        .enumerate()
-        .filter(|(slot, ability)| {
-            raze_reach(ability.id).is_some() && space.allows(cast_none(*slot))
-        })
-        .count();
-    let distance =
-        isqrt(hero.pos.distance_squared(enemy.pos) as u64) as f32 / Fixed::ONE.raw as f32 / 1_200.0;
-    TacticalFeatures::from_values([
-        tactical_ratio(hero.hp, hero.max_hp),
-        tactical_ratio(enemy.hp, enemy.max_hp),
-        tactical_ratio(hero.mana, hero.max_mana),
-        tactical_ratio(enemy.mana, enemy.max_mana),
-        tactical_ratio(
-            physical_damage(hero.attack_damage.max(0), enemy.armor),
-            enemy.hp,
-        ),
-        tactical_ratio(
-            physical_damage(enemy.attack_damage.max(0), hero.armor),
-            hero.hp,
-        ),
-        distance.clamp(0.0, 1.0),
-        ready.min(3) as f32 / 3.0,
-        tactical_ratio(tactical_burst(hero, enemy, Some(space)), enemy.hp),
-        tactical_ratio(tactical_burst(enemy, hero, None), hero.hp),
-        f32::from(enemy_tower_danger(tracker, hero.pos, hero.bound)),
-        f32::from(enemy_tower_danger(tracker, enemy.pos, hero.bound)),
-        tactical_ratio(visible_pressure(tracker, hero), hero.hp),
-        f32::from(allied_creep_near(tracker, hero.pos, 750)),
-        f32::from(last_hit),
-        f32::from(in_attack_reach(hero, enemy)),
-        f32::from(facing_gap(
-            hero.facing.brads,
-            facing_towards(hero.pos, enemy.pos),
-        )) / 32_768.0,
-        tactical_ratio(
-            raze_hit_margin(tracker, space, hero, enemy),
-            SHADOWRAZE_RADIUS,
-        ),
-        tactical_distance(hero.pos, predicted_position(tracker, enemy), 1_200),
-        tactical_distance(
-            hero.pos,
-            allied_ranged_anchor(tracker, hero.pos).unwrap_or(enemy.pos),
-            1_200,
-        ),
-        nearest_melee_distance(tracker, hero),
-        combat.last_aggro.map_or(0.0, |tick| {
-            AGGRO_COOLDOWN_TICKS.saturating_sub(space.tick().saturating_sub(tick)) as f32
-                / AGGRO_COOLDOWN_TICKS as f32
-        }),
-        combat.plan.map_or(0.0, |plan| {
-            combat_plan_remaining(plan, combat.last_aggro, space.tick()) as f32
-                / COMBAT_PLAN_TICKS as f32
-        }),
-        combat.plan.map_or(0.0, |plan| {
-            tactical_distance(hero.pos, plan.origin, BACKOFF_DISTANCE)
-        }),
-    ])
-    .ok()
-}
-
-#[allow(
-    clippy::float_arithmetic,
-    reason = "bounded normalization with a nonzero denominator"
-)]
-fn tactical_ratio(value: i32, maximum: i32) -> f32 {
-    let ratio = value.max(0) as f32 / maximum.max(1) as f32;
-    assert!(ratio.is_finite());
-    ratio.clamp(0.0, 1.0)
-}
-
 fn tactical_chase_safe(tracker: &StateTracker, hero: &UnitView, target: Vec2) -> bool {
     tower_corridor_safe(tracker, hero, target, false)
 }
@@ -1628,21 +1399,6 @@ fn tactical_burst(source: &UnitView, target: &UnitView, space: Option<&ActionSpa
         .saturating_add(raze)
 }
 
-fn combat_plan_remaining(plan: CombatPlan, last_aggro: Option<u32>, tick: u32) -> u32 {
-    let (start, limit) = match plan.purpose {
-        CombatPurpose::Finish { until, .. } => (plan.tick, until.saturating_sub(plan.tick)),
-        CombatPurpose::Aim(_) => (plan.tick, AIM_PLAN_TICKS),
-        CombatPurpose::AggroClick { .. } | CombatPurpose::AggroPull => {
-            (last_aggro.unwrap_or(plan.tick), AGGRO_HOLD_TICKS)
-        }
-        CombatPurpose::Backoff(_) | CombatPurpose::Retreat => (plan.tick, COMBAT_PLAN_TICKS),
-    };
-    assert!(limit <= COMBAT_PLAN_TICKS);
-    let remaining = limit.saturating_sub(tick.saturating_sub(start));
-    assert!(remaining <= limit);
-    remaining
-}
-
 fn combat_victim<'a>(
     tracker: &StateTracker,
     space: &'a ActionSpace,
@@ -1670,14 +1426,6 @@ fn combat_victim<'a>(
             )
         })
         .map(|(index, candidate)| (EntityIndex(index), candidate.unit()))
-}
-
-fn backoff_needed(hero: &UnitView, enemy: &UnitView) -> bool {
-    enemy.hp > 0
-        && hero
-            .pos
-            .within(enemy.pos, Fixed::from_int(BACKOFF_THREAT_RANGE))
-        && (ratio_at_most(hero.hp, hero.max_hp, 80) || ratio_at_most(hero.mana, hero.max_mana, 25))
 }
 
 fn short_lane_point(
@@ -2122,53 +1870,6 @@ fn finish_reply_estimate(view: &bota_proto::WorldView, hero: &UnitView, ticks: u
         });
     assert!(incoming >= 0);
     incoming
-}
-
-fn raze_hit_margin(
-    tracker: &StateTracker,
-    space: &ActionSpace,
-    hero: &UnitView,
-    enemy: &UnitView,
-) -> i32 {
-    let Some(slot) = best_hero_raze(tracker, space, hero, enemy, hero.facing.brads) else {
-        return 0;
-    };
-    let reach = raze_reach(hero.abilities[slot].id).expect("selected raze");
-    let center = raze_center(hero.pos, hero.facing.brads, reach);
-    let distance = isqrt(center.distance_squared(predicted_position(tracker, enemy)) as u64)
-        / Fixed::ONE.raw as u64;
-    SHADOWRAZE_RADIUS.saturating_sub(distance as i32)
-}
-
-#[allow(
-    clippy::float_arithmetic,
-    reason = "bounded normalized visible geometry"
-)]
-fn tactical_distance(source: Vec2, target: Vec2, maximum: i32) -> f32 {
-    assert!(maximum > 0);
-    let distance = isqrt(source.distance_squared(target) as u64) as f32 / Fixed::ONE.raw as f32;
-    let normalized = (distance / maximum as f32).clamp(0.0, 1.0);
-    assert!(normalized.is_finite());
-    normalized
-}
-
-fn nearest_melee_distance(tracker: &StateTracker, hero: &UnitView) -> f32 {
-    tracker
-        .current()
-        .and_then(|view| {
-            view.units
-                .iter()
-                .filter(|unit| {
-                    unit.hp > 0
-                        && unit.team != hero.team
-                        && unit.team != Team::Neutral
-                        && matches!(unit.kind, UnitKind::CreepMelee | UnitKind::CreepFlagbearer)
-                })
-                .min_by_key(|unit| (hero.pos.distance_squared(unit.pos), unit.id))
-        })
-        .map_or(1.0, |unit| {
-            tactical_distance(hero.pos, unit.pos, AGGRO_RANGE)
-        })
 }
 
 fn courier_cast(

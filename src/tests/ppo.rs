@@ -239,47 +239,6 @@ fn actor_report_merges_progress_costs_counters_and_reason_bits_without_double_co
 }
 
 #[test]
-fn rollout_compacts_sparse_tokens_and_bit_packs_behavioral_masks_losslessly() {
-    let (frame, space) = frame_and_space();
-    let model = PolicyModel::fresh(100).expect("model");
-    let policy = model.policy_identity().expect("policy");
-    let sampled = choice(&model, &frame, &space, StructuredAction::Continue);
-    let target = sampled.target.clone();
-    let packed = target.pack();
-    let mut rollout = PpoRollout::new(1, policy).expect("rollout");
-    rollout
-        .push(
-            sampled
-                .finish(PpoOutcome {
-                    stream: 0,
-                    decision: 0,
-                    ticks: 3,
-                    next_value: 0.0,
-                    reward: 1.0,
-                    terminal: true,
-                })
-                .expect("transition"),
-        )
-        .expect("push");
-    let padded_rows = UNIT_FEATURE_TOKENS
-        + REMEMBERED_UNIT_FEATURE_TOKENS
-        + POINT_FEATURE_TOKENS
-        + ABILITY_FEATURE_TOKENS
-        + ITEM_FEATURE_TOKENS
-        + PROJECTILE_FEATURE_TOKENS
-        + LOOT_FEATURE_TOKENS;
-
-    assert_eq!(packed.unpack(), target);
-    assert!(
-        std::mem::size_of_val(&packed) < std::mem::size_of::<BehavioralTarget>(),
-        "packed={} fixed={}",
-        std::mem::size_of_val(&packed),
-        std::mem::size_of::<BehavioralTarget>()
-    );
-    assert!(rollout.ragged_rows_for_test() < padded_rows);
-}
-
-#[test]
 fn ppo_schema_and_rules_audit_are_stable() {
     assert_eq!(PPO_SCHEMA_VERSION, 37);
     assert_eq!(PPO_RULES_AUDIT_VERSION, 32);
@@ -1725,221 +1684,6 @@ fn production_seed_derivation_accepts_maximum_seed_without_overflow() {
 
 #[cfg(feature = "builtin")]
 #[test]
-fn teacher_pretraining_short_map2_collection_preserves_scope_splits_sides_and_sample_bounds() {
-    let pool = crate::collect_pretraining_pool_for_test(50_001, 8)
-        .expect("eight decisions per seed, not a full trajectory regression");
-    let mut sides = [[0usize; 2]; 3];
-    let mut kinds = [[0usize; ActionKind::COUNT]; 3];
-    let mut identities = std::collections::BTreeSet::new();
-
-    assert!(!pool.is_empty());
-    assert!(pool.len() <= 8 * 8 * 2);
-    assert!(pool.binding().scope.contains_map(bota_proto::MapId(2)));
-    assert!(!pool.binding().scope.contains_map(bota_proto::MapId(0)));
-    assert!(!pool.binding().scope.contains_map(bota_proto::MapId(1)));
-    for index in 0..pool.len() {
-        let sample = pool.get(index).expect("retained sample");
-        let identity = sample.identity();
-        let split = match identity.namespace() {
-            crate::SeedNamespace::Training => 0,
-            crate::SeedNamespace::Validation => 1,
-            crate::SeedNamespace::Promotion => 2,
-        };
-        let side = usize::from(sample.side() == crate::ImitationSide::Dire);
-        sides[split][side] += 1;
-        kinds[split][sample.teacher_action().kind().index()] += 1;
-        assert_eq!(identity.map(), bota_proto::MapId(2));
-        assert!(identities.insert(identity));
-        assert!(identity.tick() <= 22);
-        assert!((identity.tick() - 1).is_multiple_of(3));
-        assert!(sample.frame().is_finite());
-        assert_eq!(sample.source(), crate::ImitationSource::Teacher);
-    }
-    assert_eq!(sides.iter().flatten().sum::<usize>(), pool.len());
-    for split in 0..3 {
-        assert!(sides[split].iter().all(|count| *count > 0));
-        assert!(kinds[split].iter().filter(|count| **count > 0).count() >= 2);
-    }
-}
-
-#[cfg(feature = "builtin")]
-#[test]
-fn pretraining_map2_profile_bounds_bc_dagger_and_gameplay_to_the_same_action_cap() {
-    let (map, decisions, capacity) = crate::pretraining_profile_for_test();
-    assert_eq!(map, bota_proto::MapId(2));
-    assert_eq!(decisions, [crate::MAP2_ACTOR_DECISIONS; 3]);
-    assert!(capacity <= crate::MAX_IMITATION_SAMPLES);
-    assert!(capacity >= 8 * 8 * 2);
-}
-
-#[cfg(feature = "builtin")]
-#[test]
-fn pretraining_map2_retention_windows_cover_all_actor_decisions_without_overlap() {
-    let width = crate::MAP2_ACTOR_DECISIONS / 4;
-    for (decision, window) in [
-        (0, 0),
-        (width - 1, 0),
-        (width, 1),
-        (2 * width - 1, 1),
-        (2 * width, 2),
-        (3 * width - 1, 2),
-        (3 * width, 3),
-        (crate::MAP2_ACTOR_DECISIONS - 1, 3),
-    ] {
-        assert_eq!(crate::pretraining_window_for_test(decision), window);
-    }
-}
-
-#[cfg(feature = "builtin")]
-#[test]
-fn pretraining_teacher_retention_checks_every_namespace_kind_cap_boundary() {
-    for namespace in [
-        crate::SeedNamespace::Training,
-        crate::SeedNamespace::Validation,
-        crate::SeedNamespace::Promotion,
-    ] {
-        for kind in ActionKind::ALL {
-            let cap = match (namespace, kind == ActionKind::Continue) {
-                (crate::SeedNamespace::Training, true) => 48,
-                (crate::SeedNamespace::Training, false) => 6,
-                (_, true) => 21,
-                (_, false) => 4,
-            };
-            assert!(crate::pretraining_retains_teacher_for_test(
-                namespace,
-                kind,
-                cap - 1
-            ));
-            for retained in [cap, cap + 1, u64::MAX] {
-                assert!(!crate::pretraining_retains_teacher_for_test(
-                    namespace, kind, retained
-                ));
-            }
-        }
-    }
-}
-
-#[cfg(feature = "builtin")]
-#[test]
-fn pretraining_dagger_retains_disagreements_and_strided_agreements_without_exceeding_cap() {
-    for decision in [0, 126, 127, 128, 6_299] {
-        for agreement in [false, true] {
-            let expected = !agreement || (decision + 1usize).is_multiple_of(128);
-            assert_eq!(
-                crate::pretraining_retains_dagger_for_test(agreement, decision, 2),
-                expected
-            );
-            assert!(!crate::pretraining_retains_dagger_for_test(
-                agreement, decision, 3
-            ));
-        }
-    }
-}
-
-#[cfg(feature = "builtin")]
-#[test]
-fn pretraining_dagger_records_and_sends_neural_stop_when_teacher_would_preserve_a_channel() {
-    let model = constant_policy_for_warmup(ActionKind::Stop);
-    let (_, mut start) = crate::Arena::new(crate::ArenaConfig {
-        map: bota_proto::MapId(2),
-        seats: 2,
-        seed: 50_001,
-    })
-    .expect("Map2 start");
-    for side in 0..2 {
-        for message in &mut start.messages[side] {
-            if let bota_proto::ServerMsg::Snapshot { view } = message {
-                let hero = view.players[side].unit.expect("own hero");
-                view.units
-                    .iter_mut()
-                    .find(|unit| unit.id == hero)
-                    .expect("visible own hero")
-                    .statuses
-                    .bits |= bota_proto::StatusFlags::CHANNELLING;
-            }
-        }
-        let (sample, request, candidate) =
-            crate::pretraining_dagger_choice_for_test(&model, side, &start.messages[side])
-                .expect("pure Neural decision and shadow label");
-        assert_eq!(sample.identity().map(), bota_proto::MapId(2));
-        assert_eq!(sample.teacher_action(), crate::StructuredAction::Continue);
-        assert_eq!(
-            sample.learner_action().expect("learner action").kind(),
-            ActionKind::Stop
-        );
-        assert_eq!(
-            request.expect("actual neural stop").order,
-            bota_proto::Order::Move {
-                target: bota_proto::Target::None,
-            }
-        );
-        assert!(candidate, "learner transport must use the candidate ledger");
-    }
-}
-
-#[cfg(feature = "builtin")]
-#[test]
-fn pretraining_short_gameplay_evaluates_both_map2_sides_without_teacher_orders() {
-    let model = constant_policy_for_warmup(ActionKind::Stop);
-    let games = crate::pretraining_gameplay_games_for_test(&model, 90_001, 4)
-        .expect("four decisions per side");
-    assert_eq!(games.len(), 2);
-    for (game, team) in games
-        .iter()
-        .zip([bota_proto::Team::Radiant, bota_proto::Team::Dire])
-    {
-        assert_eq!(game.map, bota_proto::MapId(2));
-        assert_eq!(game.candidate_team, team);
-        assert_eq!(game.decisions, 4);
-        assert_eq!(game.action_counts[ActionKind::Stop.index()], 4);
-        assert_eq!(game.baseline_wire_orders, 0);
-        assert_eq!(game.rejected_orders, 0);
-        assert_eq!(game.outcome, crate::CheckpointEvaluationOutcome::Timeout);
-    }
-}
-
-#[cfg(feature = "builtin")]
-#[test]
-fn pretraining_epochs_reserve_at_least_one_epoch_for_each_dagger_phase() {
-    let valid = crate::BehavioralPretrainingConfig {
-        epochs: 8,
-        seed: 50_001,
-    };
-    crate::validate_behavioral_pretraining_for_test(valid).expect("four DAgger phases");
-
-    let error =
-        crate::validate_behavioral_pretraining_for_test(crate::BehavioralPretrainingConfig {
-            epochs: 6,
-            ..valid
-        })
-        .expect_err("three remaining epochs cannot cover four DAgger phases");
-
-    assert_eq!(
-        error.to_string(),
-        "invalid PPO config field: pretraining epochs"
-    );
-}
-
-#[cfg(feature = "builtin")]
-#[test]
-fn pretraining_dagger_phases_all_target_the_hard_weak_quality_baseline() {
-    let baselines = (0..4)
-        .map(crate::pretraining_dagger_baseline_for_test)
-        .collect::<Vec<_>>();
-
-    assert_eq!(
-        baselines,
-        [
-            crate::CheckpointEvaluationBaseline::Weak,
-            crate::CheckpointEvaluationBaseline::Weak,
-            crate::CheckpointEvaluationBaseline::Weak,
-            crate::CheckpointEvaluationBaseline::Weak,
-        ]
-    );
-}
-
-#[cfg(feature = "builtin")]
-#[test]
 fn deployment_uses_the_audited_teacher_only_for_map_zero() {
     assert!(crate::deployment_uses_teacher_for_test(bota_proto::MapId(
         0
@@ -1950,229 +1694,6 @@ fn deployment_uses_the_audited_teacher_only_for_map_zero() {
     assert!(!crate::deployment_uses_teacher_for_test(bota_proto::MapId(
         2
     )));
-}
-
-#[cfg(feature = "builtin")]
-#[test]
-fn pretraining_agreement_accepts_documented_diverse_dataset_boundaries() {
-    let metrics = boundary_pretraining_agreement();
-
-    crate::validate_pretraining_agreement_for_test(&metrics)
-        .expect("documented agreement boundaries");
-}
-
-#[cfg(feature = "builtin")]
-#[test]
-fn pretraining_agreement_rejects_overall_kind_one_below_boundary() {
-    let mut metrics = boundary_pretraining_agreement();
-    metrics.overall.kind.matching = 59;
-
-    let error = crate::validate_pretraining_agreement_for_test(&metrics)
-        .expect_err("overall kind below boundary");
-
-    assert_eq!(
-        error.to_string(),
-        "PPO model error: pretraining held-out overall agreement failed: kind=59/100, full=55/100"
-    );
-}
-
-#[cfg(feature = "builtin")]
-#[test]
-fn pretraining_agreement_rejects_dire_full_one_below_boundary() {
-    let mut metrics = boundary_pretraining_agreement();
-    metrics.dire.full.matching = 49;
-
-    let error = crate::validate_pretraining_agreement_for_test(&metrics)
-        .expect_err("Dire full agreement below boundary");
-
-    assert_eq!(
-        error.to_string(),
-        "PPO model error: pretraining held-out dire agreement failed: kind=55/100, full=49/100"
-    );
-}
-
-#[cfg(feature = "builtin")]
-#[test]
-fn pretraining_stage_selection_prefers_exact_agreement_then_kind_agreement() {
-    let selected = crate::pretraining_best_stage_for_test(&[(700, 650), (735, 705), (800, 690)]);
-    assert_eq!(selected, 1);
-
-    let selected = crate::pretraining_best_stage_for_test(&[(700, 650), (735, 705), (800, 705)]);
-    assert_eq!(selected, 2);
-}
-
-#[cfg(feature = "builtin")]
-#[test]
-fn pretraining_stage_selection_prioritizes_gameplay_failures_then_wins() {
-    let selected = crate::pretraining_gameplay_stage_for_test(&[
-        gameplay(2, 0, 0, 0, 1),
-        gameplay(1, 1, 1, 1, 2),
-        gameplay(0, 2, 0, 0, 0),
-    ]);
-    assert_eq!(selected, 2);
-
-    let selected = crate::pretraining_gameplay_stage_for_test(&[
-        gameplay(1, 1, 0, 0, 0),
-        gameplay(0, 2, 2, 2, 1),
-    ]);
-    assert_eq!(selected, 1);
-}
-
-#[cfg(feature = "builtin")]
-#[test]
-fn pretraining_stage_selection_uses_three_fixed_gameplay_validation_seeds() {
-    assert_eq!(
-        crate::pretraining_gameplay_validation_seeds_for_test(),
-        [9_100_001, 9_100_002, 9_100_003]
-    );
-}
-
-#[cfg(feature = "builtin")]
-#[test]
-fn pretraining_stage_selection_never_trades_a_map2_win_for_structure_progress() {
-    let selected = crate::pretraining_gameplay_stage_for_test(&[
-        gameplay(1, 1, 2, 2, 0),
-        gameplay(0, 2, 0, 0, 2),
-    ]);
-
-    assert_eq!(selected, 1);
-}
-
-#[cfg(feature = "builtin")]
-#[test]
-fn pretraining_stage_selection_uses_map2_progress_after_outcome_ties() {
-    let selected = crate::pretraining_gameplay_stage_for_test(&[
-        gameplay(0, 2, 1, 1, 1),
-        gameplay(0, 2, 2, 2, 0),
-    ]);
-
-    assert_eq!(selected, 1);
-}
-
-#[cfg(feature = "builtin")]
-#[test]
-fn pretraining_acceptance_allows_paired_map2_wins_without_tower_destruction() {
-    crate::validate_pretraining_gameplay_acceptance_for_test(gameplay(0, 2, 0, 0, 1))
-        .expect("two hero-death wins are valid Map2 wins");
-}
-
-#[cfg(feature = "builtin")]
-#[test]
-fn pretraining_acceptance_rejects_a_map2_nonwin_even_with_structure_progress() {
-    let game = gameplay(1, 1, 2, 2, 1);
-    let error = crate::validate_pretraining_gameplay_acceptance_for_test(game)
-        .expect_err("one Map2 side did not win");
-    assert_eq!(
-        error.to_string(),
-        format!(
-            "PPO model error: pretraining Map2 gameplay acceptance failed: {game:?}; validation stages=[]"
-        )
-    );
-}
-
-#[cfg(feature = "builtin")]
-#[test]
-fn pretraining_gameplay_counts_draw_and_timeout_as_valid_nonwins_not_infrastructure_errors() {
-    use crate::CheckpointEvaluationOutcome::{Draw, Loss, Timeout, Win};
-    for outcome in [Win, Loss, Draw, Timeout] {
-        let game = pretraining_game(outcome);
-        let result = crate::pretraining_gameplay_result_for_test(&game).expect("valid game result");
-        assert_eq!(result.games, 1);
-        assert_eq!(result.wins, usize::from(outcome == Win));
-        assert_eq!(result.failures, usize::from(outcome != Win));
-        assert_eq!(result.draws, usize::from(outcome == Draw));
-        assert_eq!(result.timeouts, usize::from(outcome == Timeout));
-    }
-}
-
-#[cfg(feature = "builtin")]
-#[test]
-fn pretraining_gameplay_rejects_legacy_map_and_active_weak_baseline_with_specific_errors() {
-    for map in [bota_proto::MapId(0), bota_proto::MapId(1)] {
-        let mut game = pretraining_game(crate::CheckpointEvaluationOutcome::Win);
-        game.map = map;
-        let error = crate::pretraining_gameplay_result_for_test(&game).expect_err("wrong map");
-        assert_eq!(
-            error.to_string(),
-            "invalid PPO transition: pretraining Map2 weak gameplay scope"
-        );
-    }
-    let mut game = pretraining_game(crate::CheckpointEvaluationOutcome::Win);
-    game.baseline_wire_orders = 1;
-    let error = crate::pretraining_gameplay_result_for_test(&game).expect_err("invalid baseline");
-    assert_eq!(
-        error.to_string(),
-        "invalid PPO transition: pretraining weak baseline activity"
-    );
-}
-
-#[cfg(feature = "builtin")]
-fn pretraining_game(
-    outcome: crate::CheckpointEvaluationOutcome,
-) -> crate::CheckpointEvaluationGame {
-    crate::CheckpointEvaluationGame {
-        map: bota_proto::MapId(2),
-        baseline: crate::CheckpointEvaluationBaseline::Weak,
-        seed: 90_001,
-        candidate_team: bota_proto::Team::Radiant,
-        outcome,
-        decisions: 1,
-        wire_orders: 1,
-        rejected_orders: 0,
-        baseline_wire_orders: 0,
-        baseline_rejected_orders: 0,
-        elapsed_ticks: 3,
-        action_counts: [0; ActionKind::COUNT],
-        final_summary: crate::GlobalSummary {
-            destroyed_structures_present: true,
-            ..Default::default()
-        },
-    }
-}
-
-#[cfg(feature = "builtin")]
-fn gameplay(
-    failures: usize,
-    wins: usize,
-    progress_games: usize,
-    structures: u64,
-    deaths: u64,
-) -> crate::PretrainingGameplay {
-    crate::PretrainingGameplay {
-        games: 2,
-        failures,
-        wins,
-        structure_progress_games: progress_games,
-        structures,
-        deaths,
-        rejections: 0,
-        draws: 0,
-        timeouts: 0,
-    }
-}
-
-#[cfg(feature = "builtin")]
-fn boundary_pretraining_agreement() -> crate::OfflineEvaluation {
-    let mut metrics = crate::OfflineEvaluation::default();
-    metrics.overall.kind = crate::AgreementCount {
-        matching: 60,
-        total: 100,
-    };
-    metrics.overall.full = crate::AgreementCount {
-        matching: 55,
-        total: 100,
-    };
-    for side in [&mut metrics.radiant, &mut metrics.dire] {
-        side.kind = crate::AgreementCount {
-            matching: 55,
-            total: 100,
-        };
-        side.full = crate::AgreementCount {
-            matching: 50,
-            total: 100,
-        };
-    }
-    metrics
 }
 
 #[cfg(feature = "builtin")]
@@ -2702,4 +2223,45 @@ fn randomized_retention_flushes_partial_terminal_and_timeout_without_fabricating
 #[test]
 fn episode_phase_is_replayable_and_independent_of_actor_rng() {
     crate::ppo_arena::episode::assert_retention_phase_replay_for_test();
+}
+
+#[test]
+fn rollout_compacts_sparse_tokens_and_bit_packs_behavioral_masks_losslessly() {
+    let (frame, space) = frame_and_space();
+    let model = PolicyModel::fresh(100).expect("model");
+    let policy = model.policy_identity().expect("policy");
+    let sampled = choice(&model, &frame, &space, StructuredAction::Continue);
+    let target = sampled.target.clone();
+    let packed = target.pack();
+    let mut rollout = PpoRollout::new(1, policy).expect("rollout");
+    rollout
+        .push(
+            sampled
+                .finish(PpoOutcome {
+                    stream: 0,
+                    decision: 0,
+                    ticks: 3,
+                    next_value: 0.0,
+                    reward: 1.0,
+                    terminal: true,
+                })
+                .expect("transition"),
+        )
+        .expect("push");
+    let padded_rows = UNIT_FEATURE_TOKENS
+        + REMEMBERED_UNIT_FEATURE_TOKENS
+        + POINT_FEATURE_TOKENS
+        + ABILITY_FEATURE_TOKENS
+        + ITEM_FEATURE_TOKENS
+        + PROJECTILE_FEATURE_TOKENS
+        + LOOT_FEATURE_TOKENS;
+
+    assert_eq!(packed.unpack(), target);
+    assert!(
+        std::mem::size_of_val(&packed) < std::mem::size_of::<BehavioralTarget>(),
+        "packed={} fixed={}",
+        std::mem::size_of_val(&packed),
+        std::mem::size_of::<BehavioralTarget>()
+    );
+    assert!(rollout.ragged_rows_for_test() < padded_rows);
 }

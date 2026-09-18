@@ -1,67 +1,4 @@
 #[test]
-fn cli_tactical_requires_explicit_weights_directory_for_both_play_forms() {
-    for arguments in [
-        vec!["drysua", "--policy", "tactical"],
-        vec!["drysua", "play", "--policy", "tactical"],
-    ] {
-        let error = crate::cli::parse_from(arguments).expect_err("tactical needs weights");
-        assert!(
-            error
-                .to_string()
-                .contains("--weights-directory <WEIGHTS_DIRECTORY>")
-        );
-        assert!(
-            error
-                .to_string()
-                .contains("required arguments were not provided")
-        );
-    }
-}
-
-#[test]
-fn cli_tactical_missing_file_fails_before_connecting_without_teacher_fallback() {
-    let directory = super::seat::tactical_directory("cli-missing");
-    let error = crate::cli::run_from_for_test([
-        "drysua",
-        "play",
-        "--policy",
-        "tactical",
-        "--name",
-        "",
-        "--weights-directory",
-        directory.to_str().expect("UTF-8 directory"),
-    ])
-    .expect_err("missing tactical weights must fail before name validation");
-    assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
-    assert!(error.to_string().contains("drysua.tactical.bin"));
-    std::fs::remove_dir(directory).expect("remove empty directory");
-}
-
-#[test]
-fn cli_tactical_loads_canonical_file_without_safetensors() {
-    let directory = super::seat::tactical_directory("cli-valid");
-    std::fs::write(
-        directory.join("drysua.tactical.bin"),
-        crate::TacticalPolicy::default().to_bytes(),
-    )
-    .expect("canonical tactical weights");
-    let error = crate::cli::run_from_for_test([
-        "drysua",
-        "play",
-        "--policy",
-        "tactical",
-        "--name",
-        "",
-        "--weights-directory",
-        directory.to_str().expect("UTF-8 directory"),
-    ])
-    .expect_err("valid tactical weights reach name validation");
-    assert_eq!(error.to_string(), "bot name must not be empty");
-    assert!(!directory.join("drysua.weights.safetensors").exists());
-    std::fs::remove_dir_all(directory).expect("remove weights");
-}
-
-#[test]
 fn cli_defaults_to_selected_teacher_for_implicit_and_explicit_play() {
     for arguments in [vec!["drysua"], vec!["drysua", "play"]] {
         assert_eq!(
@@ -106,7 +43,7 @@ fn cli_explicit_weights_without_policy_retain_hybrid_experiment_behavior() {
 fn selected_neural_weights_resolve_from_the_repository_not_the_working_directory() {
     for policy in [
         crate::cli::PlayPolicy::Hybrid,
-        crate::cli::PlayPolicy::Tactical,
+        crate::cli::PlayPolicy::Neural,
     ] {
         let selection = crate::default_deployment::DefaultDeployment {
             policy,
@@ -131,7 +68,7 @@ fn selected_deployment_rejects_policy_and_weight_mismatches() {
             weights_directory: Some("artifacts/v9.9.9"),
         },
         crate::default_deployment::DefaultDeployment {
-            policy: crate::cli::PlayPolicy::Tactical,
+            policy: crate::cli::PlayPolicy::Neural,
             weights_directory: None,
         },
         crate::default_deployment::DefaultDeployment {
@@ -159,7 +96,7 @@ fn selected_weights_cannot_escape_the_artifact_directory() {
         "artifacts/../weights",
     ] {
         let selection = crate::default_deployment::DefaultDeployment {
-            policy: crate::cli::PlayPolicy::Tactical,
+            policy: crate::cli::PlayPolicy::Neural,
             weights_directory: Some(directory),
         };
 
@@ -239,37 +176,6 @@ fn cli_accepts_bounded_ppo_smoke_parameters() {
 }
 
 #[test]
-fn cli_accepts_bounded_self_play_smoke_parameters() {
-    crate::cli::parse_from([
-        "drysua",
-        "league",
-        "--updates",
-        "1",
-        "--environments",
-        "4",
-        "--rollout",
-        "2",
-        "--epochs",
-        "1",
-        "--minibatch",
-        "8",
-        "--evaluation-pairs",
-        "1",
-        "--evaluation-decisions",
-        "2",
-        "--seed",
-        "77",
-        "--map",
-        "2",
-        "--device",
-        "metal",
-        "--device-ordinal",
-        "0",
-    ])
-    .expect("league CLI");
-}
-
-#[test]
 fn cli_accepts_resumable_training_job_parameters() {
     crate::cli::parse_from([
         "drysua",
@@ -313,39 +219,6 @@ fn cli_rejects_provenance_migration_without_resume() {
 }
 
 #[test]
-fn cli_accepts_initial_weights_for_fresh_training() {
-    crate::cli::parse_from([
-        "drysua",
-        "train-full",
-        "--updates",
-        "8",
-        "--checkpoint-directory",
-        "training/ppo-v1",
-        "--initial-weights",
-        "artifacts/temp/pretrain-v1",
-    ])
-    .expect("fresh initialized training CLI");
-}
-
-#[test]
-fn cli_rejects_initial_weights_when_resuming() {
-    let error = crate::cli::parse_from([
-        "drysua",
-        "train-full",
-        "--updates",
-        "8",
-        "--checkpoint-directory",
-        "training/ppo-v1",
-        "--initial-weights",
-        "artifacts/temp/pretrain-v1",
-        "--resume",
-    ])
-    .expect_err("resume already restores exact model state");
-
-    assert!(error.to_string().contains("cannot be used with '--resume'"));
-}
-
-#[test]
 fn cli_accepts_fixed_checkpoint_evaluation_matrix() {
     crate::cli::parse_from([
         "drysua",
@@ -377,37 +250,6 @@ fn cli_evaluation_rejects_legacy_map_selection() {
     assert!(error.to_string().contains("unexpected argument '--map'"));
 }
 
-#[test]
-fn cli_accepts_bounded_teacher_pretraining() {
-    crate::cli::parse_from([
-        "drysua",
-        "pretrain",
-        "--output-directory",
-        "artifacts/temp/pretrain-maps",
-        "--epochs",
-        "8",
-        "--seed",
-        "50001",
-        "--device",
-        "cuda",
-    ])
-    .expect("pretrain CLI");
-}
-
-#[test]
-fn cli_teacher_pretraining_rejects_legacy_map_selection() {
-    let error = crate::cli::parse_from([
-        "drysua",
-        "pretrain",
-        "--output-directory",
-        "artifacts/temp/pretrain-map1",
-        "--map",
-        "1",
-    ])
-    .expect_err("pretraining is Map2 only");
-
-    assert!(error.to_string().contains("unexpected argument '--map'"));
-}
 #[test]
 fn neural_cli_requires_explicit_weights() {
     let error = crate::cli::parse_from(["drysua", "--policy", "neural"])
@@ -587,7 +429,7 @@ fn cli_map2_evaluation_accepts_teacher_only_without_a_policy_override() {
 
 #[test]
 fn cli_all_training_commands_default_to_map2_and_reject_other_maps_before_execution() {
-    for operation in ["train", "train-full", "league"] {
+    for operation in ["train", "train-full"] {
         let help = crate::cli::parse_from(["drysua", operation, "--help"])
             .expect_err("help is not execution")
             .to_string();
@@ -767,4 +609,37 @@ fn train_full_map2_reset_windows_require_explicit_opt_out_and_keep_full_reward()
     assert_eq!(settings.map, bota_proto::MapId(2));
     assert_eq!(settings.ppo.gamma_tick, 1.0);
     assert!(!settings.terminal_only);
+}
+
+#[test]
+fn cli_accepts_initial_weights_for_fresh_training() {
+    crate::cli::parse_from([
+        "drysua",
+        "train-full",
+        "--updates",
+        "8",
+        "--checkpoint-directory",
+        "training/ppo-v1",
+        "--initial-weights",
+        "artifacts/temp/pretrain-v1",
+    ])
+    .expect("fresh initialized training CLI");
+}
+
+#[test]
+fn cli_rejects_initial_weights_when_resuming() {
+    let error = crate::cli::parse_from([
+        "drysua",
+        "train-full",
+        "--updates",
+        "8",
+        "--checkpoint-directory",
+        "training/ppo-v1",
+        "--initial-weights",
+        "artifacts/temp/pretrain-v1",
+        "--resume",
+    ])
+    .expect_err("resume already restores exact model state");
+
+    assert!(error.to_string().contains("cannot be used with '--resume'"));
 }
