@@ -38,23 +38,6 @@ fn ppo_defaults_match_stage_nine_plan() {
 }
 
 #[cfg(feature = "builtin")]
-#[test]
-#[ignore = "Bounded release evidence for the v0.0.1 Teacher fallback."]
-fn teacher_release_evaluation_reports_three_seeds_on_both_sides() {
-    for seed in [9_000_001, 9_000_002, 9_000_003] {
-        let games = crate::evaluate_teacher_against_weak_for_test(seed, 4_096)
-            .expect("bounded Teacher versus Weak evaluation");
-
-        assert_eq!(games.len(), 4);
-        for game in games {
-            println!("teacher_release {game:?}");
-            assert_eq!(game.seed, seed);
-            assert!((1..=4_096).contains(&game.decisions));
-            assert_eq!(game.action_counts.iter().sum::<u32>(), game.decisions);
-        }
-    }
-}
-
 #[cfg(feature = "builtin")]
 #[test]
 fn actor_report_merge_retains_all_terminal_telemetry() {
@@ -1627,21 +1610,6 @@ fn production_training_covers_every_warmup_phase_on_both_policy_sides() {
 }
 
 #[cfg(feature = "builtin")]
-#[test]
-fn production_training_covers_every_warmup_phase_against_both_baselines() {
-    let mut covered = [[false; 8]; 2];
-    for stream in 0..32 {
-        let pair = crate::training_pair_index(stream);
-        let baseline = match crate::training_opponent_baseline_for_test(pair) {
-            crate::CheckpointEvaluationBaseline::Weak => 0,
-            crate::CheckpointEvaluationBaseline::Teacher => 1,
-        };
-        covered[baseline][crate::training_warmup_phase_index(stream)] = true;
-    }
-
-    assert!(covered.into_iter().flatten().all(|present| present));
-}
-
 #[cfg(feature = "builtin")]
 #[test]
 fn production_warmup_runs_the_frozen_policy_against_the_scheduled_opponent() {
@@ -1854,44 +1822,6 @@ fn map2_cli_checkpoint_restores_exact_config_and_rejects_changed_hyperparameters
     std::fs::remove_dir_all(directory).expect("remove checkpoint");
 }
 #[cfg(feature = "builtin")]
-#[test]
-fn runtime_map2_evaluation_uses_neural_stop_actions_on_both_sides_without_teacher_override() {
-    let directory = training_test_directory("pure-map2-evaluation");
-    let model = stop_policy_for_warmup();
-    crate::TrainingArtifact::save_runtime_weights(&model, &directory).expect("stop weights");
-    let report = crate::ppo_arena::evaluate_neural_map_two_checkpoint_cohort(
-        crate::CheckpointEvaluationConfig {
-            pairs: 1,
-            decisions: 2,
-            seed: 23_082,
-        },
-        &directory,
-        false,
-    )
-    .expect("pure neural evaluation");
-    assert_eq!(report.games.len(), 4);
-    let mut covered = [[false; 2]; 2];
-    for game in report.games {
-        assert_eq!(game.map, bota_proto::MapId(2));
-        let baseline = match game.baseline {
-            crate::CheckpointEvaluationBaseline::Teacher => 0,
-            crate::CheckpointEvaluationBaseline::Weak => 1,
-        };
-        covered[baseline][usize::from(game.candidate_team == Team::Dire)] = true;
-        assert_eq!(game.seed, 23_082);
-        assert_eq!(game.decisions, 2);
-        assert_eq!(game.elapsed_ticks, 6);
-        assert_eq!(game.outcome, crate::CheckpointEvaluationOutcome::Timeout);
-        assert_eq!(game.rejected_orders, 0);
-        assert_eq!(
-            game.action_counts[crate::ActionKind::Stop.index()],
-            game.decisions
-        );
-        assert_eq!(game.action_counts.iter().sum::<u32>(), game.decisions);
-    }
-    assert!(covered.into_iter().flatten().all(|present| present));
-    std::fs::remove_dir_all(directory).expect("remove weights");
-}
 #[cfg(feature = "builtin")]
 #[test]
 fn production_window_resets_lose_delayed_terminal_credit_while_episode_collection_preserves_it() {

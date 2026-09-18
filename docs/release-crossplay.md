@@ -4,9 +4,12 @@
 > (`scripts/release_crossplay.py`, `release_build.py`, `map0_challenge.py/json` and
 > their tests) left the tracked tree in the repo-slim audit. Exact contents:
 > `artifacts/temp/repo-slim-20260917/archive/scripts-historical.tar.gz` (workspace
-> root) and git history at `41bc295`. No live path imports them; current Map2
-> checkpoint qualification is `drysua evaluate`. `release_wire.py` stays because the
-> live relay imports its `varint`. The procedure below is retained as history.
+> root) and git history at `41bc295`. No live path imports them. The former
+> `drysua evaluate` fixed-matrix qualification was removed in the wave-6 repo-slim
+> (2026-09-18): there is currently no in-tree Map2 checkpoint qualification command,
+> and the identity gate/`play_match` smoke do not replace it. `release_wire.py` stays
+> because the live relay imports its `varint`. The procedure below is retained as
+> history.
 
 `releases.json` is the machine-readable historical release registry and evaluation
 contract. The initial weights-free Teacher release is the **annotated** `v0.0.1`

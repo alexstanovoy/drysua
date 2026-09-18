@@ -11,8 +11,6 @@ use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use candle_core::{DType, Device, Tensor, Var};
 
-#[path = "model_map2_initialization.rs"]
-mod map2_initialization;
 #[cfg(test)]
 #[path = "tests/model_test_support.rs"]
 mod test_support;

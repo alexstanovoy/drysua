@@ -9,12 +9,10 @@ fn reward6_and_reward7_descriptors_are_frozen_side_by_side() {
         })
     };
     assert_eq!(hash(reward_v5::DESCRIPTOR), 10_775_256_611_790_261_869);
-    assert_eq!(hash(reward_v6::DESCRIPTOR), 1_084_583_101_075_978_392);
     assert_eq!(
         hash(crate::MAP2_REWARD_SCHEMA_DESCRIPTOR),
         crate::MAP2_REWARD_SCHEMA_HASH
     );
-    assert!(!reward_v6::DESCRIPTOR.contains("victory_time"));
     assert!(crate::MAP2_REWARD_SCHEMA_DESCRIPTOR.contains("victory_time"));
 }
 

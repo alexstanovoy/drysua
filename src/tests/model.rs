@@ -27,9 +27,6 @@ use crate::{
     unit_feature,
 };
 
-#[path = "model_input_adapter.rs"]
-mod model_input_adapter;
-
 #[test]
 fn fresh_policy_fixed_corpus_has_unsaturated_heads() {
     assert_fresh_policy_conditioning(PolicyDevice::Cpu);
@@ -859,57 +856,6 @@ fn model_parameter_count_and_f32_size_are_bounded() {
             .len(),
         schema.len()
     );
-}
-
-#[test]
-fn retired_m11_adapter_preserves_length_and_finite_diagnostics_without_initializing_map2() {
-    let model = PolicyModel::fresh(408).expect("model");
-    let identity = model.policy_identity().expect("identity");
-    let error = model
-        .widen_m11_input_parameters(&[0.0])
-        .expect_err("legacy length");
-    assert_eq!(
-        error,
-        ModelError::ParameterLength {
-            actual: 1,
-            expected: 1_684_724
-        }
-    );
-    assert_eq!(
-        error.to_string(),
-        "model parameter length 1 differs from expected 1684724"
-    );
-    let mut source = vec![0.0; 1_684_724];
-    source[123] = f32::NAN;
-    let error = model
-        .widen_m11_input_parameters(&source)
-        .expect_err("legacy finite validation");
-    assert_eq!(error, ModelError::NonFiniteParameter { index: 123 });
-    assert_eq!(error.to_string(), "model parameter 123 is non-finite");
-    source[123] = 0.0;
-    let error = model
-        .widen_m11_input_parameters(&source)
-        .expect_err("retired initialization");
-    assert_eq!(
-        error,
-        ModelError::InvalidModelState(
-            "M11 initialization retired; use pinned M14 Map2 initialization"
-        )
-    );
-    assert_eq!(
-        error.to_string(),
-        "model produced invalid M11 initialization retired; use pinned M14 Map2 initialization"
-    );
-    assert_eq!(
-        model.policy_identity().expect("unchanged identity"),
-        identity
-    );
-}
-
-#[test]
-fn retired_m12_adapter_rejects_current_layout_instead_of_relabelling_it() {
-    let model = PolicyModel::fresh(409).expect("model");
-    model_input_adapter::assert_retired_m12_layout(&model.parameter_schema().expect("schema"));
 }
 
 #[test]

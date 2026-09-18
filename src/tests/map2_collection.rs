@@ -479,13 +479,6 @@ fn map2_neutral_is_a_draw_for_candidate_opponent_and_evaluation() {
             terminal_outcome(&environment, Some(Team::Neutral)),
             Some(PpoTerminalOutcome::Draw)
         );
-        assert_eq!(
-            checkpoint_evaluation_outcome(
-                environment.seats[side].tracker.team(),
-                Some(Team::Neutral)
-            ),
-            CheckpointEvaluationOutcome::Draw
-        );
         assert_eq!(terminal_outcome(&environment, None), None);
     }
 }

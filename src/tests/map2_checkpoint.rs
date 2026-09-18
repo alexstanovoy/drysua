@@ -350,33 +350,3 @@ pub(super) fn schema_hash(descriptor: &str, schemas: &[(u32, u64)]) -> u64 {
         (hash ^ u64::from(*byte)).wrapping_mul(0x0000_0100_0000_01b3)
     })
 }
-
-#[test]
-fn map2_initialization_provenance_names_ancestry_and_disclaims_gameplay_equivalence() {
-    let provenance = crate::Map2InitializationProvenance {
-        source_sha256: [0x63; 32],
-        source_ppo_schema_version: 27,
-        source_ppo_rules_audit_version: 22,
-    };
-    let description = provenance.description();
-    assert!(description.starts_with("INITIALIZATION_ONLY "));
-    for field in [
-        format!("source_m14_sha256={}", "63".repeat(32)),
-        "source_ppo=27 source_rules=22".to_owned(),
-        "target_f=22 target_a=5 target_m=24 target_ppo=37 target_rules=32".to_owned(),
-        format!(
-            "reward_version={} reward_hash={}",
-            crate::MAP2_REWARD_SCHEMA_VERSION,
-            crate::MAP2_REWARD_SCHEMA_HASH
-        ),
-        "old_parameter_bits_preserved=true new_weights=10944_positive_zero".to_owned(),
-        "optimizer_progress_rng_league=fresh gameplay_equivalence=false qualification=false"
-            .to_owned(),
-    ] {
-        assert!(
-            description.contains(&field),
-            "missing provenance field {field}"
-        );
-    }
-    assert!(description.len() < 4_096);
-}

@@ -1005,6 +1005,10 @@ Checkpoint schema v2, hash `4581258024746721724`.
 hard gate отклоняет all-timeout, no-order, server-rejected и >=95% single-action collapse runs.
 Эта итерационная suite не заменяет отдельные sealed promotion seeds.
 
+> **Удалено в wave-6 repo-slim (2026-09-18).** Команда `drysua evaluate` и её
+> фиксированная матрица/quality gate удалены из дерева; текущей встроенной
+> квалификации чекпоинтов нет. См. `artifacts/temp/repo-slim-20260917/DESLOP_WAVES_56.md`.
+
 ## 19. Производительность
 
 Обязательные крупные улучшения:

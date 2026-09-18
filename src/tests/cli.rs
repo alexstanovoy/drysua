@@ -219,38 +219,6 @@ fn cli_rejects_provenance_migration_without_resume() {
 }
 
 #[test]
-fn cli_accepts_fixed_checkpoint_evaluation_matrix() {
-    crate::cli::parse_from([
-        "drysua",
-        "evaluate",
-        "--checkpoint-directory",
-        "training/run/checkpoint",
-        "--pairs",
-        "2",
-        "--decisions",
-        "1024",
-        "--seed",
-        "77",
-    ])
-    .expect("evaluate CLI");
-}
-
-#[test]
-fn cli_evaluation_rejects_legacy_map_selection() {
-    let error = crate::cli::parse_from([
-        "drysua",
-        "evaluate",
-        "--checkpoint-directory",
-        "training/run/checkpoint",
-        "--map",
-        "1",
-    ])
-    .expect_err("evaluation is Map2 only");
-
-    assert!(error.to_string().contains("unexpected argument '--map'"));
-}
-
-#[test]
 fn neural_cli_requires_explicit_weights() {
     let error = crate::cli::parse_from(["drysua", "--policy", "neural"])
         .expect_err("neural cannot fall back");
@@ -397,37 +365,6 @@ fn train_full_map2_rejects_discounting_instead_of_silently_forcing_gamma_one() {
 }
 
 #[test]
-fn cli_evaluate_rejects_removed_neural_map_zero_mode() {
-    let error = crate::cli::parse_from([
-        "drysua",
-        "evaluate",
-        "--checkpoint-directory",
-        ".",
-        "--neural-map0",
-    ])
-    .expect_err("Map0 evaluation is no longer a production mode");
-    assert!(
-        error
-            .to_string()
-            .contains("unexpected argument '--neural-map0'")
-    );
-}
-
-#[test]
-fn cli_map2_evaluation_accepts_teacher_only_without_a_policy_override() {
-    crate::cli::parse_from([
-        "drysua",
-        "evaluate",
-        "--checkpoint-directory",
-        ".",
-        "--teacher-only",
-        "--decisions",
-        &crate::MAP2_ACTOR_DECISIONS.to_string(),
-    ])
-    .expect("bounded full-game pure evaluation");
-}
-
-#[test]
 fn cli_all_training_commands_default_to_map2_and_reject_other_maps_before_execution() {
     for operation in ["train", "train-full"] {
         let help = crate::cli::parse_from(["drysua", operation, "--help"])
@@ -457,16 +394,6 @@ fn cli_all_training_commands_default_to_map2_and_reject_other_maps_before_execut
             );
         }
     }
-}
-
-#[test]
-fn cli_map2_evaluation_defaults_to_the_complete_episode_action_cap() {
-    let help = crate::cli::parse_from(["drysua", "evaluate", "--help"])
-        .expect_err("help")
-        .to_string();
-    assert!(help.contains("Map2"));
-    assert!(help.contains(&format!("[default: {}]", crate::MAP2_ACTOR_DECISIONS)));
-    assert!(help.contains(&format!("{} ticks including pregame", crate::MAP2_TICK_CAP)));
 }
 
 #[cfg(feature = "builtin")]

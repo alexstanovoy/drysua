@@ -23,8 +23,6 @@ struct Cli {
 enum Operation {
     /// Passively score copied native participant frames from stdin; never sends orders or ACKs.
     RewardObserver(RewardObserverArgs),
-    /// Evaluate greedy Neural on Map2 across baselines and sides, without Teacher overrides.
-    Evaluate(EvaluateArgs),
     /// Connect to a server and play one match.
     Play(PlayArgs),
     /// Run a bounded stage-nine PPO actor-to-learner smoke training.
@@ -41,27 +39,6 @@ struct RewardObserverArgs {
     /// Complete ticks between diagnostic intervals.
     #[arg(long, default_value_t = 300, value_parser = clap::value_parser!(u32).range(30..=27_900))]
     interval_ticks: u32,
-}
-
-/// Options for a fixed deterministic pure Neural Map2 evaluation matrix.
-#[derive(Args)]
-struct EvaluateArgs {
-    /// Omit the secondary weak-opponent cohort from pure Neural Map2 evaluation.
-    #[arg(long)]
-    teacher_only: bool,
-    /// Directory containing drysua.weights.safetensors.
-    #[arg(long)]
-    checkpoint_directory: std::path::PathBuf,
-    /// Paired held-out seeds per baseline, bounded to eight.
-    #[arg(long, default_value_t = 1)]
-    pairs: usize,
-    /// Greedy actor decisions up to the native Map2 cap, including pregame.
-    #[arg(long, default_value_t = crate::MAP2_ACTOR_DECISIONS,
-        help = format!("Greedy {}-tick decisions, at most {} ({} ticks including pregame)", crate::MAP2_DECISION_INTERVAL_TICKS, crate::MAP2_ACTOR_DECISIONS, crate::MAP2_TICK_CAP))]
-    decisions: usize,
-    /// First deterministic held-out seed.
-    #[arg(long, default_value_t = 90_001)]
-    seed: u64,
 }
 
 /// Options for one server match.
@@ -224,7 +201,6 @@ fn run(arguments: Cli) -> std::io::Result<()> {
         Some(Operation::RewardObserver(observer)) => {
             return crate::reward_observer::run(&observer.output, observer.interval_ticks);
         }
-        Some(Operation::Evaluate(evaluate)) => return run_evaluate(evaluate),
         Some(Operation::Play(play)) => play,
         Some(Operation::Train(train)) => return run_train(train),
         Some(Operation::TrainFull(train)) => return run_train_full(train),
@@ -282,96 +258,6 @@ fn resolve_play_deployment(
         return Ok((PlayPolicy::Hybrid, play.weights_directory.clone()));
     }
     crate::default_deployment::DEFAULT_DEPLOYMENT.resolve()
-}
-
-#[cfg(feature = "builtin")]
-fn run_evaluate(arguments: EvaluateArgs) -> std::io::Result<()> {
-    let settings = crate::CheckpointEvaluationConfig {
-        pairs: arguments.pairs,
-        decisions: arguments.decisions,
-        seed: arguments.seed,
-    };
-    let report = crate::ppo_arena::evaluate_neural_map_two_checkpoint_cohort(
-        settings,
-        &arguments.checkpoint_directory,
-        arguments.teacher_only,
-    )
-    .map_err(std::io::Error::other)?;
-    let mut wins = 0usize;
-    let mut losses = 0usize;
-    let mut draws = 0usize;
-    let mut timeouts = 0usize;
-    for game in &report.games {
-        match game.outcome {
-            crate::CheckpointEvaluationOutcome::Win
-                if game.rejected_orders == 0 && game.baseline_rejected_orders == 0 =>
-            {
-                wins += 1
-            }
-            crate::CheckpointEvaluationOutcome::Win => {}
-            crate::CheckpointEvaluationOutcome::Loss => losses += 1,
-            crate::CheckpointEvaluationOutcome::Draw => draws += 1,
-            crate::CheckpointEvaluationOutcome::Timeout => timeouts += 1,
-        }
-        print_evaluation_game(game);
-    }
-    let quality = report.quality();
-    println!(
-        "evaluation: fingerprint={:016x} games={} wins={} losses={} draws={} timeouts={} idle={} collapsed={} baseline_failures={} weak_losses={} weak_stalled={} rejected={} quality_pass={}",
-        report.fingerprint,
-        report.games.len(),
-        wins,
-        losses,
-        draws,
-        timeouts,
-        quality.idle_games,
-        quality.collapsed_games,
-        quality.baseline_failure_games,
-        quality.weak_loss_games,
-        quality.weak_stalled_games,
-        quality.rejected_orders,
-        quality.passed,
-    );
-    if !quality.passed {
-        return Err(std::io::Error::other(
-            "checkpoint evaluation quality gate failed",
-        ));
-    }
-    Ok(())
-}
-
-#[cfg(feature = "builtin")]
-fn print_evaluation_game(game: &crate::CheckpointEvaluationGame) {
-    println!(
-        "map={} baseline={:?} team={:?} seed={} outcome={:?} decisions={} orders={} rejected={} baseline_orders={} baseline_rejected={} continue={} actions={:?} level={} gold={} kills={} deaths={} last_hits={} denies={} enemy_structures_destroyed={} elapsed_ticks={}",
-        game.map.0,
-        game.baseline,
-        game.candidate_team,
-        game.seed,
-        game.outcome,
-        game.decisions,
-        game.wire_orders,
-        game.rejected_orders,
-        game.baseline_wire_orders,
-        game.baseline_rejected_orders,
-        game.action_counts[crate::ActionKind::Continue.index()],
-        game.action_counts,
-        game.final_summary.own_level,
-        game.final_summary.own_gold,
-        game.final_summary.allied.kills,
-        game.final_summary.allied.deaths,
-        game.final_summary.allied.last_hits,
-        game.final_summary.allied.denies,
-        game.final_summary.enemy_structures_destroyed,
-        game.elapsed_ticks,
-    );
-}
-
-#[cfg(not(feature = "builtin"))]
-fn run_evaluate(_: EvaluateArgs) -> std::io::Result<()> {
-    Err(std::io::Error::other(
-        "checkpoint evaluation requires cargo feature `builtin`",
-    ))
 }
 
 #[cfg(feature = "builtin")]

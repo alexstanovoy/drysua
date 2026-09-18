@@ -173,149 +173,11 @@ pub struct TrainingJobReport {
     pub elapsed_ticks: u64,
 }
 
-/// Fixed held-out checkpoint evaluation settings.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CheckpointEvaluationConfig {
-    pub pairs: usize,
-    pub decisions: usize,
-    pub seed: u64,
-}
-
 /// Independent opponent used by one fixed evaluation cohort.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum CheckpointEvaluationBaseline {
     Teacher,
     Weak,
-}
-
-/// A timeout is distinct from an authoritative simulator result.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CheckpointEvaluationOutcome {
-    Win,
-    Loss,
-    Draw,
-    Timeout,
-}
-
-/// Seat-visible activity and gameplay result for one deterministic match.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CheckpointEvaluationGame {
-    pub map: MapId,
-    pub baseline: CheckpointEvaluationBaseline,
-    pub seed: u64,
-    pub candidate_team: Team,
-    pub outcome: CheckpointEvaluationOutcome,
-    pub decisions: u32,
-    pub wire_orders: u32,
-    pub rejected_orders: u32,
-    pub baseline_wire_orders: u32,
-    pub baseline_rejected_orders: u32,
-    pub elapsed_ticks: u32,
-    pub action_counts: [u32; ActionKind::COUNT],
-    pub final_summary: crate::GlobalSummary,
-}
-
-/// Complete fixed matrix over both maps, baselines, sides, and paired seeds.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CheckpointEvaluationReport {
-    pub fingerprint: u64,
-    pub games: Vec<CheckpointEvaluationGame>,
-}
-
-/// Hard failures that prevent a checkpoint from continuing to train or ship.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct CheckpointEvaluationQuality {
-    pub passed: bool,
-    pub win_games: usize,
-    pub timeout_games: usize,
-    pub idle_games: usize,
-    pub collapsed_games: usize,
-    pub baseline_failure_games: usize,
-    pub weak_loss_games: usize,
-    pub weak_stalled_games: usize,
-    pub rejected_orders: u64,
-}
-
-impl CheckpointEvaluationReport {
-    pub fn quality(&self) -> CheckpointEvaluationQuality {
-        let win_games = self
-            .games
-            .iter()
-            .filter(|game| game.outcome == CheckpointEvaluationOutcome::Win)
-            .count();
-        let timeout_games = self
-            .games
-            .iter()
-            .filter(|game| game.outcome == CheckpointEvaluationOutcome::Timeout)
-            .count();
-        let idle_games = self
-            .games
-            .iter()
-            .filter(|game| game.wire_orders == 0)
-            .count();
-        let collapsed_games = self
-            .games
-            .iter()
-            .filter(|game| action_distribution_collapsed(game))
-            .count();
-        let baseline_failure_games = self
-            .games
-            .iter()
-            .filter(|game| {
-                game.baseline == CheckpointEvaluationBaseline::Teacher
-                    && (game.baseline_wire_orders == 0 || game.baseline_rejected_orders > 0)
-            })
-            .count();
-        let weak_loss_games = self
-            .games
-            .iter()
-            .filter(|game| {
-                game.baseline == CheckpointEvaluationBaseline::Weak
-                    && game.outcome == CheckpointEvaluationOutcome::Loss
-            })
-            .count();
-        let weak_stalled_games = self
-            .games
-            .iter()
-            .filter(|game| {
-                game.baseline == CheckpointEvaluationBaseline::Weak
-                    && (game.outcome == CheckpointEvaluationOutcome::Timeout
-                        || (game.map == MapId(2)
-                            && game.outcome == CheckpointEvaluationOutcome::Draw
-                            && game.final_summary.tick == episode::TICK_CAP))
-                    && game.final_summary.enemy_structures_destroyed == 0
-            })
-            .count();
-        let rejected_orders = self
-            .games
-            .iter()
-            .map(|game| u64::from(game.rejected_orders))
-            .sum();
-        CheckpointEvaluationQuality {
-            passed: !self.games.is_empty()
-                && win_games > 0
-                && timeout_games < self.games.len()
-                && idle_games == 0
-                && collapsed_games == 0
-                && baseline_failure_games == 0
-                && weak_loss_games == 0
-                && weak_stalled_games == 0
-                && rejected_orders == 0,
-            win_games,
-            timeout_games,
-            idle_games,
-            collapsed_games,
-            baseline_failure_games,
-            weak_loss_games,
-            weak_stalled_games,
-            rejected_orders,
-        }
-    }
-}
-
-fn action_distribution_collapsed(game: &CheckpointEvaluationGame) -> bool {
-    let maximum = game.action_counts.iter().copied().max().unwrap_or(0);
-    u64::from(maximum).saturating_mul(100) >= u64::from(game.decisions).saturating_mul(95)
 }
 
 struct ArenaSeatPolicy {
@@ -434,76 +296,6 @@ impl TrainingCheckpointSchedule {
     }
 }
 
-pub(crate) fn evaluate_neural_map_two_checkpoint_cohort(
-    settings: CheckpointEvaluationConfig,
-    checkpoint_directory: &Path,
-    teacher_only: bool,
-) -> Result<CheckpointEvaluationReport, PpoError> {
-    evaluate_checkpoint_matrix(settings, checkpoint_directory, &[MapId(2)], teacher_only)
-}
-
-fn evaluate_checkpoint_matrix(
-    settings: CheckpointEvaluationConfig,
-    checkpoint_directory: &Path,
-    maps: &[MapId],
-    teacher_only: bool,
-) -> Result<CheckpointEvaluationReport, PpoError> {
-    validate_checkpoint_evaluation(settings)?;
-    let model = PolicyModel::fresh(settings.seed).map_err(text_error)?;
-    TrainingArtifact::load_runtime_weights(&model, checkpoint_directory).map_err(text_error)?;
-    let fingerprint = PolicySnapshot::capture(&model, 0)
-        .map_err(text_error)?
-        .fingerprint();
-    let match_count = settings
-        .pairs
-        .checked_mul(4 * maps.len())
-        .ok_or(PpoError::InvalidConfig("checkpoint evaluation matches"))?;
-    let mut games = Vec::with_capacity(match_count);
-    for &map in maps {
-        for baseline in [
-            CheckpointEvaluationBaseline::Teacher,
-            CheckpointEvaluationBaseline::Weak,
-        ] {
-            if teacher_only && baseline == CheckpointEvaluationBaseline::Weak {
-                continue;
-            }
-            for pair in 0..settings.pairs {
-                let seed = settings
-                    .seed
-                    .checked_add(pair as u64)
-                    .ok_or(PpoError::InvalidConfig("checkpoint evaluation seed"))?;
-                for candidate_seat in 0..2 {
-                    games.push(evaluate_checkpoint_game_with_policy(
-                        &model,
-                        settings,
-                        map,
-                        baseline,
-                        seed,
-                        candidate_seat,
-                        true,
-                    )?);
-                }
-            }
-        }
-    }
-    Ok(CheckpointEvaluationReport { fingerprint, games })
-}
-
-fn validate_checkpoint_evaluation(settings: CheckpointEvaluationConfig) -> Result<(), PpoError> {
-    if !(1..=8).contains(&settings.pairs) {
-        return Err(PpoError::InvalidConfig("checkpoint evaluation pairs"));
-    }
-    if !(1..=episode::ACTOR_DECISIONS).contains(&settings.decisions) {
-        return Err(PpoError::InvalidConfig("checkpoint evaluation decisions"));
-    }
-    settings
-        .seed
-        .checked_add(settings.pairs as u64)
-        .ok_or(PpoError::InvalidConfig("checkpoint evaluation seed"))?;
-    Ok(())
-}
-
-/// Runs the complete actor-to-learner path on one selected backend.
 pub fn run_ppo_smoke_on(
     settings: PpoSmokeConfig,
     device: PolicyDevice,
@@ -2138,103 +1930,6 @@ fn build_opponent(spec: &OpponentSpec, _seed: u64) -> Result<OpponentRuntime, Pp
     }
 }
 
-fn evaluate_checkpoint_game_with_policy(
-    candidate: &PolicyModel,
-    settings: CheckpointEvaluationConfig,
-    map: MapId,
-    baseline: CheckpointEvaluationBaseline,
-    seed: u64,
-    candidate_seat: usize,
-    neural: bool,
-) -> Result<CheckpointEvaluationGame, PpoError> {
-    let opponent = match baseline {
-        CheckpointEvaluationBaseline::Teacher => OpponentSpec::Teacher,
-        CheckpointEvaluationBaseline::Weak => OpponentSpec::Weak,
-    };
-    let opponent_seed = derive_training_seed(seed, map.0 as u64, baseline_domain(baseline));
-    let mut environment = build_environment(seed, opponent_seed, map, candidate_seat, 0, opponent)?;
-    let candidate_team = environment.seats[candidate_seat].tracker.team();
-    let mut action_counts = [0u32; ActionKind::COUNT];
-    let mut decisions = 0u32;
-    let mut elapsed_ticks = 0u32;
-    let mut winner = None;
-    for _ in 0..settings.decisions {
-        let tick = environment.seats[candidate_seat]
-            .tracker
-            .current()
-            .ok_or(PpoError::InvalidTransition("evaluation snapshot"))?
-            .tick;
-        if neural && tick >= episode::TICK_CAP {
-            break;
-        }
-        let (requests, action) = if neural {
-            requests_for_neural_greedy_decision(&mut environment, candidate)?
-        } else {
-            requests_for_greedy_decision(&mut environment, candidate)?
-        };
-        let interval = if neural {
-            crate::MAP2_DECISION_INTERVAL_TICKS.min(episode::TICK_CAP - tick)
-        } else {
-            crate::MAP2_DECISION_INTERVAL_TICKS
-        };
-        let advanced = advance_interval(&mut environment, requests, interval)?;
-        action_counts[action.index()] = action_counts[action.index()]
-            .checked_add(1)
-            .ok_or(PpoError::CounterOverflow)?;
-        decisions = decisions.checked_add(1).ok_or(PpoError::CounterOverflow)?;
-        elapsed_ticks = elapsed_ticks
-            .checked_add(advanced.ticks)
-            .ok_or(PpoError::CounterOverflow)?;
-        if advanced.winner.is_some() {
-            winner = advanced.winner;
-            break;
-        }
-    }
-    let seat = &environment.seats[candidate_seat];
-    let baseline_seat = &environment.seats[1 - candidate_seat];
-    let rejected_orders = u32::try_from(seat.rejections)
-        .map_err(|_| PpoError::InvalidTransition("evaluation rejection count"))?;
-    let final_summary = seat
-        .tracker
-        .latest_summary()
-        .ok_or(PpoError::InvalidTransition("evaluation final summary"))?;
-    Ok(CheckpointEvaluationGame {
-        map,
-        baseline,
-        seed,
-        candidate_team,
-        outcome: checkpoint_evaluation_outcome(candidate_team, winner),
-        decisions,
-        wire_orders: seat.sequence,
-        rejected_orders,
-        baseline_wire_orders: baseline_seat.sequence,
-        baseline_rejected_orders: u32::try_from(baseline_seat.rejections)
-            .map_err(|_| PpoError::InvalidTransition("baseline rejection count"))?,
-        elapsed_ticks,
-        action_counts,
-        final_summary,
-    })
-}
-
-const fn baseline_domain(baseline: CheckpointEvaluationBaseline) -> u64 {
-    match baseline {
-        CheckpointEvaluationBaseline::Teacher => 0x7465_6163_6865_7221,
-        CheckpointEvaluationBaseline::Weak => 0x7765_616b_5f5f_5f5f,
-    }
-}
-
-fn checkpoint_evaluation_outcome(
-    candidate: Team,
-    winner: Option<Team>,
-) -> CheckpointEvaluationOutcome {
-    match winner {
-        Some(Team::Neutral) => CheckpointEvaluationOutcome::Draw,
-        Some(winner) if winner == candidate => CheckpointEvaluationOutcome::Win,
-        Some(_) => CheckpointEvaluationOutcome::Loss,
-        None => CheckpointEvaluationOutcome::Timeout,
-    }
-}
-
 fn setup_seats(start: ArenaStart) -> Result<Vec<ArenaSeatPolicy>, PpoError> {
     start
         .messages
@@ -2679,6 +2374,7 @@ fn requests_for_decision_in_space(
     Ok(requests)
 }
 
+#[cfg(test)]
 fn requests_for_neural_greedy_decision(
     environment: &mut TrainingEnvironment,
     model: &PolicyModel,
@@ -2710,17 +2406,6 @@ fn neural_policy_request_in_space(
         .map_err(|error| PpoError::Model(error.to_string()))?;
     let request = issue_request(seat, issued, space, action, false)?;
     Ok((action, request))
-}
-
-fn requests_for_greedy_decision(
-    environment: &mut TrainingEnvironment,
-    model: &PolicyModel,
-) -> Result<(Vec<Option<Request>>, ActionKind), PpoError> {
-    let policy_seat = environment.policy_seat;
-    let (action, candidate_request) =
-        greedy_policy_request(&mut environment.seats[policy_seat], model)?;
-    let requests = requests_with_candidate(environment, candidate_request)?;
-    Ok((requests, action))
 }
 
 fn requests_for_batched_greedy_decisions(
@@ -2783,37 +2468,6 @@ fn requests_with_candidate(
         requests.push(request);
     }
     Ok(requests)
-}
-
-fn greedy_policy_request(
-    seat: &mut ArenaSeatPolicy,
-    model: &PolicyModel,
-) -> Result<(ActionKind, Option<Request>), PpoError> {
-    if deployment_uses_teacher(seat.tracker.metadata().map) {
-        return teacher_request_with_action(seat);
-    }
-    let (frame, space) = prepare_seat_policy_sample(seat)?;
-    let action = model.choose(&frame, &space).map_err(text_error)?.action;
-    greedy_policy_request_in_space(seat, action, &space)
-}
-
-fn greedy_policy_request_in_space(
-    seat: &mut ArenaSeatPolicy,
-    proposed: crate::StructuredAction,
-    space: &ActionSpace,
-) -> Result<(ActionKind, Option<Request>), PpoError> {
-    let action = seat
-        .teacher
-        .deployment_action(&seat.tracker, space)
-        .unwrap_or(proposed);
-    seat.local
-        .note_decision(space.tick(), action.kind())
-        .map_err(|error| PpoError::Model(error.to_string()))?;
-    let issued = space
-        .decode(action)
-        .map_err(|error| PpoError::Model(error.to_string()))?;
-    let request = issue_request(seat, issued, space, action.kind(), true)?;
-    Ok((action.kind(), request))
 }
 
 fn opponent_request(
@@ -2891,6 +2545,7 @@ fn teacher_request_with_action(
     Ok((action_kind, request))
 }
 
+#[cfg(test)]
 const fn deployment_uses_teacher(map: MapId) -> bool {
     matches!(map, MapId(0))
 }
@@ -3176,10 +2831,6 @@ fn text_error(error: impl std::fmt::Display) -> PpoError {
 fn pipeline_error(error: impl std::fmt::Display) -> PpoError {
     PpoError::Model(format!("actor-learner pipeline: {error}"))
 }
-
-#[cfg(test)]
-#[path = "tests/ppo_pregame.rs"]
-mod pregame_tests;
 
 #[cfg(test)]
 #[path = "tests/training_collection_slice.rs"]
