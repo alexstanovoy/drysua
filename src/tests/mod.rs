@@ -34,6 +34,7 @@ mod parity;
 mod persistence;
 mod pipeline;
 mod ppo;
+#[cfg(feature = "builtin")]
 mod pregame_server;
 mod progress_debt_features;
 mod progress_debt_initialization;

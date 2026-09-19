@@ -1,4 +1,9 @@
 use std::collections::VecDeque;
+mod annealed;
+pub use annealed::{
+    ANNEALED_EPISODE_DECISIONS, AnnealedJobConfig, AnnealedJobReport, AnnealedOpponent,
+    run_annealed_job_on_with_initial_weights,
+};
 pub(crate) mod episode;
 mod parallel;
 mod reward;
@@ -13,13 +18,13 @@ pub(crate) use test_support::*;
 pub(crate) mod training_order_contract;
 use std::fs::{File, OpenOptions};
 use std::path::Path;
-#[cfg(test)]
 use std::sync::Arc;
 use std::sync::mpsc::sync_channel;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use bota_proto::{EventKind, MapId, RejectReason, ServerMsg, SlotId, Team};
+use bota_server::game::SpawnModifier;
 
 use crate::persistence::training::PolicyOrderBookkeeping;
 use crate::telemetry::{
@@ -214,14 +219,12 @@ struct TrainingEnvironment {
 enum OpponentSpec {
     #[cfg(test)]
     Policy(PolicySnapshot),
-    #[cfg(test)]
     SharedPolicy(Arc<PolicyModel>),
     Teacher,
     Weak,
 }
 
 enum OpponentRuntime {
-    #[cfg(test)]
     Policy {
         model: Arc<PolicyModel>,
         rng: PpoRng,
@@ -817,6 +820,143 @@ where
     Ok(session.report())
 }
 
+/// Session counters merged from actor reports and read by checkpoints.
+///
+/// Both training sessions keep the same set, so merging and reporting live
+/// here once.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct SmokeCounters {
+    pub(crate) map2_reward: Map2TrainingReward,
+    pub(crate) episode_timeouts: u64,
+    pub(crate) terminal_wins: u64,
+    pub(crate) terminal_losses: u64,
+    pub(crate) terminal_draws: u64,
+    pub(crate) rejected_orders: u64,
+    pub(crate) elapsed_ticks: u64,
+}
+
+impl SmokeCounters {
+    /// Adds one actor report's counters into the running totals.
+    pub(crate) fn merge(&mut self, report: &PpoSmokeReport) -> Result<(), PpoError> {
+        self.map2_reward.merge(report.map2_reward)?;
+        self.episode_timeouts = self
+            .episode_timeouts
+            .checked_add(report.episode_timeouts)
+            .ok_or(PpoError::CounterOverflow)?;
+        self.terminal_wins = self
+            .terminal_wins
+            .checked_add(report.terminal_wins)
+            .ok_or(PpoError::CounterOverflow)?;
+        self.terminal_losses = self
+            .terminal_losses
+            .checked_add(report.terminal_losses)
+            .ok_or(PpoError::CounterOverflow)?;
+        self.terminal_draws = self
+            .terminal_draws
+            .checked_add(report.terminal_draws)
+            .ok_or(PpoError::CounterOverflow)?;
+        self.rejected_orders = self
+            .rejected_orders
+            .checked_add(report.rejected_orders)
+            .ok_or(PpoError::CounterOverflow)?;
+        self.elapsed_ticks = self
+            .elapsed_ticks
+            .checked_add(report.elapsed_ticks)
+            .ok_or(PpoError::CounterOverflow)?;
+        Ok(())
+    }
+}
+
+/// One checkpoint report from the running counters and the latest update.
+pub(crate) fn training_checkpoint_report(
+    counters: &SmokeCounters,
+    completed_updates: u64,
+    optimizer_step: u64,
+    rollout_samples: u64,
+    latest: PpoUpdateReport,
+    cleanup_warning: Option<String>,
+) -> TrainingCheckpointReport {
+    TrainingCheckpointReport {
+        map2_reward: counters.map2_reward,
+        episode_timeouts: counters.episode_timeouts,
+        completed_updates,
+        optimizer_step,
+        rollout_samples,
+        policy_loss: latest.policy_loss,
+        value_loss: latest.value_loss,
+        entropy: latest.entropy,
+        approximate_kl: update_kl(latest),
+        stopped_for_kl: latest.stopped_for_kl,
+        terminal_wins: counters.terminal_wins,
+        terminal_losses: counters.terminal_losses,
+        terminal_draws: counters.terminal_draws,
+        rejected_orders: counters.rejected_orders,
+        elapsed_ticks: counters.elapsed_ticks,
+        cleanup_warning,
+    }
+}
+
+/// Everything one durable checkpoint is captured from.
+pub(crate) struct SessionCheckpoint<'a> {
+    pub(crate) model: &'a PolicyModel,
+    pub(crate) trainer: &'a PpoTrainer,
+    pub(crate) run: &'a CheckpointRun,
+    pub(crate) sampling: &'a PpoRng,
+    pub(crate) completed_updates: u64,
+    pub(crate) rollout_samples: u64,
+    pub(crate) mastery: Option<crate::MasteryProgress>,
+}
+
+/// Captures and commits one durable checkpoint plus the runtime weights.
+pub(crate) fn save_training_artifact(
+    session: SessionCheckpoint<'_>,
+    directory: &Path,
+    report: TrainingCheckpointReport,
+) -> Result<TrainingCheckpointReport, PpoError> {
+    let (state, draws) = session.sampling.checkpoint();
+    let progress = CheckpointProgress {
+        mastery: session.mastery,
+        global_update: session.completed_updates,
+        policy_version: session.completed_updates,
+        scheduler_step: session.completed_updates,
+        curriculum_stage: 0,
+        rollout_samples: session.rollout_samples,
+        best_evaluation: None,
+        rng_states: vec![
+            RngCheckpoint::new("ppo_actor_sampling", state, draws).map_err(text_error)?,
+        ],
+        league_references: Vec::new(),
+    };
+    let artifact = TrainingArtifact::capture(
+        session.model,
+        session.trainer,
+        session.run.clone(),
+        progress,
+    )
+    .map_err(text_error)?;
+    let outcome = artifact.save(directory).map_err(text_error)?;
+    TrainingArtifact::save_runtime_weights(session.model, directory).map_err(text_error)?;
+    let cleanup_warning = match outcome {
+        CheckpointSaveOutcome::Committed => None,
+        CheckpointSaveOutcome::CommittedWithCleanupError(message) => Some(message),
+    };
+    Ok(TrainingCheckpointReport {
+        cleanup_warning,
+        ..report
+    })
+}
+
+/// The device name recorded in a run scope.
+pub(crate) fn device_name(device: PolicyDevice) -> &'static str {
+    match device {
+        PolicyDevice::Cpu => "cpu",
+        #[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
+        PolicyDevice::Cuda { .. } => "cuda",
+        #[cfg(all(feature = "metal", target_os = "macos"))]
+        PolicyDevice::Metal { .. } => "metal",
+    }
+}
+
 struct RestoredTrainingSession {
     trainer: PpoTrainer,
     sampling: PpoRng,
@@ -828,8 +968,7 @@ struct RestoredTrainingSession {
 
 struct TrainingSession {
     mastery: Option<crate::MasteryProgress>,
-    map2_reward: Map2TrainingReward,
-    episode_timeouts: u64,
+    counters: SmokeCounters,
     model: PolicyModel,
     trainer: PpoTrainer,
     sampling: PpoRng,
@@ -839,11 +978,6 @@ struct TrainingSession {
     latest: PpoUpdateReport,
     migrated_provenance: bool,
     starting_policy_fingerprint: u64,
-    terminal_wins: u64,
-    terminal_losses: u64,
-    terminal_draws: u64,
-    rejected_orders: u64,
-    elapsed_ticks: u64,
 }
 
 impl TrainingSession {
@@ -920,8 +1054,7 @@ impl TrainingSession {
             mastery: restored.mastery,
             model,
             trainer: restored.trainer,
-            map2_reward: Map2TrainingReward::default(),
-            episode_timeouts: 0,
+            counters: SmokeCounters::default(),
             sampling: restored.sampling,
             run,
             completed_updates: restored.completed_updates,
@@ -929,11 +1062,6 @@ impl TrainingSession {
             latest: PpoUpdateReport::default(),
             migrated_provenance: restored.migrated_provenance,
             starting_policy_fingerprint,
-            terminal_wins: 0,
-            terminal_losses: 0,
-            terminal_draws: 0,
-            rejected_orders: 0,
-            elapsed_ticks: 0,
         })
     }
 
@@ -1046,32 +1174,7 @@ impl TrainingSession {
     }
 
     fn accumulate_actor_counters(&mut self, actor_report: &PpoSmokeReport) -> Result<(), PpoError> {
-        self.map2_reward.merge(actor_report.map2_reward)?;
-        self.episode_timeouts = self
-            .episode_timeouts
-            .checked_add(actor_report.episode_timeouts)
-            .ok_or(PpoError::CounterOverflow)?;
-        self.terminal_wins = self
-            .terminal_wins
-            .checked_add(actor_report.terminal_wins)
-            .ok_or(PpoError::CounterOverflow)?;
-        self.terminal_losses = self
-            .terminal_losses
-            .checked_add(actor_report.terminal_losses)
-            .ok_or(PpoError::CounterOverflow)?;
-        self.terminal_draws = self
-            .terminal_draws
-            .checked_add(actor_report.terminal_draws)
-            .ok_or(PpoError::CounterOverflow)?;
-        self.rejected_orders = self
-            .rejected_orders
-            .checked_add(actor_report.rejected_orders)
-            .ok_or(PpoError::CounterOverflow)?;
-        self.elapsed_ticks = self
-            .elapsed_ticks
-            .checked_add(actor_report.elapsed_ticks)
-            .ok_or(PpoError::CounterOverflow)?;
-        Ok(())
+        self.counters.merge(actor_report)
     }
 
     fn next_mastery(
@@ -1112,54 +1215,30 @@ impl TrainingSession {
         directory: &Path,
         report: TrainingCheckpointReport,
     ) -> Result<TrainingCheckpointReport, PpoError> {
-        let (state, draws) = self.sampling.checkpoint();
-        let progress = CheckpointProgress {
-            mastery: self.mastery.clone(),
-            global_update: self.completed_updates,
-            policy_version: self.completed_updates,
-            scheduler_step: self.completed_updates,
-            curriculum_stage: 0,
-            rollout_samples: self.rollout_samples,
-            best_evaluation: None,
-            rng_states: vec![
-                RngCheckpoint::new("ppo_actor_sampling", state, draws).map_err(text_error)?,
-            ],
-            league_references: Vec::new(),
-        };
-        let artifact =
-            TrainingArtifact::capture(&self.model, &self.trainer, self.run.clone(), progress)
-                .map_err(text_error)?;
-        let outcome = artifact.save(directory).map_err(text_error)?;
-        TrainingArtifact::save_runtime_weights(&self.model, directory).map_err(text_error)?;
-        let cleanup_warning = match outcome {
-            CheckpointSaveOutcome::Committed => None,
-            CheckpointSaveOutcome::CommittedWithCleanupError(message) => Some(message),
-        };
-        Ok(TrainingCheckpointReport {
-            cleanup_warning,
-            ..report
-        })
+        save_training_artifact(
+            SessionCheckpoint {
+                model: &self.model,
+                trainer: &self.trainer,
+                run: &self.run,
+                sampling: &self.sampling,
+                completed_updates: self.completed_updates,
+                rollout_samples: self.rollout_samples,
+                mastery: self.mastery.clone(),
+            },
+            directory,
+            report,
+        )
     }
 
     fn checkpoint_report(&self, cleanup_warning: Option<String>) -> TrainingCheckpointReport {
-        TrainingCheckpointReport {
-            map2_reward: self.map2_reward,
-            episode_timeouts: self.episode_timeouts,
-            completed_updates: self.completed_updates,
-            optimizer_step: self.trainer.optimizer_step(),
-            rollout_samples: self.rollout_samples,
-            policy_loss: self.latest.policy_loss,
-            value_loss: self.latest.value_loss,
-            entropy: self.latest.entropy,
-            approximate_kl: update_kl(self.latest),
-            stopped_for_kl: self.latest.stopped_for_kl,
-            terminal_wins: self.terminal_wins,
-            terminal_losses: self.terminal_losses,
-            terminal_draws: self.terminal_draws,
-            rejected_orders: self.rejected_orders,
-            elapsed_ticks: self.elapsed_ticks,
+        training_checkpoint_report(
+            &self.counters,
+            self.completed_updates,
+            self.trainer.optimizer_step(),
+            self.rollout_samples,
+            self.latest,
             cleanup_warning,
-        }
+        )
     }
 
     fn report(&self) -> TrainingJobReport {
@@ -1168,8 +1247,8 @@ impl TrainingSession {
                 .mastery
                 .as_ref()
                 .is_some_and(crate::MasteryProgress::completed),
-            map2_reward: self.map2_reward,
-            episode_timeouts: self.episode_timeouts,
+            map2_reward: self.counters.map2_reward,
+            episode_timeouts: self.counters.episode_timeouts,
             starting_policy_fingerprint: self.starting_policy_fingerprint,
             completed_updates: self.completed_updates,
             optimizer_step: self.trainer.optimizer_step(),
@@ -1178,11 +1257,11 @@ impl TrainingSession {
             final_value_loss: self.latest.value_loss,
             final_entropy: self.latest.entropy,
             final_kl: update_kl(self.latest),
-            terminal_wins: self.terminal_wins,
-            terminal_losses: self.terminal_losses,
-            terminal_draws: self.terminal_draws,
-            rejected_orders: self.rejected_orders,
-            elapsed_ticks: self.elapsed_ticks,
+            terminal_wins: self.counters.terminal_wins,
+            terminal_losses: self.counters.terminal_losses,
+            terminal_draws: self.counters.terminal_draws,
+            rejected_orders: self.counters.rejected_orders,
+            elapsed_ticks: self.counters.elapsed_ticks,
         }
     }
 }
@@ -1243,7 +1322,7 @@ fn record_update(
     Ok(())
 }
 
-fn update_kl(update: PpoUpdateReport) -> f64 {
+pub(crate) fn update_kl(update: PpoUpdateReport) -> f64 {
     if update.stopped_for_kl {
         update.rejected_kl
     } else {
@@ -1447,13 +1526,7 @@ fn training_checkpoint_run(
     device: PolicyDevice,
     config: PpoConfig,
 ) -> Result<CheckpointRun, PpoError> {
-    let device_name = match device {
-        PolicyDevice::Cpu => "cpu",
-        #[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
-        PolicyDevice::Cuda { .. } => "cuda",
-        #[cfg(all(feature = "metal", target_os = "macos"))]
-        PolicyDevice::Metal { .. } => "metal",
-    };
+    let device_name = device_name(device);
     let mut command_line = format!(
         "train-full --environments {} --rollout {} --epochs {} --minibatch {} --seed {} --map {} --device {device_name}",
         config.environments,
@@ -1512,20 +1585,54 @@ fn restore_training_session(
     config: PpoConfig,
     provenance: ResumeProvenance,
 ) -> Result<RestoredTrainingSession, PpoError> {
-    let (artifact, restore_run, migrated) = match provenance {
-        ResumeProvenance::Strict => (
-            TrainingArtifact::load_compatible(directory, run).map_err(text_error)?,
-            run.clone(),
-            false,
-        ),
+    let parts = match provenance {
+        ResumeProvenance::Strict => restore_strict_session(model, directory, run, config)?,
         ResumeProvenance::MigrateGitCommit => {
             let artifact = TrainingArtifact::load(directory).map_err(text_error)?;
             let restore_run = artifact.run().clone();
             validate_provenance_migration(&restore_run, run)?;
-            (artifact, restore_run, true)
+            restore_loaded_session(model, artifact, &restore_run, config, true)?
         }
     };
-    let restored = artifact.restore(model, &restore_run).map_err(text_error)?;
+    let progress = parts.progress;
+    Ok(RestoredTrainingSession {
+        trainer: parts.trainer,
+        sampling: parts.sampling,
+        completed_updates: progress.global_update,
+        rollout_samples: progress.rollout_samples,
+        migrated_provenance: parts.migrated,
+        mastery: progress.mastery,
+    })
+}
+
+/// One restored strict session's parts.
+pub(crate) struct RestoredSessionParts {
+    pub(crate) trainer: PpoTrainer,
+    pub(crate) sampling: PpoRng,
+    pub(crate) progress: CheckpointProgress,
+    pub(crate) migrated: bool,
+}
+
+/// Restores a checkpoint whose run scope must match exactly.
+pub(crate) fn restore_strict_session(
+    model: &PolicyModel,
+    directory: &Path,
+    run: &CheckpointRun,
+    config: PpoConfig,
+) -> Result<RestoredSessionParts, PpoError> {
+    let artifact = TrainingArtifact::load_compatible(directory, run).map_err(text_error)?;
+    restore_loaded_session(model, artifact, run, config, false)
+}
+
+/// Restores one already loaded artifact and checks the session invariants.
+fn restore_loaded_session(
+    model: &PolicyModel,
+    artifact: TrainingArtifact,
+    restore_run: &CheckpointRun,
+    config: PpoConfig,
+    migrated: bool,
+) -> Result<RestoredSessionParts, PpoError> {
+    let restored = artifact.restore(model, restore_run).map_err(text_error)?;
     if restored.trainer().config() != config {
         return Err(PpoError::InvalidConfig("training checkpoint PPO config"));
     }
@@ -1536,17 +1643,13 @@ fn restore_training_session(
         ));
     }
     let sampling = restore_sampling_rng(&progress.rng_states)?;
-    let completed_updates = progress.global_update;
-    let rollout_samples = progress.rollout_samples;
-    let mastery = progress.mastery.clone();
+    let progress = progress.clone();
     let (trainer, _, _) = restored.into_parts();
-    Ok(RestoredTrainingSession {
+    Ok(RestoredSessionParts {
         trainer,
         sampling,
-        completed_updates,
-        rollout_samples,
-        migrated_provenance: migrated,
-        mastery,
+        progress,
+        migrated,
     })
 }
 
@@ -1621,7 +1724,7 @@ fn build_environments(settings: PpoSmokeConfig) -> Result<Vec<TrainingEnvironmen
         let policy_seat = index % 2;
         environments.push(build_environment(
             seed,
-            (settings.seed ^ 0x6f70_706f_6e65_6e74)
+            (settings.seed ^ crate::randomization::OPPONENT_DOMAIN)
                 .checked_add(index as u64)
                 .ok_or(PpoError::InvalidConfig("opponent seed"))?,
             settings.map,
@@ -1666,8 +1769,8 @@ fn build_training_environments(
             CheckpointEvaluationBaseline::Teacher => OpponentSpec::Teacher,
         };
         let environment = build_environment(
-            derive_training_seed(settings.seed, pair, 0x6172_656e_615f_7365),
-            derive_training_seed(settings.seed, pair, 0x6f70_706f_6e65_6e74),
+            derive_training_seed(settings.seed, pair, crate::randomization::ARENA_DOMAIN),
+            derive_training_seed(settings.seed, pair, crate::randomization::OPPONENT_DOMAIN),
             settings.map,
             training_policy_seat(stream),
             decision,
@@ -1685,12 +1788,7 @@ fn build_training_environments(
     Ok(environments)
 }
 
-pub(crate) const fn derive_training_seed(base: u64, stream: u64, domain: u64) -> u64 {
-    let mut value = base ^ stream.wrapping_mul(0x9e37_79b9_7f4a_7c15) ^ domain;
-    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    value ^ (value >> 31)
-}
+pub(crate) use crate::randomization::derive_training_seed;
 
 pub(crate) const fn training_policy_seat(stream: u64) -> usize {
     (stream % 2) as usize
@@ -1860,14 +1958,44 @@ fn build_environment(
     decision: u32,
     opponent_spec: OpponentSpec,
 ) -> Result<TrainingEnvironment, PpoError> {
+    build_environment_with_spawn_modifiers(
+        seed,
+        opponent_seed,
+        map,
+        policy_seat,
+        decision,
+        opponent_spec,
+        Vec::new(),
+    )
+}
+
+/// Builds one environment whose units carry trusted spawn modifiers.
+///
+/// The annealed loop puts one generation's rules on the units their selectors
+/// name at world construction and on every later spawn; the default training
+/// paths pass none.
+fn build_environment_with_spawn_modifiers(
+    seed: u64,
+    opponent_seed: u64,
+    map: MapId,
+    policy_seat: usize,
+    decision: u32,
+    opponent_spec: OpponentSpec,
+    spawn_modifiers: Vec<SpawnModifier>,
+) -> Result<TrainingEnvironment, PpoError> {
     if policy_seat >= 2 {
         return Err(PpoError::InvalidConfig("training policy seat"));
     }
-    let (arena, start) = Arena::new(ArenaConfig {
+    let config = ArenaConfig {
         seats: 2,
         map,
         seed,
-    })
+    };
+    let (arena, start) = if spawn_modifiers.is_empty() {
+        Arena::new(config)
+    } else {
+        Arena::new_with_spawn_modifiers(config, spawn_modifiers)
+    }
     .map_err(|error| PpoError::Model(error.to_string()))?;
     let seats = setup_seats(start)?;
     #[cfg(test)]
@@ -1920,7 +2048,6 @@ fn build_opponent(spec: &OpponentSpec, _seed: u64) -> Result<OpponentRuntime, Pp
             ),
             rng: PpoRng::new(_seed),
         }),
-        #[cfg(test)]
         OpponentSpec::SharedPolicy(model) => Ok(OpponentRuntime::Policy {
             model: Arc::clone(model),
             rng: PpoRng::new(_seed),
@@ -2475,7 +2602,6 @@ fn opponent_request(
     opponent: &mut OpponentRuntime,
 ) -> Result<Option<Request>, PpoError> {
     match opponent {
-        #[cfg(test)]
         OpponentRuntime::Policy { model, rng } => {
             let (frame, space) = prepare_neural_seat_policy_sample(seat)?;
             let choice = model.sample(&frame, &space, rng).map_err(text_error)?;
@@ -2496,7 +2622,6 @@ fn opponent_request(
     }
 }
 
-#[cfg(test)]
 fn policy_request(
     seat: &mut ArenaSeatPolicy,
     choice: &PpoPolicyChoice,
@@ -2824,7 +2949,7 @@ fn observe_arena_snapshot_owned(
     Ok(())
 }
 
-fn text_error(error: impl std::fmt::Display) -> PpoError {
+pub(crate) fn text_error(error: impl std::fmt::Display) -> PpoError {
     PpoError::Model(error.to_string())
 }
 

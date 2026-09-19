@@ -129,6 +129,7 @@ fn fixture(side: usize, place: Place) -> (World, MatchInfo) {
         mode: TickMode::Lockstep,
         ack_timeout_ticks: 150,
         cheats: false,
+        spawn_modifiers: Vec::new(),
     };
     let mut world = World::for_match(&config, config.rng());
     world.advance(&[]);

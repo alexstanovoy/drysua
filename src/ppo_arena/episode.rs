@@ -227,8 +227,8 @@ pub(super) fn environments_with_mastery(
                 .checked_add((stream / 2) as u64)
                 .ok_or(PpoError::CounterOverflow)?;
             build_environment(
-                derive_training_seed(settings.seed, pair, 0x6172_656e_615f_7365),
-                derive_training_seed(settings.seed, pair, 0x6f70_706f_6e65_6e74),
+                derive_training_seed(settings.seed, pair, crate::randomization::ARENA_DOMAIN),
+                derive_training_seed(settings.seed, pair, crate::randomization::OPPONENT_DOMAIN),
                 settings.map,
                 stream % 2,
                 0,
@@ -287,8 +287,8 @@ pub(super) fn single_environment(
     validate_serial(settings)?;
     let mastery_teacher = mastery_teacher_stage(settings, mastery)?;
     build_environment(
-        derive_training_seed(settings.seed, update, 0x6172_656e_615f_7365),
-        derive_training_seed(settings.seed, update, 0x6f70_706f_6e65_6e74),
+        derive_training_seed(settings.seed, update, crate::randomization::ARENA_DOMAIN),
+        derive_training_seed(settings.seed, update, crate::randomization::OPPONENT_DOMAIN),
         settings.map,
         0,
         0,
@@ -304,7 +304,6 @@ fn opponent_name(opponent: &OpponentRuntime) -> &'static str {
     match opponent {
         OpponentRuntime::Teacher => "Teacher",
         OpponentRuntime::Weak => "Weak",
-        #[cfg(test)]
         OpponentRuntime::Policy { .. } => "Policy",
     }
 }
@@ -807,7 +806,10 @@ fn collect_with_workers(
 ) -> Result<bool, PpoError> {
     assert_eq!(streams.len(), environments.len());
     assert_eq!(random.len(), environments.len());
-    assert!(valid_environment_count(environments.len()));
+    // The paired production collector passes even counts; the annealed batch
+    // collector admits any world count from one to the ceiling.
+    assert!(!environments.is_empty());
+    assert!(environments.len() <= MAX_EPISODE_ENVIRONMENTS);
     let (flush_sender, flush_receiver) =
         std::sync::mpsc::sync_channel::<FlushRequest>(MAX_EPISODE_ENVIRONMENTS);
     let flush_evaluator = FlushEvaluator {
@@ -1098,12 +1100,73 @@ fn retention_phase(seed: u64, update: u64, stream: usize) -> Result<usize, PpoEr
     Ok(phase)
 }
 
+/// One stream whose retention phase is a pure function of the run seed and
+/// the global game index.
+///
+/// The annealed loop gives every game its own stream, so batches sharing one
+/// rollout never collide on a retention phase or a stream index.
+pub(super) fn game_stream(seed: u64, game: u64) -> Result<EpisodeStream, PpoError> {
+    Ok(EpisodeStream {
+        retention_phase: retention_phase(seed, game, 0)?,
+        ..EpisodeStream::default()
+    })
+}
+
+/// Runs one annealed batch of episodes over already built environments.
+///
+/// `rounds` is the production episode ceiling or a test-only shorter window.
+/// A full ceiling asserts every stream reached its terminal; a shorter window
+/// stops each stream mid-episode exactly like the bounded benchmark slice.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn collect_batch(
+    model: &PolicyModel,
+    config: PpoConfig,
+    stream_base: usize,
+    thread_prefix: &str,
+    environments: &mut [TrainingEnvironment],
+    streams: &mut [EpisodeStream],
+    random: &mut [PpoRng],
+    rounds: usize,
+    rollout: &mut PpoRollout,
+    report: &mut PpoSmokeReport,
+) -> Result<(), PpoError> {
+    assert!(!environments.is_empty());
+    assert_eq!(streams.len(), environments.len());
+    assert_eq!(random.len(), environments.len());
+    if rounds == 0 || rounds > ACTOR_DECISIONS {
+        return Err(PpoError::InvalidConfig("annealed collection rounds"));
+    }
+    let completed = collect_with_workers(
+        model,
+        config,
+        stream_base,
+        thread_prefix,
+        environments,
+        streams,
+        random,
+        rounds,
+        None,
+        None,
+        rollout,
+        report,
+    )?;
+    assert!(completed, "an annealed batch cannot cancel");
+    if rounds == ACTOR_DECISIONS {
+        assert!(
+            streams.iter().all(|stream| stream.done),
+            "a full annealed batch finishes every episode"
+        );
+    }
+    Ok(())
+}
+
 /// Bootstrap barrier: every stream prepares its first decision frame.
 fn prepare_all_workers<'scope>(
     workers: &super::parallel::StreamWorkers<'scope, TrainingEnvironment, StreamJob, StreamReply>,
     stream_count: usize,
 ) -> Result<Vec<Option<(FeatureFrame, ActionSpace)>>, PpoError> {
-    assert!(stream_count >= 2);
+    assert!(stream_count >= 1);
+    assert!(stream_count <= MAX_EPISODE_ENVIRONMENTS);
     let active: Vec<usize> = (0..stream_count).collect();
     for &stream in &active {
         workers.submit(stream, StreamJob::Prepare)?;
@@ -1169,7 +1232,7 @@ fn select_choices(
 }
 
 #[derive(Default)]
-struct EpisodeStream {
+pub(super) struct EpisodeStream {
     #[cfg(test)]
     trace: std::collections::hash_map::DefaultHasher,
     #[cfg(test)]

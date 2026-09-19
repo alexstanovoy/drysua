@@ -3,13 +3,19 @@
 mod map2_tests;
 
 #[cfg(test)]
+#[path = "tests/arena_modifiers.rs"]
+mod modifier_tests;
+
+#[cfg(test)]
 #[path = "tests/arena_test_support.rs"]
 mod test_support;
 
 use core::fmt;
 
 use bota_proto::{EntityId, EventKind, MapId, Order, Pick, ServerMsg, SlotId, Team, TickMode};
-use bota_server::game::{Command, Event, EventVisibility, MAPS, MatchConfig, World};
+use bota_server::game::{
+    Command, Event, EventVisibility, MAPS, MatchConfig, SpawnModifier, World, check_spawn_modifier,
+};
 
 use crate::SHADOW_FIEND;
 
@@ -78,6 +84,11 @@ pub enum ArenaError {
         /// Number of entries received.
         got: usize,
     },
+    /// The match description was refused.
+    Config {
+        /// Why it was refused.
+        message: String,
+    },
     /// The match already sent MatchOver.
     MatchOver,
 }
@@ -100,6 +111,9 @@ impl fmt::Display for ArenaError {
                 formatter,
                 "arena request count must equal seat count {expected}, got {got}"
             ),
+            Self::Config { message } => {
+                write!(formatter, "arena match setup was refused: {message}")
+            }
             Self::MatchOver => formatter.write_str("arena cannot step after MatchOver"),
         }
     }
@@ -116,14 +130,41 @@ pub struct Arena {
 impl Arena {
     /// Creates a match and advances it to its first visible tick.
     pub fn new(settings: ArenaConfig) -> Result<(Self, ArenaStart), ArenaError> {
+        Self::build(settings, Vec::new())
+    }
+
+    /// Creates a match carrying trusted spawn modifiers on the units their
+    /// selectors name, for as long as each rule says. Cheats stay off.
+    pub fn new_with_spawn_modifiers(
+        settings: ArenaConfig,
+        spawn_modifiers: Vec<SpawnModifier>,
+    ) -> Result<(Self, ArenaStart), ArenaError> {
+        for rule in &spawn_modifiers {
+            check_spawn_modifier(rule).map_err(|error| ArenaError::Config {
+                message: error.to_string(),
+            })?;
+        }
+        Self::build(settings, spawn_modifiers)
+    }
+
+    fn build(
+        settings: ArenaConfig,
+        spawn_modifiers: Vec<SpawnModifier>,
+    ) -> Result<(Self, ArenaStart), ArenaError> {
         validate_seat_count(settings.seats)?;
         if !MAPS.iter().any(|map| map.id == settings.map) {
             return Err(ArenaError::UnsupportedMap { got: settings.map });
         }
-        let match_config = match_config(settings);
+        let match_config = match_config(settings, spawn_modifiers);
+        match_config
+            .validate()
+            .map_err(|error| ArenaError::Config {
+                message: error.to_string(),
+            })?;
         let mut world = World::for_match(&match_config, match_config.rng());
         assert_eq!(world.map.id, settings.map);
         assert_eq!(world.seats.len(), usize::from(settings.seats));
+        assert!(!world.cheats, "trusted setup needs no cheat gate");
         let events = world.advance(&[]);
         assert_eq!(world.tick, 1, "the first visible arena tick must be one");
         let arena = Self {
@@ -236,7 +277,7 @@ fn validate_seat_count(seats: u8) -> Result<(), ArenaError> {
     Ok(())
 }
 
-fn match_config(settings: ArenaConfig) -> MatchConfig {
+fn match_config(settings: ArenaConfig, spawn_modifiers: Vec<SpawnModifier>) -> MatchConfig {
     MatchConfig {
         match_id: settings.seed,
         master_key: seed_key(settings.seed),
@@ -255,8 +296,9 @@ fn match_config(settings: ArenaConfig) -> MatchConfig {
         tick_rate: ARENA_TICK_RATE,
         mode: TickMode::Lockstep,
         ack_timeout_ticks: 150,
-        // Cheats are never available to a learner or opponent seat.
+        // Trusted setup carries the modifiers; no cheat gate is opened.
         cheats: false,
+        spawn_modifiers,
     }
 }
 

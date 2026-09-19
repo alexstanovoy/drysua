@@ -1477,6 +1477,7 @@ fn wraith_upgrade_world(gold: i32) -> (bota_server::game::World, MatchInfo) {
         mode: TickMode::Lockstep,
         ack_timeout_ticks: 30,
         cheats: false,
+        spawn_modifiers: Vec::new(),
     };
     let mut world = bota_server::game::World::for_match(&config, config.rng());
     let mut events = Vec::new();

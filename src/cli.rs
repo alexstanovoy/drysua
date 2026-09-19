@@ -29,6 +29,8 @@ enum Operation {
     Train(TrainArgs),
     /// Run resumable PPO training with periodic strict checkpoints.
     TrainFull(TrainFullArgs),
+    /// Run the annealed domain-randomization loop with a frozen opponent.
+    TrainAnnealed(TrainAnnealedArgs),
 }
 
 #[derive(Args)]
@@ -191,6 +193,77 @@ enum LearnerDevice {
     Metal,
 }
 
+/// Which frozen opponent the annealed run plays against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum AnnealedOpponentArg {
+    Teacher,
+    Weights,
+}
+
+/// Options for the annealed domain-randomization loop.
+#[derive(Args)]
+struct TrainAnnealedArgs {
+    /// Total updates; the annealed loop runs one optimizer step per update.
+    #[arg(long)]
+    updates: u64,
+    /// Games per update; always even so sides split exactly.
+    #[arg(long, default_value_t = 8)]
+    games: usize,
+    /// Worlds advanced in parallel per batch; must divide games and generation
+    /// games. Defaults to the largest divisor of their gcd within the available
+    /// cores; pin it for a run that must resume on another host.
+    #[arg(long)]
+    parallel: Option<usize>,
+    /// Games per environment generation, on the global game counter.
+    #[arg(long)]
+    generation_games: u64,
+    /// Final updates with no modifiers; defaults to one fifth of the update budget.
+    #[arg(long)]
+    zero_updates: Option<u64>,
+    /// Frozen opponent: teacher or a strict runtime weights directory.
+    #[arg(long, value_enum, default_value_t = AnnealedOpponentArg::Teacher)]
+    opponent: AnnealedOpponentArg,
+    /// Strict runtime weights directory for a frozen weights opponent.
+    #[arg(long)]
+    opponent_weights: Option<std::path::PathBuf>,
+    /// Adam learning rate; must be finite and positive.
+    #[arg(long, default_value_t = crate::PpoConfig::default().learning_rate)]
+    learning_rate: f32,
+    /// PPO passes over one update's rollout.
+    #[arg(long, default_value_t = crate::PpoConfig::default().epochs)]
+    epochs: usize,
+    /// Effective Adam minibatch.
+    #[arg(long, default_value_t = crate::PpoConfig::default().minibatch)]
+    minibatch: usize,
+    /// Generalized advantage trace decay in [0, 1].
+    #[arg(long, default_value_t = crate::PpoConfig::default().gae_lambda)]
+    gae_lambda: f32,
+    /// Entropy bonus coefficient; must be finite and positive.
+    #[arg(long, default_value_t = crate::PpoConfig::default().entropy_coefficient)]
+    entropy_coefficient: f32,
+    /// Monotonic wall-clock seconds between durable checkpoints.
+    #[arg(long, default_value_t = 300)]
+    checkpoint_seconds: u64,
+    /// Existing empty directory for a fresh run, or checkpoint directory when resuming.
+    #[arg(long)]
+    checkpoint_directory: std::path::PathBuf,
+    /// Runtime weights directory loaded before the first update of a fresh run.
+    #[arg(long, conflicts_with = "resume")]
+    initial_weights: Option<std::path::PathBuf>,
+    /// Resume strict model, optimizer, counters, RNG state and generation snapshots.
+    #[arg(long, default_value_t = false)]
+    resume: bool,
+    /// Deterministic run seed.
+    #[arg(long, default_value_t = 9_001)]
+    seed: u64,
+    /// Learner tensor backend; actors and simulation remain on CPU.
+    #[arg(long, value_enum, default_value_t = LearnerDevice::Cpu)]
+    device: LearnerDevice,
+    /// CUDA or Metal device ordinal.
+    #[arg(long, default_value_t = 0)]
+    device_ordinal: usize,
+}
+
 /// Parses command line arguments and plays one match.
 pub fn run_from_env() -> std::io::Result<()> {
     run(Cli::parse())
@@ -204,6 +277,7 @@ fn run(arguments: Cli) -> std::io::Result<()> {
         Some(Operation::Play(play)) => play,
         Some(Operation::Train(train)) => return run_train(train),
         Some(Operation::TrainFull(train)) => return run_train_full(train),
+        Some(Operation::TrainAnnealed(train)) => return run_train_annealed(train),
         None => arguments.play,
     };
     let (policy, weights_directory) = resolve_play_deployment(&play)?;
@@ -340,6 +414,43 @@ fn run_train_full(arguments: TrainFullArgs) -> std::io::Result<()> {
             "training mastery complete: rolling training windows qualified through Teacher; not evaluation qualification"
         );
     }
+    Ok(())
+}
+
+#[cfg(feature = "builtin")]
+fn run_train_annealed(arguments: TrainAnnealedArgs) -> std::io::Result<()> {
+    let settings = arguments.annealed_settings(
+        embedded_commit("DRYSUA_GIT_COMMIT", option_env!("DRYSUA_GIT_COMMIT"))?,
+        embedded_commit("BOTA_GIT_COMMIT", option_env!("BOTA_GIT_COMMIT"))?,
+    )?;
+    let device = arguments.device.policy_device(arguments.device_ordinal)?;
+    validate_checkpoint_directory(&arguments.checkpoint_directory, arguments.resume)?;
+    let report = crate::run_annealed_job_on_with_initial_weights(
+        settings,
+        device,
+        &arguments.checkpoint_directory,
+        arguments.resume,
+        arguments.initial_weights.as_deref(),
+        report_training_checkpoint,
+    )
+    .map_err(std::io::Error::other)?;
+    println!(
+        "annealed training complete: starting fingerprint {:016x}, {} updates, {} samples, {} games, {} generations, optimizer step {}, terminal wins {}, terminal losses {}, terminal draws {}, ticks {}, episode timeouts {}",
+        report.starting_policy_fingerprint,
+        report.completed_updates,
+        report.rollout_samples,
+        report.games,
+        report.generations,
+        report.optimizer_step,
+        report.terminal_wins,
+        report.terminal_losses,
+        report.terminal_draws,
+        report.elapsed_ticks,
+        report.episode_timeouts,
+    );
+    report
+        .map2_reward
+        .log("invocation", report.completed_updates);
     Ok(())
 }
 
@@ -489,6 +600,137 @@ pub(crate) fn training_settings_for_test(
 }
 
 #[cfg(feature = "builtin")]
+impl TrainAnnealedArgs {
+    fn annealed_settings(
+        &self,
+        git_commit: String,
+        simulator_commit: String,
+    ) -> std::io::Result<crate::AnnealedJobConfig> {
+        if self.updates == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "annealed updates must be positive",
+            ));
+        }
+        if !self.games.is_multiple_of(2) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "annealed games per update must be even so sides split exactly",
+            ));
+        }
+        if self.generation_games == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "annealed generation games must be positive",
+            ));
+        }
+        let opponent = match (self.opponent, &self.opponent_weights) {
+            (AnnealedOpponentArg::Teacher, None) => crate::AnnealedOpponent::Teacher,
+            (AnnealedOpponentArg::Weights, Some(directory)) => {
+                crate::AnnealedOpponent::Weights(directory.clone())
+            }
+            (AnnealedOpponentArg::Weights, None) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "weights opponent requires --opponent-weights",
+                ));
+            }
+            (AnnealedOpponentArg::Teacher, Some(_)) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "teacher opponent forbids --opponent-weights",
+                ));
+            }
+        };
+        let parallel = match self.parallel {
+            Some(parallel) => parallel,
+            None => default_parallel_worlds(self.games, self.generation_games),
+        };
+        let zero_updates = self
+            .zero_updates
+            .unwrap_or_else(|| self.updates.div_ceil(5));
+        let ppo = crate::PpoConfig {
+            decision_interval_ticks: crate::MAP2_DECISION_INTERVAL_TICKS,
+            environments: self.games,
+            rollout_decisions: crate::MAP2_RETAINED_DECISIONS,
+            epochs: self.epochs,
+            minibatch: self.minibatch,
+            learning_rate: self.learning_rate,
+            gamma_tick: crate::MAP2_REWARD_GAMMA_TICK,
+            gae_lambda: self.gae_lambda,
+            entropy_coefficient: self.entropy_coefficient,
+            ..crate::PpoConfig::default()
+        };
+        Ok(crate::AnnealedJobConfig {
+            updates: self.updates,
+            games_per_update: self.games,
+            parallel_worlds: parallel,
+            games_per_generation: self.generation_games,
+            zero_updates,
+            seed: self.seed,
+            opponent,
+            ppo,
+            episode_decisions: crate::ANNEALED_EPISODE_DECISIONS,
+            stop_after: None,
+            stop_after_games: None,
+            checkpoint_cadence: crate::TrainingCheckpointCadence::WallTime(
+                std::time::Duration::from_secs(self.checkpoint_seconds),
+            ),
+            git_commit,
+            simulator_commit,
+        })
+    }
+}
+
+/// Largest divisor of `gcd(games, generation_games)` within the core budget.
+#[cfg(feature = "builtin")]
+fn default_parallel_worlds(games: usize, generation_games: u64) -> usize {
+    let cores = std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(1);
+    default_parallel_worlds_for(games, generation_games, cores)
+}
+
+/// Largest divisor of `gcd(games, generation_games)` not past `cores`.
+#[cfg(feature = "builtin")]
+pub(crate) fn default_parallel_worlds_for(
+    games: usize,
+    generation_games: u64,
+    cores: usize,
+) -> usize {
+    let gcd = greatest_common_divisor(games as u64, generation_games).max(1);
+    let cores = cores.clamp(1, crate::MAX_TRAINING_ENVIRONMENTS);
+    (1..=cores)
+        .rev()
+        .find(|candidate| gcd.is_multiple_of(*candidate as u64))
+        .unwrap_or(1)
+}
+
+#[cfg(feature = "builtin")]
+fn greatest_common_divisor(mut left: u64, mut right: u64) -> u64 {
+    while right != 0 {
+        (left, right) = (right, left % right);
+    }
+    left
+}
+
+#[cfg(all(test, feature = "builtin"))]
+pub(crate) fn annealed_settings_for_test(
+    overrides: &[&str],
+) -> std::io::Result<crate::AnnealedJobConfig> {
+    let mut arguments = vec!["drysua", "train-annealed", "--checkpoint-directory", "."];
+    arguments.extend_from_slice(overrides);
+    let cli = Cli::try_parse_from(arguments).map_err(std::io::Error::other)?;
+    let Some(Operation::TrainAnnealed(train)) = cli.operation else {
+        unreachable!("train-annealed arguments");
+    };
+    train.annealed_settings(
+        "test-drysua-commit".to_owned(),
+        "test-bota-commit".to_owned(),
+    )
+}
+
+#[cfg(feature = "builtin")]
 fn validate_checkpoint_directory(directory: &std::path::Path, resume: bool) -> std::io::Result<()> {
     if !directory.is_dir() {
         return Err(std::io::Error::other(
@@ -568,5 +810,12 @@ fn run_train(_: TrainArgs) -> std::io::Result<()> {
 fn run_train_full(_: TrainFullArgs) -> std::io::Result<()> {
     Err(std::io::Error::other(
         "PPO train requires cargo feature `builtin`",
+    ))
+}
+
+#[cfg(not(feature = "builtin"))]
+fn run_train_annealed(_: TrainAnnealedArgs) -> std::io::Result<()> {
+    Err(std::io::Error::other(
+        "annealed training requires cargo feature `builtin`",
     ))
 }

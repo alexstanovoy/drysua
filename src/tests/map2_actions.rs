@@ -665,6 +665,7 @@ pub(super) fn server_world() -> (bota_server::game::World, MatchInfo) {
         mode: TickMode::Lockstep,
         ack_timeout_ticks: 30,
         cheats: false,
+        spawn_modifiers: Vec::new(),
         picks: vec![
             Pick {
                 slot: SlotId(0),

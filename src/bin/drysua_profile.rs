@@ -253,6 +253,7 @@ fn profile_world_for(seed: u64) -> World {
         mode: TickMode::Lockstep,
         ack_timeout_ticks: 0,
         cheats: false,
+        spawn_modifiers: Vec::new(),
     };
     let mut world = World::for_match(&config, config.rng());
     world.advance(&[]);

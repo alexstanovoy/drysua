@@ -688,6 +688,7 @@ fn configured_pair(seats: u8, configure: impl Fn(&mut World)) -> (Arena, World) 
         mode: TickMode::Lockstep,
         ack_timeout_ticks: 150,
         cheats: false,
+        spawn_modifiers: Vec::new(),
     };
     let mut world = World::for_match(&config, config.rng());
     let events = world.advance(&[]);
