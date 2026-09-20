@@ -1,9 +1,10 @@
 //! Trusted spawn modifiers on the builtin arena: applied at spawn to the
 //! selected categories, timed or match-long, and off by default.
 
-use bota_proto::{Cheat, ModifierSpec, Target, Team, UnitKind, Vec2};
+use bota_proto::{Cheat, MAX_MODIFIER_TICKS, ModifierSpec, Target, Team, UnitKind, Vec2};
 use bota_server::game::{
-    Entity, MELEE_CREEP, ModifierDuration, SpawnCategory, SpawnModifier, SpawnSelector, SpawnTarget,
+    Entity, MAX_SPAWN_MODIFIERS, MELEE_CREEP, ModifierDuration, SpawnCategory, SpawnModifier,
+    SpawnSelector, SpawnTarget,
 };
 
 use super::*;
@@ -220,6 +221,30 @@ fn an_out_of_bounds_or_zero_lifetime_rule_is_refused() {
     assert!(
         matches!(&error, ArenaError::Config { message } if message.contains("duration")),
         "unexpected error: {error}"
+    );
+    let past = hero_rule(
+        ModifierSpec::NOMINAL,
+        ModifierDuration::Ticks(MAX_MODIFIER_TICKS + 1),
+    );
+    let error = Arena::new_with_spawn_modifiers(config(37), vec![past])
+        .err()
+        .expect("lifetime past the ceiling");
+    assert!(
+        matches!(&error, ArenaError::Config { message } if message.contains("duration")),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn too_many_rules_are_refused_before_walking_them() {
+    let invalid = max_hp_rule(ModifierSpec::MAX_SCALE + 1);
+    let rules = vec![invalid; MAX_SPAWN_MODIFIERS + 1];
+    let error = Arena::new_with_spawn_modifiers(config(39), rules)
+        .err()
+        .expect("too many rules");
+    assert_eq!(
+        error.to_string(),
+        "arena match setup was refused: 65 spawn modifiers exceed the 64 a match may carry"
     );
 }
 

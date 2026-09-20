@@ -13,9 +13,7 @@ mod test_support;
 use core::fmt;
 
 use bota_proto::{EntityId, EventKind, MapId, Order, Pick, ServerMsg, SlotId, Team, TickMode};
-use bota_server::game::{
-    Command, Event, EventVisibility, MAPS, MatchConfig, SpawnModifier, World, check_spawn_modifier,
-};
+use bota_server::game::{Command, Event, EventVisibility, MAPS, MatchConfig, SpawnModifier, World};
 
 use crate::SHADOW_FIEND;
 
@@ -139,11 +137,6 @@ impl Arena {
         settings: ArenaConfig,
         spawn_modifiers: Vec<SpawnModifier>,
     ) -> Result<(Self, ArenaStart), ArenaError> {
-        for rule in &spawn_modifiers {
-            check_spawn_modifier(rule).map_err(|error| ArenaError::Config {
-                message: error.to_string(),
-            })?;
-        }
         Self::build(settings, spawn_modifiers)
     }
 

@@ -33,6 +33,7 @@ candle-metal-feature = { path = "crates/candle-metal-feature", default-features 
 [dev-dependencies]
 # Mirrors bota's workspace pin so the shared bench tooling version moves in lockstep.
 criterion = { version = "=0.8.2", default-features = false }
+serde_json = { version = "1.0.151", default-features = false, features = ["std"] }
 
 [[bin]]
 name = "drysua"

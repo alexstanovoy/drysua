@@ -211,7 +211,9 @@ struct TrainAnnealedArgs {
     games: usize,
     /// Worlds advanced in parallel per batch; must divide games and generation
     /// games. Defaults to the largest divisor of their gcd within the available
-    /// cores; pin it for a run that must resume on another host.
+    /// cores and the resolved value is printed, recorded in the run scope, and
+    /// compared on resume; pass it explicitly when a run must resume on a host
+    /// with a different core count.
     #[arg(long)]
     parallel: Option<usize>,
     /// Games per environment generation, on the global game counter.
@@ -425,6 +427,16 @@ fn run_train_annealed(arguments: TrainAnnealedArgs) -> std::io::Result<()> {
     )?;
     let device = arguments.device.policy_device(arguments.device_ordinal)?;
     validate_checkpoint_directory(&arguments.checkpoint_directory, arguments.resume)?;
+    eprintln!(
+        "annealed: updates={} games={} parallel={} generation_games={} zero_updates={} seed={} opponent={:?}",
+        settings.updates,
+        settings.games_per_update,
+        settings.parallel_worlds,
+        settings.games_per_generation,
+        settings.zero_updates,
+        settings.seed,
+        settings.opponent,
+    );
     let report = crate::run_annealed_job_on_with_initial_weights(
         settings,
         device,
@@ -670,9 +682,6 @@ impl TrainAnnealedArgs {
             seed: self.seed,
             opponent,
             ppo,
-            episode_decisions: crate::ANNEALED_EPISODE_DECISIONS,
-            stop_after: None,
-            stop_after_games: None,
             checkpoint_cadence: crate::TrainingCheckpointCadence::WallTime(
                 std::time::Duration::from_secs(self.checkpoint_seconds),
             ),

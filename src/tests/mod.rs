@@ -48,3 +48,5 @@ mod teacher_arena;
 #[cfg(feature = "builtin")]
 mod teacher_economy;
 mod tracker;
+#[cfg(feature = "builtin")]
+mod train_full_identity;

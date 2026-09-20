@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 mod annealed;
 pub use annealed::{
-    ANNEALED_EPISODE_DECISIONS, AnnealedJobConfig, AnnealedJobReport, AnnealedOpponent,
+    AnnealedJobConfig, AnnealedJobReport, AnnealedOpponent,
     run_annealed_job_on_with_initial_weights,
 };
 pub(crate) mod episode;
@@ -1521,7 +1521,7 @@ fn validate_open_lock_file(file: &File, path: &Path) -> Result<(), PpoError> {
     Ok(())
 }
 
-fn training_checkpoint_run(
+pub(crate) fn training_checkpoint_run(
     settings: &TrainingJobConfig,
     device: PolicyDevice,
     config: PpoConfig,
@@ -1998,18 +1998,6 @@ fn build_environment_with_spawn_modifiers(
     }
     .map_err(|error| PpoError::Model(error.to_string()))?;
     let seats = setup_seats(start)?;
-    #[cfg(test)]
-    let mut seats = seats;
-    #[cfg(test)]
-    if matches!(
-        opponent_spec,
-        OpponentSpec::Policy(_) | OpponentSpec::SharedPolicy(_)
-    ) {
-        let seat = &mut seats[1 - policy_seat];
-        seat.order_bookkeeping
-            .enable_candidate(&seat.persistence)
-            .map_err(PpoError::InvalidTransition)?;
-    }
     let mut reward = RewardTracker::default();
     if map != MapId(2) {
         reward.observe(

@@ -366,6 +366,17 @@ impl TrainingArtifact {
         Self::load_inner(directory, Some(expected))
     }
 
+    /// Reads only the run scope of a checkpoint manifest.
+    ///
+    /// Lets a caller diagnose a scope mismatch by name before the full
+    /// compatibility check rejects it.
+    pub(crate) fn load_run_scope(directory: &Path) -> Result<CheckpointRun, CheckpointError> {
+        validate_directory(directory)?;
+        let manifest = read_recoverable(&directory.join(CHECKPOINT_META_FILE), MAX_META_BYTES)?;
+        let artifact = decode_manifest(&manifest)?;
+        Ok(artifact.run)
+    }
+
     fn load_inner(
         directory: &Path,
         expected: Option<&CheckpointRun>,
@@ -628,65 +639,106 @@ fn validate_tensor_values(name: &'static str, values: &[f32]) -> Result<(), Chec
 }
 
 fn serialize_training_tensors(artifact: &TrainingArtifact) -> Result<Vec<u8>, CheckpointError> {
-    serialize_named_tensors(
-        &[
-            ("adam.first_moment", &artifact.optimizer.first_moment),
-            ("adam.second_moment", &artifact.optimizer.second_moment),
-            ("model.parameters", &artifact.parameters),
-        ],
-        None,
-    )
-}
-
-fn serialize_runtime_tensor(parameters: &[f32]) -> Result<Vec<u8>, CheckpointError> {
-    serialize_named_tensors(
-        &[("model.parameters", parameters)],
-        Some(runtime_tensor_metadata()),
-    )
-}
-
-fn runtime_tensor_metadata() -> HashMap<String, String> {
-    HashMap::from([
-        (
-            "action_schema_hash".to_owned(),
-            ACTION_SCHEMA_HASH.to_string(),
-        ),
-        (
-            "feature_schema_hash".to_owned(),
-            FEATURE_SCHEMA_HASH.to_string(),
-        ),
-        (
-            "model_schema_hash".to_owned(),
-            MODEL_SCHEMA_HASH.to_string(),
-        ),
-        (
-            "ppo_rules_audit_version".to_owned(),
-            PPO_RULES_AUDIT_VERSION.to_string(),
-        ),
-        ("ppo_schema_hash".to_owned(), PPO_SCHEMA_HASH.to_string()),
-        (
-            "ppo_schema_version".to_owned(),
-            PPO_SCHEMA_VERSION.to_string(),
-        ),
-        (
-            "map2_reward_schema_version".to_owned(),
-            MAP2_REWARD_SCHEMA_VERSION.to_string(),
-        ),
-        (
-            "map2_reward_schema_hash".to_owned(),
-            MAP2_REWARD_SCHEMA_HASH.to_string(),
-        ),
-        (
-            "map2_reward_schema_descriptor".to_owned(),
-            MAP2_REWARD_SCHEMA_DESCRIPTOR.to_owned(),
-        ),
+    serialize_named_tensors(&[
+        ("adam.first_moment", &artifact.optimizer.first_moment),
+        ("adam.second_moment", &artifact.optimizer.second_moment),
+        ("model.parameters", &artifact.parameters),
     ])
 }
 
-fn serialize_named_tensors(
-    tensors: &[(&str, &[f32])],
-    metadata: Option<HashMap<String, String>>,
-) -> Result<Vec<u8>, CheckpointError> {
+/// Serializes the runtime weights with metadata in canonical key order.
+///
+/// The safetensors writer takes a `HashMap` and emits its iteration order,
+/// which is randomized per process, so two identical runs wrote different
+/// `drysua.weights.safetensors` bytes. This writer emits the same header with
+/// sorted metadata keys, making the whole file byte-identical; the reader
+/// compares metadata maps and stays order-insensitive, so older files load.
+fn serialize_runtime_tensor(parameters: &[f32]) -> Result<Vec<u8>, CheckpointError> {
+    let metadata = runtime_tensor_metadata();
+    debug_assert!(
+        metadata.windows(2).all(|pair| pair[0].0 < pair[1].0),
+        "runtime metadata keys are canonical"
+    );
+    let mut header = String::with_capacity(1024);
+    header.push_str("{\"__metadata__\":{");
+    for (index, (key, value)) in metadata.iter().enumerate() {
+        if index > 0 {
+            header.push(',');
+        }
+        push_json_string(&mut header, key);
+        header.push(':');
+        push_json_string(&mut header, value);
+    }
+    header.push_str("},\"model.parameters\":{\"dtype\":\"F32\",\"shape\":[");
+    header.push_str(&parameters.len().to_string());
+    header.push_str("],\"data_offsets\":[0,");
+    header.push_str(&(parameters.len() * 4).to_string());
+    header.push_str("]}}");
+    let mut header = header.into_bytes();
+    let aligned = header.len().next_multiple_of(8);
+    header.resize(aligned, b' ');
+    let mut bytes = Vec::with_capacity(8 + aligned + parameters.len() * 4);
+    bytes.extend_from_slice(&(aligned as u64).to_le_bytes());
+    bytes.extend_from_slice(&header);
+    bytes.extend_from_slice(&encode_f32(parameters));
+    Ok(bytes)
+}
+
+/// Appends one JSON string, escaping what the format requires.
+fn push_json_string(out: &mut String, value: &str) {
+    out.push('"');
+    for character in value.chars() {
+        match character {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            control if (control as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", control as u32));
+            }
+            plain => out.push(plain),
+        }
+    }
+    out.push('"');
+}
+
+/// The runtime weights metadata, sorted by key.
+fn runtime_tensor_metadata() -> Vec<(&'static str, String)> {
+    vec![
+        ("action_schema_hash", ACTION_SCHEMA_HASH.to_string()),
+        ("feature_schema_hash", FEATURE_SCHEMA_HASH.to_string()),
+        (
+            "map2_reward_schema_descriptor",
+            MAP2_REWARD_SCHEMA_DESCRIPTOR.to_owned(),
+        ),
+        (
+            "map2_reward_schema_hash",
+            MAP2_REWARD_SCHEMA_HASH.to_string(),
+        ),
+        (
+            "map2_reward_schema_version",
+            MAP2_REWARD_SCHEMA_VERSION.to_string(),
+        ),
+        ("model_schema_hash", MODEL_SCHEMA_HASH.to_string()),
+        (
+            "ppo_rules_audit_version",
+            PPO_RULES_AUDIT_VERSION.to_string(),
+        ),
+        ("ppo_schema_hash", PPO_SCHEMA_HASH.to_string()),
+        ("ppo_schema_version", PPO_SCHEMA_VERSION.to_string()),
+    ]
+}
+
+/// The same metadata as an order-insensitive map, for loading.
+fn runtime_tensor_metadata_map() -> HashMap<String, String> {
+    runtime_tensor_metadata()
+        .into_iter()
+        .map(|(key, value)| (key.to_owned(), value))
+        .collect()
+}
+
+fn serialize_named_tensors(tensors: &[(&str, &[f32])]) -> Result<Vec<u8>, CheckpointError> {
     let bytes = tensors
         .iter()
         .map(|(_, values)| encode_f32(values))
@@ -700,7 +752,7 @@ fn serialize_named_tensors(
         })
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| CheckpointError::Backend(error.to_string()))?;
-    serialize(views, metadata).map_err(|error| CheckpointError::Backend(error.to_string()))
+    serialize(views, None).map_err(|error| CheckpointError::Backend(error.to_string()))
 }
 
 fn decode_training_tensors(bytes: &[u8]) -> Result<DecodedTensors, CheckpointError> {
@@ -724,7 +776,7 @@ fn decode_training_tensors(bytes: &[u8]) -> Result<DecodedTensors, CheckpointErr
 fn decode_runtime_tensor(bytes: &[u8]) -> Result<Vec<f32>, CheckpointError> {
     let (_, metadata) = SafeTensors::read_metadata(bytes)
         .map_err(|error| CheckpointError::Backend(error.to_string()))?;
-    let expected = runtime_tensor_metadata();
+    let expected = runtime_tensor_metadata_map();
     if metadata.metadata().as_ref() != Some(&expected) {
         return Err(CheckpointError::SchemaMismatch);
     }
@@ -1223,8 +1275,7 @@ fn atomic_replace(path: &Path, bytes: &[u8]) -> Result<(), CheckpointError> {
             fs::rename(path, &backup)?;
             sync_parent(path)?;
         }
-        fs::rename(&temporary, path)?;
-        sync_parent(path)?;
+        durable_rename(&temporary, path)?;
         if backup.exists() {
             fs::remove_file(&backup)?;
         }
@@ -1241,7 +1292,7 @@ fn atomic_replace(path: &Path, bytes: &[u8]) -> Result<(), CheckpointError> {
     let temporary = temporary_path(path)?;
     let result = (|| -> Result<(), CheckpointError> {
         write_immutable(&temporary, bytes)?;
-        windows_replace(&temporary, path)
+        durable_rename(&temporary, path)
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
@@ -1272,6 +1323,19 @@ fn windows_replace(source: &Path, target: &Path) -> Result<(), CheckpointError> 
         return Err(std::io::Error::last_os_error().into());
     }
     Ok(())
+}
+
+/// Commits one synced temporary file with platform-appropriate durability.
+#[cfg(not(windows))]
+pub(crate) fn durable_rename(source: &Path, target: &Path) -> Result<(), CheckpointError> {
+    fs::rename(source, target)?;
+    sync_parent(target)
+}
+
+/// Commits one synced temporary file with platform-appropriate durability.
+#[cfg(windows)]
+pub(crate) fn durable_rename(source: &Path, target: &Path) -> Result<(), CheckpointError> {
+    windows_replace(source, target)
 }
 
 fn tensor_generation_path(directory: &Path, hash: [u8; 32]) -> PathBuf {
@@ -1345,6 +1409,7 @@ fn artifact_name(path: &Path) -> Result<&str, CheckpointError> {
         .ok_or(CheckpointError::InvalidManifest("artifact filename"))
 }
 
+#[cfg(not(windows))]
 fn sync_parent(path: &Path) -> Result<(), CheckpointError> {
     let parent = path
         .parent()
@@ -1360,6 +1425,6 @@ fn sync_directory(directory: &Path) -> Result<(), CheckpointError> {
 
 #[cfg(windows)]
 fn sync_directory(_: &Path) -> Result<(), CheckpointError> {
-    // MoveFileExW with MOVEFILE_WRITE_THROUGH makes each Windows replacement durable.
+    // Every Windows replacement uses MOVEFILE_WRITE_THROUGH; directories cannot be opened.
     Ok(())
 }

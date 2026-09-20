@@ -229,6 +229,8 @@ pub enum PpoError {
         stream: usize,
         cause: String,
     },
+    /// A checkpoint's run scope differs from the requested one, by field.
+    ScopeMismatch(String),
 }
 
 impl fmt::Display for PpoError {
@@ -268,6 +270,9 @@ impl fmt::Display for PpoError {
             Self::Model(message) => write!(formatter, "PPO model error: {message}"),
             Self::EpisodeWorker { stream, cause } => {
                 write!(formatter, "PPO episode worker {stream} failed: {cause}")
+            }
+            Self::ScopeMismatch(message) => {
+                write!(formatter, "checkpoint scope mismatch: {message}")
             }
         }
     }

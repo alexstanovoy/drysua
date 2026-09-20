@@ -435,8 +435,9 @@ fn read_snapshot(path: &Path) -> Result<String, PpoError> {
 ///
 /// A mismatch means the recomputed generation disagrees with what a previous
 /// run recorded; the run is stopped rather than continued under different
-/// world modifiers. The write is durable before the rename: file contents are
-/// synced, then the directory entry, matching the checkpoint path.
+/// world modifiers. File contents are synced before a durable rename: Unix
+/// syncs the parent directory and Windows uses `MOVEFILE_WRITE_THROUGH`,
+/// matching the checkpoint path.
 pub fn write_generation_snapshot(directory: &Path, draw: &GenerationDraw) -> Result<(), PpoError> {
     use std::io::Write;
 
@@ -461,13 +462,8 @@ pub fn write_generation_snapshot(directory: &Path, draw: &GenerationDraw) -> Res
     file.sync_all()
         .map_err(|error| PpoError::Model(format!("randomization snapshot sync: {error}")))?;
     drop(file);
-    std::fs::rename(&temporary, &path)
-        .map_err(|error| PpoError::Model(format!("randomization snapshot commit: {error}")))?;
-    let directory_handle = std::fs::File::open(directory)
-        .map_err(|error| PpoError::Model(format!("randomization directory open: {error}")))?;
-    directory_handle
-        .sync_all()
-        .map_err(|error| PpoError::Model(format!("randomization directory sync: {error}")))
+    crate::checkpoint::durable_rename(&temporary, &path)
+        .map_err(|error| PpoError::Model(format!("randomization snapshot commit: {error}")))
 }
 
 /// Verifies every generation started before `completed_games` against disk.

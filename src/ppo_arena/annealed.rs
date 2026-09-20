@@ -52,7 +52,7 @@ const TRAINER_SALT: u64 = 0x51a9;
 const SAMPLING_SALT: u64 = 0xa17e;
 
 /// Decisions one production annealed episode runs: the full Map2 ceiling.
-pub const ANNEALED_EPISODE_DECISIONS: usize = ACTOR_DECISIONS;
+pub(crate) const ANNEALED_EPISODE_DECISIONS: usize = ACTOR_DECISIONS;
 
 /// The opponent frozen for the whole annealed run.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -83,22 +83,36 @@ pub struct AnnealedJobConfig {
     /// PPO dimensions and hyperparameters; `environments` and `rollout_decisions`
     /// are the loop's, not free choices.
     pub ppo: PpoConfig,
-    /// Decisions per episode; the production ceiling, shortened only in tests.
-    pub episode_decisions: usize,
-    /// Stop after this many completed updates in one invocation; the run scope
-    /// is the planned `updates` budget, so an invocation may stop short of it.
-    /// The production command line never sets it.
-    pub stop_after: Option<u64>,
-    /// Stop inside an update after this many games, before any optimizer step;
-    /// the invocation leaves the last checkpoint untouched and a resume
-    /// replays the update. The production command line never sets it.
-    pub stop_after_games: Option<usize>,
     /// When to write a durable checkpoint.
     pub checkpoint_cadence: crate::TrainingCheckpointCadence,
     /// Drysua commit recorded in the run scope.
     pub git_commit: String,
     /// Simulator commit recorded in the run scope.
     pub simulator_commit: String,
+}
+
+/// Invocation-only bounds the test harness may set.
+///
+/// Production never sets any: the CLI always runs the full episode ceiling and
+/// stops only on the update budget. The harness is crate-private, so it cannot
+/// appear on the command line, and none of its fields shape the run scope
+/// except the effective episode ceiling, which is recorded only when a test
+/// shortens it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct AnnealedHarness {
+    /// Decisions per episode; `None` runs the production ceiling.
+    pub(crate) episode_decisions: Option<usize>,
+    /// Stop after this many completed updates in one invocation.
+    pub(crate) stop_after: Option<u64>,
+    /// Stop inside an update after this many games, before any optimizer step.
+    pub(crate) stop_after_games: Option<usize>,
+}
+
+impl AnnealedHarness {
+    /// The episode ceiling this invocation runs.
+    pub(crate) fn episode_decisions(&self) -> usize {
+        self.episode_decisions.unwrap_or(ANNEALED_EPISODE_DECISIONS)
+    }
 }
 
 /// Final durable and gameplay telemetry of one annealed invocation.
@@ -154,6 +168,30 @@ pub fn run_annealed_job_on_with_initial_weights<F>(
 where
     F: FnMut(TrainingCheckpointReport) + Send + 'static,
 {
+    run_annealed_job_harnessed(
+        settings,
+        AnnealedHarness::default(),
+        device,
+        checkpoint_directory,
+        resume,
+        initial_weights_directory,
+        checkpointed,
+    )
+}
+
+/// Runs the annealed loop under an invocation-only test harness.
+pub(crate) fn run_annealed_job_harnessed<F>(
+    settings: AnnealedJobConfig,
+    harness: AnnealedHarness,
+    device: PolicyDevice,
+    checkpoint_directory: &Path,
+    resume: bool,
+    initial_weights_directory: Option<&Path>,
+    checkpointed: F,
+) -> Result<AnnealedJobReport, PpoError>
+where
+    F: FnMut(TrainingCheckpointReport) + Send + 'static,
+{
     let directory = checkpoint_directory.to_path_buf();
     let initial_weights = initial_weights_directory.map(Path::to_path_buf);
     std::thread::Builder::new()
@@ -163,6 +201,7 @@ where
             let _log_flush = FlushPerformanceLogs;
             run_annealed_inner(
                 settings,
+                harness,
                 device,
                 &directory,
                 resume,
@@ -177,6 +216,7 @@ where
 
 fn run_annealed_inner<F>(
     settings: AnnealedJobConfig,
+    harness: AnnealedHarness,
     device: PolicyDevice,
     directory: &Path,
     resume: bool,
@@ -186,7 +226,7 @@ fn run_annealed_inner<F>(
 where
     F: FnMut(TrainingCheckpointReport),
 {
-    let config = validate_annealed(&settings)?;
+    let config = validate_annealed(&settings, harness)?;
     validate_initial_weights_directory(directory, resume, initial_weights_directory)?;
     if let AnnealedOpponent::Weights(weights) = &settings.opponent
         && weights == directory
@@ -198,13 +238,15 @@ where
     validate_training_directory(directory, resume)?;
     let _lock = TrainingDirectoryLock::acquire(directory)?;
     let opponent = load_opponent(&settings.opponent, device)?;
-    let run = annealed_run(&settings, device, config, opponent.fingerprint)?;
-    let random_directory = directory.join(RANDOMIZATION_DIRECTORY);
+    let run = annealed_run(&settings, device, config, harness, opponent.fingerprint)?;
     if resume {
-        std::fs::metadata(&random_directory).map_err(|_| {
-            PpoError::InvalidConfig("domain randomization snapshots are missing on resume")
-        })?;
-    } else {
+        let stored = TrainingArtifact::load_run_scope(directory).map_err(text_error)?;
+        if let Some(difference) = scope_command_line_difference(&stored, &run) {
+            return Err(PpoError::ScopeMismatch(difference));
+        }
+    }
+    let random_directory = directory.join(RANDOMIZATION_DIRECTORY);
+    if !resume {
         std::fs::create_dir_all(&random_directory)
             .map_err(|error| PpoError::Model(format!("randomization directory: {error}")))?;
     }
@@ -222,7 +264,7 @@ where
                 opponent.runtime,
             )
         })?;
-    session.run_updates(&settings, config, directory, &mut checkpointed)?;
+    session.run_updates(&settings, harness, config, directory, &mut checkpointed)?;
     Ok(session.report())
 }
 
@@ -262,6 +304,9 @@ impl AnnealedSession {
         }
         let (trainer, sampling, completed_updates, rollout_samples, generations) = if resume {
             let parts = restore_strict_session(&model, directory, &run, config)?;
+            std::fs::metadata(random_directory).map_err(|_| {
+                PpoError::InvalidConfig("domain randomization snapshots are missing on resume")
+            })?;
             let completed_updates = parts.progress.global_update;
             let rollout_samples = parts.progress.rollout_samples;
             let completed_games = completed_updates
@@ -314,6 +359,7 @@ impl AnnealedSession {
     fn run_updates(
         &mut self,
         settings: &AnnealedJobConfig,
+        harness: AnnealedHarness,
         config: PpoConfig,
         directory: &Path,
         checkpointed: &mut impl FnMut(TrainingCheckpointReport),
@@ -330,7 +376,7 @@ impl AnnealedSession {
             self.generations,
         );
         while self.completed_updates < settings.updates {
-            self.train_update(settings, config, &mut generations)?;
+            self.train_update(settings, harness, config, &mut generations)?;
             let final_update = self.completed_updates == settings.updates;
             if schedule.is_due(self.completed_updates, started.elapsed()) || final_update {
                 let report = self.checkpoint_report(None);
@@ -341,7 +387,7 @@ impl AnnealedSession {
                 checkpointed(durable);
                 schedule.mark_committed(started.elapsed())?;
             }
-            if settings
+            if harness
                 .stop_after
                 .is_some_and(|stop| self.completed_updates >= stop)
             {
@@ -355,6 +401,7 @@ impl AnnealedSession {
     fn train_update(
         &mut self,
         settings: &AnnealedJobConfig,
+        harness: AnnealedHarness,
         config: PpoConfig,
         generations: &mut GenerationCache,
     ) -> Result<(), PpoError> {
@@ -418,7 +465,7 @@ impl AnnealedSession {
                 &mut environments,
                 &mut streams,
                 &mut random,
-                settings.episode_decisions,
+                harness.episode_decisions(),
                 &mut rollout,
                 &mut report,
             )?;
@@ -430,7 +477,7 @@ impl AnnealedSession {
                 .checked_add(batch_len as u64)
                 .ok_or(PpoError::CounterOverflow)?;
             local += batch_len;
-            if settings.stop_after_games.is_some_and(|stop| local >= stop) {
+            if harness.stop_after_games.is_some_and(|stop| local >= stop) {
                 return Err(PpoError::InvalidTransition(
                     "annealed invocation stopped mid-update",
                 ));
@@ -519,6 +566,9 @@ fn generation_rules(draw: &GenerationDraw, global_game: u64) -> Vec<SpawnModifie
 /// - damage amplification, magic resistance, status resistance and movement
 ///   speed: heroes, lane creeps and neutral creeps;
 /// - max mana, mana cost, cooldown and gold income: heroes.
+///
+/// Structures take only the max HP rule: their blows are not amplified and
+/// they take no resistance deltas, matching the transport's documented scope.
 ///
 /// A rule whose fields are all neutral is left out, so a nominal spec yields
 /// no rules at all and a zero-temperature update never touches a world.
@@ -640,6 +690,15 @@ impl GenerationCache {
             write_generation_snapshot(&self.directory, &draw)?;
             let next = generation.checked_add(1).ok_or(PpoError::CounterOverflow)?;
             self.counted_through = self.counted_through.max(next);
+            // One line per generation, so a long run's active scale and rules
+            // are visible while it runs and not only in the snapshot files.
+            eprintln!(
+                "annealed: generation={generation} scale_bp={} start_game={} applied_games={} rules={}",
+                draw.scale_bp,
+                draw.start_game,
+                draw.applied_games,
+                spawn_modifiers_for(draw.spec).len(),
+            );
             self.last = Some(draw);
         }
         Ok(self.last.expect("drawn above"))
@@ -700,6 +759,7 @@ fn annealed_run(
     settings: &AnnealedJobConfig,
     device: PolicyDevice,
     config: PpoConfig,
+    harness: AnnealedHarness,
     opponent_fingerprint: Option<u64>,
 ) -> Result<CheckpointRun, PpoError> {
     let device_name = device_name(device);
@@ -714,10 +774,10 @@ fn annealed_run(
         config.minibatch,
         settings.seed,
     );
-    if settings.episode_decisions != ACTOR_DECISIONS {
+    if harness.episode_decisions() != ACTOR_DECISIONS {
         command_line.push_str(&format!(
             " --episode-decisions {}",
-            settings.episode_decisions
+            harness.episode_decisions()
         ));
     }
     match &settings.opponent {
@@ -758,7 +818,10 @@ fn annealed_run(
 }
 
 /// Validates every annealed parameter and returns the PPO config it forces.
-fn validate_annealed(settings: &AnnealedJobConfig) -> Result<PpoConfig, PpoError> {
+fn validate_annealed(
+    settings: &AnnealedJobConfig,
+    harness: AnnealedHarness,
+) -> Result<PpoConfig, PpoError> {
     if settings.updates == 0 || settings.updates > MAX_TRAINING_COUNTER {
         return Err(PpoError::InvalidConfig("annealed updates"));
     }
@@ -796,7 +859,7 @@ fn validate_annealed(settings: &AnnealedJobConfig) -> Result<PpoConfig, PpoError
             "annealed zero updates cannot exceed the update budget",
         ));
     }
-    if settings.episode_decisions == 0 || settings.episode_decisions > ACTOR_DECISIONS {
+    if harness.episode_decisions() == 0 || harness.episode_decisions() > ACTOR_DECISIONS {
         return Err(PpoError::InvalidConfig("annealed episode decisions"));
     }
     if settings.git_commit.is_empty() || settings.git_commit.len() > 4_096 {
@@ -834,6 +897,68 @@ fn validate_annealed(settings: &AnnealedJobConfig) -> Result<PpoConfig, PpoError
     }
     config.validate()?;
     Ok(config)
+}
+
+/// The differing command-line token when two runs differ only there.
+///
+/// A run that differs in any other scope field is left to the strict loader,
+/// which reports the generic `compatibility scope`.
+fn scope_command_line_difference(
+    stored: &CheckpointRun,
+    expected: &CheckpointRun,
+) -> Option<String> {
+    if stored == expected {
+        return None;
+    }
+    let mut stored_scope = stored.clone();
+    stored_scope.command_line.clear();
+    let mut expected_scope = expected.clone();
+    expected_scope.command_line.clear();
+    if stored_scope != expected_scope {
+        return None;
+    }
+    Some(command_line_difference(
+        &stored.command_line,
+        &expected.command_line,
+    ))
+}
+
+/// Names the first differing token, preferring the `--flag` it belongs to.
+fn command_line_difference(stored: &str, expected: &str) -> String {
+    let stored: Vec<&str> = stored.split_whitespace().collect();
+    let expected: Vec<&str> = expected.split_whitespace().collect();
+    for index in 0..stored.len().max(expected.len()) {
+        let left = stored.get(index).copied().unwrap_or("<absent>");
+        let right = expected.get(index).copied().unwrap_or("<absent>");
+        if left == right {
+            continue;
+        }
+        if right.starts_with("--") {
+            let value = command_line_option_value(&expected, index);
+            return format!("{right}: recorded <absent>, requested {value}");
+        }
+        if left.starts_with("--") {
+            let value = command_line_option_value(&stored, index);
+            return format!("{left}: recorded {value}, requested <absent>");
+        }
+        if index > 0 {
+            let flag = stored[index - 1];
+            if flag.starts_with("--") && expected.get(index - 1).copied() == Some(flag) {
+                return format!("{flag}: recorded {left}, requested {right}");
+            }
+        }
+        return format!("token {index}: recorded {left}, requested {right}");
+    }
+    "command lines differ".to_owned()
+}
+
+/// The value after one option, or its marker when the option is a switch.
+fn command_line_option_value<'a>(tokens: &[&'a str], index: usize) -> &'a str {
+    tokens
+        .get(index + 1)
+        .copied()
+        .filter(|token| !token.starts_with("--"))
+        .unwrap_or("<present>")
 }
 
 #[cfg(test)]
