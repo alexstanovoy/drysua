@@ -2,7 +2,7 @@
 //!
 //! One update plays `games_per_update` complete Map2 episodes in batches of
 //! `parallel_worlds` worlds, applies one generation's trusted spawn modifiers
-//! per `games_per_generation` global games, and runs one PPO optimizer step
+//! per `games_per_generation` global games, and runs one PPO update
 //! over every episode's samples. The opponent is frozen for the whole run.
 //!
 //! Every random choice is a pure function of `(seed, update, game index)`
@@ -22,7 +22,7 @@ use bota_server::game::{
 use super::episode::{self, ACTOR_DECISIONS};
 use super::{
     OpponentSpec, SessionCheckpoint, SmokeCounters, TRAINING_MAX_ENVIRONMENTS,
-    TrainingCheckpointSchedule, TrainingDirectoryLock, actor_stream_rngs,
+    TrainingCheckpointSchedule, TrainingDirectoryLock, TrainingEnvironment, actor_stream_rngs,
     build_environment_with_spawn_modifiers, device_name, reject_production_rejection,
     restore_strict_session, save_training_artifact, text_error, training_checkpoint_report,
     validate_checkpoint_cadence, validate_initial_weights_directory, validate_training_directory,
@@ -31,18 +31,23 @@ use crate::randomization::{
     AnnealSchedule, GenerationDraw, RANDOMIZATION_DIRECTORY, derive_training_seed, draw_generation,
     verify_generation_snapshots, write_generation_snapshot,
 };
-use crate::telemetry::{FlushPerformanceLogs, TrainingTimingScope, time_training_scope};
+use crate::telemetry::{
+    FlushPerformanceLogs, TrainingStage, TrainingTimingScope, TrainingUpdateMode,
+    TrainingUpdateTimer, time_training_scope,
+};
 use crate::{
     CheckpointDevice, CheckpointRun, MAP2_DECISION_INTERVAL_TICKS, MAP2_RETAINED_DECISIONS,
-    MAP2_REWARD_GAMMA_TICK, MAX_TRAINING_COUNTER, PPO_MAX_SAMPLES, PPO_RULES_AUDIT_VERSION,
-    PolicyDevice, PolicyModel, PolicySnapshot, PpoConfig, PpoError, PpoRng, PpoRollout,
+    MAP2_REWARD_GAMMA_TICK, MAX_TRAINING_COUNTER, MODEL_MAX_OPTIMIZER_STEP, PPO_ANNEALED_MAX_GAMES,
+    PPO_ANNEALED_MAX_SAMPLES, PPO_MAX_POLICY_SAMPLE_DRAWS, PPO_RULES_AUDIT_VERSION, PolicyDevice,
+    PolicyModel, PolicySnapshot, PpoConfig, PpoError, PpoRng, PpoRollout, PpoSampleBudget,
     PpoSmokeReport, PpoTrainer, PpoUpdateReport, SHADOW_FIEND, TrainingArtifact,
     TrainingCheckpointReport, compiled_features,
 };
 
-/// The environment ceiling and the retained-decision count bound one update's
-/// rollout, so no runtime capacity check is needed.
-const _: () = assert!(TRAINING_MAX_ENVIRONMENTS * MAP2_RETAINED_DECISIONS <= PPO_MAX_SAMPLES);
+// Sequential games share one rollout without raising the concurrent world cap.
+const _: () = assert!(TRAINING_MAX_ENVIRONMENTS < PPO_ANNEALED_MAX_GAMES);
+const _: () = assert!(PPO_ANNEALED_MAX_GAMES * MAP2_RETAINED_DECISIONS == PPO_ANNEALED_MAX_SAMPLES);
+const _: () = assert!(ACTOR_DECISIONS as u64 * PPO_MAX_POLICY_SAMPLE_DRAWS <= MAX_TRAINING_COUNTER);
 
 /// Domain separating the per-update balanced side shuffle.
 const SEAT_DOMAIN: u64 = 0x7365_6174_5f62_616c;
@@ -68,9 +73,9 @@ pub enum AnnealedOpponent {
 pub struct AnnealedJobConfig {
     /// Total updates in the run.
     pub updates: u64,
-    /// Games per update; always even so sides split exactly.
+    /// Games per update, even from 2 to 40 so sides split exactly.
     pub games_per_update: usize,
-    /// Worlds advanced in parallel per batch; divides games and generation games.
+    /// Worlds per batch, from 1 to 40; divides games and generation games.
     pub parallel_worlds: usize,
     /// Games per environment generation, on the global game counter.
     pub games_per_generation: u64,
@@ -81,7 +86,8 @@ pub struct AnnealedJobConfig {
     /// Opponent, frozen for the whole run.
     pub opponent: AnnealedOpponent,
     /// PPO dimensions and hyperparameters; `environments` and `rollout_decisions`
-    /// are the loop's, not free choices.
+    /// are the loop's, not free choices. Select `Standard` through 26 games and
+    /// `Annealed` above 26; library settings never silently change profiles.
     pub ppo: PpoConfig,
     /// When to write a durable checkpoint.
     pub checkpoint_cadence: crate::TrainingCheckpointCadence,
@@ -405,94 +411,128 @@ impl AnnealedSession {
         config: PpoConfig,
         generations: &mut GenerationCache,
     ) -> Result<(), PpoError> {
+        let mut timing = TrainingUpdateTimer::new(
+            self.completed_updates,
+            TrainingUpdateMode::Annealed,
+            self.trainer.optimizer_step(),
+        );
+        let result = self.train_update_timed(settings, harness, config, generations, &mut timing);
+        timing.observe_result(result)?;
+        timing.complete();
+        Ok(())
+    }
+
+    fn train_update_timed(
+        &mut self,
+        settings: &AnnealedJobConfig,
+        harness: AnnealedHarness,
+        config: PpoConfig,
+        generations: &mut GenerationCache,
+        timing: &mut TrainingUpdateTimer,
+    ) -> Result<(), PpoError> {
         let update = self.completed_updates;
         let games = settings.games_per_update;
-        let capacity = games
-            .checked_mul(MAP2_RETAINED_DECISIONS)
-            .ok_or(PpoError::CounterOverflow)?;
         let policy_identity = self.model.policy_identity().map_err(text_error)?;
-        let mut rollout = PpoRollout::new(capacity, policy_identity)?;
+        let mut rollout = PpoRollout::for_config(config, policy_identity)?;
         let mut report = PpoSmokeReport::default();
         let seats = balanced_policy_seats(settings.seed, update, games)?;
-        let mut local = 0usize;
-        while local < games {
-            let global_game = update
-                .checked_mul(games as u64)
-                .and_then(|base| base.checked_add(local as u64))
-                .ok_or(PpoError::CounterOverflow)?;
-            let generation = global_game / settings.games_per_generation;
-            let generation_end = generation
-                .checked_add(1)
-                .and_then(|next| next.checked_mul(settings.games_per_generation))
-                .ok_or(PpoError::CounterOverflow)?;
-            let draw = generations.draw(generation)?;
-            let rules = generation_rules(&draw, global_game);
-            let batch_len = settings.parallel_worlds;
-            assert!(local + batch_len <= games, "batch stays inside the update");
-            assert!(
-                global_game + batch_len as u64 <= generation_end,
-                "batch stays inside one generation"
-            );
-            let mut environments = Vec::with_capacity(batch_len);
-            for offset in 0..batch_len {
-                let game = global_game + offset as u64;
-                let seed =
-                    derive_training_seed(settings.seed, game, crate::randomization::ARENA_DOMAIN);
-                let opponent_seed = derive_training_seed(
-                    settings.seed,
-                    game,
-                    crate::randomization::OPPONENT_DOMAIN,
-                );
-                environments.push(build_environment_with_spawn_modifiers(
-                    seed,
-                    opponent_seed,
-                    MapId(2),
-                    seats[local + offset],
-                    0,
-                    self.opponent.spec(),
-                    rules.clone(),
-                )?);
-            }
-            let mut streams = (0..batch_len)
-                .map(|offset| episode::game_stream(settings.seed, global_game + offset as u64))
-                .collect::<Result<Vec<_>, _>>()?;
-            let mut random = actor_stream_rngs(&mut self.sampling, batch_len)?;
-            episode::collect_batch(
-                &self.model,
+        timing.enter(TrainingStage::Collection);
+        for local in (0..games).step_by(settings.parallel_worlds) {
+            self.collect_update_batch(
+                settings,
+                harness,
                 config,
+                generations,
                 local,
-                "annealed",
-                &mut environments,
-                &mut streams,
-                &mut random,
-                harness.episode_decisions(),
+                &seats,
                 &mut rollout,
                 &mut report,
             )?;
-            for environment in &environments {
-                reject_production_rejection(environment, "annealed collection")?;
-            }
             self.games = self
                 .games
-                .checked_add(batch_len as u64)
+                .checked_add(settings.parallel_worlds as u64)
                 .ok_or(PpoError::CounterOverflow)?;
-            local += batch_len;
-            if harness.stop_after_games.is_some_and(|stop| local >= stop) {
+            if harness
+                .stop_after_games
+                .is_some_and(|stop| local + settings.parallel_worlds >= stop)
+            {
                 return Err(PpoError::InvalidTransition(
                     "annealed invocation stopped mid-update",
                 ));
             }
         }
         let samples = rollout.len();
+        timing.set_samples(samples);
+        timing.enter(TrainingStage::BatchPreparation);
         let batch = rollout.finish(config)?;
-        let update_report = self.trainer.train_update(&self.model, &batch)?;
-        self.latest = update_report;
+        timing.enter(TrainingStage::Optimization);
+        let optimized = self.trainer.train_update(&self.model, &batch);
+        timing.set_optimizer_step(self.trainer.optimizer_step());
+        self.latest = optimized?;
+        timing.enter(TrainingStage::Finalization);
         self.completed_updates = self.trainer.updates();
         self.rollout_samples = self
             .rollout_samples
             .checked_add(samples as u64)
             .ok_or(PpoError::CounterOverflow)?;
         self.counters.merge(&report)?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn collect_update_batch(
+        &mut self,
+        settings: &AnnealedJobConfig,
+        harness: AnnealedHarness,
+        config: PpoConfig,
+        generations: &mut GenerationCache,
+        local: usize,
+        seats: &[usize],
+        rollout: &mut PpoRollout,
+        report: &mut PpoSmokeReport,
+    ) -> Result<(), PpoError> {
+        let global_game = self
+            .completed_updates
+            .checked_mul(settings.games_per_update as u64)
+            .and_then(|base| base.checked_add(local as u64))
+            .ok_or(PpoError::CounterOverflow)?;
+        let generation = global_game / settings.games_per_generation;
+        let draw = generations.draw(generation)?;
+        let batch_len = settings.parallel_worlds;
+        assert!(
+            local + batch_len <= settings.games_per_update,
+            "batch stays inside the update"
+        );
+        assert!(
+            global_game + batch_len as u64 <= draw.end_game,
+            "batch stays inside one generation"
+        );
+        let mut environments = batch_environments(
+            settings,
+            global_game,
+            &seats[local..local + batch_len],
+            &self.opponent,
+            &draw,
+        )?;
+        let mut streams = (0..batch_len)
+            .map(|offset| episode::game_stream(settings.seed, global_game + offset as u64))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut random = actor_stream_rngs(&mut self.sampling, batch_len)?;
+        episode::collect_batch(
+            &self.model,
+            config,
+            local,
+            "annealed",
+            &mut environments,
+            &mut streams,
+            &mut random,
+            harness.episode_decisions(),
+            rollout,
+            report,
+        )?;
+        for environment in &environments {
+            reject_production_rejection(environment, "annealed collection")?;
+        }
         Ok(())
     }
 
@@ -544,6 +584,35 @@ impl AnnealedSession {
             latest: self.latest,
         }
     }
+}
+
+fn batch_environments(
+    settings: &AnnealedJobConfig,
+    global_game: u64,
+    seats: &[usize],
+    opponent: &AnnealedOpponentRuntime,
+    draw: &GenerationDraw,
+) -> Result<Vec<TrainingEnvironment>, PpoError> {
+    assert_eq!(seats.len(), settings.parallel_worlds);
+    assert!(seats.len() <= PPO_ANNEALED_MAX_GAMES);
+    let rules = generation_rules(draw, global_game);
+    let mut environments = Vec::with_capacity(seats.len());
+    for (offset, seat) in seats.iter().copied().enumerate() {
+        let game = global_game + offset as u64;
+        let seed = derive_training_seed(settings.seed, game, crate::randomization::ARENA_DOMAIN);
+        let opponent_seed =
+            derive_training_seed(settings.seed, game, crate::randomization::OPPONENT_DOMAIN);
+        environments.push(build_environment_with_spawn_modifiers(
+            seed,
+            opponent_seed,
+            MapId(2),
+            seat,
+            0,
+            opponent.spec(),
+            rules.clone(),
+        )?);
+    }
+    Ok(environments)
 }
 
 /// The rules one generation's draw puts on a batch starting at `global_game`.
@@ -711,6 +780,7 @@ impl GenerationCache {
 
 /// One balanced seat assignment per update: exactly half of the games per side.
 fn balanced_policy_seats(seed: u64, update: u64, games: usize) -> Result<Vec<usize>, PpoError> {
+    assert!((2..=PPO_ANNEALED_MAX_GAMES).contains(&games));
     assert!(games.is_multiple_of(2), "sides need an even game count");
     let mut seats = (0..games).map(|index| index % 2).collect::<Vec<_>>();
     let mut rng = PpoRng::new(derive_training_seed(seed, update, SEAT_DOMAIN));
@@ -774,6 +844,9 @@ fn annealed_run(
         config.minibatch,
         settings.seed,
     );
+    if config.sample_budget == PpoSampleBudget::Annealed {
+        command_line.push_str(" --sample-budget annealed-v1");
+    }
     if harness.episode_decisions() != ACTOR_DECISIONS {
         command_line.push_str(&format!(
             " --episode-decisions {}",
@@ -817,7 +890,7 @@ fn annealed_run(
     })
 }
 
-/// Validates every annealed parameter and returns the PPO config it forces.
+/// Validates every annealed parameter without silently changing its PPO profile.
 fn validate_annealed(
     settings: &AnnealedJobConfig,
     harness: AnnealedHarness,
@@ -825,35 +898,7 @@ fn validate_annealed(
     if settings.updates == 0 || settings.updates > MAX_TRAINING_COUNTER {
         return Err(PpoError::InvalidConfig("annealed updates"));
     }
-    if settings.games_per_update < 2
-        || settings.games_per_update > TRAINING_MAX_ENVIRONMENTS
-        || !settings.games_per_update.is_multiple_of(2)
-    {
-        return Err(PpoError::InvalidConfig(
-            "annealed games per update must be even and within the environment ceiling",
-        ));
-    }
-    if settings.parallel_worlds == 0 || settings.parallel_worlds > TRAINING_MAX_ENVIRONMENTS {
-        return Err(PpoError::InvalidConfig("annealed parallel worlds"));
-    }
-    if !settings
-        .games_per_update
-        .is_multiple_of(settings.parallel_worlds)
-    {
-        return Err(PpoError::InvalidConfig(
-            "annealed parallel worlds must divide games per update",
-        ));
-    }
-    if settings.games_per_generation == 0
-        || settings.games_per_generation > MAX_TRAINING_COUNTER
-        || !settings
-            .games_per_generation
-            .is_multiple_of(settings.parallel_worlds as u64)
-    {
-        return Err(PpoError::InvalidConfig(
-            "annealed games per generation must be positive and divisible by parallel worlds",
-        ));
-    }
+    validate_annealed_batches(settings)?;
     if settings.zero_updates > settings.updates {
         return Err(PpoError::InvalidConfig(
             "annealed zero updates cannot exceed the update budget",
@@ -874,6 +919,45 @@ fn validate_annealed(
     {
         return Err(PpoError::InvalidConfig("annealed opponent weights"));
     }
+    let config = validate_annealed_ppo(settings)?;
+    validate_annealed_counters(settings, config)?;
+    Ok(config)
+}
+
+fn validate_annealed_batches(settings: &AnnealedJobConfig) -> Result<(), PpoError> {
+    if settings.games_per_update < 2
+        || settings.games_per_update > PPO_ANNEALED_MAX_GAMES
+        || !settings.games_per_update.is_multiple_of(2)
+    {
+        return Err(PpoError::InvalidConfig(
+            "annealed games per update must be even and within 2..=40",
+        ));
+    }
+    if settings.parallel_worlds == 0 || settings.parallel_worlds > PPO_ANNEALED_MAX_GAMES {
+        return Err(PpoError::InvalidConfig("annealed parallel worlds"));
+    }
+    if !settings
+        .games_per_update
+        .is_multiple_of(settings.parallel_worlds)
+    {
+        return Err(PpoError::InvalidConfig(
+            "annealed parallel worlds must divide games per update",
+        ));
+    }
+    if settings.games_per_generation == 0
+        || settings.games_per_generation > MAX_TRAINING_COUNTER
+        || !settings
+            .games_per_generation
+            .is_multiple_of(settings.parallel_worlds as u64)
+    {
+        return Err(PpoError::InvalidConfig(
+            "annealed games per generation must be positive and divisible by parallel worlds",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_annealed_ppo(settings: &AnnealedJobConfig) -> Result<PpoConfig, PpoError> {
     let config = settings.ppo;
     if config.environments != settings.games_per_update {
         return Err(PpoError::InvalidConfig(
@@ -895,8 +979,77 @@ fn validate_annealed(
             "annealed Map2 reward requires gamma per tick one",
         ));
     }
-    config.validate()?;
-    Ok(config)
+    let expected = if settings.games_per_update > TRAINING_MAX_ENVIRONMENTS {
+        PpoSampleBudget::Annealed
+    } else {
+        PpoSampleBudget::Standard
+    };
+    if config.sample_budget != expected {
+        return Err(PpoError::InvalidConfig(
+            "annealed PPO sample budget must match games per update",
+        ));
+    }
+    config.validate()
+}
+
+fn validate_annealed_counters(
+    settings: &AnnealedJobConfig,
+    config: PpoConfig,
+) -> Result<(), PpoError> {
+    assert_eq!(config.environments, settings.games_per_update);
+    assert_eq!(config.rollout_decisions, MAP2_RETAINED_DECISIONS);
+    let samples = (config.environments as u64)
+        .checked_mul(config.rollout_decisions as u64)
+        .ok_or(PpoError::InvalidConfig("annealed sample counter"))?;
+    let optimizer_steps = samples
+        .div_ceil(config.minibatch as u64)
+        .checked_mul(config.epochs as u64)
+        .ok_or(PpoError::InvalidConfig("annealed optimizer counter"))?;
+    validate_counter_budget(
+        settings.updates,
+        optimizer_steps,
+        MODEL_MAX_OPTIMIZER_STEP,
+        "annealed optimizer counter",
+    )?;
+    validate_counter_budget(
+        settings.updates,
+        samples,
+        MAX_TRAINING_COUNTER,
+        "annealed sample counter",
+    )?;
+    validate_counter_budget(
+        settings.updates,
+        settings.games_per_update as u64,
+        MAX_TRAINING_COUNTER,
+        "annealed actor RNG counter",
+    )?;
+    // All games share one shuffle per epoch; multiplying by games again would
+    // incorrectly reject the expanded profile's normal production budgets.
+    let shuffle_draws = samples
+        .saturating_sub(1)
+        .checked_mul(config.epochs as u64)
+        .ok_or(PpoError::InvalidConfig("annealed shuffle RNG counter"))?;
+    validate_counter_budget(
+        settings.updates,
+        shuffle_draws,
+        MAX_TRAINING_COUNTER,
+        "annealed shuffle RNG counter",
+    )
+}
+
+fn validate_counter_budget(
+    count: u64,
+    per_count: u64,
+    maximum: u64,
+    field: &'static str,
+) -> Result<(), PpoError> {
+    assert!(maximum > 0);
+    assert!(!field.is_empty());
+    count
+        .checked_mul(per_count)
+        .filter(|total| *total <= maximum)
+        .map(|_| ())
+        .ok_or(PpoError::InvalidConfig(field))
 }
 
 /// The differing command-line token when two runs differ only there.

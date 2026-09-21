@@ -10,6 +10,9 @@ use bota_proto::{HeroId, MapId};
 use safetensors::tensor::{Dtype, SafeTensors, TensorView, serialize};
 use sha2::{Digest, Sha256};
 
+#[cfg(test)]
+#[path = "tests/checkpoint_capacity.rs"]
+mod capacity_tests;
 #[path = "checkpoint_mastery.rs"]
 mod mastery;
 #[path = "checkpoint_terminal.rs"]
@@ -19,7 +22,7 @@ use crate::{
     MAP2_REWARD_SCHEMA_DESCRIPTOR, MAP2_REWARD_SCHEMA_HASH, MAP2_REWARD_SCHEMA_VERSION,
     MAX_TRAINING_COUNTER, MODEL_MAX_OPTIMIZER_STEP, MODEL_PARAMETER_COUNT, MODEL_SCHEMA_HASH,
     MODEL_SCHEMA_VERSION, PPO_RULES_AUDIT_VERSION, PPO_SCHEMA_HASH, PPO_SCHEMA_VERSION,
-    PolicyDevice, PolicyModel, PpoConfig, PpoTrainer, SHADOW_FIEND,
+    PolicyDevice, PolicyModel, PpoConfig, PpoSampleBudget, PpoTrainer, SHADOW_FIEND,
 };
 
 const CHECKPOINT_MAGIC: &[u8; 8] = b"DRYCKP18";
@@ -46,6 +49,17 @@ const LINKED_SCHEMAS: [(u32, u64); 5] = [
 /// FNV-1a of the descriptor, ordered linked identities, and reward descriptor.
 pub const CHECKPOINT_SCHEMA_HASH: u64 =
     crate::model::linked_schema_hash(CHECKPOINT_SCHEMA_DESCRIPTOR, &LINKED_SCHEMAS);
+/// Version of the opt-in annealed sample-budget checkpoint contract.
+pub const CHECKPOINT_ANNEALED_SCHEMA_VERSION: u32 = 13;
+/// Capacity extension of checkpoint twelve, without changing its default identity.
+pub const CHECKPOINT_ANNEALED_SCHEMA_DESCRIPTOR: &str = concat!(
+    "bota-drysua-checkpoint/v13;profile=annealed;",
+    "linked_schemas=action,feature,model,ppo_annealed,map2_reward,base_checkpoint12;linked_hash=fnv1a_descriptor_then_ordered_version_le32_hash_le64_then_map2_reward_descriptor_utf8;",
+    "base=exact_linked_checkpoint12_tensor_names_shapes_dtype_finite_SHA256_run_progress_rng_device_features_and_durable_commit_contract;",
+    "manifest=unchanged_checkpoint12_field_order_and_five_encoded_linked_schemas,base_checkpoint12_identity_hash_link_only;config=unchanged64bytes_five_le32_dimensions_eleven_f32,budget_derived_from_exact_header_and_linked_PPO_profile_no_extra_tag;",
+    "capacity=even_games2to40,retained1163_per_game,samples46520_max,decision_interval3,gamma_tick1,concurrent_world_limit_unchanged;progress=committed_rollout_samples_le_updates_times_configured_games_times1163_checked;mastery=forbidden;actor_learner_pipeline=forbidden;",
+    "runtime=explicit_annealed_PPO_version_hash_same_other_metadata_fields_and_tensor_contract,accept_only_exact_standard_or_annealed_tuple_no_relabel;standard=checkpoint12_and_PPO37_bytes_unchanged;"
+);
 const CHECKPOINT_TENSOR_FILE: &str = "checkpoint.safetensors";
 const CHECKPOINT_META_FILE: &str = "checkpoint.meta";
 const RUNTIME_TENSOR_FILE: &str = "drysua.weights.safetensors";
@@ -273,6 +287,11 @@ impl RestoredTrainingState {
         workers: usize,
         model: &PolicyModel,
     ) -> Result<crate::ActorLearnerPipeline, CheckpointError> {
+        if self.trainer.config().sample_budget == PpoSampleBudget::Annealed {
+            return Err(CheckpointError::InvalidManifest(
+                "annealed actor-learner pipeline",
+            ));
+        }
         crate::ActorLearnerPipeline::new_at(
             sample_capacity,
             workers,
@@ -295,7 +314,7 @@ impl TrainingArtifact {
         progress: CheckpointProgress,
     ) -> Result<Self, CheckpointError> {
         validate_run(&run, model, trainer.config())?;
-        validate_progress(&progress, trainer.updates())?;
+        validate_progress(&progress, trainer.updates(), trainer.config())?;
         mastery::validate_scope(
             run.mastery_config,
             progress.mastery.as_ref(),
@@ -330,6 +349,11 @@ impl TrainingArtifact {
 
     pub fn progress(&self) -> &CheckpointProgress {
         &self.progress
+    }
+
+    /// The exact optimizer configuration, including its checkpoint capacity profile.
+    pub const fn config(&self) -> PpoConfig {
+        self.config
     }
 
     /// Writes tensors and manifest via sibling temporary files, fsync, and rename.
@@ -439,22 +463,31 @@ impl TrainingArtifact {
         })
     }
 
-    /// Saves the deployment-only policy tensor with strict schema metadata.
+    /// Saves deployment weights with the unchanged standard PPO schema metadata.
     pub fn save_runtime_weights(
         model: &PolicyModel,
         directory: &Path,
+    ) -> Result<(), CheckpointError> {
+        Self::save_runtime_weights_with_budget(model, directory, PpoSampleBudget::Standard)
+    }
+
+    /// Saves deployment weights with the explicitly selected training capacity identity.
+    pub fn save_runtime_weights_with_budget(
+        model: &PolicyModel,
+        directory: &Path,
+        budget: PpoSampleBudget,
     ) -> Result<(), CheckpointError> {
         validate_directory(directory)?;
         let parameters = model
             .export_parameters()
             .map_err(|error| CheckpointError::Model(error.to_string()))?;
         validate_tensor_values("model.parameters", &parameters)?;
-        let bytes = serialize_runtime_tensor(&parameters)?;
+        let bytes = serialize_runtime_tensor(&parameters, budget)?;
         atomic_replace(&directory.join(RUNTIME_TENSOR_FILE), &bytes)?;
         sync_directory(directory)
     }
 
-    /// Loads only the exact current Map2 identity. Legacy tuples are not runtime compatible.
+    /// Loads either exact current Map2 capacity profile; older semantic tuples stay rejected.
     pub fn load_runtime_weights(
         model: &PolicyModel,
         directory: &Path,
@@ -472,16 +505,13 @@ impl TrainingArtifact {
 
     fn validate(&self) -> Result<(), CheckpointError> {
         validate_run_without_model(&self.run, self.config)?;
-        validate_progress(&self.progress, self.trainer_updates)?;
+        validate_progress(&self.progress, self.trainer_updates, self.config)?;
         mastery::validate_scope(
             self.run.mastery_config,
             self.progress.mastery.as_ref(),
             self.progress.global_update,
             self.config.environments,
         )?;
-        self.config
-            .validate()
-            .map_err(|_| CheckpointError::InvalidManifest("PPO config"))?;
         validate_tensor_values("model.parameters", &self.parameters)?;
         validate_tensor_values("adam.first_moment", &self.optimizer.first_moment)?;
         validate_tensor_values("adam.second_moment", &self.optimizer.second_moment)?;
@@ -543,6 +573,12 @@ fn validate_run_without_model(
     run: &CheckpointRun,
     config: PpoConfig,
 ) -> Result<(), CheckpointError> {
+    config
+        .validate()
+        .map_err(|_| CheckpointError::InvalidManifest("PPO config"))?;
+    if config.sample_budget == PpoSampleBudget::Annealed && run.mastery_config.is_some() {
+        return Err(CheckpointError::InvalidManifest("annealed mastery"));
+    }
     for (field, value) in [
         ("git commit", &run.git_commit),
         ("simulator commit", &run.simulator_commit),
@@ -571,7 +607,11 @@ fn validate_run_without_model(
 fn validate_progress(
     progress: &CheckpointProgress,
     trainer_updates: u64,
+    config: PpoConfig,
 ) -> Result<(), CheckpointError> {
+    if config.sample_budget == PpoSampleBudget::Annealed && progress.mastery.is_some() {
+        return Err(CheckpointError::InvalidManifest("annealed mastery"));
+    }
     if progress.global_update != trainer_updates || trainer_updates > MAX_TRAINING_COUNTER {
         return Err(CheckpointError::InvalidManifest("global update"));
     }
@@ -585,9 +625,7 @@ fn validate_progress(
             "policy or curriculum counter",
         ));
     }
-    let maximum_rollout_samples = trainer_updates
-        .saturating_add(1)
-        .saturating_mul(crate::PPO_MAX_SAMPLES as u64);
+    let maximum_rollout_samples = maximum_rollout_samples(config, trainer_updates)?;
     if progress.rollout_samples > maximum_rollout_samples {
         return Err(CheckpointError::InvalidManifest("rollout sample counter"));
     }
@@ -618,6 +656,18 @@ fn validate_progress(
         return Err(CheckpointError::InvalidManifest("league references"));
     }
     Ok(())
+}
+
+fn maximum_rollout_samples(config: PpoConfig, updates: u64) -> Result<u64, CheckpointError> {
+    match config.sample_budget {
+        PpoSampleBudget::Standard => Ok(updates
+            .saturating_add(1)
+            .saturating_mul(crate::PPO_MAX_SAMPLES as u64)),
+        PpoSampleBudget::Annealed => updates
+            .checked_mul(config.environments as u64)
+            .and_then(|count| count.checked_mul(crate::MAP2_RETAINED_DECISIONS as u64))
+            .ok_or(CheckpointError::InvalidManifest("rollout sample counter")),
+    }
 }
 
 fn validate_text(field: &'static str, value: &str) -> Result<(), CheckpointError> {
@@ -653,8 +703,11 @@ fn serialize_training_tensors(artifact: &TrainingArtifact) -> Result<Vec<u8>, Ch
 /// `drysua.weights.safetensors` bytes. This writer emits the same header with
 /// sorted metadata keys, making the whole file byte-identical; the reader
 /// compares metadata maps and stays order-insensitive, so older files load.
-fn serialize_runtime_tensor(parameters: &[f32]) -> Result<Vec<u8>, CheckpointError> {
-    let metadata = runtime_tensor_metadata();
+fn serialize_runtime_tensor(
+    parameters: &[f32],
+    budget: PpoSampleBudget,
+) -> Result<Vec<u8>, CheckpointError> {
+    let metadata = runtime_tensor_metadata(budget);
     debug_assert!(
         metadata.windows(2).all(|pair| pair[0].0 < pair[1].0),
         "runtime metadata keys are canonical"
@@ -704,7 +757,7 @@ fn push_json_string(out: &mut String, value: &str) {
 }
 
 /// The runtime weights metadata, sorted by key.
-fn runtime_tensor_metadata() -> Vec<(&'static str, String)> {
+fn runtime_tensor_metadata(budget: PpoSampleBudget) -> Vec<(&'static str, String)> {
     vec![
         ("action_schema_hash", ACTION_SCHEMA_HASH.to_string()),
         ("feature_schema_hash", FEATURE_SCHEMA_HASH.to_string()),
@@ -725,14 +778,14 @@ fn runtime_tensor_metadata() -> Vec<(&'static str, String)> {
             "ppo_rules_audit_version",
             PPO_RULES_AUDIT_VERSION.to_string(),
         ),
-        ("ppo_schema_hash", PPO_SCHEMA_HASH.to_string()),
-        ("ppo_schema_version", PPO_SCHEMA_VERSION.to_string()),
+        ("ppo_schema_hash", budget.schema_hash().to_string()),
+        ("ppo_schema_version", budget.schema_version().to_string()),
     ]
 }
 
 /// The same metadata as an order-insensitive map, for loading.
-fn runtime_tensor_metadata_map() -> HashMap<String, String> {
-    runtime_tensor_metadata()
+fn runtime_tensor_metadata_map(budget: PpoSampleBudget) -> HashMap<String, String> {
+    runtime_tensor_metadata(budget)
         .into_iter()
         .map(|(key, value)| (key.to_owned(), value))
         .collect()
@@ -776,8 +829,10 @@ fn decode_training_tensors(bytes: &[u8]) -> Result<DecodedTensors, CheckpointErr
 fn decode_runtime_tensor(bytes: &[u8]) -> Result<Vec<f32>, CheckpointError> {
     let (_, metadata) = SafeTensors::read_metadata(bytes)
         .map_err(|error| CheckpointError::Backend(error.to_string()))?;
-    let expected = runtime_tensor_metadata_map();
-    if metadata.metadata().as_ref() != Some(&expected) {
+    let actual = metadata.metadata().as_ref();
+    if actual != Some(&runtime_tensor_metadata_map(PpoSampleBudget::Standard))
+        && actual != Some(&runtime_tensor_metadata_map(PpoSampleBudget::Annealed))
+    {
         return Err(CheckpointError::SchemaMismatch);
     }
     let tensors = SafeTensors::deserialize(bytes)
@@ -840,10 +895,12 @@ fn encode_manifest(
     tensor_hash: [u8; 32],
 ) -> Result<Vec<u8>, CheckpointError> {
     let mut writer = ManifestWriter::default();
+    let budget = artifact.config.sample_budget;
+    let (version, hash) = checkpoint_schema_identity(budget);
     writer.bytes.extend(CHECKPOINT_MAGIC);
-    writer.u32(CHECKPOINT_SCHEMA_VERSION);
-    writer.u64(CHECKPOINT_SCHEMA_HASH);
-    encode_schema(&mut writer);
+    writer.u32(version);
+    writer.u64(hash);
+    encode_schema(&mut writer, budget);
     encode_run(&mut writer, &artifact.run)?;
     encode_progress(&mut writer, &artifact.progress)?;
     encode_config(&mut writer, artifact.config)?;
@@ -860,13 +917,12 @@ fn decode_manifest(bytes: &[u8]) -> Result<TrainingArtifact, CheckpointError> {
     if reader.take(8)? != CHECKPOINT_MAGIC {
         return Err(CheckpointError::ManifestMagic);
     }
-    if reader.u32()? != CHECKPOINT_SCHEMA_VERSION || reader.u64()? != CHECKPOINT_SCHEMA_HASH {
-        return Err(CheckpointError::SchemaMismatch);
-    }
-    decode_schema(&mut reader)?;
+    let budget = decode_checkpoint_identity(&mut reader)?;
+    decode_schema(&mut reader, budget)?;
     let run = decode_run(&mut reader)?;
     let progress = decode_progress(&mut reader, run.mastery_config)?;
-    let config = decode_config(&mut reader)?;
+    let config = decode_config(&mut reader, budget)?;
+    validate_run_without_model(&run, config)?;
     mastery::validate_scope(
         run.mastery_config,
         progress.mastery.as_ref(),
@@ -874,8 +930,7 @@ fn decode_manifest(bytes: &[u8]) -> Result<TrainingArtifact, CheckpointError> {
         config.environments,
     )?;
     let trainer_updates = reader.u64()?;
-    validate_run_without_model(&run, config)?;
-    validate_progress(&progress, trainer_updates)?;
+    validate_progress(&progress, trainer_updates, config)?;
     let step = reader.u64()?;
     let shuffle = (reader.u64()?, reader.u64()?);
     let tensor_hash = reader.array_32()?;
@@ -896,15 +951,63 @@ fn decode_manifest(bytes: &[u8]) -> Result<TrainingArtifact, CheckpointError> {
     })
 }
 
-fn encode_schema(writer: &mut ManifestWriter) {
-    for (version, hash) in LINKED_SCHEMAS {
+fn checkpoint_schema_identity(budget: PpoSampleBudget) -> (u32, u64) {
+    let version = match budget {
+        PpoSampleBudget::Standard => return (CHECKPOINT_SCHEMA_VERSION, CHECKPOINT_SCHEMA_HASH),
+        PpoSampleBudget::Annealed => CHECKPOINT_ANNEALED_SCHEMA_VERSION,
+    };
+    let schemas = linked_schemas(budget);
+    let linked = [
+        schemas[0],
+        schemas[1],
+        schemas[2],
+        schemas[3],
+        schemas[4],
+        (CHECKPOINT_SCHEMA_VERSION, CHECKPOINT_SCHEMA_HASH),
+    ];
+    (
+        version,
+        crate::model::linked_schema_hash(CHECKPOINT_ANNEALED_SCHEMA_DESCRIPTOR, &linked),
+    )
+}
+
+fn decode_checkpoint_identity(
+    reader: &mut ManifestReader<'_>,
+) -> Result<PpoSampleBudget, CheckpointError> {
+    let identity = (reader.u32()?, reader.u64()?);
+    match identity.0 {
+        CHECKPOINT_SCHEMA_VERSION
+            if identity == checkpoint_schema_identity(PpoSampleBudget::Standard) =>
+        {
+            Ok(PpoSampleBudget::Standard)
+        }
+        CHECKPOINT_ANNEALED_SCHEMA_VERSION
+            if identity == checkpoint_schema_identity(PpoSampleBudget::Annealed) =>
+        {
+            Ok(PpoSampleBudget::Annealed)
+        }
+        _ => Err(CheckpointError::SchemaMismatch),
+    }
+}
+
+fn linked_schemas(budget: PpoSampleBudget) -> [(u32, u64); 5] {
+    let mut schemas = LINKED_SCHEMAS;
+    schemas[3] = (budget.schema_version(), budget.schema_hash());
+    schemas
+}
+
+fn encode_schema(writer: &mut ManifestWriter, budget: PpoSampleBudget) {
+    for (version, hash) in linked_schemas(budget) {
         writer.u32(version);
         writer.u64(hash);
     }
 }
 
-fn decode_schema(reader: &mut ManifestReader<'_>) -> Result<(), CheckpointError> {
-    for (version, hash) in LINKED_SCHEMAS {
+fn decode_schema(
+    reader: &mut ManifestReader<'_>,
+    budget: PpoSampleBudget,
+) -> Result<(), CheckpointError> {
+    for (version, hash) in linked_schemas(budget) {
         if reader.u32()? != version || reader.u64()? != hash {
             return Err(CheckpointError::SchemaMismatch);
         }
@@ -1053,7 +1156,10 @@ fn encode_config(writer: &mut ManifestWriter, config: PpoConfig) -> Result<(), C
     Ok(())
 }
 
-fn decode_config(reader: &mut ManifestReader<'_>) -> Result<PpoConfig, CheckpointError> {
+fn decode_config(
+    reader: &mut ManifestReader<'_>,
+    budget: PpoSampleBudget,
+) -> Result<PpoConfig, CheckpointError> {
     let decision_interval_ticks = reader.u32()?;
     let rollout_decisions = reader.u32()? as usize;
     let environments = reader.u32()? as usize;
@@ -1062,7 +1168,8 @@ fn decode_config(reader: &mut ManifestReader<'_>) -> Result<PpoConfig, Checkpoin
     let values = std::array::from_fn::<_, 11, _>(|_| reader.f32())
         .into_iter()
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(PpoConfig {
+    PpoConfig {
+        sample_budget: budget,
         decision_interval_ticks,
         rollout_decisions,
         environments,
@@ -1079,7 +1186,9 @@ fn decode_config(reader: &mut ManifestReader<'_>) -> Result<PpoConfig, Checkpoin
         gamma_tick: values[8],
         gae_lambda: values[9],
         target_kl: values[10],
-    })
+    }
+    .validate()
+    .map_err(|_| CheckpointError::InvalidManifest("PPO config"))
 }
 
 fn config_floats(config: PpoConfig) -> [f32; 11] {

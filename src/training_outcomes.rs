@@ -2,10 +2,19 @@
 use crate::PpoError;
 use crate::TrainingGameOutcome;
 
-/// At most one completed outcome per full-episode stream, sorted by tick then stream.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+/// At most one completed outcome per update stream, sorted by tick then stream.
+/// Sequential annealed batches can finish more games than the concurrent world cap.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CompletedTrainingEpisodes {
-    entries: [Option<(u32, usize, TrainingGameOutcome)>; crate::MAX_TRAINING_ENVIRONMENTS],
+    entries: [Option<(u32, usize, TrainingGameOutcome)>; crate::PPO_ANNEALED_MAX_GAMES],
+}
+
+impl Default for CompletedTrainingEpisodes {
+    fn default() -> Self {
+        Self {
+            entries: [None; crate::PPO_ANNEALED_MAX_GAMES],
+        }
+    }
 }
 
 impl CompletedTrainingEpisodes {
@@ -54,7 +63,7 @@ impl CompletedTrainingEpisodes {
 
     pub fn ordered_outcomes(&self) -> Vec<TrainingGameOutcome> {
         let mut entries: Vec<_> = self.entries.iter().flatten().copied().collect();
-        assert!(entries.len() <= crate::MAX_TRAINING_ENVIRONMENTS);
+        assert!(entries.len() <= crate::PPO_ANNEALED_MAX_GAMES);
         entries.sort_by_key(|entry| (entry.0, entry.1));
         entries.into_iter().map(|entry| entry.2).collect()
     }

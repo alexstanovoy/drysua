@@ -253,6 +253,7 @@ impl Display for TrainingStage {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TrainingUpdateMode {
+    Annealed,
     CompleteEpisodes,
     ResetWindow,
 }
@@ -260,6 +261,7 @@ pub(crate) enum TrainingUpdateMode {
 impl Display for TrainingUpdateMode {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
+            Self::Annealed => "annealed",
             Self::CompleteEpisodes => "complete_episodes",
             Self::ResetWindow => "reset_window",
         })

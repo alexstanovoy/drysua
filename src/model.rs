@@ -15,6 +15,9 @@ use candle_core::{DType, Device, Tensor, Var};
 #[path = "tests/model_test_support.rs"]
 mod test_support;
 #[cfg(test)]
+#[path = "tests/model_transfers.rs"]
+mod transfer_tests;
+#[cfg(test)]
 pub(crate) use test_support::*;
 
 use crate::{
@@ -83,6 +86,7 @@ const SLOT_EMBEDDING: usize = 16;
 const DECODER_CONTEXT: usize = 336;
 const TARGET_MODE_HEAD: usize = 3;
 const PUT_MODE_HEAD: usize = 2;
+const MODEL_PARAMETER_TENSORS: usize = 62;
 static NEXT_MODEL_LINEAGE: AtomicU64 = AtomicU64::new(1);
 static NEXT_OPTIMIZER_LINEAGE: AtomicU64 = AtomicU64::new(1);
 
@@ -1942,7 +1946,7 @@ impl PolicyModel {
         }
         let original = self.export_parameters_locked()?;
         let original_adam = adam.clone();
-        let diagnostics = self.apply_adam_locked(adam, &gradients)?;
+        let diagnostics = self.apply_adam_locked(adam, &gradients, &original)?;
         let candidate_kl = self.ppo_candidate_kl_locked(
             examples,
             config,
@@ -2064,11 +2068,14 @@ impl PolicyModel {
         &self,
         adam: &mut AdamState,
         gradients: &[f32],
+        parameters: &[f32],
     ) -> Result<AdamDiagnostics, ModelError> {
+        assert_eq!(parameters.len(), MODEL_PARAMETER_COUNT);
+        assert_eq!(adam.binding.policy, self.policy_identity_locked());
         let next = self.next_policy_identity_locked()?;
-        let parameters = self.export_parameters_locked()?;
+        // The exclusive candidate lock keeps the rollback snapshot current until import.
         let replacement = compute_adam_step(
-            &parameters,
+            parameters,
             gradients,
             &adam.first_moment,
             &adam.second_moment,
@@ -2472,7 +2479,7 @@ impl PolicyModel {
     }
 
     fn parameters(&self) -> Vec<NamedParameter<'_>> {
-        let mut output = Vec::with_capacity(62);
+        let mut output = Vec::with_capacity(MODEL_PARAMETER_TENSORS);
         self.unit.parameters(
             &[
                 ("unit.0.weight", "unit.0.bias"),
@@ -2984,19 +2991,146 @@ fn append_tensor_target<const WIDTH: usize>(
 }
 
 fn collect_host_gradients(named: Vec<NamedPolicyGradient>) -> Result<Vec<f32>, ModelError> {
+    validate_gradient_descriptors(&named)?;
+    let first = named.iter().find_map(|gradient| gradient.gradient.as_ref());
+    if first.is_some_and(|first| {
+        !first.device().is_cpu()
+            && named
+                .iter()
+                .filter_map(|gradient| gradient.gradient.as_ref())
+                .all(|tensor| {
+                    tensor.dtype() == DType::F32 && tensor.device().same_device(first.device())
+                })
+    }) {
+        return collect_packed_gradients(&named);
+    }
     let mut output = Vec::with_capacity(MODEL_PARAMETER_COUNT);
+    let mut total = Some(0usize);
     for gradient in named {
-        let count = gradient.parameter_shape.iter().product::<usize>();
+        let count = gradient_element_count(&gradient.parameter_shape)?;
+        let end = total.and_then(|offset| gradient_buffer_end(offset, count));
         if let Some(tensor) = gradient.gradient {
+            // Match Candle's extraction error before compacting invalid or empty inputs.
+            if tensor.dtype() != DType::F32 {
+                return Err(candle_core::Error::UnexpectedDType {
+                    expected: DType::F32,
+                    got: tensor.dtype(),
+                    msg: "unexpected dtype",
+                }
+                .bt()
+                .into());
+            }
+            if tensor.elem_count() != count {
+                return Err(ModelError::InvalidModelState("gradient shape"));
+            }
+            if count == 0 || count > MODEL_PARAMETER_COUNT {
+                total = end;
+                continue;
+            }
+            let tensor = if tensor.device().is_cpu() {
+                tensor
+            } else {
+                tensor.detach().force_contiguous()?
+            };
             let values = tensor.flatten_all()?.to_vec1::<f32>()?;
             if values.len() != count {
                 return Err(ModelError::InvalidModelState("gradient shape"));
             }
-            output.extend(values);
-        } else {
-            output.resize(output.len() + count, 0.0);
+            if end.is_some() {
+                output.extend(values);
+            }
+        } else if let Some(end) = end {
+            output.resize(end, 0.0);
         }
+        total = end;
     }
+    // Shape/dtype errors retain priority even after a bounded total overflows.
+    total.ok_or(ModelError::InvalidModelState("gradient parameter count"))?;
+    finish_host_gradients(output)
+}
+
+fn collect_packed_gradients(named: &[NamedPolicyGradient]) -> Result<Vec<f32>, ModelError> {
+    validate_gradient_descriptors(named)?;
+    let mut tensors = Vec::with_capacity(named.len());
+    let mut ranges = Vec::with_capacity(named.len());
+    let mut total = Some(0usize);
+    let mut present = 0usize;
+    for gradient in named {
+        let count = gradient_element_count(&gradient.parameter_shape)?;
+        let end = total.and_then(|offset| gradient_buffer_end(offset, count));
+        if let Some(tensor) = &gradient.gradient {
+            if tensor.elem_count() != count {
+                return Err(ModelError::InvalidModelState("gradient shape"));
+            }
+            if let Some(end) = end
+                && count > 0
+            {
+                present = gradient_buffer_end(present, count)
+                    .ok_or(ModelError::InvalidModelState("gradient parameter count"))?;
+                tensors.push(tensor.detach().flatten_all()?);
+                ranges.push(end - count..end);
+            }
+        }
+        total = end;
+    }
+    let total = total.ok_or(ModelError::InvalidModelState("gradient parameter count"))?;
+    let mut output = vec![0.0f32; total];
+    if !tensors.is_empty() {
+        // Singleton cat aliases backing storage; compact it before the only host read.
+        let packed = if tensors.len() == 1 {
+            tensors[0].force_contiguous()?
+        } else {
+            Tensor::cat(&tensors, 0)?
+        };
+        assert_eq!(packed.elem_count(), present);
+        assert_eq!(packed.layout().start_offset(), 0);
+        let values = packed.to_vec1::<f32>()?;
+        if values.len() != present {
+            return Err(ModelError::InvalidModelState("gradient shape"));
+        }
+        let mut offset = 0usize;
+        for range in ranges {
+            let end = gradient_buffer_end(offset, range.len())
+                .ok_or(ModelError::InvalidModelState("gradient parameter count"))?;
+            let source = values
+                .get(offset..end)
+                .ok_or(ModelError::InvalidModelState("gradient shape"))?;
+            let target = output
+                .get_mut(range)
+                .ok_or(ModelError::InvalidModelState("gradient parameter count"))?;
+            target.copy_from_slice(source);
+            offset = end;
+        }
+        assert_eq!(offset, present);
+    }
+    finish_host_gradients(output)
+}
+
+fn validate_gradient_descriptors(named: &[NamedPolicyGradient]) -> Result<(), ModelError> {
+    if named.len() > MODEL_PARAMETER_TENSORS {
+        return Err(ModelError::InvalidModelState("gradient parameter count"));
+    }
+    Ok(())
+}
+
+fn gradient_element_count(shape: &[usize]) -> Result<usize, ModelError> {
+    if shape.len() > 2 {
+        return Err(ModelError::InvalidModelState("gradient shape"));
+    }
+    shape.iter().try_fold(1usize, |count, dimension| {
+        count
+            .checked_mul(*dimension)
+            .ok_or(ModelError::InvalidModelState("gradient shape"))
+    })
+}
+
+fn gradient_buffer_end(offset: usize, count: usize) -> Option<usize> {
+    offset
+        .checked_add(count)
+        .filter(|end| *end <= MODEL_PARAMETER_COUNT)
+}
+
+fn finish_host_gradients(output: Vec<f32>) -> Result<Vec<f32>, ModelError> {
     if output.len() != MODEL_PARAMETER_COUNT {
         return Err(ModelError::InvalidModelState("gradient parameter count"));
     }

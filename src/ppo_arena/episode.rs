@@ -38,6 +38,9 @@ const RETENTION_STREAM_DOMAIN: u64 = 0x7068_6173_655f_726e;
 const _: () = assert!(RETENTION_STRIDE.is_power_of_two());
 const RETAINED_PER_EPISODE: usize = crate::MAP2_RETAINED_DECISIONS;
 const MAX_EPISODE_ENVIRONMENTS: usize = super::TRAINING_MAX_ENVIRONMENTS;
+const MAX_ACTOR_ENVIRONMENTS: usize = crate::PPO_ANNEALED_MAX_GAMES;
+const _: () = assert!(MAX_EPISODE_ENVIRONMENTS <= MAX_ACTOR_ENVIRONMENTS);
+const _: () = assert!(MAX_ACTOR_ENVIRONMENTS <= crate::MODEL_TRAINING_BATCH);
 const RETAINED_BYTES_PER_ENVIRONMENT: usize = 3
     * RETAINED_PER_EPISODE
     * (std::mem::size_of::<FeatureFrame>() + std::mem::size_of::<crate::BehavioralTarget>());
@@ -48,6 +51,9 @@ const _: () = assert!(MAX_EPISODE_ENVIRONMENTS * RETAINED_PER_EPISODE <= crate::
 
 /// Map2 comprehensive-reward contract shared by the parallel and serial collectors.
 fn validate_reward_contract(settings: &TrainingJobConfig) -> Result<(), PpoError> {
+    if settings.ppo.sample_budget != crate::PpoSampleBudget::Standard {
+        return Err(PpoError::InvalidConfig("train-full sample budget"));
+    }
     if (settings.opponent_schedule == crate::TrainingOpponentSchedule::MasteryV1)
         != settings.mastery_config.is_some()
     {
@@ -809,9 +815,23 @@ fn collect_with_workers(
     // The paired production collector passes even counts; the annealed batch
     // collector admits any world count from one to the ceiling.
     assert!(!environments.is_empty());
-    assert!(environments.len() <= MAX_EPISODE_ENVIRONMENTS);
+    let maximum_worlds = match config.sample_budget {
+        crate::PpoSampleBudget::Standard => MAX_EPISODE_ENVIRONMENTS,
+        crate::PpoSampleBudget::Annealed => MAX_ACTOR_ENVIRONMENTS,
+    };
+    if environments.len() > maximum_worlds
+        || stream_base
+            .checked_add(environments.len())
+            .is_none_or(|end| end > config.environments)
+    {
+        return Err(PpoError::InvalidConfig(
+            "episode collection worlds or streams",
+        ));
+    }
+    // Preserve the queue size for existing batches; expanded batches need one slot per world.
+    let flush_capacity = MAX_EPISODE_ENVIRONMENTS.max(environments.len());
     let (flush_sender, flush_receiver) =
-        std::sync::mpsc::sync_channel::<FlushRequest>(MAX_EPISODE_ENVIRONMENTS);
+        std::sync::mpsc::sync_channel::<FlushRequest>(flush_capacity);
     let flush_evaluator = FlushEvaluator {
         sender: std::sync::Mutex::new(Some(flush_sender)),
     };
@@ -1166,7 +1186,7 @@ fn prepare_all_workers<'scope>(
     stream_count: usize,
 ) -> Result<Vec<Option<(FeatureFrame, ActionSpace)>>, PpoError> {
     assert!(stream_count >= 1);
-    assert!(stream_count <= MAX_EPISODE_ENVIRONMENTS);
+    assert!(stream_count <= MAX_ACTOR_ENVIRONMENTS);
     let active: Vec<usize> = (0..stream_count).collect();
     for &stream in &active {
         workers.submit(stream, StreamJob::Prepare)?;
@@ -1199,8 +1219,9 @@ fn sample_choices(
 
 fn validate_active(random: &[PpoRng], active: &[usize]) -> Result<(), PpoError> {
     assert!(!active.is_empty());
-    assert!(active.len() <= MAX_EPISODE_ENVIRONMENTS);
-    if active.iter().any(|index| *index >= random.len())
+    if active.len() > MAX_ACTOR_ENVIRONMENTS
+        || random.len() > MAX_ACTOR_ENVIRONMENTS
+        || active.iter().any(|index| *index >= random.len())
         || active.windows(2).any(|pair| pair[0] >= pair[1])
     {
         return Err(PpoError::InvalidConfig("episode active streams"));

@@ -8,6 +8,8 @@ use bota_proto::Team;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::feature::{encode, tracker_with_view, world_view};
+#[path = "ppo_capacity.rs"]
+mod capacity;
 #[cfg(feature = "builtin")]
 use crate::ActionKind;
 use crate::{

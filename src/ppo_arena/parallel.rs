@@ -30,7 +30,7 @@ impl<'scope, T: Send + 'scope, R: Send + 'scope, O: Send + 'scope> StreamWorkers
         name_prefix: &str,
         operation: impl Fn(usize, &mut T, R) -> Result<O, PpoError> + Send + Sync + Copy + 'scope,
     ) -> Result<Self, PpoError> {
-        if worlds.is_empty() || worlds.len() > super::TRAINING_MAX_ENVIRONMENTS {
+        if worlds.is_empty() || worlds.len() > crate::PPO_ANNEALED_MAX_GAMES {
             return Err(PpoError::InvalidConfig("stream worker environments"));
         }
         assert!(!name_prefix.is_empty());
@@ -78,7 +78,7 @@ impl<'scope, T: Send + 'scope, R: Send + 'scope, O: Send + 'scope> StreamWorkers
     }
 
     pub(super) fn receive(&self, streams: &[usize]) -> Result<Vec<O>, PpoError> {
-        assert!(streams.len() <= super::TRAINING_MAX_ENVIRONMENTS);
+        assert!(streams.len() <= self.receivers.len());
         let mut output = Vec::with_capacity(streams.len());
         let mut failure = None;
         for &stream in streams {

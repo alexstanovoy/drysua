@@ -22,6 +22,10 @@ use crate::{
 };
 
 #[cfg(test)]
+#[path = "tests/feature_capacity.rs"]
+mod capacity_tests;
+
+#[cfg(test)]
 #[path = "tests/feature_test_support.rs"]
 mod test_support;
 
@@ -730,6 +734,42 @@ struct IndexedFeatureRow<const FEATURES: usize> {
     values: [f32; FEATURES],
 }
 
+const ANNEALED_FEATURE_ARENA_BYTES: [u64; 7] = [
+    annealed_feature_row_bytes::<UNIT_FEATURE_TOKENS, UNIT_FEATURES>(),
+    annealed_feature_row_bytes::<REMEMBERED_UNIT_FEATURE_TOKENS, UNIT_FEATURES>(),
+    annealed_feature_row_bytes::<POINT_FEATURE_TOKENS, POINT_FEATURES>(),
+    annealed_feature_row_bytes::<ABILITY_FEATURE_TOKENS, ABILITY_FEATURES>(),
+    annealed_feature_row_bytes::<ITEM_FEATURE_TOKENS, ITEM_FEATURES>(),
+    annealed_feature_row_bytes::<PROJECTILE_FEATURE_TOKENS, PROJECTILE_FEATURES>(),
+    annealed_feature_row_bytes::<LOOT_FEATURE_TOKENS, LOOT_FEATURES>(),
+];
+
+/// Capped row-vector bytes plus one largest arena's moving-reallocation overlap.
+/// Excludes headers, transitions, materialized minibatches, and allocator overhead;
+/// this is not a bound on the process's total memory consumption.
+pub(crate) const ANNEALED_FEATURE_ARENA_PEAK_BYTES: u64 = {
+    let mut total = 0;
+    let mut largest = 0;
+    let mut index = 0;
+    while index < ANNEALED_FEATURE_ARENA_BYTES.len() {
+        let bytes = ANNEALED_FEATURE_ARENA_BYTES[index];
+        total += bytes;
+        if bytes > largest {
+            largest = bytes;
+        }
+        index += 1;
+    }
+    total + largest
+};
+
+const fn annealed_feature_row_bytes<const TOKENS: usize, const FEATURES: usize>() -> u64 {
+    assert!(TOKENS > 0);
+    assert!(TOKENS <= u16::MAX as usize);
+    let rows = crate::PPO_ANNEALED_MAX_SAMPLES as u64 * TOKENS as u64;
+    assert!(rows <= u32::MAX as u64);
+    rows * std::mem::size_of::<IndexedFeatureRow<FEATURES>>() as u64
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct FeatureRowRange {
     offset: u32,
@@ -755,6 +795,7 @@ pub(crate) struct RaggedFeatureHeader {
 
 pub(crate) struct RaggedFeatureArena {
     sample_capacity: usize,
+    bounded_growth: bool,
     units: Vec<IndexedFeatureRow<UNIT_FEATURES>>,
     remembered_units: Vec<IndexedFeatureRow<UNIT_FEATURES>>,
     points: Vec<IndexedFeatureRow<POINT_FEATURES>>,
@@ -768,6 +809,7 @@ impl RaggedFeatureArena {
     pub(crate) fn new(sample_capacity: usize) -> Self {
         Self {
             sample_capacity,
+            bounded_growth: false,
             units: Vec::new(),
             remembered_units: Vec::new(),
             points: Vec::new(),
@@ -778,10 +820,24 @@ impl RaggedFeatureArena {
         }
     }
 
+    /// Opt-in Annealed storage; every row vector grows fallibly within its row cap.
+    pub(crate) fn new_bounded(sample_capacity: usize) -> Result<Self, &'static str> {
+        if !(1..=crate::PPO_ANNEALED_MAX_SAMPLES).contains(&sample_capacity) {
+            return Err("bounded ragged feature sample capacity is outside 1..=46520");
+        }
+        Ok(Self {
+            bounded_growth: true,
+            ..Self::new(sample_capacity)
+        })
+    }
+
     pub(crate) fn push(
         &mut self,
         frame: &FeatureFrame,
     ) -> Result<RaggedFeatureHeader, &'static str> {
+        if self.bounded_growth {
+            self.reserve_frame(frame)?;
+        }
         let units = append_feature_rows(
             &mut self.units,
             &frame.units,
@@ -841,6 +897,54 @@ impl RaggedFeatureArena {
         })
     }
 
+    fn reserve_frame(&mut self, frame: &FeatureFrame) -> Result<(), &'static str> {
+        assert!(self.bounded_growth);
+        assert!(self.sample_capacity <= crate::PPO_ANNEALED_MAX_SAMPLES);
+        // Reserve all seven arenas first so an allocation failure cannot append partial rows.
+        reserve_feature_rows(
+            &mut self.units,
+            &frame.units,
+            unit_feature::TOKEN_PRESENT,
+            self.sample_capacity,
+        )?;
+        reserve_feature_rows(
+            &mut self.remembered_units,
+            &frame.remembered_units,
+            unit_feature::TOKEN_PRESENT,
+            self.sample_capacity,
+        )?;
+        reserve_feature_rows(
+            &mut self.points,
+            &frame.points,
+            point_feature::TOKEN_PRESENT,
+            self.sample_capacity,
+        )?;
+        reserve_feature_rows(
+            &mut self.abilities,
+            &frame.abilities,
+            ability_feature::TOKEN_PRESENT,
+            self.sample_capacity,
+        )?;
+        reserve_feature_rows(
+            &mut self.items,
+            &frame.items,
+            item_feature::TOKEN_PRESENT,
+            self.sample_capacity,
+        )?;
+        reserve_feature_rows(
+            &mut self.projectiles,
+            &frame.projectiles,
+            projectile_feature::TOKEN_PRESENT,
+            self.sample_capacity,
+        )?;
+        reserve_feature_rows(
+            &mut self.loot,
+            &frame.loot,
+            loot_feature::TOKEN_PRESENT,
+            self.sample_capacity,
+        )
+    }
+
     pub(crate) fn expand(
         &self,
         header: &RaggedFeatureHeader,
@@ -871,6 +975,65 @@ impl RaggedFeatureArena {
         restore_feature_rows(&self.loot, header.loot, &mut frame.loot)?;
         Ok(frame)
     }
+}
+
+fn reserve_feature_rows<const TOKENS: usize, const FEATURES: usize>(
+    arena: &mut Vec<IndexedFeatureRow<FEATURES>>,
+    rows: &[[f32; FEATURES]; TOKENS],
+    presence: usize,
+    sample_capacity: usize,
+) -> Result<(), &'static str> {
+    let maximum = bounded_feature_row_capacity::<TOKENS>(sample_capacity)?;
+    if presence >= FEATURES {
+        return Err("ragged feature presence index out of range");
+    }
+    let count = rows.iter().filter(|row| row[presence] == 1.0).count();
+    let end = arena
+        .len()
+        .checked_add(count)
+        .filter(|end| *end <= maximum)
+        .ok_or("ragged feature arena capacity exceeded")?;
+    reserve_feature_capacity(arena, end, maximum)
+}
+
+fn bounded_feature_row_capacity<const TOKENS: usize>(
+    sample_capacity: usize,
+) -> Result<usize, &'static str> {
+    if TOKENS == 0 || TOKENS > u16::MAX as usize {
+        return Err("ragged feature token count is outside 1..=65535");
+    }
+    let maximum = sample_capacity
+        .checked_mul(TOKENS)
+        .ok_or("ragged feature arena capacity overflow")?;
+    u32::try_from(maximum).map_err(|_| "ragged feature arena offset capacity exceeds u32")?;
+    Ok(maximum)
+}
+
+fn reserve_feature_capacity<const FEATURES: usize>(
+    arena: &mut Vec<IndexedFeatureRow<FEATURES>>,
+    end: usize,
+    maximum: usize,
+) -> Result<(), &'static str> {
+    if end < arena.len() || end > maximum {
+        return Err("ragged feature arena capacity exceeded");
+    }
+    if arena.capacity() > maximum {
+        return Err("ragged feature allocated capacity exceeds maximum");
+    }
+    if end <= arena.capacity() {
+        return Ok(());
+    }
+    let capacity = arena.capacity().saturating_mul(2).max(end).min(maximum);
+    assert!(capacity >= end);
+    assert!(capacity <= maximum);
+    arena
+        .try_reserve_exact(capacity - arena.len())
+        .map_err(|_| "ragged feature arena allocation failed")?;
+    if arena.capacity() > maximum {
+        return Err("ragged feature allocated capacity exceeds maximum");
+    }
+    assert!(arena.capacity() >= end);
+    Ok(())
 }
 
 fn append_feature_rows<const TOKENS: usize, const FEATURES: usize>(

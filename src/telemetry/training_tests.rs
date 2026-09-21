@@ -18,6 +18,45 @@ const STAGES: [TrainingStage; 5] = [
 ];
 
 #[test]
+fn annealed_update_reports_separate_collection_and_optimization_with_exact_counters() {
+    let mut timing = TrainingUpdateTiming::new(38, TrainingUpdateMode::Annealed, 100);
+    for (stage, milliseconds) in STAGES.into_iter().zip(1..=5) {
+        timing.record(stage, Duration::from_millis(milliseconds));
+    }
+    timing.set_samples(20_815);
+    timing.set_optimizer_step(144);
+
+    timing.finish(Duration::from_millis(16), TrainingTimingOutcome::Complete);
+
+    assert_eq!(
+        timing.to_string(),
+        concat!(
+            "level=INFO event=training_update_timing update_index=38 mode=annealed ",
+            "outcome=complete elapsed_ns=16000000 measured_ns=15000000 ",
+            "rollout_initialization_ns=1000000 collection_ns=2000000 ",
+            "batch_preparation_ns=3000000 optimization_ns=4000000 finalization_ns=5000000 ",
+            "samples=20815 optimizer_steps=44 last_stage=finalization ",
+            "duration_overflow=false timing_valid=true",
+        )
+    );
+}
+
+#[test]
+fn annealed_collection_error_does_not_claim_an_optimizer_update() {
+    let mut timing = TrainingUpdateTiming::new(38, TrainingUpdateMode::Annealed, 100);
+    timing.record(TrainingStage::RolloutInitialization, Duration::ZERO);
+    timing.record(TrainingStage::Collection, Duration::from_millis(1));
+
+    timing.finish(Duration::from_millis(1), TrainingTimingOutcome::Error);
+    let output = timing.to_string();
+
+    assert!(output.contains("mode=annealed outcome=error"));
+    assert!(output.contains("batch_preparation_ns=unknown optimization_ns=unknown"));
+    assert!(output.contains("samples=unknown optimizer_steps=unknown last_stage=collection"));
+    assert!(output.ends_with("timing_valid=true"));
+}
+
+#[test]
 fn complete_update_formats_exact_measured_stages_and_applied_optimizer_delta() {
     let mut timing = TrainingUpdateTiming::new(7, TrainingUpdateMode::CompleteEpisodes, 100);
     for (stage, milliseconds) in STAGES.into_iter().zip(1..=5) {

@@ -135,6 +135,36 @@ fn stream_workers_keep_stream_order_and_survive_one_worker_error() {
 }
 
 #[test]
+fn parallel40_workers_keep_all_streams_and_reject_world41() {
+    let mut worlds = [0usize; 40];
+    std::thread::scope(|scope| {
+        let workers = StreamWorkers::spawn(scope, &mut worlds, "ppo", |stream, world, ()| {
+            *world = stream;
+            Ok(stream)
+        })
+        .expect("forty workers");
+        let streams: Vec<_> = (0..40).collect();
+        for &stream in &streams {
+            workers.submit(stream, ()).expect("submit every stream");
+        }
+        assert_eq!(workers.receive(&streams).expect("all replies"), streams);
+        assert_eq!(
+            workers.submit(40, ()),
+            Err(PpoError::InvalidConfig("stream worker index"))
+        );
+        workers.finish().expect("join all workers");
+    });
+    assert_eq!(worlds, std::array::from_fn(|index| index));
+    let mut oversized = [0usize; 41];
+    std::thread::scope(|scope| {
+        assert_eq!(
+            StreamWorkers::spawn(scope, &mut oversized, "ppo", |_, _, ()| Ok(())).err(),
+            Some(PpoError::InvalidConfig("stream worker environments"))
+        );
+    });
+}
+
+#[test]
 fn stream_workers_match_the_one_shot_executor_on_identical_requests() {
     let operation = |stream: usize, world: &mut u64, value: u64| {
         *world = world.wrapping_mul(3).wrapping_add(value + stream as u64);

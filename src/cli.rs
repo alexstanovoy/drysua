@@ -203,13 +203,13 @@ enum AnnealedOpponentArg {
 /// Options for the annealed domain-randomization loop.
 #[derive(Args)]
 struct TrainAnnealedArgs {
-    /// Total updates; the annealed loop runs one optimizer step per update.
+    /// Total PPO updates; each may perform multiple Adam minibatch steps.
     #[arg(long)]
     updates: u64,
-    /// Games per update; always even so sides split exactly.
+    /// Games per update, even from 2 to 40; above 26 selects the annealed sample budget.
     #[arg(long, default_value_t = 8)]
     games: usize,
-    /// Worlds advanced in parallel per batch; must divide games and generation
+    /// Worlds advanced in parallel per batch (1..=40); must divide games and generation
     /// games. Defaults to the largest divisor of their gcd within the available
     /// cores and the resolved value is printed, recorded in the run scope, and
     /// compared on resume; pass it explicitly when a run must resume on a host
@@ -636,24 +636,7 @@ impl TrainAnnealedArgs {
                 "annealed generation games must be positive",
             ));
         }
-        let opponent = match (self.opponent, &self.opponent_weights) {
-            (AnnealedOpponentArg::Teacher, None) => crate::AnnealedOpponent::Teacher,
-            (AnnealedOpponentArg::Weights, Some(directory)) => {
-                crate::AnnealedOpponent::Weights(directory.clone())
-            }
-            (AnnealedOpponentArg::Weights, None) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "weights opponent requires --opponent-weights",
-                ));
-            }
-            (AnnealedOpponentArg::Teacher, Some(_)) => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "teacher opponent forbids --opponent-weights",
-                ));
-            }
-        };
+        let opponent = self.frozen_opponent()?;
         let parallel = match self.parallel {
             Some(parallel) => parallel,
             None => default_parallel_worlds(self.games, self.generation_games),
@@ -664,6 +647,11 @@ impl TrainAnnealedArgs {
         let ppo = crate::PpoConfig {
             decision_interval_ticks: crate::MAP2_DECISION_INTERVAL_TICKS,
             environments: self.games,
+            sample_budget: if self.games > crate::MAX_TRAINING_ENVIRONMENTS {
+                crate::PpoSampleBudget::Annealed
+            } else {
+                crate::PpoSampleBudget::Standard
+            },
             rollout_decisions: crate::MAP2_RETAINED_DECISIONS,
             epochs: self.epochs,
             minibatch: self.minibatch,
@@ -688,6 +676,23 @@ impl TrainAnnealedArgs {
             git_commit,
             simulator_commit,
         })
+    }
+
+    fn frozen_opponent(&self) -> std::io::Result<crate::AnnealedOpponent> {
+        match (self.opponent, &self.opponent_weights) {
+            (AnnealedOpponentArg::Teacher, None) => Ok(crate::AnnealedOpponent::Teacher),
+            (AnnealedOpponentArg::Weights, Some(directory)) => {
+                Ok(crate::AnnealedOpponent::Weights(directory.clone()))
+            }
+            (AnnealedOpponentArg::Weights, None) => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "weights opponent requires --opponent-weights",
+            )),
+            (AnnealedOpponentArg::Teacher, Some(_)) => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "teacher opponent forbids --opponent-weights",
+            )),
+        }
     }
 }
 

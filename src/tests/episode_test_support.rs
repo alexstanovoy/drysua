@@ -787,3 +787,45 @@ fn ragged_trial_for_test(model: &PolicyModel, settings: &TrainingJobConfig) -> V
         })
         .collect()
 }
+#[test]
+fn parallel40_active_actor_streams_accept_high_indices_and_reject_index40() {
+    let random = vec![PpoRng::new(7); 40];
+    assert_eq!(
+        validate_active(&random, &(0..40).collect::<Vec<_>>()),
+        Ok(())
+    );
+    assert_eq!(
+        validate_active(&random, &(27..40).collect::<Vec<_>>()),
+        Ok(())
+    );
+    assert_eq!(
+        validate_active(&random, &[39, 40]),
+        Err(PpoError::InvalidConfig("episode active streams"))
+    );
+    assert_eq!(
+        validate_active(&vec![PpoRng::new(7); 41], &(0..41).collect::<Vec<_>>()),
+        Err(PpoError::InvalidConfig("episode active streams"))
+    );
+}
+
+#[test]
+fn parallel40_actor_rngs_preserve_seed_order_and_reject_count41_without_draws() {
+    let mut master = PpoRng::new(7);
+    let mut expected = master.clone();
+    let random = actor_stream_rngs(&mut master, 40).expect("forty actor RNGs");
+    assert_eq!(random.len(), 40);
+    for state in random {
+        assert_eq!(state, PpoRng::new(expected.next_word().expect("seed")));
+    }
+    assert_eq!(master, expected);
+    assert_eq!(
+        actor_stream_rngs(&mut master, 41),
+        Err(PpoError::InvalidConfig("actor RNG streams"))
+    );
+    assert_eq!(master, expected);
+    assert!(valid_environment_count(26));
+    assert!(
+        !valid_environment_count(40),
+        "standard train-full remains bounded at26"
+    );
+}

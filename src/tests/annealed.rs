@@ -11,6 +11,9 @@ use bota_server::game::{SpawnCategory, SpawnTarget};
 use super::*;
 use crate::randomization::{AnnealSchedule, RANDOMIZATION_DIRECTORY, draw_generation};
 
+#[path = "annealed_capacity.rs"]
+mod capacity_tests;
+
 fn test_directory(name: &str) -> PathBuf {
     static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(1);
     let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
@@ -123,7 +126,7 @@ fn validation_rejects_divisibility_and_budget_mistakes() {
         validate_annealed(&config, harness())
             .expect_err("odd games")
             .to_string(),
-        "invalid PPO config field: annealed games per update must be even and within the environment ceiling"
+        "invalid PPO config field: annealed games per update must be even and within 2..=40"
     );
     let mut config = settings(1, 2);
     config.parallel_worlds = 3;
@@ -188,7 +191,7 @@ fn validation_rejects_divisibility_and_budget_mistakes() {
 
 #[test]
 fn every_update_splits_sides_exactly_evenly() {
-    for games in [2usize, 4, 8, 16, 26] {
+    for games in [2usize, 4, 8, 16, 26, 28, 40] {
         for update in 0..64u64 {
             let seats = balanced_policy_seats(0x51de, update, games).expect("seats");
             assert_eq!(seats.len(), games);

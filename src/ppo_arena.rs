@@ -935,7 +935,12 @@ pub(crate) fn save_training_artifact(
     )
     .map_err(text_error)?;
     let outcome = artifact.save(directory).map_err(text_error)?;
-    TrainingArtifact::save_runtime_weights(session.model, directory).map_err(text_error)?;
+    TrainingArtifact::save_runtime_weights_with_budget(
+        session.model,
+        directory,
+        session.trainer.config().sample_budget,
+    )
+    .map_err(text_error)?;
     let cleanup_warning = match outcome {
         CheckpointSaveOutcome::Committed => None,
         CheckpointSaveOutcome::CommittedWithCleanupError(message) => Some(message),
@@ -1334,6 +1339,9 @@ fn validate_training_job(
     settings: &TrainingJobConfig,
     resume: bool,
 ) -> Result<PpoConfig, PpoError> {
+    if settings.ppo.sample_budget != crate::PpoSampleBudget::Standard {
+        return Err(PpoError::InvalidConfig("train-full sample budget"));
+    }
     if settings.updates == 0 || settings.updates > 1_000_000 {
         return Err(PpoError::InvalidConfig("training updates"));
     }
@@ -1632,10 +1640,10 @@ fn restore_loaded_session(
     config: PpoConfig,
     migrated: bool,
 ) -> Result<RestoredSessionParts, PpoError> {
-    let restored = artifact.restore(model, restore_run).map_err(text_error)?;
-    if restored.trainer().config() != config {
+    if artifact.config() != config {
         return Err(PpoError::InvalidConfig("training checkpoint PPO config"));
     }
+    let restored = artifact.restore(model, restore_run).map_err(text_error)?;
     let progress = restored.progress();
     if progress.policy_version != progress.global_update {
         return Err(PpoError::InvalidConfig(
@@ -2138,7 +2146,7 @@ fn collect_update(
 }
 
 fn actor_stream_rngs(master: &mut PpoRng, count: usize) -> Result<Vec<PpoRng>, PpoError> {
-    if count == 0 || count > TRAINING_MAX_ENVIRONMENTS {
+    if count == 0 || count > crate::PPO_ANNEALED_MAX_GAMES {
         return Err(PpoError::InvalidConfig("actor RNG streams"));
     }
     (0..count)
