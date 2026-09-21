@@ -1,3 +1,6 @@
+#[path = "arena_feared.rs"]
+mod feared_tests;
+
 use bota_proto::{ItemId, MapId, Order, RejectReason, ServerMsg, SlotId, Team, UnitKind};
 
 use crate::{Arena, ArenaConfig, ArenaError, Request};

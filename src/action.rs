@@ -2215,6 +2215,7 @@ fn fill_body_masks(
 
 fn fill_cast_masks(space: &ActionSpace, state: &ControlledState, masks: &mut ControlledMasks) {
     let disabled = has_status(&state.unit, StatusFlags::STUNNED)
+        || has_status(&state.unit, StatusFlags::FEARED)
         || has_status(&state.unit, StatusFlags::SILENCED)
         || has_status(&state.unit, StatusFlags::CHANNELLING);
     masks.casts.reserve(state.unit.abilities.len());
@@ -2253,6 +2254,7 @@ fn fill_use_masks(
             && item.charges != Some(0)
             && can_afford_mana(state.unit.mana, item.mana_cost)
             && !has_status(&state.unit, StatusFlags::STUNNED)
+            && !has_status(&state.unit, StatusFlags::FEARED)
             && !has_status(&state.unit, StatusFlags::CHANNELLING)
             && !space
                 .readiness

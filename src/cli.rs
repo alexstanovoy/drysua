@@ -21,6 +21,8 @@ struct Cli {
 /// Drysua operations.
 #[derive(Subcommand)]
 enum Operation {
+    /// Serve persistent training metrics without starting a learner.
+    MetricsServe(MetricsServeArgs),
     /// Passively score copied native participant frames from stdin; never sends orders or ACKs.
     RewardObserver(RewardObserverArgs),
     /// Connect to a server and play one match.
@@ -31,6 +33,16 @@ enum Operation {
     TrainFull(TrainFullArgs),
     /// Run the annealed domain-randomization loop with a frozen opponent.
     TrainAnnealed(TrainAnnealedArgs),
+}
+
+#[derive(Args)]
+struct MetricsServeArgs {
+    /// Persistent training metrics directory to serve.
+    #[arg(long)]
+    metrics_directory: std::path::PathBuf,
+    /// Socket address for the standalone metrics server.
+    #[arg(long, default_value = "127.0.0.1:9464")]
+    metrics_listen: std::net::SocketAddr,
 }
 
 #[derive(Args)]
@@ -105,6 +117,8 @@ struct TrainArgs {
 /// Options for bounded resumable PPO training.
 #[derive(Args)]
 struct TrainFullArgs {
+    #[command(flatten)]
+    metrics: crate::telemetry::prometheus::MetricsOptions,
     /// Separate episode time cost; Map2 comprehensive reward requires zero.
     #[arg(long, default_value_t = 0.0)]
     episode_time_cost: f32,
@@ -203,9 +217,14 @@ enum AnnealedOpponentArg {
 /// Options for the annealed domain-randomization loop.
 #[derive(Args)]
 struct TrainAnnealedArgs {
+    #[command(flatten)]
+    metrics: crate::telemetry::prometheus::MetricsOptions,
     /// Total PPO updates; each may perform multiple Adam minibatch steps.
     #[arg(long)]
     updates: u64,
+    /// Additional committed updates this invocation; leaves the total target and annealing unchanged.
+    #[arg(long, value_parser = clap::builder::RangedU64ValueParser::<std::num::NonZeroU64>::new().range(1..=crate::MAX_TRAINING_COUNTER))]
+    invocation_updates: Option<std::num::NonZeroU64>,
     /// Games per update, even from 2 to 40; above 26 selects the annealed sample budget.
     #[arg(long, default_value_t = 8)]
     games: usize,
@@ -273,6 +292,12 @@ pub fn run_from_env() -> std::io::Result<()> {
 
 fn run(arguments: Cli) -> std::io::Result<()> {
     let play = match arguments.operation {
+        Some(Operation::MetricsServe(serve)) => {
+            return crate::telemetry::prometheus::serve_directory(
+                serve.metrics_directory,
+                serve.metrics_listen,
+            );
+        }
         Some(Operation::RewardObserver(observer)) => {
             return crate::reward_observer::run(&observer.output, observer.interval_ticks);
         }
@@ -382,6 +407,10 @@ fn run_train_full(arguments: TrainFullArgs) -> std::io::Result<()> {
     )?;
     let device = arguments.device.policy_device(arguments.device_ordinal)?;
     validate_checkpoint_directory(&arguments.checkpoint_directory, arguments.resume)?;
+    arguments
+        .metrics
+        .validate_checkpoint_directory(&arguments.checkpoint_directory)?;
+    let metrics = arguments.metrics.start()?;
     let report = crate::run_training_job_on_with_initial_weights(
         settings,
         device,
@@ -416,7 +445,7 @@ fn run_train_full(arguments: TrainFullArgs) -> std::io::Result<()> {
             "training mastery complete: rolling training windows qualified through Teacher; not evaluation qualification"
         );
     }
-    Ok(())
+    metrics.finish()
 }
 
 #[cfg(feature = "builtin")]
@@ -427,6 +456,10 @@ fn run_train_annealed(arguments: TrainAnnealedArgs) -> std::io::Result<()> {
     )?;
     let device = arguments.device.policy_device(arguments.device_ordinal)?;
     validate_checkpoint_directory(&arguments.checkpoint_directory, arguments.resume)?;
+    arguments
+        .metrics
+        .validate_checkpoint_directory(&arguments.checkpoint_directory)?;
+    let metrics = arguments.metrics.start()?;
     eprintln!(
         "annealed: updates={} games={} parallel={} generation_games={} zero_updates={} seed={} opponent={:?}",
         settings.updates,
@@ -463,7 +496,7 @@ fn run_train_annealed(arguments: TrainAnnealedArgs) -> std::io::Result<()> {
     report
         .map2_reward
         .log("invocation", report.completed_updates);
-    Ok(())
+    metrics.finish()
 }
 
 #[cfg(feature = "builtin")]
@@ -663,6 +696,7 @@ impl TrainAnnealedArgs {
         };
         Ok(crate::AnnealedJobConfig {
             updates: self.updates,
+            invocation_updates: self.invocation_updates,
             games_per_update: self.games,
             parallel_worlds: parallel,
             games_per_generation: self.generation_games,

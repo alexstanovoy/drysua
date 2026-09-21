@@ -18,6 +18,145 @@ const STAGES: [TrainingStage; 5] = [
 ];
 
 #[test]
+fn complete_valid_timing_forwards_exact_typed_durations_without_global_metrics() {
+    for mode in [
+        TrainingUpdateMode::Annealed,
+        TrainingUpdateMode::CompleteEpisodes,
+        TrainingUpdateMode::ResetWindow,
+    ] {
+        let mut timing = TrainingUpdateTiming::new(38, mode, 100);
+        for (stage, nanoseconds) in STAGES.into_iter().zip(1..=5) {
+            timing.record(stage, Duration::from_nanos(nanoseconds));
+        }
+        timing.set_samples(32);
+        timing.set_optimizer_step(144);
+        timing.finish(Duration::from_nanos(16), TrainingTimingOutcome::Complete);
+        let mut forwarded = None;
+
+        timing.forward_metrics(|update, elapsed, stages, valid| {
+            forwarded = Some((update, elapsed, stages, valid));
+        });
+
+        assert_eq!(
+            forwarded,
+            Some((
+                38,
+                Duration::from_nanos(16),
+                [1, 2, 3, 4, 5].map(|value| Some(Duration::from_nanos(value))),
+                true,
+            ))
+        );
+    }
+}
+
+#[test]
+fn failed_unfinished_and_panicking_updates_do_not_forward_metrics() {
+    for outcome in [
+        None,
+        Some(TrainingTimingOutcome::Error),
+        Some(TrainingTimingOutcome::Incomplete),
+        Some(TrainingTimingOutcome::Complete.on_scope_exit(true)),
+    ] {
+        let mut timing = TrainingUpdateTiming::new(38, TrainingUpdateMode::Annealed, 0);
+        for stage in STAGES {
+            timing.record(stage, Duration::ZERO);
+        }
+        if let Some(outcome) = outcome {
+            timing.finish(Duration::ZERO, outcome);
+        }
+        let mut forwarded = false;
+
+        timing.forward_metrics(|_, _, _, _| forwarded = true);
+
+        assert!(!forwarded);
+    }
+}
+
+#[test]
+fn invalid_completed_timing_does_not_forward_metrics() {
+    for invalid_case in 0..5 {
+        let mut timing = TrainingUpdateTiming::new(38, TrainingUpdateMode::Annealed, 100);
+        for stage in STAGES {
+            if invalid_case != 0 || stage != TrainingStage::Finalization {
+                timing.record(stage, Duration::from_nanos(1));
+            }
+        }
+        if invalid_case == 1 {
+            timing.set_optimizer_step(99);
+        }
+        if invalid_case == 2 {
+            timing.record(TrainingStage::Finalization, Duration::MAX);
+        }
+        let elapsed = if invalid_case == 3 { 4 } else { 6 };
+        timing.finish(
+            Duration::from_nanos(elapsed),
+            TrainingTimingOutcome::Complete,
+        );
+        if invalid_case == 4 {
+            timing.finish(
+                Duration::from_nanos(elapsed),
+                TrainingTimingOutcome::Complete,
+            );
+        }
+        let mut forwarded = false;
+
+        timing.forward_metrics(|_, _, _, _| forwarded = true);
+
+        assert!(!forwarded, "invalid case {invalid_case}");
+    }
+}
+
+#[test]
+fn zero_duration_completed_timing_is_forwarded_as_measured() {
+    let mut timing = TrainingUpdateTiming::new(0, TrainingUpdateMode::ResetWindow, 0);
+    for stage in STAGES {
+        timing.record(stage, Duration::ZERO);
+    }
+    timing.finish(Duration::ZERO, TrainingTimingOutcome::Complete);
+    let mut forwarded = None;
+
+    timing.forward_metrics(|update, elapsed, stages, valid| {
+        forwarded = Some((update, elapsed, stages, valid));
+    });
+
+    assert_eq!(
+        forwarded,
+        Some((0, Duration::ZERO, [Some(Duration::ZERO); 5], true))
+    );
+}
+
+#[test]
+fn scope_metrics_forward_stable_indices_elapsed_and_completion_without_global_metrics() {
+    for (scope, index) in [
+        (TrainingTimingScope::SessionInitialization, 0),
+        (TrainingTimingScope::CheckpointCaptureSaveRuntimeExport, 1),
+        (TrainingTimingScope::ResumeRuntimeExport, 2),
+    ] {
+        for outcome in [
+            TrainingTimingOutcome::Complete,
+            TrainingTimingOutcome::Error,
+            TrainingTimingOutcome::Incomplete,
+        ] {
+            let timing = TrainingScopeTiming::new(scope, Some(5), Duration::from_nanos(7), outcome);
+            let mut forwarded = None;
+
+            timing.forward_metrics(|index, elapsed, complete| {
+                forwarded = Some((index, elapsed, complete));
+            });
+
+            assert_eq!(
+                forwarded,
+                Some((
+                    index,
+                    Duration::from_nanos(7),
+                    outcome == TrainingTimingOutcome::Complete,
+                ))
+            );
+        }
+    }
+}
+
+#[test]
 fn annealed_update_reports_separate_collection_and_optimization_with_exact_counters() {
     let mut timing = TrainingUpdateTiming::new(38, TrainingUpdateMode::Annealed, 100);
     for (stage, milliseconds) in STAGES.into_iter().zip(1..=5) {

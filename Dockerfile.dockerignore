@@ -1,0 +1,35 @@
+# Context is the parent containing drysua/ and bota/. Start by excluding everything.
+**
+!drysua/
+!drysua/Cargo.toml
+!drysua/Cargo.lock
+!drysua/rust-toolchain.toml
+!drysua/Dockerfile
+!drysua/Dockerfile.dockerignore
+!drysua/src/
+!drysua/src/**/
+!drysua/src/**/*.rs
+!drysua/benches/
+!drysua/benches/**/*.rs
+!drysua/crates/
+!drysua/crates/**/
+!drysua/crates/**/Cargo.toml
+!drysua/crates/**/*.rs
+!drysua/docker/
+!drysua/docker/runtime_guard.py
+!drysua/docker/source_identity.py
+!bota/
+!bota/Cargo.toml
+!bota/Cargo.lock
+!bota/crates/
+!bota/crates/**/
+!bota/crates/**/Cargo.toml
+!bota/crates/**/*.rs
+# Never admit nested output even when its extension matches an allowed source.
+**/target/**
+**/artifacts/**
+**/temp/**
+**/.git/**
+**/.env*
+**/.secrets/**
+**/__pycache__/**

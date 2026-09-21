@@ -1,0 +1,184 @@
+name: drysua
+
+# Documentation metadata only: `up` cannot implicitly build this source image.
+# BuildKit work needs its own approved, bounded heavy-work window (docs/docker.md).
+x-source-build:
+  context: ..
+  dockerfile: drysua/Dockerfile
+  platform: linux/amd64
+  args:
+    CUDA_COMPUTE_CAP: ${CUDA_COMPUTE_CAP:-}
+
+x-native: &native
+  image: ${DRYSUA_IMAGE:-drysua-source:qualification-required}
+  platform: linux/amd64
+  pull_policy: never
+  user: "${DRYSUA_UID:-1000}:${DRYSUA_GID:-1000}"
+  init: true
+  cgroup: private
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  # No automatic retry after OOM, a telemetry failure, or a strict-scope mismatch.
+  restart: "no"
+  stop_grace_period: 5s
+  tmpfs:
+    - /tmp:rw,noexec,nosuid,nodev,size=32m,mode=1777
+  logging:
+    driver: json-file
+    options: {max-size: "20m", max-file: "1"}
+
+services:
+  training:
+    <<: *native
+    # Plain `up` never creates a learner. The guard also refuses held host flocks.
+    profiles: [training]
+    network_mode: none
+    entrypoint: [python3, /opt/drysua/runtime_guard.py]
+    # A stricter hard cap, NOT memory.high; mem_reservation is intentionally absent.
+    mem_limit: 12g
+    memswap_limit: 12g
+    pids_limit: 1024
+    environment:
+      GPU_UUID: ${GPU_UUID:?Set the exact physical GPU UUID}
+      NVIDIA_VISIBLE_DEVICES: ${GPU_UUID:?Set the exact physical GPU UUID}
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+      CUDA_VISIBLE_DEVICES: "0"
+      TRAIN_UPDATES: ${TRAIN_UPDATES:-1000}
+      TRAIN_GAMES: ${TRAIN_GAMES:-40}
+      TRAIN_PARALLEL: ${TRAIN_PARALLEL:-40}
+      TRAIN_GENERATION_GAMES: ${TRAIN_GENERATION_GAMES:-200}
+      TRAIN_ZERO_UPDATES: ${TRAIN_ZERO_UPDATES:-200}
+      TRAIN_SEED: ${TRAIN_SEED:-9001}
+      INVOCATION_SECONDS: ${INVOCATION_SECONDS:-300}
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${GPU_UUID:?Set the exact physical GPU UUID}"]
+              capabilities: [gpu]
+    volumes:
+      - type: bind
+        source: ${TRAINING_DIRECTORY:?Select a new private accepted run COPY, never the live campaign}
+        target: /run-data
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${INITIAL_WEIGHTS_DIRECTORY:?Select immutable initial weights}
+        target: /input/weights
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${PROVENANCE_DIRECTORY:?Select frozen provenance and acceptance.json}
+        target: /input/provenance
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ./heavy.lock
+        target: /locks/workspace
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${GLOBAL_HEAVY_LOCK:-./artifacts/temp/map2-learning-20260911/credit-095-002-resume-001-journal/heavy.lock}
+        target: /locks/global
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: /proc/meminfo
+        target: /host/meminfo
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: ${CPU_HWMON_DIRECTORY:?Set the resolved host k10temp or coretemp directory}
+        target: /host/cpu-hwmon
+        read_only: true
+        bind: {create_host_path: false}
+    healthcheck:
+      test: [CMD, python3, /opt/drysua/runtime_guard.py, --healthcheck]
+      interval: 10s
+      timeout: 2s
+      retries: 2
+      start_period: 10s
+
+  metrics:
+    <<: *native
+    # Host loopback is required by the native API and the shared Prometheus config.
+    network_mode: host
+    entrypoint: [/usr/local/bin/drysua]
+    command: [metrics-serve, --metrics-directory, /metrics, --metrics-listen, "127.0.0.1:9464"]
+    mem_limit: 256m
+    memswap_limit: 256m
+    pids_limit: 32
+    environment:
+      NVIDIA_VISIBLE_DEVICES: ${GPU_UUID:?Set the exact physical GPU UUID}
+      NVIDIA_DRIVER_CAPABILITIES: compute,utility
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              device_ids: ["${GPU_UUID:?Set the exact physical GPU UUID}"]
+              capabilities: [gpu]
+    volumes:
+      - type: bind
+        source: ${TRAINING_DIRECTORY:?Select a private accepted run COPY}/metrics
+        target: /metrics
+        read_only: true
+        bind: {create_host_path: false}
+      # Native liveness probing opens this one pre-existing file read/write.
+      - type: bind
+        source: ${TRAINING_DIRECTORY:?Select a private accepted run COPY}/metrics/.metrics.writer.lock
+        target: /metrics/.metrics.writer.lock
+        bind: {create_host_path: false}
+      - type: bind
+        source: /proc/meminfo
+        target: /proc/meminfo
+        read_only: true
+        bind: {create_host_path: false}
+      - type: bind
+        source: /proc/stat
+        target: /proc/stat
+        read_only: true
+        bind: {create_host_path: false}
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import urllib.request; r=urllib.request.urlopen('http://127.0.0.1:9464/metrics',timeout=1); assert r.status==200; assert len(r.read(49153))<=49152"
+      interval: 15s
+      timeout: 2s
+      retries: 2
+
+  # Monitoring ownership stays in monitoring/; extends reuses pins, safeguards,
+  # provisioning, retention and history refusal. Root deployment retries nothing.
+  prometheus:
+    extends:
+      file: monitoring/compose.yml
+      service: prometheus
+    restart: "no"
+    stop_grace_period: 5s
+    healthcheck:
+      test: [CMD, /bin/wget, -q, --spider, -T, "2", "http://127.0.0.1:${PROMETHEUS_PORT:-9090}/-/ready"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+
+  grafana:
+    extends:
+      file: monitoring/compose.yml
+      service: grafana
+    restart: "no"
+    stop_grace_period: 5s
+    healthcheck:
+      test: [CMD, /usr/bin/wget, -q, --spider, -T, "2", "http://127.0.0.1:${GRAFANA_PORT:-3000}/api/health"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+
+# Preserve both secret files and the database together; never regenerate on restart.
+secrets:
+  grafana_admin_password:
+    file: ${GRAFANA_ADMIN_PASSWORD_FILE:?Set existing private password file or an approved preserved copy}
+  grafana_secret_key:
+    file: ${GRAFANA_SECRET_KEY_FILE:?Set existing private encryption key file or an approved preserved copy}

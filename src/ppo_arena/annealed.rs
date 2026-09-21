@@ -31,6 +31,7 @@ use crate::randomization::{
     AnnealSchedule, GenerationDraw, RANDOMIZATION_DIRECTORY, derive_training_seed, draw_generation,
     verify_generation_snapshots, write_generation_snapshot,
 };
+use crate::telemetry::prometheus::{self, TrainingMetricsStart};
 use crate::telemetry::{
     FlushPerformanceLogs, TrainingStage, TrainingTimingScope, TrainingUpdateMode,
     TrainingUpdateTimer, time_training_scope,
@@ -91,6 +92,12 @@ pub struct AnnealedJobConfig {
     pub ppo: PpoConfig,
     /// When to write a durable checkpoint.
     pub checkpoint_cadence: crate::TrainingCheckpointCadence,
+    /// Additional committed updates in this invocation, capped by `updates`.
+    /// The limit must not exceed `MAX_TRAINING_COUNTER`.
+    /// `None` runs to the total target. Like checkpoint cadence, this is excluded
+    /// from the run scope and does not change the annealing schedule. Finishing
+    /// at this boundary forces a durable checkpoint and runtime export.
+    pub invocation_updates: Option<std::num::NonZeroU64>,
     /// Drysua commit recorded in the run scope.
     pub git_commit: String,
     /// Simulator commit recorded in the run scope.
@@ -100,7 +107,7 @@ pub struct AnnealedJobConfig {
 /// Invocation-only bounds the test harness may set.
 ///
 /// Production never sets any: the CLI always runs the full episode ceiling and
-/// stops only on the update budget. The harness is crate-private, so it cannot
+/// uses only the config's update limits. The harness is crate-private, so it cannot
 /// appear on the command line, and none of its fields shape the run scope
 /// except the effective episode ceiling, which is recorded only when a test
 /// shortens it.
@@ -270,6 +277,21 @@ where
                 opponent.runtime,
             )
         })?;
+    prometheus::begin_training(
+        &session.run,
+        config,
+        directory,
+        resume,
+        TrainingMetricsStart {
+            completed_updates: session.completed_updates,
+            samples: session.rollout_samples,
+            optimizer_steps: session.trainer.optimizer_step(),
+            updates_target: settings.updates,
+            parallel: settings.parallel_worlds,
+            games_per_update: settings.games_per_update,
+        },
+    )
+    .map_err(text_error)?;
     session.run_updates(&settings, harness, config, directory, &mut checkpointed)?;
     Ok(session.report())
 }
@@ -370,6 +392,14 @@ impl AnnealedSession {
         directory: &Path,
         checkpointed: &mut impl FnMut(TrainingCheckpointReport),
     ) -> Result<(), PpoError> {
+        let invocation_target = match settings.invocation_updates {
+            Some(limit) => self
+                .completed_updates
+                .checked_add(limit.get())
+                .ok_or(PpoError::CounterOverflow)?
+                .min(settings.updates),
+            None => settings.updates,
+        };
         let started = Instant::now();
         let mut schedule = TrainingCheckpointSchedule::new(settings.checkpoint_cadence)?;
         let anneal = anneal_schedule(settings);
@@ -381,9 +411,9 @@ impl AnnealedSession {
             anneal,
             self.generations,
         );
-        while self.completed_updates < settings.updates {
+        while self.completed_updates < invocation_target {
             self.train_update(settings, harness, config, &mut generations)?;
-            let final_update = self.completed_updates == settings.updates;
+            let final_update = self.completed_updates == invocation_target;
             if schedule.is_due(self.completed_updates, started.elapsed()) || final_update {
                 let report = self.checkpoint_report(None);
                 let durable =
@@ -418,6 +448,9 @@ impl AnnealedSession {
         );
         let result = self.train_update_timed(settings, harness, config, generations, &mut timing);
         timing.observe_result(result)?;
+        let observed =
+            prometheus::observe_training_update(&self.checkpoint_report(None)).map_err(text_error);
+        timing.observe_result(observed)?;
         timing.complete();
         Ok(())
     }
@@ -507,6 +540,8 @@ impl AnnealedSession {
             global_game + batch_len as u64 <= draw.end_game,
             "batch stays inside one generation"
         );
+        let (generation, scale_bp) = generation_metrics(&draw, global_game);
+        prometheus::set_generation(generation, scale_bp);
         let mut environments = batch_environments(
             settings,
             global_game,
@@ -626,6 +661,17 @@ fn generation_rules(draw: &GenerationDraw, global_game: u64) -> Vec<SpawnModifie
     } else {
         Vec::new()
     }
+}
+
+fn generation_metrics(draw: &GenerationDraw, global_game: u64) -> (u64, u32) {
+    let applied_through = draw.start_game.saturating_add(draw.applied_games);
+    let scale_bp = if draw.applies() && global_game < applied_through {
+        // An applying draw has a positive scale; cached draws can outlive their applied games.
+        draw.scale_bp as u32
+    } else {
+        0
+    };
+    (draw.generation, scale_bp)
 }
 
 /// The trusted spawn rules one generation's spec turns into.
@@ -759,15 +805,15 @@ impl GenerationCache {
             write_generation_snapshot(&self.directory, &draw)?;
             let next = generation.checked_add(1).ok_or(PpoError::CounterOverflow)?;
             self.counted_through = self.counted_through.max(next);
-            // One line per generation, so a long run's active scale and rules
-            // are visible while it runs and not only in the snapshot files.
-            eprintln!(
-                "annealed: generation={generation} scale_bp={} start_game={} applied_games={} rules={}",
-                draw.scale_bp,
-                draw.start_game,
-                draw.applied_games,
-                spawn_modifiers_for(draw.spec).len(),
-            );
+            if !prometheus::enabled() {
+                eprintln!(
+                    "annealed: generation={generation} scale_bp={} start_game={} applied_games={} rules={}",
+                    draw.scale_bp,
+                    draw.start_game,
+                    draw.applied_games,
+                    spawn_modifiers_for(draw.spec).len(),
+                );
+            }
             self.last = Some(draw);
         }
         Ok(self.last.expect("drawn above"))
@@ -897,6 +943,14 @@ fn validate_annealed(
 ) -> Result<PpoConfig, PpoError> {
     if settings.updates == 0 || settings.updates > MAX_TRAINING_COUNTER {
         return Err(PpoError::InvalidConfig("annealed updates"));
+    }
+    if settings
+        .invocation_updates
+        .is_some_and(|limit| limit.get() > MAX_TRAINING_COUNTER)
+    {
+        return Err(PpoError::InvalidConfig(
+            "annealed invocation updates exceed MAX_TRAINING_COUNTER",
+        ));
     }
     validate_annealed_batches(settings)?;
     if settings.zero_updates > settings.updates {
@@ -1113,6 +1167,10 @@ fn command_line_option_value<'a>(tokens: &[&'a str], index: usize) -> &'a str {
         .filter(|token| !token.starts_with("--"))
         .unwrap_or("<present>")
 }
+
+#[cfg(all(test, unix))]
+#[path = "../tests/metrics_training_integration.rs"]
+mod metrics_integration_tests;
 
 #[cfg(test)]
 #[path = "../tests/annealed.rs"]

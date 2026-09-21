@@ -1087,6 +1087,94 @@ fn item_masks_cover_all_aims_and_reject_backpack_cooldown_charges_mana_and_range
 }
 
 #[test]
+fn feared_items_are_masked_but_no_disable_or_silence_alone_allows_use() {
+    let action = StructuredAction::Use {
+        unit: ControlledUnit::Hero,
+        slot: ItemSlot(2),
+        target: ActionTarget::None,
+    };
+    for (statuses, allowed) in [
+        (StatusFlags::FEARED, false),
+        (StatusFlags::STUNNED, false),
+        (StatusFlags::CHANNELLING, false),
+        (0, true),
+        (StatusFlags::SILENCED, true),
+    ] {
+        let mut view = world_view(1);
+        let hero_index = hero_index(&view);
+        view.units[hero_index].items[2] = Some(item(Some(Aim::Own), 0));
+        view.units[hero_index].statuses.bits = statuses;
+
+        let space = ActionSpace::from_tracker(&tracker_with_view(view)).expect("item status space");
+
+        assert_eq!(space.item_slot_mask(ControlledUnit::Hero)[2], allowed);
+        assert_eq!(space.allows(action), allowed);
+        if allowed {
+            assert_eq!(
+                space
+                    .decode(action)
+                    .expect("legal item")
+                    .expect("order")
+                    .order,
+                Order::Use {
+                    slot: ItemSlot(2),
+                    target: Target::None
+                }
+            );
+        } else {
+            assert_eq!(
+                space.decode(action),
+                Err(ActionError::NotAllowed(ActionKind::Use))
+            );
+        }
+    }
+}
+
+#[test]
+fn feared_casts_are_masked_but_no_disable_allows_cast() {
+    let action = StructuredAction::Cast {
+        unit: ControlledUnit::Hero,
+        slot: AbilitySlot(0),
+        target: ActionTarget::None,
+    };
+    for (statuses, allowed) in [
+        (StatusFlags::FEARED, false),
+        (StatusFlags::STUNNED, false),
+        (StatusFlags::CHANNELLING, false),
+        (StatusFlags::SILENCED, false),
+        (0, true),
+    ] {
+        let mut view = world_view(1);
+        let hero_index = hero_index(&view);
+        view.units[hero_index].abilities = vec![ability(Aim::Own, 0)];
+        view.units[hero_index].statuses.bits = statuses;
+
+        let space = ActionSpace::from_tracker(&tracker_with_view(view)).expect("cast status space");
+
+        assert_eq!(space.ability_slot_mask(ControlledUnit::Hero)[0], allowed);
+        assert_eq!(space.allows(action), allowed);
+        if allowed {
+            assert_eq!(
+                space
+                    .decode(action)
+                    .expect("legal cast")
+                    .expect("order")
+                    .order,
+                Order::Cast {
+                    slot: AbilitySlot(0),
+                    target: Target::None
+                }
+            );
+        } else {
+            assert_eq!(
+                space.decode(action),
+                Err(ActionError::NotAllowed(ActionKind::Cast))
+            );
+        }
+    }
+}
+
+#[test]
 fn channelling_masks_casts_and_items_but_keeps_interrupting_movement_legal() {
     let mut view = world_view(1);
     let hero_index = hero_index(&view);

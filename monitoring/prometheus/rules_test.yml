@@ -1,0 +1,239 @@
+rule_files:
+  - rules.yml
+evaluation_interval: 5s
+
+tests:
+  - name: missing_metrics_remain_no_data
+    interval: 5s
+    input_series: []
+    promql_expr_test:
+      - {expr: 'drysua:metrics:ready', eval_time: 5m, exp_samples: []}
+      - {expr: 'drysua:host_cpu:ready', eval_time: 5m, exp_samples: []}
+      - {expr: 'drysua:host_memory:ready', eval_time: 5m, exp_samples: []}
+      - {expr: 'drysua:gpu:ready', eval_time: 5m, exp_samples: []}
+      - {expr: 'drysua:win_rate:5m', eval_time: 5m, exp_samples: []}
+      - {expr: 'drysua:win_rate:30m', eval_time: 5m, exp_samples: []}
+      - {expr: 'drysua:win_rate:cumulative', eval_time: 5m, exp_samples: []}
+      - {expr: 'drysua:win_rate:last_update', eval_time: 5m, exp_samples: []}
+      - {expr: 'drysua:progress:ratio', eval_time: 5m, exp_samples: []}
+      - {expr: 'drysua:eta:seconds', eval_time: 5m, exp_samples: []}
+
+  - name: zero_games_zero_target_and_idle_updates_remain_no_data
+    interval: 1m
+    input_series:
+      - {series: 'drysua_training_metrics_available{job="drysua"}', values: '1+0x30'}
+      - {series: 'drysua_training_metrics_state_healthy{job="drysua"}', values: '1+0x30'}
+      - {series: 'up{job="drysua"}', values: '1+0x30'}
+      - {series: 'drysua_training_games_total{job="drysua",outcome="win"}', values: '0+0x30'}
+      - {series: 'drysua_training_games_total{job="drysua",outcome="loss"}', values: '0+0x30'}
+      - {series: 'drysua_training_games_total{job="drysua",outcome="draw"}', values: '0+0x30'}
+      - {series: 'drysua_training_games_total{job="drysua",outcome="time_cap"}', values: '0+0x30'}
+      - {series: 'drysua_training_last_update_games{job="drysua",outcome="win"}', values: '0+0x30'}
+      - {series: 'drysua_training_updates_completed{job="drysua"}', values: '0+0x30'}
+      - {series: 'drysua_training_updates_target{job="drysua"}', values: '0+0x30'}
+      - {series: 'drysua_training_update_duration_seconds_count{job="drysua"}', values: '0+0x30'}
+    promql_expr_test:
+      - {expr: 'drysua:win_rate:5m', eval_time: 30m, exp_samples: []}
+      - {expr: 'drysua:win_rate:30m', eval_time: 30m, exp_samples: []}
+      - {expr: 'drysua:win_rate:cumulative', eval_time: 30m, exp_samples: []}
+      - {expr: 'drysua:win_rate:last_update', eval_time: 30m, exp_samples: []}
+      - {expr: 'drysua:progress:ratio', eval_time: 30m, exp_samples: []}
+      - {expr: 'drysua:eta:seconds', eval_time: 30m, exp_samples: []}
+
+  - name: each_outcome_counts_once_including_draws_and_time_caps
+    interval: 1m
+    input_series:
+      - {series: 'drysua_training_metrics_available{job="drysua"}', values: '1+0x30'}
+      - {series: 'drysua_training_metrics_state_healthy{job="drysua"}', values: '1+0x30'}
+      - {series: 'up{job="drysua"}', values: '1+0x30'}
+      - {series: 'drysua_training_games_total{job="drysua",outcome="win"}', values: '0+10x30'}
+      - {series: 'drysua_training_games_total{job="drysua",outcome="loss"}', values: '0+20x30'}
+      - {series: 'drysua_training_games_total{job="drysua",outcome="draw"}', values: '0+5x30'}
+      - {series: 'drysua_training_games_total{job="drysua",outcome="time_cap"}', values: '0+5x30'}
+      - {series: 'drysua_training_last_update_games{job="drysua",outcome="win"}', values: '10+0x30'}
+      - {series: 'drysua_training_last_update_games{job="drysua",outcome="loss"}', values: '20+0x30'}
+      - {series: 'drysua_training_last_update_games{job="drysua",outcome="draw"}', values: '5+0x30'}
+      - {series: 'drysua_training_last_update_games{job="drysua",outcome="time_cap"}', values: '5+0x30'}
+    promql_expr_test:
+      - expr: 'drysua:win_rate:5m'
+        eval_time: 30m
+        exp_samples: [{labels: 'drysua:win_rate:5m', value: 0.25}]
+      - expr: 'drysua:win_rate:30m'
+        eval_time: 30m
+        exp_samples: [{labels: 'drysua:win_rate:30m', value: 0.25}]
+      - expr: 'drysua:win_rate:cumulative'
+        eval_time: 30m
+        exp_samples: [{labels: 'drysua:win_rate:cumulative', value: 0.25}]
+      - expr: 'drysua:win_rate:last_update'
+        eval_time: 30m
+        exp_samples: [{labels: 'drysua:win_rate:last_update', value: 0.25}]
+
+  - name: zero_wins_with_completed_losses_is_a_real_zero
+    interval: 1m
+    input_series:
+      - {series: 'drysua_training_metrics_available{job="drysua"}', values: '1+0x5'}
+      - {series: 'drysua_training_metrics_state_healthy{job="drysua"}', values: '1+0x5'}
+      - {series: 'up{job="drysua"}', values: '1+0x5'}
+      - {series: 'drysua_training_games_total{job="drysua",outcome="win"}', values: '0+0x5'}
+      - {series: 'drysua_training_games_total{job="drysua",outcome="loss"}', values: '0+1x5'}
+    promql_expr_test:
+      - expr: 'drysua:win_rate:5m'
+        eval_time: 5m
+        exp_samples: [{labels: 'drysua:win_rate:5m', value: 0}]
+
+  - name: rates_handle_counter_resets_before_aggregation
+    interval: 1m
+    input_series:
+      - {series: 'drysua_training_metrics_available{job="drysua"}', values: '1+0x5'}
+      - {series: 'drysua_training_metrics_state_healthy{job="drysua"}', values: '1+0x5'}
+      - {series: 'up{job="drysua"}', values: '1+0x5'}
+      - {series: 'drysua_training_games_total{job="drysua",outcome="win"}', values: '10 20 30 0 10 20'}
+      - {series: 'drysua_training_games_total{job="drysua",outcome="loss"}', values: '20 40 60 0 20 40'}
+      - {series: 'drysua_training_games_total{job="drysua",outcome="draw"}', values: '5 10 15 0 5 10'}
+      - {series: 'drysua_training_games_total{job="drysua",outcome="time_cap"}', values: '5 10 15 0 5 10'}
+    promql_expr_test:
+      - expr: 'drysua:win_rate:5m'
+        eval_time: 5m
+        exp_samples: [{labels: 'drysua:win_rate:5m', value: 0.25}]
+
+  - name: eta_requires_positive_speed_live_training_fresh_heartbeat_and_reachable_endpoint
+    interval: 1m
+    input_series:
+      - {series: 'drysua_training_metrics_available{job="drysua"}', values: '1+0x10'}
+      - {series: 'drysua_training_metrics_state_healthy{job="drysua"}', values: '1+0x10'}
+      - {series: 'drysua_training_updates_completed{job="drysua"}', values: '0+1x10'}
+      - {series: 'drysua_training_updates_target{job="drysua"}', values: '100+0x10'}
+      - {series: 'drysua_training_update_duration_seconds_count{job="drysua"}', values: '0+1x10'}
+      - {series: 'drysua_training_active{job="drysua"}', values: '1 1 1 1 1 1 0 1 1 1 1'}
+      - {series: 'drysua_training_last_heartbeat_timestamp_seconds{job="drysua"}', values: '0 60 120 180 240 300 360 420 0 180 660'}
+      - {series: 'up{job="drysua"}', values: '1 1 1 1 1 1 1 0 1 1 1'}
+    promql_expr_test:
+      - expr: 'drysua:progress:ratio'
+        eval_time: 5m
+        exp_samples: [{labels: 'drysua:progress:ratio', value: 0.05}]
+      - expr: 'drysua:eta:seconds'
+        eval_time: 5m
+        exp_samples: [{labels: 'drysua:eta:seconds', value: 5700}]
+      - {expr: 'drysua:eta:seconds', eval_time: 6m, exp_samples: []}
+      - {expr: 'drysua:eta:seconds', eval_time: 7m, exp_samples: []}
+      - {expr: 'drysua:eta:seconds', eval_time: 8m, exp_samples: []}
+      - {expr: 'drysua:eta:seconds', eval_time: 9m, exp_samples: []}
+      - {expr: 'drysua:eta:seconds', eval_time: 10m, exp_samples: []}
+
+  - name: eta_with_live_fresh_training_but_no_completed_updates_is_no_data
+    interval: 1m
+    input_series:
+      - {series: 'drysua_training_metrics_available{job="drysua"}', values: '1+0x5'}
+      - {series: 'drysua_training_metrics_state_healthy{job="drysua"}', values: '1+0x5'}
+      - {series: 'drysua_training_updates_completed{job="drysua"}', values: '10+0x5'}
+      - {series: 'drysua_training_updates_target{job="drysua"}', values: '100+0x5'}
+      - {series: 'drysua_training_update_duration_seconds_count{job="drysua"}', values: '0+0x5'}
+      - {series: 'drysua_training_active{job="drysua"}', values: '1+0x5'}
+      - {series: 'drysua_training_last_heartbeat_timestamp_seconds{job="drysua"}', values: '0+60x5'}
+      - {series: 'up{job="drysua"}', values: '1+0x5'}
+    promql_expr_test:
+      - {expr: 'drysua:eta:seconds', eval_time: 5m, exp_samples: []}
+
+  - name: eta_with_missing_histogram_is_no_data
+    interval: 1m
+    input_series:
+      - {series: 'drysua_training_metrics_available{job="drysua"}', values: '1+0x5'}
+      - {series: 'drysua_training_metrics_state_healthy{job="drysua"}', values: '1+0x5'}
+      - {series: 'drysua_training_updates_completed{job="drysua"}', values: '10+0x5'}
+      - {series: 'drysua_training_updates_target{job="drysua"}', values: '100+0x5'}
+      - {series: 'drysua_training_active{job="drysua"}', values: '1+0x5'}
+      - {series: 'drysua_training_last_heartbeat_timestamp_seconds{job="drysua"}', values: '0+60x5'}
+      - {series: 'up{job="drysua"}', values: '1+0x5'}
+    promql_expr_test:
+      - {expr: 'drysua:eta:seconds', eval_time: 5m, exp_samples: []}
+
+  - name: eta_rejects_target_below_completed_progress
+    interval: 1m
+    input_series:
+      - {series: 'drysua_training_metrics_available{job="drysua"}', values: '1+0x5'}
+      - {series: 'drysua_training_metrics_state_healthy{job="drysua"}', values: '1+0x5'}
+      - {series: 'drysua_training_updates_completed{job="drysua"}', values: '100+1x5'}
+      - {series: 'drysua_training_updates_target{job="drysua"}', values: '100+0x5'}
+      - {series: 'drysua_training_update_duration_seconds_count{job="drysua"}', values: '0+1x5'}
+      - {series: 'drysua_training_active{job="drysua"}', values: '1+0x5'}
+      - {series: 'drysua_training_last_heartbeat_timestamp_seconds{job="drysua"}', values: '0+60x5'}
+      - {series: 'up{job="drysua"}', values: '1+0x5'}
+    promql_expr_test:
+      - {expr: 'drysua:eta:seconds', eval_time: 5m, exp_samples: []}
+
+  - name: eta_remains_visible_during_a_250_second_update
+    interval: 5s
+    input_series:
+      - {series: 'drysua_training_metrics_available{job="drysua"}', values: '1+0x74'}
+      - {series: 'drysua_training_metrics_state_healthy{job="drysua"}', values: '1+0x74'}
+      - {series: 'drysua_training_updates_completed{job="drysua"}', values: '9 10+0x73'}
+      - {series: 'drysua_training_updates_target{job="drysua"}', values: '100+0x74'}
+      - {series: 'drysua_training_update_duration_seconds_count{job="drysua"}', values: '0 1+0x73'}
+      - {series: 'drysua_training_active{job="drysua"}', values: '1+0x74'}
+      - {series: 'drysua_training_last_heartbeat_timestamp_seconds{job="drysua"}', values: '5+0x74'}
+      - {series: 'up{job="drysua"}', values: '1+0x74'}
+    promql_expr_test:
+      - expr: 'drysua:eta:seconds > bool 0'
+        eval_time: 4m15s
+        exp_samples: [{labels: '{}', value: 1}]
+
+  - name: eta_heartbeat_boundary_filters_even_when_a_positive_rate_remains
+    interval: 1m
+    input_series:
+      - {series: 'drysua_training_metrics_available{job="drysua"}', values: '1+0x11'}
+      - {series: 'drysua_training_metrics_state_healthy{job="drysua"}', values: '1+0x11'}
+      - {series: 'drysua_training_updates_completed{job="drysua"}', values: '0+1x11'}
+      - {series: 'drysua_training_updates_target{job="drysua"}', values: '100+0x11'}
+      - {series: 'drysua_training_update_duration_seconds_count{job="drysua"}', values: '0+1x11'}
+      - {series: 'drysua_training_active{job="drysua"}', values: '1+0x11'}
+      - {series: 'drysua_training_last_heartbeat_timestamp_seconds{job="drysua"}', values: '0 60 120 180 240 300 360 420 480 540 241 300'}
+      - {series: 'up{job="drysua"}', values: '1+0x11'}
+    promql_expr_test:
+      - expr: 'drysua:eta:seconds'
+        eval_time: 10m
+        exp_samples: [{labels: 'drysua:eta:seconds', value: 5400}]
+      - {expr: 'drysua:eta:seconds', eval_time: 11m, exp_samples: []}
+
+  - name: unavailable_unhealthy_or_down_suppresses_rates_despite_existing_counter_history
+    interval: 1m
+    input_series:
+      - {series: 'drysua_training_metrics_available{job="drysua"}', values: '1 0 1 1 1'}
+      - {series: 'drysua_training_metrics_state_healthy{job="drysua"}', values: '1 1 0 1 1'}
+      - {series: 'up{job="drysua"}', values: '1 1 1 0 1'}
+      - {series: 'drysua_training_active{job="drysua"}', values: '0+0x4'}
+      - {series: 'drysua_training_games_total{job="drysua",outcome="win"}', values: '0+10x4'}
+      - {series: 'drysua_training_games_total{job="drysua",outcome="loss"}', values: '0+30x4'}
+    promql_expr_test:
+      - {expr: 'drysua:win_rate:5m', eval_time: 1m, exp_samples: []}
+      - {expr: 'drysua:win_rate:5m', eval_time: 2m, exp_samples: []}
+      - {expr: 'drysua:win_rate:5m', eval_time: 3m, exp_samples: []}
+      - expr: 'drysua:win_rate:cumulative'
+        eval_time: 4m
+        exp_samples: [{labels: 'drysua:win_rate:cumulative', value: 0.25}]
+
+  - name: resource_readiness_is_independent_of_training_and_requires_its_own_collector_and_endpoint
+    interval: 1m
+    input_series:
+      - {series: 'drysua_training_metrics_available{job="drysua"}', values: '0+0x3'}
+      - {series: 'drysua_training_metrics_state_healthy{job="drysua"}', values: '0+0x3'}
+      - {series: 'drysua_host_cpu_collection_available{job="drysua"}', values: '0 1 1 1'}
+      - {series: 'drysua_host_memory_collection_available{job="drysua"}', values: '1 1 0 1'}
+      - {series: 'drysua_gpu_collection_available{job="drysua"}', values: '0 0 1 1'}
+      - {series: 'up{job="drysua"}', values: '1 1 1 0'}
+    promql_expr_test:
+      - {expr: 'drysua:metrics:ready', eval_time: 1m, exp_samples: []}
+      - {expr: 'drysua:host_cpu:ready', eval_time: 0m, exp_samples: []}
+      - expr: 'drysua:host_cpu:ready'
+        eval_time: 1m
+        exp_samples: [{labels: 'drysua:host_cpu:ready', value: 1}]
+      - expr: 'drysua:host_memory:ready'
+        eval_time: 1m
+        exp_samples: [{labels: 'drysua:host_memory:ready', value: 1}]
+      - {expr: 'drysua:host_memory:ready', eval_time: 2m, exp_samples: []}
+      - {expr: 'drysua:gpu:ready', eval_time: 1m, exp_samples: []}
+      - expr: 'drysua:gpu:ready'
+        eval_time: 2m
+        exp_samples: [{labels: 'drysua:gpu:ready', value: 1}]
+      - {expr: 'drysua:host_cpu:ready', eval_time: 3m, exp_samples: []}
+      - {expr: 'drysua:host_memory:ready', eval_time: 3m, exp_samples: []}
+      - {expr: 'drysua:gpu:ready', eval_time: 3m, exp_samples: []}

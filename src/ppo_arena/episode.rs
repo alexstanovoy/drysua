@@ -12,6 +12,10 @@ use super::*;
 mod curriculum_tests;
 
 #[cfg(test)]
+#[path = "../tests/episode_log_contract.rs"]
+mod log_contract_tests;
+
+#[cfg(test)]
 #[path = "../tests/mastery_training.rs"]
 mod mastery_tests;
 
@@ -501,6 +505,9 @@ fn log_collection(
     update: u64,
     group: Option<(usize, usize)>,
 ) {
+    if prometheus::enabled() {
+        return;
+    }
     let config = settings.ppo;
     let retained_bytes_bound = environments.len() * RETAINED_BYTES_PER_ENVIRONMENT;
     let (opponent, weak_environments, teacher_environments) = collection_opponents(environments);
@@ -1587,24 +1594,39 @@ fn record_episode(
             None => crate::TrainingGameOutcome::TimeCap,
         },
     )?;
-    eprintln!(
-        "episode: stream={stream} map=2 opponent={opponent} tick={tick} outcome={label} actor_decisions={} retained={} terminal_sample={} raw_return={:.9} discounted_return={:.9} terminal_reward={} shaping_return={:.9} actions={:?} noncontinue={} retention_phase={}",
-        state.decisions,
-        state.retained,
-        state.retained > 0,
-        state.raw_return,
-        state.discounted_return,
-        state.terminal_reward,
-        state.shaping_return,
-        state.actions,
-        state.decisions - state.actions[ActionKind::Continue.index()] as usize,
-        state.retention_phase
-    );
-    crate::telemetry::PerformanceOutput::new(crate::telemetry::AsyncLogWriter::default()).emit(
+    emit_episode_logs(
+        prometheus::enabled(),
+        || {
+            eprintln!(
+                "episode: stream={stream} map=2 opponent={opponent} tick={tick} outcome={label} actor_decisions={} retained={} terminal_sample={} raw_return={:.9} discounted_return={:.9} terminal_reward={} shaping_return={:.9} actions={:?} noncontinue={} retention_phase={}",
+                state.decisions,
+                state.retained,
+                state.retained > 0,
+                state.raw_return,
+                state.discounted_return,
+                state.terminal_reward,
+                state.shaping_return,
+                state.actions,
+                state.decisions - state.actions[ActionKind::Continue.index()] as usize,
+                state.retention_phase
+            )
+        },
+        || {
+            crate::telemetry::PerformanceOutput::new(crate::telemetry::AsyncLogWriter::default()).emit(
         &format_args!(
             "level=INFO event=map2_episode_reward stream={stream} tick={tick} outcome={label} opponent={opponent} {}",
             state.map2_reward
         ),
+    )
+        },
     );
     Ok(())
+}
+
+fn emit_episode_logs(prometheus_mode: bool, audit: impl FnOnce(), reward: impl FnOnce()) {
+    // The guarded runner consumes the exact episode event independently of telemetry.
+    audit();
+    if !prometheus_mode {
+        reward();
+    }
 }

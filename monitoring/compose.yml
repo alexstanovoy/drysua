@@ -1,0 +1,116 @@
+services:
+  prometheus:
+    image: docker.io/prom/prometheus:v3.14.0@sha256:5ce7540c3c00ef4ab0c9d2c995c6a5b9c421f44b4a115d97a2c7af3b1c21cbb0
+    pull_policy: never
+    network_mode: host
+    user: "${MONITORING_UID:-1000}:${MONITORING_GID:-1000}"
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        if ! (set -- /prometheus/wal/[0-9]*; test -f "$$1") &&
+           ! (set -- /prometheus/*/meta.json; test -f "$$1"); then
+          printf '%s\n' 'Refusing empty Prometheus history: select a verified TSDB copy or snapshot.' >&2
+          exit 1
+        fi
+        exec /bin/prometheus "$$@"
+      - --
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=14d
+      - --storage.tsdb.retention.size=2GB
+      - --web.listen-address=127.0.0.1:${PROMETHEUS_PORT:-9090}
+      - --web.max-connections=64
+      - --query.max-concurrency=4
+      - --query.timeout=10s
+      - --query.max-samples=500000
+    volumes:
+      - ./prometheus:/etc/prometheus:ro
+      - type: bind
+        source: ${PROMETHEUS_DATA_DIRECTORY:?Set an absolute path to a verified Prometheus data copy, never the live directory}
+        target: /prometheus
+        bind:
+          create_host_path: false
+    mem_limit: 512m
+    memswap_limit: 512m
+    pids_limit: 128
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=32m
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    restart: "on-failure:3"
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+
+  grafana:
+    image: docker.io/grafana/grafana:13.2.2@sha256:ac461fb352abc50da10a51c7d02462e9c05488f11f53f14b3ad79a8145f638a0
+    pull_policy: never
+    network_mode: host
+    user: "${MONITORING_UID:-1000}:${MONITORING_GID:-1000}"
+    entrypoint:
+      - /bin/sh
+      - -ec
+      - |
+        if ! test -s /var/lib/grafana/grafana.db; then
+          printf '%s\n' 'Refusing an empty Grafana database: select a verified SQLite/data copy.' >&2
+          exit 1
+        fi
+        exec /run.sh "$$@"
+      - --
+    environment:
+      GOMEMLIMIT: 256MiB
+      GOGC: "75"
+      GODEBUG: disablethp=1
+      DRYSUA_PROMETHEUS_URL: http://127.0.0.1:${PROMETHEUS_PORT:-9090}
+      GF_SERVER_HTTP_ADDR: 127.0.0.1
+      GF_SERVER_HTTP_PORT: ${GRAFANA_PORT:-3000}
+      GF_SERVER_DOMAIN: localhost
+      GF_SERVER_ROOT_URL: http://localhost:${GRAFANA_PORT:-3000}/
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD__FILE: /run/secrets/grafana_admin_password
+      GF_SECURITY_SECRET_KEY__FILE: /run/secrets/grafana_secret_key
+      GF_SECURITY_ALLOW_EMBEDDING: "false"
+      GF_SECURITY_COOKIE_SAMESITE: strict
+      GF_AUTH_ANONYMOUS_ENABLED: "false"
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      GF_USERS_ALLOW_ORG_CREATE: "false"
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_ANALYTICS_CHECK_FOR_PLUGIN_UPDATES: "false"
+      GF_PLUGINS_PREINSTALL_DISABLED: "true"
+      GF_PLUGINS_DISABLE_PLUGINS: elasticsearch,grafana-postgresql-datasource,grafana-pyroscope-datasource,influxdb,jaeger,loki,mssql,mysql,opentsdb,stackdriver,tempo,zipkin
+      GF_PLUGINS_PLUGIN_ADMIN_ENABLED: "false"
+      GF_PUBLIC_DASHBOARDS_ENABLED: "false"
+      GF_LOG_MODE: console
+    secrets: [grafana_admin_password, grafana_secret_key]
+    volumes:
+      - type: bind
+        source: ${GRAFANA_DATA_DIRECTORY:?Set an absolute path to a verified Grafana data copy, never the live directory}
+        target: /var/lib/grafana
+        bind:
+          create_host_path: false
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/etc/grafana/dashboards:ro
+    mem_limit: 512m
+    memswap_limit: 512m
+    pids_limit: 128
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=32m
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    restart: "on-failure:3"
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+
+secrets:
+  grafana_admin_password:
+    file: ${GRAFANA_ADMIN_PASSWORD_FILE:-../artifacts/temp/monitoring-native-20260921/secrets/grafana_admin_password}
+  grafana_secret_key:
+    file: ${GRAFANA_SECRET_KEY_FILE:-../artifacts/temp/monitoring-native-20260921/secrets/grafana_secret_key}

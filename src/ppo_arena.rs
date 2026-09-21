@@ -27,6 +27,7 @@ use bota_proto::{EventKind, MapId, RejectReason, ServerMsg, SlotId, Team};
 use bota_server::game::SpawnModifier;
 
 use crate::persistence::training::PolicyOrderBookkeeping;
+use crate::telemetry::prometheus::{self, TrainingMetricsStart};
 use crate::telemetry::{
     FlushPerformanceLogs, TrainingStage, TrainingTimingScope, TrainingUpdateMode,
     TrainingUpdateTimer, time_training_checkpoint, time_training_scope,
@@ -794,6 +795,7 @@ where
             "training update target precedes checkpoint",
         ));
     }
+    session.begin_metrics(&settings, checkpoint_directory, resume)?;
     if session.migrated_provenance {
         let migration = session.checkpoint_report(None);
         let durable = time_training_checkpoint(session.completed_updates, || {
@@ -986,6 +988,33 @@ struct TrainingSession {
 }
 
 impl TrainingSession {
+    fn begin_metrics(
+        &self,
+        settings: &TrainingJobConfig,
+        directory: &Path,
+        resume: bool,
+    ) -> Result<(), PpoError> {
+        prometheus::begin_training(
+            &self.run,
+            self.trainer.config(),
+            directory,
+            resume,
+            TrainingMetricsStart {
+                completed_updates: self.completed_updates,
+                samples: self.rollout_samples,
+                optimizer_steps: self.trainer.optimizer_step(),
+                updates_target: settings.updates,
+                parallel: settings.ppo.environments,
+                games_per_update: if settings.complete_episodes {
+                    settings.ppo.environments
+                } else {
+                    0
+                },
+            },
+        )
+        .map_err(text_error)
+    }
+
     fn run_updates(
         &mut self,
         settings: &TrainingJobConfig,
@@ -1127,6 +1156,8 @@ impl TrainingSession {
             .ok_or(PpoError::CounterOverflow)?;
         self.log_mastery_progress();
         let report = self.checkpoint_report(None);
+        let observed = prometheus::observe_training_update(&report).map_err(text_error);
+        timing.observe_result(observed)?;
         timing.complete();
         Ok(report)
     }
@@ -1206,6 +1237,9 @@ impl TrainingSession {
     }
 
     fn log_mastery_progress(&self) {
+        if prometheus::enabled() {
+            return;
+        }
         if let (Some(config), Some(progress)) = (self.run.mastery_config, &self.mastery) {
             crate::telemetry::PerformanceOutput::new(crate::telemetry::AsyncLogWriter::default()).emit(
                 &format_args!("level=INFO event=training_mastery_progress updates={} stage={:?} stage_games={} recent_games={} recent_wins={} window={} win_percent={} completed={}",

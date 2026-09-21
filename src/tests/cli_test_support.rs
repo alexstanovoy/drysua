@@ -1,5 +1,8 @@
 use super::*;
 
+#[path = "cli_metrics.rs"]
+mod metrics_tests;
+
 #[cfg(test)]
 pub(crate) fn parse_from<I, T>(arguments: I) -> Result<(), clap::Error>
 where

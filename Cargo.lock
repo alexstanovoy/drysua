@@ -706,6 +706,7 @@ dependencies = [
  "candle-metal-feature",
  "clap",
  "criterion",
+ "libc",
  "rustc-hash",
  "safetensors 0.8.0",
  "serde_json",

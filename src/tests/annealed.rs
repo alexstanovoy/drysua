@@ -13,6 +13,46 @@ use crate::randomization::{AnnealSchedule, RANDOMIZATION_DIRECTORY, draw_generat
 
 #[path = "annealed_capacity.rs"]
 mod capacity_tests;
+#[path = "annealed_invocation.rs"]
+mod invocation_tests;
+
+#[test]
+fn metrics_options_leave_annealed_scope_config_and_seed_unchanged() {
+    let arguments = [
+        "--updates",
+        "8",
+        "--generation-games",
+        "8",
+        "--parallel",
+        "2",
+    ];
+    let plain = crate::cli::annealed_settings_for_test(&arguments).expect("plain settings");
+    let mut observed_arguments = arguments.to_vec();
+    observed_arguments.extend([
+        "--metrics-directory",
+        "unused-metrics",
+        "--metrics-listen",
+        "127.0.0.1:9464",
+    ]);
+    let observed =
+        crate::cli::annealed_settings_for_test(&observed_arguments).expect("observed settings");
+    let scope = |settings: &AnnealedJobConfig| {
+        annealed_run(
+            settings,
+            PolicyDevice::Cpu,
+            settings.ppo,
+            AnnealedHarness::default(),
+            None,
+        )
+        .expect("canonical scope")
+    };
+
+    assert_eq!(plain, observed);
+    assert_eq!(scope(&plain), scope(&observed));
+    let mut extended = observed;
+    extended.updates += 1;
+    assert_ne!(scope(&plain), scope(&extended));
+}
 
 fn test_directory(name: &str) -> PathBuf {
     static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(1);
@@ -31,6 +71,7 @@ fn test_directory(name: &str) -> PathBuf {
 fn settings(seed: u64, updates: u64) -> AnnealedJobConfig {
     AnnealedJobConfig {
         updates,
+        invocation_updates: None,
         games_per_update: 2,
         parallel_worlds: 2,
         games_per_generation: 2,
@@ -312,6 +353,66 @@ fn generation_rules_follow_the_zero_window() {
     assert!(generation_rules(&draw, 6).is_empty());
     let after = draw_generation(3, 2, 4, 2, schedule).expect("after");
     assert!(generation_rules(&after, 8).is_empty());
+}
+
+#[test]
+fn generation_metrics_zero_the_cached_draw_at_the_boundary_without_changing_generation() {
+    let schedule = AnnealSchedule {
+        updates: 4,
+        zero_updates: 1,
+    };
+    let draw = draw_generation(3, 1, 4, 2, schedule).expect("truncated draw");
+    let nominal_scale = u32::try_from(draw.scale_bp).expect("positive scale");
+    assert!(nominal_scale > 0);
+    assert_eq!(draw.applied_games, 2);
+
+    for (global_game, expected_scale) in [(4, nominal_scale), (5, nominal_scale), (6, 0), (7, 0)] {
+        let metrics = generation_metrics(&draw, global_game);
+
+        assert_eq!(metrics, (1, expected_scale));
+        assert_eq!(
+            generation_rules(&draw, global_game).is_empty(),
+            expected_scale == 0
+        );
+    }
+}
+
+#[test]
+fn generation_metrics_report_zero_for_first_and_cached_zero_temperature_batches() {
+    let schedule = AnnealSchedule {
+        updates: 4,
+        zero_updates: 4,
+    };
+    let draw = draw_generation(3, 0, 4, 2, schedule).expect("zero-temperature draw");
+    assert!(!draw.applies());
+
+    for global_game in [0, 2] {
+        let metrics = generation_metrics(&draw, global_game);
+
+        assert_eq!(metrics, (0, 0));
+        assert!(generation_rules(&draw, global_game).is_empty());
+    }
+}
+
+#[test]
+fn generation_metrics_report_zero_when_no_games_apply_despite_positive_nominal_scale() {
+    let schedule = AnnealSchedule {
+        updates: 4,
+        zero_updates: 1,
+    };
+    let draw = GenerationDraw {
+        applied_games: 0,
+        ..draw_generation(3, 1, 4, 2, schedule).expect("draw")
+    };
+    assert!(draw.scale_bp > 0);
+    assert!(!draw.applies());
+
+    for global_game in [4, 6] {
+        let metrics = generation_metrics(&draw, global_game);
+
+        assert_eq!(metrics, (1, 0));
+        assert!(generation_rules(&draw, global_game).is_empty());
+    }
 }
 
 #[test]

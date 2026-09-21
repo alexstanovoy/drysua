@@ -39,6 +39,9 @@ impl Map2TrainingReward {
             "checkpoint" | "invocation" | "ppo_smoke" | "league_smoke"
         ));
         assert!(updates <= 1_000_000);
+        if crate::telemetry::prometheus::enabled() {
+            return;
+        }
         crate::telemetry::PerformanceOutput::new(crate::telemetry::AsyncLogWriter::default()).emit(
             &format_args!(
                 "level=INFO event=map2_training_reward scope={scope} updates={updates} {self}"

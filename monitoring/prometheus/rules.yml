@@ -1,0 +1,55 @@
+groups:
+  - name: drysua_dashboard
+    interval: 5s
+    rules:
+      - record: drysua:metrics:ready
+        expr: >-
+          (min(drysua_training_metrics_available{job="drysua"}) == 1)
+          and (min(drysua_training_metrics_state_healthy{job="drysua"}) == 1)
+          and (min(up{job="drysua"}) == 1)
+      - record: drysua:host_cpu:ready
+        expr: >-
+          (min(drysua_host_cpu_collection_available{job="drysua"}) == 1)
+          and (min(up{job="drysua"}) == 1)
+      - record: drysua:host_memory:ready
+        expr: >-
+          (min(drysua_host_memory_collection_available{job="drysua"}) == 1)
+          and (min(up{job="drysua"}) == 1)
+      - record: drysua:gpu:ready
+        expr: >-
+          (min(drysua_gpu_collection_available{job="drysua"}) == 1)
+          and (min(up{job="drysua"}) == 1)
+      - record: drysua:win_rate:5m
+        expr: >-
+          sum(rate(drysua_training_games_total{job="drysua",outcome="win"}[5m]))
+          / (sum(rate(drysua_training_games_total{job="drysua"}[5m])) > 0)
+          and drysua:metrics:ready
+      - record: drysua:win_rate:30m
+        expr: >-
+          sum(rate(drysua_training_games_total{job="drysua",outcome="win"}[30m]))
+          / (sum(rate(drysua_training_games_total{job="drysua"}[30m])) > 0)
+          and drysua:metrics:ready
+      - record: drysua:win_rate:cumulative
+        expr: >-
+          sum(drysua_training_games_total{job="drysua",outcome="win"})
+          / (sum(drysua_training_games_total{job="drysua"}) > 0)
+          and drysua:metrics:ready
+      - record: drysua:win_rate:last_update
+        expr: >-
+          sum(drysua_training_last_update_games{job="drysua",outcome="win"})
+          / (sum(drysua_training_last_update_games{job="drysua"}) > 0)
+          and drysua:metrics:ready
+      - record: drysua:progress:ratio
+        expr: >-
+          max(drysua_training_updates_completed{job="drysua"})
+          / (max(drysua_training_updates_target{job="drysua"}) > 0)
+          and drysua:metrics:ready
+      - record: drysua:eta:seconds
+        expr: >-
+          ((max(drysua_training_updates_target{job="drysua"})
+          - max(drysua_training_updates_completed{job="drysua"})) >= 0)
+          / (sum(rate(drysua_training_update_duration_seconds_count{job="drysua"}[5m])) > 0)
+          and (max(drysua_training_active{job="drysua"}) == 1)
+          and ((time() - max(drysua_training_last_heartbeat_timestamp_seconds{job="drysua"})) >= 0)
+          and ((time() - max(drysua_training_last_heartbeat_timestamp_seconds{job="drysua"})) < 360)
+          and drysua:metrics:ready

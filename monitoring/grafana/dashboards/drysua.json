@@ -1,0 +1,359 @@
+{
+  "uid": "drysua-training",
+  "title": "Drysua training",
+  "description": "Committed training metrics, availability, outcome coverage, throughput and whole-host resources. No reconstructed pre-deployment history.",
+  "tags": ["drysua", "training"],
+  "schemaVersion": 39,
+  "version": 3,
+  "editable": true,
+  "timezone": "browser",
+  "refresh": "30s",
+  "time": {"from": "now-1h", "to": "now"},
+  "timepicker": {"refresh_intervals": ["30s", "1m", "5m"]},
+  "annotations": {"list": []},
+  "templating": {
+    "list": [
+      {
+        "name": "cpu", "label": "Logical CPUs", "type": "query",
+        "datasource": {"type": "prometheus", "uid": "drysua-prometheus"},
+        "query": {"query": "label_values(drysua_host_cpu_utilization_ratio{job=\"drysua\"}, cpu)", "refId": "cpu"},
+        "definition": "label_values(drysua_host_cpu_utilization_ratio{job=\"drysua\"}, cpu)",
+        "regex": "/^[0-9]+$/", "sort": 3, "refresh": 1,
+        "multi": true, "includeAll": true, "allValue": ".*",
+        "current": {"text": "All", "value": "$__all"}, "options": []
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1, "type": "text", "title": "Coverage and interpretation",
+      "gridPos": {"x": 0, "y": 0, "w": 24, "h": 4},
+      "options": {
+        "mode": "markdown",
+        "content": "**Committed checkpoints only; no historical backfill.** Outcome/duration coverage starts **after the checkpoint at Metrics start update**. For an existing run, earlier wins are unknown. Absolute sample/optimizer totals may include older work.\n\nWin rates include **win + loss + draw + time_cap**, each once; **No data is not 0%**. Last update normally has **40 games for B40**. Check snapshot availability, state health and endpoint. Active means **writer lock held**, not learner progress; heartbeat advances at init/checkpoints, **not every 5s** (ETA cutoff: 360s). CPU/RAM/GPU have independent availability and describe the **whole host/device**, not individual bots."
+      }
+    },
+    {
+      "id": 2, "type": "stat", "title": "Endpoint reachable",
+      "description": "Prometheus up only checks HTTP scraping; it does not prove training is running.",
+      "gridPos": {"x": 0, "y": 4, "w": 4, "h": 4},
+      "datasource": {"type": "prometheus", "uid": "drysua-prometheus"},
+      "fieldConfig": {"defaults": {"noValue": "No data", "mappings": [{"type": "value", "options": {"0": {"text": "DOWN", "color": "red"}, "1": {"text": "UP", "color": "green"}}}]}, "overrides": []},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "values": false}},
+      "targets": [{"refId": "A", "expr": "up{job=\"drysua\"}", "instant": true, "range": false}]
+    },
+    {
+      "id": 3, "type": "stat", "title": "Training heartbeat age",
+      "description": "Trainer timestamp at initialization, committed checkpoint or target refresh; not a 5-second heartbeat. A 250-second update may legitimately leave it unchanged. At 360 seconds ETA is suppressed (300-second task cap plus 60-second gap). A final committed snapshot remains readable while inactive.",
+      "gridPos": {"x": 4, "y": 4, "w": 4, "h": 4},
+      "datasource": {"type": "prometheus", "uid": "drysua-prometheus"},
+      "fieldConfig": {"defaults": {"unit": "s", "noValue": "No data", "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 300}, {"color": "red", "value": 360}]}}, "overrides": []},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "values": false}, "colorMode": "value"},
+      "targets": [{"refId": "A", "expr": "(time() - drysua_training_last_heartbeat_timestamp_seconds{job=\"drysua\"}) and on() (min(up{job=\"drysua\"}) == 1)", "instant": true, "range": false}]
+    },
+    {
+      "id": 4, "type": "stat", "title": "Training active",
+      "description": "Stable exporter: the training writer lock is held. Direct listener: a training guard exists. Not a stored active flag and not proof of learner progress; compare committed updates and heartbeat age.",
+      "gridPos": {"x": 8, "y": 4, "w": 4, "h": 4},
+      "datasource": {"type": "prometheus", "uid": "drysua-prometheus"},
+      "fieldConfig": {"defaults": {"noValue": "No data", "mappings": [{"type": "value", "options": {"0": {"text": "Inactive", "color": "yellow"}, "1": {"text": "Active", "color": "green"}}}]}, "overrides": []},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "values": false}},
+      "targets": [{"refId": "A", "expr": "drysua_training_active{job=\"drysua\"} and on() (min(up{job=\"drysua\"}) == 1)", "instant": true, "range": false}]
+    },
+    {
+      "id": 5, "type": "stat", "title": "Metrics start update",
+      "description": "N means outcome/duration coverage starts after the checkpoint containing N completed updates. On first deployment to an existing run, results through N are unknown and are never inferred from configured games per update.",
+      "gridPos": {"x": 12, "y": 4, "w": 4, "h": 4},
+      "datasource": {"type": "prometheus", "uid": "drysua-prometheus"},
+      "fieldConfig": {"defaults": {"decimals": 0, "noValue": "No data"}, "overrides": []},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "values": false}},
+      "targets": [{"refId": "A", "expr": "drysua_training_metrics_start_update{job=\"drysua\"} and on() drysua:metrics:ready", "instant": true, "range": false}]
+    },
+    {
+      "id": 6, "type": "stat", "title": "Last committed update games (B40: 40)",
+      "gridPos": {"x": 16, "y": 4, "w": 4, "h": 4},
+      "datasource": {"type": "prometheus", "uid": "drysua-prometheus"},
+      "fieldConfig": {"defaults": {"decimals": 0, "noValue": "No data"}, "overrides": []},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "values": false}},
+      "targets": [{"refId": "A", "expr": "sum(drysua_training_last_update_games{job=\"drysua\"}) and drysua:metrics:ready", "instant": true, "range": false}]
+    },
+    {
+      "id": 7, "type": "stat", "title": "Update progress",
+      "gridPos": {"x": 20, "y": 4, "w": 4, "h": 4},
+      "datasource": {"type": "prometheus", "uid": "drysua-prometheus"},
+      "fieldConfig": {"defaults": {"unit": "percentunit", "decimals": 1, "noValue": "No data"}, "overrides": []},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "values": false}},
+      "targets": [{"refId": "A", "expr": "drysua:progress:ratio", "instant": true, "range": false}]
+    },
+    {
+      "id": 32, "type": "stat", "title": "Training snapshot available",
+      "description": "Healthy committed snapshot can be exposed. Zero suppresses training panels, not independently collected host/GPU resources. Missing or unreconciled state is not zero historical outcomes.",
+      "gridPos": {"x": 0, "y": 8, "w": 4, "h": 4},
+      "datasource": {"type": "prometheus", "uid": "drysua-prometheus"},
+      "fieldConfig": {"defaults": {"noValue": "No data", "mappings": [{"type": "value", "options": {"0": {"text": "Unavailable", "color": "red"}, "1": {"text": "Available", "color": "green"}}}]}, "overrides": []},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "values": false}},
+      "targets": [{"refId": "A", "expr": "drysua_training_metrics_available{job=\"drysua\"} and on() (min(up{job=\"drysua\"}) == 1)", "instant": true, "range": false}]
+    },
+    {
+      "id": 33, "type": "stat", "title": "Training state health",
+      "description": "Validation/reconciliation/I/O health. Unhealthy or abandoned pending state requires the documented checkpoint-aware recovery, not deleting telemetry records.",
+      "gridPos": {"x": 4, "y": 8, "w": 4, "h": 4},
+      "datasource": {"type": "prometheus", "uid": "drysua-prometheus"},
+      "fieldConfig": {"defaults": {"noValue": "No data", "mappings": [{"type": "value", "options": {"0": {"text": "Unhealthy", "color": "red"}, "1": {"text": "Healthy", "color": "green"}}}]}, "overrides": []},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "values": false}},
+      "targets": [{"refId": "A", "expr": "drysua_training_metrics_state_healthy{job=\"drysua\"} and on() (min(up{job=\"drysua\"}) == 1)", "instant": true, "range": false}]
+    },
+    {
+      "id": 34, "type": "stat", "title": "Resource collection availability",
+      "description": "Independent CPU, RAM and GPU collection validity. CPU needs an initial valid delta; optional GPU telemetry may be unavailable. An unavailable collector is not an idle CPU or a zero-degree GPU.",
+      "gridPos": {"x": 8, "y": 8, "w": 8, "h": 4},
+      "datasource": {"type": "prometheus", "uid": "drysua-prometheus"},
+      "fieldConfig": {"defaults": {"noValue": "No data", "mappings": [{"type": "value", "options": {"0": {"text": "Unavailable", "color": "yellow"}, "1": {"text": "Available", "color": "green"}}}]}, "overrides": []},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "values": false}},
+      "targets": [
+        {"refId": "A", "expr": "drysua_host_cpu_collection_available{job=\"drysua\"} and on() (min(up{job=\"drysua\"}) == 1)", "legendFormat": "CPU", "instant": true, "range": false},
+        {"refId": "B", "expr": "drysua_host_memory_collection_available{job=\"drysua\"} and on() (min(up{job=\"drysua\"}) == 1)", "legendFormat": "RAM", "instant": true, "range": false},
+        {"refId": "C", "expr": "drysua_gpu_collection_available{job=\"drysua\"} and on() (min(up{job=\"drysua\"}) == 1)", "legendFormat": "GPU", "instant": true, "range": false}
+      ]
+    },
+    {
+      "id": 35, "type": "stat", "title": "Configured parallel worlds",
+      "description": "Configured simultaneous worlds, not the number of logical CPUs or currently running OS threads.",
+      "gridPos": {"x": 16, "y": 8, "w": 4, "h": 4},
+      "datasource": {"type": "prometheus", "uid": "drysua-prometheus"},
+      "fieldConfig": {"defaults": {"decimals": 0, "noValue": "No data"}, "overrides": []},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "values": false}},
+      "targets": [{"refId": "A", "expr": "drysua_training_parallel_worlds{job=\"drysua\"} and on() drysua:metrics:ready", "instant": true, "range": false}]
+    },
+    {
+      "id": 36, "type": "stat", "title": "Configured games / update",
+      "description": "Configured full-episode games; zero denotes reset-window mode. This is not evidence for unobserved historical outcomes.",
+      "gridPos": {"x": 20, "y": 8, "w": 4, "h": 4},
+      "datasource": {"type": "prometheus", "uid": "drysua-prometheus"},
+      "fieldConfig": {"defaults": {"decimals": 0, "noValue": "No data", "mappings": [{"type": "value", "options": {"0": {"text": "Reset-window mode"}}}]}, "overrides": []},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "values": false}},
+      "targets": [{"refId": "A", "expr": "drysua_training_games_per_update{job=\"drysua\"} and on() drysua:metrics:ready", "instant": true, "range": false}]
+    },
+    {
+      "id": 8, "type": "timeseries", "title": "Recent win rate — all outcomes in denominator",
+      "maxDataPoints": 120, "interval": "30s",
+      "gridPos": {"x": 0, "y": 12, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "drysua-prometheus"},
+      "fieldConfig": {"defaults": {"unit": "percentunit", "min": 0, "max": 1, "noValue": "No data", "custom": {"spanNulls": false}}, "overrides": []},
+      "targets": [
+        {"refId": "A", "expr": "drysua:win_rate:5m", "legendFormat": "5 minute"},
+        {"refId": "B", "expr": "drysua:win_rate:30m", "legendFormat": "30 minute"}
+      ]
+    },
+    {
+      "id": 9, "type": "stat", "title": "Cumulative win rate — covered updates only",
+      "description": "Committed wins / all committed observed outcomes. Coverage starts after Metrics start update; results through that checkpoint are not reconstructed.",
+      "gridPos": {"x": 12, "y": 12, "w": 6, "h": 4},
+      "datasource": {"type": "prometheus", "uid": "drysua-prometheus"},
+      "fieldConfig": {"defaults": {"unit": "percentunit", "decimals": 1, "noValue": "No data"}, "overrides": []},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "values": false}},
+      "targets": [{"refId": "A", "expr": "drysua:win_rate:cumulative", "instant": true, "range": false}]
+    },
+    {
+      "id": 10, "type": "stat", "title": "Last update win rate (normally 40 games)",
+      "gridPos": {"x": 18, "y": 12, "w": 6, "h": 4},
+      "datasource": {"type": "prometheus", "uid": "drysua-prometheus"},
+      "fieldConfig": {"defaults": {"unit": "percentunit", "decimals": 1, "noValue": "No data"}, "overrides": []},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "values": false}},
+      "targets": [{"refId": "A", "expr": "drysua:win_rate:last_update", "instant": true, "range": false}]
+    },
+    {
+      "id": 11, "type": "stat", "title": "Durable outcomes — covered updates only",
+      "gridPos": {"x": 12, "y": 16, "w": 6, "h": 4},
+      "datasource": {"type": "prometheus", "uid": "drysua-prometheus"},
+      "fieldConfig": {"defaults": {"decimals": 0, "noValue": "No data"}, "overrides": []},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "values": false}},
+      "targets": [{"refId": "A", "expr": "sum by (outcome) (drysua_training_games_total{job=\"drysua\"}) and on() drysua:metrics:ready", "legendFormat": "{{outcome}}", "instant": true, "range": false}]
+    },
+    {
+      "id": 12, "type": "stat", "title": "Last update wins / losses / draws / time caps",
+      "gridPos": {"x": 18, "y": 16, "w": 6, "h": 4},
+      "datasource": {"type": "prometheus", "uid": "drysua-prometheus"},
+      "fieldConfig": {"defaults": {"decimals": 0, "noValue": "No data"}, "overrides": []},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "values": false}},
+      "targets": [{"refId": "A", "expr": "sum by (outcome) (drysua_training_last_update_games{job=\"drysua\"}) and on() drysua:metrics:ready", "legendFormat": "{{outcome}}", "instant": true, "range": false}]
+    },
+    {
+      "id": 13, "type": "timeseries", "title": "Games / hour (5 minute rate)",
+      "maxDataPoints": 120, "interval": "30s",
+      "gridPos": {"x": 0, "y": 20, "w": 8, "h": 7},
+      "datasource": {"type": "prometheus", "uid": "drysua-prometheus"},
+      "fieldConfig": {"defaults": {"unit": "suffix:games/h", "min": 0, "noValue": "No data", "custom": {"spanNulls": false}}, "overrides": []},
+      "targets": [{"refId": "A", "expr": "3600 * sum(rate(drysua_training_games_total{job=\"drysua\"}[5m])) and drysua:metrics:ready", "legendFormat": "All outcomes"}]
+    },
+    {
+      "id": 14, "type": "timeseries", "title": "Updates / hour (5 minute rate)",
+      "maxDataPoints": 120, "interval": "30s",
+      "description": "Uses the durable committed-update histogram count, never rate() on the completed-updates gauge. Histograms persist across segments; scrape gaps can still distort windowed rates.",
+      "gridPos": {"x": 8, "y": 20, "w": 8, "h": 7},
+      "datasource": {"type": "prometheus", "uid": "drysua-prometheus"},
+      "fieldConfig": {"defaults": {"unit": "suffix:updates/h", "min": 0, "noValue": "No data", "custom": {"spanNulls": false}}, "overrides": []},
+      "targets": [{"refId": "A", "expr": "3600 * sum(rate(drysua_training_update_duration_seconds_count{job=\"drysua\"}[5m])) and drysua:metrics:ready", "legendFormat": "Updates"}]
+    },
+    {
+      "id": 15, "type": "timeseries", "title": "Samples / second (5 minute rate)",
+      "maxDataPoints": 120, "interval": "30s",
+      "gridPos": {"x": 16, "y": 20, "w": 8, "h": 7},
+      "datasource": {"type": "prometheus", "uid": "drysua-prometheus"},
+      "fieldConfig": {"defaults": {"unit": "suffix:samples/s", "min": 0, "noValue": "No data", "custom": {"spanNulls": false}}, "overrides": []},
+      "targets": [{"refId": "A", "expr": "sum(rate(drysua_training_samples_total{job=\"drysua\"}[5m])) and drysua:metrics:ready", "legendFormat": "Samples"}]
+    },
+    {
+      "id": 16, "type": "timeseries", "title": "Seconds / update — mean and p95 (5 minutes)",
+      "maxDataPoints": 120, "interval": "30s",
+      "description": "Histogram mean and bucket-estimated p95; no observations means No data. This duration is not necessarily full segment wall time including checkpoint/startup.",
+      "gridPos": {"x": 0, "y": 27, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "drysua-prometheus"},
+      "fieldConfig": {"defaults": {"unit": "s", "min": 0, "noValue": "No data", "custom": {"spanNulls": false}}, "overrides": []},
+      "targets": [
+        {"refId": "A", "expr": "sum(rate(drysua_training_update_duration_seconds_sum{job=\"drysua\"}[5m])) / (sum(rate(drysua_training_update_duration_seconds_count{job=\"drysua\"}[5m])) > 0) and drysua:metrics:ready", "legendFormat": "Mean"},
+        {"refId": "B", "expr": "histogram_quantile(0.95, sum by (le) (rate(drysua_training_update_duration_seconds_bucket{job=\"drysua\"}[5m]))) and (sum(rate(drysua_training_update_duration_seconds_count{job=\"drysua\"}[5m])) > 0) and drysua:metrics:ready", "legendFormat": "p95"}
+      ]
+    },
+    {
+      "id": 17, "type": "timeseries", "title": "Phase duration — means (5 minutes)",
+      "maxDataPoints": 120, "interval": "30s",
+      "gridPos": {"x": 12, "y": 27, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "drysua-prometheus"},
+      "fieldConfig": {"defaults": {"unit": "s", "min": 0, "noValue": "No data", "custom": {"spanNulls": false}}, "overrides": []},
+      "targets": [{"refId": "A", "expr": "sum by (stage) (rate(drysua_training_stage_duration_seconds_sum{job=\"drysua\",stage=~\"rollout_initialization|collection|batch_preparation|optimization|finalization\"}[5m])) / (sum by (stage) (rate(drysua_training_stage_duration_seconds_count{job=\"drysua\"}[5m])) > 0) and on() drysua:metrics:ready", "legendFormat": "{{stage}}"}]
+    },
+    {
+      "id": 18, "type": "timeseries", "title": "Phase duration — p95 (5 minutes)",
+      "maxDataPoints": 120, "interval": "30s",
+      "description": "Bucket interpolation estimate; only stages with observations appear.",
+      "gridPos": {"x": 0, "y": 35, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "drysua-prometheus"},
+      "fieldConfig": {"defaults": {"unit": "s", "min": 0, "noValue": "No data", "custom": {"spanNulls": false}}, "overrides": []},
+      "targets": [{"refId": "A", "expr": "histogram_quantile(0.95, sum by (stage, le) (rate(drysua_training_stage_duration_seconds_bucket{job=\"drysua\",stage=~\"rollout_initialization|collection|batch_preparation|optimization|finalization\"}[5m]))) and on (stage) (sum by (stage) (rate(drysua_training_stage_duration_seconds_count{job=\"drysua\"}[5m])) > 0) and on() drysua:metrics:ready", "legendFormat": "{{stage}}"}]
+    },
+    {
+      "id": 19, "type": "timeseries", "title": "Latest PPO policy / value loss",
+      "maxDataPoints": 120, "interval": "30s",
+      "gridPos": {"x": 12, "y": 35, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "drysua-prometheus"},
+      "fieldConfig": {"defaults": {"noValue": "No data", "custom": {"spanNulls": false}}, "overrides": []},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull"]}},
+      "targets": [
+        {"refId": "A", "expr": "drysua_training_policy_loss{job=\"drysua\"} and on() drysua:metrics:ready", "legendFormat": "Policy loss"},
+        {"refId": "B", "expr": "drysua_training_value_loss{job=\"drysua\"} and on() drysua:metrics:ready", "legendFormat": "Value loss"}
+      ]
+    },
+    {
+      "id": 20, "type": "timeseries", "title": "Latest PPO entropy / approximate KL",
+      "maxDataPoints": 120, "interval": "30s",
+      "gridPos": {"x": 0, "y": 43, "w": 12, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "drysua-prometheus"},
+      "fieldConfig": {"defaults": {"noValue": "No data", "custom": {"spanNulls": false}}, "overrides": [{"matcher": {"id": "byName", "options": "Approximate KL"}, "properties": [{"id": "custom.axisPlacement", "value": "right"}]}]},
+      "options": {"legend": {"displayMode": "table", "placement": "bottom", "calcs": ["lastNotNull"]}},
+      "targets": [
+        {"refId": "A", "expr": "drysua_training_entropy{job=\"drysua\"} and on() drysua:metrics:ready", "legendFormat": "Entropy"},
+        {"refId": "B", "expr": "drysua_training_approximate_kl{job=\"drysua\"} and on() drysua:metrics:ready", "legendFormat": "Approximate KL"}
+      ]
+    },
+    {
+      "id": 21, "type": "stat", "title": "Rough ETA at recent update throughput",
+      "description": "Remaining updates / 5-minute durable histogram count rate. Requires positive speed, a healthy available snapshot, writer lock held, endpoint UP and heartbeat age below 360 seconds. Heartbeat advances at init/checkpoints, not each scrape. A missing rate still means No data, not zero ETA.",
+      "gridPos": {"x": 12, "y": 43, "w": 6, "h": 4},
+      "datasource": {"type": "prometheus", "uid": "drysua-prometheus"},
+      "fieldConfig": {"defaults": {"unit": "s", "noValue": "No data"}, "overrides": []},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "values": false}},
+      "targets": [{"refId": "A", "expr": "drysua:eta:seconds", "instant": true, "range": false}]
+    },
+    {
+      "id": 22, "type": "stat", "title": "Completed / target updates",
+      "gridPos": {"x": 18, "y": 43, "w": 6, "h": 4},
+      "datasource": {"type": "prometheus", "uid": "drysua-prometheus"},
+      "fieldConfig": {"defaults": {"decimals": 0, "noValue": "No data"}, "overrides": []},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "values": false}},
+      "targets": [
+        {"refId": "A", "expr": "drysua_training_updates_completed{job=\"drysua\"} and on() drysua:metrics:ready", "legendFormat": "Completed", "instant": true, "range": false},
+        {"refId": "B", "expr": "drysua_training_updates_target{job=\"drysua\"} and on() drysua:metrics:ready", "legendFormat": "Target", "instant": true, "range": false}
+      ]
+    },
+    {
+      "id": 23, "type": "stat", "title": "Environment generation",
+      "description": "Annealed-only, zero-based generation used by the last committed batch.",
+      "gridPos": {"x": 12, "y": 47, "w": 6, "h": 4},
+      "datasource": {"type": "prometheus", "uid": "drysua-prometheus"},
+      "fieldConfig": {"defaults": {"decimals": 0, "noValue": "No data"}, "overrides": []},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "values": false}},
+      "targets": [{"refId": "A", "expr": "drysua_training_generation{job=\"drysua\"} and on() drysua:metrics:ready", "instant": true, "range": false}]
+    },
+    {
+      "id": 24, "type": "stat", "title": "Environment scale",
+      "description": "Annealed-only effective scale, 0–1; zero in the no-modifier window.",
+      "gridPos": {"x": 18, "y": 47, "w": 6, "h": 4},
+      "datasource": {"type": "prometheus", "uid": "drysua-prometheus"},
+      "fieldConfig": {"defaults": {"unit": "percentunit", "noValue": "No data"}, "overrides": []},
+      "options": {"reduceOptions": {"calcs": ["lastNotNull"], "values": false}},
+      "targets": [{"refId": "A", "expr": "drysua_training_environment_scale_ratio{job=\"drysua\"} and on() drysua:metrics:ready", "instant": true, "range": false}]
+    },
+    {
+      "id": 25, "type": "timeseries", "title": "GPU utilization — whole device",
+      "maxDataPoints": 120, "interval": "30s",
+      "gridPos": {"x": 0, "y": 51, "w": 8, "h": 7},
+      "datasource": {"type": "prometheus", "uid": "drysua-prometheus"},
+      "fieldConfig": {"defaults": {"unit": "percentunit", "min": 0, "max": 1, "noValue": "No data", "custom": {"spanNulls": false}}, "overrides": []},
+      "targets": [{"refId": "A", "expr": "drysua_gpu_utilization_ratio{job=\"drysua\"} and on() drysua:gpu:ready", "legendFormat": "GPU {{gpu}}"}]
+    },
+    {
+      "id": 26, "type": "timeseries", "title": "GPU VRAM — used / total",
+      "maxDataPoints": 120, "interval": "30s",
+      "gridPos": {"x": 8, "y": 51, "w": 8, "h": 7},
+      "datasource": {"type": "prometheus", "uid": "drysua-prometheus"},
+      "fieldConfig": {"defaults": {"unit": "bytes", "min": 0, "noValue": "No data", "custom": {"spanNulls": false}}, "overrides": []},
+      "targets": [
+        {"refId": "A", "expr": "drysua_gpu_memory_used_bytes{job=\"drysua\"} and on() drysua:gpu:ready", "legendFormat": "GPU {{gpu}} used"},
+        {"refId": "B", "expr": "drysua_gpu_memory_total_bytes{job=\"drysua\"} and on() drysua:gpu:ready", "legendFormat": "GPU {{gpu}} total"}
+      ]
+    },
+    {
+      "id": 27, "type": "timeseries", "title": "GPU temperature",
+      "maxDataPoints": 120, "interval": "30s",
+      "gridPos": {"x": 16, "y": 51, "w": 8, "h": 7},
+      "datasource": {"type": "prometheus", "uid": "drysua-prometheus"},
+      "fieldConfig": {"defaults": {"unit": "celsius", "noValue": "No data", "custom": {"spanNulls": false}}, "overrides": []},
+      "targets": [{"refId": "A", "expr": "drysua_gpu_temperature_celsius{job=\"drysua\"} and on() drysua:gpu:ready", "legendFormat": "GPU {{gpu}}"}]
+    },
+    {
+      "id": 28, "type": "timeseries", "title": "Host RAM — used / available / total",
+      "maxDataPoints": 120, "interval": "30s",
+      "description": "Used is MemTotal minus MemAvailable, not process RSS. Includes all host workloads.",
+      "gridPos": {"x": 0, "y": 58, "w": 12, "h": 7},
+      "datasource": {"type": "prometheus", "uid": "drysua-prometheus"},
+      "fieldConfig": {"defaults": {"unit": "bytes", "min": 0, "noValue": "No data", "custom": {"spanNulls": false}}, "overrides": []},
+      "targets": [
+        {"refId": "A", "expr": "(drysua_host_memory_total_bytes{job=\"drysua\"} - drysua_host_memory_available_bytes{job=\"drysua\"}) and on() drysua:host_memory:ready", "legendFormat": "Used"},
+        {"refId": "B", "expr": "drysua_host_memory_available_bytes{job=\"drysua\"} and on() drysua:host_memory:ready", "legendFormat": "Available"},
+        {"refId": "C", "expr": "drysua_host_memory_total_bytes{job=\"drysua\"} and on() drysua:host_memory:ready", "legendFormat": "Total"}
+      ]
+    },
+    {
+      "id": 29, "type": "timeseries", "title": "Optimizer steps / second (5 minute rate)",
+      "maxDataPoints": 120, "interval": "30s",
+      "gridPos": {"x": 12, "y": 58, "w": 12, "h": 7},
+      "datasource": {"type": "prometheus", "uid": "drysua-prometheus"},
+      "fieldConfig": {"defaults": {"unit": "suffix:steps/s", "min": 0, "noValue": "No data", "custom": {"spanNulls": false}}, "overrides": []},
+      "targets": [{"refId": "A", "expr": "sum(rate(drysua_training_optimizer_steps_total{job=\"drysua\"}[5m])) and drysua:metrics:ready", "legendFormat": "Optimizer steps"}]
+    },
+    {
+      "id": 30, "type": "row", "title": "Whole-host logical CPU utilization — all detected CPUs in one chart",
+      "gridPos": {"x": 0, "y": 65, "w": 24, "h": 1}, "collapsed": false, "panels": []
+    },
+    {
+      "id": 31, "type": "timeseries", "title": "Logical CPU utilization — whole host",
+      "maxDataPoints": 120, "interval": "30s",
+      "description": "One query returns all selected logical CPUs, including 16/32-CPU hosts, without per-core panel fanout. Not per-bot, per-worker or physical-core attribution. Missing telemetry remains No data.",
+      "gridPos": {"x": 0, "y": 66, "w": 24, "h": 8},
+      "datasource": {"type": "prometheus", "uid": "drysua-prometheus"},
+      "fieldConfig": {"defaults": {"unit": "percentunit", "min": 0, "max": 1, "noValue": "No data", "custom": {"spanNulls": false}}, "overrides": []},
+      "targets": [{"refId": "A", "expr": "drysua_host_cpu_utilization_ratio{job=\"drysua\",cpu=~\"${cpu:regex}\"} and on() drysua:host_cpu:ready", "legendFormat": "CPU {{cpu}}"}]
+    }
+  ]
+}

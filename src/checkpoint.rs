@@ -15,6 +15,9 @@ use sha2::{Digest, Sha256};
 mod capacity_tests;
 #[path = "checkpoint_mastery.rs"]
 mod mastery;
+#[cfg(test)]
+#[path = "checkpoint_metrics_tests.rs"]
+mod metrics_tests;
 #[path = "checkpoint_terminal.rs"]
 mod terminal;
 use crate::{
@@ -364,11 +367,29 @@ impl TrainingArtifact {
         let tensor_bytes = serialize_training_tensors(self)?;
         let tensor_hash = sha256(&tensor_bytes);
         let manifest_bytes = encode_manifest(self, tensor_hash)?;
+        let metrics_identity = if crate::telemetry::prometheus::enabled() {
+            let metrics_identity = sha256(&manifest_bytes);
+            crate::telemetry::prometheus::prepare_checkpoint(
+                &self.run,
+                self.config,
+                self.progress.global_update,
+                metrics_identity,
+            )?;
+            Some(metrics_identity)
+        } else {
+            None
+        };
         let generation = tensor_generation_path(directory, tensor_hash);
         write_immutable(&generation, &tensor_bytes)?;
         atomic_replace(&directory.join(CHECKPOINT_TENSOR_FILE), &tensor_bytes)?;
         atomic_replace(&directory.join(CHECKPOINT_META_FILE), &manifest_bytes)?;
         sync_directory(directory)?;
+        if let Some(metrics_identity) = metrics_identity {
+            crate::telemetry::prometheus::commit_checkpoint(
+                self.progress.global_update,
+                metrics_identity,
+            )?;
+        }
         match prune_tensor_generations(directory, tensor_hash) {
             Ok(()) => Ok(CheckpointSaveOutcome::Committed),
             Err(error) => Ok(CheckpointSaveOutcome::CommittedWithCleanupError(
@@ -533,6 +554,48 @@ impl TrainingArtifact {
         }
         Ok(())
     }
+}
+
+/// Hashes canonical run/config provenance without logging options or output paths.
+pub(crate) fn metrics_scope_identity(
+    run: &CheckpointRun,
+    config: PpoConfig,
+) -> Result<[u8; 32], CheckpointError> {
+    validate_run_without_model(run, config)?;
+    let mut writer = ManifestWriter::default();
+    writer.bytes.extend(b"drysua-metrics-scope/v1");
+    let (version, hash) = checkpoint_schema_identity(config.sample_budget);
+    writer.u32(version);
+    writer.u64(hash);
+    encode_schema(&mut writer, config.sample_budget);
+    encode_run(&mut writer, run)?;
+    encode_config(&mut writer, config)?;
+    Ok(sha256(&writer.bytes))
+}
+
+/// Identifies exact recoverable metadata only; call after strict session restore.
+/// Reestablishes directory durability before resumed metrics can be published.
+#[cfg(feature = "builtin")]
+pub(crate) fn metrics_checkpoint_identity(directory: &Path) -> Result<[u8; 32], CheckpointError> {
+    validate_directory(directory)?;
+    let manifest_bytes = read_recoverable(&directory.join(CHECKPOINT_META_FILE), MAX_META_BYTES)?;
+    metrics_manifest_identity_after_sync(&manifest_bytes, || sync_directory(directory))
+}
+
+#[cfg(any(feature = "builtin", test))]
+fn metrics_manifest_identity_after_sync(
+    manifest_bytes: &[u8],
+    synchronize: impl FnOnce() -> Result<(), CheckpointError>,
+) -> Result<[u8; 32], CheckpointError> {
+    let identity = metrics_manifest_identity(manifest_bytes)?;
+    synchronize()?;
+    Ok(identity)
+}
+
+#[cfg(any(feature = "builtin", test))]
+fn metrics_manifest_identity(manifest_bytes: &[u8]) -> Result<[u8; 32], CheckpointError> {
+    decode_manifest(manifest_bytes)?;
+    Ok(sha256(manifest_bytes))
 }
 
 impl CheckpointDevice {
