@@ -92,6 +92,7 @@ fn run_job(annealed: bool, directory: &Path, target: u64, resume: bool) -> Count
             episode_decisions: Some(15),
             stop_after: None,
             stop_after_games: None,
+            fail_actor_after_dispatch: false,
         };
         let report = run_annealed_job_harnessed(
             config,
@@ -168,6 +169,7 @@ fn full_settings(updates: u64) -> crate::TrainingJobConfig {
 
 fn annealed_settings(settings: crate::TrainingJobConfig) -> AnnealedJobConfig {
     AnnealedJobConfig {
+        execution: crate::TrainingExecutionOptions::default(),
         updates: 2,
         invocation_updates: None,
         games_per_update: 2,

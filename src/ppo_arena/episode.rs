@@ -27,6 +27,10 @@ mod map2_tests;
 #[path = "../tests/episode_collection_parallel.rs"]
 mod parallel_tests;
 
+mod continue_overlap;
+#[cfg(test)]
+#[path = "../tests/continue_overlap.rs"]
+mod continue_overlap_tests;
 #[cfg(test)]
 #[path = "../tests/episode_test_support.rs"]
 mod test_support;
@@ -1178,6 +1182,8 @@ pub(super) fn collect_batch(
         report,
     )?;
     assert!(completed, "an annealed batch cannot cancel");
+    #[cfg(test)]
+    test_support::emit_concurrency_probe_counts(streams, false);
     if rounds == ACTOR_DECISIONS {
         assert!(
             streams.iter().all(|stream| stream.done),
@@ -1185,6 +1191,50 @@ pub(super) fn collect_batch(
         );
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn collect_batch_with_execution(
+    model: &PolicyModel,
+    config: PpoConfig,
+    stream_base: usize,
+    thread_prefix: &str,
+    environments: &mut [TrainingEnvironment],
+    streams: &mut [EpisodeStream],
+    random: &mut [PpoRng],
+    rounds: usize,
+    rollout: &mut PpoRollout,
+    report: &mut PpoSmokeReport,
+    execution: crate::TrainingExecutionOptions,
+    #[cfg(test)] fail_late: bool,
+) -> Result<(), PpoError> {
+    if execution.actor_overlap == crate::ActorOverlap::Off {
+        return collect_batch(
+            model,
+            config,
+            stream_base,
+            thread_prefix,
+            environments,
+            streams,
+            random,
+            rounds,
+            rollout,
+            report,
+        );
+    }
+    continue_overlap::collect(
+        model,
+        config,
+        stream_base,
+        environments,
+        streams,
+        random,
+        rounds,
+        rollout,
+        report,
+        #[cfg(test)]
+        fail_late,
+    )
 }
 
 /// Bootstrap barrier: every stream prepares its first decision frame.
@@ -1387,6 +1437,18 @@ fn advance_cpu(
     space: ActionSpace,
     config: PpoConfig,
 ) -> Result<CompletedAdvance, PpoError> {
+    advance_cpu_with_requests(environment, state, &choice, config, |environment| {
+        requests_for_decision_in_space(environment, &choice, &space)
+    })
+}
+
+fn advance_cpu_with_requests(
+    environment: &mut TrainingEnvironment,
+    state: &mut EpisodeStream,
+    choice: &PpoPolicyChoice,
+    config: PpoConfig,
+    requests: impl FnOnce(&mut TrainingEnvironment) -> Result<Vec<Option<Request>>, PpoError>,
+) -> Result<CompletedAdvance, PpoError> {
     assert!(!state.done);
     assert!(state.decisions < ACTOR_DECISIONS);
     if state.begins_interval() {
@@ -1400,7 +1462,7 @@ fn advance_cpu(
         .ok_or(PpoError::InvalidTransition("episode snapshot"))?
         .tick;
     assert!(tick < TICK_CAP);
-    let requests = requests_for_decision_in_space(environment, &choice, &space)?;
+    let requests = requests(environment)?;
     #[cfg(test)]
     {
         use std::hash::Hash;

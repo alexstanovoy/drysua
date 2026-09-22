@@ -11,6 +11,13 @@ use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use candle_core::{DType, Device, Tensor, Var};
 
+mod host_folding;
+#[cfg(all(test, feature = "builtin"))]
+pub(crate) use host_folding::resolved_host_math_workers;
+
+#[cfg(feature = "builtin")]
+mod continue_sampling;
+
 #[cfg(test)]
 #[path = "tests/model_test_support.rs"]
 mod test_support;
@@ -1622,7 +1629,18 @@ impl PolicyModel {
     ) -> Result<Vec<BatchSelection>, ModelError> {
         let state = self.forward_frames(frames)?;
         let base = self.sampling_base_logits(&state)?;
-        let mut rows = initialize_sampling_rows(&base, action_spaces, &mut rngs)?;
+        let rows = initialize_sampling_rows(&base, action_spaces, &mut rngs)?;
+        self.finish_selection_stages_locked(state, base, rows, action_spaces, rngs)
+    }
+
+    fn finish_selection_stages_locked(
+        &self,
+        state: ForwardState,
+        base: SamplingBaseLogits,
+        mut rows: Vec<SamplingRow>,
+        action_spaces: &[ActionSpace],
+        mut rngs: Option<&mut [PpoRng]>,
+    ) -> Result<Vec<BatchSelection>, ModelError> {
         let kind = self.sampling_kind_logits(&state, &sampling_prefixes(&rows))?;
         select_sampling_units(&mut rows, &kind, action_spaces, &mut rngs)?;
         let unit = self.sampling_unit_logits(&state, &sampling_prefixes(&rows))?;
@@ -1920,22 +1938,61 @@ impl PolicyModel {
         microbatch_size: usize,
         #[cfg(test)] faults: PpoTestFaults,
     ) -> Result<PpoMinibatchReport, ModelError> {
+        self.ppo_update_with_microbatch_and_workers(
+            examples,
+            adam,
+            config,
+            microbatch_size,
+            1,
+            #[cfg(test)]
+            faults,
+        )
+    }
+
+    pub(crate) fn ppo_update_with_execution(
+        &self,
+        examples: &[&PpoPreparedSample],
+        adam: &mut AdamState,
+        config: PpoConfig,
+        execution: crate::TrainingExecutionOptions,
+    ) -> Result<PpoMinibatchReport, ModelError> {
+        if execution.host_math_workers == 1 {
+            return self.ppo_update(examples, adam, config);
+        }
+        self.ppo_update_with_microbatch_and_workers(
+            examples,
+            adam,
+            config,
+            MODEL_TRAINING_BATCH,
+            execution.host_math_workers,
+            #[cfg(test)]
+            PpoTestFaults::default(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn ppo_update_with_microbatch_and_workers(
+        &self,
+        examples: &[&PpoPreparedSample],
+        adam: &mut AdamState,
+        config: PpoConfig,
+        microbatch_size: usize,
+        requested_workers: usize,
+        #[cfg(test)] faults: PpoTestFaults,
+    ) -> Result<PpoMinibatchReport, ModelError> {
         if examples.is_empty() || examples.len() > MODEL_MAX_BATCH {
             return Err(ModelError::InvalidModelState("PPO minibatch count"));
         }
         if !(1..=MODEL_TRAINING_BATCH).contains(&microbatch_size) {
             return Err(ModelError::InvalidModelState("PPO microbatch size"));
         }
+        if !(1..=32).contains(&requested_workers) {
+            return Err(ModelError::InvalidModelState("host math workers"));
+        }
         let _guard = self.write_parameter_lock()?;
         self.validate_optimizer_binding_locked(adam.binding)?;
-        let mut gradients = vec![0.0f32; MODEL_PARAMETER_COUNT];
-        let mut report = PpoMinibatchReport::default();
-        for microbatch in examples.chunks(microbatch_size) {
-            let mut result = self.ppo_microbatch_locked(microbatch, config)?;
-            scale_gradients(&mut result.gradients, microbatch.len() as f32)?;
-            accumulate_gradients(&mut gradients, &result.gradients)?;
-            accumulate_ppo_report(&mut report, result.report)?;
-        }
+        let (mut gradients, mut report) =
+            host_folding::collect(self, examples, config, microbatch_size, requested_workers)?;
         let divisor = examples.len() as f32;
         for gradient in &mut gradients {
             *gradient /= divisor;
@@ -2045,6 +2102,15 @@ impl PolicyModel {
         examples: &[&PpoPreparedSample],
         config: PpoConfig,
     ) -> Result<PpoMicrobatch, ModelError> {
+        self.ppo_microbatch_readback_locked(examples, config, true)
+    }
+
+    fn ppo_microbatch_readback_locked(
+        &self,
+        examples: &[&PpoPreparedSample],
+        config: PpoConfig,
+        validate: bool,
+    ) -> Result<PpoMicrobatch, ModelError> {
         let frames = examples
             .iter()
             .map(|sample| sample.transition.frame.clone())
@@ -2059,7 +2125,11 @@ impl PolicyModel {
         let (loss, report) = ppo_loss(&output, examples, config)?;
         let named = self.backward_named_locked(&loss)?;
         Ok(PpoMicrobatch {
-            gradients: collect_host_gradients(named)?,
+            gradients: if validate {
+                collect_host_gradients(named)?
+            } else {
+                collect_host_gradients_checked(named, false)?
+            },
             report,
         })
     }
@@ -2991,6 +3061,13 @@ fn append_tensor_target<const WIDTH: usize>(
 }
 
 fn collect_host_gradients(named: Vec<NamedPolicyGradient>) -> Result<Vec<f32>, ModelError> {
+    collect_host_gradients_checked(named, true)
+}
+
+fn collect_host_gradients_checked(
+    named: Vec<NamedPolicyGradient>,
+    validate: bool,
+) -> Result<Vec<f32>, ModelError> {
     validate_gradient_descriptors(&named)?;
     let first = named.iter().find_map(|gradient| gradient.gradient.as_ref());
     if first.is_some_and(|first| {
@@ -3002,7 +3079,11 @@ fn collect_host_gradients(named: Vec<NamedPolicyGradient>) -> Result<Vec<f32>, M
                     tensor.dtype() == DType::F32 && tensor.device().same_device(first.device())
                 })
     }) {
-        return collect_packed_gradients(&named);
+        return if validate {
+            collect_packed_gradients(&named)
+        } else {
+            collect_packed_gradients_checked(&named, false)
+        };
     }
     let mut output = Vec::with_capacity(MODEL_PARAMETER_COUNT);
     let mut total = Some(0usize);
@@ -3046,10 +3127,17 @@ fn collect_host_gradients(named: Vec<NamedPolicyGradient>) -> Result<Vec<f32>, M
     }
     // Shape/dtype errors retain priority even after a bounded total overflows.
     total.ok_or(ModelError::InvalidModelState("gradient parameter count"))?;
-    finish_host_gradients(output)
+    finish_host_gradients(output, validate)
 }
 
 fn collect_packed_gradients(named: &[NamedPolicyGradient]) -> Result<Vec<f32>, ModelError> {
+    collect_packed_gradients_checked(named, true)
+}
+
+fn collect_packed_gradients_checked(
+    named: &[NamedPolicyGradient],
+    validate: bool,
+) -> Result<Vec<f32>, ModelError> {
     validate_gradient_descriptors(named)?;
     let mut tensors = Vec::with_capacity(named.len());
     let mut ranges = Vec::with_capacity(named.len());
@@ -3103,7 +3191,7 @@ fn collect_packed_gradients(named: &[NamedPolicyGradient]) -> Result<Vec<f32>, M
         }
         assert_eq!(offset, present);
     }
-    finish_host_gradients(output)
+    finish_host_gradients(output, validate)
 }
 
 fn validate_gradient_descriptors(named: &[NamedPolicyGradient]) -> Result<(), ModelError> {
@@ -3130,11 +3218,13 @@ fn gradient_buffer_end(offset: usize, count: usize) -> Option<usize> {
         .filter(|end| *end <= MODEL_PARAMETER_COUNT)
 }
 
-fn finish_host_gradients(output: Vec<f32>) -> Result<Vec<f32>, ModelError> {
+fn finish_host_gradients(output: Vec<f32>, validate: bool) -> Result<Vec<f32>, ModelError> {
     if output.len() != MODEL_PARAMETER_COUNT {
         return Err(ModelError::InvalidModelState("gradient parameter count"));
     }
-    validate_gradients(&output)?;
+    if validate {
+        validate_gradients(&output)?;
+    }
     Ok(output)
 }
 

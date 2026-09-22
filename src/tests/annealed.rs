@@ -13,6 +13,8 @@ use crate::randomization::{AnnealSchedule, RANDOMIZATION_DIRECTORY, draw_generat
 
 #[path = "annealed_capacity.rs"]
 mod capacity_tests;
+#[path = "training_concurrency.rs"]
+mod concurrency_tests;
 #[path = "annealed_invocation.rs"]
 mod invocation_tests;
 
@@ -70,6 +72,7 @@ fn test_directory(name: &str) -> PathBuf {
 
 fn settings(seed: u64, updates: u64) -> AnnealedJobConfig {
     AnnealedJobConfig {
+        execution: crate::TrainingExecutionOptions::default(),
         updates,
         invocation_updates: None,
         games_per_update: 2,

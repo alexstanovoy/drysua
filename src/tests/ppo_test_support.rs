@@ -40,6 +40,19 @@ impl PpoTrainer {
 
 impl PpoBatch {
     #[cfg(test)]
+    pub(crate) fn corrupt_prefetch_frame_for_test(&mut self, index: usize) {
+        self.samples[index]
+            .transition
+            .frame
+            .corrupt_unit_offset_for_test();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reject_prefetch_minibatch_for_test(&mut self, index: usize) {
+        self.samples[index].transition.old_log_probability = -5.0;
+    }
+
+    #[cfg(test)]
     pub(crate) fn replace_advantage_for_test(&mut self, index: usize, value: f32) -> f32 {
         std::mem::replace(&mut self.samples[index].advantage, value)
     }

@@ -176,16 +176,21 @@ two interleaved repeats per cell, games/hour from update wall):
 The same binary with the CPU learner at E16 moved one update from 191.4 s to
 101.4 s (collection 155.8 s to 66.1 s): 301 to 568 games/hour end-to-end.
 
-Read the device split plainly: on a CPU learner the batched forward and sampler
-are the dominant serial fraction, so overlapping group forwards with other
-groups' stepping collapses the barrier (phase accounting in the session report
-shows forward work rising in total but the wall falling). On the CUDA learner
-the forward is already cheap, and concurrent group forwards serialize on the
-device with per-call overhead that grows as the batch shrinks, so groups lose
-there. Use groups for CPU-learner runs; keep the default one-group contract for
-CUDA-learner runs until the CUDA sampler path is measured independently.
+The CPU measurements support overlapping group forwards with other groups'
+stepping: total forward work rises while wall time falls. On CUDA, the grouped
+runs above were slower, but those results do not establish that all forwards
+serialize on the device. Source inspection of the installed Candle 0.11.0 and
+cudarc 0.19.9 shows a per-thread default CUDA stream. Distinct callers can submit
+work eligible for overlap even when sharing the Rust device object; native cuBLAS
+handle contention and actual kernel concurrency still require a timeline.
+Smaller GEMMs, extra launches, copies and host coordination are possible costs,
+not an isolated measured cause. Keep the default one-group contract for CUDA
+until a different schedule demonstrates an end-to-end improvement.
 Within a mode, repeats are byte-identical; only the interleaving of concurrent
 episode log lines differs between groups.
+
+Bounded overlap candidates that do not simply repeat the grouped experiment are
+described in [training_concurrency.md](training_concurrency.md).
 
 ## Accelerator-transfer experiment
 

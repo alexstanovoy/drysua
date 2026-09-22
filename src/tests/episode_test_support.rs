@@ -1,5 +1,21 @@
 use super::*;
 
+pub(super) fn emit_concurrency_probe_counts(streams: &[EpisodeStream], overlap: bool) {
+    if std::env::var_os("DRYSUA_PROBE_MODE").is_none() {
+        return;
+    }
+    assert!(streams.len() <= crate::PPO_ANNEALED_MAX_GAMES);
+    let decisions = streams.iter().map(|stream| stream.decisions).sum::<usize>();
+    let continues = streams
+        .iter()
+        .map(|stream| stream.actions[ActionKind::Continue.index()] as usize)
+        .sum::<usize>();
+    eprintln!(
+        "concurrency-actor overlap={overlap} worlds={} decisions={decisions} continues={continues}",
+        streams.len()
+    );
+}
+
 #[cfg(test)]
 fn validate_time_cost(budget: f32) -> Result<(), PpoError> {
     if !budget.is_finite() || !(0.0..=0.25).contains(&budget) {

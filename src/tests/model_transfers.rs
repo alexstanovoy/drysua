@@ -1,5 +1,8 @@
 use super::*;
 
+#[path = "model_concurrency.rs"]
+mod concurrency_tests;
+
 #[test]
 fn packed_gradients_preserve_descriptor_order_missing_spans_and_float_bits() {
     assert_gradient_parity(&Device::Cpu);

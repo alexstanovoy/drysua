@@ -72,6 +72,8 @@ pub enum AnnealedOpponent {
 /// Bounded, resumable annealed-loop settings.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AnnealedJobConfig {
+    /// Experimental execution choices, bound to command scope rather than PPO codecs.
+    pub execution: crate::TrainingExecutionOptions,
     /// Total updates in the run.
     pub updates: u64,
     /// Games per update, even from 2 to 40 so sides split exactly.
@@ -113,6 +115,8 @@ pub struct AnnealedJobConfig {
 /// shortens it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct AnnealedHarness {
+    #[cfg(test)]
+    pub(crate) fail_actor_after_dispatch: bool,
     /// Decisions per episode; `None` runs the production ceiling.
     pub(crate) episode_decisions: Option<usize>,
     /// Stop after this many completed updates in one invocation.
@@ -330,7 +334,7 @@ impl AnnealedSession {
             TrainingArtifact::load_runtime_weights(&model, initial_weights_directory)
                 .map_err(text_error)?;
         }
-        let (trainer, sampling, completed_updates, rollout_samples, generations) = if resume {
+        let (mut trainer, sampling, completed_updates, rollout_samples, generations) = if resume {
             let parts = restore_strict_session(&model, directory, &run, config)?;
             std::fs::metadata(random_directory).map_err(|_| {
                 PpoError::InvalidConfig("domain randomization snapshots are missing on resume")
@@ -361,6 +365,7 @@ impl AnnealedSession {
             let sampling = PpoRng::new(settings.seed ^ SAMPLING_SALT);
             (trainer, sampling, 0, 0, 0)
         };
+        trainer.set_execution(settings.execution)?;
         let starting_policy_fingerprint = PolicySnapshot::capture(&model, completed_updates)
             .map_err(text_error)?
             .fingerprint();
@@ -553,7 +558,7 @@ impl AnnealedSession {
             .map(|offset| episode::game_stream(settings.seed, global_game + offset as u64))
             .collect::<Result<Vec<_>, _>>()?;
         let mut random = actor_stream_rngs(&mut self.sampling, batch_len)?;
-        episode::collect_batch(
+        episode::collect_batch_with_execution(
             &self.model,
             config,
             local,
@@ -564,6 +569,9 @@ impl AnnealedSession {
             harness.episode_decisions(),
             rollout,
             report,
+            settings.execution,
+            #[cfg(test)]
+            harness.fail_actor_after_dispatch,
         )?;
         for environment in &environments {
             reject_production_rejection(environment, "annealed collection")?;
@@ -921,6 +929,7 @@ fn annealed_run(
             config.entropy_coefficient
         ));
     }
+    settings.execution.append_scope(&mut command_line);
     Ok(CheckpointRun {
         mastery_config: None,
         git_commit: settings.git_commit.clone(),
@@ -941,6 +950,14 @@ fn validate_annealed(
     settings: &AnnealedJobConfig,
     harness: AnnealedHarness,
 ) -> Result<PpoConfig, PpoError> {
+    settings.execution.validate()?;
+    if settings.execution.actor_overlap == crate::ActorOverlap::ContinueV1
+        && !matches!(settings.opponent, AnnealedOpponent::Teacher)
+    {
+        return Err(PpoError::InvalidConfig(
+            "Continue overlap requires a scripted opponent",
+        ));
+    }
     if settings.updates == 0 || settings.updates > MAX_TRAINING_COUNTER {
         return Err(PpoError::InvalidConfig("annealed updates"));
     }

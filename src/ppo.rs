@@ -6,6 +6,9 @@
 use std::error::Error;
 use std::fmt;
 
+mod prefetch;
+pub use prefetch::PPO_PREFETCH_STORAGE_PEAK_BYTES;
+
 use crate::{
     ACTION_SCHEMA_HASH, ACTION_SCHEMA_VERSION, AdamConfig, AdamState, BehavioralTarget,
     FEATURE_SCHEMA_HASH, FEATURE_SCHEMA_VERSION, FeatureFrame, GlobalSummary, MODEL_MAX_BATCH,
@@ -834,6 +837,7 @@ pub struct PpoUpdateReport {
 
 /// Exclusive PPO optimizer owner with deterministic bounded shuffling.
 pub struct PpoTrainer {
+    execution: crate::TrainingExecutionOptions,
     config: PpoConfig,
     adam: AdamState,
     shuffle: PpoRng,
@@ -851,11 +855,21 @@ impl PpoTrainer {
             adam,
             shuffle: PpoRng::new(seed),
             updates: 0,
+            execution: crate::TrainingExecutionOptions::default(),
         })
     }
 
     pub const fn config(&self) -> PpoConfig {
         self.config
+    }
+
+    /// Reapply operational choices after strict checkpoint restoration.
+    pub fn set_execution(
+        &mut self,
+        execution: crate::TrainingExecutionOptions,
+    ) -> Result<(), PpoError> {
+        self.execution = execution.validate()?;
+        Ok(())
     }
 
     pub const fn optimizer_step(&self) -> u64 {
@@ -897,6 +911,7 @@ impl PpoTrainer {
             adam,
             shuffle: PpoRng::from_checkpoint(shuffle.0, shuffle.1)?,
             updates,
+            execution: crate::TrainingExecutionOptions::default(),
         })
     }
 
@@ -1004,6 +1019,9 @@ impl PpoTrainer {
         model: &PolicyModel,
         batch: &PpoBatch,
     ) -> Result<PpoUpdateReport, PpoError> {
+        if self.execution.learner_prefetch {
+            return self.train_update_prefetched(model, batch);
+        }
         let mut aggregate = PpoUpdateReport::default();
         let mut order = (0..batch.samples.len()).collect::<Vec<_>>();
         'epochs: for epoch in 0..self.config.epochs {
@@ -1012,7 +1030,12 @@ impl PpoTrainer {
                 let samples = batch.materialize(indices)?;
                 let references = samples.iter().collect::<Vec<_>>();
                 let report = model
-                    .ppo_update(&references, &mut self.adam, self.config)
+                    .ppo_update_with_execution(
+                        &references,
+                        &mut self.adam,
+                        self.config,
+                        self.execution,
+                    )
                     .map_err(|error| PpoError::Model(error.to_string()))?;
                 if !report.applied {
                     aggregate.stopped_for_kl = true;
