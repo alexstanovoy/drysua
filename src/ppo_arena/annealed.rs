@@ -21,17 +21,16 @@ use bota_server::game::{
 
 use super::episode::{self, ACTOR_DECISIONS};
 use super::{
-    OpponentSpec, SessionCheckpoint, SmokeCounters, TRAINING_MAX_ENVIRONMENTS,
-    TrainingCheckpointSchedule, TrainingDirectoryLock, TrainingEnvironment, actor_stream_rngs,
-    build_environment_with_spawn_modifiers, device_name, reject_production_rejection,
-    restore_strict_session, save_training_artifact, text_error, training_checkpoint_report,
+    OpponentSpec, ResumeProvenance, TRAINING_MAX_ENVIRONMENTS, TrainingCheckpointSchedule,
+    TrainingDirectoryLock, TrainingEnvironment, TrainingSession, actor_stream_rngs,
+    build_environment_with_spawn_modifiers, device_name, reject_production_rejection, text_error,
     validate_checkpoint_cadence, validate_initial_weights_directory, validate_training_directory,
 };
 use crate::randomization::{
     AnnealSchedule, GenerationDraw, RANDOMIZATION_DIRECTORY, derive_training_seed, draw_generation,
     verify_generation_snapshots, write_generation_snapshot,
 };
-use crate::telemetry::prometheus::{self, TrainingMetricsStart};
+use crate::telemetry::prometheus;
 use crate::telemetry::{
     FlushPerformanceLogs, TrainingStage, TrainingTimingScope, TrainingUpdateMode,
     TrainingUpdateTimer, time_training_scope,
@@ -41,8 +40,8 @@ use crate::{
     MAP2_REWARD_GAMMA_TICK, MAX_TRAINING_COUNTER, MODEL_MAX_OPTIMIZER_STEP, PPO_ANNEALED_MAX_GAMES,
     PPO_ANNEALED_MAX_SAMPLES, PPO_MAX_POLICY_SAMPLE_DRAWS, PPO_RULES_AUDIT_VERSION, PolicyDevice,
     PolicyModel, PolicySnapshot, PpoConfig, PpoError, PpoRng, PpoRollout, PpoSampleBudget,
-    PpoSmokeReport, PpoTrainer, PpoUpdateReport, SHADOW_FIEND, TrainingArtifact,
-    TrainingCheckpointReport, compiled_features,
+    PpoSmokeReport, PpoUpdateReport, SHADOW_FIEND, TrainingArtifact, TrainingCheckpointReport,
+    compiled_features,
 };
 
 // Sequential games share one rollout without raising the concurrent world cap.
@@ -52,10 +51,6 @@ const _: () = assert!(ACTOR_DECISIONS as u64 * PPO_MAX_POLICY_SAMPLE_DRAWS <= MA
 
 /// Domain separating the per-update balanced side shuffle.
 const SEAT_DOMAIN: u64 = 0x7365_6174_5f62_616c;
-/// Trainer seed mixing, matching the production training job.
-const TRAINER_SALT: u64 = 0x51a9;
-/// Actor sampling seed mixing, matching the production training job.
-const SAMPLING_SALT: u64 = 0xa17e;
 
 /// Decisions one production annealed episode runs: the full Map2 ceiling.
 pub(crate) const ANNEALED_EPISODE_DECISIONS: usize = ACTOR_DECISIONS;
@@ -115,8 +110,6 @@ pub struct AnnealedJobConfig {
 /// shortens it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct AnnealedHarness {
-    #[cfg(test)]
-    pub(crate) fail_actor_after_dispatch: bool,
     /// Decisions per episode; `None` runs the production ceiling.
     pub(crate) episode_decisions: Option<usize>,
     /// Stop after this many completed updates in one invocation.
@@ -281,39 +274,23 @@ where
                 opponent.runtime,
             )
         })?;
-    prometheus::begin_training(
-        &session.run,
-        config,
+    session.state.begin_metrics(
         directory,
         resume,
-        TrainingMetricsStart {
-            completed_updates: session.completed_updates,
-            samples: session.rollout_samples,
-            optimizer_steps: session.trainer.optimizer_step(),
-            updates_target: settings.updates,
-            parallel: settings.parallel_worlds,
-            games_per_update: settings.games_per_update,
-        },
-    )
-    .map_err(text_error)?;
+        settings.updates,
+        settings.parallel_worlds,
+        settings.games_per_update,
+    )?;
     session.run_updates(&settings, harness, config, directory, &mut checkpointed)?;
     Ok(session.report())
 }
 
 struct AnnealedSession {
-    model: PolicyModel,
-    trainer: PpoTrainer,
-    sampling: PpoRng,
+    state: TrainingSession,
     opponent: AnnealedOpponentRuntime,
-    run: CheckpointRun,
     random_directory: PathBuf,
     generations: u64,
-    starting_policy_fingerprint: u64,
-    completed_updates: u64,
-    rollout_samples: u64,
     games: u64,
-    latest: PpoUpdateReport,
-    counters: SmokeCounters,
 }
 
 impl AnnealedSession {
@@ -329,63 +306,42 @@ impl AnnealedSession {
         random_directory: &Path,
         opponent: AnnealedOpponentRuntime,
     ) -> Result<Self, PpoError> {
-        let model = PolicyModel::fresh_on(settings.seed, device).map_err(text_error)?;
-        if !resume && let Some(initial_weights_directory) = initial_weights_directory {
-            TrainingArtifact::load_runtime_weights(&model, initial_weights_directory)
-                .map_err(text_error)?;
-        }
-        let (mut trainer, sampling, completed_updates, rollout_samples, generations) = if resume {
-            let parts = restore_strict_session(&model, directory, &run, config)?;
+        let mut state = TrainingSession::initialize(
+            device,
+            directory,
+            resume,
+            initial_weights_directory,
+            config,
+            run,
+            ResumeProvenance::Strict,
+        )?;
+        let games = state
+            .completed_updates
+            .checked_mul(settings.games_per_update as u64)
+            .ok_or(PpoError::CounterOverflow)?;
+        let generations = if resume {
             std::fs::metadata(random_directory).map_err(|_| {
                 PpoError::InvalidConfig("domain randomization snapshots are missing on resume")
             })?;
-            let completed_updates = parts.progress.global_update;
-            let rollout_samples = parts.progress.rollout_samples;
-            let completed_games = completed_updates
-                .checked_mul(settings.games_per_update as u64)
-                .ok_or(PpoError::CounterOverflow)?;
             let schedule = anneal_schedule(settings);
-            let generations = verify_generation_snapshots(
+            verify_generation_snapshots(
                 random_directory,
                 settings.seed,
                 settings.games_per_generation,
                 settings.games_per_update as u64,
                 schedule,
-                completed_games,
-            )?;
-            (
-                parts.trainer,
-                parts.sampling,
-                completed_updates,
-                rollout_samples,
-                generations,
-            )
+                games,
+            )?
         } else {
-            let trainer = PpoTrainer::new(&model, config, settings.seed ^ TRAINER_SALT)?;
-            let sampling = PpoRng::new(settings.seed ^ SAMPLING_SALT);
-            (trainer, sampling, 0, 0, 0)
+            0
         };
-        trainer.set_execution(settings.execution)?;
-        let starting_policy_fingerprint = PolicySnapshot::capture(&model, completed_updates)
-            .map_err(text_error)?
-            .fingerprint();
-        let games = completed_updates
-            .checked_mul(settings.games_per_update as u64)
-            .ok_or(PpoError::CounterOverflow)?;
+        state.trainer.set_execution(settings.execution)?;
         Ok(Self {
-            model,
-            trainer,
-            sampling,
+            state,
             opponent,
-            run,
             random_directory: random_directory.to_path_buf(),
             generations,
-            starting_policy_fingerprint,
-            completed_updates,
-            rollout_samples,
             games,
-            latest: PpoUpdateReport::default(),
-            counters: SmokeCounters::default(),
         })
     }
 
@@ -399,6 +355,7 @@ impl AnnealedSession {
     ) -> Result<(), PpoError> {
         let invocation_target = match settings.invocation_updates {
             Some(limit) => self
+                .state
                 .completed_updates
                 .checked_add(limit.get())
                 .ok_or(PpoError::CounterOverflow)?
@@ -416,21 +373,21 @@ impl AnnealedSession {
             anneal,
             self.generations,
         );
-        while self.completed_updates < invocation_target {
+        while self.state.completed_updates < invocation_target {
             self.train_update(settings, harness, config, &mut generations)?;
-            let final_update = self.completed_updates == invocation_target;
-            if schedule.is_due(self.completed_updates, started.elapsed()) || final_update {
-                let report = self.checkpoint_report(None);
-                let durable =
-                    crate::telemetry::time_training_checkpoint(self.completed_updates, || {
-                        self.save(directory, report)
-                    })?;
+            let final_update = self.state.completed_updates == invocation_target;
+            if schedule.is_due(self.state.completed_updates, started.elapsed()) || final_update {
+                let report = self.state.checkpoint_report(None);
+                let durable = crate::telemetry::time_training_checkpoint(
+                    self.state.completed_updates,
+                    || self.state.save(directory, report),
+                )?;
                 checkpointed(durable);
                 schedule.mark_committed(started.elapsed())?;
             }
             if harness
                 .stop_after
-                .is_some_and(|stop| self.completed_updates >= stop)
+                .is_some_and(|stop| self.state.completed_updates >= stop)
             {
                 break;
             }
@@ -447,14 +404,14 @@ impl AnnealedSession {
         generations: &mut GenerationCache,
     ) -> Result<(), PpoError> {
         let mut timing = TrainingUpdateTimer::new(
-            self.completed_updates,
+            self.state.completed_updates,
             TrainingUpdateMode::Annealed,
-            self.trainer.optimizer_step(),
+            self.state.trainer.optimizer_step(),
         );
         let result = self.train_update_timed(settings, harness, config, generations, &mut timing);
         timing.observe_result(result)?;
-        let observed =
-            prometheus::observe_training_update(&self.checkpoint_report(None)).map_err(text_error);
+        let observed = prometheus::observe_training_update(&self.state.checkpoint_report(None))
+            .map_err(text_error);
         timing.observe_result(observed)?;
         timing.complete();
         Ok(())
@@ -468,9 +425,9 @@ impl AnnealedSession {
         generations: &mut GenerationCache,
         timing: &mut TrainingUpdateTimer,
     ) -> Result<(), PpoError> {
-        let update = self.completed_updates;
+        let update = self.state.completed_updates;
         let games = settings.games_per_update;
-        let policy_identity = self.model.policy_identity().map_err(text_error)?;
+        let policy_identity = self.state.model.policy_identity().map_err(text_error)?;
         let mut rollout = PpoRollout::for_config(config, policy_identity)?;
         let mut report = PpoSmokeReport::default();
         let seats = balanced_policy_seats(settings.seed, update, games)?;
@@ -504,16 +461,17 @@ impl AnnealedSession {
         timing.enter(TrainingStage::BatchPreparation);
         let batch = rollout.finish(config)?;
         timing.enter(TrainingStage::Optimization);
-        let optimized = self.trainer.train_update(&self.model, &batch);
-        timing.set_optimizer_step(self.trainer.optimizer_step());
-        self.latest = optimized?;
+        let optimized = self.state.trainer.train_update(&self.state.model, &batch);
+        timing.set_optimizer_step(self.state.trainer.optimizer_step());
+        self.state.latest = optimized?;
         timing.enter(TrainingStage::Finalization);
-        self.completed_updates = self.trainer.updates();
-        self.rollout_samples = self
+        self.state.completed_updates = self.state.trainer.updates();
+        self.state.rollout_samples = self
+            .state
             .rollout_samples
             .checked_add(samples as u64)
             .ok_or(PpoError::CounterOverflow)?;
-        self.counters.merge(&report)?;
+        self.state.counters.merge(&report)?;
         Ok(())
     }
 
@@ -530,6 +488,7 @@ impl AnnealedSession {
         report: &mut PpoSmokeReport,
     ) -> Result<(), PpoError> {
         let global_game = self
+            .state
             .completed_updates
             .checked_mul(settings.games_per_update as u64)
             .and_then(|base| base.checked_add(local as u64))
@@ -557,9 +516,9 @@ impl AnnealedSession {
         let mut streams = (0..batch_len)
             .map(|offset| episode::game_stream(settings.seed, global_game + offset as u64))
             .collect::<Result<Vec<_>, _>>()?;
-        let mut random = actor_stream_rngs(&mut self.sampling, batch_len)?;
-        episode::collect_batch_with_execution(
-            &self.model,
+        let mut random = actor_stream_rngs(&mut self.state.sampling, batch_len)?;
+        episode::collect_batch(
+            &self.state.model,
             config,
             local,
             "annealed",
@@ -569,9 +528,6 @@ impl AnnealedSession {
             harness.episode_decisions(),
             rollout,
             report,
-            settings.execution,
-            #[cfg(test)]
-            harness.fail_actor_after_dispatch,
         )?;
         for environment in &environments {
             reject_production_rejection(environment, "annealed collection")?;
@@ -579,52 +535,22 @@ impl AnnealedSession {
         Ok(())
     }
 
-    fn save(
-        &self,
-        directory: &Path,
-        report: TrainingCheckpointReport,
-    ) -> Result<TrainingCheckpointReport, PpoError> {
-        save_training_artifact(
-            SessionCheckpoint {
-                model: &self.model,
-                trainer: &self.trainer,
-                run: &self.run,
-                sampling: &self.sampling,
-                completed_updates: self.completed_updates,
-                rollout_samples: self.rollout_samples,
-                mastery: None,
-            },
-            directory,
-            report,
-        )
-    }
-
-    fn checkpoint_report(&self, cleanup_warning: Option<String>) -> TrainingCheckpointReport {
-        training_checkpoint_report(
-            &self.counters,
-            self.completed_updates,
-            self.trainer.optimizer_step(),
-            self.rollout_samples,
-            self.latest,
-            cleanup_warning,
-        )
-    }
-
     fn report(&self) -> AnnealedJobReport {
+        let state = &self.state;
         AnnealedJobReport {
-            starting_policy_fingerprint: self.starting_policy_fingerprint,
-            completed_updates: self.completed_updates,
-            optimizer_step: self.trainer.optimizer_step(),
-            rollout_samples: self.rollout_samples,
+            starting_policy_fingerprint: state.starting_policy_fingerprint,
+            completed_updates: state.completed_updates,
+            optimizer_step: state.trainer.optimizer_step(),
+            rollout_samples: state.rollout_samples,
             games: self.games,
             generations: self.generations,
-            map2_reward: self.counters.map2_reward,
-            episode_timeouts: self.counters.episode_timeouts,
-            terminal_wins: self.counters.terminal_wins,
-            terminal_losses: self.counters.terminal_losses,
-            terminal_draws: self.counters.terminal_draws,
-            elapsed_ticks: self.counters.elapsed_ticks,
-            latest: self.latest,
+            map2_reward: state.counters.map2_reward,
+            episode_timeouts: state.counters.episode_timeouts,
+            terminal_wins: state.counters.terminal_wins,
+            terminal_losses: state.counters.terminal_losses,
+            terminal_draws: state.counters.terminal_draws,
+            elapsed_ticks: state.counters.elapsed_ticks,
+            latest: state.latest,
         }
     }
 }
@@ -951,13 +877,6 @@ fn validate_annealed(
     harness: AnnealedHarness,
 ) -> Result<PpoConfig, PpoError> {
     settings.execution.validate()?;
-    if settings.execution.actor_overlap == crate::ActorOverlap::ContinueV1
-        && !matches!(settings.opponent, AnnealedOpponent::Teacher)
-    {
-        return Err(PpoError::InvalidConfig(
-            "Continue overlap requires a scripted opponent",
-        ));
-    }
     if settings.updates == 0 || settings.updates > MAX_TRAINING_COUNTER {
         return Err(PpoError::InvalidConfig("annealed updates"));
     }

@@ -45,6 +45,7 @@ impl CompletedTrainingEpisodes {
     /// the same stream set as one global batch; ordering inside the ordered
     /// outcome view is derived from the recorded ticks and streams.
     #[cfg(any(feature = "builtin", test))]
+    #[cfg(feature = "builtin")]
     pub(crate) fn merge(&mut self, other: &Self) -> Result<(), PpoError> {
         for (stream, entry) in other.entries.iter().enumerate() {
             let Some((tick, recorded_stream, outcome)) = entry else {

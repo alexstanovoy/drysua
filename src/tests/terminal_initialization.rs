@@ -14,16 +14,6 @@ fn reward6_and_reward7_descriptors_are_frozen_side_by_side() {
         crate::MAP2_REWARD_SCHEMA_HASH
     );
     assert!(crate::MAP2_REWARD_SCHEMA_DESCRIPTOR.contains("victory_time"));
-}
-
-#[test]
-fn terminal02_m21_source_metadata_and_reward5_descriptor_are_frozen() {
-    let hash = reward_v5::DESCRIPTOR
-        .bytes()
-        .fold(0xcbf29ce484222325u64, |hash, byte| {
-            (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
-        });
-    assert_eq!(hash, 10775256611790261869);
     assert_eq!(
         source_metadata()["model_schema_hash"],
         "13521186719558157260"

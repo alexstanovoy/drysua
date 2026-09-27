@@ -119,6 +119,10 @@ struct TrainArgs {
 struct TrainFullArgs {
     #[command(flatten)]
     metrics: crate::telemetry::prometheus::MetricsOptions,
+    #[command(flatten)]
+    optimizer: OptimizerArgs,
+    #[command(flatten)]
+    checkpoint: CheckpointArgs,
     /// Separate episode time cost; Map2 comprehensive reward requires zero.
     #[arg(long, default_value_t = 0.0)]
     episode_time_cost: f32,
@@ -143,18 +147,9 @@ struct TrainFullArgs {
     /// Per-opponent mastery override, e.g. weak=90 or teacher=80; no duplicates.
     #[arg(long)]
     opponent_win_percent: Vec<crate::OpponentWinPercent>,
-    /// Adam learning rate; must be finite and positive.
-    #[arg(long, default_value_t = crate::PpoConfig::default().learning_rate)]
-    learning_rate: f32,
     /// Discount per simulator tick; Map2 comprehensive reward requires exactly one.
     #[arg(long, default_value_t = crate::MAP2_REWARD_GAMMA_TICK)]
     gamma_per_tick: f32,
-    /// Generalized advantage trace decay in [0, 1]; one uses full discounted Monte Carlo returns.
-    #[arg(long, default_value_t = crate::PpoConfig::default().gae_lambda)]
-    gae_lambda: f32,
-    /// Entropy bonus coefficient; must be finite and positive.
-    #[arg(long, default_value_t = crate::PpoConfig::default().entropy_coefficient)]
-    entropy_coefficient: f32,
     /// Total PPO update target, including updates restored from a checkpoint.
     #[arg(long)]
     updates: u64,
@@ -165,24 +160,6 @@ struct TrainFullArgs {
     #[arg(long, default_value_t = 2_048,
         help = format!("Window decisions or per-episode retained capacity (at least {}), at most {}", crate::MAP2_RETAINED_DECISIONS, crate::PPO_MAX_ROLLOUT_DECISIONS))]
     rollout: usize,
-    /// PPO passes over one rollout.
-    #[arg(long, default_value_t = 4)]
-    epochs: usize,
-    /// Effective Adam minibatch.
-    #[arg(long, default_value_t = 2_048)]
-    minibatch: usize,
-    /// Monotonic wall-clock seconds between durable checkpoints.
-    #[arg(long, default_value_t = 300)]
-    checkpoint_seconds: u64,
-    /// Existing empty directory for a fresh run, or checkpoint directory when resuming.
-    #[arg(long)]
-    checkpoint_directory: std::path::PathBuf,
-    /// Runtime weights directory loaded before the first update of a fresh run.
-    #[arg(long, conflicts_with = "resume")]
-    initial_weights: Option<std::path::PathBuf>,
-    /// Resume strict model, optimizer, counters, pipeline generation, and actor RNG state.
-    #[arg(long, default_value_t = false)]
-    resume: bool,
     /// Rebind an otherwise identical checkpoint to this build's Git provenance once.
     #[arg(long, default_value_t = false, requires = "resume")]
     migrate_provenance: bool,
@@ -219,12 +196,10 @@ enum AnnealedOpponentArg {
 struct TrainAnnealedArgs {
     #[command(flatten)]
     metrics: crate::telemetry::prometheus::MetricsOptions,
-    /// Experimental scripted-opponent actor overlap; checkpoint-scope bound.
-    #[arg(long, value_enum, default_value_t = crate::ActorOverlap::Off)]
-    actor_overlap: crate::ActorOverlap,
-    /// Prefetch one effective learner minibatch on a bounded CPU worker.
-    #[arg(long)]
-    learner_prefetch: bool,
+    #[command(flatten)]
+    optimizer: OptimizerArgs,
+    #[command(flatten)]
+    checkpoint: CheckpointArgs,
     /// Local gradient-fold worker ceiling (1 is the historical serial path).
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=32))]
     host_math_workers: u8,
@@ -256,33 +231,6 @@ struct TrainAnnealedArgs {
     /// Strict runtime weights directory for a frozen weights opponent.
     #[arg(long)]
     opponent_weights: Option<std::path::PathBuf>,
-    /// Adam learning rate; must be finite and positive.
-    #[arg(long, default_value_t = crate::PpoConfig::default().learning_rate)]
-    learning_rate: f32,
-    /// PPO passes over one update's rollout.
-    #[arg(long, default_value_t = crate::PpoConfig::default().epochs)]
-    epochs: usize,
-    /// Effective Adam minibatch.
-    #[arg(long, default_value_t = crate::PpoConfig::default().minibatch)]
-    minibatch: usize,
-    /// Generalized advantage trace decay in [0, 1].
-    #[arg(long, default_value_t = crate::PpoConfig::default().gae_lambda)]
-    gae_lambda: f32,
-    /// Entropy bonus coefficient; must be finite and positive.
-    #[arg(long, default_value_t = crate::PpoConfig::default().entropy_coefficient)]
-    entropy_coefficient: f32,
-    /// Monotonic wall-clock seconds between durable checkpoints.
-    #[arg(long, default_value_t = 300)]
-    checkpoint_seconds: u64,
-    /// Existing empty directory for a fresh run, or checkpoint directory when resuming.
-    #[arg(long)]
-    checkpoint_directory: std::path::PathBuf,
-    /// Runtime weights directory loaded before the first update of a fresh run.
-    #[arg(long, conflicts_with = "resume")]
-    initial_weights: Option<std::path::PathBuf>,
-    /// Resume strict model, optimizer, counters, RNG state and generation snapshots.
-    #[arg(long, default_value_t = false)]
-    resume: bool,
     /// Deterministic run seed.
     #[arg(long, default_value_t = 9_001)]
     seed: u64,
@@ -292,6 +240,43 @@ struct TrainAnnealedArgs {
     /// CUDA or Metal device ordinal.
     #[arg(long, default_value_t = 0)]
     device_ordinal: usize,
+}
+
+/// Shared optimizer controls for resumable training commands.
+#[derive(Args)]
+struct OptimizerArgs {
+    /// Adam learning rate; must be finite and positive.
+    #[arg(long, default_value_t = crate::PpoConfig::default().learning_rate)]
+    learning_rate: f32,
+    /// PPO passes over one rollout.
+    #[arg(long, default_value_t = crate::PpoConfig::default().epochs)]
+    epochs: usize,
+    /// Effective Adam minibatch.
+    #[arg(long, default_value_t = crate::PpoConfig::default().minibatch)]
+    minibatch: usize,
+    /// Generalized advantage trace decay in [0, 1]; one uses full discounted Monte Carlo returns.
+    #[arg(long, default_value_t = crate::PpoConfig::default().gae_lambda)]
+    gae_lambda: f32,
+    /// Entropy bonus coefficient; must be finite and positive.
+    #[arg(long, default_value_t = crate::PpoConfig::default().entropy_coefficient)]
+    entropy_coefficient: f32,
+}
+
+/// Shared persistence controls; neither command can initialize and resume together.
+#[derive(Args)]
+struct CheckpointArgs {
+    /// Monotonic wall-clock seconds between durable checkpoints.
+    #[arg(long, default_value_t = 300)]
+    checkpoint_seconds: u64,
+    /// Existing empty directory for a fresh run, or checkpoint directory when resuming.
+    #[arg(long)]
+    checkpoint_directory: std::path::PathBuf,
+    /// Runtime weights directory loaded before the first update of a fresh run.
+    #[arg(long, conflicts_with = "resume")]
+    initial_weights: Option<std::path::PathBuf>,
+    /// Resume strict model, optimizer, counters, RNG state and collection progress.
+    #[arg(long, default_value_t = false)]
+    resume: bool,
 }
 
 /// Parses command line arguments and plays one match.
@@ -415,17 +400,14 @@ fn run_train_full(arguments: TrainFullArgs) -> std::io::Result<()> {
         embedded_commit("BOTA_GIT_COMMIT", option_env!("BOTA_GIT_COMMIT"))?,
     )?;
     let device = arguments.device.policy_device(arguments.device_ordinal)?;
-    validate_checkpoint_directory(&arguments.checkpoint_directory, arguments.resume)?;
-    arguments
-        .metrics
-        .validate_checkpoint_directory(&arguments.checkpoint_directory)?;
+    arguments.checkpoint.validate(&arguments.metrics)?;
     let metrics = arguments.metrics.start()?;
     let report = crate::run_training_job_on_with_initial_weights(
         settings,
         device,
-        &arguments.checkpoint_directory,
-        arguments.resume,
-        arguments.initial_weights.as_deref(),
+        &arguments.checkpoint.checkpoint_directory,
+        arguments.checkpoint.resume,
+        arguments.checkpoint.initial_weights.as_deref(),
         report_training_checkpoint,
     )
     .map_err(std::io::Error::other)?;
@@ -464,10 +446,7 @@ fn run_train_annealed(arguments: TrainAnnealedArgs) -> std::io::Result<()> {
         embedded_commit("BOTA_GIT_COMMIT", option_env!("BOTA_GIT_COMMIT"))?,
     )?;
     let device = arguments.device.policy_device(arguments.device_ordinal)?;
-    validate_checkpoint_directory(&arguments.checkpoint_directory, arguments.resume)?;
-    arguments
-        .metrics
-        .validate_checkpoint_directory(&arguments.checkpoint_directory)?;
+    arguments.checkpoint.validate(&arguments.metrics)?;
     let metrics = arguments.metrics.start()?;
     eprintln!(
         "annealed: updates={} games={} parallel={} generation_games={} zero_updates={} seed={} opponent={:?}",
@@ -482,9 +461,9 @@ fn run_train_annealed(arguments: TrainAnnealedArgs) -> std::io::Result<()> {
     let report = crate::run_annealed_job_on_with_initial_weights(
         settings,
         device,
-        &arguments.checkpoint_directory,
-        arguments.resume,
-        arguments.initial_weights.as_deref(),
+        &arguments.checkpoint.checkpoint_directory,
+        arguments.checkpoint.resume,
+        arguments.checkpoint.initial_weights.as_deref(),
         report_training_checkpoint,
     )
     .map_err(std::io::Error::other)?;
@@ -566,20 +545,16 @@ impl TrainFullArgs {
         git_commit: String,
         simulator_commit: String,
     ) -> std::io::Result<crate::TrainingJobConfig> {
-        let ppo = crate::PpoConfig {
-            decision_interval_ticks: crate::MAP2_DECISION_INTERVAL_TICKS,
-            environments: self.environments,
-            rollout_decisions: self.rollout,
-            epochs: self.epochs,
-            minibatch: self.minibatch,
-            learning_rate: self.learning_rate,
-            gamma_tick: self.gamma_per_tick,
-            gae_lambda: self.gae_lambda,
-            entropy_coefficient: self.entropy_coefficient,
-            ..crate::PpoConfig::default()
-        }
-        .validate()
-        .map_err(std::io::Error::other)?;
+        let ppo = self
+            .optimizer
+            .ppo(crate::PpoConfig {
+                environments: self.environments,
+                rollout_decisions: self.rollout,
+                gamma_tick: self.gamma_per_tick,
+                ..crate::PpoConfig::default()
+            })
+            .validate()
+            .map_err(std::io::Error::other)?;
         self.validate_map2_reward()?;
         let settings = crate::TrainingJobConfig {
             mastery_config: self.mastery_config()?,
@@ -590,9 +565,7 @@ impl TrainFullArgs {
             pipeline_groups: usize::from(self.pipeline_groups),
             updates: self.updates,
             ppo,
-            checkpoint_cadence: crate::TrainingCheckpointCadence::WallTime(
-                std::time::Duration::from_secs(self.checkpoint_seconds),
-            ),
+            checkpoint_cadence: self.checkpoint.cadence(),
             resume_provenance: if self.migrate_provenance {
                 crate::ResumeProvenance::MigrateGitCommit
             } else {
@@ -686,8 +659,7 @@ impl TrainAnnealedArgs {
         let zero_updates = self
             .zero_updates
             .unwrap_or_else(|| self.updates.div_ceil(5));
-        let ppo = crate::PpoConfig {
-            decision_interval_ticks: crate::MAP2_DECISION_INTERVAL_TICKS,
+        let ppo = self.optimizer.ppo(crate::PpoConfig {
             environments: self.games,
             sample_budget: if self.games > crate::MAX_TRAINING_ENVIRONMENTS {
                 crate::PpoSampleBudget::Annealed
@@ -695,18 +667,11 @@ impl TrainAnnealedArgs {
                 crate::PpoSampleBudget::Standard
             },
             rollout_decisions: crate::MAP2_RETAINED_DECISIONS,
-            epochs: self.epochs,
-            minibatch: self.minibatch,
-            learning_rate: self.learning_rate,
             gamma_tick: crate::MAP2_REWARD_GAMMA_TICK,
-            gae_lambda: self.gae_lambda,
-            entropy_coefficient: self.entropy_coefficient,
             ..crate::PpoConfig::default()
-        };
+        });
         Ok(crate::AnnealedJobConfig {
             execution: crate::TrainingExecutionOptions {
-                actor_overlap: self.actor_overlap,
-                learner_prefetch: self.learner_prefetch,
                 host_math_workers: usize::from(self.host_math_workers),
             },
             updates: self.updates,
@@ -718,9 +683,7 @@ impl TrainAnnealedArgs {
             seed: self.seed,
             opponent,
             ppo,
-            checkpoint_cadence: crate::TrainingCheckpointCadence::WallTime(
-                std::time::Duration::from_secs(self.checkpoint_seconds),
-            ),
+            checkpoint_cadence: self.checkpoint.cadence(),
             git_commit,
             simulator_commit,
         })
@@ -790,6 +753,38 @@ pub(crate) fn annealed_settings_for_test(
         "test-drysua-commit".to_owned(),
         "test-bota-commit".to_owned(),
     )
+}
+
+#[cfg(feature = "builtin")]
+impl OptimizerArgs {
+    fn ppo(&self, config: crate::PpoConfig) -> crate::PpoConfig {
+        crate::PpoConfig {
+            decision_interval_ticks: crate::MAP2_DECISION_INTERVAL_TICKS,
+            epochs: self.epochs,
+            minibatch: self.minibatch,
+            learning_rate: self.learning_rate,
+            gae_lambda: self.gae_lambda,
+            entropy_coefficient: self.entropy_coefficient,
+            ..config
+        }
+    }
+}
+
+#[cfg(feature = "builtin")]
+impl CheckpointArgs {
+    fn cadence(&self) -> crate::TrainingCheckpointCadence {
+        crate::TrainingCheckpointCadence::WallTime(std::time::Duration::from_secs(
+            self.checkpoint_seconds,
+        ))
+    }
+
+    fn validate(
+        &self,
+        metrics: &crate::telemetry::prometheus::MetricsOptions,
+    ) -> std::io::Result<()> {
+        validate_checkpoint_directory(&self.checkpoint_directory, self.resume)?;
+        metrics.validate_checkpoint_directory(&self.checkpoint_directory)
+    }
 }
 
 #[cfg(feature = "builtin")]

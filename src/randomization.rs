@@ -16,6 +16,7 @@ use crate::model::{FNV_OFFSET, fnv1a_extend};
 /// Schema tag of one generation snapshot file.
 pub const RANDOMIZATION_SCHEMA: &str = "drysua-domain-randomization/v2";
 /// Directory of generation snapshots inside a checkpoint directory.
+#[cfg(feature = "builtin")]
 pub const RANDOMIZATION_DIRECTORY: &str = "domain-randomization";
 /// Nominal value of a basis-point rate, one hundred percent.
 pub const NOMINAL_BP: i32 = 10_000;
@@ -28,8 +29,10 @@ const NORMAL_DRAW_BITS: u32 = 32;
 /// Domain separating generation draws from other derived streams.
 const GENERATION_DOMAIN: u64 = 0x6765_6e65_7261_7465;
 /// Domain separating per-game arena seeds from other derived streams.
+#[cfg(feature = "builtin")]
 pub(crate) const ARENA_DOMAIN: u64 = 0x6172_656e_615f_7365;
 /// Domain separating per-game opponent streams.
+#[cfg(feature = "builtin")]
 pub(crate) const OPPONENT_DOMAIN: u64 = 0x6f70_706f_6e65_6e74;
 /// Largest accepted generation snapshot file, one small JSON line.
 const MAX_SNAPSHOT_BYTES: u64 = 4 * 1024;

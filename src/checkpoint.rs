@@ -415,6 +415,7 @@ impl TrainingArtifact {
     ///
     /// Lets a caller diagnose a scope mismatch by name before the full
     /// compatibility check rejects it.
+    #[cfg(feature = "builtin")]
     pub(crate) fn load_run_scope(directory: &Path) -> Result<CheckpointRun, CheckpointError> {
         validate_directory(directory)?;
         let manifest = read_recoverable(&directory.join(CHECKPOINT_META_FILE), MAX_META_BYTES)?;
@@ -890,12 +891,23 @@ fn decode_training_tensors(bytes: &[u8]) -> Result<DecodedTensors, CheckpointErr
 }
 
 fn decode_runtime_tensor(bytes: &[u8]) -> Result<Vec<f32>, CheckpointError> {
+    decode_runtime_tensor_with_metadata(
+        bytes,
+        &[
+            runtime_tensor_metadata_map(PpoSampleBudget::Standard),
+            runtime_tensor_metadata_map(PpoSampleBudget::Annealed),
+        ],
+    )
+}
+
+fn decode_runtime_tensor_with_metadata(
+    bytes: &[u8],
+    expected: &[HashMap<String, String>],
+) -> Result<Vec<f32>, CheckpointError> {
     let (_, metadata) = SafeTensors::read_metadata(bytes)
         .map_err(|error| CheckpointError::Backend(error.to_string()))?;
     let actual = metadata.metadata().as_ref();
-    if actual != Some(&runtime_tensor_metadata_map(PpoSampleBudget::Standard))
-        && actual != Some(&runtime_tensor_metadata_map(PpoSampleBudget::Annealed))
-    {
+    if !expected.iter().any(|expected| actual == Some(expected)) {
         return Err(CheckpointError::SchemaMismatch);
     }
     let tensors = SafeTensors::deserialize(bytes)
@@ -1113,20 +1125,13 @@ fn decode_run(reader: &mut ManifestReader<'_>) -> Result<CheckpointRun, Checkpoi
 }
 
 fn encode_device(writer: &mut ManifestWriter, device: CheckpointDevice) {
-    match device {
-        CheckpointDevice::Cpu => {
-            writer.u8(0);
-            writer.u32(0);
-        }
-        CheckpointDevice::Cuda { ordinal } => {
-            writer.u8(1);
-            writer.u32(ordinal);
-        }
-        CheckpointDevice::Metal { ordinal } => {
-            writer.u8(2);
-            writer.u32(ordinal);
-        }
-    }
+    let (kind, ordinal) = match device {
+        CheckpointDevice::Cpu => (0, 0),
+        CheckpointDevice::Cuda { ordinal } => (1, ordinal),
+        CheckpointDevice::Metal { ordinal } => (2, ordinal),
+    };
+    writer.u8(kind);
+    writer.u32(ordinal);
 }
 
 fn decode_device(reader: &mut ManifestReader<'_>) -> Result<CheckpointDevice, CheckpointError> {
@@ -1228,9 +1233,6 @@ fn decode_config(
     let environments = reader.u32()? as usize;
     let epochs = reader.u32()? as usize;
     let minibatch = reader.u32()? as usize;
-    let values = std::array::from_fn::<_, 11, _>(|_| reader.f32())
-        .into_iter()
-        .collect::<Result<Vec<_>, _>>()?;
     PpoConfig {
         sample_budget: budget,
         decision_interval_ticks,
@@ -1238,17 +1240,17 @@ fn decode_config(
         environments,
         epochs,
         minibatch,
-        clip_epsilon: values[0],
-        value_coefficient: values[1],
-        entropy_coefficient: values[2],
-        learning_rate: values[3],
-        adam_beta1: values[4],
-        adam_beta2: values[5],
-        adam_epsilon: values[6],
-        gradient_clip: values[7],
-        gamma_tick: values[8],
-        gae_lambda: values[9],
-        target_kl: values[10],
+        clip_epsilon: reader.f32()?,
+        value_coefficient: reader.f32()?,
+        entropy_coefficient: reader.f32()?,
+        learning_rate: reader.f32()?,
+        adam_beta1: reader.f32()?,
+        adam_beta2: reader.f32()?,
+        adam_epsilon: reader.f32()?,
+        gradient_clip: reader.f32()?,
+        gamma_tick: reader.f32()?,
+        gae_lambda: reader.f32()?,
+        target_kl: reader.f32()?,
     }
     .validate()
     .map_err(|_| CheckpointError::InvalidManifest("PPO config"))
@@ -1329,25 +1331,29 @@ impl<'data> ManifestReader<'data> {
         Ok(self.take(1)?[0])
     }
     fn u16(&mut self) -> Result<u16, CheckpointError> {
-        Ok(u16::from_le_bytes(
-            self.take(2)?.try_into().expect("two bytes"),
-        ))
+        Ok(u16::from_le_bytes(self.array()?))
     }
     fn u32(&mut self) -> Result<u32, CheckpointError> {
-        Ok(u32::from_le_bytes(
-            self.take(4)?.try_into().expect("four bytes"),
-        ))
+        Ok(u32::from_le_bytes(self.array()?))
     }
     fn u64(&mut self) -> Result<u64, CheckpointError> {
-        Ok(u64::from_le_bytes(
-            self.take(8)?.try_into().expect("eight bytes"),
-        ))
+        Ok(u64::from_le_bytes(self.array()?))
     }
     fn f32(&mut self) -> Result<f32, CheckpointError> {
         Ok(f32::from_bits(self.u32()?))
     }
     fn array_32(&mut self) -> Result<[u8; 32], CheckpointError> {
-        Ok(self.take(32)?.try_into().expect("32 bytes"))
+        self.array()
+    }
+    fn array<const N: usize>(&mut self) -> Result<[u8; N], CheckpointError> {
+        Ok(self.take(N)?.try_into().expect("exact array length"))
+    }
+    fn flag(&mut self, field: &'static str) -> Result<bool, CheckpointError> {
+        match self.u8()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(CheckpointError::InvalidManifest(field)),
+        }
     }
     fn string(&mut self) -> Result<String, CheckpointError> {
         let count = self.u16()? as usize;
@@ -1434,12 +1440,13 @@ fn write_immutable(path: &Path, bytes: &[u8]) -> Result<(), CheckpointError> {
     Ok(())
 }
 
-#[cfg(not(windows))]
 fn atomic_replace(path: &Path, bytes: &[u8]) -> Result<(), CheckpointError> {
     let temporary = temporary_path(path)?;
+    #[cfg(not(windows))]
     let backup = backup_path(path)?;
     let result = (|| -> Result<(), CheckpointError> {
         write_immutable(&temporary, bytes)?;
+        #[cfg(not(windows))]
         if path.exists() {
             if backup.exists() {
                 fs::remove_file(&backup)?;
@@ -1448,23 +1455,11 @@ fn atomic_replace(path: &Path, bytes: &[u8]) -> Result<(), CheckpointError> {
             sync_parent(path)?;
         }
         durable_rename(&temporary, path)?;
+        #[cfg(not(windows))]
         if backup.exists() {
             fs::remove_file(&backup)?;
         }
         Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    result
-}
-
-#[cfg(windows)]
-fn atomic_replace(path: &Path, bytes: &[u8]) -> Result<(), CheckpointError> {
-    let temporary = temporary_path(path)?;
-    let result = (|| -> Result<(), CheckpointError> {
-        write_immutable(&temporary, bytes)?;
-        durable_rename(&temporary, path)
     })();
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
@@ -1521,37 +1516,33 @@ fn tensor_generation_path(directory: &Path, hash: [u8; 32]) -> PathBuf {
 
 fn prune_tensor_generations(directory: &Path, retained: [u8; 32]) -> Result<(), CheckpointError> {
     let retained = tensor_generation_path(directory, retained);
+    visit_tensor_generations(directory, Some(&retained), |path| {
+        fs::remove_file(path).map_err(CheckpointError::from)
+    })
+}
+
+fn preflight_tensor_generations(directory: &Path) -> Result<(), CheckpointError> {
+    visit_tensor_generations(directory, None, |_| Ok(()))
+}
+
+fn visit_tensor_generations(
+    directory: &Path,
+    retained: Option<&Path>,
+    mut visit: impl FnMut(&Path) -> Result<(), CheckpointError>,
+) -> Result<(), CheckpointError> {
     for (index, entry) in fs::read_dir(directory)?.enumerate() {
         if index >= 128 {
             return Err(CheckpointError::InvalidManifest("artifact file count"));
         }
-        let entry = entry?;
-        let path = entry.path();
-        if path == retained || !is_tensor_generation(&path) {
+        let path = entry?.path();
+        if retained == Some(path.as_path()) || !is_tensor_generation(&path) {
             continue;
         }
         let metadata = fs::symlink_metadata(&path)?;
         if metadata.file_type().is_symlink() || !metadata.is_file() {
             return Err(CheckpointError::InvalidManifest("generation file type"));
         }
-        fs::remove_file(path)?;
-    }
-    Ok(())
-}
-
-fn preflight_tensor_generations(directory: &Path) -> Result<(), CheckpointError> {
-    for (index, entry) in fs::read_dir(directory)?.enumerate() {
-        if index >= 128 {
-            return Err(CheckpointError::InvalidManifest("artifact file count"));
-        }
-        let path = entry?.path();
-        if !is_tensor_generation(&path) {
-            continue;
-        }
-        let metadata = fs::symlink_metadata(path)?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
-            return Err(CheckpointError::InvalidManifest("generation file type"));
-        }
+        visit(&path)?;
     }
     Ok(())
 }

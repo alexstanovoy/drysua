@@ -1,267 +1,131 @@
 # Prometheus telemetry contract
 
-Status: verified and deployed on **2026-09-21**, including the stable exporter,
-Prometheus, Grafana and resumed B40 training. All heavy checks used the
-unchanged original guard, with evidence under
-`artifacts/temp/prometheus-20260921/runs/`. Follow
-[experiment-safety.md](experiment-safety.md) for further execution. This document
-owns the binary/schema contract; deployment configuration lives separately.
+Native HTTP, journal recovery and metrics-enabled trainer resume are qualified;
+current U428's 858-byte state and checkpoint binding passed read-only verification.
+Strict all-feature and no-default Clippy/tests passed in the final refactor.
+See `artifacts/deslop-20260922/REPORT.md` for exact executed results, not the retired
+test-count diary (`git show 2ddb68b:docs/metrics_schema.md`). Docker runtime remains
+unqualified; [deployment/security](docker.md), [database/credential operations](monitoring.md)
+and [execution safety](experiment-safety.md) are separate contracts.
 
-Verification results:
+## CLI and endpoint
 
-- All-target/all-feature Clippy passed with `-D warnings -D clippy::all`.
-- The telemetry verification had **1380 passed, 15 ignored, zero failed** in
-  `cargo test --all-targets --all-features --quiet`. The final release, including
-  four feared-action regressions, passed **1384 tests, 15 ignored, zero failed**;
-  all 13 Criterion test-mode collection cases also succeeded.
-- `cargo test --all-targets --no-default-features --quiet`: **1018 passed,
-  3 ignored, zero failed**. The no-default-feature standalone binary built.
-- The isolated `metrics_enabled_trainers_resume_with_identical_checkpoints`
-  test also passed separately. It executes shortened CPU paths for both trainers,
-  compares enabled/resumed versus disabled/uninterrupted checkpoint manifests
-  (including model/Adam tensor SHA and RNG metadata), and checks persisted
-  sample/optimizer/outcome counters, histogram counts, and coverage.
-- Real standalone HTTP/resource smoke passed: eight observed CPU series, memory
-  and GPU-0 samples, missing-state availability without invented outcomes, finite
-  exposition values, 404/405 handling, non-loopback rejection, and SIGTERM exit 0.
-  No CUDA learner or production training was started for this HTTP check.
-- `cargo fmt`, `cargo machete`, and `git diff --check` passed. No guard resource
-  violation was recorded. No frozen artifacts or production checkpoints changed.
-
-Additional checks/limitations: an extra **no-default-feature Clippy with warnings
-denied** fails on existing non-builtin dead-code/unused-import warnings in
-checkpoint/randomization/training-outcome and old action-test code, not the new
-telemetry modules. Those unrelated warnings were not changed. The ordinary
-no-default build/tests pass with warnings. Native promtool lives in the private
-monitoring runtime rather than PATH: configuration, all 13 recording-rule fixtures,
-and actual exporter exposition passed. Prometheus ingestion and Grafana provisioning
-were verified through their APIs; see [monitoring.md](monitoring.md).
-
-Production resumed from accepted U135 with the fixed feared-action gates and
-`--metrics-directory`. U136 completed all 40 games with zero rejected orders.
-Successive checkpoint manifests, sample/Adam counts and persistent outcomes were
-checked across restarts: outcomes advanced by 40 without reset or double counting.
-Outcome and duration coverage begins after U135; earlier outcomes were not
-backfilled. The frozen release and execution evidence are under
-`artifacts/temp/prometheus-training-20260921/` and the campaign's `attempt-008/`.
-
-## Commands and ownership
-
-Both `train-full` and `train-annealed` accept:
-
-- `--metrics-directory DIR`: existing private, shared directory for one campaign's
-  telemetry. It must be separate from, and not nested with, checkpoint directories.
-  Keep this directory constant when invocation/checkpoint/output directories move.
-  Only one training writer may hold it. The directory must not be a symlink.
-- `--metrics-listen 127.0.0.1:9464`: optional direct, in-process endpoint. Without
-  `--metrics-directory`, this is process-local telemetry, suitable for a long-lived
-  trainer, **not** a durable segmented-campaign exporter.
-
-Either flag enables Prometheus mode. Neither flag retains legacy behavior. Both
-flags may be supplied together. The smoke `train`, gameplay, and RewardObserver
-commands are unchanged. Training still requires `builtin`; the standalone exporter
-does not require `builtin` or initialize a model, learner, CUDA context, or simulator.
-
-For restarting training processes, use the **same binary** as a stable exporter:
+Both `train-full` and `train-annealed` accept `--metrics-directory DIR` and optional
+`--metrics-listen 127.0.0.1:9464`; either enables Prometheus mode, both may coexist.
+DIR must be existing, private, non-symlink, separate from/not nested with checkpoints,
+and shared consistently across campaign segments with one writer. Listen-only is
+process-local, not durable. Neither flag means legacy logging. Gameplay, smoke train
+and RewardObserver behavior is unchanged. Training requires builtin; the exporter
+requires no builtin, model, learner, CUDA context or simulator initialization:
 
 ```text
 drysua metrics-serve --metrics-directory DIR --metrics-listen 127.0.0.1:9464
 ```
 
-The exporter requires `--metrics-directory`; its default listener is
-`127.0.0.1:9464`. Only literal loopback socket addresses are accepted, including
-IPv6 loopback. There is no public-bind override, authentication, dashboard, or
-HTTP control API. Exact `GET /metrics` returns Prometheus text format 0.0.4.
-Queries, other routes/methods, bodies, and buffered pipelining are rejected;
-connections close after one response. SIGINT/SIGTERM gracefully stop the Unix
-standalone exporter, close clients, and clean up any resource-collection child.
-Direct training listeners shut down with their CLI guard on normal/error return.
+DIR is required; the listener defaults to 127.0.0.1:9464. Only literal loopback IPv4/
+IPv6 addresses are accepted. Exact GET /metrics returns text format 0.0.4; queries,
+other routes/methods, bodies and buffered pipelining are rejected. One response per
+connection; no authentication/control API. Unix SIGINT/SIGTERM closes clients and
+owned collection children; direct listeners close with the training guard. Persistent
+atomic replacement/directory fsync and standalone signal shutdown require Unix.
+Resources are Linux-only; unsupported platforms report availability zero.
 
-Unix signal handling uses the **already locked** `libc 0.2.189` package as a direct,
-Unix-only dependency with default features disabled: std has no signal installation
-API. No new package or NVML FFI/dependency stack was added. Persistent atomic
-replacement/directory fsync and standalone signal shutdown currently require Unix;
-other platforms retain training/direct-listener compilation. Host/GPU sampling is
-Linux-only; unsupported platforms expose resource availability zero, not samples.
+## Durable publication and recovery
 
-## Durable counters, scope, and coverage
+Training samples, optimizer steps, outcomes, PPO gauges and update/stage histograms
+describe **committed checkpoints**, not speculative collections. Absolute counters
+come from restored progress; invocation outcome counters contribute staged deltas
+once, never re-add previously committed totals. The transaction is:
 
-All training progress, outcomes, PPO gauges, and update/stage histograms below
-describe **committed checkpoints**, not speculative collections. Absolute sample
-and optimizer-step counters come from strict training restoration, never from
-adding invocation totals to previously restored totals. Outcomes use the existing
-session `SmokeCounters`: per-update deltas are staged once, and invocation counters
-start at zero on every resume while durable observed totals are retained.
+1. Stage a completed update and hash the exact existing checkpoint manifest bytes.
+2. Write/fsync metrics.pending before checkpoint writes; commit/fsync the manifest.
+3. Replace/fsync metrics.state, then remove/fsync pending. Restore reestablishes the
+   checkpoint directory durability barrier before journal recovery publishes anything.
 
-The bounded transaction is:
+At most two checksummed/versioned 858-byte records, fixed temporary names and
+.metrics.writer.lock; reads are <=16 KiB. No unbounded journal/queue and no telemetry
+input to policy, RNG, rewards, scheduling, optimizer or checkpoint cadence.
+Scope hashes canonical run/config/schema identity, including provenance/opponent/
+parallelism, excluding metrics flags and paths. Train-full target remains mutable;
+annealed target keeps its schedule scope. Fresh runs cannot reuse existing state.
 
-1. Complete an update; stage outcome deltas, typed timer measurements, and PPO data.
-2. Serialize the existing checkpoint, without changing its bytes or format. Hash
-   its exact manifest (which already includes the tensor SHA-256, RNG, and progress).
-3. Atomically write and fsync `metrics.pending` **before** checkpoint file writes.
-4. Commit and fsync the existing checkpoint manifest.
-5. Atomically publish and fsync `metrics.state`, then remove/fsync the pending record.
-
-Resume re-establishes the checkpoint-directory durability barrier after validating
-the restored manifest and before telemetry recovery can publish it. Normal removal
-of a pending file racing an exporter read is retried within the fixed read bound.
-
-State consists of two fixed-size, versioned, checksummed 858-byte records at most,
-fixed crash-temporary filenames, and `.metrics.writer.lock`. Reads are limited to
-16 KiB. There is no append-only event log or unbounded update queue. The journal is
-independent of the checkpoint format. No metrics field influences policy seeds,
-RNG, modifiers, rewards, optimizer choices, scheduling, or checkpoint cadence.
-
-Scope is a SHA-256 of the existing canonical checkpoint run/config encoding plus
-linked schema identity and a metrics domain separator. This includes real seeds,
-provenance, opponent identity, parallelism, and PPO settings; it does **not** include
-logging/metrics flags or output/checkpoint paths. `train-full`'s target is a mutable
-gauge, as in its existing checkpoint contract; annealed schedule targets retain
-their existing scope rules. Fresh training cannot reuse existing state, even with
-the same seed/configuration. Resumed state also matches the exact checkpoint
-manifest identity and its absolute update/sample/optimizer progress.
-
-| Resume situation | Behavior |
+| Actual checkpoint / journal condition | Recovery |
 |---|---|
-| Actual checkpoint matches committed state | Restore observed totals, without adding them again. |
-| Actual checkpoint matches prepared state | Publish that complete snapshot once; repeated resume is idempotent. |
-| Checkpoint remains at committed state; a newer preparation exists | Discard the speculative preparation; resumed training may replay the uncommitted work. |
-| Checkpoint is older than state, neither committed nor prepared, or scope/identity differs | Fail with a specific error; never guess/reset historical totals. |
-| Corrupt/oversized state, or missing committed state with pending present | Fail; exporter marks unavailable and omits outcome/progress samples. |
-| Neither record exists at first opt-in | Establish explicit new coverage at the actual restored update, with zero **observed** outcomes. |
+| Matches committed | Restore totals without adding again |
+| Matches pending | Publish once; repeated recovery is idempotent |
+| Matches committed with newer pending | Discard speculative preparation |
+| Ahead/behind incompatible state, wrong scope/identity, corrupt/oversized record, or pending without committed | Fail; never guess/reset history |
+| Neither record at first opt-in | Start explicit zero-observation coverage at restored update |
 
-`drysua_training_metrics_start_update = N` means observed outcome/duration coverage
-starts **after the checkpoint containing N completed updates**. On first resume,
-historical game results before N are unknown—not inferred from games-per-update,
-weights, logs, or wins in a previous process. Samples/optimizer steps can still be
-restored absolutely because the checkpoint contains them. Deleting both records is
-indistinguishable from first opt-in and starts a new, explicitly reported coverage
-window; retain the directory and do not delete/reset it to repair an error.
-Historical win-history migration is a separate explicit future operation.
+Coverage N begins **after** checkpoint N. Earlier outcomes are unknown; samples/steps
+remain absolute. Deleting both records silently starts a new coverage window, so
+never use deletion as repair. Existing coverage cannot cross provenance migration:
+use a new metrics directory. First opt-in with validated train-full migration may
+rebind same-update identity only while observed outcomes/updates/durations are empty.
+Exporter never promotes pending; abandoned pending makes training metrics unavailable
+until resume reconciles. Valid historical state stays available without an active writer.
 
-Existing metrics scope cannot silently cross a Git provenance migration. Use a new
-metrics directory/new coverage window for that change. First opt-in alongside an
-already-validated `train-full --migrate-provenance` can rebind the same-update
-checkpoint identity only while coverage has no observed updates/outcomes/durations.
-It cannot rewrite previously observed history.
+Telemetry transaction errors fail the invocation. Preparation failure prevents the
+checkpoint write; publication failure may follow a durable rename—do not assume
+rollback. Timer/direct-worker failure latches unhealthy state and fails control-plane
+operations/finalization; worker failure is reported immediately. Exporter logs read
+health transitions. Resources remain independently available. Durable totals survive
+missed final scrapes, but rate/increase cannot reconstruct pre-scrape intervals.
 
-The stable exporter only reads committed state, never promotes pending data. An
-abandoned pending record (no active writer) makes metrics unavailable until training
-resume reconciles it against the actual checkpoint. Missing/corrupt state is an
-availability-zero response, not an invented all-zero history. Resource metrics
-remain independently available. A valid historical record remains available while
-training is inactive.
+## Training families (`drysua_training_` prefix)
 
-**Failure policy:** fail the training invocation on a telemetry transaction error,
-with a specific diagnostic. Preparation failure prevents that checkpoint write;
-publication failure can occur after a durable checkpoint and leaves recovery state.
-Do not assume an I/O error rolled back a rename. Timer-hook errors and unexpected
-direct-server worker failure latch unhealthy state and fail the next control-plane
-operation/final guard; server failure is reported immediately rather than waiting
-for shutdown. No success notification
-is manufactured after a failed telemetry commit. Neither checkpoints nor telemetry
-should be manually deleted as recovery. Exporter read errors are logged on state
-transitions and exposed through health/availability gauges.
+No run/seed/path/PID/entity labels. Missing measurements are omitted, never fabricated.
 
-Persistent counters survive a process ending before its final scrape: the stable
-endpoint can expose the final committed totals later. **Process-local counters plus
-`rate()` alone do not provide this guarantee.** Absolute totals are authoritative;
-`rate`/`increase` need sampled endpoints and cannot recover intervals before the
-first Prometheus sample, even with persistence. Keep exporter target identity stable
-and scope/coverage changes visible in dashboards.
-
-## Training metric families
-
-All names in this table have the `drysua_training_` prefix. No run IDs, seeds,
-paths, process IDs, or entity IDs appear as labels. Absent measurements are omitted.
-
-| Suffix | Type | Labels / meaning |
+| Suffix | Type | Meaning / fixed labels |
 |---|---|---|
-| `updates_completed` | gauge | Absolute durable update count, including restored updates. |
-| `updates_target` | gauge | Configured total target; may change under existing train-full rules. |
-| `samples_total` | counter | Absolute durable rollout samples, restored from checkpoint. |
-| `optimizer_steps_total` | counter | Absolute durable Adam steps, restored from checkpoint. |
-| `games_total` | counter | `outcome="win\|loss\|draw\|time_cap"`; committed observed counts since coverage began. |
-| `last_update_games` | gauge | Same four outcome labels; last committed **update**, not sum across checkpoint interval. |
-| `update_duration_seconds` | histogram | Successful committed updates since coverage began. |
-| `stage_duration_seconds` | histogram | `stage="rollout_initialization\|collection\|batch_preparation\|optimization\|finalization"`. |
-| `scope_duration_seconds` | histogram | Direct listener only, invocation-local; `scope="session_initialization\|checkpoint_capture_save_runtime_export\|resume_runtime_export"`. |
-| `policy_loss`, `value_loss`, `entropy`, `approximate_kl` | gauge | Last committed PPO report; omitted before an observed report. KL uses the existing report's rejected KL when stopped for KL. |
-| `generation` | gauge | Annealed only; actual zero-based generation used by the last committed batch. |
-| `environment_scale_ratio` | gauge | Annealed only; effective scale in `[0,1]`; zero inside the no-modifier window, including a partially applied cached generation. |
-| `parallel_worlds` | gauge | Configured simultaneous worlds. |
-| `games_per_update` | gauge | Configured full-episode games; zero denotes reset-window mode. |
-| `active` | gauge | Direct: training guard exists. Stable exporter: training writer lock is held. Not proof of learner progress. |
-| `last_heartbeat_timestamp_seconds` | gauge | Trainer-supplied Unix seconds at initialization/committed snapshot (or target refresh); **not** exporter scrape time. May be old during a long update. Omitted if unavailable. |
-| `metrics_start_update` | gauge | Explicit outcome/duration coverage boundary described above. |
-| `metrics_available` | gauge | 1 iff a healthy committed training snapshot can be exposed. |
-| `metrics_state_healthy` | gauge | State validation/reconciliation/I/O health; 0 when unavailable or abandoned pending. |
+| updates_completed, updates_target | gauge | Absolute committed updates / configured total target |
+| samples_total, optimizer_steps_total | counter | Absolute restored samples / Adam steps |
+| games_total | counter | Observed committed outcomes since coverage; outcome="win\|loss\|draw\|time_cap" |
+| last_update_games | gauge | Same labels; last update, not entire checkpoint interval |
+| update_duration_seconds | histogram | Successful committed updates |
+| stage_duration_seconds | histogram | stage="rollout_initialization\|collection\|batch_preparation\|optimization\|finalization" |
+| scope_duration_seconds | histogram | Direct listener, invocation-local: scope="session_initialization\|checkpoint_capture_save_runtime_export\|resume_runtime_export" |
+| policy_loss, value_loss, entropy, approximate_kl | gauge | Latest committed PPO report; rejected KL when stopped for KL |
+| generation, environment_scale_ratio | gauge | Annealed generation and effective [0,1] scale, including cached partial generation |
+| parallel_worlds, games_per_update | gauge | Simultaneous worlds / full games; zero games denotes reset-window |
+| active | gauge | Direct guard exists / stable writer lock held, not progress |
+| last_heartbeat_timestamp_seconds | gauge | Trainer timestamp at initialization/commit/target refresh, never scrape time |
+| metrics_start_update | gauge | Explicit outcome/duration coverage boundary |
+| metrics_available, metrics_state_healthy | gauge | Exposable healthy committed snapshot / validation-reconciliation-I/O health |
 
-The `|` separators above enumerate literal allowed values, not combined label
-values. Win, loss, draw, and time cap are mutually exclusive. Failed/incomplete
-collection and infrastructure errors are never game outcomes. Histograms have
-cumulative buckets at `0.001, 0.01, 0.1, 1, 5, 15, 60, 300, 900, 3600` seconds, plus
-`le="+Inf"`, `_count`, and `_sum`. Each family has one `# HELP` and `# TYPE` declaration;
-all sample values and sums are finite. Update/stage histograms persist across
-segments; scope/checkpoint histograms intentionally do not and are absent from the
-file-only exporter. No KL-stop counter is currently exported.
+Pipe separators enumerate literal labels. Outcomes are mutually exclusive; incomplete
+work/infrastructure failures are not game results. Histograms have cumulative bounds
+0.001, 0.01, 0.1, 1, 5, 15, 60, 300, 900, 3600 seconds, +Inf, count and sum; one HELP/
+TYPE declaration and finite values. Update/stage histograms persist; scope histograms
+are absent from file-only export. No KL-stop counter. Unavailable state suppresses
+training value/timing families, keeping active/health/availability and known heartbeat.
 
-`metrics_available=0` suppresses outcome, progress, loss, generation and timing
-families rather than publishing plausible zero values. Active/health/availability
-remain present; a known heartbeat may still be exposed. Use availability and
-coverage when interpreting cumulative game totals; compare update progress over
-time to detect a stuck trainer, not writer-lock ownership alone.
+## Resource families and bounds
 
-## Resource metric families
+Collected only by the server, describing whole host/device, not individual bots:
 
-All are gauges, collected **only in the metrics server**, not trainer hot paths:
+- drysua_host_cpu_utilization_ratio{cpu="0".."255"}: first eight /proc/stat modes,
+  idle+iowait treated as idle, guest not double-counted. Initial/reset/zero-delta/
+  missing-hotplug/invalid samples are omitted rather than reported as idle.
+- drysua_host_memory_available_bytes and drysua_host_memory_total_bytes: bounded
+  /proc/meminfo reads, KiB converted to bytes.
+- drysua_gpu_utilization_ratio, drysua_gpu_memory_used_bytes,
+  drysua_gpu_memory_total_bytes, drysua_gpu_temperature_celsius: gpu="0".."7".
+  Optional nvidia-smi without shell; missing/unsupported/malformed/timeout samples
+  are omitted, and unsupported index/count sets fail closed.
+- drysua_host_cpu_collection_available, drysua_host_memory_collection_available,
+  drysua_gpu_collection_available: independent 0/1 validity; CPU needs a valid delta.
 
-- `drysua_host_cpu_utilization_ratio{cpu="0".."255"}`: non-idle delta of Linux
-  `/proc/stat`'s first eight modes, with idle+iowait treated as idle. Guest fields
-  are already included in user/nice and are not double-counted. Initial samples,
-  counter regressions, zero deltas, missing/hotplugged CPUs, and invalid samples
-  are omitted, not reported as idle CPUs.
-- `drysua_host_memory_available_bytes`, `drysua_host_memory_total_bytes`:
-  bounded `/proc/meminfo` reads; KiB converted to bytes.
-- `drysua_gpu_utilization_ratio{gpu="0".."7"}`,
-  `drysua_gpu_memory_used_bytes{gpu=...}`,
-  `drysua_gpu_memory_total_bytes{gpu=...}`,
-  `drysua_gpu_temperature_celsius{gpu=...}`: optional `nvidia-smi`, no shell.
-  Missing command/GPU, unsupported values, malformed output, and timeout omit
-  samples. Unsupported index/count sets fail closed rather than truncate secretly.
-- `drysua_host_cpu_collection_available`,
-  `drysua_host_memory_collection_available`,
-  `drysua_gpu_collection_available`: 0/1 collection validity, independent of
-  training-state availability. CPU starts at zero availability until a valid delta.
+Eight client slots, <=4096-byte requests/64 headers, absolute 2s read/write deadlines,
+128 KiB shared response, 48 KiB per training/resource exposition, 20ms idle polling.
+No per-client thread or hot-path registry lock. Cached collection starts >=5s after
+the preceding completion, independent of scrapes. Proc files <=64 KiB; GPU discovery/
+sampling share 1s, one owned child, <=4096 stdout bytes per invocation and <=8 GPUs.
+Timeout kills/reaps; kernel-stalled open/spawn/reap cannot have hard real-time guarantees.
 
-## Bounds and cadence
+## Log compatibility
 
-One server event loop services eight fixed client slots. Requests are at most
-4,096 bytes/64 headers; read and write phases each have an absolute two-second
-deadline. Responses are bounded to 128 KiB and shared by clients; training and
-resource exposition each have a 48 KiB bound. Idle polling is 20 ms. There is no
-per-client thread, unbounded client/task queue, or per-decision registry lock.
-
-Training-state reads/rendering and resource collection occur at least five seconds
-apart **after the preceding collection finishes**, independent of scrape frequency.
-Responses are cached. Proc files are bounded to 64 KiB and CPU indices to 256.
-GPU discovery and sampling share a one-second deadline, use at most one owned child
-at a time, limit stdout to 4,096 bytes per invocation, and support at most eight
-GPUs. Timeout triggers kill/reap cleanup. std cannot impose a hard deadline on a
-kernel-stalled file open, process creation, or process reaping; this is not a hard
-real-time service. No shell, reader-thread queue, or GPU library is loaded.
-
-## Text-log compatibility exception
-
-Prometheus mode suppresses per-episode `event=map2_episode_reward` dumps, collection metric summaries,
-periodic training update/scope timing lines, mastery metric lines, generation
-metric lines, and aggregate training reward dumps. Startup, errors, warnings,
-checkpoint notifications, and shutdown remain.
-
-The exact existing `episode:` records (one per completed game, including ticks,
-retained samples, actions, and all existing fields), `checkpoint:`, and final
-`training complete:` / `annealed training complete:` records are retained as
-**guarded-runner control/audit protocol**, even though they carry numerical fields.
-In the B40 campaign the controller requires 40 episode events per completed update.
-These lifecycle/game events are logs, not graph telemetry; they are not the metrics source. No controller
-rewrite, RewardObserver removal, or gameplay-log suppression is part of this change.
+Prometheus suppresses redundant reward/collection/timing/mastery/generation metric
+dumps, not startup/errors/warnings/shutdown. Exact episode:, checkpoint:, training
+complete: and annealed training complete: control/audit records remain; B40 requires
+40 completed-game episode records per update. These logs are not the graph data source.

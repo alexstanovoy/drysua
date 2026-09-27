@@ -6,14 +6,27 @@ import json
 from pathlib import Path
 import socket
 import signal
-import struct
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import play_match
 from play_admission import Endpoint, SeatRelay
 from play_reward import RewardPipe, print_overview
+from test_release_wire import frame
+
+
+def relay_fixture(test, slot=0, role="human", mode=0, pacer=None):
+    relay = SeatRelay(1, slot, role, mode, pacer=pacer)
+    test.addCleanup(relay.close)
+    pairs = []
+    for _ in range(2):
+        pair = socket.socketpair()
+        pairs.append(pair)
+        for connection in pair:
+            test.addCleanup(connection.close)
+    relay.endpoints = [Endpoint(pair[0]) for pair in pairs]
+    return relay, pairs
 
 
 class OpponentTests(unittest.TestCase):
@@ -41,79 +54,92 @@ class OpponentTests(unittest.TestCase):
 
 
 class TeeTests(unittest.TestCase):
+    def reward_pipe(self, role="human"):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        reader, writer = socket.socketpair()
+        self.addCleanup(reader.close)
+        self.addCleanup(writer.close)
+        pipe = RewardPipe(writer, Path(directory.name) / role, role)
+        self.addCleanup(pipe.close)
+        return pipe, reader
+
+    def test_fragmented_welcome_reaches_player_and_passive_pipe_without_extra_ack(self):
+        for slot, role in ((0, "human"), (1, "bot")):
+            with self.subTest(role=role):
+                relay, _ = relay_fixture(self, slot, role)
+                pipe, reader = self.reward_pipe(role)
+                reader.setblocking(False)
+                relay.observer = Mock(wraps=pipe.offer)
+                name = b"human" if role == "human" else b"drysua"
+                hello = frame(bytes([0, slot, len(name)]) + name)
+                relay.endpoints[0].incoming.extend(hello)
+                relay.forward_frames(0)
+                self.assertEqual(relay.endpoints[1].outgoing, hello)
+                relay.observer.assert_not_called()
+                with self.assertRaises(BlockingIOError):
+                    reader.recv(64)
+                welcome = frame(bytes([0, slot + 1, 1, slot, 30, 0]))
+                for fragment in (welcome[:2], welcome[2:5], welcome[5:]):
+                    relay.endpoints[1].incoming.extend(fragment)
+                    relay.forward_frames(1)
+                pipe.finish()
+                relay.observer.assert_called_once_with(welcome)
+                self.assertEqual(reader.recv(64), welcome)
+                self.assertEqual(reader.recv(64), b"")
+                self.assertEqual(relay.endpoints[0].outgoing, welcome)
+                self.assertEqual(relay.endpoints[1].outgoing, hello)
+                self.assertIsNone(pipe.failure)
+
     def test_failed_report_repeated_overview_preserves_original_observer_error(self):
-        with tempfile.TemporaryDirectory() as directory:
-            reader, writer = socket.socketpair()
-            pipe = RewardPipe(writer, Path(directory) / "human", "human")
-            path = pipe.prefix.with_suffix(".json")
-            report = {"valid": False, "complete": False, "error": "EOF before MatchOver",
-                      "components": {}, "total": 0, "total_without_terminal": 0}
-            path.write_text(json.dumps(report))
-            try:
-                pipe.fail("observer rejected stream")
-                with contextlib.redirect_stdout(io.StringIO()):
-                    print_overview([(pipe, None, None)])
-                    first = json.loads(path.read_text())
-                    print_overview([(pipe, None, None)])
-                second = json.loads(path.read_text())
-                self.assertEqual(first, second)
-                self.assertEqual(second["observer_error"], "EOF before MatchOver")
-            finally:
-                pipe.close()
-                reader.close()
+        pipe, _ = self.reward_pipe()
+        path = pipe.prefix.with_suffix(".json")
+        report = {"valid": False, "complete": False, "error": "EOF before MatchOver",
+                  "components": {}, "total": 0, "total_without_terminal": 0}
+        path.write_text(json.dumps(report))
+        pipe.fail("observer rejected stream")
+        with contextlib.redirect_stdout(io.StringIO()):
+            print_overview([(pipe, None, None)])
+            first = json.loads(path.read_text())
+            print_overview([(pipe, None, None)])
+        second = json.loads(path.read_text())
+        self.assertEqual(first, second)
+        self.assertEqual(second["observer_error"], "EOF before MatchOver")
 
     def test_marker_io_failure_during_overflow_cannot_drop_original_server_frame(self):
-        with tempfile.TemporaryDirectory() as directory:
-            reader, writer = socket.socketpair()
-            pipe = RewardPipe(writer, Path(directory) / "human", "human")
-            relay = SeatRelay(1, 0, "human", 0)
-            pairs = [socket.socketpair(), socket.socketpair()]
-            relay.endpoints = [Endpoint(pair[0]) for pair in pairs]
-            relay.hello = True
-            relay.observer = pipe.offer
-            payload = bytes([0, 1, 1, 0, 30, 0])
-            frame = struct.pack("<I", len(payload)) + payload
-            try:
-                pipe.pending.extend(b"x" * pipe.limit)
-                relay.endpoints[1].incoming.extend(frame)
-                with patch.object(pipe, "pump"), patch.object(Path, "open", side_effect=OSError("disk full")), \
-                        contextlib.redirect_stdout(io.StringIO()) as output:
-                    relay.forward_frames(1)
-                self.assertEqual(bytes(relay.endpoints[0].outgoing), frame)
-                self.assertIn("queue limit", pipe.failure)
-                self.assertIn("disk full", pipe.persistence_error)
-                self.assertIn("persistence failed", output.getvalue())
-                self.assertTrue(pipe.closed)
-            finally:
-                pipe.close()
-                reader.close()
-                relay.close()
-                for pair in pairs:
-                    pair[1].close()
+        pipe, _ = self.reward_pipe()
+        relay, _ = relay_fixture(self)
+        relay.hello = True
+        relay.observer = pipe.offer
+        welcome = frame(bytes([0, 1, 1, 0, 30, 0]))
+        pipe.pending.extend(b"x" * pipe.limit)
+        relay.endpoints[1].incoming.extend(welcome)
+        with patch.object(pipe, "pump"), patch.object(Path, "open", side_effect=OSError("disk full")), \
+                contextlib.redirect_stdout(io.StringIO()) as output:
+            relay.forward_frames(1)
+        self.assertEqual(bytes(relay.endpoints[0].outgoing), welcome)
+        self.assertIn("queue limit", pipe.failure)
+        self.assertIn("disk full", pipe.persistence_error)
+        self.assertIn("persistence failed", output.getvalue())
+        self.assertTrue(pipe.closed)
 
     def test_final_report_rewrite_io_failure_is_reported_without_raising(self):
-        with tempfile.TemporaryDirectory() as directory:
-            reader, writer = socket.socketpair()
-            pipe = RewardPipe(writer, Path(directory) / "human", "human")
-            path = pipe.prefix.with_suffix(".json")
-            path.write_text(json.dumps({"error": "EOF before MatchOver", "components": {}}))
-            original_open = Path.open
+        pipe, _ = self.reward_pipe()
+        path = pipe.prefix.with_suffix(".json")
+        path.write_text(json.dumps({"error": "EOF before MatchOver", "components": {}}))
+        original_open = Path.open
 
-            def fail_writes(path, mode="r", *args, **kwargs):
-                if mode == "w":
-                    raise PermissionError("read-only report")
-                return original_open(path, mode, *args, **kwargs)
+        def fail_writes(path, mode="r", *args, **kwargs):
+            if mode == "w":
+                raise PermissionError("read-only report")
+            return original_open(path, mode, *args, **kwargs)
 
-            try:
-                pipe.fail("observer rejected stream")
-                with patch.object(Path, "open", fail_writes), contextlib.redirect_stdout(io.StringIO()) as output:
-                    print_overview([(pipe, None, None)])
-                self.assertIn("persistence failed", output.getvalue())
-                self.assertIn("read-only report", pipe.persistence_error)
-                self.assertIn("INVALID/INCOMPLETE", output.getvalue())
-            finally:
-                pipe.close()
-                reader.close()
+        pipe.fail("observer rejected stream")
+        with patch.object(Path, "open", fail_writes), contextlib.redirect_stdout(io.StringIO()) as output:
+            print_overview([(pipe, None, None)])
+        self.assertIn("persistence failed", output.getvalue())
+        self.assertIn("read-only report", pipe.persistence_error)
+        self.assertIn("INVALID/INCOMPLETE", output.getvalue())
 
     def test_reporting_exception_cannot_skip_child_group_cleanup(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -125,57 +151,20 @@ class TeeTests(unittest.TestCase):
                 self.assertEqual([call.args[0] for call in groups.call_args_list],
                                  [signal.SIGTERM, signal.SIGKILL])
 
-    def test_complete_server_frames_copied_without_order_changes_or_ack(self):
-        for role, slot in (("human", 0), ("bot", 1)):
-            relay = SeatRelay(1, slot, role, 0)
-            pairs = [socket.socketpair(), socket.socketpair()]
-            copies = []
-            relay.observer = copies.append
-            relay.endpoints = [Endpoint(pair[0]) for pair in pairs]
-            name = b"human" if role == "human" else b"drysua"
-            hello = bytes([0, 0 if role == "human" else 1, len(name)]) + name
-            wire = struct.pack("<I", len(hello)) + hello
-            try:
-                relay.endpoints[0].incoming.extend(wire)
-                relay.forward_frames(0)
-                self.assertEqual(bytes(relay.endpoints[1].outgoing), wire)
-                self.assertEqual(copies, [])
-                payload = bytes([0, slot + 1, 1, slot, 30, 0])
-                frame = struct.pack("<I", len(payload)) + payload
-                for fragment in (frame[:2], frame[2:5], frame[5:]):
-                    relay.endpoints[1].incoming.extend(fragment)
-                    relay.forward_frames(1)
-                self.assertEqual(copies, [frame])
-                self.assertEqual(bytes(relay.endpoints[0].outgoing), frame)
-                self.assertEqual(bytes(relay.endpoints[1].outgoing), wire)
-            finally:
-                relay.close()
-                for pair in pairs:
-                    pair[1].close()
-
     def test_backpressure_invalidates_instead_of_dropping_silently(self):
-        with tempfile.TemporaryDirectory() as directory:
-            reader, writer = socket.socketpair()
-            pipe = RewardPipe(writer, Path(directory) / "human", "human")
-            try:
-                with patch.object(pipe, "pump"):
-                    pipe.offer(b"x" * pipe.limit)
-                    pipe.offer(b"x")
-                self.assertIn("queue limit", pipe.failure)
-                self.assertEqual(len(pipe.pending), 0)
-                self.assertTrue(pipe.failure_path.is_file())
-            finally:
-                pipe.close()
-                reader.close()
+        pipe, _ = self.reward_pipe()
+        with patch.object(pipe, "pump"):
+            pipe.offer(b"x" * pipe.limit)
+            pipe.offer(b"x")
+        self.assertIn("queue limit", pipe.failure)
+        self.assertEqual(len(pipe.pending), 0)
+        self.assertTrue(pipe.failure_path.is_file())
 
     def test_observer_crash_is_incomplete_not_terminal(self):
-        with tempfile.TemporaryDirectory() as directory:
-            reader, writer = socket.socketpair()
-            reader.close()
-            pipe = RewardPipe(writer, Path(directory) / "human", "human")
-            pipe.offer(b"frame")
-            self.assertIn("observer write failed", pipe.failure)
-            pipe.close()
+        pipe, reader = self.reward_pipe()
+        reader.close()
+        pipe.offer(b"frame")
+        self.assertIn("observer write failed", pipe.failure)
 
 
 if __name__ == "__main__":

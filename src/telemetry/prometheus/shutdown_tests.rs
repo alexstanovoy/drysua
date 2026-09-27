@@ -2,6 +2,51 @@
 mod unix {
     use super::super::*;
 
+    #[test]
+    fn ownership_lifecycle_preserves_requests_and_restores_saved_handlers() {
+        for during_install in [false, true] {
+            let state = SignalState::new();
+            state.requested.store(true, Ordering::Relaxed);
+            let mut installed = Vec::new();
+            let originals = install_with(
+                &state,
+                &action(0),
+                |signal, _| {
+                    installed.push(signal);
+                    assert!(state.owned.load(Ordering::Acquire));
+                    if during_install {
+                        state.requested.store(true, Ordering::Relaxed);
+                    }
+                    Ok(action(signal))
+                },
+                |_, _| panic!("unexpected rollback"),
+            )
+            .unwrap();
+            assert_eq!(installed, [libc::SIGINT, libc::SIGTERM]);
+            assert_eq!(state.requested.load(Ordering::Relaxed), during_install);
+            let error = install_with(
+                &state,
+                &action(0),
+                |_, _| panic!("second owner"),
+                |_, _| panic!("rollback"),
+            );
+            let Err(error) = error else {
+                panic!("duplicate installation succeeded")
+            };
+            assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+            assert_eq!(
+                error.to_string(),
+                "metrics shutdown signal ownership is already held or restoration is incomplete"
+            );
+            assert!(restore_with(
+                &state,
+                &originals,
+                |_, _| Ok(action(0)),
+                |_, _| panic!("restore failed")
+            ));
+        }
+    }
+
     fn action(marker: libc::c_int) -> libc::sigaction {
         let mut action = signal_action().unwrap();
         action.sa_flags = marker as _;
@@ -22,7 +67,6 @@ mod unix {
             request_shutdown(signal);
 
             assert!(guard.requested());
-            assert!(guard.requested());
             request_shutdown(signal);
             assert!(guard.requested());
         }
@@ -31,217 +75,65 @@ mod unix {
     }
 
     #[test]
-    fn signal_action_uses_the_store_only_handler_and_restarts_interrupted_calls() {
-        let replacement = signal_action().unwrap();
-
-        assert_eq!(replacement.sa_flags, action(libc::SA_RESTART).sa_flags);
-        assert_eq!(
-            replacement.sa_sigaction,
-            request_shutdown as *const () as libc::sighandler_t
-        );
-    }
-
-    #[test]
-    fn installation_saves_both_dispositions_and_clears_a_stale_request() {
-        let state = SignalState::new();
-        state.requested.store(true, Ordering::Relaxed);
-        let replacement = action(0);
-        let mut calls = Vec::new();
-
-        let originals = install_with(
-            &state,
-            &replacement,
-            |signal, _| {
-                assert!(calls.len() < 2);
-                calls.push(signal);
-                Ok(action(signal))
-            },
-            |_, _| panic!("successful installation must not report restoration errors"),
-        )
-        .unwrap();
-
-        assert_eq!(calls, [libc::SIGINT, libc::SIGTERM]);
-        assert_eq!(
-            originals[0].as_ref().unwrap().sa_flags,
-            action(libc::SIGINT).sa_flags
-        );
-        assert_eq!(
-            originals[1].as_ref().unwrap().sa_flags,
-            action(libc::SIGTERM).sa_flags
-        );
-        assert!(state.owned.load(Ordering::Acquire));
-        assert!(!state.requested.load(Ordering::Relaxed));
-    }
-
-    #[test]
-    fn request_received_during_installation_is_not_cleared_afterward() {
-        let state = SignalState::new();
-
-        install_with(
-            &state,
-            &action(0),
-            |signal, _| {
-                if signal == libc::SIGINT {
-                    state.requested.store(true, Ordering::Relaxed);
-                }
-                Ok(action(signal))
-            },
-            |_, _| panic!("successful installation must not report restoration errors"),
-        )
-        .unwrap();
-
-        assert!(state.requested.load(Ordering::Relaxed));
-    }
-
-    #[test]
-    fn duplicate_installation_preserves_the_request_and_never_exchanges_dispositions() {
-        let state = SignalState::new();
-        state.owned.store(true, Ordering::Release);
-        state.requested.store(true, Ordering::Relaxed);
-
-        let error = match install_with(
-            &state,
-            &action(0),
-            |_, _| panic!("a second owner must not exchange dispositions"),
-            |_, _| panic!("a second owner has nothing to restore"),
-        ) {
-            Ok(_) => panic!("duplicate installation must fail"),
-            Err(error) => error,
-        };
-
-        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
-        assert_eq!(
-            error.to_string(),
-            "metrics shutdown signal ownership is already held or restoration is incomplete"
-        );
-        assert!(state.requested.load(Ordering::Relaxed));
-        assert!(state.owned.load(Ordering::Acquire));
-    }
-
-    #[test]
-    fn first_install_failure_releases_ownership_without_attempting_rollback() {
-        let state = SignalState::new();
-        let mut calls = 0;
-
-        let error = match install_with(
-            &state,
-            &action(0),
-            |signal, _| {
-                calls += 1;
-                assert_eq!(signal, libc::SIGINT);
-                Err(io::Error::new(io::ErrorKind::PermissionDenied, "denied"))
-            },
-            |_, _| panic!("no disposition was installed"),
-        ) {
-            Ok(_) => panic!("installation must fail"),
-            Err(error) => error,
-        };
-
-        assert_eq!(calls, 1);
-        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
-        assert_eq!(
-            error.to_string(),
-            "cannot install metrics shutdown handler for SIGINT: denied"
-        );
-        assert!(!state.owned.load(Ordering::Acquire));
-    }
-
-    #[test]
-    fn second_install_failure_restores_sigint_and_releases_ownership() {
-        let state = SignalState::new();
-        let mut calls = Vec::new();
-
-        let error = match install_with(
-            &state,
-            &action(0),
-            |signal, replacement| {
-                assert!(calls.len() < 3);
-                calls.push((signal, replacement.sa_flags));
-                if signal == libc::SIGTERM {
-                    Err(io::Error::new(io::ErrorKind::PermissionDenied, "denied"))
+    fn install_failures_restore_only_installed_signals_and_retain_ownership_if_rollback_fails() {
+        for (failed_signal, name, rollback_fails) in [
+            (libc::SIGINT, "SIGINT", false),
+            (libc::SIGTERM, "SIGTERM", false),
+            (libc::SIGTERM, "SIGTERM", true),
+        ] {
+            let state = SignalState::new();
+            let mut calls = Vec::new();
+            let mut reported = Vec::new();
+            let error = match install_with(
+                &state,
+                &action(0),
+                |signal, replacement| {
+                    assert!(calls.len() < 3);
+                    calls.push((signal, replacement.sa_flags));
+                    if calls.len() == 3 && rollback_fails {
+                        Err(io::Error::other("restore denied"))
+                    } else if signal == failed_signal {
+                        Err(io::Error::new(io::ErrorKind::PermissionDenied, "denied"))
+                    } else {
+                        Ok(action(11))
+                    }
+                },
+                |name, error| reported.push((name, error.to_string())),
+            ) {
+                Ok(_) => panic!("installation must fail"),
+                Err(error) => error,
+            };
+            let expected = if failed_signal == libc::SIGINT {
+                vec![(libc::SIGINT, 0)]
+            } else {
+                vec![(libc::SIGINT, 0), (libc::SIGTERM, 0), (libc::SIGINT, 11)]
+            };
+            assert_eq!(calls, expected);
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            let suffix = if rollback_fails {
+                "; rollback incomplete; shutdown signal ownership retained"
+            } else {
+                ""
+            };
+            assert_eq!(
+                error.to_string(),
+                format!("cannot install metrics shutdown handler for {name}: denied{suffix}")
+            );
+            assert_eq!(
+                reported,
+                if rollback_fails {
+                    vec![("SIGINT", "restore denied".to_owned())]
                 } else {
-                    Ok(action(11))
+                    vec![]
                 }
-            },
-            |_, _| panic!("rollback must succeed"),
-        ) {
-            Ok(_) => panic!("installation must fail"),
-            Err(error) => error,
-        };
-
-        assert_eq!(
-            calls,
-            [(libc::SIGINT, 0), (libc::SIGTERM, 0), (libc::SIGINT, 11)]
-        );
-        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
-        assert_eq!(
-            error.to_string(),
-            "cannot install metrics shutdown handler for SIGTERM: denied"
-        );
-        assert!(!state.owned.load(Ordering::Acquire));
+            );
+            assert_eq!(state.owned.load(Ordering::Acquire), rollback_fails);
+        }
     }
 
     #[test]
-    fn rollback_failure_reports_the_signal_and_retains_ownership() {
-        let state = SignalState::new();
-        let mut calls = 0;
-        let mut reported = Vec::new();
-
-        let error = match install_with(
-            &state,
-            &action(0),
-            |_, _| {
-                calls += 1;
-                match calls {
-                    1 => Ok(action(11)),
-                    2 => Err(io::Error::new(io::ErrorKind::PermissionDenied, "denied")),
-                    3 => Err(io::Error::other("restore denied")),
-                    _ => panic!("rollback must not retry indefinitely"),
-                }
-            },
-            |name, error| reported.push((name, error.to_string())),
-        ) {
-            Ok(_) => panic!("installation must fail"),
-            Err(error) => error,
-        };
-
-        assert_eq!(calls, 3);
-        assert_eq!(reported, [("SIGINT", "restore denied".to_owned())]);
-        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
-        assert_eq!(
-            error.to_string(),
-            "cannot install metrics shutdown handler for SIGTERM: denied; rollback incomplete; shutdown signal ownership retained"
-        );
-        assert!(state.owned.load(Ordering::Acquire));
-    }
-
-    #[test]
-    fn restoration_replays_saved_dispositions_in_reverse_order_before_releasing_ownership() {
-        let state = SignalState::new();
-        state.owned.store(true, Ordering::Release);
-        let originals = [Some(action(11)), Some(action(22))];
-        let mut calls = Vec::new();
-
-        let restored = restore_with(
-            &state,
-            &originals,
-            |signal, original| {
-                assert!(state.owned.load(Ordering::Acquire));
-                assert!(calls.len() < 2);
-                calls.push((signal, original.sa_flags));
-                Ok(action(0))
-            },
-            |_, _| panic!("restoration must succeed"),
-        );
-
-        assert!(restored);
-        assert_eq!(calls, [(libc::SIGTERM, 22), (libc::SIGINT, 11)]);
-        assert!(!state.owned.load(Ordering::Acquire));
-    }
-
-    #[test]
-    fn restoration_attempts_both_signals_even_when_either_or_both_fail() {
-        for failures in [[true, false], [false, true], [true, true]] {
+    fn restoration_replays_both_saved_dispositions_and_releases_ownership_only_on_success() {
+        for failures in [[false, false], [true, false], [false, true], [true, true]] {
             let state = SignalState::new();
             state.owned.store(true, Ordering::Release);
             let originals = [Some(action(11)), Some(action(22))];
@@ -251,9 +143,10 @@ mod unix {
             let restored = restore_with(
                 &state,
                 &originals,
-                |signal, _| {
+                |signal, original| {
+                    assert!(state.owned.load(Ordering::Acquire));
                     assert!(calls.len() < 2);
-                    calls.push(signal);
+                    calls.push((signal, original.sa_flags));
                     if failures[usize::from(signal == libc::SIGINT)] {
                         Err(io::Error::other("restore denied"))
                     } else {
@@ -263,8 +156,8 @@ mod unix {
                 |name, error| reported.push((name, error.to_string())),
             );
 
-            assert!(!restored);
-            assert_eq!(calls, [libc::SIGTERM, libc::SIGINT]);
+            assert_eq!(restored, !failures.contains(&true));
+            assert_eq!(calls, [(libc::SIGTERM, 22), (libc::SIGINT, 11)]);
             let expected: Vec<_> = ["SIGTERM", "SIGINT"]
                 .into_iter()
                 .zip(failures)
@@ -272,7 +165,10 @@ mod unix {
                 .map(|(name, _)| (name, "restore denied".to_owned()))
                 .collect();
             assert_eq!(reported, expected);
-            assert!(state.owned.load(Ordering::Acquire));
+            assert_eq!(
+                state.owned.load(Ordering::Acquire),
+                failures.contains(&true)
+            );
         }
     }
 }

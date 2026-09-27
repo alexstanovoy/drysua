@@ -1,187 +1,77 @@
-use std::sync::{
-    Barrier,
-    atomic::{AtomicUsize, Ordering},
-};
+use std::sync::Barrier;
 
 use super::*;
 
 #[test]
-fn active_jobs_run_concurrently_and_return_in_stream_order() {
-    let mut worlds = [10, 20, 30, 40];
+fn persistent_workers_preserve_sparse_order_and_recover_after_errors() {
+    let mut worlds = [0usize; 40];
     let barrier = Barrier::new(2);
-    let results = ordered_active(&mut worlds, vec![(1, 7), (3, 9)], |stream, world, value| {
-        barrier.wait();
-        *world += value;
-        Ok((stream, *world))
-    })
-    .expect("parallel jobs");
-
-    assert_eq!(results, [(1, 27), (3, 49)]);
-    assert_eq!(worlds, [10, 27, 30, 49]);
-}
-
-#[test]
-fn invalid_job_indices_fail_before_any_world_is_modified() {
-    for jobs in [
-        vec![(1, ()), (1, ())],
-        vec![(2, ()), (0, ())],
-        vec![(3, ())],
-    ] {
-        let mut worlds = [0; 3];
-        let error = ordered_active(&mut worlds, jobs, |_, world, _| {
-            *world += 1;
-            Ok(())
-        })
-        .expect_err("invalid schedule");
-
-        assert_eq!(
-            error.to_string(),
-            "invalid PPO config field: parallel episode jobs"
-        );
-        assert_eq!(worlds, [0; 3]);
-    }
-}
-
-#[test]
-fn worker_errors_do_not_abandon_other_jobs() {
-    let mut worlds = [0; 3];
-    let completed = AtomicUsize::new(0);
-    let error = ordered_active(
-        &mut worlds,
-        vec![(0, ()), (1, ()), (2, ())],
-        |stream, world, _| {
-            *world = 1;
-            completed.fetch_add(1, Ordering::Relaxed);
-            if stream == 0 {
-                Err(PpoError::NonFinite("test job"))
-            } else {
-                Ok(())
-            }
-        },
-    )
-    .expect_err("worker error");
-
-    assert_eq!(error, PpoError::NonFinite("test job"));
-    assert_eq!(completed.load(Ordering::Relaxed), 3);
-    assert_eq!(worlds, [1; 3]);
-}
-
-#[test]
-fn worker_panics_are_reported_after_other_workers_are_joined() {
-    let mut worlds = [0; 3];
-    let error = ordered_active(
-        &mut worlds,
-        vec![(0, ()), (1, ()), (2, ())],
-        |stream, world, _| {
-            assert_ne!(stream, 0, "injected worker panic");
-            *world = 1;
-            Ok(())
-        },
-    )
-    .expect_err("worker panic");
-
-    assert_eq!(
-        error.to_string(),
-        "PPO episode worker 0 failed: thread panicked"
-    );
-    assert_eq!(worlds, [0, 1, 1]);
-}
-
-#[test]
-fn empty_and_single_jobs_need_no_parallel_barrier() {
-    let mut worlds = [0];
-    let empty: Vec<()> = ordered_active(&mut worlds, vec![], |_, _, ()| Ok(())).expect("empty");
-    let single = ordered_active(&mut worlds, vec![(0, 7)], |_, world, value| {
-        *world = value;
-        Ok(value)
-    })
-    .expect("single");
-
-    assert!(empty.is_empty());
-    assert_eq!(single, [7]);
-    assert_eq!(worlds, [7]);
-}
-
-#[test]
-fn stream_workers_keep_stream_order_and_survive_one_worker_error() {
-    let mut worlds = [0u32; 4];
     std::thread::scope(|scope| {
+        let barrier = &barrier;
         let workers =
-            StreamWorkers::spawn(scope, &mut worlds, "ppo", |stream, world, request: u32| {
-                if request == 99 {
-                    return Err(PpoError::InvalidConfig("worker failure"));
+            StreamWorkers::spawn(scope, &mut worlds, "ppo", move |stream, world, request| {
+                match request {
+                    0 => return Err(PpoError::InvalidConfig("worker failure")),
+                    1 => {
+                        barrier.wait();
+                    }
+                    _ => {}
                 }
                 *world += request;
                 Ok((stream, *world))
             })
-            .expect("stream workers");
-        workers.submit(0, 5).expect("submit");
-        workers.submit(2, 7).expect("submit");
-        workers.submit(1, 99).expect("submit");
-        workers.submit(3, 9).expect("submit");
-        assert_eq!(
-            workers.receive(&[0, 2, 3]).expect("ordered replies"),
-            [(0, 5), (2, 7), (3, 9)]
-        );
-        assert_eq!(
-            workers
-                .receive(&[1])
-                .expect_err("worker error surfaces")
-                .to_string(),
-            "invalid PPO config field: worker failure"
-        );
-        workers.finish().expect("join");
-    });
-}
-
-#[test]
-fn parallel40_workers_keep_all_streams_and_reject_world41() {
-    let mut worlds = [0usize; 40];
-    std::thread::scope(|scope| {
-        let workers = StreamWorkers::spawn(scope, &mut worlds, "ppo", |stream, world, ()| {
-            *world = stream;
-            Ok(stream)
-        })
-        .expect("forty workers");
-        let streams: Vec<_> = (0..40).collect();
-        for &stream in &streams {
-            workers.submit(stream, ()).expect("submit every stream");
+            .expect("forty workers");
+        for stream in [1, 39] {
+            workers.submit(stream, 1).expect("concurrent requests");
         }
-        assert_eq!(workers.receive(&streams).expect("all replies"), streams);
         assert_eq!(
-            workers.submit(40, ()),
+            workers.receive(&[1, 39]).expect("ordered replies"),
+            [(1, 1), (39, 1)]
+        );
+        workers.submit(0, 0).expect("injected error");
+        workers.submit(39, 2).expect("successful peer");
+        assert_eq!(
+            workers.receive(&[0, 39]),
+            Err(PpoError::InvalidConfig("worker failure"))
+        );
+        for stream in [0, 39] {
+            workers.submit(stream, 2).expect("recovery requests");
+        }
+        assert_eq!(
+            workers.receive(&[0, 39]).expect("drained and recovered"),
+            [(0, 2), (39, 5)]
+        );
+        assert_eq!(
+            workers.submit(40, 2),
             Err(PpoError::InvalidConfig("stream worker index"))
         );
-        workers.finish().expect("join all workers");
+        workers.finish().expect("join");
     });
-    assert_eq!(worlds, std::array::from_fn(|index| index));
-    let mut oversized = [0usize; 41];
-    std::thread::scope(|scope| {
-        assert_eq!(
-            StreamWorkers::spawn(scope, &mut oversized, "ppo", |_, _, ()| Ok(())).err(),
-            Some(PpoError::InvalidConfig("stream worker environments"))
-        );
-    });
+    assert_eq!(worlds[0], 2);
+    assert_eq!(worlds[39], 5);
+    assert!(worlds[2..39].iter().all(|world| *world == 0));
+    super::super::assert_worker_capacity_for_test();
 }
 
 #[test]
-fn stream_workers_match_the_one_shot_executor_on_identical_requests() {
-    let operation = |stream: usize, world: &mut u64, value: u64| {
-        *world = world.wrapping_mul(3).wrapping_add(value + stream as u64);
-        Ok(*world)
-    };
-    let schedule = [(0usize, 4u64), (2, 8), (5, 12)];
-    let mut one_shot = [1u64, 2, 3, 4, 5, 6];
-    let expected = ordered_active(&mut one_shot, schedule.to_vec(), operation).expect("one shot");
-    let mut worlds = [1u64, 2, 3, 4, 5, 6];
-    let actual = std::thread::scope(|scope| {
-        let workers = StreamWorkers::spawn(scope, &mut worlds, "ppo", operation).expect("workers");
-        for (stream, value) in schedule {
-            workers.submit(stream, value).expect("submit");
+fn persistent_worker_panic_surfaces_while_other_replies_remain_drainable() {
+    let mut worlds = [0; 2];
+    std::thread::scope(|scope| {
+        let workers = StreamWorkers::spawn(scope, &mut worlds, "ppo", |stream, world, ()| {
+            assert_ne!(stream, 0, "injected worker panic");
+            *world = 1;
+            Ok(())
+        })
+        .expect("workers");
+        for stream in [0, 1] {
+            workers.submit(stream, ()).expect("submit");
         }
-        let output = workers.receive(&[0, 2, 5]).expect("replies");
-        workers.finish().expect("join");
-        output
+        assert_eq!(
+            workers.receive(&[0]).expect_err("worker panic").to_string(),
+            "PPO episode worker 0 failed: stream worker stopped"
+        );
+        assert_eq!(workers.receive(&[1]).expect("drain peer"), [()]);
+        workers.finish().expect("join all workers");
     });
-    assert_eq!(actual, expected);
+    assert_eq!(worlds, [0, 1]);
 }

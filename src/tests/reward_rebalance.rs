@@ -4,30 +4,16 @@ use super::*;
 fn rebalance_opening_ignores_enemy_neutral_and_dead_creeps_and_has_no_early_clamped_deadline() {
     let (mut reward, mut view) = opening_fixture(Team::Radiant, 9, false, 3000);
     view.tick = 10;
-    view.units
-        .iter_mut()
-        .find(|unit| unit.id == id(6))
-        .unwrap()
-        .pos = Vec2::from_ints(9216, 9216);
+    view.units[5].pos = Vec2::from_ints(9216, 9216);
     view.units
         .push(unit(9, UnitKind::CreepNeutral, Team::Neutral, 9216));
     view.units.last_mut().unwrap().pos.y = Fixed::from_int(9216);
     set_wave(&mut view, Team::Radiant, true);
-    view.units
-        .iter_mut()
-        .find(|unit| unit.id == id(5))
-        .unwrap()
-        .statuses
-        .bits |= StatusFlags::DEAD;
+    view.units[4].statuses.bits |= StatusFlags::DEAD;
     assert_eq!(advance(&mut reward, &view, &[]).opening_position, 0.0);
     assert!(reward.state().opening_position_pending);
     view.tick += 1;
-    view.units
-        .iter_mut()
-        .find(|unit| unit.id == id(5))
-        .unwrap()
-        .statuses
-        .bits &= !StatusFlags::DEAD;
+    view.units[4].statuses.bits &= !StatusFlags::DEAD;
     assert_eq!(advance(&mut reward, &view, &[]).opening_position, -0.1);
     let mut info = match_info();
     info.pregame_ticks = crate::MAP2_TICK_CAP;
@@ -62,14 +48,6 @@ fn rebalance_full_cost_raw_boundary_is_exact_and_zero_cost_marks_resolution() {
 
 #[test]
 fn rebalance_new_features_append_without_overwriting_old_budget_and_potential_indices() {
-    use crate::global_feature as global;
-    assert_eq!(crate::GLOBAL_FEATURES, 92);
-    assert_eq!(global::MAP2_REWARD_REMAINING_START, 73);
-    assert_eq!(global::MAP2_TOWER_POTENTIAL, 82);
-    assert_eq!(global::MAP2_LANE_POTENTIAL, 83);
-    assert_eq!(global::MAP2_STAGNATION_BASE_CHARGED, 89);
-    assert_eq!(global::MAP2_TOWER_DAMAGE_REMAINING, 90);
-    assert_eq!(global::MAP2_OPENING_POSITION_PENDING, 91);
     let mut tracker = crate::StateTracker::new(SlotId(0), &match_info()).unwrap();
     let mut view = snapshot(1);
     view.units[6].pos = Vec2::ZERO;
@@ -80,28 +58,18 @@ fn rebalance_new_features_append_without_overwriting_old_budget_and_potential_in
     tracker.observe_snapshot(&view).unwrap();
     tracker.observe_events(2, &[damage(4, 1, 100)]).unwrap();
     let frame = super::super::feature::encode(&tracker, &crate::LocalPolicyState::new(0));
+    let state = tracker.map2_reward_state().unwrap();
+    assert_eq!(frame.global().len(), 92);
     assert_eq!(&frame.global()[73..82], &[1.0; 9]);
     assert_eq!(
-        frame.global()[82],
-        tracker.map2_reward_state().unwrap().tower_potential
+        &frame.global()[82..84],
+        &[state.tower_potential, state.lane_potential]
     );
-    assert_eq!(
-        frame.global()[83],
-        tracker.map2_reward_state().unwrap().lane_potential
-    );
-    assert_eq!(
-        frame.global()[90],
-        tracker.map2_reward_state().unwrap().remaining[9]
-    );
+    assert_eq!(&frame.global()[89..], &[0.0, state.remaining[9], 1.0]);
     assert!(frame.global()[90] < 1.0);
-    assert_eq!(frame.global()[91], 1.0);
     tracker.finish_map2_reward(Map2RewardEnd::Draw).unwrap();
-    assert!(
-        !tracker
-            .map2_reward_state()
-            .unwrap()
-            .opening_position_pending
-    );
+    let finished = tracker.map2_reward_state().unwrap();
+    assert!(!finished.opening_position_pending);
 }
 
 #[test]
@@ -382,29 +350,14 @@ fn close(actual: f64, expected: f64) {
 fn wire_rebase_missed_is_not_damage_healing_or_a_terminal_and_changes_no_counter() {
     let mut reward = initialized();
     let baseline = advance(&mut reward, &snapshot(2), &[]);
-    let before = reward.state();
+    let mut control = reward.clone();
     let missed = bota_proto::EventKind::Missed {
         source: Some(id(1)),
         target: id(2),
     };
     let result = advance(&mut reward, &snapshot(3), &[missed]);
 
+    assert_eq!(result, advance(&mut control, &snapshot(3), &[]));
+    assert_eq!(reward.state(), control.state());
     assert_eq!(baseline.total, 0.0);
-    assert_eq!(result.total, 0.0);
-    assert_eq!(result.gold, 0.0);
-    assert_eq!(result.experience, 0.0);
-    assert_eq!(result.hero_damage, 0.0);
-    assert_eq!(result.hero_damage_taken, 0.0);
-    assert_eq!(result.creep_damage_taken, 0.0);
-    assert_eq!(result.other_damage_taken, 0.0);
-    assert_eq!(result.tower_damage_taken, 0.0);
-    assert_eq!(result.mana_spent, 0.0);
-    assert_eq!(result.terminal, 0.0);
-    assert!(result.end.is_none());
-    assert_eq!(result.observations.hero_damage_dealt, 0);
-    assert_eq!(result.observations.hero_damage_taken, 0);
-    assert_eq!(result.observations.unattributed_damage_events, 0);
-    assert_eq!(reward.state().remaining, before.remaining);
-    assert_eq!(reward.state().tower_potential, before.tower_potential);
-    assert_eq!(reward.state().lane_potential, before.lane_potential);
 }

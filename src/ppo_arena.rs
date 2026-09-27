@@ -780,13 +780,13 @@ where
     let mut session =
         time_training_scope(TrainingTimingScope::SessionInitialization, None, || {
             TrainingSession::initialize(
-                &settings,
                 device,
                 checkpoint_directory,
                 resume,
                 initial_weights_directory,
                 config,
                 run,
+                settings.resume_provenance,
             )
         })?;
     let start = session.completed_updates;
@@ -795,7 +795,17 @@ where
             "training update target precedes checkpoint",
         ));
     }
-    session.begin_metrics(&settings, checkpoint_directory, resume)?;
+    session.begin_metrics(
+        checkpoint_directory,
+        resume,
+        settings.updates,
+        settings.ppo.environments,
+        if settings.complete_episodes {
+            settings.ppo.environments
+        } else {
+            0
+        },
+    )?;
     if session.migrated_provenance {
         let migration = session.checkpoint_report(None);
         let durable = time_training_checkpoint(session.completed_updates, || {
@@ -869,90 +879,6 @@ impl SmokeCounters {
     }
 }
 
-/// One checkpoint report from the running counters and the latest update.
-pub(crate) fn training_checkpoint_report(
-    counters: &SmokeCounters,
-    completed_updates: u64,
-    optimizer_step: u64,
-    rollout_samples: u64,
-    latest: PpoUpdateReport,
-    cleanup_warning: Option<String>,
-) -> TrainingCheckpointReport {
-    TrainingCheckpointReport {
-        map2_reward: counters.map2_reward,
-        episode_timeouts: counters.episode_timeouts,
-        completed_updates,
-        optimizer_step,
-        rollout_samples,
-        policy_loss: latest.policy_loss,
-        value_loss: latest.value_loss,
-        entropy: latest.entropy,
-        approximate_kl: update_kl(latest),
-        stopped_for_kl: latest.stopped_for_kl,
-        terminal_wins: counters.terminal_wins,
-        terminal_losses: counters.terminal_losses,
-        terminal_draws: counters.terminal_draws,
-        rejected_orders: counters.rejected_orders,
-        elapsed_ticks: counters.elapsed_ticks,
-        cleanup_warning,
-    }
-}
-
-/// Everything one durable checkpoint is captured from.
-pub(crate) struct SessionCheckpoint<'a> {
-    pub(crate) model: &'a PolicyModel,
-    pub(crate) trainer: &'a PpoTrainer,
-    pub(crate) run: &'a CheckpointRun,
-    pub(crate) sampling: &'a PpoRng,
-    pub(crate) completed_updates: u64,
-    pub(crate) rollout_samples: u64,
-    pub(crate) mastery: Option<crate::MasteryProgress>,
-}
-
-/// Captures and commits one durable checkpoint plus the runtime weights.
-pub(crate) fn save_training_artifact(
-    session: SessionCheckpoint<'_>,
-    directory: &Path,
-    report: TrainingCheckpointReport,
-) -> Result<TrainingCheckpointReport, PpoError> {
-    let (state, draws) = session.sampling.checkpoint();
-    let progress = CheckpointProgress {
-        mastery: session.mastery,
-        global_update: session.completed_updates,
-        policy_version: session.completed_updates,
-        scheduler_step: session.completed_updates,
-        curriculum_stage: 0,
-        rollout_samples: session.rollout_samples,
-        best_evaluation: None,
-        rng_states: vec![
-            RngCheckpoint::new("ppo_actor_sampling", state, draws).map_err(text_error)?,
-        ],
-        league_references: Vec::new(),
-    };
-    let artifact = TrainingArtifact::capture(
-        session.model,
-        session.trainer,
-        session.run.clone(),
-        progress,
-    )
-    .map_err(text_error)?;
-    let outcome = artifact.save(directory).map_err(text_error)?;
-    TrainingArtifact::save_runtime_weights_with_budget(
-        session.model,
-        directory,
-        session.trainer.config().sample_budget,
-    )
-    .map_err(text_error)?;
-    let cleanup_warning = match outcome {
-        CheckpointSaveOutcome::Committed => None,
-        CheckpointSaveOutcome::CommittedWithCleanupError(message) => Some(message),
-    };
-    Ok(TrainingCheckpointReport {
-        cleanup_warning,
-        ..report
-    })
-}
-
 /// The device name recorded in a run scope.
 pub(crate) fn device_name(device: PolicyDevice) -> &'static str {
     match device {
@@ -964,15 +890,7 @@ pub(crate) fn device_name(device: PolicyDevice) -> &'static str {
     }
 }
 
-struct RestoredTrainingSession {
-    trainer: PpoTrainer,
-    sampling: PpoRng,
-    completed_updates: u64,
-    rollout_samples: u64,
-    migrated_provenance: bool,
-    mastery: Option<crate::MasteryProgress>,
-}
-
+/// Checkpoint-owned state shared by both orchestrators; collectors remain mode-specific.
 struct TrainingSession {
     mastery: Option<crate::MasteryProgress>,
     counters: SmokeCounters,
@@ -990,9 +908,11 @@ struct TrainingSession {
 impl TrainingSession {
     fn begin_metrics(
         &self,
-        settings: &TrainingJobConfig,
         directory: &Path,
         resume: bool,
+        updates_target: u64,
+        parallel: usize,
+        games_per_update: usize,
     ) -> Result<(), PpoError> {
         prometheus::begin_training(
             &self.run,
@@ -1003,13 +923,9 @@ impl TrainingSession {
                 completed_updates: self.completed_updates,
                 samples: self.rollout_samples,
                 optimizer_steps: self.trainer.optimizer_step(),
-                updates_target: settings.updates,
-                parallel: settings.ppo.environments,
-                games_per_update: if settings.complete_episodes {
-                    settings.ppo.environments
-                } else {
-                    0
-                },
+                updates_target,
+                parallel,
+                games_per_update,
             },
         )
         .map_err(text_error)
@@ -1052,30 +968,30 @@ impl TrainingSession {
     }
 
     fn initialize(
-        settings: &TrainingJobConfig,
         device: PolicyDevice,
         directory: &Path,
         resume: bool,
         initial_weights_directory: Option<&Path>,
         config: PpoConfig,
         run: CheckpointRun,
+        provenance: ResumeProvenance,
     ) -> Result<Self, PpoError> {
-        let model = PolicyModel::fresh_on(settings.seed, device).map_err(text_error)?;
+        let model = PolicyModel::fresh_on(run.run_seed, device).map_err(text_error)?;
         if !resume && let Some(initial_weights_directory) = initial_weights_directory {
             TrainingArtifact::load_runtime_weights(&model, initial_weights_directory)
                 .map_err(text_error)?;
         }
         let restored = if resume {
-            restore_training_session(&model, directory, &run, config, settings.resume_provenance)?
+            restore_training_session(&model, directory, &run, config, provenance)?
         } else {
-            let trainer = PpoTrainer::new(&model, config, settings.seed ^ 0x51a9)?;
+            let trainer = PpoTrainer::new(&model, config, run.run_seed ^ 0x51a9)?;
             RestoredTrainingSession {
                 trainer,
-                sampling: PpoRng::new(settings.seed ^ 0xa17e),
+                sampling: PpoRng::new(run.run_seed ^ 0xa17e),
                 completed_updates: 0,
                 rollout_samples: 0,
                 migrated_provenance: false,
-                mastery: settings
+                mastery: run
                     .mastery_config
                     .map(|_| crate::MasteryProgress::default()),
             }
@@ -1254,30 +1170,59 @@ impl TrainingSession {
         directory: &Path,
         report: TrainingCheckpointReport,
     ) -> Result<TrainingCheckpointReport, PpoError> {
-        save_training_artifact(
-            SessionCheckpoint {
-                model: &self.model,
-                trainer: &self.trainer,
-                run: &self.run,
-                sampling: &self.sampling,
-                completed_updates: self.completed_updates,
-                rollout_samples: self.rollout_samples,
-                mastery: self.mastery.clone(),
-            },
+        let (state, draws) = self.sampling.checkpoint();
+        let progress = CheckpointProgress {
+            mastery: self.mastery.clone(),
+            global_update: self.completed_updates,
+            policy_version: self.completed_updates,
+            scheduler_step: self.completed_updates,
+            curriculum_stage: 0,
+            rollout_samples: self.rollout_samples,
+            best_evaluation: None,
+            rng_states: vec![
+                RngCheckpoint::new("ppo_actor_sampling", state, draws).map_err(text_error)?,
+            ],
+            league_references: Vec::new(),
+        };
+        let artifact =
+            TrainingArtifact::capture(&self.model, &self.trainer, self.run.clone(), progress)
+                .map_err(text_error)?;
+        let outcome = artifact.save(directory).map_err(text_error)?;
+        TrainingArtifact::save_runtime_weights_with_budget(
+            &self.model,
             directory,
-            report,
+            self.trainer.config().sample_budget,
         )
+        .map_err(text_error)?;
+        let cleanup_warning = match outcome {
+            CheckpointSaveOutcome::Committed => None,
+            CheckpointSaveOutcome::CommittedWithCleanupError(message) => Some(message),
+        };
+        Ok(TrainingCheckpointReport {
+            cleanup_warning,
+            ..report
+        })
     }
 
     fn checkpoint_report(&self, cleanup_warning: Option<String>) -> TrainingCheckpointReport {
-        training_checkpoint_report(
-            &self.counters,
-            self.completed_updates,
-            self.trainer.optimizer_step(),
-            self.rollout_samples,
-            self.latest,
+        TrainingCheckpointReport {
+            map2_reward: self.counters.map2_reward,
+            episode_timeouts: self.counters.episode_timeouts,
+            completed_updates: self.completed_updates,
+            optimizer_step: self.trainer.optimizer_step(),
+            rollout_samples: self.rollout_samples,
+            policy_loss: self.latest.policy_loss,
+            value_loss: self.latest.value_loss,
+            entropy: self.latest.entropy,
+            approximate_kl: update_kl(self.latest),
+            stopped_for_kl: self.latest.stopped_for_kl,
+            terminal_wins: self.counters.terminal_wins,
+            terminal_losses: self.counters.terminal_losses,
+            terminal_draws: self.counters.terminal_draws,
+            rejected_orders: self.counters.rejected_orders,
+            elapsed_ticks: self.counters.elapsed_ticks,
             cleanup_warning,
-        )
+        }
     }
 
     fn report(&self) -> TrainingJobReport {
@@ -1627,43 +1572,27 @@ fn restore_training_session(
     config: PpoConfig,
     provenance: ResumeProvenance,
 ) -> Result<RestoredTrainingSession, PpoError> {
-    let parts = match provenance {
-        ResumeProvenance::Strict => restore_strict_session(model, directory, run, config)?,
+    match provenance {
+        ResumeProvenance::Strict => {
+            let artifact = TrainingArtifact::load_compatible(directory, run).map_err(text_error)?;
+            restore_loaded_session(model, artifact, run, config, false)
+        }
         ResumeProvenance::MigrateGitCommit => {
             let artifact = TrainingArtifact::load(directory).map_err(text_error)?;
             let restore_run = artifact.run().clone();
             validate_provenance_migration(&restore_run, run)?;
-            restore_loaded_session(model, artifact, &restore_run, config, true)?
+            restore_loaded_session(model, artifact, &restore_run, config, true)
         }
-    };
-    let progress = parts.progress;
-    Ok(RestoredTrainingSession {
-        trainer: parts.trainer,
-        sampling: parts.sampling,
-        completed_updates: progress.global_update,
-        rollout_samples: progress.rollout_samples,
-        migrated_provenance: parts.migrated,
-        mastery: progress.mastery,
-    })
+    }
 }
 
-/// One restored strict session's parts.
-pub(crate) struct RestoredSessionParts {
-    pub(crate) trainer: PpoTrainer,
-    pub(crate) sampling: PpoRng,
-    pub(crate) progress: CheckpointProgress,
-    pub(crate) migrated: bool,
-}
-
-/// Restores a checkpoint whose run scope must match exactly.
-pub(crate) fn restore_strict_session(
-    model: &PolicyModel,
-    directory: &Path,
-    run: &CheckpointRun,
-    config: PpoConfig,
-) -> Result<RestoredSessionParts, PpoError> {
-    let artifact = TrainingArtifact::load_compatible(directory, run).map_err(text_error)?;
-    restore_loaded_session(model, artifact, run, config, false)
+struct RestoredTrainingSession {
+    trainer: PpoTrainer,
+    sampling: PpoRng,
+    completed_updates: u64,
+    rollout_samples: u64,
+    migrated_provenance: bool,
+    mastery: Option<crate::MasteryProgress>,
 }
 
 /// Restores one already loaded artifact and checks the session invariants.
@@ -1673,7 +1602,7 @@ fn restore_loaded_session(
     restore_run: &CheckpointRun,
     config: PpoConfig,
     migrated: bool,
-) -> Result<RestoredSessionParts, PpoError> {
+) -> Result<RestoredTrainingSession, PpoError> {
     if artifact.config() != config {
         return Err(PpoError::InvalidConfig("training checkpoint PPO config"));
     }
@@ -1687,11 +1616,13 @@ fn restore_loaded_session(
     let sampling = restore_sampling_rng(&progress.rng_states)?;
     let progress = progress.clone();
     let (trainer, _, _) = restored.into_parts();
-    Ok(RestoredSessionParts {
+    Ok(RestoredTrainingSession {
         trainer,
         sampling,
-        progress,
-        migrated,
+        completed_updates: progress.global_update,
+        rollout_samples: progress.rollout_samples,
+        migrated_provenance: migrated,
+        mastery: progress.mastery,
     })
 }
 
@@ -2531,23 +2462,6 @@ fn requests_for_decision_in_space(
     Ok(requests)
 }
 
-#[cfg(test)]
-fn requests_for_neural_greedy_decision(
-    environment: &mut TrainingEnvironment,
-    model: &PolicyModel,
-) -> Result<(Vec<Option<Request>>, ActionKind), PpoError> {
-    assert!(environment.policy_seat < environment.seats.len());
-    let (frame, space) = prepare_policy_sample(environment)?;
-    let choice = model.choose(&frame, &space).map_err(text_error)?;
-    assert!(space.allows(choice.action));
-    let (action, request) = neural_policy_request_in_space(
-        &mut environment.seats[environment.policy_seat],
-        choice.action,
-        &space,
-    )?;
-    Ok((requests_with_candidate(environment, request)?, action))
-}
-
 fn neural_policy_request_in_space(
     seat: &mut ArenaSeatPolicy,
     proposed: crate::StructuredAction,
@@ -2698,11 +2612,6 @@ fn teacher_request_with_action(
         .map_err(|error| PpoError::Model(error.to_string()))?;
     let request = issue_request(seat, issued, &space, action_kind, true)?;
     Ok((action_kind, request))
-}
-
-#[cfg(test)]
-const fn deployment_uses_teacher(map: MapId) -> bool {
-    matches!(map, MapId(0))
 }
 
 fn issue_request(

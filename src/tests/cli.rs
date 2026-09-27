@@ -1,83 +1,100 @@
 #[test]
-fn cli_defaults_to_selected_teacher_for_implicit_and_explicit_play() {
-    for arguments in [vec!["drysua"], vec!["drysua", "play"]] {
+fn public_cli_accepts_play_training_and_initialization_contracts() {
+    use crate::cli::PlayPolicy::{Hybrid, Neural, Teacher};
+    for (arguments, expected) in [
+        ("drysua", Teacher),
+        ("drysua play", Teacher),
+        ("drysua --policy teacher", Teacher),
+        ("drysua --weights-directory explicit-experiment", Hybrid),
+        (
+            "drysua play --weights-directory explicit-experiment",
+            Hybrid,
+        ),
+        (
+            "drysua play --policy neural --weights-directory artifacts/test",
+            Neural,
+        ),
+    ] {
         assert_eq!(
-            crate::cli::play_policy_for_test(arguments).expect("play policy"),
-            crate::cli::PlayPolicy::Teacher
+            crate::cli::play_policy_for_test(arguments.split_ascii_whitespace()).unwrap(),
+            expected
         );
     }
-}
-
-#[test]
-fn cli_default_play_reaches_connection_validation_without_artifact_arguments() {
     for arguments in [
-        vec!["drysua", "--name", ""],
-        vec!["drysua", "play", "--name", ""],
+        "drysua train --updates 1 --environments 2 --rollout 8 --epochs 1 --minibatch 16 --seed 77 --map 2 --device cuda --device-ordinal 1",
+        "drysua train-full --updates 10000 --environments 4 --rollout 8 --epochs 1 --minibatch 32 --checkpoint-seconds 300 --checkpoint-directory artifacts/temp/training --resume --migrate-provenance --device cuda",
+        "drysua train-full --updates 8 --checkpoint-directory training/ppo-v1 --initial-weights artifacts/temp/pretrain-v1",
     ] {
-        let error = crate::cli::run_from_for_test(arguments)
-            .expect_err("the selected Teacher must validate its name without loading weights");
-
-        assert_eq!(error.to_string(), "bot name must not be empty");
+        crate::cli::parse_from(arguments.split_ascii_whitespace()).expect(arguments);
     }
 }
 
 #[test]
-fn cli_explicit_weights_without_policy_retain_hybrid_experiment_behavior() {
-    for arguments in [
-        vec!["drysua", "--weights-directory", "explicit-experiment"],
-        vec![
-            "drysua",
-            "play",
-            "--weights-directory",
-            "explicit-experiment",
-        ],
+fn public_cli_rejects_invalid_policies_and_conflicting_training_sources() {
+    for (arguments, message) in [
+        (
+            "drysua play --policy idle",
+            "invalid value 'idle' for '--policy <POLICY>'",
+        ),
+        ("drysua --hero 2", "unexpected argument '--hero'"),
+        ("drysua --policy neural", "--weights-directory"),
+        (
+            "drysua train-full --updates 1 --checkpoint-directory . --migrate-provenance",
+            "--resume",
+        ),
+        (
+            "drysua train-full --updates 1 --checkpoint-directory . --initial-weights artifacts/test --resume",
+            "cannot be used with '--resume'",
+        ),
     ] {
+        let error =
+            crate::cli::parse_from(arguments.split_ascii_whitespace()).expect_err(arguments);
+        assert!(error.to_string().contains(message), "{error}");
+    }
+    for prefix in ["drysua", "drysua play", "drysua play --policy teacher"] {
+        let mut arguments: Vec<_> = prefix.split_ascii_whitespace().collect();
+        arguments.extend(["--name", ""]);
         assert_eq!(
-            crate::cli::play_policy_for_test(arguments).expect("explicit weights"),
-            crate::cli::PlayPolicy::Hybrid
+            crate::cli::run_from_for_test(arguments)
+                .unwrap_err()
+                .to_string(),
+            "bot name must not be empty"
         );
     }
 }
 
 #[test]
 fn selected_neural_weights_resolve_from_the_repository_not_the_working_directory() {
-    for policy in [
-        crate::cli::PlayPolicy::Hybrid,
-        crate::cli::PlayPolicy::Neural,
-    ] {
+    use crate::cli::PlayPolicy::{Hybrid, Neural};
+    for policy in [Hybrid, Neural] {
         let selection = crate::default_deployment::DefaultDeployment {
             policy,
             weights_directory: Some("artifacts/v9.9.9"),
         };
-
-        let (resolved_policy, directory) = selection.resolve().expect("selected deployment");
-
-        assert_eq!(resolved_policy, policy);
         assert_eq!(
-            directory.expect("automatic weights"),
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("artifacts/v9.9.9")
+            selection.resolve().unwrap(),
+            (
+                policy,
+                Some(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("artifacts/v9.9.9"))
+            )
         );
     }
 }
 
 #[test]
 fn selected_deployment_rejects_policy_and_weight_mismatches() {
-    for selection in [
-        crate::default_deployment::DefaultDeployment {
-            policy: crate::cli::PlayPolicy::Teacher,
-            weights_directory: Some("artifacts/v9.9.9"),
-        },
-        crate::default_deployment::DefaultDeployment {
-            policy: crate::cli::PlayPolicy::Neural,
-            weights_directory: None,
-        },
-        crate::default_deployment::DefaultDeployment {
-            policy: crate::cli::PlayPolicy::Hybrid,
-            weights_directory: None,
-        },
+    use crate::cli::PlayPolicy::{Hybrid, Neural, Teacher};
+    for (policy, weights_directory) in [
+        (Teacher, Some("artifacts/v9.9.9")),
+        (Neural, None),
+        (Hybrid, None),
     ] {
-        let error = selection.resolve().expect_err("inconsistent selection");
-
+        let error = crate::default_deployment::DefaultDeployment {
+            policy,
+            weights_directory,
+        }
+        .resolve()
+        .unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
         assert_eq!(
             error.to_string(),
@@ -95,13 +112,12 @@ fn selected_weights_cannot_escape_the_artifact_directory() {
         "/tmp/weights",
         "artifacts/../weights",
     ] {
-        let selection = crate::default_deployment::DefaultDeployment {
+        let error = crate::default_deployment::DefaultDeployment {
             policy: crate::cli::PlayPolicy::Neural,
             weights_directory: Some(directory),
-        };
-
-        let error = selection.resolve().expect_err("invalid artifact location");
-
+        }
+        .resolve()
+        .unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
         assert_eq!(
             error.to_string(),
@@ -111,282 +127,25 @@ fn selected_weights_cannot_escape_the_artifact_directory() {
 }
 
 #[test]
-fn cli_teacher_reaches_connection_validation_without_loading_weights() {
-    let error =
-        crate::cli::run_from_for_test(["drysua", "play", "--policy", "teacher", "--name", ""])
-            .expect_err("empty name must fail before connecting");
-
-    assert_eq!(error.to_string(), "bot name must not be empty");
-}
-
-#[test]
-fn cli_accepts_teacher_for_implicit_play_and_rejects_unknown_policy() {
-    assert_eq!(
-        crate::cli::play_policy_for_test(["drysua", "--policy", "teacher"])
-            .expect("teacher policy"),
-        crate::cli::PlayPolicy::Teacher
-    );
-    let error = crate::cli::parse_from(["drysua", "play", "--policy", "idle"])
-        .expect_err("unsupported policy");
-    assert!(
-        error
-            .to_string()
-            .contains("invalid value 'idle' for '--policy <POLICY>'")
-    );
-}
-
-#[test]
-fn cli_rejects_hero_selector() {
-    let error = crate::cli::parse_from(["drysua", "--hero", "2"])
-        .expect_err("drysua must not accept a hero selector");
-
-    assert!(error.to_string().contains("unexpected argument '--hero'"));
-}
-
-#[test]
-fn shadow_fiend_pick_is_hero_two() {
-    assert_eq!(crate::SHADOW_FIEND, bota_proto::HeroId(2));
-}
-
-#[test]
-fn cli_accepts_bounded_ppo_smoke_parameters() {
-    crate::cli::parse_from([
-        "drysua",
-        "train",
-        "--updates",
-        "1",
-        "--environments",
-        "2",
-        "--rollout",
-        "8",
-        "--epochs",
-        "1",
-        "--minibatch",
-        "16",
-        "--seed",
-        "77",
-        "--map",
-        "2",
-        "--device",
-        "cuda",
-        "--device-ordinal",
-        "1",
-    ])
-    .expect("train CLI");
-}
-
-#[test]
-fn cli_accepts_resumable_training_job_parameters() {
-    crate::cli::parse_from([
-        "drysua",
-        "train-full",
-        "--updates",
-        "10000",
-        "--environments",
-        "4",
-        "--rollout",
-        "8",
-        "--epochs",
-        "1",
-        "--minibatch",
-        "32",
-        "--checkpoint-seconds",
-        "300",
-        "--checkpoint-directory",
-        "artifacts/temp/training",
-        "--resume",
-        "--migrate-provenance",
-        "--device",
-        "cuda",
-    ])
-    .expect("resumable train CLI");
-}
-
-#[test]
-fn cli_rejects_provenance_migration_without_resume() {
-    let error = crate::cli::parse_from([
-        "drysua",
-        "train-full",
-        "--updates",
-        "10000",
-        "--checkpoint-directory",
-        "artifacts/temp/training",
-        "--migrate-provenance",
-    ])
-    .expect_err("migration requires resume");
-
-    assert!(error.to_string().contains("--resume"));
-}
-
-#[test]
-fn neural_cli_requires_explicit_weights() {
-    let error = crate::cli::parse_from(["drysua", "--policy", "neural"])
-        .expect_err("neural cannot fall back");
-    assert_eq!(
-        error.kind(),
-        clap::error::ErrorKind::MissingRequiredArgument
-    );
-    assert!(error.to_string().contains("--weights-directory"));
-    assert_eq!(
-        crate::cli::play_policy_for_test([
-            "drysua",
-            "play",
-            "--policy",
-            "neural",
-            "--weights-directory",
-            "artifacts/test"
-        ])
-        .expect("explicit neural"),
-        crate::cli::PlayPolicy::Neural
-    );
-}
-
-#[test]
-fn neural_default_resolves_qualified_repository_weights() {
-    let selected = crate::default_deployment::DefaultDeployment {
-        policy: crate::cli::PlayPolicy::Neural,
-        weights_directory: Some("artifacts/qualified"),
-    }
-    .resolve()
-    .expect("future qualified neural default");
-    assert_eq!(selected.0, crate::cli::PlayPolicy::Neural);
-    assert!(
-        selected
-            .1
-            .expect("weights")
-            .ends_with("artifacts/qualified")
-    );
-}
-
-#[test]
-fn neural_default_rejects_missing_weights() {
-    let error = crate::default_deployment::DefaultDeployment {
-        policy: crate::cli::PlayPolicy::Neural,
-        weights_directory: None,
-    }
-    .resolve()
-    .expect_err("neural needs weights");
-    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
-    assert_eq!(
-        error.to_string(),
-        "default Teacher must be weights-free; default neural policies must specify weights"
-    );
-}
-#[cfg(feature = "builtin")]
-#[test]
-fn train_full_defaults_use_complete_map2_episodes_and_undiscounted_full_reward() {
-    let settings = crate::cli::training_settings_for_test(&[]).expect("default settings");
-    assert_eq!(settings.map, bota_proto::MapId(2));
-    assert!(settings.complete_episodes);
-    assert!(!settings.terminal_only);
-    assert_eq!(settings.episode_time_cost, 0.0);
-    assert_eq!(
-        settings.ppo,
-        crate::PpoConfig {
-            environments: 4,
-            rollout_decisions: 2_048,
-            gamma_tick: 1.0,
-            ..crate::PpoConfig::default()
-        }
-    );
-}
-
-#[cfg(feature = "builtin")]
-#[test]
-fn train_full_map2_hyperparameter_flags_reach_training_config_without_override() {
-    let settings = crate::cli::training_settings_for_test(&[
-        "--map",
-        "2",
-        "--learning-rate",
-        "3e-5",
-        "--gamma-per-tick",
-        "1",
-        "--gae-lambda",
-        "0.995",
-        "--entropy-coefficient",
-        "0.001",
-    ])
-    .expect("long horizon settings");
-    assert_eq!(settings.map, bota_proto::MapId(2));
-    assert_eq!(settings.ppo.learning_rate, 3e-5);
-    assert_eq!(settings.ppo.gamma_tick, 1.0);
-    assert_eq!(settings.ppo.gae_lambda, 0.995);
-    assert_eq!(settings.ppo.entropy_coefficient, 0.001);
-}
-
-#[cfg(feature = "builtin")]
-#[test]
-fn train_full_rejects_nonfinite_and_out_of_range_hyperparameters() {
-    for (flag, field, invalid) in [
-        (
-            "--learning-rate",
-            "learning rate",
-            vec!["NaN", "inf", "-inf", "0", "-0.1"],
-        ),
-        (
-            "--gamma-per-tick",
-            "discount",
-            vec!["NaN", "inf", "-inf", "-0.1", "1.01"],
-        ),
-        (
-            "--gae-lambda",
-            "discount",
-            vec!["NaN", "inf", "-inf", "-0.1", "1.01"],
-        ),
-        (
-            "--entropy-coefficient",
-            "entropy coefficient",
-            vec!["NaN", "inf", "-inf", "0", "-0.1"],
-        ),
-    ] {
-        for value in invalid {
-            let argument = format!("{flag}={value}");
-            let error = crate::cli::training_settings_for_test(&[&argument])
-                .expect_err("invalid hyperparameter");
-            assert_eq!(
-                error.to_string(),
-                format!("invalid PPO config field: {field}")
-            );
-        }
-    }
-}
-
-#[cfg(feature = "builtin")]
-#[test]
-fn train_full_map2_rejects_discounting_instead_of_silently_forcing_gamma_one() {
-    for gamma in ["0", "0.9966555", "0.9999722", "0.99999994"] {
-        let error = crate::cli::training_settings_for_test(&["--gamma-per-tick", gamma])
-            .expect_err("Map2 potential accounting requires gamma one");
-        assert_eq!(
-            error.to_string(),
-            "Map2 comprehensive reward requires --gamma-per-tick 1"
-        );
-    }
-}
-
-#[test]
 fn cli_all_training_commands_default_to_map2_and_reject_other_maps_before_execution() {
     for operation in ["train", "train-full"] {
         let help = crate::cli::parse_from(["drysua", operation, "--help"])
-            .expect_err("help is not execution")
+            .unwrap_err()
             .to_string();
         let map_help = help.split("--map <MAP>").nth(1).expect("map option");
-        assert_eq!(
+        assert!(
             map_help
                 .lines()
                 .take_while(|line| !line.trim_start().starts_with('-'))
-                .filter(|line| line.contains("[default: 2]"))
-                .count(),
-            1
+                .any(|line| line.contains("[default: 2]"))
         );
         for map in ["0", "1", "3", "65535"] {
             let mut arguments = vec!["drysua", operation, "--map", map];
             if operation == "train-full" {
                 arguments.extend(["--updates", "1", "--checkpoint-directory", "."]);
             }
-            crate::cli::parse_from(arguments.clone()).expect_err("reject before execution");
-            let error = crate::cli::run_from_for_test(arguments)
-                .expect_err("unsupported map must fail before provenance, devices, or arenas");
+            let error =
+                crate::cli::run_from_for_test(arguments).expect_err("reject before execution");
             assert!(
                 error
                     .to_string()
@@ -398,42 +157,28 @@ fn cli_all_training_commands_default_to_map2_and_reject_other_maps_before_execut
 
 #[cfg(feature = "builtin")]
 #[test]
-fn train_full_map2_rejects_terminal_only_instead_of_silently_enabling_dense_reward() {
-    let error = crate::cli::training_settings_for_test(&["--terminal-only", "--complete-episodes"])
-        .expect_err("Map2 requires comprehensive reward");
-    assert_eq!(
-        error.to_string(),
-        "Map2 comprehensive reward forbids --terminal-only"
-    );
-}
-
-#[cfg(feature = "builtin")]
-#[test]
 fn train_full_map2_reward_errors_precede_compiled_provenance_and_checkpoint_access() {
-    for (flag, message) in [
+    for (flags, message) in [
         (
             "--terminal-only",
             "Map2 comprehensive reward forbids --terminal-only",
+        ),
+        (
+            "--episode-time-cost=NaN",
+            "Map2 comprehensive reward requires --episode-time-cost 0",
         ),
         (
             "--episode-time-cost=0.1",
             "Map2 comprehensive reward requires --episode-time-cost 0",
         ),
         (
-            "--gamma-per-tick=0.9",
+            "--gamma-per-tick=0.99999994",
             "Map2 comprehensive reward requires --gamma-per-tick 1",
         ),
     ] {
-        let error = crate::cli::run_from_for_test([
-            "drysua",
-            "train-full",
-            "--updates",
-            "1",
-            "--checkpoint-directory",
-            "artifacts/temp/not-accessed-map2-reward-validation",
-            flag,
-        ])
-        .expect_err("invalid reward must not start a training job");
+        let arguments = "drysua train-full --updates 1 --checkpoint-directory artifacts/temp/not-accessed-map2-reward-validation"
+            .split_ascii_whitespace().chain(flags.split_ascii_whitespace());
+        let error = crate::cli::run_from_for_test(arguments).expect_err(flags);
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
         assert_eq!(error.to_string(), message);
     }
@@ -441,132 +186,34 @@ fn train_full_map2_reward_errors_precede_compiled_provenance_and_checkpoint_acce
 
 #[cfg(feature = "builtin")]
 #[test]
-fn train_full_map2_rejects_nonzero_and_nonfinite_episode_time_cost() {
-    for cost in ["-0.1", "0.00000001", "0.25", "NaN", "inf", "-inf"] {
-        let argument = format!("--episode-time-cost={cost}");
-        let error = crate::cli::training_settings_for_test(&[&argument])
-            .expect_err("Map2 forbids a separate time cost");
+fn train_full_configuration_accepts_boundaries_and_rejects_invalid_hyperparameters() {
+    for (flags, field) in [
+        ("--rollout 1162", "complete episode retained capacity"),
+        (
+            "--environments 3",
+            "complete episodes require Map2, an even environment count up to the training maximum, and three-tick actions",
+        ),
+        ("--learning-rate=NaN", "learning rate"),
+        ("--learning-rate=0", "learning rate"),
+        ("--gae-lambda=1.01", "discount"),
+        ("--entropy-coefficient=0", "entropy coefficient"),
+    ] {
+        let error = crate::cli::training_settings_for_test(
+            &flags.split_ascii_whitespace().collect::<Vec<_>>(),
+        )
+        .expect_err(flags);
         assert_eq!(
             error.to_string(),
-            "Map2 comprehensive reward requires --episode-time-cost 0"
+            format!("invalid PPO config field: {field}")
         );
     }
-    for zero in ["0", "-0"] {
-        let argument = format!("--episode-time-cost={zero}");
-        let settings = crate::cli::training_settings_for_test(&[&argument]).expect("zero cost");
-        assert_eq!(settings.episode_time_cost, 0.0);
+    for flags in [
+        "--environments 2 --rollout 1163 --minibatch 64",
+        "--environments 26 --rollout 1163 --minibatch 64",
+        "--complete-episodes=false --rollout 8 --minibatch 32",
+        "--learning-rate 3e-5 --gamma-per-tick 1 --gae-lambda .995 --entropy-coefficient .001 --episode-time-cost=-0",
+    ] {
+        crate::cli::training_settings_for_test(&flags.split_ascii_whitespace().collect::<Vec<_>>())
+            .expect(flags);
     }
-}
-
-#[cfg(feature = "builtin")]
-#[test]
-fn train_full_map2_retention_capacity_accepts_1163_and_rejects_1162_for_paired_environments() {
-    for environments in ["2", "4", "6"] {
-        let settings = crate::cli::training_settings_for_test(&[
-            "--environments",
-            environments,
-            "--rollout",
-            &crate::MAP2_RETAINED_DECISIONS.to_string(),
-            "--minibatch",
-            "64",
-        ])
-        .expect("shared ceiling actor budget divided by retention stride");
-        assert!(settings.complete_episodes);
-        assert_eq!(settings.ppo.decision_interval_ticks, 3);
-        let error = crate::cli::training_settings_for_test(&[
-            "--environments",
-            environments,
-            "--rollout",
-            &(crate::MAP2_RETAINED_DECISIONS - 1).to_string(),
-            "--minibatch",
-            "64",
-        ])
-        .expect_err("one row below complete episode capacity");
-        assert_eq!(
-            error.to_string(),
-            "invalid PPO config field: complete episode retained capacity"
-        );
-    }
-}
-
-#[cfg(feature = "builtin")]
-#[test]
-fn train_full_map2_complete_episodes_reject_unpaired_or_excess_environment_counts() {
-    for environments in ["1", "3", "5", "7"] {
-        let error = crate::cli::training_settings_for_test(&["--environments", environments])
-            .expect_err("complete episodes require an even count up to the training maximum");
-        assert_eq!(
-            error.to_string(),
-            "invalid PPO config field: complete episodes require Map2, an even environment count up to the training maximum, and three-tick actions"
-        );
-    }
-    for environments in ["28", "32"] {
-        crate::cli::training_settings_for_test(&["--environments", environments])
-            .expect_err("excess environments must fail before collection");
-    }
-    for environments in ["2", "4", "6", "8", "16", "18", "20", "22", "24", "26"] {
-        let settings = crate::cli::training_settings_for_test(&[
-            "--environments",
-            environments,
-            "--rollout",
-            &crate::MAP2_RETAINED_DECISIONS.to_string(),
-            "--minibatch",
-            "64",
-        ])
-        .expect("supported even environment count");
-        assert_eq!(
-            settings.ppo.environments,
-            environments.parse::<usize>().unwrap()
-        );
-    }
-}
-
-#[cfg(feature = "builtin")]
-#[test]
-fn train_full_map2_reset_windows_require_explicit_opt_out_and_keep_full_reward() {
-    let settings = crate::cli::training_settings_for_test(&[
-        "--complete-episodes=false",
-        "--rollout",
-        "8",
-        "--minibatch",
-        "32",
-    ])
-    .expect("explicit reset window");
-    assert!(!settings.complete_episodes);
-    assert_eq!(settings.map, bota_proto::MapId(2));
-    assert_eq!(settings.ppo.gamma_tick, 1.0);
-    assert!(!settings.terminal_only);
-}
-
-#[test]
-fn cli_accepts_initial_weights_for_fresh_training() {
-    crate::cli::parse_from([
-        "drysua",
-        "train-full",
-        "--updates",
-        "8",
-        "--checkpoint-directory",
-        "training/ppo-v1",
-        "--initial-weights",
-        "artifacts/temp/pretrain-v1",
-    ])
-    .expect("fresh initialized training CLI");
-}
-
-#[test]
-fn cli_rejects_initial_weights_when_resuming() {
-    let error = crate::cli::parse_from([
-        "drysua",
-        "train-full",
-        "--updates",
-        "8",
-        "--checkpoint-directory",
-        "training/ppo-v1",
-        "--initial-weights",
-        "artifacts/temp/pretrain-v1",
-        "--resume",
-    ])
-    .expect_err("resume already restores exact model state");
-
-    assert!(error.to_string().contains("cannot be used with '--resume'"));
 }

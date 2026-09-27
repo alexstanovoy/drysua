@@ -21,13 +21,22 @@ fn assert_folded_ppo(device: PolicyDevice) {
         .claim_optimizer(config.adam())
         .expect("reference Adam");
     let mut samples = transfer_ppo_samples(&model);
-    for target_kl in [1000.0, 1.0e-12] {
+    for target_kl in [1000.0, 1000.0, 1000.0, 1.0e-12] {
         refresh_old_probabilities(&model, &mut samples);
+        if target_kl < 1000.0 {
+            // Exercise KL rejection independently of the next Adam step's policy drift.
+            for sample in &mut samples {
+                sample.transition.old_log_probability -= 1.0;
+            }
+        }
         let examples = samples.iter().collect::<Vec<_>>();
         let config = PpoConfig {
             target_kl,
             ..config
         };
+        let before = model
+            .coherent_snapshot(&actual_adam)
+            .expect("before update");
         let expected = reference
             .ppo_update_with_microbatch(
                 &examples,
@@ -47,13 +56,22 @@ fn assert_folded_ppo(device: PolicyDevice) {
                 PpoTestFaults::default(),
             )
             .expect("folded update");
+        assert_eq!(actual.applied, target_kl == 1000.0);
         assert_report_bits(actual, expected);
         assert_state_bits(&model, &actual_adam, &reference, &expected_adam);
+        if !actual.applied {
+            assert!(actual.approximate_kl > f64::from(config.target_kl));
+            let after = model
+                .coherent_snapshot(&actual_adam)
+                .expect("after rejection");
+            assert_snapshot_bits(&after, &before);
+            assert_eq!(after.adam.binding, before.adam.binding);
+        }
     }
 }
 
 #[test]
-fn prefetched_updates_preserve_shuffle_parameters_and_optimizer_state() {
+fn folded_updates_preserve_shuffle_parameters_and_optimizer_state() {
     let config = PpoConfig {
         environments: 1,
         rollout_decisions: 3,
@@ -68,15 +86,13 @@ fn prefetched_updates_preserve_shuffle_parameters_and_optimizer_state() {
     let mut expected = crate::PpoTrainer::new(&reference, config, 19).expect("reference trainer");
     actual
         .set_execution(crate::TrainingExecutionOptions {
-            learner_prefetch: true,
-            host_math_workers: 2,
-            ..Default::default()
+            host_math_workers: 4,
         })
         .expect("options");
     let first = learner_batch(&model, config);
     let second = learner_batch(&reference, config);
     let source = expected.train_update(&reference, &second).expect("serial");
-    let target = actual.train_update(&model, &first).expect("prefetched");
+    let target = actual.train_update(&model, &first).expect("folded");
     assert_eq!(source, target);
     assert_eq!(actual.rng_checkpoint(), expected.rng_checkpoint());
     assert_snapshot_bits(
@@ -99,7 +115,7 @@ fn learner_batch(model: &PolicyModel, config: PpoConfig) -> crate::PpoBatch {
 }
 
 #[test]
-fn prefetch_ignores_unused_error_on_kl_stop_and_rolls_back_consumed_error() {
+fn folded_updates_skip_unused_error_on_kl_stop_and_roll_back_consumed_error() {
     for reject in [false, true] {
         let config = PpoConfig {
             environments: 1,
@@ -115,8 +131,7 @@ fn prefetch_ignores_unused_error_on_kl_stop_and_rolls_back_consumed_error() {
         let mut expected = crate::PpoTrainer::new(&reference, config, 19).expect("trainer");
         actual
             .set_execution(crate::TrainingExecutionOptions {
-                learner_prefetch: true,
-                ..Default::default()
+                host_math_workers: 4,
             })
             .expect("options");
         let mut first = learner_batch(&model, config);
@@ -126,15 +141,15 @@ fn prefetch_ignores_unused_error_on_kl_stop_and_rolls_back_consumed_error() {
             .shuffle(&mut order)
             .expect("reference order");
         for batch in [&mut first, &mut second] {
-            batch.corrupt_prefetch_frame_for_test(order[2]);
+            batch.corrupt_materialization_frame_for_test(order[2]);
             if reject {
-                batch.reject_prefetch_minibatch_for_test(order[0]);
+                batch.reject_minibatch_for_test(order[0]);
             }
         }
         let source = expected.train_update(&reference, &second);
         let target = actual.train_update(&model, &first);
         if reject {
-            let report = target.expect("unused prefetch error is discarded");
+            let report = target.expect("unused materialization error is skipped");
             assert!(report.stopped_for_kl);
             assert_eq!(report, source.expect("serial KL stop"));
         } else {
@@ -147,7 +162,7 @@ fn prefetch_ignores_unused_error_on_kl_stop_and_rolls_back_consumed_error() {
             );
             assert_eq!(
                 target
-                    .expect_err("prefetch materialization error")
+                    .expect_err("folded materialization error")
                     .to_string(),
                 message
             );

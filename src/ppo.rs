@@ -6,9 +6,6 @@
 use std::error::Error;
 use std::fmt;
 
-mod prefetch;
-pub use prefetch::PPO_PREFETCH_STORAGE_PEAK_BYTES;
-
 use crate::{
     ACTION_SCHEMA_HASH, ACTION_SCHEMA_VERSION, AdamConfig, AdamState, BehavioralTarget,
     FEATURE_SCHEMA_HASH, FEATURE_SCHEMA_VERSION, FeatureFrame, GlobalSummary, MODEL_MAX_BATCH,
@@ -1019,9 +1016,6 @@ impl PpoTrainer {
         model: &PolicyModel,
         batch: &PpoBatch,
     ) -> Result<PpoUpdateReport, PpoError> {
-        if self.execution.learner_prefetch {
-            return self.train_update_prefetched(model, batch);
-        }
         let mut aggregate = PpoUpdateReport::default();
         let mut order = (0..batch.samples.len()).collect::<Vec<_>>();
         'epochs: for epoch in 0..self.config.epochs {

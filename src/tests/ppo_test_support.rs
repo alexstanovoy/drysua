@@ -1,5 +1,53 @@
 use super::*;
 
+#[cfg(feature = "builtin")]
+pub(crate) fn training_settings_for_test(seed: u64, updates: u64) -> crate::TrainingJobConfig {
+    crate::TrainingJobConfig {
+        mastery_config: None,
+        opponent_schedule: crate::TrainingOpponentSchedule::Teacher,
+        episode_time_cost: 0.0,
+        terminal_only: false,
+        complete_episodes: false,
+        pipeline_groups: 1,
+        updates,
+        ppo: PpoConfig {
+            decision_interval_ticks: crate::MAP2_DECISION_INTERVAL_TICKS,
+            environments: 2,
+            rollout_decisions: 2,
+            epochs: 1,
+            minibatch: 2,
+            gamma_tick: crate::MAP2_REWARD_GAMMA_TICK,
+            ..PpoConfig::default()
+        },
+        checkpoint_cadence: crate::TrainingCheckpointCadence::Updates(1),
+        resume_provenance: crate::ResumeProvenance::Strict,
+        seed,
+        map: bota_proto::MapId(2),
+        git_commit: "test-drysua-commit".to_owned(),
+        simulator_commit: "test-bota-commit".to_owned(),
+    }
+}
+
+pub(crate) fn test_directory(name: &str) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(1);
+    let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
+    let directory = std::env::temp_dir().join(format!(
+        "drysua-learning-{name}-{}-{sequence}",
+        std::process::id()
+    ));
+    let mut builder = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder
+        .create(&directory)
+        .expect("unique private test directory");
+    directory
+}
+
 #[cfg(test)]
 pub(crate) fn open_unit_bounds_for_test() -> (f64, f64) {
     (
@@ -8,19 +56,7 @@ pub(crate) fn open_unit_bounds_for_test() -> (f64, f64) {
     )
 }
 
-impl PpoRollout {
-    #[cfg(test)]
-    pub(crate) fn ragged_rows_for_test(&self) -> usize {
-        self.frames.stored_rows()
-    }
-}
-
 impl PpoTrainer {
-    #[cfg(test)]
-    pub(crate) const fn shuffle_draws_for_test(&self) -> u64 {
-        self.shuffle.draws()
-    }
-
     #[cfg(test)]
     pub(crate) fn train_pipeline_update_with_barriers_for_test(
         &mut self,
@@ -40,7 +76,7 @@ impl PpoTrainer {
 
 impl PpoBatch {
     #[cfg(test)]
-    pub(crate) fn corrupt_prefetch_frame_for_test(&mut self, index: usize) {
+    pub(crate) fn corrupt_materialization_frame_for_test(&mut self, index: usize) {
         self.samples[index]
             .transition
             .frame
@@ -48,7 +84,7 @@ impl PpoBatch {
     }
 
     #[cfg(test)]
-    pub(crate) fn reject_prefetch_minibatch_for_test(&mut self, index: usize) {
+    pub(crate) fn reject_minibatch_for_test(&mut self, index: usize) {
         self.samples[index].transition.old_log_probability = -5.0;
     }
 

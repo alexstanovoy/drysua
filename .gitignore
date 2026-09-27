@@ -1,6 +1,7 @@
 /target/
 /artifacts/temp/
 /artifacts/runtimes-current/
+/artifacts/deslop-20260922/
 /heavy.lock
 __pycache__/
 *.py[cod]

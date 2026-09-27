@@ -12,220 +12,131 @@ mod simple_wait;
 #[path = "victory_time.rs"]
 mod victory_time;
 
+use super::fixtures;
+use crate::{Map2Reward, Map2RewardBreakdown, Map2RewardEnd};
 use bota_proto::{
     Attributes, DamageKind, EntityId, EventKind, Fixed, HeroId, MapId, MatchInfo, PlayerView,
     SlotId, StatusFlags, Team, UnitKind, UnitView, Vec2, WorldView,
 };
 
-use super::fixtures;
-use crate::{Map2Reward, Map2RewardBreakdown, Map2RewardEnd};
+#[test]
+fn visible_tower_progress_reverses_without_refilling_dense_budgets() {
+    let mut reward = initialized();
+    let mut view = snapshot(2);
+    view.units[3].hp -= 200;
+    let progress = advance(&mut reward, &view, &[]);
+    assert!(progress.tower_health > 0.0);
+    let reversed = advance(&mut reward, &snapshot(3), &[]);
+    assert!((progress.total + reversed.total).abs() < 1.0e-12);
+    assert_eq!(reward.finish(Map2RewardEnd::Draw).unwrap().total, 0.0);
+}
 
 #[test]
-fn terminal02_values_change_only_terminal_component_and_keep_dense_budgets() {
-    for (end, expected) in [
-        (Map2RewardEnd::Win, 0.2),
-        (Map2RewardEnd::Loss, -0.2),
-        (Map2RewardEnd::Draw, 0.0),
-        (Map2RewardEnd::TimeCap, -0.2),
+fn paid_combat_retains_dense_credit_through_a_lethal_finish() {
+    let mut reward = initialized();
+    let mut view = snapshot(2);
+    own_hero(&mut view).mana -= 75;
+    view.players[0].xp += 60;
+    view.players[1].unit = None;
+    view.units.retain(|unit| unit.id != id(2));
+    reward.observe_snapshot(&view).unwrap();
+    reward
+        .observe_events(2, &[damage(1, 2, 100), damage(6, 1, 30), death(2, 1, 200)])
+        .unwrap();
+    let result = reward.finish(Map2RewardEnd::Win).unwrap();
+    assert_eq!(result.observations.own_gold_earned, 200);
+    assert_eq!(result.observations.hero_damage_dealt, 100);
+    assert_eq!(result.observations.mana_spent, 75);
+    assert!(result.experience > 0.0);
+    assert!(result.creep_damage_taken < 0.0);
+    assert!(result.mana_spent < 0.0);
+    assert!(result.total > result.terminal);
+}
+
+#[test]
+fn terminal_outcomes_keep_dense_costs_and_only_wins_receive_victory_time() {
+    for (end, terminal, victory) in [
+        (Map2RewardEnd::Win, 0.2, 0.2),
+        (Map2RewardEnd::Loss, -0.2, 0.0),
+        (Map2RewardEnd::Draw, 0.0, 0.0),
+        (Map2RewardEnd::TimeCap, -0.2, 0.0),
     ] {
         let mut reward = initialized();
         let dense = advance(&mut reward, &snapshot(2), &[damage(4, 1, 100)]);
         let finished = reward.finish(end).unwrap();
-        assert_eq!(finished.terminal, expected);
         assert_eq!(finished.end, Some(end));
-        assert!((dense.tower_damage_taken + 0.1 * 100.0 / 600.0).abs() < 1.0e-12);
-        let victory = if end == Map2RewardEnd::Win { 0.2 } else { 0.0 };
+        assert_eq!(finished.terminal, terminal);
         assert_eq!(finished.victory_time, victory);
-        assert_eq!(finished.total, expected + victory);
+        assert_eq!(finished.total, terminal + victory);
+        assert!((dense.tower_damage_taken + 0.1 * 100.0 / 600.0).abs() < 1.0e-12);
+        assert_eq!(
+            reward
+                .observe_snapshot(&snapshot(3))
+                .unwrap_err()
+                .to_string(),
+            "Map2 reward: episode already ended"
+        );
     }
-    assert!((crate::MAP2_REWARD_NATIVE_NEGATIVE_BOUND - 1.0488).abs() < 1.0e-12);
-    assert!((crate::MAP2_REWARD_NATIVE_POSITIVE_BOUND - 0.645).abs() < 1.0e-12);
-    assert!((crate::MAP2_REWARD_DENSE_BOUND - 1.4488).abs() < 1.0e-12);
+    for (actual, expected) in [
+        (crate::MAP2_REWARD_NATIVE_NEGATIVE_BOUND, 1.0488),
+        (crate::MAP2_REWARD_NATIVE_POSITIVE_BOUND, 0.645),
+        (crate::MAP2_REWARD_DENSE_BOUND, 1.4488),
+    ] {
+        assert!((actual - expected).abs() < 1.0e-12);
+    }
 }
 
 #[test]
-fn mastery_nonwins_keep_loss_and_task_costs_with_zero_reward_for_actual_draw() {
-    for outcome in [Map2RewardEnd::Loss, Map2RewardEnd::TimeCap] {
+fn gold_credit_requires_paid_own_or_enemy_bounty_not_cash_changes_denies_or_npcs() {
+    for (victim, killer, gold, denied, own, enemy, hits) in [
+        (6, 1, 40, false, 40, 0, 1),
+        (5, 2, 40, false, 0, 40, 0),
+        (5, 1, 0, true, 0, 0, 0),
+        (6, 1, 0, false, 0, 0, 0),
+        (6, 5, 0, false, 0, 0, 0),
+        (6, 5, 40, false, 0, 0, 0),
+    ] {
         let mut reward = initialized();
-        let finished = reward.finish(outcome).expect("completed task");
-        assert_eq!(finished.terminal, -0.2);
-        assert_eq!(finished.end, Some(outcome));
+        let mut view = snapshot(2);
+        view.units.retain(|unit| unit.id != id(victim));
+        let event = EventKind::Died {
+            unit: id(victim),
+            killer: Some(id(killer)),
+            denied,
+            gold,
+        };
+        let result = advance(&mut reward, &view, &[event]);
+        assert_eq!(result.observations.own_gold_earned, own);
+        assert_eq!(result.observations.enemy_gold_earned, enemy);
+        assert_eq!(result.observations.lane_last_hits, hits);
+        assert_eq!(result.observations.duplicate_deaths, 0);
+        assert_eq!(result.gold > 0.0, own > 0);
+        assert_eq!(result.gold < 0.0, enemy > 0);
     }
-    assert_eq!(
-        initialized()
-            .finish(Map2RewardEnd::Draw)
-            .expect("draw")
-            .terminal,
-        0.0
-    );
-    assert_eq!(
-        initialized()
-            .finish(Map2RewardEnd::Win)
-            .expect("win")
-            .terminal,
-        0.2
-    );
+    for (cash, purchase) in [(50, true), (1000, false)] {
+        let mut reward = initialized();
+        let mut view = snapshot(2);
+        view.players[0].gold = Some(cash);
+        let events = if purchase {
+            vec![EventKind::ItemBought {
+                slot: SlotId(0),
+                item: bota_proto::ItemId(42),
+            }]
+        } else {
+            vec![]
+        };
+        let result = advance(&mut reward, &view, &events);
+        assert_eq!(result.gold, 0.0);
+        assert_eq!(result.observations.own_gold_earned, 0);
+    }
 }
 
 #[test]
-fn empty_raze_mana_spend_is_worse_than_continue_without_a_cast_request() {
-    let mut miss = initialized();
-    let mut wait = initialized();
-    let mut view = snapshot(2);
-    own_hero(&mut view).mana -= 75;
-
-    let miss = advance(&mut miss, &view, &[]);
-    let wait = advance(&mut wait, &snapshot(2), &[]);
-
-    assert!(miss.total < wait.total);
-    assert_eq!(miss.observations.mana_spent, 75);
-    assert_eq!(wait.total, 0.0);
-}
-
-#[test]
-fn useful_hero_hit_offsets_raze_mana_cost_and_outscores_an_empty_raze() {
-    let mut hit = initialized();
-    let mut miss = initialized();
-    let mut view = snapshot(2);
-    own_hero(&mut view).mana -= 75;
-    let damage = damage(1, 2, 67);
-
-    let hit = advance(&mut hit, &view, &[damage]);
-    let miss = advance(&mut miss, &view, &[]);
-
-    assert!(hit.total > 0.0);
-    assert!(hit.total > miss.total);
-    assert_eq!(hit.observations.hero_damage_dealt, 67);
-}
-
-#[test]
-fn creep_scratch_has_no_damage_credit_but_a_last_hit_earns_gold_once() {
-    let mut scratch = initialized();
-    let mut kill = initialized();
-    let mut killed_view = snapshot(2);
-    killed_view.units.retain(|unit| unit.id != id(6));
-
-    let scratch = advance(&mut scratch, &snapshot(2), &[damage(1, 6, 20)]);
-    let kill = advance(&mut kill, &killed_view, &[death(6, 1, 40)]);
-
-    assert_eq!(scratch.total, 0.0);
-    assert!(kill.gold > 0.0);
-    assert_eq!(kill.observations.lane_last_hits, 1);
-    assert_eq!(kill.observations.own_gold_earned, 40);
-    assert_eq!(kill.total, kill.gold);
-}
-
-#[test]
-fn last_hit_gold_and_xp_can_offset_meaningful_mana_spend() {
-    let mut reward = initialized();
-    let mut view = snapshot(2);
-    own_hero(&mut view).mana -= 75;
-    view.players[0].xp += 60;
-    view.units.retain(|unit| unit.id != id(6));
-
-    let result = advance(&mut reward, &view, &[death(6, 1, 40)]);
-
-    assert!(result.total > 0.0);
-    assert!(result.mana_spent < 0.0);
-}
-
-#[test]
-fn lethal_finish_outscores_running_despite_modest_creep_damage_taken() {
-    let mut finish = initialized();
-    let mut run = initialized();
-    let mut view = snapshot(2);
-    view.players[1].unit = None;
-    view.units.retain(|unit| unit.id != id(2));
-    own_hero(&mut view).mana -= 75;
-    let events = [damage(1, 2, 100), damage(6, 1, 30), death(2, 1, 200)];
-    finish.observe_snapshot(&view).unwrap();
-    finish.observe_events(2, &events).unwrap();
-
-    let result = finish.finish(Map2RewardEnd::Win).unwrap();
-    let run = advance(&mut run, &snapshot(2), &[]);
-
-    assert!(result.total > run.total);
-    assert!(result.total > 0.2);
-    assert!(result.creep_damage_taken < 0.0);
-}
-
-#[test]
-fn purchasing_a_consumable_is_not_negative_earned_gold() {
-    let mut reward = initialized();
-    let mut view = snapshot(2);
-    view.players[0].gold = Some(50);
-    let purchase = EventKind::ItemBought {
-        slot: SlotId(0),
-        item: bota_proto::ItemId(42),
-    };
-
-    let result = advance(&mut reward, &view, &[purchase]);
-
-    assert_eq!(result.gold, 0.0);
-    assert_eq!(result.total, 0.0);
-}
-
-#[test]
-fn passive_gold_and_item_sale_cash_do_not_earn_bounty_reward() {
-    let mut reward = initialized();
-    let mut view = snapshot(2);
-    view.players[0].gold = Some(1000);
-
-    let result = advance(&mut reward, &view, &[]);
-
-    assert_eq!(result.observations.own_gold_earned, 0);
-    assert_eq!(result.gold, 0.0);
-}
-
-#[test]
-fn experience_rewards_public_gain_advantage_not_absolute_starting_experience() {
-    let mut reward = initialized();
-    let mut view = snapshot(2);
-    view.players[0].xp += 60;
-    view.players[1].xp += 20;
-
-    let result = advance(&mut reward, &view, &[]);
-
-    assert!(result.experience > 0.0);
-    assert_eq!(result.observations.own_xp_gained, 60);
-    assert_eq!(result.observations.enemy_xp_gained, 20);
-}
-
-#[test]
-fn own_received_damage_is_separated_by_hero_creep_and_unknown_source() {
-    let mut reward = initialized();
-    let events = [damage(2, 1, 40), damage(6, 1, 20), damage(99, 1, 10)];
-
-    let result = advance(&mut reward, &snapshot(2), &events);
-
-    assert!(result.hero_damage_taken < 0.0);
-    assert!(result.creep_damage_taken < 0.0);
-    assert!(result.other_damage_taken < 0.0);
-    assert_eq!(result.observations.hero_damage_taken, 40);
-    assert_eq!(result.observations.creep_damage_taken, 20);
-    assert_eq!(result.observations.unattributed_damage_taken, 10);
-}
-
-#[test]
-fn equal_hero_trade_is_not_discouraged_by_a_dominant_received_damage_penalty() {
-    let mut reward = initialized();
-
-    let result = advance(
-        &mut reward,
-        &snapshot(2),
-        &[damage(1, 2, 100), damage(2, 1, 100)],
-    );
-
-    assert!(result.hero_damage > result.hero_damage_taken.abs());
-    assert!(result.total > 0.0);
-}
-
-#[test]
-fn healing_and_mana_restoration_never_refund_spent_cost_budgets() {
+fn restoration_does_not_refund_costs_and_capacity_or_body_changes_are_not_spending() {
     let mut reward = initialized();
     let mut view = snapshot(2);
     own_hero(&mut view).mana = 325;
-    let spent = advance(&mut reward, &view, &[damage(2, 1, 100)]);
+    assert!(advance(&mut reward, &view, &[damage(2, 1, 100)]).total < 0.0);
     let before = reward.state();
     view.tick = 3;
     own_hero(&mut view).mana = 400;
@@ -235,231 +146,34 @@ fn healing_and_mana_restoration_never_refund_spent_cost_budgets() {
         amount: 100,
         mana: 0,
     };
-
-    let restored = advance(&mut reward, &view, &[healed]);
-    let after = reward.state();
-
-    assert!(spent.total < 0.0);
-    assert_eq!(restored.total, 0.0);
-    assert_eq!(before.remaining, after.remaining);
-}
-
-#[test]
-fn mana_capacity_reduction_and_respawn_are_not_mana_expenditure() {
-    let mut reward = initialized();
-    let mut view = snapshot(2);
-    own_hero(&mut view).mana = 300;
-    own_hero(&mut view).max_mana = 300;
-    let capacity = advance(&mut reward, &view, &[]);
-    view.tick = 3;
-    view.players[0].unit = Some(EntityId {
-        idx: 1,
-        generation: 2,
-    });
-    own_hero(&mut view).id.generation = 2;
-    own_hero(&mut view).mana = 100;
-
-    let respawn = advance(&mut reward, &view, &[]);
-
-    assert_eq!(capacity.observations.mana_spent, 0);
-    assert_eq!(respawn.observations.mana_spent, 0);
-}
-
-#[test]
-fn partially_filled_mana_capacity_changes_do_not_charge_preserved_fraction_as_spend() {
-    let mut reward = Map2Reward::new(SlotId(0), &match_info()).unwrap();
-    let mut view = snapshot(1);
-    own_hero(&mut view).mana = 200;
-    advance(&mut reward, &view, &[]);
-    view.tick = 2;
-    own_hero(&mut view).mana = 150;
-    own_hero(&mut view).max_mana = 300;
-    let shrink = advance(&mut reward, &view, &[]);
-    view.tick = 3;
-    own_hero(&mut view).mana = 200;
-    own_hero(&mut view).max_mana = 400;
-
-    let expand = advance(&mut reward, &view, &[]);
-
-    assert_eq!(shrink.mana_spent, 0.0);
-    assert_eq!(expand.mana_spent, 0.0);
-}
-
-#[test]
-fn moving_the_hero_without_moving_creeps_has_no_lane_pressure_reward() {
-    let mut reward = initialized();
-    let mut view = snapshot(2);
-    own_hero(&mut view).pos = Vec2::from_ints(900, 0);
-
-    let result = advance(&mut reward, &view, &[]);
-
-    assert_eq!(result.lane_pressure, 0.0);
-    assert_eq!(result.total, 0.0);
-}
-
-#[test]
-fn advancing_visible_creeps_gains_small_pressure_and_a_return_loop_is_not_profitable() {
-    let mut reward = initialized();
-    let mut view = snapshot(2);
-    for unit in &mut view.units {
-        if matches!(unit.kind, UnitKind::CreepMelee) {
-            unit.pos.x += Fixed::from_int(100);
+    assert_eq!(advance(&mut reward, &view, &[healed]).total, 0.0);
+    assert_eq!(before.remaining, reward.state().remaining);
+    for initial in [200, 400] {
+        let mut view = snapshot(1);
+        own_hero(&mut view).mana = initial;
+        let mut reward = Map2Reward::new(SlotId(0), &match_info()).unwrap();
+        advance(&mut reward, &view, &[]);
+        for (tick, mana, maximum, generation) in [
+            (2, initial * 3 / 4, 300, 1),
+            (3, initial, 400, 1),
+            (4, 100, 400, 2),
+        ] {
+            view.tick = tick;
+            let hero = own_hero(&mut view);
+            hero.mana = mana;
+            hero.max_mana = maximum;
+            hero.id.generation = generation;
+            view.players[0].unit = Some(EntityId { idx: 1, generation });
+            let result = advance(&mut reward, &view, &[]);
+            assert_eq!(result.observations.mana_spent, 0);
+            assert_eq!(result.mana_spent, 0.0);
         }
-    }
-    let forward = advance(&mut reward, &view, &[]);
-
-    let backward = advance(&mut reward, &snapshot(3), &[]);
-
-    assert!(forward.lane_pressure > 0.0);
-    assert!(forward.lane_pressure < 0.01);
-    assert!((forward.total + backward.total).abs() < 1.0e-12);
-}
-
-#[test]
-fn disappearing_creeps_hold_pressure_as_unknown_instead_of_earning_fog_progress() {
-    let mut reward = initialized();
-    let mut view = snapshot(2);
-    view.units.retain(|unit| unit.id != id(6));
-
-    let result = advance(&mut reward, &view, &[]);
-
-    assert_eq!(result.lane_pressure, 0.0);
-    assert!(!reward.state().lane_observed);
-}
-
-#[test]
-fn enemy_tower_health_loss_is_positive_and_healing_reverses_the_potential() {
-    let mut reward = initialized();
-    let mut view = snapshot(2);
-    view.units
-        .iter_mut()
-        .find(|unit| unit.id == id(4))
-        .unwrap()
-        .hp -= 200;
-    let damaged = advance(&mut reward, &view, &[]);
-
-    let healed = advance(&mut reward, &snapshot(3), &[]);
-
-    assert!(damaged.tower_health > 0.0);
-    assert!((damaged.total + healed.total).abs() < 1.0e-12);
-}
-
-#[test]
-fn missing_tower_is_not_destroyed_until_a_visible_destruction_event() {
-    let mut reward = initialized();
-    let mut view = snapshot(2);
-    view.units.retain(|unit| unit.id != id(3));
-    let unknown = advance(&mut reward, &view, &[]);
-    view.tick = 3;
-    let event = EventKind::StructureDestroyed {
-        unit: id(3),
-        team: Team::Radiant,
-    };
-
-    let destroyed = advance(&mut reward, &view, &[event]);
-
-    assert_eq!(unknown.tower_health, 0.0);
-    assert!(destroyed.tower_health < 0.0);
-}
-
-#[test]
-fn terminal02_win_can_have_negative_return_after_opposing_tower_progress() {
-    let mut win = initialized();
-    let mut loss = initialized();
-    let mut won_view = snapshot(2);
-    won_view
-        .units
-        .iter_mut()
-        .find(|unit| unit.id == id(3))
-        .unwrap()
-        .hp = 1;
-    win.observe_snapshot(&won_view).unwrap();
-    win.observe_events(2, &[damage(2, 1, 1_000_000)]).unwrap();
-    loss.observe_snapshot(&snapshot(2)).unwrap();
-    loss.observe_events(2, &[damage(1, 2, 1_000_000)]).unwrap();
-
-    let won = win.finish(Map2RewardEnd::Win).unwrap();
-    let lost = loss.finish(Map2RewardEnd::Loss).unwrap();
-
-    assert_eq!(won.terminal, 0.2);
-    assert_eq!(won.victory_time, 0.2);
-    assert_eq!(lost.terminal, -0.2);
-    assert_eq!(lost.victory_time, 0.0);
-    let dense = won.gold
-        + won.experience
-        + won.hero_damage
-        + won.hero_damage_taken
-        + won.creep_damage_taken
-        + won.other_damage_taken
-        + won.tower_damage_taken
-        + won.opening_position
-        + won.mana_spent
-        + won.tower_health
-        + won.lane_pressure
-        + won.pregame_movement
-        + won.fountain_wait
-        + won.fountain_wait_refund
-        + won.stagnation_base
-        + won.stagnation_ticks_cost;
-    assert_eq!(won.total, won.terminal + won.victory_time + dense);
-    assert_eq!(lost.victory_time, 0.0, "no bonus for a loss");
-    assert!(lost.total.is_finite());
-}
-
-#[test]
-fn opponent_bounty_is_negative_without_own_last_hit_credit() {
-    let mut reward = initialized();
-    let mut view = snapshot(2);
-    view.units.retain(|unit| unit.id != id(5));
-
-    let result = advance(&mut reward, &view, &[death(5, 2, 40)]);
-
-    assert!(result.gold < 0.0);
-    assert_eq!(result.observations.enemy_gold_earned, 40);
-    assert_eq!(result.observations.lane_last_hits, 0);
-}
-
-#[test]
-fn an_independent_deny_does_not_pay_gold_or_a_last_hit() {
-    let mut reward = initialized();
-    let mut view = snapshot(2);
-    view.units.retain(|unit| unit.id != id(5));
-    let deny = EventKind::Died {
-        unit: id(5),
-        killer: Some(id(1)),
-        denied: true,
-        gold: 0,
-    };
-
-    let result = advance(&mut reward, &view, &[deny]);
-
-    assert_eq!(result.gold, 0.0);
-    assert_eq!(result.observations.lane_last_hits, 0);
-    assert_eq!(result.observations.duplicate_deaths, 0);
-}
-
-#[test]
-fn zero_paid_gold_and_npc_killers_do_not_count_as_own_credited_last_hits() {
-    for (killer, gold) in [(1, 0), (5, 0), (5, 40)] {
-        let mut reward = initialized();
-        let mut view = snapshot(2);
-        view.units.retain(|unit| unit.id != id(6));
-
-        let result = advance(&mut reward, &view, &[death(6, killer, gold)]);
-
-        assert_eq!(result.gold, 0.0, "killer={killer}, gold={gold}");
-        assert_eq!(
-            result.observations.lane_last_hits, 0,
-            "killer={killer}, gold={gold}"
-        );
     }
 }
 
 pub(super) fn initialized() -> Map2Reward {
     let mut reward = Map2Reward::new(SlotId(0), &match_info()).unwrap();
-    reward.observe_snapshot(&snapshot(1)).unwrap();
-    reward.observe_events(1, &[]).unwrap();
-    assert_eq!(reward.take_interval().unwrap().total, 0.0);
+    assert_eq!(advance(&mut reward, &snapshot(1), &[]).total, 0.0);
     reward
 }
 

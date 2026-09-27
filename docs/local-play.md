@@ -310,8 +310,8 @@ The old **corrected-ppo-001/u4 F12/M14/PPO27/rules22** archive is historical,
 not current Map2 evidence. The never-called `review_paths` utility and its pinned
 constants were removed from `scripts/play_match.py` on 2026-09-18; the archive and
 its pins below remain evidence-only, and no launcher code references them. The
-regression suite still hashes the archived review binary and weights directly when
-its native smokes run. Archive locations and pins remain unchanged:
+historical native smoke fixtures have also been retired; archive locations and
+pins remain unchanged:
 
 ```text
 drysua/artifacts/temp/human-review-20260909/current/
@@ -325,10 +325,10 @@ drysua/artifacts/temp/human-review-20260909/current/
 | Weights | `6348fe57a128ebd521dba68da0949ceb7378d3e0d6b7d6a7ce9a5fb6446547ab` |
 | Frozen executable | `64ba25ebb10e6beabc26ff667a3e3bddeb40dbf391110d4f0e31db6478500a2b` |
 
-Do not run the frozen bot against the current root server. The historical native
-test requires the SHA-pinned historical server referenced by
-`artifacts/temp/map0-baseline-observationfix-4096/baseline.json`; it skips if that
-copy/pin is unavailable and never substitutes the root target server.
+Do not run the frozen bot against the current root server. Historical runs used
+the SHA-pinned server referenced by
+`artifacts/temp/map0-baseline-observationfix-4096/baseline.json`, not the root target
+server.
 
 The two complete review replays use that archived Neural checkpoint. Their
 original replay/viewer files are untouched by this integration. Run either command
@@ -367,17 +367,11 @@ signals, descendants, and relay cleanup. No readiness probe is accepted by the m
 Socketpair/mock tests also cover fragmented terminal drain, queued/late orders,
 EPIPE/reset handling, retained GUI write sockets, and selector waits without sleeps.
 
-When the review copy and SHA-pinned historical server are available, archive smokes
-run a real-protocol headless **Player** against the exact frozen Neural bot on both
-sides: 30 ticks in realtime and 1000 ticks in lockstep. Both participants' Welcome
-and snapshot identities are checked, as are zero rejected bot orders. If the
-copy is not yet prepared, only the tests (not the launcher) can explicitly select
-the original frozen inputs via `PLAY_TEST_REVIEW_BINARY` and
-`PLAY_TEST_REVIEW_WEIGHTS`; the same two pinned hashes are still mandatory.
-These short native smokes intentionally cancel at their tick cap, rather than
-reach `MatchOver`. Post-cap EPIPE is accepted only by the test harness after both
-clients exit successfully; exact tick/side summaries are still required. Production
-terminal handling is verified by the deterministic tests, not relaxed for a cap.
+The retired historical native smoke fixtures no longer run the archived review
+binary or accept `PLAY_TEST_REVIEW_BINARY` / `PLAY_TEST_REVIEW_WEIGHTS`. Archive
+pins remain historical evidence, not a current compatibility gate. Current
+admission, side identity, and terminal cleanup are covered by deterministic
+protocol tests; the opt-in current Teacher smoke below is separate.
 
 An additional current Map2 **Teacher-only protocol smoke** uses the existing root
 release bot/server on both sides (30 realtime / 1000 lockstep ticks), never a GUI

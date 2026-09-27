@@ -1,39 +1,22 @@
 use super::*;
 
 #[test]
-fn standard_feature_rows_reproduce_growth_past_logical_capacity() {
-    let rows = [[1.0]; 3];
-    let mut arena = Vec::new();
-
-    let range = append_feature_rows(&mut arena, &rows, 0, 1).expect("three rows");
-
-    assert_eq!(arena.len(), 3);
-    assert_eq!(range.count, 3);
-    assert!(
-        arena.capacity() > 3,
-        "ordinary Vec growth exceeds the row limit"
-    );
-}
-
-#[test]
-fn bounded_feature_rows_grow_geometrically_and_stop_at_exact_limit() {
-    let rows = [[1.0], [0.0], [0.0]];
-    let mut arena = Vec::new();
-    for (index, capacity) in [1, 2, 4, 4, 8, 8, 8, 8, 9].into_iter().enumerate() {
-        reserve_feature_rows(&mut arena, &rows, 0, 3).expect("bounded reservation");
-        let range = append_feature_rows(&mut arena, &rows, 0, 3).expect("reserved row");
-
-        assert_eq!(arena.capacity(), capacity);
-        assert_eq!(arena.len(), index + 1);
-        assert_eq!(range.offset as usize, index);
-        assert_eq!(range.count, 1);
+fn bounded_sparse_rows_roundtrip_through_exact_capacity_and_preserve_prior_headers() {
+    let mut frame = FeatureFrame::new();
+    frame.units[UNIT_FEATURE_TOKENS - 1][unit_feature::TOKEN_PRESENT] = 1.0;
+    let mut arena = RaggedFeatureArena::new_bounded(1).expect("bounded arena");
+    let first = arena.push(&frame).expect("first sparse frame");
+    for _ in 1..UNIT_FEATURE_TOKENS {
+        let header = arena.push(&frame).expect("remaining sparse row");
+        assert_eq!(arena.expand(&header).expect("sparse roundtrip"), frame);
+        assert!(arena.units.capacity() <= UNIT_FEATURE_TOKENS);
     }
-
-    let error = reserve_feature_rows(&mut arena, &rows, 0, 3).expect_err("tenth row");
-
-    assert_eq!(error, "ragged feature arena capacity exceeded");
-    assert_eq!(arena.len(), 9);
-    assert_eq!(arena.capacity(), 9);
+    assert_eq!(arena.units.capacity(), UNIT_FEATURE_TOKENS);
+    assert_eq!(
+        arena.push(&frame).expect_err("one row past capacity"),
+        "ragged feature arena capacity exceeded"
+    );
+    assert_eq!(arena.expand(&first).expect("first frame retained"), frame);
 }
 
 #[test]
@@ -68,21 +51,6 @@ fn bounded_feature_arena_caps_every_vector_and_roundtrips_dense_frame() {
     );
     assert_eq!(arena_capacities(&arena), token_counts());
     assert_eq!(arena.expand(&header).expect("unchanged frame"), frame);
-}
-
-#[test]
-fn standard_feature_arena_keeps_ordinary_vec_growth() {
-    let frame = dense_frame();
-    let mut arena = RaggedFeatureArena::new(1);
-    let mut expected = Vec::new();
-    append_feature_rows(&mut expected, &frame.units, unit_feature::TOKEN_PRESENT, 1)
-        .expect("ordinary unit rows");
-
-    let header = arena.push(&frame).expect("standard frame");
-
-    assert_eq!(arena.units.capacity(), expected.capacity());
-    assert!(arena.units.capacity() > UNIT_FEATURE_TOKENS);
-    assert_eq!(arena.expand(&header).expect("standard roundtrip"), frame);
 }
 
 #[test]

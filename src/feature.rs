@@ -666,38 +666,23 @@ impl FeatureFrame {
 
     /// Whether every scalar in the frame is finite.
     pub fn is_finite(&self) -> bool {
-        self.global.iter().all(|value| value.is_finite())
-            && self.history.iter().flatten().all(|value| value.is_finite())
-            && self
-                .policy_history
-                .iter()
-                .flatten()
-                .all(|value| value.is_finite())
-            && self.units.iter().flatten().all(|value| value.is_finite())
-            && self
-                .own_units
-                .iter()
-                .flatten()
-                .all(|value| value.is_finite())
-            && self
-                .remembered_units
-                .iter()
-                .flatten()
-                .all(|value| value.is_finite())
-            && self.points.iter().flatten().all(|value| value.is_finite())
-            && self
-                .abilities
-                .iter()
-                .flatten()
-                .all(|value| value.is_finite())
-            && self.items.iter().flatten().all(|value| value.is_finite())
-            && self
-                .projectiles
-                .iter()
-                .flatten()
-                .all(|value| value.is_finite())
-            && self.loot.iter().flatten().all(|value| value.is_finite())
-            && self.map.iter().all(|value| value.is_finite())
+        let fields: [&[f32]; 12] = [
+            &self.global,
+            self.history.as_flattened(),
+            self.policy_history.as_flattened(),
+            self.units.as_flattened(),
+            self.own_units.as_flattened(),
+            self.remembered_units.as_flattened(),
+            self.points.as_flattened(),
+            self.abilities.as_flattened(),
+            self.items.as_flattened(),
+            self.projectiles.as_flattened(),
+            self.loot.as_flattened(),
+            &self.map,
+        ];
+        fields
+            .into_iter()
+            .all(|field| field.iter().all(|value| value.is_finite()))
     }
 
     pub(crate) fn matches_action_space(&self, action_space: &ActionSpace) -> bool {

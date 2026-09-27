@@ -5,6 +5,8 @@ Missed after Damaged and shifted the later variants; the previous (037c6a2) and
 historical (18db0f6) pins keep their own order and are never decoded as current.
 """
 
+import json
+from pathlib import Path
 import struct
 import unittest
 
@@ -43,15 +45,6 @@ def rebase_heal(fixture, simulator):
     if simulator == PREVIOUS or simulator == HISTORICAL:
         return fixture
     return HEAL_TAG[simulator] + fixture[1:]
-
-
-def rebase_bytes(fixture, simulator):
-    """Re-tag a previous-pin mixed batch for the current shifted order."""
-    if simulator != CURRENT:
-        return fixture
-    return fixture.replace(b"\x01\x01 ac02", b"\x02\x01 ac02", 1).replace(
-        b"\x01\x00 ad02", b"\x02\x00 ad02", 1).replace(
-        b"\x01\x01 ac02 02 ad02 03 5a f001", b"\x02\x01 ac02 02 ad02 03 5a f001", 1)
 
 
 # Convenience current-pin heal batch for helpers that default to the current pin.
@@ -121,17 +114,19 @@ class CurrentEventTests(unittest.TestCase):
         self.assertTrue(relay.observed["cap_events"])
         self.assertEqual(relay.buffer, b"")
 
-    def test_current_heals_shift_to_index_two_and_consume_mana(self):
-        for healed in (HP_ONLY_OLD, MANA_ONLY_OLD, BOTH_OLD):
-            with self.subTest(healed=healed.hex()):
-                self.assertEqual(wire.verify_events(events(rebase_heal(healed, CURRENT))), 901)
-
-    def test_current_shifted_following_variants_stay_aligned(self):
-        payload = events(FOLLOWING_CURRENT, 8)
-        self.assertEqual(wire.verify_events(payload), 901)
-        relay = observer()
-        relay.observe(frame(payload))
-        self.assertTrue(relay.observed["cap_events"])
+    def test_pin_specific_heals_consume_mana_and_keep_following_events_aligned(self):
+        for simulator, following, count in ((CURRENT, FOLLOWING_CURRENT, 9), (PREVIOUS, FOLLOWING_OLD, 7)):
+            for healed in (HP_ONLY_OLD, MANA_ONLY_OLD, BOTH_OLD):
+                with self.subTest(simulator=simulator, healed=healed.hex()):
+                    payload = events(rebase_heal(healed, simulator))
+                    self.assertEqual(wire.verify_events(payload, simulator), 901)
+                    payload = events(rebase_heal(healed, simulator) + following, count)
+                    self.assertEqual(wire.verify_events(payload, simulator), 901)
+                    relay = observer()
+                    relay.simulator_commit = simulator
+                    relay.observe(frame(payload))
+                    self.assertTrue(relay.observed["cap_events"])
+                    self.assertEqual(relay.buffer, b"")
 
     def test_current_invalid_kinds_and_fields_fail_closed(self):
         invalid = (
@@ -155,29 +150,31 @@ class CurrentEventTests(unittest.TestCase):
 
 
 class PreviousPinTests(unittest.TestCase):
-    def test_previous_heals_keep_the_old_declaration_order(self):
-        for healed in (HP_ONLY_OLD, MANA_ONLY_OLD, BOTH_OLD):
-            with self.subTest(healed=healed.hex()):
-                payload = events(healed + FOLLOWING_OLD, 7)
-                self.assertEqual(wire.verify_events(payload, PREVIOUS), 901)
-                relay = observer()
-                relay.simulator_commit = PREVIOUS
-                relay.observe(frame(payload))
-                self.assertTrue(relay.observed["cap_events"])
-                self.assertEqual(relay.buffer, b"")
+    def test_v001_through_v004_registry_pins_decode_historical_events(self):
+        registry = json.loads((Path(__file__).resolve().parents[1] / "releases.json").read_text())
+        releases = {release["tag"]: release for release in registry["releases"]}
+        payload = events(HP_ONLY_OLD[:-1] + FOLLOWING_OLD, 7)
+        for tag in ("v0.0.1", "v0.0.2", "v0.0.3", "v0.0.4"):
+            with self.subTest(tag=tag):
+                simulator = releases[tag]["simulator_commit"]
+                self.assertEqual(simulator, HISTORICAL)
+                self.assertEqual(wire.verify_events(payload, simulator), 901)
 
     def test_current_missed_tag_is_healed_under_the_previous_pin(self):
         # A current-shaped Missed first byte cannot be guessed as a miss.
         with self.assertRaisesRegex(ValueError, "truncated|invalid"):
             wire.verify_events(events(bytes.fromhex("01 01 ac02 02 ad02")), PREVIOUS)
 
-    def test_previous_truncations_and_trailing_bytes_fail(self):
-        payload = events(BOTH_OLD + FOLLOWING_OLD, 7)
-        for length in range(len(payload)):
-            with self.subTest(length=length), self.assertRaisesRegex(ValueError, "truncated"):
-                wire.verify_events(payload[:length], PREVIOUS)
-        with self.assertRaisesRegex(ValueError, "trailing Events bytes"):
-            wire.verify_events(events(BOTH_OLD) + b"\x00", PREVIOUS)
+    def test_every_pin_rejects_truncated_batches_and_trailing_bytes(self):
+        for simulator, body, count in ((CURRENT, BOTH_CURRENT + FOLLOWING_CURRENT, 9),
+                                       (PREVIOUS, BOTH_OLD + FOLLOWING_OLD, 7),
+                                       (HISTORICAL, HP_ONLY_OLD[:-1] + FOLLOWING_OLD, 7)):
+            payload = events(body, count)
+            for length in range(len(payload)):
+                with self.subTest(simulator=simulator, length=length), self.assertRaisesRegex(ValueError, "truncated"):
+                    wire.verify_events(payload[:length], simulator)
+            with self.subTest(simulator=simulator), self.assertRaisesRegex(ValueError, "trailing Events bytes"):
+                wire.verify_events(payload + b"\x00", simulator)
 
     def test_historical_heal_requires_explicit_pin_and_is_not_guessed(self):
         old_payload = events(HP_ONLY_OLD[:-1])

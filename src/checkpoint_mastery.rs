@@ -13,14 +13,12 @@ pub(super) fn encode_config(writer: &mut ManifestWriter, config: Option<MasteryC
 pub(super) fn decode_config(
     reader: &mut ManifestReader<'_>,
 ) -> Result<Option<MasteryConfig>, CheckpointError> {
-    match reader.u8()? {
-        0 => Ok(None),
-        1 => MasteryConfig::from_resolved(reader.u32()? as usize, reader.u8()?, reader.u8()?)
+    if reader.flag("mastery configuration presence")? {
+        MasteryConfig::from_resolved(reader.u32()? as usize, reader.u8()?, reader.u8()?)
             .map(Some)
-            .map_err(CheckpointError::InvalidManifest),
-        _ => Err(CheckpointError::InvalidManifest(
-            "mastery configuration presence",
-        )),
+            .map_err(CheckpointError::InvalidManifest)
+    } else {
+        Ok(None)
     }
 }
 
@@ -40,14 +38,8 @@ pub(super) fn decode_progress(
     reader: &mut ManifestReader<'_>,
     config: Option<MasteryConfig>,
 ) -> Result<Option<MasteryProgress>, CheckpointError> {
-    match reader.u8()? {
-        0 => return Ok(None),
-        1 => {}
-        _ => {
-            return Err(CheckpointError::InvalidManifest(
-                "mastery progress presence",
-            ));
-        }
+    if !reader.flag("mastery progress presence")? {
+        return Ok(None);
     }
     let config = config.ok_or(CheckpointError::InvalidManifest(
         "mastery configuration/state mismatch",
@@ -67,11 +59,7 @@ pub(super) fn decode_progress(
     }
     let mut recent = Vec::with_capacity(count);
     for _ in 0..count {
-        recent.push(match reader.u8()? {
-            0 => false,
-            1 => true,
-            _ => return Err(CheckpointError::InvalidManifest("mastery outcome flag")),
-        });
+        recent.push(reader.flag("mastery outcome flag")?);
     }
     MasteryProgress::restore(stage, games, recent, config)
         .map(Some)

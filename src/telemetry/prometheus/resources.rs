@@ -429,31 +429,18 @@ impl GpuSample {
         assert!((0.0..=200.0).contains(&self.temperature));
         assert!(self.used <= self.total);
         assert!(self.total > 0);
-        writeln!(
-            output,
-            "drysua_gpu_utilization_ratio{{gpu=\"{index}\"}} {}",
-            self.utilization
-        )
-        .expect("writing to String cannot fail");
-        writeln!(
-            output,
-            "drysua_gpu_memory_used_bytes{{gpu=\"{index}\"}} {}",
-            self.used
-        )
-        .expect("writing to String cannot fail");
-        writeln!(
-            output,
-            "drysua_gpu_memory_total_bytes{{gpu=\"{index}\"}} {}",
-            self.total
-        )
-        .expect("writing to String cannot fail");
-        writeln!(
-            output,
-            "drysua_gpu_temperature_celsius{{gpu=\"{index}\"}} {}",
-            self.temperature
-        )
-        .expect("writing to String cannot fail");
+        gpu_sample(output, index, "utilization_ratio", self.utilization);
+        gpu_sample(output, index, "memory_used_bytes", self.used);
+        gpu_sample(output, index, "memory_total_bytes", self.total);
+        gpu_sample(output, index, "temperature_celsius", self.temperature);
     }
+}
+
+fn gpu_sample(output: &mut String, index: usize, name: &str, value: impl std::fmt::Display) {
+    assert!(index < GPU_LIMIT);
+    assert!(!name.is_empty());
+    writeln!(output, "drysua_gpu_{name}{{gpu=\"{index}\"}} {value}")
+        .expect("writing to String cannot fail");
 }
 
 #[cfg(any(target_os = "linux", test))]

@@ -153,8 +153,6 @@ impl ProvenanceBuffer {
 #[derive(Debug)]
 struct ProvenancePool {
     free: std::sync::Mutex<Vec<ProvenanceBuffer>>,
-    #[cfg(test)]
-    allocations: AtomicU64,
 }
 
 /// Most buffers any live setup can need: one per observation history entry
@@ -165,17 +163,11 @@ impl ProvenancePool {
     fn new() -> Self {
         Self {
             free: std::sync::Mutex::new(Vec::new()),
-            #[cfg(test)]
-            allocations: AtomicU64::new(0),
         }
     }
 
     fn take(self: &Arc<Self>) -> PooledProvenance {
         let buffer = self.free.lock().expect("provenance pool lock").pop();
-        if buffer.is_none() {
-            #[cfg(test)]
-            self.allocations.fetch_add(1, Ordering::Relaxed);
-        }
         PooledProvenance(Arc::new(PooledProvenanceInner {
             buffer: Some(buffer.unwrap_or_default()),
             pool: Arc::clone(self),
@@ -2556,7 +2548,3 @@ pub(crate) fn recent_restoration_reports(
     }
     reports
 }
-
-#[cfg(test)]
-#[path = "tests/tracker_test_support.rs"]
-mod test_support;

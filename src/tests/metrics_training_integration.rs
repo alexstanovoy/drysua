@@ -1,7 +1,5 @@
 use std::fs;
-use std::os::unix::fs::DirBuilderExt;
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::*;
 
@@ -9,8 +7,15 @@ const CHILD_ENV: &str = "DRYSUA_METRICS_TRAINING_CHILD";
 
 #[test]
 fn metrics_enabled_trainers_resume_with_identical_checkpoints() {
+    if std::env::var_os(CHILD_ENV) == Some(module_path!().into()) {
+        for annealed in [false, true] {
+            assert!(!prometheus::enabled());
+            assert_resume_preserves_training(annealed);
+        }
+        return;
+    }
     let (_, module) = module_path!().split_once("::").expect("test module path");
-    let worker = format!("{module}::metrics_training_worker");
+    let worker = format!("{module}::metrics_enabled_trainers_resume_with_identical_checkpoints");
     let status = Command::new(std::env::current_exe().expect("current test executable"))
         .args(["--exact", &worker, "--nocapture"])
         .env(CHILD_ENV, module_path!())
@@ -19,17 +24,6 @@ fn metrics_enabled_trainers_resume_with_identical_checkpoints() {
         .status()
         .expect("launch isolated metrics training worker");
     assert!(status.success(), "metrics training worker failed: {status}");
-}
-
-#[test]
-fn metrics_training_worker() {
-    if std::env::var_os(CHILD_ENV) != Some(module_path!().into()) {
-        return;
-    }
-    for annealed in [false, true] {
-        assert!(!prometheus::enabled());
-        assert_resume_preserves_training(annealed);
-    }
 }
 
 fn assert_resume_preserves_training(annealed: bool) {
@@ -87,16 +81,14 @@ fn run_job(annealed: bool, directory: &Path, target: u64, resume: bool) -> Count
     if annealed {
         let mut config = annealed_settings(settings);
         config.invocation_updates = std::num::NonZeroU64::new(if resume { 1 } else { target });
-        let harness = AnnealedHarness {
-            // Eight-step retention with phase 0..7 needs fifteen rounds to flush every game.
-            episode_decisions: Some(15),
-            stop_after: None,
-            stop_after_games: None,
-            fail_actor_after_dispatch: false,
-        };
+        // Eight-step retention with phase 0..7 needs fifteen rounds to flush every game.
         let report = run_annealed_job_harnessed(
             config,
-            harness,
+            AnnealedHarness {
+                episode_decisions: Some(15),
+                stop_after: None,
+                stop_after_games: None,
+            },
             PolicyDevice::Cpu,
             directory,
             resume,
@@ -142,28 +134,9 @@ fn run_job(annealed: bool, directory: &Path, target: u64, resume: bool) -> Count
 
 fn full_settings(updates: u64) -> crate::TrainingJobConfig {
     crate::TrainingJobConfig {
-        mastery_config: None,
-        opponent_schedule: crate::TrainingOpponentSchedule::Teacher,
-        episode_time_cost: 0.0,
-        terminal_only: false,
-        complete_episodes: false,
-        pipeline_groups: 1,
-        updates,
-        ppo: PpoConfig {
-            decision_interval_ticks: MAP2_DECISION_INTERVAL_TICKS,
-            environments: 2,
-            rollout_decisions: 2,
-            epochs: 1,
-            minibatch: 2,
-            gamma_tick: MAP2_REWARD_GAMMA_TICK,
-            ..PpoConfig::default()
-        },
-        checkpoint_cadence: crate::TrainingCheckpointCadence::Updates(1),
-        resume_provenance: crate::ResumeProvenance::Strict,
-        seed: 0x1234,
-        map: MapId(2),
         git_commit: "test-drysua-metrics".to_owned(),
         simulator_commit: "test-bota-metrics".to_owned(),
+        ..crate::ppo::training_settings_for_test(0x1234, updates)
     }
 }
 
@@ -236,14 +209,7 @@ struct Fixture(PathBuf);
 
 impl Fixture {
     fn new() -> Self {
-        static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(0);
-        let sequence = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
-        let process = std::process::id();
-        let directory =
-            std::env::temp_dir().join(format!("drysua-metrics-training-{process}-{sequence}"));
-        let mut builder = fs::DirBuilder::new();
-        builder.mode(0o700).create(&directory).unwrap();
-        Self(directory)
+        Self(crate::ppo::test_directory("metrics-training"))
     }
 }
 

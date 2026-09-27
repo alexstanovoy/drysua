@@ -66,38 +66,29 @@ Boundary and compatibility tests precede their implementation. Heavy checks
 must execute serially under the original guard; neither these tests nor this
 extension authorize a production training launch.
 
-New tests in `src/tests/annealed_capacity.rs`, included by `src/tests/annealed.rs`:
+Current contracts in `src/tests/annealed_capacity.rs`, included by `src/tests/annealed.rs`:
 
-- `m40_b8_k200_settings_validate_without_reducing_the_rollout`
-- `completed_episodes_merge_all_forty_streams_in_tick_then_stream_order`
-- `completed_episodes_accept_stream39_and_reject_stream40_and_duplicates`
-- `games40_is_valid_but_games41_and_games42_are_rejected`
-- `parallel_worlds26_is_valid_but_parallel_worlds41_is_rejected`
-- `parallel40_accepts_m40_k200_and_rejects_maximum_plus_one`
-- `parallel40_m40_k200_shortened_updates_resume_byte_identically`
-- `expanded_games_keep_batch_and_generation_divisibility_requirements`
-- `library_settings_reject_noncanonical_sample_profiles_and_dimensions`
-- `cli_selects_expanded_profile_only_above26_and_legacy_scope_bytes_are_unchanged`
-- `m40_four_epoch_thousand_update_budget_uses_one_shuffle_per_update`
+- `m40_sequential_and_b40_updates_resume_model_optimizer_rng_and_generation_bytes`
+- `expanded_jobs_enforce_capacity_and_partition_boundaries`
 - `shuffle_sample_and_optimizer_preflight_accept_max_updates_and_reject_max_plus_one`
-- `counter_budget_accepts_exact_limit_and_rejects_limit_plus_one_or_overflow`
-- `m40_b8_k200_six_updates_resume_and_mid_update_replay_are_byte_identical`
+- `completed_episode_capacity_rejects_overflow_and_duplicate_merge_atomically`
 
-The single new simulator integration test uses only the existing private
+The parameterized simulator integration test uses only the existing private
 16-decision harness, one epoch, and minibatch 80. It compares six uninterrupted
 updates with a run stopped after update five, interrupted after 24 games of
 update six, then resumed. It checks checkpoint-file digests, parameters, Adam
 moments, RNG state, progress, generation snapshots, and unchanged committed
 files after interruption or rejected M/B/K changes. Synthetic completed-stream
 tests separately exercise terminal bookkeeping that these short windows do
-not reach. The existing side-balance test now covers M28 and M40 as well.
+not reach. The earlier exhaustive side-balance matrix was retired during test
+consolidation; it is not an additional current coverage claim.
 
 `ppo_capacity.rs` additionally fills all 46,520 retained slots, checks max+1,
 stream/per-episode limits, public trainer and pipeline isolation, and unchanged
 standard identity. `feature_capacity.rs` checks capped allocations and overflow
 without allocating a dense maximum-size rollout. `checkpoint_capacity.rs`
-checks both codecs, legacy byte identity, mixed-profile rejection, update-three
+checks both codecs, mixed-profile rejection, update-three
 counters (139,560 accepted; 139,561 rejected), and exact runtime compatibility.
-Its ignored local-initializer test requires an explicit
-`DRYSUA_INITIALIZER_TEST_DIRECTORY`, loads the existing runtime on CPU/CUDA and
-verifies every initializer file's SHA256 is unchanged.
+The retired optional local-initializer test is no longer part of this suite.
+Pinned artifact compatibility and CUDA identity probes require the separately
+authorized resource-bounded integration run.

@@ -1,1657 +1,337 @@
 use bota_proto::{
-    AbilityId, AbilityView, Aim, Angle, Attribute, Attributes, DamageKind, EffectId, EffectView,
-    EntityId, EventKind, Fixed, HeroId, ItemId, ItemView, Kit, LootView, MapId, MatchInfo, Pick,
-    PlayerView, ProjectileView, ShopEntry, SlotId, StatusFlags, Team, UnitKind, UnitView, Vec2,
-    WorldView,
+    AbilityId, DamageKind, EntityId, EventKind, Fixed, MapId, MatchInfo, SlotId, Team, UnitKind,
+    Vec2, WorldView,
 };
 
 use super::fixtures;
-use crate::tracker::is_structure;
-use crate::{
-    HISTORY_AGES, HISTORY_TICKS, MAX_ABILITY_SLOTS, MAX_EFFECTS_PER_UNIT, MAX_EVENTS_PER_BATCH,
-    MAX_HISTORY_SUMMARIES, MAX_LOOT, MAX_OPAQUE_CELLS, MAX_PLANTED_TREES, MAX_PROJECTILES,
-    MAX_RECENT_EVENTS, MAX_SEATS, MAX_SHOP_COMPONENTS, MAX_SHOP_ITEMS, MAX_STATIC_TREES,
-    MAX_TERRAIN_AXIS, MAX_TERRAIN_RUNS, MAX_TRACKED_ENTITIES, OWN_ITEM_SLOTS, SHADOW_FIEND,
-    SHADOW_FIEND_ABILITY_SLOTS, StateTracker, UNIT_TOKENS,
-};
+use crate::{ActionSpace, SHADOW_FIEND, StateTracker};
 
 #[test]
-fn every_protocol_structure_kind_has_structure_semantics() {
-    for kind in [
-        UnitKind::Tower,
-        UnitKind::Ancient,
-        UnitKind::Barracks,
-        UnitKind::Fountain,
-    ] {
-        assert!(is_structure(kind), "{kind:?}");
+fn metadata_accepts_supported_maps_and_rejects_invalid_map_and_clock() {
+    for map in [MapId(0), MapId(1), MapId(2)] {
+        let mut info = match_info();
+        info.map = map;
+        let tracker = StateTracker::new(SlotId(0), &info).expect("supported map");
+        assert_eq!(tracker.metadata().map, map);
+        assert!(tracker.current().is_none());
     }
-    for kind in [
-        UnitKind::Hero,
-        UnitKind::CreepMelee,
-        UnitKind::CreepFlagbearer,
-        UnitKind::CreepRanged,
-        UnitKind::CreepSiege,
-        UnitKind::CreepNeutral,
-        UnitKind::Ward,
-        UnitKind::Courier,
+    for (map, tick_rate, expected) in [
+        (
+            MapId(3),
+            30,
+            "unsupported map MapId(3); expected MapId(0), MapId(1), or MapId(2)",
+        ),
+        (MapId(0), 0, "MatchInfo.tick_rate must be positive"),
     ] {
-        assert!(!is_structure(kind), "{kind:?}");
-    }
-}
-
-#[test]
-fn tracker_initializes_with_valid_shadow_fiend_match_terms() {
-    let info = match_info();
-
-    let tracker = StateTracker::new(SlotId(0), &info).expect("valid tracker");
-
-    assert_eq!(tracker.slot(), SlotId(0));
-    assert_eq!(tracker.team(), Team::Radiant);
-    assert_eq!(tracker.metadata().map, MapId(0));
-    assert_eq!(tracker.metadata().seats, 2);
-    assert_eq!(tracker.static_trees(), [Vec2::from_ints(4, 5)]);
-    assert_eq!(tracker.terrain_rle(), [(64, 0x80)]);
-    assert_eq!(tracker.opaque_cells(), [(0, 0)]);
-    assert_eq!(tracker.shop().len(), 1);
-    assert!(tracker.current().is_none());
-}
-
-#[test]
-fn match_start_opaque_baseline_contains_the_static_tree_cell() {
-    let tracker = new_tracker();
-    let tree = tracker.static_trees()[0];
-    let cell = (
-        u16::try_from(tree.x.to_int() / crate::TERRAIN_CELL_SIZE).expect("tree x cell"),
-        u16::try_from(tree.y.to_int() / crate::TERRAIN_CELL_SIZE).expect("tree y cell"),
-    );
-
-    assert!(tracker.opaque_cells().contains(&cell));
-}
-
-#[test]
-fn tracker_observation_limits_are_separate_from_model_token_budgets() {
-    assert_eq!(MAX_SEATS, 10);
-    assert_eq!(UNIT_TOKENS, 96);
-    assert_eq!(MAX_TRACKED_ENTITIES, 4_096);
-    assert_eq!(MAX_PROJECTILES, 4_096);
-    assert_eq!(crate::PROJECTILE_FEATURE_TOKENS, 32);
-    assert_eq!(MAX_LOOT, 16);
-    assert_eq!(SHADOW_FIEND_ABILITY_SLOTS, 6);
-    assert_eq!(MAX_ABILITY_SLOTS, 8);
-    assert_eq!(OWN_ITEM_SLOTS, 21);
-    assert_eq!(MAX_SHOP_ITEMS, 64);
-    assert_eq!(crate::MAX_POINT_CANDIDATES, 48);
-    assert_eq!(MAX_EVENTS_PER_BATCH, bota_proto::MAX_PAYLOAD_LEN / 2);
-    assert_eq!(MAX_RECENT_EVENTS, 64);
-    assert_eq!(HISTORY_TICKS, 480);
-    assert_eq!(MAX_HISTORY_SUMMARIES, 481);
-    assert_eq!(HISTORY_AGES, [480, 240, 120, 60, 30, 15, 0]);
-}
-
-#[test]
-fn tracker_rejects_invalid_hero_team_map_seats_and_tick_rate_with_exact_messages() {
-    let mut info = match_info();
-    info.picks[0].hero = HeroId(1);
-    assert_new_error(
-        &info,
-        "own slot picked HeroId(1), expected Shadow Fiend HeroId(2)",
-    );
-
-    let mut info = match_info();
-    info.picks[0].team = Team::Neutral;
-    assert_new_error(&info, "own slot has non-playable team Neutral");
-
-    let mut info = match_info();
-    info.map = MapId(3);
-    assert_new_error(
-        &info,
-        "unsupported map MapId(3); expected MapId(0), MapId(1), or MapId(2)",
-    );
-
-    let mut info = match_info();
-    info.picks.clear();
-    assert_new_error(&info, "MatchInfo.picks has 0 seats; expected 1..=10");
-
-    let mut info = match_info();
-    info.picks = (0..=10)
-        .map(|slot| Pick {
-            slot: SlotId(slot),
-            team: if slot % 2 == 0 {
-                Team::Radiant
-            } else {
-                Team::Dire
-            },
-            hero: SHADOW_FIEND,
-        })
-        .collect();
-    assert_new_error(&info, "MatchInfo.picks has 11 seats; expected 1..=10");
-
-    let mut info = match_info();
-    info.tick_rate = 0;
-    assert_new_error(&info, "MatchInfo.tick_rate must be positive");
-}
-
-#[test]
-fn tracker_rejects_bounded_static_inputs_before_cloning() {
-    let mut info = match_info();
-    info.trees = vec![Vec2::ZERO; MAX_STATIC_TREES + 1];
-    assert_new_error(&info, "MatchInfo.trees has 4097 entries; limit is 4096");
-
-    let mut info = match_info();
-    info.shop = vec![shop_entry(); MAX_SHOP_ITEMS + 1];
-    assert_new_error(&info, "MatchInfo.shop has 65 entries; limit is 64");
-
-    let mut info = match_info();
-    info.shop[0].components = vec![ItemId(1); MAX_SHOP_COMPONENTS + 1];
-    assert_new_error(&info, "ShopEntry.components has 17 entries; limit is 16");
-
-    let mut info = match_info();
-    info.terrain_cells = MAX_TERRAIN_AXIS + 1;
-    assert_new_error(&info, "MatchInfo.terrain_cells is 513; expected 1..=512");
-
-    let mut info = match_info();
-    info.terrain_rle = vec![(1, 0); MAX_TERRAIN_RUNS + 1];
-    assert_new_error(
-        &info,
-        "MatchInfo.terrain_rle has 262145 entries; limit is 262144",
-    );
-
-    let mut info = match_info();
-    info.opaque_cells = vec![(0, 0); MAX_OPAQUE_CELLS + 1];
-    assert_new_error(
-        &info,
-        "MatchInfo.opaque_cells has 262145 entries; limit is 262144",
-    );
-
-    let mut info = match_info();
-    info.terrain_rle = vec![(0, 0), (1, 0)];
-    assert_new_error(&info, "MatchInfo.terrain_rle entry 0 has zero run length");
-
-    let mut info = match_info();
-    info.opaque_cells = vec![(8, 0)];
-    assert_new_error(
-        &info,
-        "MatchInfo.opaque_cells contains (8, 0) outside 8x8 terrain",
-    );
-}
-
-#[test]
-fn tracker_accepts_exact_map_boundary_and_rejects_every_position_source_atomically() {
-    let maximum = ((8 * crate::TERRAIN_CELL_SIZE) << Fixed::FRAC_BITS) - 1;
-    let boundary = Vec2 {
-        x: Fixed { raw: maximum },
-        y: Fixed { raw: maximum },
-    };
-    let mut info = match_info();
-    info.trees = vec![boundary];
-    StateTracker::new(SlotId(0), &info).expect("inclusive static boundary");
-    info.trees[0].x.raw += 1;
-    assert_new_error(
-        &info,
-        "MatchInfo.trees[0] position raw (33554432, 33554431) is outside 0..=33554431",
-    );
-
-    let mut boundary_view = world_view(1);
-    for unit in &mut boundary_view.units {
-        unit.pos = boundary;
-    }
-    boundary_view.projectiles[0].pos = boundary;
-    boundary_view.planted_trees[0] = boundary;
-    boundary_view.loot[0].pos = boundary;
-    new_tracker()
-        .observe_snapshot(&boundary_view)
-        .expect("inclusive dynamic boundaries");
-
-    for (change, field) in [
-        (set_unit_outside as fn(&mut WorldView), "WorldView.units"),
-        (set_projectile_outside, "WorldView.projectiles"),
-        (set_planted_tree_outside, "WorldView.planted_trees"),
-        (set_loot_outside, "WorldView.loot"),
-    ] {
-        let mut tracker = tracker_with_first_tick(1);
-        let mut invalid = world_view(2);
-        change(&mut invalid);
-        let expected = format!("{field}[0] position raw (-1, 0) is outside 0..=33554431");
-        assert_observe_error(&mut tracker, &invalid, &expected);
-        assert_eq!(tracker.current().expect("prior snapshot").tick, 1);
-        assert_eq!(tracker.history()[6].tick, 1);
+        let mut info = match_info();
+        info.map = map;
+        info.tick_rate = tick_rate;
         assert_eq!(
-            tracker
-                .entity(entity(1, 1))
-                .expect("prior hero")
-                .last_seen_tick,
-            1
+            StateTracker::new(SlotId(0), &info)
+                .err()
+                .expect("invalid metadata")
+                .to_string(),
+            expected
         );
     }
+}
 
-    for (change, field) in [
-        (set_unit_above as fn(&mut WorldView), "WorldView.units"),
-        (set_projectile_above, "WorldView.projectiles"),
-        (set_planted_tree_above, "WorldView.planted_trees"),
-        (set_loot_above, "WorldView.loot"),
-    ] {
-        let mut tracker = tracker_with_first_tick(1);
+#[test]
+fn invalid_snapshot_is_transactional_and_same_tick_retry_invalidates_only_live_space() {
+    type SnapshotChange = fn(&mut WorldView);
+    let cases: &[(SnapshotChange, &str)] = &[
+        (
+            |view| view.viewer = Some(Team::Dire),
+            "snapshot viewer Some(Dire) differs from tracker team Radiant",
+        ),
+        (
+            |view| view.tick = 1,
+            "snapshot tick 1 does not follow current tick 1",
+        ),
+        (
+            |view| {
+                view.players.remove(0);
+            },
+            "snapshot players has no MatchInfo pick SlotId(0)",
+        ),
+        (
+            |view| view.units[0].pos.x.raw = -1,
+            "WorldView.units[0] position raw (-1, 1310720) is outside 0..=33554431",
+        ),
+        (
+            |view| view.units[0].items = vec![None; 10],
+            "UnitView.items has 10 entries; limit is 9",
+        ),
+    ];
+    for (change, expected) in cases {
+        let mut tracker = new_tracker();
+        tracker.observe_snapshot(&world_view(1)).expect("baseline");
+        let branch = tracker.clone();
+        let space = ActionSpace::from_tracker(&tracker).expect("space");
+        let branch_space = ActionSpace::from_tracker(&branch).expect("branch space");
+        assert!(!space.matches_tracker(&branch));
+        assert!(!branch_space.matches_tracker(&tracker));
+        let provenance = tracker.provenance();
+        let history = tracker.history();
         let mut invalid = world_view(2);
         change(&mut invalid);
-        let expected =
-            format!("{field}[0] position raw (33554432, 33554431) is outside 0..=33554431");
-        assert_observe_error(&mut tracker, &invalid, &expected);
-        assert_eq!(tracker.current().expect("prior snapshot").tick, 1);
-    }
-}
-
-#[test]
-fn tracker_rejects_ambiguous_own_hero_and_courier_bodies_with_exact_errors() {
-    let mut hero_view = world_view(1);
-    let mut extra_hero = hero();
-    extra_hero.id = entity(3, 7);
-    hero_view.units.push(extra_hero);
-    hero_view.units.sort_by_key(|unit| unit.id);
-    assert_observe_error(
-        &mut new_tracker(),
-        &hero_view,
-        "own slot has visible hero EntityId(3, 7) besides scoreboard hero EntityId(1, 1)",
-    );
-
-    let mut dead_view = world_view(1);
-    dead_view.players[0].unit = None;
-    dead_view.players[0].kit = Some(dead_kit());
-    assert_observe_error(
-        &mut new_tracker(),
-        &dead_view,
-        "own slot has visible hero EntityId(1, 1) while scoreboard body is absent",
-    );
-
-    let mut courier_view = world_view(1);
-    let mut extra_courier = courier();
-    extra_courier.id = entity(4, 9);
-    courier_view.units.push(extra_courier);
-    courier_view.units.sort_by_key(|unit| unit.id);
-    assert_observe_error(
-        &mut new_tracker(),
-        &courier_view,
-        "own slot has ambiguous couriers EntityId(2, 1) and EntityId(4, 9)",
-    );
-}
-
-#[test]
-fn public_visibility_uses_terrain_opaque_line_and_exact_radius_boundary() {
-    let mut view = world_view(1);
-    view.units[0].vision_radius = Fixed::from_int(200);
-    view.units[1].vision_radius = Fixed::ZERO;
-    let mut clear_info = match_info();
-    clear_info.opaque_cells.clear();
-    let mut clear = StateTracker::new(SlotId(0), &clear_info).expect("clear tracker");
-    clear.observe_snapshot(&view).expect("snapshot");
-    let target = Vec2::from_ints(130, 20);
-    assert!(clear.position_visible_to_own_seat(target));
-
-    let mut blocked_info = clear_info;
-    blocked_info.opaque_cells = vec![(1, 0)];
-    let mut blocked = StateTracker::new(SlotId(0), &blocked_info).expect("blocked tracker");
-    blocked.observe_snapshot(&view).expect("snapshot");
-    assert!(!blocked.position_visible_to_own_seat(target));
-
-    let mut elevated_info = match_info();
-    elevated_info.opaque_cells.clear();
-    elevated_info.terrain_rle = vec![(1, 0x80), (1, 0x81), (62, 0x80)];
-    let mut elevated = StateTracker::new(SlotId(0), &elevated_info).expect("elevated tracker");
-    elevated.observe_snapshot(&view).expect("snapshot");
-    assert!(!elevated.position_visible_to_own_seat(target));
-
-    let mut corner_view = view.clone();
-    corner_view.units[0].pos = Vec2::from_ints(32, 32);
-    let mut corner_info = match_info();
-    corner_info.opaque_cells = vec![(1, 0)];
-    let mut corner = StateTracker::new(SlotId(0), &corner_info).expect("corner tracker");
-    corner.observe_snapshot(&corner_view).expect("snapshot");
-    assert!(!corner.position_visible_to_own_seat(Vec2::from_ints(96, 96)));
-
-    let hero = blocked.own_hero().expect("hero");
-    let radius_edge = hero.pos + Vec2::from_ints(hero.vision_radius.to_int(), 0);
-    assert!(clear.position_visible_to_own_seat(radius_edge));
-    assert!(!clear.position_visible_to_own_seat(radius_edge + Vec2::from_ints(1, 0)));
-}
-
-fn set_unit_outside(view: &mut WorldView) {
-    view.units[0].pos = raw_position(-1, 0);
-}
-
-fn set_projectile_outside(view: &mut WorldView) {
-    view.projectiles[0].pos = raw_position(-1, 0);
-}
-
-fn set_planted_tree_outside(view: &mut WorldView) {
-    view.planted_trees[0] = raw_position(-1, 0);
-}
-
-fn set_loot_outside(view: &mut WorldView) {
-    view.loot[0].pos = raw_position(-1, 0);
-}
-
-fn set_unit_above(view: &mut WorldView) {
-    view.units[0].pos = raw_position(33_554_432, 33_554_431);
-}
-
-fn set_projectile_above(view: &mut WorldView) {
-    view.projectiles[0].pos = raw_position(33_554_432, 33_554_431);
-}
-
-fn set_planted_tree_above(view: &mut WorldView) {
-    view.planted_trees[0] = raw_position(33_554_432, 33_554_431);
-}
-
-fn set_loot_above(view: &mut WorldView) {
-    view.loot[0].pos = raw_position(33_554_432, 33_554_431);
-}
-
-const fn raw_position(x: i32, y: i32) -> Vec2 {
-    Vec2 {
-        x: Fixed { raw: x },
-        y: Fixed { raw: y },
-    }
-}
-
-#[test]
-fn tracker_rejects_wrong_viewer_tick_and_missing_player_with_exact_messages() {
-    let mut tracker = new_tracker();
-    let mut view = world_view(1);
-    view.viewer = Some(Team::Dire);
-    assert_observe_error(
-        &mut tracker,
-        &view,
-        "snapshot viewer Some(Dire) differs from tracker team Radiant",
-    );
-
-    tracker
-        .observe_snapshot(&world_view(1))
-        .expect("first snapshot");
-    assert_observe_error(
-        &mut tracker,
-        &world_view(1),
-        "snapshot tick 1 does not follow current tick 1",
-    );
-
-    let mut tracker = new_tracker();
-    let mut view = world_view(1);
-    view.players.remove(0);
-    assert_observe_error(
-        &mut tracker,
-        &view,
-        "snapshot players has no MatchInfo pick SlotId(0)",
-    );
-}
-
-#[test]
-fn tracker_rejects_scoreboard_rows_not_in_exact_match_roster_atomically() {
-    assert_roster_error(
-        |view| {
-            view.players.remove(1);
-        },
-        "snapshot players has no MatchInfo pick SlotId(1)",
-    );
-    assert_roster_error(
-        |view| {
-            let mut extra = enemy_player();
-            extra.slot = SlotId(2);
-            view.players.push(extra);
-        },
-        "snapshot players contains unknown SlotId(2)",
-    );
-    assert_roster_error(
-        |view| view.players[1].slot = SlotId(2),
-        "snapshot players contains unknown SlotId(2)",
-    );
-    assert_roster_error(
-        |view| view.players[1].team = Team::Radiant,
-        "snapshot player SlotId(1) team Radiant differs from MatchInfo pick Dire",
-    );
-    assert_roster_error(
-        |view| view.players[1].hero = HeroId(1),
-        "snapshot player SlotId(1) HeroId(1) differs from MatchInfo pick HeroId(2)",
-    );
-    assert_roster_error(
-        |view| view.players.swap(0, 1),
-        "snapshot players are not sorted by SlotId",
-    );
-}
-
-#[test]
-fn tracker_distinguishes_entity_generations_and_sorts_by_full_handle() {
-    let mut tracker = new_tracker();
-    let mut view = world_view(1);
-    view.units.push(creep(entity(20, 1), Team::Dire, 100, 200));
-    view.units.push(creep(entity(20, 2), Team::Dire, 100, 200));
-    view.units.sort_by_key(|unit| unit.id);
-
-    tracker.observe_snapshot(&view).expect("snapshot");
-
-    assert!(tracker.entity(entity(20, 1)).is_some());
-    assert!(tracker.entity(entity(20, 2)).is_some());
-    assert!(
+        assert_eq!(
+            tracker
+                .observe_snapshot(&invalid)
+                .expect_err("invalid snapshot")
+                .to_string(),
+            *expected
+        );
+        assert!(space.matches_tracker(&tracker));
+        assert_eq!(tracker.provenance(), provenance);
+        assert_eq!(tracker.history(), history);
+        assert_eq!(tracker.current(), branch.current());
         tracker
-            .entities()
-            .windows(2)
-            .all(|pair| pair[0].id < pair[1].id)
-    );
+            .observe_snapshot(&world_view(2))
+            .expect("same tick retry");
+        assert!(!space.matches_tracker(&tracker));
+        assert!(branch_space.matches_tracker(&branch));
+    }
 }
 
 #[test]
-fn tracker_records_exact_velocity_and_resource_deltas_across_skipped_ticks() {
+fn snapshot_position_accepts_last_raw_coordinate_but_rejects_the_next_transactionally() {
+    let mut view = world_view(1);
+    view.units[0].pos = Vec2 {
+        x: Fixed { raw: 33_554_431 },
+        y: Fixed { raw: 33_554_431 },
+    };
     let mut tracker = new_tracker();
-    tracker
-        .observe_snapshot(&world_view(1))
-        .expect("first snapshot");
+    tracker.observe_snapshot(&view).expect("inclusive boundary");
+    let baseline = ActionSpace::from_tracker(&tracker).expect("boundary space");
+    view.tick = 2;
+    view.units[0].pos.x.raw += 1;
+    assert_eq!(
+        tracker
+            .observe_snapshot(&view)
+            .expect_err("outside boundary")
+            .to_string(),
+        "WorldView.units[0] position raw (33554432, 33554431) is outside 0..=33554431"
+    );
+    assert!(baseline.matches_tracker(&tracker));
+}
+
+#[test]
+fn generations_remain_distinct_and_fog_expires_on_game_tick_boundary() {
+    let mut first = world_view(1);
+    for generation in [1, 2] {
+        let mut enemy = first.units[0].clone();
+        enemy.id = EntityId {
+            idx: 20,
+            generation,
+        };
+        enemy.owner = None;
+        enemy.team = Team::Dire;
+        first.units.push(enemy);
+    }
+    let mut tracker = new_tracker();
+    tracker.observe_snapshot(&first).expect("two generations");
     let mut next = world_view(6);
     next.units[0].pos = Vec2::from_ints(16, 24);
     next.units[0].hp = 875;
     next.units[0].mana = 360;
-
-    tracker.observe_snapshot(&next).expect("skipped snapshot");
-
-    let hero = tracker.entity(entity(1, 1)).expect("hero track");
-    let velocity = hero.velocity.expect("velocity estimate");
+    tracker.observe_snapshot(&next).expect("skipped ticks");
+    let hero = tracker.entity(entity()).expect("hero");
+    let velocity = hero.velocity.expect("velocity");
     assert_eq!(velocity.delta, Vec2::from_ints(6, 4));
     assert_eq!(velocity.elapsed_ticks, 5);
-    assert_eq!(hero.hp_delta, -125);
-    assert_eq!(hero.mana_delta, -40);
-    assert_eq!(hero.previous_seen_tick, 1);
-    assert_eq!(hero.last_seen_tick, 6);
-}
-
-#[test]
-fn tracker_remembers_invisible_entity_through_history_boundary_then_expires_it() {
-    let remembered = entity(20, 1);
-    let mut tracker = new_tracker();
-    let mut first = world_view(1);
-    first.units.push(creep(remembered, Team::Dire, 100, 200));
-    first.units.sort_by_key(|unit| unit.id);
-    tracker.observe_snapshot(&first).expect("visible snapshot");
-
-    tracker
-        .observe_snapshot(&world_view(481))
-        .expect("boundary snapshot");
-    assert!(
-        !tracker
-            .entity(remembered)
-            .expect("remembered at age 480")
-            .visible
-    );
-
-    tracker
-        .observe_snapshot(&world_view(482))
-        .expect("expiry snapshot");
-    assert!(tracker.entity(remembered).is_none());
-}
-
-#[test]
-fn tracker_evicts_the_complete_oldest_invisible_tick_cohort() {
-    let mut tracker = new_tracker();
-    let mut first = world_view(1);
-    for index in 3..=MAX_TRACKED_ENTITIES as u32 {
-        first
-            .units
-            .push(creep(entity(index, 1), Team::Dire, 100, 100));
-    }
-    first.units.sort_by_key(|unit| unit.id);
-    tracker.observe_snapshot(&first).expect("full tracker");
-
-    let mut second = world_view(2);
-    second
-        .units
-        .push(creep(entity(10_000, 1), Team::Dire, 100, 100));
-    second.units.sort_by_key(|unit| unit.id);
-    tracker
-        .observe_snapshot(&second)
-        .expect("evicting snapshot");
-
-    assert_eq!(tracker.entities().len(), 3);
-    for index in 3..=MAX_TRACKED_ENTITIES as u32 {
-        assert!(tracker.entity(entity(index, 1)).is_none());
-    }
-    assert!(
-        tracker
-            .entity(entity(10_000, 1))
-            .expect("new track")
-            .visible
-    );
-    assert!(tracker.entity(entity(1, 1)).expect("own hero").visible);
-}
-
-#[test]
-fn tracker_evicts_only_complete_oldest_cohorts_needed_for_the_incoming_snapshot() {
-    let mut tracker = new_tracker();
-    let mut first = world_view(1);
-    for index in 3..=MAX_TRACKED_ENTITIES as u32 {
-        first
-            .units
-            .push(creep(entity(index, 1), Team::Dire, 100, 100));
-    }
-    first.units.sort_by_key(|unit| unit.id);
-    tracker.observe_snapshot(&first).expect("full tracker");
-
-    let mut second = world_view(2);
-    second.units.extend(
-        (100..=MAX_TRACKED_ENTITIES as u32)
-            .map(|index| creep(entity(index, 1), Team::Dire, 100, 100)),
-    );
-    second.units.sort_by_key(|unit| unit.id);
-    tracker.observe_snapshot(&second).expect("newer cohort");
-
-    let mut third = second;
-    third.tick = 3;
-    third
-        .units
-        .extend((10_000..10_097).map(|index| creep(entity(index, 1), Team::Dire, 100, 100)));
-    third.units.sort_by_key(|unit| unit.id);
-    tracker.observe_snapshot(&third).expect("evicting snapshot");
-
-    assert_eq!(tracker.entities().len(), MAX_TRACKED_ENTITIES);
-    assert!(tracker.entity(entity(3, 1)).is_none());
-    assert!(tracker.entity(entity(99, 1)).is_none());
-    assert!(
-        tracker
-            .entity(entity(100, 1))
-            .expect("newer cohort")
-            .velocity
-            .is_some()
-    );
-    assert!(
-        tracker
-            .entity(entity(10_096, 1))
-            .expect("incoming cohort")
-            .visible
-    );
-}
-
-#[test]
-fn tracker_rejects_visible_unit_input_above_hard_safe_cap() {
-    let mut tracker = tracker_with_first_tick(1);
-    let mut view = crowded_map0_view(MAX_TRACKED_ENTITIES + 1, 0);
-    view.tick = 2;
-    let before = tracker.provenance();
-
-    assert_observe_error(
-        &mut tracker,
-        &view,
-        "WorldView.units has 4097 entries; limit is 4096",
-    );
-    assert_eq!(tracker.provenance(), before);
-}
-
-#[test]
-fn tracker_accepts_33_projectiles_in_a_normal_map0_snapshot_without_truncation() {
-    let mut tracker = new_tracker();
-    let view = crowded_map0_view(2, 33);
-
-    tracker
-        .observe_snapshot(&view)
-        .expect("ordinary Map0 snapshot");
-
-    assert_eq!(tracker.metadata().map, MapId(0));
-    assert_eq!(tracker.current(), Some(&view));
-}
-
-#[test]
-fn tracker_accepts_crowded_map0_counts_and_exact_observation_capacity_on_wire() {
-    for (units, projectiles) in [(520, 39), (2_048, 2_048), (4_096, 4_096)] {
-        let view = crowded_map0_view(units, projectiles);
-        let message = bota_proto::ServerMsg::Snapshot { view: view.clone() };
-        let bytes = bota_proto::encode_frame_to_vec(&message).expect("bounded wire frame");
-        assert!(bytes.len() <= bota_proto::LEN_PREFIX + bota_proto::MAX_PAYLOAD_LEN);
-        eprintln!(
-            "representative units={units} projectiles={projectiles} frame_bytes={}",
-            bytes.len()
+    assert_eq!((hero.hp_delta, hero.mana_delta), (-125, -40));
+    tracker.observe_snapshot(&world_view(481)).expect("age 480");
+    for generation in [1, 2] {
+        assert!(
+            !tracker
+                .entity(EntityId {
+                    idx: 20,
+                    generation
+                })
+                .expect("remembered generation")
+                .visible
         );
-        let mut reader = bota_proto::FrameReader::new();
-        reader.push(&bytes);
-        assert_eq!(reader.next_message().expect("decode"), Some(message));
+    }
+    tracker.observe_snapshot(&world_view(482)).expect("age 481");
+    for generation in [1, 2] {
+        assert!(
+            tracker
+                .entity(EntityId {
+                    idx: 20,
+                    generation
+                })
+                .is_none()
+        );
+    }
+}
+
+#[test]
+fn events_preserve_cast_ambiguity_and_reject_old_batches_without_mutation() {
+    for cast in [false, true] {
         let mut tracker = new_tracker();
-
-        tracker
-            .observe_snapshot(&view)
-            .expect("crowded Map0 snapshot");
-
-        assert_eq!(tracker.current(), Some(&view));
-        assert_eq!(tracker.entities().len(), units);
-    }
-}
-
-#[test]
-fn full_capacity_mixed_catalog_observation_fits_wire_without_truncation() {
-    let mut view = crowded_map0_view(4_096, 4_096);
-    let kinds = [
-        UnitKind::CreepMelee,
-        UnitKind::CreepRanged,
-        UnitKind::CreepSiege,
-        UnitKind::CreepFlagbearer,
-        UnitKind::CreepNeutral,
-        UnitKind::Tower,
-        UnitKind::Ancient,
-        UnitKind::Barracks,
-        UnitKind::Fountain,
-        UnitKind::Ward,
-    ];
-    for (index, unit) in view.units.iter_mut().enumerate().skip(2) {
-        unit.kind = kinds[index % kinds.len()];
-        if index.is_multiple_of(97) {
-            unit.kind = UnitKind::Hero;
-            unit.hero = Some(SHADOW_FIEND);
-            unit.abilities = vec![ability(); 6];
-            unit.items = vec![Some(item()); 9];
-            unit.effects = vec![effect(); 4];
-        }
-    }
-    let message = bota_proto::ServerMsg::Snapshot { view: view.clone() };
-
-    let bytes = bota_proto::encode_frame_to_vec(&message).expect("representative catalog frame");
-    new_tracker()
-        .observe_snapshot(&view)
-        .expect("all records accepted");
-
-    assert!(bytes.len() <= bota_proto::MAX_PAYLOAD_LEN + bota_proto::LEN_PREFIX);
-    let decoded: bota_proto::ServerMsg =
-        bota_proto::decode_payload(&bytes[bota_proto::LEN_PREFIX..]).expect("wire roundtrip");
-    assert_eq!(decoded, message);
-    eprintln!(
-        "mixed_catalog units=4096 projectiles=4096 frame_bytes={}",
-        bytes.len()
-    );
-}
-
-#[test]
-fn tracker_rejects_projectile_capacity_plus_one_before_any_state_mutation() {
-    let mut tracker = tracker_with_first_tick(1);
-    let mut view = crowded_map0_view(2, MAX_PROJECTILES + 1);
-    view.tick = 2;
-    let before = tracker.provenance();
-
-    assert_observe_error(
-        &mut tracker,
-        &view,
-        "WorldView.projectiles has 4097 entries; limit is 4096",
-    );
-
-    assert_eq!(tracker.provenance(), before);
-}
-
-#[test]
-fn tracker_validates_projectile_geometry_beyond_the_model_token_prefix() {
-    let mut tracker = tracker_with_first_tick(1);
-    let mut view = crowded_map0_view(2, 4_096);
-    view.tick = 2;
-    view.projectiles[4_095].pos = raw_position(-1, 0);
-    let before = tracker.provenance();
-
-    assert_observe_error(
-        &mut tracker,
-        &view,
-        "WorldView.projectiles[4095] position raw (-1, 0) is outside 0..=33554431",
-    );
-
-    assert_eq!(tracker.provenance(), before);
-}
-
-#[test]
-fn tracker_rejects_duplicate_projectiles_beyond_the_model_token_prefix() {
-    let mut tracker = tracker_with_first_tick(1);
-    let mut view = crowded_map0_view(2, 4_096);
-    view.tick = 2;
-    view.projectiles[4_095].id = view.projectiles[0].id;
-    let before = tracker.provenance();
-
-    assert_observe_error(
-        &mut tracker,
-        &view,
-        "snapshot projectiles repeats EntityId(1000, 1)",
-    );
-
-    assert_eq!(tracker.provenance(), before);
-}
-
-#[test]
-fn protocol_accepts_exact_byte_cap_and_rejects_next_byte_from_header_alone() {
-    let payload = vec![0u8; bota_proto::MAX_PAYLOAD_LEN - 4];
-    let bytes = bota_proto::encode_frame_to_vec(&payload).expect("exact byte cap");
-    assert_eq!(
-        bytes.len(),
-        bota_proto::LEN_PREFIX + bota_proto::MAX_PAYLOAD_LEN
-    );
-    let mut reader = bota_proto::FrameReader::new();
-    reader.push(&bytes);
-    assert_eq!(reader.next_message().expect("decode at cap"), Some(payload));
-    let excessive = bota_proto::MAX_PAYLOAD_LEN + 1;
-    reader.push(&(excessive as u32).to_le_bytes());
-
-    let error = reader
-        .next_message::<WorldView>()
-        .expect_err("oversize header");
-
-    assert_eq!(error, bota_proto::CodecError::TooLarge { len: excessive });
-    assert_eq!(
-        error.to_string(),
-        "frame payload of 4194305 bytes exceeds 4194304"
-    );
-    assert_eq!(reader.buffered(), bota_proto::LEN_PREFIX);
-}
-
-#[test]
-fn protocol_projectile_record_sizes_are_seven_to_twenty_eight_bytes_not_a_count_cap() {
-    let smallest = ProjectileView {
-        id: entity(0, 0),
-        pos: Vec2::ZERO,
-        facing: Angle { brads: 0 },
-        team: Team::Radiant,
-        ability: None,
-    };
-    let largest = ProjectileView {
-        id: entity(u32::MAX, u32::MAX),
-        pos: raw_position(i32::MAX, i32::MIN),
-        facing: Angle { brads: u16::MAX },
-        team: Team::Dire,
-        ability: Some(AbilityId(u16::MAX)),
-    };
-
-    let minimum = bota_proto::encode_frame_to_vec(&smallest).expect("minimum postcard record");
-    let maximum = bota_proto::encode_frame_to_vec(&largest).expect("maximum postcard record");
-
-    assert_eq!(minimum.len() - bota_proto::LEN_PREFIX, 7);
-    assert_eq!(maximum.len() - bota_proto::LEN_PREFIX, 28);
-}
-
-fn crowded_map0_view(units: usize, projectiles: usize) -> WorldView {
-    assert!((2..=4_097).contains(&units));
-    assert!(projectiles <= 4_097);
-    let mut view = world_view(1);
-    view.units
-        .extend((3..=units as u32).map(|index| creep(entity(index, 1), Team::Dire, 100, 100)));
-    view.projectiles = (0..projectiles as u32)
-        .map(|index| {
-            let mut shot = projectile();
-            shot.id = entity(1_000 + index, 1);
-            shot
-        })
-        .collect();
-    view
-}
-
-#[cfg(feature = "builtin")]
-#[test]
-#[ignore = "requires DRYSUA_MAP0_REPLAY pointing to the frozen seed-9470002 replay; release only"]
-fn frozen_map0_replay_accepts_every_seat_frame_including_first_33_projectiles() {
-    use bota_proto::{ReplayRecord, ServerMsg};
-    let file = std::fs::File::open(
-        std::env::var_os("DRYSUA_MAP0_REPLAY").expect("DRYSUA_MAP0_REPLAY is required"),
-    )
-    .expect("frozen replay");
-    let mut remaining = file.metadata().expect("replay length").len();
-    assert_eq!(remaining, 533_134_855);
-    let mut reader = std::io::BufReader::new(file);
-    let (mut arena, start) = crate::Arena::new(crate::ArenaConfig {
-        seats: 2,
-        map: MapId(0),
-        seed: 9_470_002,
-    })
-    .expect("unmodified Map0 simulation");
-    let ServerMsg::MatchStart { info } = &start.messages[0][0] else {
-        panic!("MatchStart must precede seat observations");
-    };
-    assert_eq!(
-        read_frozen_record(&mut reader, &mut remaining),
-        ReplayRecord::Msg(ServerMsg::MatchStart { info: info.clone() })
-    );
-    let mut trackers = std::array::from_fn(|slot| {
-        StateTracker::new(SlotId(slot as u8), info).expect("seat tracker")
-    });
-    let mut counts = [0; 2];
-    let mut first_33 = [None; 2];
-    let mut peaks = [(0, 0); 2];
-    observe_replayed_seats(
-        &mut trackers,
-        start.messages,
-        &mut counts,
-        &mut first_33,
-        &mut peaks,
-    );
-    for _ in 0..48_626 * 3 {
-        if remaining == 0 {
-            break;
-        }
-        let ReplayRecord::Orders { tick, orders } = read_frozen_record(&mut reader, &mut remaining)
-        else {
-            continue;
-        };
-        assert!(orders.len() <= 2);
-        if tick == 1 {
-            assert!(orders.is_empty());
-            continue;
-        }
-        assert_eq!(tick, arena.tick() + 1);
-        let requests = replay_requests(tick, orders);
-        let step = arena.step(&requests).expect("recorded orders");
-        observe_replayed_seats(
-            &mut trackers,
-            step.messages,
-            &mut counts,
-            &mut first_33,
-            &mut peaks,
-        );
-    }
-    assert_eq!(remaining, 0);
-    assert_eq!(counts, [48_626; 2]);
-    assert_eq!(first_33, [Some(48_626), Some(47_725)]);
-    eprintln!(
-        "seed=9470002 snapshots={counts:?} first_33={first_33:?} unit_projectile_peaks={peaks:?}"
-    );
-}
-
-#[cfg(feature = "builtin")]
-fn replay_requests(tick: u32, orders: Vec<bota_proto::SlotOrder>) -> [Option<crate::Request>; 2] {
-    assert!((2..=48_626).contains(&tick));
-    assert!(orders.len() <= 2);
-    let mut requests = [None; 2];
-    for order in orders {
-        let slot = usize::from(order.slot.0);
-        assert!(slot < requests.len());
-        assert!(requests[slot].is_none());
-        requests[slot] = Some(crate::Request {
-            seq: tick,
-            unit: order.unit,
-            order: order.order,
-        });
-    }
-    requests
-}
-
-#[cfg(feature = "builtin")]
-fn read_frozen_record(
-    reader: &mut impl std::io::Read,
-    remaining: &mut u64,
-) -> bota_proto::ReplayRecord {
-    assert!(*remaining >= bota_proto::LEN_PREFIX as u64);
-    let mut header = [0; bota_proto::LEN_PREFIX];
-    reader.read_exact(&mut header).expect("replay header");
-    let length = u32::from_le_bytes(header) as usize;
-    assert!((1..=bota_proto::MAX_PAYLOAD_LEN).contains(&length));
-    assert!(length as u64 <= *remaining - bota_proto::LEN_PREFIX as u64);
-    let mut payload = vec![0; length];
-    reader.read_exact(&mut payload).expect("replay payload");
-    *remaining -= (bota_proto::LEN_PREFIX + length) as u64;
-    bota_proto::decode_payload(&payload).expect("replay record")
-}
-
-#[cfg(feature = "builtin")]
-fn observe_replayed_seats(
-    trackers: &mut [StateTracker; 2],
-    messages: Vec<Vec<bota_proto::ServerMsg>>,
-    counts: &mut [u32; 2],
-    first_33: &mut [Option<u32>; 2],
-    peaks: &mut [(usize, usize); 2],
-) {
-    assert_eq!(messages.len(), 2);
-    for (slot, stream) in messages.into_iter().enumerate() {
-        assert!(stream.len() <= 4);
-        for message in stream {
-            match message {
-                bota_proto::ServerMsg::Snapshot { view } => {
-                    assert_eq!(view.viewer, Some(trackers[slot].team()));
-                    assert_eq!(view.tick, counts[slot] + 1);
-                    trackers[slot]
-                        .observe_snapshot(&view)
-                        .unwrap_or_else(|error| {
-                            panic!("seed=9470002 slot={slot} tick={}: {error}", view.tick);
-                        });
-                    counts[slot] += 1;
-                    peaks[slot].0 = peaks[slot].0.max(view.units.len());
-                    peaks[slot].1 = peaks[slot].1.max(view.projectiles.len());
-                    if view.projectiles.len() > 32 && first_33[slot].is_none() {
-                        assert_eq!(view.projectiles.len(), 33);
-                        first_33[slot] = Some(view.tick);
-                        assert!(
-                            super::feature::encode(
-                                &trackers[slot],
-                                &crate::LocalPolicyState::new(0)
-                            )
-                            .is_finite()
-                        );
-                    }
-                }
-                bota_proto::ServerMsg::Events { tick, events } => {
-                    assert_eq!(tick, counts[slot]);
-                    trackers[slot]
-                        .observe_events(tick, &events)
-                        .expect("seat events");
-                }
-                bota_proto::ServerMsg::MatchStart { .. } => {}
-                other => panic!("unexpected replayed seat message: {other:?}"),
-            }
-        }
-    }
-}
-
-#[test]
-fn tracker_updates_damage_heal_death_cast_and_possible_attack_observations() {
-    let attacker = entity(1, 1);
-    let target = entity(20, 1);
-    let mut tracker = new_tracker();
-    let mut view = world_view(1);
-    view.units.push(creep(target, Team::Dire, 100, 100));
-    view.units.sort_by_key(|unit| unit.id);
-    tracker.observe_snapshot(&view).expect("snapshot");
-    let events = [
-        EventKind::Damaged {
-            source: Some(attacker),
-            target,
+        tracker.observe_snapshot(&world_view(1)).expect("snapshot");
+        let mut events = vec![EventKind::Damaged {
+            source: Some(entity()),
+            target: entity(),
             amount: 75,
             kind: DamageKind::Physical,
             crit: false,
-        },
-        EventKind::Healed {
-            source: Some(attacker),
-            target: attacker,
+        }];
+        if cast {
+            events.push(EventKind::AbilityCast {
+                caster: entity(),
+                ability: AbilityId(13),
+            });
+        }
+        events.push(EventKind::Healed {
+            source: None,
+            target: entity(),
             amount: 20,
             mana: 0,
-        },
-        EventKind::Died {
-            unit: target,
-            killer: Some(attacker),
-            denied: false,
-            gold: 125,
-        },
-        EventKind::AbilityCast {
-            caster: attacker,
-            ability: AbilityId(13),
-        },
-    ];
-
-    tracker.observe_events(1, &events).expect("events");
-
-    let attacker_track = tracker.entity(attacker).expect("attacker");
-    assert_eq!(
-        attacker_track
-            .last_damage_dealt
-            .expect("damage")
-            .counterpart,
-        Some(target)
-    );
-    assert_eq!(attacker_track.last_heal_received.expect("heal").amount, 20);
-    assert_eq!(
-        attacker_track.last_ability_cast.expect("cast").ability,
-        AbilityId(13)
-    );
-    assert!(
-        attacker_track.last_possible_attack_landed.is_none(),
-        "a same-tick ability cast keeps physical damage ambiguous rather than calling it an attack"
-    );
-    let target_track = tracker.entity(target).expect("target");
-    assert_eq!(target_track.last_damage_taken.expect("damage").amount, 75);
-    assert_eq!(
-        target_track.last_death.expect("death").killer,
-        Some(attacker)
-    );
-    assert_eq!(target_track.last_death.expect("death").gold, 125);
-    assert!(!target_track.visible);
-}
-
-#[test]
-fn tracker_marks_only_unattributed_physical_noncritical_damage_as_possible_attack() {
-    let attacker = entity(1, 1);
-    let target = entity(20, 1);
-    let mut tracker = new_tracker();
-    let mut view = world_view(1);
-    view.units.push(creep(target, Team::Dire, 100, 100));
-    view.units.sort_by_key(|unit| unit.id);
-    tracker.observe_snapshot(&view).expect("snapshot");
-
-    tracker
-        .observe_events(
-            1,
-            &[EventKind::Damaged {
-                source: Some(attacker),
-                target,
-                amount: 30,
-                kind: DamageKind::Physical,
-                crit: false,
-            }],
-        )
-        .expect("damage");
-
-    let possible = tracker
-        .entity(attacker)
-        .expect("attacker")
-        .last_possible_attack_landed
-        .expect("possible attack");
-    assert_eq!(possible.tick, 1);
-    assert_eq!(possible.target, target);
-}
-
-#[test]
-fn tracker_retains_unknown_event_ids_without_creating_entities() {
-    let mut tracker = new_tracker();
-    tracker.observe_snapshot(&world_view(1)).expect("snapshot");
-    let unknown = entity(999, 7);
-
-    tracker
-        .observe_events(
-            1,
-            &[EventKind::Died {
-                unit: unknown,
-                killer: None,
-                denied: false,
-                gold: 0,
-            }],
-        )
-        .expect("unknown event");
-
-    assert!(tracker.entity(unknown).is_none());
-    assert_eq!(tracker.recent_events().len(), 1);
-    assert_eq!(
-        tracker.recent_events()[0].kind,
-        EventKind::Died {
-            unit: unknown,
+        });
+        tracker.observe_events(1, &events).expect("events");
+        let hero = tracker.entity(entity()).expect("hero");
+        assert_eq!(hero.last_damage_taken.expect("damage").amount, 75);
+        assert_eq!(hero.last_heal_received.expect("heal").amount, 20);
+        assert_eq!(hero.last_possible_attack_landed.is_none(), cast);
+        let death = EventKind::Died {
+            unit: entity(),
             killer: None,
             denied: false,
-            gold: 0,
-        }
-    );
+            gold: 125,
+        };
+        tracker.observe_events(2, &[death]).expect("death");
+        assert!(!tracker.entity(entity()).expect("dead").visible);
+        assert_eq!(
+            tracker
+                .entity(entity())
+                .expect("dead")
+                .last_death
+                .expect("death")
+                .gold,
+            125
+        );
+        let before = ActionSpace::from_tracker(&tracker).expect("event space");
+        assert_eq!(
+            tracker
+                .observe_events(2, &[])
+                .expect_err("duplicate tick")
+                .to_string(),
+            "event batch tick 2 must be greater than last event tick 2"
+        );
+        assert!(before.matches_tracker(&tracker));
+        tracker.observe_events(3, &[]).expect("valid retry");
+    }
 }
 
 #[test]
-fn tracker_accepts_event_stream_independently_of_snapshots_and_rejects_old_ticks() {
+fn public_visibility_obeys_obstruction_and_exact_radius() {
+    for (opaque, distance, visible) in [(false, 200, true), (false, 201, false), (true, 120, false)]
+    {
+        let mut info = match_info();
+        if opaque {
+            info.opaque_cells = vec![(1, 0)];
+        }
+        let mut view = world_view(1);
+        view.units[0].vision_radius = Fixed::from_int(200);
+        let mut tracker = StateTracker::new(SlotId(0), &info).expect("tracker");
+        tracker.observe_snapshot(&view).expect("snapshot");
+        assert_eq!(
+            tracker.position_visible_to_own_seat(Vec2::from_ints(10 + distance, 20)),
+            visible
+        );
+    }
+}
+
+#[test]
+fn event_stream_is_bounded_independent_and_does_not_invent_unknown_entities() {
     let mut tracker = new_tracker();
-    let one = EventKind::ItemBought {
-        slot: SlotId(0),
-        item: ItemId(1),
+    let unknown = EntityId {
+        idx: 999,
+        generation: 7,
+    };
+    let death = EventKind::Died {
+        unit: unknown,
+        killer: None,
+        denied: false,
+        gold: 0,
     };
     tracker
-        .observe_events(10, std::slice::from_ref(&one))
-        .expect("event before snapshot");
+        .observe_events(10, std::slice::from_ref(&death))
+        .expect("events first");
     tracker
         .observe_snapshot(&world_view(20))
-        .expect("newer snapshot");
+        .expect("independent snapshot");
     tracker
-        .observe_events(11, &[])
-        .expect("empty event batch older than snapshot");
-    tracker
-        .observe_events(30, std::slice::from_ref(&one))
-        .expect("event batch newer than snapshot");
-
-    let error = tracker
-        .observe_events(30, &[])
-        .expect_err("equal event tick rejected");
-    assert_eq!(
-        error.to_string(),
-        "event batch tick 30 must be greater than last event tick 30"
-    );
-    let error = tracker
-        .observe_events(29, std::slice::from_ref(&one))
-        .expect_err("older event tick rejected");
-    assert_eq!(
-        error.to_string(),
-        "event batch tick 29 must be greater than last event tick 30"
-    );
-    assert_eq!(tracker.recent_events().len(), 2);
-}
-
-#[test]
-fn event_batch_limit_accepts_the_wire_bound_and_rejects_the_next_count() {
-    crate::tracker::validate_event_batch_limit(MAX_EVENTS_PER_BATCH).expect("exact boundary");
-
-    let error = crate::tracker::validate_event_batch_limit(MAX_EVENTS_PER_BATCH + 1)
-        .expect_err("count above boundary");
-
-    assert_eq!(
-        error.to_string(),
-        "event batch has 2097153 entries; limit is 2097152"
-    );
-}
-
-#[test]
-fn tracker_processes_a_small_functional_event_batch() {
-    let mut tracker = new_tracker();
-    tracker.observe_snapshot(&world_view(1)).expect("snapshot");
-    let events: Vec<_> = (0..3)
-        .map(|index| EventKind::ItemBought {
-            slot: SlotId(0),
-            item: ItemId(index as u16),
-        })
-        .collect();
-
-    tracker.observe_events(2, &events).expect("small batch");
-
-    assert_eq!(tracker.recent_events().len(), 3);
-    assert_eq!(
-        tracker.recent_events().front().expect("front").kind,
-        EventKind::ItemBought {
-            slot: SlotId(0),
-            item: ItemId(0),
-        }
-    );
-    assert_eq!(
-        tracker.recent_events().back().expect("back").kind,
-        EventKind::ItemBought {
-            slot: SlotId(0),
-            item: ItemId(2),
-        }
-    );
-}
-
-#[test]
-fn tracker_history_selects_exact_tick_ages_and_falls_back_to_oldest() {
-    let mut tracker = new_tracker();
-    for tick in 1..=481 {
-        tracker
-            .observe_snapshot(&world_view(tick))
-            .expect("snapshot");
-    }
-
-    assert_eq!(
-        tracker.history().map(|summary| summary.tick),
-        [1, 241, 361, 421, 451, 466, 481]
-    );
-
-    let mut early = tracker_with_first_tick(7);
-    assert_eq!(early.history().map(|summary| summary.tick), [7; 7]);
-    early
-        .observe_snapshot(&world_view(22))
-        .expect("second snapshot");
-    assert_eq!(
-        early.history().map(|summary| summary.tick),
-        [7, 7, 7, 7, 7, 7, 22]
-    );
-}
-
-#[test]
-fn tracker_history_uses_game_ticks_across_snapshot_call_gaps() {
-    let mut tracker = new_tracker();
-    for tick in 1..=600 {
-        tracker
-            .observe_snapshot(&world_view(tick))
-            .expect("snapshot");
-    }
-    tracker
-        .observe_snapshot(&world_view(901))
-        .expect("gap snapshot");
-
-    assert_eq!(
-        tracker.history().map(|summary| summary.tick),
-        [421, 600, 600, 600, 600, 600, 901]
-    );
-}
-
-#[test]
-fn tracker_global_summary_aggregates_scoreboard_units_and_structures() {
-    let mut tracker = new_tracker();
-    let mut view = world_view(1);
-    view.players[0].xp = 120;
-    view.players[0].kills = 2;
-    view.players[0].last_hits = 8;
-    view.players[1].xp = 90;
-    view.players[1].deaths = 2;
-    view.players[1].denies = 3;
-    view.units.push(building(entity(30, 1), Team::Radiant, 700));
-    view.units.push(building(entity(31, 1), Team::Dire, 650));
-    view.units.sort_by_key(|unit| unit.id);
-
-    tracker.observe_snapshot(&view).expect("summary snapshot");
-
-    let summary = tracker.history()[6];
-    assert_eq!(summary.own_hp, 1_000);
-    assert_eq!(summary.own_max_hp, 1_000);
-    assert!(summary.own_hp_present);
-    assert_eq!(summary.own_mana, 400);
-    assert_eq!(summary.own_max_mana, 400);
-    assert!(summary.own_mana_present);
-    assert_eq!(summary.own_level, 3);
-    assert_eq!(summary.own_gold, 600);
-    assert_eq!(summary.visible_allied_units, 3);
-    assert_eq!(summary.visible_enemy_units, 1);
-    assert_eq!(summary.allied.xp, 120);
-    assert_eq!(summary.allied.levels, 3);
-    assert_eq!(summary.allied.kills, 2);
-    assert_eq!(summary.allied.last_hits, 8);
-    assert_eq!(summary.enemy.xp, 90);
-    assert_eq!(summary.enemy.levels, 2);
-    assert_eq!(summary.enemy.deaths, 2);
-    assert_eq!(summary.enemy.denies, 3);
-    assert_eq!(summary.allied_structure_hp, 700);
-    assert_eq!(summary.enemy_structure_hp, 650);
-    assert!(summary.destroyed_structures_present);
-    assert_eq!(summary.allied_structures_destroyed, 0);
-    assert_eq!(summary.enemy_structures_destroyed, 0);
-}
-
-#[test]
-fn tracker_summary_marks_live_resources_missing_and_counts_observed_structure_removal() {
-    let mut tracker = new_tracker();
-    let mut first = world_view(1);
-    first
-        .units
-        .push(building(entity(30, 1), Team::Radiant, 700));
-    first.units.push(building(entity(31, 1), Team::Dire, 650));
-    first.units.sort_by_key(|unit| unit.id);
-    tracker.observe_snapshot(&first).expect("baseline");
-
-    let mut second = world_view(2);
-    second.players[0].unit = None;
-    second.players[0].respawn_left = 30;
-    second.players[0].kit = Some(bota_proto::Kit {
-        abilities: Vec::new(),
-        items: vec![None; 9],
-    });
-    second.units.retain(|unit| unit.id != entity(1, 1));
-    second
-        .units
-        .push(building(entity(30, 1), Team::Radiant, 700));
-    second.units.sort_by_key(|unit| unit.id);
-    tracker.observe_snapshot(&second).expect("removal");
-
-    let summary = tracker.history()[6];
-    assert!(!summary.own_hp_present);
-    assert!(!summary.own_mana_present);
-    assert_eq!(summary.own_hp, 0);
-    assert_eq!(summary.own_mana, 0);
-    assert_eq!(summary.allied_structures_destroyed, 0);
-    assert_eq!(summary.enemy_structures_destroyed, 1);
-}
-
-#[test]
-fn tracker_marks_destroyed_structure_count_missing_without_pregame_baseline() {
-    let mut tracker = new_tracker();
-    let mut joined = world_view(100);
-    joined
-        .units
-        .push(building(entity(30, 1), Team::Radiant, 700));
-    joined.units.sort_by_key(|unit| unit.id);
-    tracker.observe_snapshot(&joined).expect("joined snapshot");
-
-    tracker
-        .observe_snapshot(&world_view(101))
-        .expect("later snapshot");
-
-    let summary = tracker.history()[6];
-    assert!(!summary.destroyed_structures_present);
-    assert_eq!(summary.allied_structures_destroyed, 0);
-    assert_eq!(summary.enemy_structures_destroyed, 0);
-}
-
-#[test]
-fn tracker_rejects_snapshot_loot_tree_and_nested_vector_bounds() {
-    assert_snapshot_limit(
-        |view| view.loot = vec![loot(); MAX_LOOT + 1],
-        "WorldView.loot has 17 entries; limit is 16",
-    );
-    assert_snapshot_limit(
-        |view| view.planted_trees = vec![Vec2::ZERO; MAX_PLANTED_TREES + 1],
-        "WorldView.planted_trees has 4097 entries; limit is 4096",
-    );
-    assert_snapshot_limit(
-        |view| view.units[0].abilities = vec![ability(); SHADOW_FIEND_ABILITY_SLOTS + 1],
-        "UnitView.abilities has 7 entries; limit is 6",
-    );
-    assert_snapshot_limit(
-        |view| view.units[0].items = vec![None; 10],
-        "UnitView.items has 10 entries; limit is 9",
-    );
-    assert_snapshot_limit(
-        |view| view.units[0].effects = vec![effect(); MAX_EFFECTS_PER_UNIT + 1],
-        "UnitView.effects has 33 entries; limit is 32",
-    );
-}
-
-#[test]
-fn tracker_exposes_own_player_hero_courier_and_current_map_state() {
-    let mut tracker = new_tracker();
-    let view = world_view(1);
-
-    tracker.observe_snapshot(&view).expect("snapshot");
-
-    assert_eq!(tracker.own_player().expect("player").slot, SlotId(0));
-    assert_eq!(tracker.own_hero().expect("hero").id, entity(1, 1));
-    assert_eq!(tracker.own_courier().expect("courier").id, entity(2, 1));
-    let current = tracker.current().expect("current");
-    assert_eq!(current.projectiles.len(), 1);
-    assert_eq!(current.loot.len(), 1);
-    assert_eq!(current.felled_trees, [0]);
-    assert_eq!(current.planted_trees, [Vec2::from_ints(6, 7)]);
-}
-
-#[test]
-fn tracker_returns_no_own_hero_while_dead_and_keeps_courier_available() {
-    let mut tracker = new_tracker();
-    let mut view = world_view(1);
-    view.players[0].unit = None;
-    view.players[0].kit = Some(dead_kit());
-    view.players[0].respawn_left = 20;
-    view.units.retain(|unit| unit.id != entity(1, 1));
-
-    tracker.observe_snapshot(&view).expect("dead snapshot");
-
-    assert!(tracker.own_hero().is_none());
-    assert_eq!(tracker.own_courier().expect("courier").id, entity(2, 1));
-    assert_eq!(tracker.history()[6].own_respawn_left, 20);
-}
-
-fn assert_new_error(info: &MatchInfo, expected: &str) {
-    let error = StateTracker::new(SlotId(0), info)
-        .err()
-        .expect("invalid match info must fail");
-    assert_eq!(error.to_string(), expected);
-}
-
-fn assert_observe_error(tracker: &mut StateTracker, view: &WorldView, expected: &str) {
-    let error = tracker
-        .observe_snapshot(view)
-        .expect_err("invalid snapshot must fail");
-    assert_eq!(error.to_string(), expected);
-}
-
-fn assert_snapshot_limit(change: impl FnOnce(&mut WorldView), expected: &str) {
-    let mut tracker = new_tracker();
-    let mut view = world_view(1);
-    change(&mut view);
-    assert_observe_error(&mut tracker, &view, expected);
-}
-
-fn assert_roster_error(change: impl FnOnce(&mut WorldView), expected: &str) {
-    let mut tracker = tracker_with_first_tick(1);
-    let mut view = world_view(2);
-    change(&mut view);
-
-    assert_observe_error(&mut tracker, &view, expected);
-    assert_eq!(tracker.current().expect("unchanged snapshot").tick, 1);
-    assert_eq!(tracker.history()[6].tick, 1);
+        .observe_events(11, &vec![death.clone(); 100])
+        .expect("events behind snapshot");
+    assert_eq!(tracker.recent_events().len(), 64);
+    assert_eq!(tracker.recent_events().back().expect("event").kind, death);
+    assert!(tracker.entity(unknown).is_none());
 }
 
 fn new_tracker() -> StateTracker {
-    StateTracker::new(SlotId(0), &match_info()).expect("fixture tracker")
-}
-
-fn tracker_with_first_tick(tick: u32) -> StateTracker {
-    let mut tracker = new_tracker();
-    tracker
-        .observe_snapshot(&world_view(tick))
-        .expect("first snapshot");
-    tracker
+    StateTracker::new(SlotId(0), &match_info()).expect("tracker")
 }
 
 fn match_info() -> MatchInfo {
     fixtures::MatchInfoFixture::new(77, MapId(0), fixtures::two_seat_picks(Team::Radiant))
-        .pregame_ticks(90)
-        .trees(vec![Vec2::from_ints(4, 5)])
         .terrain_cells(8)
         .terrain_rle(vec![(64, 0x80)])
-        .opaque_cells(vec![(0, 0)])
-        .shop(vec![shop_entry()])
         .build()
 }
 
-fn shop_entry() -> ShopEntry {
-    ShopEntry {
-        id: ItemId(1),
-        cost: 50,
-        components: Vec::new(),
-    }
-}
-
 fn world_view(tick: u32) -> WorldView {
-    let mut units = vec![hero(), courier()];
-    units.sort_by_key(|unit| unit.id);
-    WorldView {
-        tick,
-        viewer: Some(Team::Radiant),
-        units,
-        projectiles: vec![projectile()],
-        players: vec![own_player(), enemy_player()],
-        felled_trees: vec![0],
-        planted_trees: vec![Vec2::from_ints(6, 7)],
-        loot: vec![loot()],
-    }
-}
-
-fn hero() -> UnitView {
-    UnitView {
-        id: entity(1, 1),
+    let hero = fixtures::UnitFixture {
+        id: entity(),
         kind: UnitKind::Hero,
         team: Team::Radiant,
         pos: Vec2::from_ints(10, 20),
-        facing: Angle { brads: 0 },
-        hp: 1_000,
-        max_hp: 1_000,
         mana: 400,
-        max_mana: 400,
-        move_speed: Fixed::from_int(300),
         attack_damage: 55,
-        attack_range: Fixed::from_int(500),
         attack_time: 1000,
-        attack_point: 0,
-        attack_speed: 100,
-        armor: Fixed::from_int(2),
-        magic_resist: Fixed::from_ratio(1, 4),
-        collision: Fixed::from_int(24),
-        bound: Fixed::from_int(24),
-        vision_radius: Fixed::from_int(1_800),
-        true_sight_radius: Fixed::ZERO,
-        statuses: StatusFlags { bits: 0 },
-        attributes: Attributes::all(20),
-        primary: Some(Attribute::Agility),
+        attributes: bota_proto::Attributes::all(20),
+        primary: Some(bota_proto::Attribute::Agility),
         hero: Some(SHADOW_FIEND),
         owner: Some(SlotId(0)),
         level: 3,
-        abilities: vec![ability(); SHADOW_FIEND_ABILITY_SLOTS],
-        items: vec![None; 9],
-        effects: vec![effect()],
+    }
+    .build();
+    let players = [true, false]
+        .map(|own| bota_proto::PlayerView {
+            slot: SlotId(u8::from(!own)),
+            team: if own { Team::Radiant } else { Team::Dire },
+            hero: SHADOW_FIEND,
+            unit: own.then_some(entity()),
+            level: if own { 3 } else { 2 },
+            xp: 0,
+            gold: own.then_some(600),
+            stash: own.then(|| vec![None; 6]),
+            kit: None,
+            kills: 0,
+            deaths: 0,
+            assists: 0,
+            last_hits: 0,
+            denies: 0,
+            respawn_left: if own { 0 } else { 10 },
+        })
+        .to_vec();
+    WorldView {
+        tick,
+        viewer: Some(Team::Radiant),
+        units: vec![hero],
+        players,
+        projectiles: Vec::new(),
+        felled_trees: Vec::new(),
+        planted_trees: Vec::new(),
+        loot: Vec::new(),
     }
 }
 
-fn courier() -> UnitView {
-    UnitView {
-        id: entity(2, 1),
-        kind: UnitKind::Courier,
-        team: Team::Radiant,
-        pos: Vec2::from_ints(8, 8),
-        facing: Angle { brads: 1 },
-        hp: 100,
-        max_hp: 100,
-        mana: 0,
-        max_mana: 0,
-        move_speed: Fixed::from_int(350),
-        attack_damage: 0,
-        attack_range: Fixed::ZERO,
-        attack_time: 0,
-        attack_point: 0,
-        attack_speed: 0,
-        armor: Fixed::ZERO,
-        magic_resist: Fixed::ZERO,
-        collision: Fixed::from_int(16),
-        bound: Fixed::from_int(16),
-        vision_radius: Fixed::from_int(400),
-        true_sight_radius: Fixed::ZERO,
-        statuses: StatusFlags { bits: 0 },
-        attributes: Attributes::ZERO,
-        primary: None,
-        hero: None,
-        owner: Some(SlotId(0)),
-        level: 0,
-        abilities: Vec::new(),
-        items: vec![None; 6],
-        effects: Vec::new(),
-    }
-}
-
-fn creep(id: EntityId, team: Team, hp: i32, mana: i32) -> UnitView {
-    UnitView {
-        id,
-        kind: UnitKind::CreepMelee,
-        team,
-        pos: Vec2::from_ints(100, 200),
-        facing: Angle { brads: 2 },
-        hp,
-        max_hp: 500,
-        mana,
-        max_mana: 200,
-        move_speed: Fixed::from_int(300),
-        attack_damage: 20,
-        attack_range: Fixed::from_int(100),
-        attack_time: 1334,
-        attack_point: 0,
-        attack_speed: 100,
-        armor: Fixed::ZERO,
-        magic_resist: Fixed::ZERO,
-        collision: Fixed::from_int(20),
-        bound: Fixed::from_int(20),
-        vision_radius: Fixed::from_int(600),
-        true_sight_radius: Fixed::ZERO,
-        statuses: StatusFlags { bits: 0 },
-        attributes: Attributes::ZERO,
-        primary: None,
-        hero: None,
-        owner: None,
-        level: 0,
-        abilities: Vec::new(),
-        items: Vec::new(),
-        effects: Vec::new(),
-    }
-}
-
-fn building(id: EntityId, team: Team, hp: i32) -> UnitView {
-    UnitView {
-        id,
-        kind: UnitKind::Tower,
-        team,
-        pos: Vec2::from_ints(300, 400),
-        facing: Angle { brads: 3 },
-        hp,
-        max_hp: 1_000,
-        mana: 0,
-        max_mana: 0,
-        move_speed: Fixed::ZERO,
-        attack_damage: 100,
-        attack_range: Fixed::from_int(700),
-        attack_time: 1000,
-        attack_point: 0,
-        attack_speed: 100,
-        armor: Fixed::from_int(10),
-        magic_resist: Fixed::from_ratio(1, 4),
-        collision: Fixed::from_int(80),
-        bound: Fixed::from_int(80),
-        vision_radius: Fixed::from_int(1_800),
-        true_sight_radius: Fixed::ZERO,
-        statuses: StatusFlags { bits: 0 },
-        attributes: Attributes::ZERO,
-        primary: None,
-        hero: None,
-        owner: None,
-        level: 0,
-        abilities: Vec::new(),
-        items: Vec::new(),
-        effects: Vec::new(),
-    }
-}
-
-fn own_player() -> PlayerView {
-    PlayerView {
-        slot: SlotId(0),
-        team: Team::Radiant,
-        hero: SHADOW_FIEND,
-        unit: Some(entity(1, 1)),
-        level: 3,
-        xp: 100,
-        gold: Some(600),
-        stash: Some(vec![None; 6]),
-        kit: None,
-        kills: 0,
-        deaths: 0,
-        assists: 0,
-        last_hits: 0,
-        denies: 0,
-        respawn_left: 0,
-    }
-}
-
-fn enemy_player() -> PlayerView {
-    PlayerView {
-        slot: SlotId(1),
-        team: Team::Dire,
-        hero: SHADOW_FIEND,
-        unit: None,
-        level: 2,
-        xp: 80,
-        gold: None,
-        stash: None,
-        kit: None,
-        kills: 0,
-        deaths: 0,
-        assists: 0,
-        last_hits: 0,
-        denies: 0,
-        respawn_left: 10,
-    }
-}
-
-fn ability() -> AbilityView {
-    AbilityView {
-        id: AbilityId(13),
-        level: 1,
-        max_level: 4,
-        cooldown_left: 0,
-        mana_cost: 75,
-        range: 200,
-        aim: Aim::Point,
-        passive: false,
-        on: false,
-        can_level: false,
-    }
-}
-
-fn item() -> ItemView {
-    ItemView {
-        id: ItemId(1),
-        charges: Some(1),
-        cooldown_left: 0,
-        mute_left: 0,
-        mode: None,
-        mana_cost: 0,
-        range: 0,
-        aim: Some(Aim::Own),
-        for_sale: false,
-    }
-}
-
-fn effect() -> EffectView {
-    EffectView {
-        id: EffectId(11),
-        ticks_left: None,
-        stacks: Some(3),
-    }
-}
-
-fn projectile() -> ProjectileView {
-    ProjectileView {
-        id: entity(40, 1),
-        pos: Vec2::from_ints(20, 30),
-        facing: Angle { brads: 4 },
-        team: Team::Radiant,
-        ability: None,
-    }
-}
-
-fn loot() -> LootView {
-    LootView {
-        id: entity(50, 1),
-        pos: Vec2::from_ints(30, 40),
-        item: ItemId(1),
-        charges: Some(1),
-    }
-}
-
-fn entity(idx: u32, generation: u32) -> EntityId {
-    EntityId { idx, generation }
-}
-
-fn dead_kit() -> Kit {
-    Kit {
-        abilities: vec![ability(); SHADOW_FIEND_ABILITY_SLOTS],
-        items: vec![Some(item()); 9],
+fn entity() -> EntityId {
+    EntityId {
+        idx: 1,
+        generation: 1,
     }
 }

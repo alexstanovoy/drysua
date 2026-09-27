@@ -1,11 +1,12 @@
 use std::collections::HashMap;
 use std::path::Path;
 
+#[cfg(test)]
 use safetensors::SafeTensors;
 
 use super::{
     CheckpointError, MAX_RUNTIME_TENSOR_BYTES, RUNTIME_TENSOR_FILE, TrainingArtifact,
-    decode_tensor_count, read_bounded, sha256, validate_directory, validate_names,
+    decode_runtime_tensor_with_metadata, read_bounded, sha256, validate_directory,
 };
 use crate::{PolicyDevice, PolicyModel};
 
@@ -34,15 +35,7 @@ impl TrainingArtifact {
             &directory.join(RUNTIME_TENSOR_FILE),
             MAX_RUNTIME_TENSOR_BYTES,
         )?;
-        let (_, metadata) = SafeTensors::read_metadata(&bytes)
-            .map_err(|error| CheckpointError::Backend(error.to_string()))?;
-        if metadata.metadata().as_ref() != Some(&source_metadata()) {
-            return Err(CheckpointError::SchemaMismatch);
-        }
-        let tensors = SafeTensors::deserialize(&bytes)
-            .map_err(|error| CheckpointError::Backend(error.to_string()))?;
-        validate_names(&tensors, &["model.parameters"])?;
-        let parameters = decode_tensor_count(&tensors, "model.parameters", SOURCE_PARAMETERS)?;
+        let parameters = decode_runtime_tensor_with_metadata(&bytes, &[source_metadata()])?;
         if sha256(&bytes) != SOURCE {
             return Err(CheckpointError::TensorContract(
                 "selected M21/u300 terminal initialization source SHA-256",

@@ -1,553 +1,154 @@
 #![allow(
     clippy::float_arithmetic,
-    reason = "PPO reference calculations use floating-point arithmetic"
+    reason = "PPO numerical and transaction regressions"
 )]
 
-use bota_proto::Team;
 #[cfg(feature = "builtin")]
-use std::sync::atomic::{AtomicU64, Ordering};
+use crate::ppo::test_directory as training_directory;
+use bota_proto::Team;
 
 use super::feature::{encode, tracker_with_view, world_view};
-#[path = "ppo_capacity.rs"]
-mod capacity;
-#[cfg(feature = "builtin")]
-use crate::ActionKind;
 use crate::{
-    ABILITY_FEATURE_TOKENS, ActionSpace, BehavioralTarget, ControlledUnit, ITEM_FEATURE_TOKENS,
-    LOOT_FEATURE_TOKENS, LocalPolicyState, MODEL_TRAINING_BATCH, POINT_FEATURE_TOKENS,
-    PPO_MAX_ROLLOUT_DECISIONS, PPO_RULES_AUDIT_VERSION, PPO_SCHEMA_HASH, PPO_SCHEMA_VERSION,
-    PPO_SHAPING_BUDGET, PPO_TERMINAL_REWARD, PROJECTILE_FEATURE_TOKENS, PolicyModel, PpoConfig,
-    PpoOutcome, PpoPolicyChoice, PpoRng, PpoRollout, PpoTerminalOutcome, PpoTrainer,
-    REMEMBERED_UNIT_FEATURE_TOKENS, RewardTracker, StructuredAction, UNIT_FEATURE_TOKENS,
-    clipped_surrogate, tick_discount,
+    ActionSpace, BehavioralTarget, ControlledUnit, LocalPolicyState, MODEL_TRAINING_BATCH,
+    PolicyModel, PpoConfig, PpoOutcome, PpoPolicyChoice, PpoRng, PpoRollout, PpoTrainer,
+    StructuredAction, clipped_surrogate, tick_discount,
 };
 
+#[path = "ppo_capacity.rs"]
+mod capacity;
+
 #[test]
-fn ppo_defaults_match_stage_nine_plan() {
-    let config = PpoConfig::default();
-
-    assert_eq!(config.decision_interval_ticks, 3);
-    assert_eq!(config.rollout_decisions, 256);
-    assert_eq!(config.environments, 32);
-    assert_eq!(config.epochs, 4);
-    assert_eq!(config.minibatch, 2_048);
-    assert_eq!(config.clip_epsilon, 0.2);
-    assert_eq!(config.value_coefficient, 0.5);
-    assert_eq!(config.entropy_coefficient, 0.01);
-    assert_eq!(config.gae_lambda, 0.98);
-    assert_eq!(config.target_kl, 0.02);
-    assert_eq!(PPO_TERMINAL_REWARD, 1.0);
-}
-
-#[cfg(feature = "builtin")]
-#[cfg(feature = "builtin")]
-#[test]
-fn actor_report_merge_retains_all_terminal_telemetry() {
-    let mut aggregate = crate::PpoSmokeReport {
-        episode_timeouts: 5,
-        terminal_wins: 1,
-        terminal_losses: 2,
-        terminal_draws: 3,
-        rejected_orders: 4,
-        elapsed_ticks: 5,
-        ..crate::PpoSmokeReport::default()
-    };
-    let actor = crate::PpoSmokeReport {
-        episode_timeouts: 10,
-        terminal_wins: 6,
-        terminal_losses: 7,
-        terminal_draws: 8,
-        rejected_orders: 9,
-        elapsed_ticks: 10,
-        ..crate::PpoSmokeReport::default()
-    };
-
-    crate::merge_actor_report_for_test(&mut aggregate, actor).expect("merge actor report");
-
-    assert_eq!(aggregate.terminal_wins, 7);
-    assert_eq!(aggregate.terminal_losses, 9);
-    assert_eq!(aggregate.terminal_draws, 11);
-    assert_eq!(aggregate.rejected_orders, 13);
-    assert_eq!(aggregate.elapsed_ticks, 15);
-    assert_eq!(aggregate.episode_timeouts, 15);
-}
-
-#[cfg(feature = "builtin")]
-fn map2_reward_merge_fixture() -> crate::Map2TrainingReward {
-    crate::Map2TrainingReward {
-        tower_damage_taken: -0.0625,
-        opening_position: -0.0625,
-        ticks: 3,
-        gold: 0.5,
-        experience: 0.25,
-        hero_damage: 0.125,
-        hero_damage_taken: -0.125,
-        creep_damage_taken: -0.25,
-        other_damage_taken: -0.5,
-        mana_spent: -0.25,
-        tower_health: 0.25,
-        lane_pressure: 0.5,
-        pregame_movement: 0.125,
-        fountain_wait: -0.25,
-        fountain_wait_refund: 0.125,
-        stagnation_base: 0.0,
-        stagnation_ticks_cost: 0.0,
-        terminal: 1.0,
-        victory_time: 0.25,
-        total: 1.625,
-        observations: crate::Map2RewardObservations {
-            tower_damage_taken: 15,
-            opening_position_checks: 1,
-            victory_time_ticks: 9_000,
-            hero_damage_dealt: 50,
-            mana_spent: 75,
-            lane_observed_ticks: 3,
-            fountain_wait_ticks: 60,
-            fountain_wait_charged_ticks: 31,
-            fountain_wait_refunds: 1,
-            ..crate::Map2RewardObservations::default()
-        },
+fn actor_batch_sampling_preserves_scalar_actions_rng_and_learner_likelihood() {
+    let model = PolicyModel::fresh(9_101).expect("model");
+    let actor = model.actor_snapshot().expect("actor");
+    let (frames, spaces, mut random) = sampling_inputs(MODEL_TRAINING_BATCH);
+    let mut scalar_random = random.clone();
+    let batch = model
+        .sample_batch(&frames, &spaces, &mut random)
+        .expect("batch");
+    let chosen = model.choose_batch(&frames, &spaces).expect("greedy batch");
+    assert_eq!(batch.len(), MODEL_TRAINING_BATCH);
+    assert_eq!(chosen.len(), batch.len());
+    let mut samples = Vec::new();
+    for (index, sampled) in batch.into_iter().enumerate() {
+        let scalar = actor
+            .sample(&frames[index], &spaces[index], &mut scalar_random[index])
+            .expect("actor");
+        assert_eq!(sampled.action(), scalar.action());
+        assert_eq!(sampled.policy(), scalar.policy());
+        for (actual, expected) in [
+            (sampled.log_probability(), scalar.log_probability()),
+            (sampled.entropy(), scalar.entropy()),
+            (sampled.value(), scalar.value()),
+        ] {
+            assert!((actual - expected).abs() <= 1.0e-4);
+        }
+        assert!(spaces[index].decode(sampled.action()).is_ok());
+        let greedy = model
+            .choose(&frames[index], &spaces[index])
+            .expect("scalar greedy");
+        assert_eq!(chosen[index].action, greedy.action);
+        assert!((chosen[index].value - greedy.value).abs() < 1.0e-5);
+        samples.push(prepared_choice(index, sampled));
     }
-}
-
-#[cfg(feature = "builtin")]
-#[test]
-fn actor_report_merge_preserves_map2_reward_components_and_raw_observations() {
-    let actor = crate::PpoSmokeReport {
-        map2_reward: map2_reward_merge_fixture(),
-        elapsed_ticks: 3,
-        ..crate::PpoSmokeReport::default()
-    };
-    let mut aggregate = actor;
-
-    crate::merge_actor_report_for_test(&mut aggregate, actor).expect("merge Map2 components");
-
-    assert_eq!(aggregate.map2_reward.ticks, 6);
-    assert_eq!(aggregate.map2_reward.gold, 1.0);
-    assert_eq!(aggregate.map2_reward.experience, 0.5);
-    assert_eq!(aggregate.map2_reward.hero_damage, 0.25);
-    assert_eq!(aggregate.map2_reward.hero_damage_taken, -0.25);
-    assert_eq!(aggregate.map2_reward.creep_damage_taken, -0.5);
-    assert_eq!(aggregate.map2_reward.other_damage_taken, -1.0);
-    assert_eq!(aggregate.map2_reward.mana_spent, -0.5);
-    assert_eq!(aggregate.map2_reward.tower_health, 0.5);
-    assert_eq!(aggregate.map2_reward.lane_pressure, 1.0);
-    assert_eq!(aggregate.map2_reward.pregame_movement, 0.25);
-    assert_eq!(aggregate.map2_reward.fountain_wait, -0.5);
-    assert_eq!(aggregate.map2_reward.fountain_wait_refund, 0.25);
-    assert_eq!(aggregate.map2_reward.terminal, 2.0);
-    assert_eq!(aggregate.map2_reward.victory_time, 0.5);
-    assert_eq!(aggregate.map2_reward.total, 3.25);
-    assert_eq!(aggregate.map2_reward.tower_damage_taken, -0.125);
-    assert_eq!(aggregate.map2_reward.opening_position, -0.125);
-    assert_eq!(aggregate.map2_reward.observations.tower_damage_taken, 30);
-    assert_eq!(
-        aggregate.map2_reward.observations.opening_position_checks,
-        2
-    );
-    assert_eq!(aggregate.map2_reward.observations.hero_damage_dealt, 100);
-    assert_eq!(aggregate.map2_reward.observations.mana_spent, 150);
-    assert_eq!(aggregate.map2_reward.observations.lane_observed_ticks, 6);
-    assert_eq!(aggregate.map2_reward.observations.fountain_wait_ticks, 120);
-    assert_eq!(
-        aggregate
-            .map2_reward
-            .observations
-            .fountain_wait_charged_ticks,
-        62
-    );
-    assert_eq!(aggregate.map2_reward.observations.fountain_wait_refunds, 2);
-}
-
-#[cfg(feature = "builtin")]
-#[test]
-fn actor_report_rejection_delta_does_not_recount_prior_updates() {
-    assert_eq!(crate::rejection_delta_for_test(1, 1).expect("no delta"), 0);
-    assert_eq!(crate::rejection_delta_for_test(1, 2).expect("one delta"), 1);
-    assert_eq!(
-        crate::rejection_delta_for_test(2, 1)
-            .expect_err("counter regression")
-            .to_string(),
-        "invalid PPO transition: arena rejection counter regressed"
-    );
-}
-
-#[cfg(feature = "builtin")]
-#[test]
-fn actor_report_merges_progress_costs_counters_and_reason_bits_without_double_counting_bits() {
-    let mut aggregate = crate::PpoSmokeReport {
-        map2_reward: crate::Map2TrainingReward {
-            stagnation_base: -0.02,
-            stagnation_ticks_cost: -0.000002,
-            total: -0.020002,
-            observations: crate::Map2RewardObservations {
-                structure_damage_dealt: 7,
-                creep_kills: 2,
-                creep_denies: 1,
-                stagnation_active_ticks: 30,
-                stagnation_idle_ticks: 10,
-                stagnation_charged_ticks: 1,
-                stagnation_base_charges: 1,
-                stagnation_repaid_ticks: 90,
-                progress_reasons: crate::MAP2_PROGRESS_HERO_DAMAGE
-                    | crate::MAP2_PROGRESS_FOUNTAIN_AURA,
-                ..crate::Map2RewardObservations::default()
-            },
-            ..crate::Map2TrainingReward::default()
-        },
-        ..crate::PpoSmokeReport::default()
-    };
-    let mut other = aggregate;
-    other.map2_reward.observations.progress_reasons =
-        crate::MAP2_PROGRESS_FOUNTAIN_AURA | crate::MAP2_PROGRESS_PURCHASE;
-
-    crate::merge_actor_report_for_test(&mut aggregate, other).unwrap();
-
-    let reward = aggregate.map2_reward;
-    assert_eq!(reward.stagnation_base, -0.04);
-    assert_eq!(reward.stagnation_ticks_cost, -0.000004);
-    assert!((reward.total + 0.040004).abs() < 1.0e-12);
-    assert_eq!(reward.observations.structure_damage_dealt, 14);
-    assert_eq!(reward.observations.creep_kills, 4);
-    assert_eq!(reward.observations.creep_denies, 2);
-    assert_eq!(reward.observations.stagnation_active_ticks, 60);
-    assert_eq!(reward.observations.stagnation_idle_ticks, 20);
-    assert_eq!(reward.observations.stagnation_charged_ticks, 2);
-    assert_eq!(reward.observations.stagnation_base_charges, 2);
-    assert_eq!(reward.observations.stagnation_repaid_ticks, 180);
-    assert_eq!(
-        reward.observations.progress_reasons,
-        crate::MAP2_PROGRESS_HERO_DAMAGE
-            | crate::MAP2_PROGRESS_FOUNTAIN_AURA
-            | crate::MAP2_PROGRESS_PURCHASE
-    );
-}
-
-#[test]
-fn ppo_schema_and_rules_audit_are_stable() {
-    assert_eq!(PPO_SCHEMA_VERSION, 37);
-    assert_eq!(PPO_RULES_AUDIT_VERSION, 32);
-    assert_eq!(
-        PPO_SCHEMA_HASH,
-        super::map2_checkpoint::schema_hash(
-            crate::PPO_SCHEMA_DESCRIPTOR,
-            &[
-                (crate::ACTION_SCHEMA_VERSION, crate::ACTION_SCHEMA_HASH),
-                (crate::FEATURE_SCHEMA_VERSION, crate::FEATURE_SCHEMA_HASH),
-                (crate::MODEL_SCHEMA_VERSION, crate::MODEL_SCHEMA_HASH),
-                (
-                    crate::MAP2_REWARD_SCHEMA_VERSION,
-                    crate::MAP2_REWARD_SCHEMA_HASH
-                ),
-            ],
+    assert_eq!(random, scalar_random);
+    assert!(
+        random.iter().all(
+            |random| random.draws() > 0 && random.draws() <= crate::PPO_MAX_POLICY_SAMPLE_DRAWS
         )
     );
-    assert_ne!(PPO_SCHEMA_HASH, 9_274_275_648_898_675_046);
-    assert_eq!(PpoConfig::default().learning_rate, 3.0e-6);
+    assert_actor_likelihood(&model, &samples);
 }
 
-#[test]
-fn ppo_config_rejects_every_unbounded_dimension() {
+fn assert_actor_likelihood(model: &PolicyModel, samples: &[crate::PpoPreparedSample]) {
     assert!(
-        PpoConfig {
-            environments: 129,
-            ..PpoConfig::default()
-        }
-        .validate()
-        .is_err()
-    );
-    assert!(
-        PpoConfig {
-            rollout_decisions: PPO_MAX_ROLLOUT_DECISIONS + 1,
-            ..PpoConfig::default()
-        }
-        .validate()
-        .is_err()
-    );
-    assert!(
-        PpoConfig {
-            epochs: 17,
-            ..PpoConfig::default()
-        }
-        .validate()
-        .is_err()
-    );
-    assert!(
-        PpoConfig {
-            minibatch: 8_193,
-            ..PpoConfig::default()
-        }
-        .validate()
-        .is_err()
-    );
-}
-
-#[test]
-fn ppo_config_accepts_the_maximum_bounded_production_rollout() {
-    let config = PpoConfig {
-        environments: crate::PPO_MAX_SAMPLES / PPO_MAX_ROLLOUT_DECISIONS,
-        rollout_decisions: PPO_MAX_ROLLOUT_DECISIONS,
-        minibatch: 8_192,
-        ..PpoConfig::default()
-    };
-
-    config.validate().expect("maximum bounded rollout");
-}
-
-#[test]
-fn ppo_config_reports_a_sample_product_above_the_global_bound() {
-    let error = PpoConfig {
-        environments: crate::PPO_MAX_SAMPLES / PPO_MAX_ROLLOUT_DECISIONS + 1,
-        rollout_decisions: PPO_MAX_ROLLOUT_DECISIONS,
-        minibatch: 8_192,
-        ..PpoConfig::default()
-    }
-    .validate()
-    .expect_err("sample product exceeds the global rollout buffer");
-
-    assert_eq!(
-        error.to_string(),
-        "invalid PPO config field: samples per update"
-    );
-}
-
-#[test]
-fn discount_uses_elapsed_simulation_ticks() {
-    let discount = tick_discount(0.99, 3).expect("discount");
-
-    assert!((discount - 0.970_299).abs() < 1.0e-6);
-}
-
-#[test]
-fn sampling_uniform_is_open_at_both_integer_boundaries() {
-    let (minimum, maximum) = crate::ppo::open_unit_bounds_for_test();
-
-    assert!(minimum > 0.0);
-    assert!(maximum < 1.0);
-    assert!(minimum.is_finite());
-    assert!(maximum.is_finite());
-}
-
-#[test]
-fn clipped_surrogate_uses_the_worse_boundary_for_each_advantage_sign() {
-    assert!((clipped_surrogate(1.5, 2.0, 0.2) - 2.4).abs() < 1.0e-6);
-    assert!((clipped_surrogate(0.5, -2.0, 0.2) - -1.6).abs() < 1.0e-6);
-    assert!((clipped_surrogate(1.1, 2.0, 0.2) - 2.2).abs() < 1.0e-6);
-}
-
-#[test]
-fn sampled_action_is_legal_and_statistics_match_exactly() {
-    let (frame, space) = frame_and_space();
-    let model = PolicyModel::fresh(91).expect("model");
-    let mut rng = PpoRng::new(17);
-
-    let choice = model.sample(&frame, &space, &mut rng).expect("sample");
-    let (log_probability, entropy, value) = model
-        .action_statistics(&frame, &space, choice.action)
-        .expect("statistics");
-
-    assert!(space.allows(choice.action));
-    assert_eq!(choice.log_probability, log_probability);
-    assert_eq!(choice.entropy, entropy);
-    assert_eq!(choice.value, value);
-    assert!(choice.log_probability <= 0.0);
-    assert!(choice.entropy >= 0.0);
-    assert!(rng.draws() > 0);
-    assert!(rng.draws() <= crate::PPO_MAX_POLICY_SAMPLE_DRAWS);
-}
-
-#[test]
-fn batched_sampling_matches_independent_scalar_streams_at_the_actor_batch_limit() {
-    let model = PolicyModel::fresh(9_101).expect("model");
-    let (frames, spaces) = policy_batch_inputs();
-    let mut scalar_rngs = (0..MODEL_TRAINING_BATCH)
-        .map(|index| PpoRng::new(17 + index as u64 * 97))
-        .collect::<Vec<_>>();
-    let mut batch_rngs = scalar_rngs.clone();
-    let scalar = frames
-        .iter()
-        .zip(&spaces)
-        .zip(&mut scalar_rngs)
-        .map(|((frame, space), rng)| model.sample(frame, space, rng).expect("scalar sample"))
-        .collect::<Vec<_>>();
-
-    let batch = model
-        .sample_batch(&frames, &spaces, &mut batch_rngs)
-        .expect("batch sample");
-
-    assert_eq!(batch.len(), MODEL_TRAINING_BATCH);
-    assert!(scalar.iter().any(|choice| matches!(
-        choice.action().kind(),
-        crate::ActionKind::Cast
-            | crate::ActionKind::Use
-            | crate::ActionKind::PutPoint
-            | crate::ActionKind::PutUnit
-            | crate::ActionKind::Swap
-    )));
-    assert!(
-        scalar_rngs
+        samples
             .iter()
-            .map(PpoRng::draws)
-            .min()
-            .expect("minimum draws")
-            < scalar_rngs
-                .iter()
-                .map(PpoRng::draws)
-                .max()
-                .expect("maximum draws")
+            .any(|sample| sample.transition.target.point_pointer.active)
     );
-    for (index, (batch, scalar)) in batch.iter().zip(&scalar).enumerate() {
-        assert_eq!(batch.action(), scalar.action());
-        assert_eq!(batch.policy(), scalar.policy());
-        assert!((batch.log_probability() - scalar.log_probability()).abs() <= 1.0e-5);
-        assert!((batch.entropy() - scalar.entropy()).abs() <= 1.0e-5);
-        assert!((batch.value() - scalar.value()).abs() <= 1.0e-5);
-        assert!(spaces[index].allows(batch.action()));
-        assert!(spaces[index].decode(batch.action()).is_ok());
+    assert!(
+        samples
+            .iter()
+            .any(|sample| sample.transition.target.entity_pointer.active)
+    );
+    let references = samples.iter().collect::<Vec<_>>();
+    let (likelihood, report) = model
+        .ppo_likelihood_for_test(&references)
+        .expect("learner likelihood");
+    assert_eq!(likelihood.len(), samples.len());
+    for (current, sample) in likelihood.iter().zip(samples) {
+        assert!((current - sample.transition.old_log_probability).abs() < 1.0e-4);
     }
-    for (batch, scalar) in batch_rngs.iter().zip(&scalar_rngs) {
-        assert_eq!(batch.checkpoint(), scalar.checkpoint());
-    }
+    assert!(report.approximate_kl.abs() < 1.0e-6);
+    assert_eq!(report.clip_fraction, 0.0);
 }
 
 #[test]
-fn batched_choice_matches_independent_scalar_rows_at_the_actor_batch_limit() {
-    let model = PolicyModel::fresh(9_105).expect("model");
-    let (frames, spaces) = policy_batch_inputs();
-    let identity = model.policy_identity().expect("policy identity");
-    let scalar = frames
-        .iter()
-        .zip(&spaces)
-        .map(|(frame, space)| model.choose(frame, space).expect("scalar choice"))
-        .collect::<Vec<_>>();
-
-    let batch = model.choose_batch(&frames, &spaces).expect("batch choice");
-
-    assert_eq!(batch.len(), MODEL_TRAINING_BATCH);
-    for (index, (batch, scalar)) in batch.iter().zip(&scalar).enumerate() {
-        assert_eq!(batch.action, scalar.action);
-        assert!((batch.value - scalar.value).abs() <= 1.0e-5);
-        assert!(spaces[index].allows(batch.action));
-        assert!(spaces[index].decode(batch.action).is_ok());
-    }
-    assert_eq!(model.policy_identity().expect("stable identity"), identity);
-}
-
-#[test]
-fn batched_choice_rejects_empty_mismatched_and_stale_inputs() {
-    let model = PolicyModel::fresh(9_106).expect("model");
-    let (frame, _) = frame_and_space();
-
-    assert_eq!(
-        model.choose_batch(&[], &[]).unwrap_err().to_string(),
-        "model batch must contain at least one frame"
-    );
-    assert_eq!(
-        model
-            .choose_batch(std::slice::from_ref(&frame), &[])
-            .unwrap_err()
-            .to_string(),
-        "model batch action-space count 0 differs from frame count 1"
-    );
-    let (_, stale_space) = frame_and_space();
-    assert_eq!(
-        model
-            .choose_batch(
-                std::slice::from_ref(&frame),
-                std::slice::from_ref(&stale_space),
-            )
-            .unwrap_err()
-            .to_string(),
-        "model batch frame 0 does not belong to its action space"
-    );
-}
-
-#[test]
-fn batched_sampling_rejects_empty_and_mismatched_counts_without_rng_mutation() {
+fn invalid_sampling_batches_do_not_consume_rng() {
     let model = PolicyModel::fresh(9_102).expect("model");
     let (frame, space) = frame_and_space();
-    let mut rngs = vec![PpoRng::new(21)];
-    let before = rngs.clone();
-
-    assert_eq!(
-        model
-            .sample_batch(&[], &[], &mut [])
-            .unwrap_err()
-            .to_string(),
-        "model batch must contain at least one frame"
-    );
-    let oversized = vec![frame.clone(); MODEL_TRAINING_BATCH + 1];
-    assert_eq!(
-        model
-            .sample_batch(&oversized, &[], &mut rngs)
-            .unwrap_err()
-            .to_string(),
-        format!(
-            "model batch count {} exceeds maximum {MODEL_TRAINING_BATCH}",
-            MODEL_TRAINING_BATCH + 1
-        )
-    );
-    assert_eq!(rngs, before);
-    assert_eq!(
-        model
-            .sample_batch(std::slice::from_ref(&frame), &[], &mut rngs)
-            .unwrap_err()
-            .to_string(),
-        "model batch action-space count 0 differs from frame count 1"
-    );
-    assert_eq!(rngs, before);
-    let mut extra_rngs = vec![PpoRng::new(22), PpoRng::new(23)];
-    let extra_before = extra_rngs.clone();
-    assert_eq!(
-        model
-            .sample_batch(
-                std::slice::from_ref(&frame),
-                std::slice::from_ref(&space),
-                &mut extra_rngs,
-            )
-            .unwrap_err()
-            .to_string(),
-        "model sampling RNG count 2 differs from frame count 1"
-    );
-    assert_eq!(extra_rngs, extra_before);
+    let (_, stale) = frame_and_space();
+    let frames = vec![frame; MODEL_TRAINING_BATCH + 1];
+    let spaces = [space, stale];
+    for (count, range, random_count, message) in [
+        (
+            0,
+            0..0,
+            0,
+            "model batch must contain at least one frame".to_owned(),
+        ),
+        (
+            MODEL_TRAINING_BATCH + 1,
+            0..0,
+            1,
+            format!(
+                "model batch count {} exceeds maximum {MODEL_TRAINING_BATCH}",
+                MODEL_TRAINING_BATCH + 1
+            ),
+        ),
+        (
+            1,
+            0..0,
+            1,
+            "model batch action-space count 0 differs from frame count 1".to_owned(),
+        ),
+        (
+            1,
+            0..1,
+            2,
+            "model sampling RNG count 2 differs from frame count 1".to_owned(),
+        ),
+        (
+            1,
+            1..2,
+            1,
+            "model batch frame 0 does not belong to its action space".to_owned(),
+        ),
+    ] {
+        let mut random = vec![PpoRng::new(22); random_count];
+        let before = random.clone();
+        let error = model
+            .sample_batch(&frames[..count], &spaces[range], &mut random)
+            .expect_err("invalid batch");
+        assert_eq!(error.to_string(), message);
+        assert_eq!(random, before);
+    }
 }
 
 #[test]
-fn batched_sampling_rejects_stale_provenance_without_rng_mutation() {
-    let model = PolicyModel::fresh(9_103).expect("model");
-    let (frame, _) = frame_and_space();
-    let (_, stale_space) = frame_and_space();
-    let mut rngs = vec![PpoRng::new(22)];
-    let before = rngs.clone();
-
-    assert_eq!(
-        model
-            .sample_batch(
-                std::slice::from_ref(&frame),
-                std::slice::from_ref(&stale_space),
-                &mut rngs,
-            )
-            .unwrap_err()
-            .to_string(),
-        "model batch frame 0 does not belong to its action space"
-    );
-    assert_eq!(rngs, before);
-}
-
-#[test]
-fn batched_sampling_rolls_back_rng_after_a_traversed_head_fails() {
+fn failing_a_head_after_sampling_restores_rng() {
     let model = PolicyModel::fresh(9_104).expect("model");
     let mut parameters = vec![0.0; model.parameter_count()];
     let kind = crate::ActionKind::Stop.index();
-    set_policy_parameter_range(&model, &mut parameters, "kind.bias", kind..kind + 1, 100.0);
-    set_policy_parameter_range(
+    set_parameter_range(&model, &mut parameters, "kind.bias", kind..kind + 1, 100.0);
+    set_parameter_range(
         &model,
         &mut parameters,
         "kind_embedding.weight",
         kind * 32..(kind + 1) * 32,
         1.0,
     );
-    set_policy_parameter_range(
+    set_parameter_range(
         &model,
         &mut parameters,
         "controlled.weight",
@@ -558,110 +159,180 @@ fn batched_sampling_rolls_back_rng_after_a_traversed_head_fails() {
         .import_parameters(&parameters)
         .expect("finite parameters");
     let (frame, space) = frame_and_space();
-    let mut rngs = vec![PpoRng::new(24)];
-    let before = rngs.clone();
-
+    let mut random = [PpoRng::new(24)];
+    let before = random.clone();
     assert_eq!(
         model
-            .sample_batch(
-                std::slice::from_ref(&frame),
-                std::slice::from_ref(&space),
-                &mut rngs,
-            )
-            .unwrap_err()
+            .sample_batch(&[frame], &[space], &mut random)
+            .expect_err("head overflow")
             .to_string(),
         "model controlled output at batch 0 index 0 is non-finite"
     );
-    assert_eq!(rngs, before);
+    assert_eq!(random, before);
 }
 
 #[test]
-fn policy_sample_rng_bound_covers_the_longest_decoder_path() {
-    let longest_path = 16 + 2 + 15 + 3 + 96;
-
-    assert_eq!(crate::PPO_MAX_POLICY_SAMPLE_DRAWS, longest_path);
-}
-
-#[test]
-fn policy_ratio_is_one_before_any_update() {
-    let (frame, space) = frame_and_space();
-    let model = PolicyModel::fresh(92).expect("model");
-    let sampled = choice(&model, &frame, &space, StructuredAction::Continue);
-
-    let current = model
-        .action_statistics(&frame, &space, sampled.action)
-        .expect("current")
-        .0;
-
-    assert_eq!((current - sampled.log_probability).exp(), 1.0);
-}
-
-#[test]
-fn gae_uses_tick_discount_and_resets_at_terminal_transition() {
-    let (frame, space) = frame_and_space();
-    let model = PolicyModel::fresh(93).expect("model");
-    let policy = model.policy_identity().expect("policy");
-    let mut rollout = PpoRollout::new(2, policy).expect("rollout");
-    let mut first = choice(&model, &frame, &space, StructuredAction::Continue);
-    first.value = 0.0;
-    let mut second = choice(&model, &frame, &space, StructuredAction::Continue);
-    second.value = 0.0;
-    rollout
-        .push(
-            first
-                .finish(PpoOutcome {
-                    stream: 0,
-                    decision: 0,
-                    ticks: 1,
-                    next_value: 0.0,
-                    reward: 1.0,
-                    terminal: false,
-                })
-                .expect("first"),
-        )
-        .expect("first push");
-    rollout
-        .push(
-            second
-                .finish(PpoOutcome {
-                    stream: 0,
-                    decision: 1,
-                    ticks: 1,
-                    next_value: 0.0,
-                    reward: 2.0,
-                    terminal: true,
-                })
-                .expect("second"),
-        )
-        .expect("second push");
-    let config = PpoConfig {
-        rollout_decisions: 2,
-        environments: 1,
-        minibatch: 1,
-        gamma_tick: 0.9,
-        gae_lambda: 0.8,
-        ..PpoConfig::default()
-    };
-
-    let batch = rollout.finish(config).expect("batch");
-
-    assert!((batch.sample(0).expect("first").return_value() - 2.44).abs() < 1.0e-5);
-    assert_eq!(batch.sample(1).expect("second").return_value(), 2.0);
-}
-
-#[test]
-fn synthetic_bandit_update_increases_rewarded_action_probability() {
+fn trainer_retry_learns_rewarded_action_and_rejects_stale_rollout_transactionally() {
     let (frame, space) = frame_and_space();
     let model = PolicyModel::fresh(101).expect("model");
-    let policy = model.policy_identity().expect("policy");
-    let before = model
-        .action_statistics(&frame, &space, StructuredAction::Continue)
-        .expect("before")
-        .0;
-    let mut rollout = PpoRollout::new(2, policy).expect("rollout");
+    let reference = PolicyModel::fresh(101).expect("reference");
+    let config = smoke_config();
+    let mut batch = bandit_batch(&model, &frame, &space, config);
+    let reference_batch = bandit_batch(&reference, &frame, &space, config);
+    let mut trainer = PpoTrainer::new(&model, config, 7).expect("trainer");
+    let mut expected = PpoTrainer::new(&reference, config, 7).expect("reference trainer");
+    let before = trainer.checkpoint_snapshot(&model).expect("before");
+    let identity = model.policy_identity().expect("identity");
+    let random = trainer.rng_checkpoint();
+    let probability = || {
+        model
+            .action_statistics(&frame, &space, StructuredAction::Continue)
+            .expect("rewarded action statistics")
+            .0
+    };
+    let before_probability = probability();
+    let advantage = batch.replace_advantage_for_test(0, f32::NAN);
+    let error = trainer
+        .train_update(&model, &batch)
+        .expect_err("nonfinite advantage");
+    assert!(error.to_string().contains("non-finite"), "{error}");
+    assert_eq!(
+        trainer
+            .checkpoint_snapshot(&model)
+            .expect("failed snapshot"),
+        before
+    );
+    assert_eq!(trainer.rng_checkpoint(), random);
+    assert_eq!(model.policy_identity().expect("failed identity"), identity);
+    batch.replace_advantage_for_test(0, advantage);
+    let report = trainer.train_update(&model, &batch).expect("retry");
+    assert!(probability() > before_probability);
+    assert_eq!(report.optimizer_step, 1);
+    assert_eq!(report.samples_optimized, 2);
+    assert_eq!(
+        report,
+        expected
+            .train_update(&reference, &reference_batch)
+            .expect("clean update")
+    );
+    let actual = trainer
+        .checkpoint_snapshot(&model)
+        .expect("updated snapshot");
+    let expected_state = expected
+        .checkpoint_snapshot(&reference)
+        .expect("reference snapshot");
+    assert_eq!(actual.parameters, expected_state.parameters);
+    assert_eq!(actual.adam.moments(), expected_state.adam.moments());
+    assert_eq!(trainer.rng_checkpoint(), expected.rng_checkpoint());
+    let random = trainer.rng_checkpoint();
+    assert_eq!(
+        trainer
+            .train_update(&model, &batch)
+            .expect_err("stale rollout")
+            .to_string(),
+        "PPO rollout policy identity is stale"
+    );
+    assert_eq!(
+        trainer.checkpoint_snapshot(&model).expect("stale snapshot"),
+        actual
+    );
+    assert_eq!(trainer.rng_checkpoint(), random);
+}
+
+#[test]
+fn uneven_microbatch_partitions_produce_the_same_effective_update() {
+    let (frame, space) = frame_and_space();
+    let first = PolicyModel::fresh(104).expect("first");
+    let second = PolicyModel::fresh(104).expect("second");
+    let config = smoke_config();
+    let batch = bandit_batch(&first, &frame, &space, config);
+    let samples = (0..65)
+        .map(|index| batch.sample(index % 2).expect("sample"))
+        .collect::<Vec<_>>();
+    let references = samples.iter().collect::<Vec<_>>();
+    let mut first_adam = first
+        .claim_optimizer(config.adam())
+        .expect("first optimizer");
+    let mut second_adam = second
+        .claim_optimizer(config.adam())
+        .expect("second optimizer");
+    first
+        .ppo_update_with_microbatch_for_test(&references, &mut first_adam, config, 64)
+        .expect("64-way");
+    second
+        .ppo_update_with_microbatch_for_test(&references, &mut second_adam, config, 13)
+        .expect("13-way");
+    let difference = first
+        .export_parameters()
+        .expect("first parameters")
+        .iter()
+        .zip(second.export_parameters().expect("second parameters"))
+        .map(|(left, right)| (left - right).abs())
+        .fold(0.0f32, f32::max);
+    assert!(difference < 2.0e-6, "{difference}");
+}
+
+#[test]
+fn gae_discounts_elapsed_ticks_and_stops_bootstrapping_at_terminal() {
+    let (frame, space) = frame_and_space();
+    let model = PolicyModel::fresh(93).expect("model");
+    let mut rollout =
+        PpoRollout::new(2, model.policy_identity().expect("policy")).expect("rollout");
+    for (decision, reward, terminal) in [(0, 1.0, false), (1, 2.0, true)] {
+        let mut sampled = choice(&model, &frame, &space, StructuredAction::Continue);
+        sampled.value = 0.0;
+        rollout
+            .push(
+                sampled
+                    .finish(PpoOutcome {
+                        stream: 0,
+                        decision,
+                        ticks: 1,
+                        next_value: 0.0,
+                        reward,
+                        terminal,
+                    })
+                    .expect("transition"),
+            )
+            .expect("push");
+    }
+    let batch = rollout
+        .finish(PpoConfig {
+            rollout_decisions: 2,
+            environments: 1,
+            minibatch: 1,
+            gamma_tick: 0.9,
+            gae_lambda: 0.8,
+            ..PpoConfig::default()
+        })
+        .expect("batch");
+    assert!((batch.sample(0).expect("first").return_value() - 2.44).abs() < 1.0e-5);
+    assert_eq!(batch.sample(1).expect("terminal").return_value(), 2.0);
+}
+
+#[test]
+fn sampling_and_surrogate_boundaries_match_independent_references() {
+    let (minimum, maximum) = crate::ppo::open_unit_bounds_for_test();
+    assert!(minimum > 0.0);
+    assert!(maximum < 1.0);
+    assert!((tick_discount(0.99, 3).expect("discount") - 0.970_299).abs() < 1.0e-6);
+    for (ratio, advantage, expected) in [(1.5, 2.0, 2.4), (0.5, -2.0, -1.6), (1.1, 2.0, 2.2)] {
+        assert!((clipped_surrogate(ratio, advantage, 0.2) - expected).abs() < 1.0e-6);
+    }
+}
+
+#[test]
+fn compact_rollout_storage_preserves_frame_target_and_behavior_statistics() {
+    let (frame, space) = frame_and_space();
+    let model = PolicyModel::fresh(100).expect("model");
+    let sampled = choice(&model, &frame, &space, StructuredAction::Continue);
+    let target = sampled.target.clone();
+    let packed = target.pack();
+    let log_probability = sampled.log_probability;
+    let mut rollout = PpoRollout::new(1, sampled.policy).expect("rollout");
     rollout
         .push(
-            choice(&model, &frame, &space, StructuredAction::Continue)
+            sampled
                 .finish(PpoOutcome {
                     stream: 0,
                     decision: 0,
@@ -670,386 +341,63 @@ fn synthetic_bandit_update_increases_rewarded_action_probability() {
                     reward: 1.0,
                     terminal: true,
                 })
-                .expect("rewarded transition"),
+                .expect("transition"),
         )
-        .expect("rewarded sample");
-    rollout
-        .push(
-            choice(
-                &model,
-                &frame,
-                &space,
-                StructuredAction::Hold {
-                    unit: ControlledUnit::Hero,
-                },
-            )
-            .finish(PpoOutcome {
-                stream: 1,
-                decision: 0,
-                ticks: 3,
-                next_value: 0.0,
-                reward: -1.0,
-                terminal: true,
-            })
-            .expect("penalized transition"),
-        )
-        .expect("penalized sample");
-    let config = smoke_config();
-    let batch = rollout.finish(config).expect("batch");
-    let mut trainer = PpoTrainer::new(&model, config, 7).expect("trainer");
-
-    let report = trainer.train_update(&model, &batch).expect("PPO update");
-    let after = model
-        .action_statistics(&frame, &space, StructuredAction::Continue)
-        .expect("after")
-        .0;
-
-    assert!(after > before, "{before} -> {after}");
-    assert_eq!(report.optimizer_step, 1);
-    assert_eq!(report.samples_optimized, 2);
-}
-
-#[test]
-fn direct_trainer_rejects_rollout_one_policy_revision_behind() {
-    assert_stale_rollout_is_rejected(1);
-}
-
-#[test]
-fn rollout_two_policy_revisions_behind_is_rejected_before_optimizer_mutation() {
-    assert_stale_rollout_is_rejected(2);
-}
-
-fn assert_stale_rollout_is_rejected(revisions: u32) {
-    let (frame, space) = frame_and_space();
-    let model = PolicyModel::fresh(102).expect("model");
-    let policy = model.policy_identity().expect("policy");
-    let mut rollout = PpoRollout::new(2, policy).expect("rollout");
-    for stream in 0..2 {
-        rollout
-            .push(
-                choice(&model, &frame, &space, StructuredAction::Continue)
-                    .finish(PpoOutcome {
-                        stream,
-                        decision: 0,
-                        ticks: 3,
-                        next_value: 0.0,
-                        reward: stream as f32,
-                        terminal: true,
-                    })
-                    .expect("transition"),
-            )
-            .expect("push");
-    }
-    let config = smoke_config();
-    let batch = rollout.finish(config).expect("batch");
-    let parameters = model.export_parameters().expect("parameters");
-    for _ in 0..revisions {
-        model
-            .import_parameters(&parameters)
-            .expect("stale policy revision");
-    }
-    let mut trainer = PpoTrainer::new(&model, config, 5).expect("trainer");
-    let before = model.export_parameters().expect("before");
-    let error = trainer
-        .train_update(&model, &batch)
-        .expect_err("stale rollout");
-
-    assert_eq!(error.to_string(), "PPO rollout policy identity is stale");
-    assert_eq!(model.export_parameters().expect("after"), before);
-    assert_eq!(trainer.optimizer_step(), 0);
-}
-
-#[test]
-fn failed_preupdate_restores_shuffle_and_allows_exact_retry() {
-    let (frame, space) = frame_and_space();
-    let model = PolicyModel::fresh(103).expect("model");
-    let config = smoke_config();
-    let mut batch = bandit_batch(&model, &frame, &space, config);
-    let mut trainer = PpoTrainer::new(&model, config, 19).expect("trainer");
-    let parameters = model.export_parameters().expect("parameters");
-    let identity = model.policy_identity().expect("identity");
-    let draws = trainer.shuffle_draws_for_test();
-    let advantage = batch.replace_advantage_for_test(0, f32::NAN);
-
-    assert!(trainer.train_update(&model, &batch).is_err());
-    assert_eq!(
-        model.export_parameters().expect("after failure"),
-        parameters
-    );
-    assert_eq!(model.policy_identity().expect("after identity"), identity);
-    assert_eq!(trainer.optimizer_step(), 0);
-    assert_eq!(trainer.shuffle_draws_for_test(), draws);
-
-    batch.replace_advantage_for_test(0, advantage);
-    let report = trainer.train_update(&model, &batch).expect("retry");
-    assert_eq!(report.optimizer_step, 1);
-}
-
-#[test]
-fn effective_gradient_is_stable_across_microbatch_partitions() {
-    let (frame, space) = frame_and_space();
-    let first = PolicyModel::fresh(104).expect("first model");
-    let second = PolicyModel::fresh(104).expect("second model");
-    let config = smoke_config();
-    let batch = bandit_batch(&first, &frame, &space, config);
-    let samples = (0..65)
-        .map(|index| batch.sample(index % 2).expect("sample"))
-        .collect::<Vec<_>>();
-    let references = samples.iter().collect::<Vec<_>>();
-    let mut first_adam = first
-        .claim_adam_for_test(config.adam())
-        .expect("first Adam");
-    let mut second_adam = second
-        .claim_adam_for_test(config.adam())
-        .expect("second Adam");
-
-    first
-        .ppo_update_with_microbatch_for_test(&references, &mut first_adam, config, 64)
-        .expect("64-way update");
-    second
-        .ppo_update_with_microbatch_for_test(&references, &mut second_adam, config, 13)
-        .expect("13-way update");
-
-    let first_parameters = first.export_parameters().expect("first parameters");
-    let second_parameters = second.export_parameters().expect("second parameters");
-    let maximum_difference = first_parameters
-        .iter()
-        .zip(second_parameters)
-        .map(|(left, right)| (left - right).abs())
-        .fold(0.0f32, f32::max);
-    assert!(maximum_difference < 2.0e-6, "{maximum_difference}");
-}
-
-#[test]
-fn reward_shaping_is_bounded_and_terminal_result_dominates() {
-    let mut tracker = RewardTracker::default();
-    let mut summary = crate::GlobalSummary::default();
-    tracker.observe(summary, 1.0, None).expect("baseline");
-    let mut shaping = 0.0;
-    for step in 1..=200u32 {
-        summary.enemy_structures_destroyed = step;
-        shaping += tracker.observe(summary, 1.0, None).expect("shaping").total;
-    }
-    let win = tracker
-        .observe(summary, 1.0, Some(PpoTerminalOutcome::Win))
-        .expect("win");
-
-    assert!(shaping.abs() <= PPO_SHAPING_BUDGET + 1.0e-5);
-    assert_eq!(win.terminal, PPO_TERMINAL_REWARD);
-    assert!(win.total >= PPO_TERMINAL_REWARD - 1.0e-5);
-    assert!((PPO_TERMINAL_REWARD - PPO_SHAPING_BUDGET - 1.0 / 101.0).abs() < 1.0e-7);
-}
-
-#[test]
-fn reward_values_experience_not_cash_last_hits_or_denies() {
-    let mut economy = RewardTracker::default();
-    let baseline = crate::GlobalSummary::default();
-    economy.observe(baseline, 1.0, None).expect("baseline");
-    let mut improved = baseline;
-    improved.own_gold = 100;
-    improved.allied.xp = 100;
-    let economy_reward = economy.observe(improved, 1.0, None).expect("economy");
-
-    let mut farm = RewardTracker::default();
-    farm.observe(baseline, 1.0, None).expect("baseline");
-    let mut farmed = baseline;
-    farmed.allied.last_hits = 10;
-    farmed.allied.denies = 10;
-    let farm_reward = farm.observe(farmed, 1.0, None).expect("farm");
-
-    let mut opponent = RewardTracker::default();
-    opponent.observe(baseline, 1.0, None).expect("baseline");
-    let mut opponent_progress = baseline;
-    opponent_progress.enemy.xp = 100;
-    let opponent_reward = opponent
-        .observe(opponent_progress, 1.0, None)
-        .expect("opponent XP");
-
-    assert_eq!(farm_reward.last_hits, 0.0);
-    assert_eq!(farm_reward.denies, 0.0);
-    assert_eq!(economy_reward.wealth, 0.0);
-    assert!(economy_reward.experience > economy_reward.wealth);
-    assert!(opponent_reward.experience < 0.0);
-    assert!(economy_reward.total > farm_reward.total);
-}
-
-#[test]
-fn reward_cash_spending_is_neutral() {
-    let mut tracker = RewardTracker::default();
-    let mut summary = crate::GlobalSummary {
-        own_gold: 1_000,
-        ..Default::default()
-    };
-    tracker.observe(summary, 0.99, None).expect("baseline");
-    summary.own_gold = 0;
-
-    let reward = tracker.observe(summary, 0.99, None).expect("purchase");
-
-    assert_eq!(reward.wealth, 0.0);
-    assert_eq!(reward.total, 0.0);
-}
-
-#[test]
-fn reward_extreme_public_totals_emit_finite_bounded_components() {
-    let mut tracker = RewardTracker::default();
-    let mut summary = crate::GlobalSummary::default();
-    summary.allied.xp = i64::MIN;
-    summary.enemy.xp = i64::MAX;
-    summary.allied.kills = u64::MAX;
-    tracker.observe(summary, 1.0, None).expect("baseline");
-    summary.allied.xp = i64::MAX;
-    summary.enemy.xp = i64::MIN;
-    summary.allied.kills = 0;
-    summary.enemy.kills = u64::MAX;
-
-    let reward = tracker
-        .observe(summary, 1.0, Some(PpoTerminalOutcome::Loss))
-        .expect("terminal");
-
-    let components = [
-        reward.experience,
-        reward.combat,
-        reward.structures,
-        reward.wealth,
-    ];
-    for value in components {
-        assert!(value.is_finite());
-        assert!(value.abs() <= PPO_SHAPING_BUDGET);
-    }
-    assert!(components.iter().map(|value| value.abs()).sum::<f32>() <= PPO_SHAPING_BUDGET + 1.0e-6);
-    assert!(reward.total.is_finite());
-    assert!(reward.total.abs() <= 1.0 + PPO_SHAPING_BUDGET);
-}
-
-#[test]
-fn reward_terminal_uses_zero_next_potential_independent_of_final_summary() {
-    let previous = crate::GlobalSummary::default();
-    let mut rich = previous;
-    rich.allied.xp = 1_000;
-    rich.enemy_structures_destroyed = 2;
-    for outcome in [
-        PpoTerminalOutcome::Win,
-        PpoTerminalOutcome::Loss,
-        PpoTerminalOutcome::Draw,
-    ] {
-        let mut left = RewardTracker::default();
-        let mut right = RewardTracker::default();
-        left.observe(previous, 0.99, None).expect("baseline");
-        right.observe(previous, 0.99, None).expect("baseline");
-
-        let reward = left
-            .observe(previous, 0.99, Some(outcome))
-            .expect("terminal");
-        let alternate = right.observe(rich, 0.99, Some(outcome)).expect("terminal");
-
-        assert_eq!(reward, alternate);
-        assert!(reward.total.abs() <= 1.0);
-    }
-}
-
-#[test]
-fn reward_terminal_removes_previous_potential_at_the_same_normalized_scale() {
-    let mut tracker = RewardTracker::default();
-    let mut previous = crate::GlobalSummary::default();
-    previous.allied.xp = 100;
-    tracker.observe(previous, 0.99, None).expect("baseline");
-
-    let reward = tracker
-        .observe(previous, 0.99, Some(PpoTerminalOutcome::Win))
-        .expect("terminal");
-
-    assert_eq!(reward.terminal, 1.0);
-    assert!((reward.experience + 2.0 / 101.0).abs() < 1.0e-7);
-    assert!((reward.total - (1.0 - 2.0 / 101.0)).abs() < 1.0e-7);
-}
-
-#[test]
-fn reward_alternating_potential_exhausts_absolute_budget_without_replenishing() {
-    let mut tracker = RewardTracker::default();
-    let mut summary = crate::GlobalSummary::default();
-    tracker.observe(summary, 1.0, None).expect("baseline");
-    let mut expenditure = 0.0;
-    for index in 0..64 {
-        summary.enemy_structures_destroyed = if index % 2 == 0 { 100 } else { 0 };
-        let reward = tracker
-            .observe(summary, 1.0, None)
-            .expect("alternating shaping");
-        expenditure += reward.total.abs();
-        assert!(reward.total.is_finite());
-        assert!(expenditure <= PPO_SHAPING_BUDGET + 1.0e-6);
-        if index > 0 {
-            assert_eq!(reward.total, 0.0);
-        }
-    }
-    assert!(expenditure < 1.0);
-}
-
-#[test]
-fn reward_rejects_invalid_discount_without_consuming_budget_or_previous_state() {
-    let mut tracker = RewardTracker::default();
-    let baseline = crate::GlobalSummary::default();
-    tracker.observe(baseline, 1.0, None).expect("baseline");
-    let improved = crate::GlobalSummary {
-        enemy_structures_destroyed: 1,
-        ..baseline
-    };
-    for discount in [f32::NAN, f32::INFINITY, -0.01, 1.01] {
-        let error = tracker
-            .observe(improved, discount, None)
-            .expect_err("invalid discount");
-        assert_eq!(error, crate::PpoError::InvalidDiscount);
-        assert_eq!(error.to_string(), "invalid tick discount");
-    }
-    let reward = tracker.observe(improved, 1.0, None).expect("valid shaping");
-    assert_eq!(reward.structures, 5.0 / 101.0);
-    assert_eq!(reward.total, reward.structures);
+        .expect("push");
+    assert_eq!(packed.unpack(), target);
+    assert!(std::mem::size_of_val(&packed) < std::mem::size_of::<BehavioralTarget>());
+    let batch = rollout.finish(smoke_config()).expect("batch");
+    let sample = batch.sample(0).expect("materialized");
+    assert_eq!(sample.transition.frame, frame);
+    assert_eq!(sample.transition.target, target);
+    assert_eq!(sample.transition.old_log_probability, log_probability);
 }
 
 fn frame_and_space() -> (crate::FeatureFrame, ActionSpace) {
     let tracker = tracker_with_view(Team::Radiant, world_view(Team::Radiant, 10));
     let space = ActionSpace::from_tracker(&tracker).expect("space");
-    let frame = encode(&tracker, &LocalPolicyState::new(0));
-    (frame, space)
+    (encode(&tracker, &LocalPolicyState::new(0)), space)
 }
 
-fn policy_batch_inputs() -> (Vec<crate::FeatureFrame>, Vec<ActionSpace>) {
-    let mut frames = Vec::with_capacity(MODEL_TRAINING_BATCH);
-    let mut spaces = Vec::with_capacity(MODEL_TRAINING_BATCH);
-    for index in 0..MODEL_TRAINING_BATCH {
+pub(super) fn sampling_inputs(
+    count: usize,
+) -> (Vec<crate::FeatureFrame>, Vec<ActionSpace>, Vec<PpoRng>) {
+    assert!(count > 0);
+    assert!(count <= MODEL_TRAINING_BATCH);
+    let mut frames = Vec::with_capacity(count);
+    let mut spaces = Vec::with_capacity(count);
+    let mut random = Vec::with_capacity(count);
+    for index in 0..count {
         let team = if index.is_multiple_of(2) {
             Team::Radiant
         } else {
             Team::Dire
         };
         let tracker = tracker_with_view(team, world_view(team, 10 + index as u32));
-        let space = ActionSpace::from_tracker(&tracker).expect("action space");
+        spaces.push(ActionSpace::from_tracker(&tracker).expect("space"));
         let mut frame = encode(&tracker, &LocalPolicyState::new(0));
         frame.global[63] = index as f32 / MODEL_TRAINING_BATCH as f32;
         frames.push(frame);
-        spaces.push(space);
+        random.push(PpoRng::new(17 + index as u64 * 97));
     }
-    (frames, spaces)
+    (frames, spaces, random)
 }
 
-fn set_policy_parameter_range(
-    model: &PolicyModel,
-    parameters: &mut [f32],
-    target: &str,
-    range: std::ops::Range<usize>,
-    value: f32,
-) {
-    let mut offset = 0usize;
-    for (name, shape) in model.parameter_schema().expect("parameter schema") {
-        let count = shape.iter().product::<usize>();
-        if name == target {
-            assert!(range.start <= range.end);
-            assert!(range.end <= count);
-            parameters[offset + range.start..offset + range.end].fill(value);
-            return;
-        }
-        offset += count;
+pub(super) fn prepared_choice(stream: usize, choice: PpoPolicyChoice) -> crate::PpoPreparedSample {
+    crate::PpoPreparedSample {
+        return_value: choice.value(),
+        advantage: 1.0,
+        transition: choice
+            .finish(PpoOutcome {
+                stream,
+                decision: 0,
+                ticks: 3,
+                next_value: 0.0,
+                reward: 0.0,
+                terminal: true,
+            })
+            .expect("transition"),
     }
-    panic!("missing model parameter {target}");
 }
 
 fn choice(
@@ -1060,7 +408,7 @@ fn choice(
 ) -> PpoPolicyChoice {
     let (log_probability, entropy, value) = model
         .action_statistics(frame, space, action)
-        .expect("action statistics");
+        .expect("statistics");
     PpoPolicyChoice {
         frame: frame.clone(),
         target: BehavioralTarget::from_action(frame, space, action).expect("target"),
@@ -1120,1080 +468,156 @@ fn bandit_batch(
     rollout.finish(config).expect("batch")
 }
 
-#[cfg(feature = "builtin")]
-#[test]
-fn rollout_append_rejects_a_foreign_policy_before_any_transition() {
-    let first = PolicyModel::fresh(23_081).expect("first model");
-    let second = PolicyModel::fresh(23_082).expect("second model");
-    let mut target =
-        PpoRollout::new(1, first.policy_identity().expect("first identity")).expect("target");
-    let other =
-        PpoRollout::new(1, second.policy_identity().expect("second identity")).expect("other");
-    assert_eq!(target.append(other), Err(crate::PpoError::PolicyMismatch));
-}
-
-#[cfg(feature = "builtin")]
-#[test]
-fn builtin_smoke_exercises_real_arena_rollout_and_one_ppo_update() {
-    let report = crate::run_ppo_smoke_on(
-        crate::PpoSmokeConfig {
-            updates: 1,
-            environments: 1,
-            rollout_decisions: 2,
-            epochs: 1,
-            minibatch: 2,
-            seed: 77,
-            map: bota_proto::MapId(2),
-        },
-        crate::PolicyDevice::Cpu,
-    )
-    .expect("smoke PPO");
-
-    assert_eq!(report.updates, 1);
-    assert_eq!(report.transitions, 2);
-    assert_eq!(report.optimizer_step, 1);
-    assert_eq!(report.elapsed_ticks, 6);
-    assert_eq!(report.map2_reward.ticks, report.elapsed_ticks);
-    assert!(report.map2_reward.total.is_finite());
-    assert!(report.final_policy_loss.is_finite());
-    assert!(report.final_value_loss.is_finite());
-    assert!(report.final_entropy.is_finite());
-    assert!(report.final_kl.is_finite());
-}
-
-#[cfg(feature = "builtin")]
-#[test]
-fn persistent_actor_refreshes_policy_after_waiting_for_a_recycled_buffer() {
-    let report = crate::run_ppo_smoke_on(
-        crate::PpoSmokeConfig {
-            updates: 3,
-            environments: 2,
-            rollout_decisions: 2,
-            epochs: 1,
-            minibatch: 4,
-            seed: 3,
-            map: bota_proto::MapId(2),
-        },
-        crate::PolicyDevice::Cpu,
-    )
-    .expect("three-update pipeline");
-
-    assert_eq!(report.updates, 3);
-    assert_eq!(report.transitions, 12);
-    assert_eq!(report.optimizer_step, 3);
-}
-
-#[cfg(feature = "builtin")]
-#[test]
-fn wall_checkpoint_schedule_uses_fixed_monotonic_deadlines_without_drift() {
-    let cadence = crate::TrainingCheckpointCadence::WallTime(std::time::Duration::from_secs(300));
-    let mut schedule = crate::ppo_arena::TrainingCheckpointSchedule::new(cadence)
-        .expect("wall checkpoint schedule");
-
-    assert!(!schedule.is_due(1, std::time::Duration::from_secs(299)));
-    assert!(schedule.is_due(2, std::time::Duration::from_secs(300)));
-    schedule
-        .mark_committed(std::time::Duration::from_secs(300))
-        .expect("second deadline");
-    assert!(!schedule.is_due(3, std::time::Duration::from_secs(599)));
-    assert!(schedule.is_due(4, std::time::Duration::from_secs(600)));
-    schedule
-        .mark_committed(std::time::Duration::from_secs(600))
-        .expect("third deadline");
-    assert!(!schedule.is_due(5, std::time::Duration::from_secs(899)));
-    assert!(schedule.is_due(6, std::time::Duration::from_secs(900)));
-    schedule
-        .mark_committed(std::time::Duration::from_secs(1_201))
-        .expect("deadline after a delayed commit");
-    assert!(!schedule.is_due(7, std::time::Duration::from_secs(1_499)));
-    assert!(schedule.is_due(8, std::time::Duration::from_secs(1_500)));
-}
-
-#[cfg(feature = "builtin")]
-#[test]
-fn production_training_resume_matches_uninterrupted_parameters_adam_and_rng() {
-    assert_production_resume_matches_uninterrupted(None);
-}
-
-#[cfg(feature = "builtin")]
-#[test]
-fn map2_gamma_one_resume_matches_uninterrupted_parameters_adam_and_rng() {
-    let settings = crate::cli::training_settings_for_test(&[
-        "--complete-episodes=false",
-        "--map",
-        "2",
-        "--environments",
-        "2",
-        "--rollout",
-        "2",
-        "--epochs",
-        "1",
-        "--minibatch",
-        "2",
-        "--learning-rate",
-        "3e-5",
-        "--gamma-per-tick",
-        "1",
-        "--gae-lambda",
-        "0.995",
-        "--entropy-coefficient",
-        "0.001",
-    ])
-    .expect("Map2 reset-window config");
-    assert_production_resume_matches_uninterrupted(Some(settings));
-}
-
-#[cfg(feature = "builtin")]
-fn training_settings(seed: u64) -> crate::TrainingJobConfig {
-    crate::TrainingJobConfig {
-        mastery_config: None,
-        opponent_schedule: crate::TrainingOpponentSchedule::Teacher,
-        episode_time_cost: 0.0,
-        terminal_only: false,
-        complete_episodes: false,
-        pipeline_groups: 1,
-        updates: 1,
-        ppo: crate::PpoConfig {
-            environments: 2,
-            rollout_decisions: 2,
-            epochs: 1,
-            minibatch: 2,
-            gamma_tick: 1.0,
-            ..crate::PpoConfig::default()
-        },
-        checkpoint_cadence: crate::TrainingCheckpointCadence::Updates(1),
-        resume_provenance: crate::ResumeProvenance::Strict,
-        seed,
-        map: bota_proto::MapId(2),
-        git_commit: "test-drysua-commit".to_owned(),
-        simulator_commit: "test-bota-commit".to_owned(),
-    }
-}
-
-#[cfg(feature = "builtin")]
-fn assert_production_resume_matches_uninterrupted(overrides: Option<crate::TrainingJobConfig>) {
-    let uninterrupted_directory = training_test_directory("production-uninterrupted");
-    let resumed_directory = training_test_directory("production-resumed");
-    let mut settings = training_settings(23_071);
-    settings.updates = 2;
-    if let Some(overrides) = overrides {
-        settings.ppo = overrides.ppo;
-        settings.map = overrides.map;
-    }
-    crate::run_training_job_on_with_initial_weights(
-        settings.clone(),
-        crate::PolicyDevice::Cpu,
-        &uninterrupted_directory,
-        false,
-        None,
-        |_| {},
-    )
-    .expect("uninterrupted production updates");
-    settings.updates = 1;
-    crate::run_training_job_on_with_initial_weights(
-        settings.clone(),
-        crate::PolicyDevice::Cpu,
-        &resumed_directory,
-        false,
-        None,
-        |_| {},
-    )
-    .expect("first production update");
-    settings.updates = 2;
-    crate::run_training_job_on_with_initial_weights(
-        settings,
-        crate::PolicyDevice::Cpu,
-        &resumed_directory,
-        true,
-        None,
-        |_| {},
-    )
-    .expect("resumed production update");
-
-    let uninterrupted =
-        crate::TrainingArtifact::load(&uninterrupted_directory).expect("uninterrupted artifact");
-    let resumed = crate::TrainingArtifact::load(&resumed_directory).expect("resumed artifact");
-    assert_eq!(uninterrupted.run(), resumed.run());
-    assert_eq!(uninterrupted.progress(), resumed.progress());
-    assert_eq!(resumed.progress().global_update, 2);
-    assert_eq!(resumed.progress().policy_version, 2);
-    assert_eq!(resumed.progress().rollout_samples, 8);
-    assert_production_artifact_training_state_equal(&uninterrupted, &resumed);
-    std::fs::remove_dir_all(uninterrupted_directory).expect("remove uninterrupted directory");
-    std::fs::remove_dir_all(resumed_directory).expect("remove resumed directory");
-}
-
-#[cfg(feature = "builtin")]
-fn assert_production_artifact_training_state_equal(
-    uninterrupted: &crate::TrainingArtifact,
-    resumed: &crate::TrainingArtifact,
+fn set_parameter_range(
+    model: &PolicyModel,
+    parameters: &mut [f32],
+    target: &str,
+    range: std::ops::Range<usize>,
+    value: f32,
 ) {
-    let source = PolicyModel::fresh(23_072).expect("source model");
-    let target = PolicyModel::fresh(23_073).expect("target model");
-    let source_state = uninterrupted
-        .restore(&source, uninterrupted.run())
-        .expect("source restore");
-    let target_state = resumed
-        .restore(&target, resumed.run())
-        .expect("target restore");
-    let source_trainer = source_state.trainer();
-    let target_trainer = target_state.trainer();
-    let source_snapshot = source_trainer
-        .checkpoint_snapshot(&source)
-        .expect("source snapshot");
-    let target_snapshot = target_trainer
-        .checkpoint_snapshot(&target)
-        .expect("target snapshot");
-
-    assert_eq!(source_snapshot.parameters, target_snapshot.parameters);
-    assert_eq!(
-        source_snapshot.adam.moments(),
-        target_snapshot.adam.moments()
-    );
-    assert_eq!(
-        source_trainer.optimizer_step(),
-        target_trainer.optimizer_step()
-    );
-    assert_eq!(source_trainer.updates(), target_trainer.updates());
-    assert_eq!(
-        source_trainer.rng_checkpoint(),
-        target_trainer.rng_checkpoint()
-    );
-    assert!(target_trainer.optimizer_step() > 0);
-    assert!(target_trainer.rng_checkpoint().1 > 0);
+    let mut offset = 0;
+    for (name, shape) in model.parameter_schema().expect("schema") {
+        let count = shape.iter().product::<usize>();
+        if name == target {
+            assert!(range.start <= range.end);
+            assert!(range.end <= count);
+            parameters[offset + range.start..offset + range.end].fill(value);
+            return;
+        }
+        offset += count;
+    }
+    panic!("missing parameter {target}");
 }
 
 #[cfg(feature = "builtin")]
 #[test]
-fn training_job_checkpoints_and_resumes_from_the_next_update() {
-    let directory = training_test_directory("resume");
-    let mut settings = training_settings(23_071);
-
-    let first = crate::run_training_job_on_with_initial_weights(
-        settings.clone(),
-        crate::PolicyDevice::Cpu,
-        &directory,
-        false,
-        None,
-        |_| {},
-    )
-    .expect("first training update");
-    assert_eq!(first.completed_updates, 1);
-    assert_eq!(first.optimizer_step, 2);
-    assert_eq!(
-        crate::TrainingArtifact::load(&directory)
-            .expect("first checkpoint")
-            .progress()
-            .global_update,
-        1
-    );
-
-    settings.updates = 2;
-    let resumed = crate::run_training_job_on_with_initial_weights(
-        settings.clone(),
-        crate::PolicyDevice::Cpu,
-        &directory,
-        true,
-        None,
-        |_| {},
-    )
-    .expect("resumed training update");
-    assert_eq!(resumed.completed_updates, 2);
-    assert_eq!(resumed.optimizer_step, 4);
-    assert_eq!(
-        crate::TrainingArtifact::load(&directory)
-            .expect("resumed checkpoint")
-            .progress()
-            .global_update,
-        2
-    );
-
-    settings.updates = 1;
-    settings.git_commit = "test-drysua-next-commit".to_owned();
-    settings.resume_provenance = crate::ResumeProvenance::MigrateGitCommit;
-    let error = crate::run_training_job_on_with_initial_weights(
-        settings.clone(),
-        crate::PolicyDevice::Cpu,
-        &directory,
-        true,
-        None,
-        |_| {},
-    )
-    .expect_err("migration target before restored update");
-    assert_eq!(
-        error.to_string(),
-        "invalid PPO config field: training update target precedes checkpoint"
-    );
-    assert_eq!(
-        crate::TrainingArtifact::load(&directory)
-            .expect("checkpoint after rejected migration")
-            .run()
-            .git_commit,
-        "test-drysua-commit"
-    );
-
-    settings.updates = 3;
-    let mut incompatible = settings.clone();
-    incompatible.simulator_commit = "different-bota-commit".to_owned();
-    let error = crate::run_training_job_on_with_initial_weights(
-        incompatible,
-        crate::PolicyDevice::Cpu,
-        &directory,
-        true,
-        None,
-        |_| {},
-    )
-    .expect_err("migration with a different simulator commit");
-    assert_eq!(
-        error.to_string(),
-        "invalid PPO config field: provenance migration scope"
-    );
-    let migrated = crate::run_training_job_on_with_initial_weights(
-        settings,
-        crate::PolicyDevice::Cpu,
-        &directory,
-        true,
-        None,
-        |_| {},
-    )
-    .expect("migrated training update");
-    let migrated_artifact = crate::TrainingArtifact::load(&directory).expect("migrated checkpoint");
-    assert_eq!(migrated.completed_updates, 3);
-    assert_eq!(migrated_artifact.progress().global_update, 3);
-    assert_eq!(
-        migrated_artifact.run().git_commit,
-        "test-drysua-next-commit"
-    );
-
-    std::fs::remove_dir_all(directory).expect("remove checkpoint directory");
-}
-
-#[cfg(feature = "builtin")]
-#[test]
-fn fresh_training_loads_the_requested_runtime_weights_before_the_first_update() {
-    let weights_directory = training_test_directory("initial-weights");
-    let checkpoint_directory = training_test_directory("initialized-run");
-    let initial_model = PolicyModel::fresh(23_074).expect("initial model");
-    crate::TrainingArtifact::save_runtime_weights(&initial_model, &weights_directory)
-        .expect("initial runtime weights");
-    let initial_fingerprint = crate::PolicySnapshot::capture(&initial_model, 0)
-        .expect("initial snapshot")
+fn production_load_update_resume_matches_uninterrupted_parameters_optimizer_and_rng() {
+    let weights = training_directory("weights");
+    let uninterrupted = training_directory("uninterrupted");
+    let resumed = training_directory("resumed");
+    let initial = PolicyModel::fresh(23_074).expect("initial model");
+    crate::TrainingArtifact::save_runtime_weights(&initial, &weights).expect("initial weights");
+    let fingerprint = crate::PolicySnapshot::capture(&initial, 0)
+        .expect("snapshot")
         .fingerprint();
-    let settings = training_settings(23_075);
-
-    let report = crate::run_training_job_on_with_initial_weights(
-        settings,
-        crate::PolicyDevice::Cpu,
-        &checkpoint_directory,
-        false,
-        Some(&weights_directory),
-        |_| {},
-    )
-    .expect("initialized training update");
-
-    assert_eq!(report.starting_policy_fingerprint, initial_fingerprint);
-    assert_eq!(report.completed_updates, 1);
-    std::fs::remove_dir_all(weights_directory).expect("remove initial weights");
-    std::fs::remove_dir_all(checkpoint_directory).expect("remove checkpoint directory");
-}
-
-#[cfg(feature = "builtin")]
-#[test]
-fn production_training_rejects_an_unpaired_environment_count() {
-    let directory = training_test_directory("odd-environments");
-    let mut settings = training_settings(23_079);
-    settings.ppo.environments = 1;
-    let error = crate::run_training_job_on_with_initial_weights(
-        settings,
-        crate::PolicyDevice::Cpu,
-        &directory,
-        false,
-        None,
-        |_| {},
-    )
-    .expect_err("production arenas require complete side pairs");
-
-    assert_eq!(
-        error.to_string(),
-        "invalid PPO config field: training environments"
-    );
-    std::fs::remove_dir_all(directory).expect("remove checkpoint directory");
-}
-
-#[cfg(feature = "builtin")]
-#[test]
-fn resumed_training_rejects_an_initial_weights_directory() {
-    let directory = training_test_directory("resume-with-initial");
-    let settings = training_settings(23_076);
-
-    let error = crate::run_training_job_on_with_initial_weights(
-        settings,
-        crate::PolicyDevice::Cpu,
-        &directory,
-        true,
-        Some(&directory),
-        |_| {},
-    )
-    .expect_err("resume must not reload runtime weights");
-
-    assert_eq!(
-        error.to_string(),
-        "invalid PPO config field: resume initial weights"
-    );
-    std::fs::remove_dir_all(directory).expect("remove checkpoint directory");
-}
-
-#[cfg(feature = "builtin")]
-#[test]
-fn training_job_rejects_a_checkpoint_directory_locked_by_another_writer() {
-    let directory = training_test_directory("locked");
-    let lock = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .open(directory.join(".training.lock"))
-        .expect("create training lock");
-    lock.lock().expect("hold training lock");
-    let settings = training_settings(23_072);
-    let error = crate::run_training_job_on_with_initial_weights(
-        settings,
-        crate::PolicyDevice::Cpu,
-        &directory,
-        true,
-        None,
-        |_| {},
-    )
-    .expect_err("second checkpoint writer");
-
-    assert!(error.to_string().contains("checkpoint directory is locked"));
-    drop(lock);
-    std::fs::remove_dir_all(directory).expect("remove checkpoint directory");
-}
-
-#[cfg(feature = "builtin")]
-#[test]
-fn production_warmup_phases_cover_pregame_and_active_match_ticks() {
-    assert_eq!(crate::training_warmup_decisions(0), 0);
-    assert_eq!(crate::training_warmup_decisions(1), 300);
-    assert!(crate::training_warmup_decisions(2) * 3 > 900);
-    assert_eq!(crate::training_warmup_decisions(7), 2_400);
-    assert_eq!(crate::training_warmup_decisions(8), 0);
-}
-
-#[cfg(feature = "builtin")]
-#[test]
-fn production_warmup_cycle_has_a_fixed_discarded_decision_budget() {
-    let decisions = (0..8).map(crate::training_warmup_decisions).sum::<usize>();
-
-    assert_eq!(decisions, 7_650);
-    assert_eq!(decisions * 2 * 2, 30_600);
-}
-
-#[cfg(feature = "builtin")]
-#[test]
-fn production_training_alternates_policy_side_for_odd_environment_counts() {
-    assert_eq!(crate::training_policy_seat(0), 0);
-    assert_eq!(crate::training_policy_seat(1), 1);
-    assert_eq!(crate::training_policy_seat(2), 0);
-}
-
-#[cfg(feature = "builtin")]
-#[test]
-fn production_training_covers_every_warmup_phase_on_both_policy_sides() {
-    let mut covered = [[false; 2]; 8];
-    for stream in 0..16 {
-        covered[crate::training_warmup_phase_index(stream)][crate::training_policy_seat(stream)] =
-            true;
-    }
-
-    assert!(covered.into_iter().flatten().all(|present| present));
-    assert_eq!(crate::training_pair_index(0), crate::training_pair_index(1));
-    assert_ne!(crate::training_pair_index(1), crate::training_pair_index(2));
-}
-
-#[cfg(feature = "builtin")]
-#[cfg(feature = "builtin")]
-#[test]
-fn production_warmup_runs_the_frozen_policy_against_the_scheduled_opponent() {
-    let model = stop_policy_for_warmup();
-
-    let orders = crate::production_warmup_order_counts_for_test(&model, 16)
-        .expect("policy warmup against Weak");
-
-    assert_eq!(orders, [1, 0]);
-}
-
-#[cfg(feature = "builtin")]
-#[test]
-fn batched_production_warmup_runs_both_policy_sides_without_weak_orders() {
-    let model = stop_policy_for_warmup();
-
-    let orders = crate::production_batched_warmup_order_counts_for_test(&model, 16)
-        .expect("batched policy warmup against Weak");
-
-    assert_eq!(orders, [[1, 0], [0, 1]]);
-}
-
-#[cfg(feature = "builtin")]
-#[test]
-fn production_warmup_cleanup_preserves_server_mirrored_item_timers() {
-    assert!(
-        crate::production_warmup_cleanup_preserves_readiness_for_test()
-            .expect("warmup readiness cleanup")
-    );
-}
-
-#[cfg(feature = "builtin")]
-#[test]
-fn production_seed_derivation_accepts_maximum_seed_without_overflow() {
-    let arena = crate::derive_training_seed(u64::MAX, 1_000_000, 1);
-    let opponent = crate::derive_training_seed(u64::MAX, 1_000_000, 2);
-
-    assert_ne!(arena, opponent);
-}
-
-#[cfg(feature = "builtin")]
-#[test]
-fn deployment_uses_the_audited_teacher_only_for_map_zero() {
-    assert!(crate::deployment_uses_teacher_for_test(bota_proto::MapId(
-        0
-    )));
-    assert!(!crate::deployment_uses_teacher_for_test(bota_proto::MapId(
-        1
-    )));
-    assert!(!crate::deployment_uses_teacher_for_test(bota_proto::MapId(
-        2
-    )));
-}
-
-#[cfg(feature = "builtin")]
-fn stop_policy_for_warmup() -> PolicyModel {
-    constant_policy_for_warmup(ActionKind::Stop)
-}
-
-#[cfg(feature = "builtin")]
-fn constant_policy_for_warmup(kind: ActionKind) -> PolicyModel {
-    let model = PolicyModel::fresh(23_077).expect("warmup model");
-    let mut parameters = vec![0.0; crate::MODEL_PARAMETER_COUNT];
-    let mut offset = 0usize;
-    for (name, shape) in model.parameter_schema().expect("parameter schema") {
-        if name == "kind.bias" {
-            parameters[offset + kind.index()] = 10.0;
-            model
-                .import_parameters(&parameters)
-                .expect("stop policy parameters");
-            return model;
-        }
-        offset += shape.iter().product::<usize>();
-    }
-    panic!("kind bias parameter is missing");
-}
-
-#[cfg(feature = "builtin")]
-#[test]
-fn neural_warmup_stop_and_continue_match_raw_ledger_while_teacher_opponent_buys() {
-    for kind in [ActionKind::Stop, ActionKind::Continue] {
-        let model = constant_policy_for_warmup(kind);
-        crate::ppo_arena::assert_pure_warmup_ledger_for_test(&model, kind);
-    }
-}
-
-#[cfg(feature = "builtin")]
-#[test]
-fn frozen_neural_opponent_keeps_its_policy_identity_and_never_uses_teacher_orders() {
-    let model = stop_policy_for_warmup();
-    crate::ppo_arena::assert_frozen_neural_opponent_for_test(&model);
-}
-
-#[cfg(feature = "builtin")]
-#[test]
-fn training_job_rejects_targets_that_cannot_fit_shuffle_rng_counters() {
-    let directory = training_test_directory("counter-bound");
-    let mut settings = training_settings(23_073);
-    settings.updates = 1_000_000;
-    settings.ppo.environments = 16;
-    settings.ppo.rollout_decisions = 64;
-    settings.ppo.minibatch = 32;
-    settings.checkpoint_cadence = crate::TrainingCheckpointCadence::Updates(5);
-    let error = crate::run_training_job_on_with_initial_weights(
-        settings,
-        crate::PolicyDevice::Cpu,
-        &directory,
-        false,
-        None,
-        |_| {},
-    )
-    .expect_err("uncheckpointable shuffle RNG target");
-
-    assert_eq!(
-        error.to_string(),
-        "invalid PPO config field: training shuffle RNG counter"
-    );
-    std::fs::remove_dir_all(directory).expect("remove checkpoint directory");
-}
-
-#[cfg(feature = "builtin")]
-fn training_test_directory(name: &str) -> std::path::PathBuf {
-    static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(1);
-    let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
-    let directory = std::env::temp_dir().join(format!(
-        "drysua-training-job-{name}-{}-{sequence}",
-        std::process::id()
-    ));
-    if directory.exists() {
-        std::fs::remove_dir_all(&directory).expect("remove stale training directory");
-    }
-    std::fs::create_dir(&directory).expect("create checkpoint directory");
-    directory
-}
-#[cfg(feature = "builtin")]
-#[test]
-fn map2_cli_checkpoint_restores_exact_config_and_rejects_changed_hyperparameters() {
-    let directory = training_test_directory("map2-cli");
-    let settings = crate::cli::training_settings_for_test(&[
-        "--complete-episodes=false",
-        "--map",
-        "2",
-        "--environments",
-        "2",
-        "--rollout",
-        "2",
-        "--epochs",
-        "1",
-        "--minibatch",
-        "2",
-        "--learning-rate",
-        "3e-5",
-        "--gamma-per-tick",
-        "1",
-        "--gae-lambda",
-        "0.995",
-        "--entropy-coefficient",
-        "0.001",
-    ])
-    .expect("CLI training settings");
-    crate::run_training_job_on_with_initial_weights(
-        settings.clone(),
-        crate::PolicyDevice::Cpu,
-        &directory,
-        false,
-        None,
-        |_| {},
-    )
-    .expect("first update");
-    let artifact = crate::TrainingArtifact::load(&directory).expect("checkpoint");
-    let model = PolicyModel::fresh(23_080).expect("restore model");
-    let restored = artifact
-        .restore(&model, artifact.run())
-        .expect("restore trainer");
-    assert_eq!(restored.trainer().config(), settings.ppo);
-    crate::run_training_job_on_with_initial_weights(
-        settings.clone(),
-        crate::PolicyDevice::Cpu,
-        &directory,
-        true,
-        None,
-        |_| {},
-    )
-    .expect("same exact config resumes");
-    for field in 0..4 {
-        let mut changed = settings.clone();
-        match field {
-            0 => changed.ppo.learning_rate = 3e-6,
-            1 => changed.ppo.gamma_tick = 0.9966555,
-            2 => changed.ppo.gae_lambda = 0.98,
-            3 => changed.ppo.entropy_coefficient = 0.01,
-            _ => unreachable!(),
-        }
-        let error = crate::run_training_job_on_with_initial_weights(
-            changed,
+    let mut settings = crate::ppo::training_settings_for_test(23_071, 1);
+    for update in 1..=2 {
+        settings.updates = update;
+        let report = crate::run_training_job_on_with_initial_weights(
+            settings.clone(),
             crate::PolicyDevice::Cpu,
-            &directory,
+            &resumed,
+            update > 1,
+            if update == 1 {
+                Some(weights.as_path())
+            } else {
+                None
+            },
+            |_| {},
+        )
+        .expect("update");
+        assert_eq!(report.completed_updates, update);
+        if update == 1 {
+            assert_eq!(report.starting_policy_fingerprint, fingerprint);
+        }
+    }
+    crate::run_training_job_on_with_initial_weights(
+        settings.clone(),
+        crate::PolicyDevice::Cpu,
+        &uninterrupted,
+        false,
+        Some(&weights),
+        |_| {},
+    )
+    .expect("uninterrupted");
+    let source = crate::TrainingArtifact::load(&uninterrupted).expect("reference");
+    let target = crate::TrainingArtifact::load(&resumed).expect("resumed");
+    assert_eq!(source.run(), target.run());
+    assert_eq!(source.progress(), target.progress());
+    assert_eq!(target.progress().global_update, 2);
+    assert_eq!(target.progress().rollout_samples, 8);
+    assert_restored_training_equal(&source, &target);
+    assert_checkpoint_scope_rejections(&settings, &resumed);
+    for directory in [weights, uninterrupted, resumed] {
+        std::fs::remove_dir_all(directory).expect("cleanup");
+    }
+}
+
+#[cfg(feature = "builtin")]
+fn assert_restored_training_equal(
+    source: &crate::TrainingArtifact,
+    target: &crate::TrainingArtifact,
+) {
+    let first = PolicyModel::fresh(23_072).expect("first model");
+    let second = PolicyModel::fresh(23_073).expect("second model");
+    let source = source.restore(&first, source.run()).expect("first restore");
+    let target = target
+        .restore(&second, target.run())
+        .expect("second restore");
+    let source = source.trainer();
+    let target = target.trainer();
+    let source_state = source.checkpoint_snapshot(&first).expect("first snapshot");
+    let target_state = target
+        .checkpoint_snapshot(&second)
+        .expect("second snapshot");
+    assert_eq!(source_state.parameters, target_state.parameters);
+    assert_eq!(source_state.adam.moments(), target_state.adam.moments());
+    assert_eq!(source.optimizer_step(), target.optimizer_step());
+    assert_eq!(source.config(), target.config());
+    assert_eq!(source.updates(), target.updates());
+    assert_eq!(source.rng_checkpoint(), target.rng_checkpoint());
+    assert!(target.optimizer_step() > 0);
+    assert!(target.rng_checkpoint().1 > 0);
+}
+
+#[cfg(feature = "builtin")]
+fn assert_checkpoint_scope_rejections(
+    settings: &crate::TrainingJobConfig,
+    directory: &std::path::Path,
+) {
+    let mutations: [fn(&mut crate::TrainingJobConfig); 3] = [
+        |config| config.ppo.learning_rate *= 0.1,
+        |config| config.updates = 1,
+        |config| {
+            config.git_commit = "next-git-commit".to_owned();
+            config.simulator_commit = "foreign-simulator".to_owned();
+            config.resume_provenance = crate::ResumeProvenance::MigrateGitCommit;
+        },
+    ];
+    for (mutate, message) in mutations.into_iter().zip([
+        "invalid PPO config field: training checkpoint PPO config",
+        "invalid PPO config field: training update target precedes checkpoint",
+        "invalid PPO config field: provenance migration scope",
+    ]) {
+        let mut invalid = settings.clone();
+        mutate(&mut invalid);
+        let error = crate::run_training_job_on_with_initial_weights(
+            invalid,
+            crate::PolicyDevice::Cpu,
+            directory,
             true,
             None,
             |_| {},
         )
-        .expect_err("changed hyperparameter must reject resume");
-        let expected = if field == 1 {
-            "invalid PPO config field: Map2 comprehensive reward requires gamma per tick one"
-        } else {
-            "invalid PPO config field: training checkpoint PPO config"
-        };
-        assert_eq!(error.to_string(), expected);
-    }
-    std::fs::remove_dir_all(directory).expect("remove checkpoint");
-}
-#[cfg(feature = "builtin")]
-#[cfg(feature = "builtin")]
-#[test]
-fn production_window_resets_lose_delayed_terminal_credit_while_episode_collection_preserves_it() {
-    crate::ppo_arena::episode::assert_reset_loses_terminal_credit_for_test();
-}
-
-#[cfg(feature = "builtin")]
-#[test]
-fn episode_intervals_discount_rewards_flush_terminal_and_partial_timeout_without_false_done() {
-    crate::ppo_arena::episode::assert_discounted_intervals_for_test();
-}
-
-#[cfg(feature = "builtin")]
-#[test]
-fn complete_episode_cli_binds_map2_gamma_one_and_rejects_capacity_below_the_shared_bound() {
-    let settings = crate::cli::training_settings_for_test(&[
-        "--complete-episodes",
-        "--map",
-        "2",
-        "--environments",
-        "2",
-        "--rollout",
-        &crate::MAP2_RETAINED_DECISIONS.to_string(),
-        "--minibatch",
-        "512",
-        "--gamma-per-tick",
-        "1",
-    ])
-    .expect("complete episode settings");
-    assert!(settings.complete_episodes);
-    assert_eq!(settings.map, bota_proto::MapId(2));
-    assert_eq!(settings.ppo.gamma_tick, 1.0);
-    assert_eq!(
-        settings.ppo.rollout_decisions,
-        crate::MAP2_RETAINED_DECISIONS
-    );
-    assert!(!settings.terminal_only);
-    assert_eq!(settings.episode_time_cost, 0.0);
-    crate::ppo_arena::episode::validate(&settings).expect("bounded episode config");
-    let mut short = settings.clone();
-    short.ppo.rollout_decisions = crate::MAP2_RETAINED_DECISIONS - 1;
-    assert_eq!(
-        crate::ppo_arena::episode::validate(&short)
-            .expect_err("insufficient retained capacity")
-            .to_string(),
-        "invalid PPO config field: complete episode retained capacity"
-    );
-    for map in [bota_proto::MapId(0), bota_proto::MapId(1)] {
-        let mut invalid = settings.clone();
-        invalid.map = map;
-        assert_eq!(
-            crate::ppo_arena::episode::validate(&invalid)
-                .expect_err("historical map")
-                .to_string(),
-            "invalid PPO config field: production training requires Map2"
-        );
-    }
-}
-#[cfg(feature = "builtin")]
-#[test]
-fn episode_sampling_replays_rng_and_retains_original_logprob_without_action_overrides() {
-    crate::ppo_arena::episode::assert_rng_and_sample_provenance_for_test(&stop_policy_for_warmup());
-}
-
-#[cfg(feature = "builtin")]
-#[test]
-fn pipeline_groups_require_complete_paired_configurations() {
-    for (arguments, message) in [
-        (
-            vec!["--environments", "8", "--pipeline-groups", "3"],
-            "invalid PPO config field: pipeline groups",
-        ),
-        (
-            vec!["--environments", "4", "--pipeline-groups", "4"],
-            "invalid PPO config field: pipeline groups exceed paired environments",
-        ),
-        (
-            vec![
-                "--environments",
-                "8",
-                "--pipeline-groups",
-                "2",
-                "--complete-episodes=false",
-            ],
-            "invalid PPO config field: pipeline groups require complete episodes",
-        ),
-    ] {
-        assert_eq!(
-            crate::cli::training_settings_for_test(&arguments)
-                .expect_err("invalid pipeline groups")
-                .to_string(),
-            message,
-            "arguments={arguments:?}"
-        );
+        .expect_err("incompatible checkpoint");
+        assert_eq!(error.to_string(), message);
+        let artifact =
+            crate::TrainingArtifact::load(directory).expect("checkpoint survives rejection");
+        assert_eq!(artifact.progress().global_update, 2);
+        assert_eq!(artifact.run().simulator_commit, settings.simulator_commit);
     }
 }
 
 #[cfg(feature = "builtin")]
 #[test]
-fn episode_checkpoint_rejects_pipeline_group_scope_mismatch() {
-    let directory = training_test_directory("episode-groups-scope");
-    let settings = crate::cli::training_settings_for_test(&[
-        "--complete-episodes",
-        "--map",
-        "2",
-        "--environments",
-        "8",
-        "--pipeline-groups",
-        "2",
-        "--rollout",
-        &crate::MAP2_RETAINED_DECISIONS.to_string(),
-        "--minibatch",
-        "512",
-        "--gamma-per-tick",
-        "1",
-    ])
-    .expect("grouped settings");
-    crate::ppo_arena::episode::assert_pipeline_groups_scope_for_test(settings, &directory);
-}
-
-#[cfg(feature = "builtin")]
-#[test]
-fn episode_checkpoint_restores_exact_rng_and_rejects_window_collection_scope() {
-    let directory = training_test_directory("episode-scope");
-    let settings = crate::cli::training_settings_for_test(&[
-        "--complete-episodes",
-        "--map",
-        "2",
-        "--environments",
-        "2",
-        "--rollout",
-        &crate::MAP2_RETAINED_DECISIONS.to_string(),
-        "--minibatch",
-        "512",
-        "--gamma-per-tick",
-        "1",
-    ])
-    .expect("episode settings");
-    crate::ppo_arena::episode::assert_checkpoint_scope_for_test(settings, &directory);
-    std::fs::remove_dir_all(directory).expect("cleanup");
-}
-#[test]
-fn exhausted_shaping_budget_can_make_a_discounted_losing_episode_positive() {
-    let mut tracker = RewardTracker::default();
-    let mut summary = crate::GlobalSummary::default();
-    tracker.observe(summary, 1.0, None).expect("baseline");
-    summary.allied.xp = 6000;
-    let gain = tracker
-        .observe(
-            summary,
-            tick_discount(0.9999722, 3).expect("discount"),
-            None,
-        )
-        .expect("early XP");
-    let loss = tracker
-        .observe(
-            summary,
-            tick_discount(0.9999722, 60000).expect("discount"),
-            Some(PpoTerminalOutcome::Loss),
-        )
-        .expect("loss");
-    assert_eq!(loss.experience, 0.0);
-    assert_eq!(loss.terminal, -1.0);
-    assert!(gain.total + loss.total < 0.0);
-    assert!(gain.total + tick_discount(0.9999722, 60000).expect("discount") * loss.total > 0.0);
-}
-
-#[test]
-fn legacy_terminal_only_reward_has_no_shaping_and_never_fabricates_draws() {
-    for (outcome, expected) in [
-        (None, 0.0),
-        (Some(PpoTerminalOutcome::Win), 1.0),
-        (Some(PpoTerminalOutcome::Loss), -1.0),
-    ] {
-        let reward = RewardTracker::terminal_only(outcome).expect("terminal-only reward");
-        assert_eq!(
-            reward,
-            crate::RewardBreakdown {
-                terminal: expected,
-                total: expected,
-                ..crate::RewardBreakdown::default()
-            }
-        );
-    }
-    assert_eq!(
-        RewardTracker::terminal_only(Some(PpoTerminalOutcome::Draw))
-            .expect_err("no synthetic draw")
-            .to_string(),
-        "invalid PPO transition: terminal-only Map0 draw"
-    );
-}
-
-#[cfg(feature = "builtin")]
-#[test]
-fn map2_e6_capacity_and_lambda_one_are_explicit_and_bounded() {
-    let settings = crate::cli::training_settings_for_test(&[
-        "--complete-episodes",
-        "--map",
-        "2",
-        "--environments",
-        "6",
-        "--rollout",
-        &crate::MAP2_RETAINED_DECISIONS.to_string(),
-        "--gamma-per-tick",
-        "1",
-        "--gae-lambda",
-        "1",
-    ])
-    .expect("Map2 E6 settings");
-    assert!(!settings.terminal_only);
-    assert_eq!(settings.episode_time_cost, 0.0);
-    assert_eq!(settings.ppo.gamma_tick, 1.0);
-    assert_eq!(settings.ppo.gae_lambda, 1.0);
-    crate::ppo_arena::episode::validate(&settings).expect("E6 fits");
-    let mut four = settings.clone();
-    four.ppo.environments = 4;
-    four.ppo.rollout_decisions = 8192;
-    crate::ppo_arena::episode::validate(&four).expect("E4 reaches global product cap exactly");
-    assert_eq!(
-        four.ppo.environments * four.ppo.rollout_decisions,
-        crate::PPO_MAX_SAMPLES
-    );
-    let mut too_large = settings.clone();
-    too_large.ppo.rollout_decisions = 8192;
-    assert_eq!(
-        crate::ppo_arena::episode::validate(&too_large)
-            .expect_err("E6 cannot retain that capacity")
-            .to_string(),
-        "invalid PPO config field: samples per update"
-    );
-    let mut invalid = settings.clone();
-    invalid.ppo.environments = 28;
-    assert_eq!(
-        crate::ppo_arena::episode::validate(&invalid)
-            .expect_err("unbounded complete-episode environment count")
-            .to_string(),
-        "invalid PPO config field: complete episodes require Map2, an even environment count up to the training maximum, and three-tick actions"
-    );
-    let mut odd = settings.clone();
-    odd.ppo.environments = 7;
-    assert!(crate::ppo_arena::episode::validate(&odd).is_err());
-    invalid = settings;
-    invalid.ppo.decision_interval_ticks = 4;
-    assert_eq!(
-        crate::ppo_arena::episode::validate(&invalid)
-            .expect_err("non-three-tick episode actions")
-            .to_string(),
-        "invalid PPO config field: complete episodes require Map2, an even environment count up to the training maximum, and three-tick actions"
-    );
-}
-
-#[cfg(feature = "builtin")]
-#[test]
-fn map2_gamma_one_lambda_one_retention_preserves_full_mc_and_timeout_bootstrap() {
+fn episode_retention_preserves_actor_rng_delayed_credit_and_timeout_bootstrap() {
+    let model = PolicyModel::fresh(23_077).expect("model");
+    let mut parameters = vec![0.0; model.parameter_count()];
+    let kind = crate::ActionKind::Stop.index();
+    set_parameter_range(&model, &mut parameters, "kind.bias", kind..kind + 1, 10.0);
+    model.import_parameters(&parameters).expect("stop policy");
+    crate::ppo_arena::episode::assert_retention_actor_parity_for_test(&model);
+    crate::ppo_arena::episode::assert_retention_boundaries_for_test(&model);
     crate::ppo_arena::episode::assert_full_mc_for_test();
-}
-
-#[cfg(feature = "builtin")]
-#[test]
-fn e2_e4_e6_ragged_sampling_and_early_terminals_preserve_rng_and_retained_actions() {
-    crate::ppo_arena::episode::assert_ragged_streams_for_test(&stop_policy_for_warmup());
-}
-#[cfg(feature = "builtin")]
-#[test]
-fn historical_elapsed_time_cost_orders_equal_outcomes_and_keeps_wins_above_losses() {
-    crate::ppo_arena::episode::assert_time_cost_for_test();
-}
-
-#[cfg(feature = "builtin")]
-#[test]
-fn map2_training_cli_rejects_terminal_only_in_complete_episodes_and_windows() {
-    for mode in ["--complete-episodes", "--complete-episodes=false"] {
-        let error = crate::cli::training_settings_for_test(&[
-            mode,
-            "--map",
-            "2",
-            "--gamma-per-tick",
-            "1",
-            "--terminal-only",
-        ])
-        .expect_err("Map2 never accepts terminal-only reward");
-        assert_eq!(
-            error.to_string(),
-            "Map2 comprehensive reward forbids --terminal-only"
-        );
-    }
-}
-
-#[cfg(feature = "builtin")]
-#[test]
-fn map2_training_cli_rejects_nonzero_and_nonfinite_time_cost_in_every_collection_mode() {
-    for mode in ["--complete-episodes", "--complete-episodes=false"] {
-        for cost in ["0.125", "0.25", "NaN", "inf", "-inf", "-0.01", "0.250001"] {
-            let argument = format!("--episode-time-cost={cost}");
-            let error = crate::cli::training_settings_for_test(&[
-                mode,
-                "--map",
-                "2",
-                "--gamma-per-tick",
-                "1",
-                &argument,
-            ])
-            .expect_err("Map2 comprehensive reward never adds an episode time cost");
-            assert_eq!(
-                error.to_string(),
-                "Map2 comprehensive reward requires --episode-time-cost 0"
-            );
-        }
-    }
-}
-#[cfg(feature = "builtin")]
-#[test]
-fn production_episode_retention_covers_all_eight_indexed_action_phases() {
-    crate::ppo_arena::episode::assert_all_retention_phase_labels_for_test(&stop_policy_for_warmup());
-}
-#[cfg(feature = "builtin")]
-#[test]
-fn randomized_retention_preserves_actor_rng_orders_and_skips_past_rewards() {
-    crate::ppo_arena::episode::assert_retention_actor_parity_for_test(&stop_policy_for_warmup());
-}
-
-#[cfg(feature = "builtin")]
-#[test]
-fn randomized_retention_flushes_partial_terminal_and_timeout_without_fabricating_short_samples() {
-    crate::ppo_arena::episode::assert_retention_boundaries_for_test(&stop_policy_for_warmup());
-}
-
-#[cfg(feature = "builtin")]
-#[test]
-fn episode_phase_is_replayable_and_independent_of_actor_rng() {
-    crate::ppo_arena::episode::assert_retention_phase_replay_for_test();
-}
-
-#[test]
-fn rollout_compacts_sparse_tokens_and_bit_packs_behavioral_masks_losslessly() {
-    let (frame, space) = frame_and_space();
-    let model = PolicyModel::fresh(100).expect("model");
-    let policy = model.policy_identity().expect("policy");
-    let sampled = choice(&model, &frame, &space, StructuredAction::Continue);
-    let target = sampled.target.clone();
-    let packed = target.pack();
-    let mut rollout = PpoRollout::new(1, policy).expect("rollout");
-    rollout
-        .push(
-            sampled
-                .finish(PpoOutcome {
-                    stream: 0,
-                    decision: 0,
-                    ticks: 3,
-                    next_value: 0.0,
-                    reward: 1.0,
-                    terminal: true,
-                })
-                .expect("transition"),
-        )
-        .expect("push");
-    let padded_rows = UNIT_FEATURE_TOKENS
-        + REMEMBERED_UNIT_FEATURE_TOKENS
-        + POINT_FEATURE_TOKENS
-        + ABILITY_FEATURE_TOKENS
-        + ITEM_FEATURE_TOKENS
-        + PROJECTILE_FEATURE_TOKENS
-        + LOOT_FEATURE_TOKENS;
-
-    assert_eq!(packed.unpack(), target);
-    assert!(
-        std::mem::size_of_val(&packed) < std::mem::size_of::<BehavioralTarget>(),
-        "packed={} fixed={}",
-        std::mem::size_of_val(&packed),
-        std::mem::size_of::<BehavioralTarget>()
-    );
-    assert!(rollout.ragged_rows_for_test() < padded_rows);
+    crate::ppo_arena::episode::assert_reset_loses_terminal_credit_for_test();
 }

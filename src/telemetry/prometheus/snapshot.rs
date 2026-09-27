@@ -39,6 +39,11 @@ pub(super) struct DurationHistogram {
     pub sum_seconds: f64,
 }
 
+pub(super) enum HistogramKind {
+    Training,
+    Scope,
+}
+
 impl TrainingSnapshot {
     pub(super) fn validate(&self) -> io::Result<()> {
         if self.start_update > self.completed_updates
@@ -118,10 +123,9 @@ impl DurationHistogram {
         next.sum_seconds += seconds;
         for (count, upper) in next.buckets.iter_mut().zip(BUCKETS) {
             if seconds <= upper {
-                *count = count
-                    .checked_add(1)
-                    .filter(|count| *count <= MAX_COUNTER)
-                    .ok_or_else(|| invalid("metrics duration count exceeds 9007199254740991"))?;
+                // Validation bounds every bucket by the already checked total.
+                assert!(*count < next.count);
+                *count += 1;
             }
         }
         next.validate()?;
@@ -132,27 +136,38 @@ impl DurationHistogram {
     }
 
     fn validate(&self) -> io::Result<()> {
+        self.validate_for(HistogramKind::Training)
+    }
+
+    pub(super) fn validate_for(&self, kind: HistogramKind) -> io::Result<()> {
+        let duration = match kind {
+            HistogramKind::Training => "duration",
+            HistogramKind::Scope => "scope duration",
+        };
+        let invalid = |message| io::Error::new(io::ErrorKind::InvalidData, message);
         if !self.sum_seconds.is_finite() || self.sum_seconds < 0.0 {
-            return Err(invalid(
-                "metrics duration sum must be finite and nonnegative",
-            ));
+            return Err(invalid(format!(
+                "metrics {duration} sum must be finite and nonnegative"
+            )));
         }
         if self.count > MAX_COUNTER {
-            return Err(invalid("metrics duration count exceeds 9007199254740991"));
+            return Err(invalid(format!(
+                "metrics {duration} count exceeds 9007199254740991"
+            )));
         }
         let mut previous = 0;
         for count in self.buckets {
             if count < previous || count > self.count {
-                return Err(invalid(
-                    "metrics duration buckets must be cumulative and at most count",
-                ));
+                return Err(invalid(format!(
+                    "metrics {duration} buckets must be cumulative and at most count"
+                )));
             }
             previous = count;
         }
         if self.count == 0 && self.sum_seconds != 0.0 {
-            return Err(invalid(
-                "metrics empty duration histogram must have zero sum",
-            ));
+            return Err(invalid(format!(
+                "metrics empty {duration} histogram must have zero sum"
+            )));
         }
         assert!(self.buckets[9] <= self.count);
         assert!(self.sum_seconds.is_finite());

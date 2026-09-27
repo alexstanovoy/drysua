@@ -1,4 +1,4 @@
-use super::snapshot::{BUCKETS, DurationHistogram, TrainingSnapshot};
+use super::snapshot::{BUCKETS, DurationHistogram, HistogramKind, TrainingSnapshot};
 use std::fmt::{self, Write};
 use std::io;
 
@@ -332,38 +332,8 @@ fn scalar(
 }
 
 fn validate_scopes(scopes: &[DurationHistogram; 3]) -> io::Result<()> {
-    // The snapshot owns its private histogram validator; invocation scopes are separate.
     for histogram in scopes {
-        if !histogram.sum_seconds.is_finite() || histogram.sum_seconds < 0.0 {
-            return Err(invalid(
-                "metrics scope duration sum must be finite and nonnegative",
-            ));
-        }
-        if histogram.count >= 1_u64 << 53 {
-            return Err(invalid(
-                "metrics scope duration count exceeds 9007199254740991",
-            ));
-        }
-        let mut previous = 0;
-        for count in histogram.buckets {
-            if count < previous || count > histogram.count {
-                return Err(invalid(
-                    "metrics scope duration buckets must be cumulative and at most count",
-                ));
-            }
-            previous = count;
-        }
-        if histogram.count == 0 && histogram.sum_seconds != 0.0 {
-            return Err(invalid(
-                "metrics empty scope duration histogram must have zero sum",
-            ));
-        }
-        assert!(histogram.sum_seconds.is_finite());
-        assert!(previous <= histogram.count);
+        histogram.validate_for(HistogramKind::Scope)?;
     }
     Ok(())
-}
-
-fn invalid(message: &'static str) -> io::Error {
-    io::Error::new(io::ErrorKind::InvalidData, message)
 }

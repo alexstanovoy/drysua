@@ -7,33 +7,33 @@ use crate::{
 };
 
 #[test]
-fn feared_item_mask_matches_arena_disabled_rejection_and_expiry_acceptance() {
-    assert_fear_gate_and_expiry(
-        StructuredAction::Use {
-            unit: ControlledUnit::Hero,
-            slot: ItemSlot(2),
-            target: ActionTarget::None,
-        },
-        Order::Use {
-            slot: ItemSlot(2),
-            target: Target::None,
-        },
-    );
-}
-
-#[test]
-fn feared_cast_mask_matches_arena_disabled_rejection_and_expiry_acceptance() {
-    assert_fear_gate_and_expiry(
-        StructuredAction::Cast {
-            unit: ControlledUnit::Hero,
-            slot: AbilitySlot(0),
-            target: ActionTarget::None,
-        },
-        Order::Cast {
-            slot: AbilitySlot(0),
-            target: Target::None,
-        },
-    );
+fn feared_use_and_cast_masks_match_native_rejection_then_expiry_acceptance() {
+    for (action, order) in [
+        (
+            StructuredAction::Use {
+                unit: ControlledUnit::Hero,
+                slot: ItemSlot(2),
+                target: ActionTarget::None,
+            },
+            Order::Use {
+                slot: ItemSlot(2),
+                target: Target::None,
+            },
+        ),
+        (
+            StructuredAction::Cast {
+                unit: ControlledUnit::Hero,
+                slot: AbilitySlot(0),
+                target: ActionTarget::None,
+            },
+            Order::Cast {
+                slot: AbilitySlot(0),
+                target: Target::None,
+            },
+        ),
+    ] {
+        assert_fear_gate_and_expiry(action, order);
+    }
 }
 
 fn assert_fear_gate_and_expiry(action: StructuredAction, order: Order) {

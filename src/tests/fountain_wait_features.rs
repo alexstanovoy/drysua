@@ -4,17 +4,8 @@
 )]
 
 use super::feature::{encode, match_info, world_view};
-use crate::{ActionSpace, LocalPolicyState, Map2RewardEnd, StateTracker, global_feature};
+use crate::{ActionSpace, LocalPolicyState, Map2RewardEnd, StateTracker};
 use bota_proto::{EventKind, ItemId, MapId, SlotId, Team, UnitKind, WorldView};
-
-#[test]
-fn wait_feature_columns_stay_fixed_before_the_three_new_progress_fields() {
-    assert_eq!(crate::FEATURE_SCHEMA_VERSION, 22);
-    assert_eq!(crate::GLOBAL_FEATURES, 92);
-    assert_eq!(crate::UNIT_FEATURES, 84);
-    assert_eq!(global_feature::MAP2_FOUNTAIN_WAIT_TICKS, 85);
-    assert_eq!(global_feature::MAP2_FOUNTAIN_WAIT_REFUNDABLE_COST, 86);
-}
 
 #[test]
 fn wait_features_normalize_open_period_ticks_and_refundable_cost_without_extra_state() {

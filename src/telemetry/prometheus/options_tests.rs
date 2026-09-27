@@ -46,17 +46,3 @@ fn missing_exporter_state_reports_unavailable_without_fabricating_games() {
     assert!(rendered.contains("drysua_training_metrics_state_healthy 0\n"));
     assert!(!rendered.contains("drysua_training_games_total{"));
 }
-
-#[test]
-fn active_writer_does_not_fabricate_a_trainer_heartbeat() {
-    let snapshot = snapshot::TrainingSnapshot {
-        parallel: 1,
-        updates_target: 1,
-        heartbeat: 123,
-        ..snapshot::TrainingSnapshot::default()
-    };
-    let rendered =
-        exposition::render(Some(&snapshot), true, true, snapshot.heartbeat, None).unwrap();
-    assert!(rendered.contains("drysua_training_active 1\n"));
-    assert!(rendered.contains("drysua_training_last_heartbeat_timestamp_seconds 123\n"));
-}

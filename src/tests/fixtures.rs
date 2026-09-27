@@ -140,11 +140,6 @@ impl MatchInfoFixture {
         self
     }
 
-    pub(super) fn mode(mut self, mode: TickMode) -> Self {
-        self.info.mode = mode;
-        self
-    }
-
     pub(super) fn shop(mut self, shop: Vec<ShopEntry>) -> Self {
         self.info.shop = shop;
         self

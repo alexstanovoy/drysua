@@ -1,4 +1,97 @@
+#![cfg(unix)]
+
 use super::*;
+
+type InvalidObservation = (fn(&mut UpdateObservation), &'static str);
+
+#[test]
+fn http_publication_replay_and_resume_preserve_only_checkpointed_observations() {
+    use super::super::state::{has_pending, read_snapshot};
+    for crash_before_publish in [false, true] {
+        let directory = Directory::new();
+        prepare_invocation(&directory, crash_before_publish);
+        let mut checkpoint = baseline();
+        checkpoint.completed_updates = 42;
+        checkpoint.start_update = 42;
+        checkpoint.samples = 4200;
+        checkpoint.optimizer_steps = 84;
+        checkpoint.checkpoint = [3; 32];
+        checkpoint.updates_target = 50;
+        for _ in 0..2 {
+            let mut resumed = directory.registry();
+            resumed.begin(checkpoint.clone(), true).unwrap();
+            let persisted = read_snapshot(&directory.0).unwrap();
+            assert_eq!(persisted.updates_target, 50);
+            assert_eq!(persisted.durations.map(|value| value.count), [2; 6]);
+            assert!(!has_pending(&directory.0).unwrap());
+            assert_exposition(&directory);
+        }
+        let mut resumed = directory.registry();
+        resumed.begin(checkpoint, true).unwrap();
+        resumed.observe(update(43, [1, 37, 0, 2])).unwrap();
+        resumed.prepare([1; 32], 43, [4; 32], 124).unwrap();
+        resumed.commit(43, [4; 32]).unwrap();
+        let persisted = read_snapshot(&directory.0).unwrap();
+        assert_eq!(persisted.games, [6, 108, 2, 4]);
+        assert_eq!(persisted.last_update_games, [1, 37, 0, 2]);
+        assert_eq!(persisted.samples, 4300);
+        assert_eq!(persisted.optimizer_steps, 86);
+        drop(resumed);
+        let body = super::super::DirectoryReader::new(directory.0.clone())
+            .scrape_for_test("GET /metrics HTTP/1.0\r\n\r\n");
+        assert!(body.contains("drysua_training_active 0\n"));
+    }
+}
+
+fn prepare_invocation(directory: &Directory, crash_before_publish: bool) {
+    let mut first = directory.registry();
+    first.begin(baseline(), true).unwrap();
+    for (completed, games) in [(41, [3, 35, 1, 1]), (42, [5, 71, 2, 2])] {
+        if completed == 42 {
+            reject_invalid_observations(&mut first);
+        }
+        first.observe(update(completed, games)).unwrap();
+        first
+            .timing(
+                completed - 1,
+                Duration::from_secs(5),
+                [Some(Duration::from_secs(1)); 5],
+                true,
+            )
+            .unwrap();
+    }
+    for (result, message) in [
+        (
+            first.observe(update(42, [5, 71, 2, 2])),
+            "metrics update must follow the previous completed update",
+        ),
+        (
+            first.timing(41, Duration::ZERO, [None; 5], true),
+            "metrics update timing is duplicated or out of order",
+        ),
+        (
+            first.prepare([9; 32], 42, [3; 32], 123),
+            "metrics checkpoint scope or update does not match staging",
+        ),
+    ] {
+        assert_eq!(result.unwrap_err().to_string(), message);
+    }
+    first.prepare([1; 32], 42, [3; 32], 123).unwrap();
+    first.prepare([1; 32], 42, [3; 32], 123).unwrap();
+    let body = super::super::DirectoryReader::new(directory.0.clone())
+        .scrape_for_test("GET /metrics HTTP/1.0\r\n\r\n");
+    assert!(body.contains("drysua_training_updates_completed 40\n"));
+    for outcome in ["win", "loss", "draw", "time_cap"] {
+        assert!(body.contains(&format!(
+            "drysua_training_games_total{{outcome=\"{outcome}\"}} 0\n"
+        )));
+    }
+    if !crash_before_publish {
+        first.commit(42, [3; 32]).unwrap();
+        first.commit(42, [3; 32]).unwrap();
+        assert_exposition(directory);
+    }
+}
 
 fn baseline() -> TrainingSnapshot {
     TrainingSnapshot {
@@ -11,6 +104,8 @@ fn baseline() -> TrainingSnapshot {
         start_update: 40,
         parallel: 8,
         games_per_update: 40,
+        generation: Some(0),
+        scale_bp: Some(2500),
         ..TrainingSnapshot::default()
     }
 }
@@ -25,174 +120,78 @@ fn update(completed_updates: u64, games: [u64; 4]) -> UpdateObservation {
     }
 }
 
-fn registry() -> Registry {
-    let mut registry = Registry::new(None);
-    registry.begin(baseline(), true).expect("first coverage");
-    registry
+fn reject_invalid_observations(registry: &mut Registry) {
+    let cases: [InvalidObservation; 4] = [
+        (
+            |value| value.games[0] = 2,
+            "metrics invocation outcome counters regressed",
+        ),
+        (
+            |value| value.losses[0] = f64::NAN,
+            "metrics losses must be finite",
+        ),
+        (
+            |value| value.samples = 1,
+            "metrics absolute sample or optimizer counters regressed",
+        ),
+        (
+            |value| value.optimizer_steps = 1,
+            "metrics absolute sample or optimizer counters regressed",
+        ),
+    ];
+    for (invalidate, message) in cases {
+        let mut observation = update(42, [5, 71, 2, 2]);
+        invalidate(&mut observation);
+        assert_eq!(
+            registry.observe(observation).unwrap_err().to_string(),
+            message
+        );
+    }
 }
 
-#[test]
-fn completed_update_outcomes_are_invisible_until_checkpoint_commit() {
-    let mut registry = registry();
-    registry.observe(update(41, [3, 35, 1, 1])).unwrap();
-    assert_eq!(registry.committed.as_ref().unwrap().games, [0; 4]);
-    registry.prepare([1; 32], 41, [3; 32], 123).unwrap();
-    assert_eq!(registry.committed.as_ref().unwrap().completed_updates, 40);
-    registry.commit(41, [3; 32]).unwrap();
-    assert_eq!(registry.committed.as_ref().unwrap().games, [3, 35, 1, 1]);
+fn assert_exposition(directory: &Directory) {
+    let output = super::super::DirectoryReader::new(directory.0.clone())
+        .scrape_for_test("GET /metrics HTTP/1.1\r\nhOsT: [::1]:9100\r\nContent-Length: 0\r\n\r\n");
+    let sample = |name: &str, value: &str| {
+        let prefix = format!("drysua_training_{name} ");
+        assert_eq!(
+            output
+                .lines()
+                .filter_map(|line| line.strip_prefix(&prefix))
+                .collect::<Vec<_>>(),
+            [value],
+            "{name}"
+        );
+    };
+    for (name, value) in [
+        ("updates_completed", "42"),
+        ("samples_total", "4200"),
+        ("optimizer_steps_total", "84"),
+        ("metrics_start_update", "40"),
+        ("policy_loss", "0.1"),
+        ("value_loss", "0.2"),
+        ("entropy", "0.3"),
+        ("approximate_kl", "0.01"),
+        ("generation", "0"),
+        ("environment_scale_ratio", "0.25"),
+        ("active", "1"),
+        ("metrics_available", "1"),
+    ] {
+        sample(name, value);
+    }
+    for (outcome, total, last) in [
+        ("win", "5", "2"),
+        ("loss", "71", "36"),
+        ("draw", "2", "1"),
+        ("time_cap", "2", "1"),
+    ] {
+        sample(&format!("games_total{{outcome=\"{outcome}\"}}"), total);
+        sample(&format!("last_update_games{{outcome=\"{outcome}\"}}"), last);
+    }
 }
 
-#[test]
-fn invocation_cumulative_outcomes_are_differenced_once_per_update() {
-    let mut registry = registry();
-    registry.observe(update(41, [3, 35, 1, 1])).unwrap();
-    registry.observe(update(42, [5, 71, 2, 2])).unwrap();
-    registry.prepare([1; 32], 42, [3; 32], 123).unwrap();
-    registry.commit(42, [3; 32]).unwrap();
-    let committed = registry.committed.as_ref().unwrap();
-    assert_eq!(committed.games, [5, 71, 2, 2]);
-    assert_eq!(committed.last_update_games, [2, 36, 1, 1]);
-}
-
-#[test]
-fn resumed_invocation_zero_counters_do_not_subtract_previous_history() {
-    let mut resumed = baseline();
-    resumed.start_update = 10;
-    resumed.games = [50, 1000, 20, 130];
-    let mut registry = Registry::new(None);
-    registry.begin(resumed, true).unwrap();
-    registry.observe(update(41, [1, 37, 0, 2])).unwrap();
-    registry.prepare([1; 32], 41, [3; 32], 123).unwrap();
-    registry.commit(41, [3; 32]).unwrap();
-    assert_eq!(
-        registry.committed.as_ref().unwrap().games,
-        [51, 1037, 20, 132]
-    );
-}
-
-#[test]
-fn duplicate_update_is_rejected_without_double_counting() {
-    let mut registry = registry();
-    registry.observe(update(41, [3, 35, 1, 1])).unwrap();
-    let before = registry.staged.clone();
-    let error = registry.observe(update(41, [3, 35, 1, 1])).unwrap_err();
-    assert_eq!(
-        error.to_string(),
-        "metrics update must follow the previous completed update"
-    );
-    assert_eq!(registry.staged, before);
-}
-
-#[test]
-fn failed_or_reordered_update_counters_leave_staging_unchanged() {
-    let mut registry = registry();
-    registry.observe(update(41, [3, 35, 1, 1])).unwrap();
-    let before = registry.staged.clone();
-    let error = registry.observe(update(42, [2, 71, 2, 2])).unwrap_err();
-    assert_eq!(
-        error.to_string(),
-        "metrics invocation outcome counters regressed"
-    );
-    assert_eq!(registry.staged, before);
-}
-
-#[test]
-fn nonfinite_loss_is_rejected_without_publishing_update() {
-    let mut registry = registry();
-    let mut observation = update(41, [3, 35, 1, 1]);
-    observation.losses[0] = f64::NAN;
-    assert_eq!(
-        registry.observe(observation).unwrap_err().to_string(),
-        "metrics losses must be finite"
-    );
-    assert_eq!(registry.staged.as_ref().unwrap().completed_updates, 40);
-}
-
-#[test]
-fn invalid_or_duplicate_timing_never_increments_histograms() {
-    let mut registry = registry();
-    registry.observe(update(41, [3, 35, 1, 1])).unwrap();
-    let stages = [Some(Duration::from_secs(1)); 5];
-    registry
-        .timing(40, Duration::from_secs(5), stages, false)
-        .unwrap();
-    assert_eq!(registry.staged.as_ref().unwrap().durations[0].count, 0);
-    registry
-        .timing(40, Duration::from_secs(5), stages, true)
-        .unwrap();
-    assert_eq!(
-        registry
-            .timing(40, Duration::from_secs(5), stages, true)
-            .unwrap_err()
-            .to_string(),
-        "metrics update timing is duplicated or out of order"
-    );
-    assert_eq!(registry.staged.as_ref().unwrap().durations[0].count, 1);
-}
-
-#[test]
-fn committed_histograms_survive_idempotent_checkpoint_commit() {
-    let mut registry = registry();
-    registry.observe(update(41, [3, 35, 1, 1])).unwrap();
-    registry
-        .timing(
-            40,
-            Duration::from_secs(5),
-            [Some(Duration::from_secs(1)); 5],
-            true,
-        )
-        .unwrap();
-    registry.prepare([1; 32], 41, [3; 32], 123).unwrap();
-    registry.commit(41, [3; 32]).unwrap();
-    registry.commit(41, [3; 32]).unwrap();
-    assert_eq!(registry.committed.as_ref().unwrap().durations[0].count, 1);
-}
-
-#[test]
-fn wrong_checkpoint_scope_or_commit_identity_cannot_publish() {
-    let mut registry = registry();
-    registry.observe(update(41, [3, 35, 1, 1])).unwrap();
-    assert_eq!(
-        registry
-            .prepare([9; 32], 41, [3; 32], 123)
-            .unwrap_err()
-            .to_string(),
-        "metrics checkpoint scope or update does not match staging"
-    );
-    registry.prepare([1; 32], 41, [3; 32], 123).unwrap();
-    assert_eq!(
-        registry.commit(41, [9; 32]).unwrap_err().to_string(),
-        "metrics commit does not match a prepared snapshot"
-    );
-    assert_eq!(registry.committed.as_ref().unwrap().games, [0; 4]);
-}
-
-#[test]
-fn update_progress_counter_regression_is_rejected() {
-    let mut registry = registry();
-    let mut observation = update(41, [3, 35, 1, 1]);
-    observation.samples = 1;
-    assert_eq!(
-        registry.observe(observation).unwrap_err().to_string(),
-        "metrics absolute sample or optimizer counters regressed"
-    );
-    assert_eq!(registry.staged.as_ref().unwrap().samples, 4000);
-}
-
-#[test]
-fn update_target_is_available_before_first_new_checkpoint() {
-    let mut registry = Registry::new(None);
-    let mut current = baseline();
-    current.updates_target = 200;
-    registry.begin(current, true).unwrap();
-    assert_eq!(registry.committed.as_ref().unwrap().updates_target, 200);
-    assert_eq!(registry.committed.as_ref().unwrap().games, [0; 4]);
-}
-
-#[cfg(unix)]
 struct Directory(std::path::PathBuf);
 
-#[cfg(unix)]
 impl Directory {
     fn new() -> Self {
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -211,64 +210,8 @@ impl Directory {
     }
 }
 
-#[cfg(unix)]
 impl Drop for Directory {
     fn drop(&mut self) {
         std::fs::remove_dir_all(&self.0).unwrap();
     }
-}
-
-#[cfg(unix)]
-#[test]
-fn persisted_registry_resume_restarts_session_counters_and_accepts_lower_target() {
-    let directory = Directory::new();
-    let mut first = directory.registry();
-    first.begin(baseline(), true).unwrap();
-    first.observe(update(41, [3, 35, 1, 1])).unwrap();
-    first.prepare([1; 32], 41, [3; 32], 123).unwrap();
-    first.commit(41, [3; 32]).unwrap();
-    drop(first);
-    let mut restored = baseline();
-    restored.completed_updates = 41;
-    restored.start_update = 41;
-    restored.samples = 4100;
-    restored.optimizer_steps = 82;
-    restored.checkpoint = [3; 32];
-    restored.updates_target = 50;
-    let mut second = directory.registry();
-    second.begin(restored, true).unwrap();
-    assert_eq!(second.committed.as_ref().unwrap().updates_target, 50);
-    second.observe(update(42, [2, 36, 1, 1])).unwrap();
-    second.prepare([1; 32], 42, [4; 32], 124).unwrap();
-    second.commit(42, [4; 32]).unwrap();
-    let snapshot = super::super::state::read_snapshot(&directory.0).unwrap();
-    assert_eq!(snapshot.games, [5, 71, 2, 2]);
-    assert_eq!(snapshot.last_update_games, [2, 36, 1, 1]);
-    assert_eq!(snapshot.start_update, 40);
-    assert_eq!(snapshot.samples, 4200);
-    assert_eq!(snapshot.optimizer_steps, 84);
-}
-
-#[cfg(unix)]
-#[test]
-fn registry_crash_after_checkpoint_before_metrics_publish_recovers_once() {
-    let directory = Directory::new();
-    let mut first = directory.registry();
-    first.begin(baseline(), true).unwrap();
-    first.observe(update(41, [3, 35, 1, 1])).unwrap();
-    first.prepare([1; 32], 41, [3; 32], 123).unwrap();
-    drop(first);
-    let mut actual_checkpoint = baseline();
-    actual_checkpoint.completed_updates = 41;
-    actual_checkpoint.start_update = 41;
-    actual_checkpoint.samples = 4100;
-    actual_checkpoint.optimizer_steps = 82;
-    actual_checkpoint.checkpoint = [3; 32];
-    for _ in 0..2 {
-        let mut resumed = directory.registry();
-        resumed.begin(actual_checkpoint.clone(), true).unwrap();
-        assert_eq!(resumed.committed.as_ref().unwrap().games, [3, 35, 1, 1]);
-        assert_eq!(resumed.committed.as_ref().unwrap().start_update, 40);
-    }
-    assert!(!super::super::state::has_pending(&directory.0).unwrap());
 }

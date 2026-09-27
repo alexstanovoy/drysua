@@ -25,9 +25,9 @@ from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[2]
 TEMPORARY = ROOT / "drysua/artifacts/temp"
-REVIEW = Path("drysua/artifacts/temp/human-review-20260909/current")
-WEIGHTS_SHA = "6348fe57a128ebd521dba68da0949ceb7378d3e0d6b7d6a7ce9a5fb6446547ab"
+# Reject known obsolete binaries even when supplied as current-build attestations.
 BINARY_SHA = "64ba25ebb10e6beabc26ff667a3e3bddeb40dbf391110d4f0e31db6478500a2b"
+HISTORICAL_SERVER_SHA = "24a8efccb285308810678c7e3a8717b57814c9d8fecef386ca923cdb7c04e97c"
 CURRENT_METADATA = {
     "action_schema_hash": "10658390830565586343",
     "feature_schema_hash": "10552563335950731440",
@@ -113,24 +113,15 @@ def read_client_output(path):
 
 # Frozen old reward descriptors whose Rust readers were retired in the wave-5 deslop.
 # Their bytes are preserved here so the rejection tests keep pinning them.
+MAP2_REWARD_V1_DESCRIPTOR = "drysua-map2-reward/v1;map2_1v1_seat_snapshot_events_contiguous_tick_complete;units4096_events4096_identities8192_towers64_tick3600000_amount1000000_xp1000000000;identity_opaque_full_generation_public_scoreboard_heroes_retained_other_metadata480ticks;snapshot_capacity_preflight_death_structure_current_and_prior_role_validation_no_alive_victim_or_known_resurrection;gold_observed_paid_died_own_minus_enemy_no_cash_networth_passive_sales_or_lh_double_payment;xp_public_positive_increments_own_minus_enemy;hero_damage_positive_reported_mitigated_own_hero_to_opposing_hero_no_creep_damage;received_own_hero_from_hero_creep_other_unknown_separate_no_healing_reward;mana_positive_same_body_same_capacity_previous_minus_current_no_request_cost_capacity_change_unobserved;channels=own_gold:.03/300,enemy_gold:-.03/300,own_xp:.03/3000,enemy_xp:-.03/3000,hero_dealt:.08/1600,hero_taken:-.025/1600,creep_taken:-.01/500,other_taken:-.005/500,mana:-.04/1200;channel_payout=budget*scale*amount/((scale+prior_count)*(scale+prior_count+amount));nonreplenishing_separate_unsigned_counts_state_remaining_scale_over_scale_plus_count;tower=.05*(mean_own_hp_fraction-mean_enemy_hp_fraction)_public_cached_no_absence_death;lane=.01*(mean_own_creep_axis+mean_enemy_creep_axis-1)_fountain_axis_public_both_cohorts_else_hold;potentials_exact_gamma1_deltas_not_budget_clipped_first_tick_resources_potentials_baseline_events_counted;terminal_win1_loss-1_draw0_timecap0_distinct_lane_zero_tower_final_retained;gamma1_only_dense_absolute_net_return_bound.4_no_strategy_masks_or_teacher_inputs;"
+MAP2_REWARD_V2_DESCRIPTOR = "drysua-map2-reward/v2;map2_1v1_seat_snapshot_events_contiguous_tick_complete;units4096_events4096_identities8192_towers64_tick27900_amount1000000_xp1000000000;public_metadata=map2_rate30_terrain_axis1to512_pregame0to27900;identity_opaque_full_generation_public_scoreboard_heroes_retained_other_metadata480ticks;snapshot_capacity_preflight_death_structure_current_and_prior_role_validation_no_alive_victim_or_known_resurrection;gold_observed_paid_died_own_minus_enemy_no_cash_networth_passive_sales_or_lh_double_payment;xp_public_positive_increments_own_minus_enemy;hero_damage_positive_reported_mitigated_own_hero_to_opposing_hero_no_creep_damage;received_own_hero_from_hero_creep_other_unknown_separate_no_healing_reward;mana_positive_same_body_same_capacity_previous_minus_current_no_request_cost_capacity_change_unobserved;channels=own_gold:.03/300,enemy_gold:-.03/300,own_xp:.03/3000,enemy_xp:-.03/3000,hero_dealt:.08/1600,hero_taken:-.025/1600,creep_taken:-.01/500,other_taken:-.005/500,mana:-.04/1200;channel_payout=budget*scale*amount/((scale+prior_count)*(scale+prior_count+amount));nonreplenishing_separate_unsigned_counts_state_remaining_scale_over_scale_plus_count;tower=.05*(mean_own_hp_fraction-mean_enemy_hp_fraction)_public_cached_no_absence_death;lane=.01*(mean_own_creep_axis+mean_enemy_creep_axis-1)_fountain_axis_public_both_cohorts_else_hold;potentials_exact_gamma1_deltas_not_budget_clipped_first_tick_resources_potentials_baseline_events_counted;pregame_movement=.005_times_one_minus_clamped_euclidean_distance_to9216_9216_over9216sqrt2,only_pending_tick_lt_public_pregame_ticks,first_complete_observed_body_baseline_free,missing_body_holds_last_observed_potential,reappearance_uses_observed_position,no_cutoff_or_terminal_reversal,no_postspawn_hero_position_reward;fountain_wait=own_live_full_projected_hp_mana_both_consecutive_snapshots_same_full_generation_raw_position_inside_observed_own_fountain1200_inclusive,first_eligible_elapsed0,grace30_at30_base.0001_then.00005_per_second_prorated_div30_per_tick,incremental_negative_cost,any_movement_or_condition_break_resets_without_refund;fountain_purchase=any_confirmed_own_ItemBought_priority_before_condition_break_refunds_entire_open_period_including_drained_charges_then_resets_elapsed0_no_new_wait_interval,enemy_buy_ignored,no_price_intent_channel_saving_exceptions;state_additions=fountain_wait_ticks_u32_and_current_refundable_cost_f32_only;terminal_win1_loss-1_draw0_timecap0_distinct_lane_zero_tower_final_retained;finish_preserves_pregame_hint_and_emitted_wait_total_no_further_wait_charge_or_refund;gamma1_only_dense_absolute_net_return_bound=.4_v1+.005_center+.0001_times27900over30=.498,wait_rate_le_base_refund_le_charged_current_period_no_wait_clipping_no_strategy_masks_or_teacher_inputs;"
 MAP2_REWARD_V3_DESCRIPTOR = "drysua-map2-reward/v3;map2_1v1_seat_snapshot_events_contiguous_tick_complete;units4096_events4096_identities8192_towers64_tick27900_amount1000000_xp1000000000;public_metadata=map2_rate30_terrain_axis1to512_pregame0to27900;identity_opaque_full_generation_public_scoreboard_heroes_retained_other_metadata480ticks;snapshot_capacity_preflight_death_structure_current_and_prior_role_validation_no_alive_victim_or_known_resurrection;gold_observed_paid_died_own_minus_enemy_no_cash_networth_passive_sales_or_lh_double_payment;xp_public_positive_increments_own_minus_enemy;hero_damage_positive_reported_mitigated_own_hero_to_opposing_hero_no_creep_damage;received_own_hero_from_hero_creep_other_unknown_separate_no_healing_reward;mana_positive_same_body_same_capacity_previous_minus_current_no_request_cost_capacity_change_unobserved;channels=own_gold:.03/300,enemy_gold:-.03/300,own_xp:.03/3000,enemy_xp:-.03/3000,hero_dealt:.08/1600,hero_taken:-.025/1600,creep_taken:-.01/500,other_taken:-.005/500,mana:-.04/1200;channel_payout=budget*scale*amount/((scale+prior_count)*(scale+prior_count+amount));nonreplenishing_separate_unsigned_counts_state_remaining_scale_over_scale_plus_count;tower=.05*(mean_own_hp_fraction-mean_enemy_hp_fraction)_public_cached_no_absence_death;lane=.01*(mean_own_creep_axis+mean_enemy_creep_axis-1)_fountain_axis_public_both_cohorts_else_hold;potentials_exact_gamma1_deltas_not_budget_clipped_first_tick_resources_potentials_baseline_events_counted;pregame_movement=.005_times_one_minus_clamped_euclidean_distance_to9216_9216_over9216sqrt2,only_pending_tick_lt_public_pregame_ticks,first_complete_observed_body_baseline_free,missing_body_holds_last_observed_potential,reappearance_uses_observed_position,no_cutoff_or_terminal_reversal,no_postspawn_hero_position_reward;fountain_wait=own_live_full_projected_hp_mana_both_consecutive_snapshots_same_full_generation_raw_position_inside_observed_own_fountain1200_inclusive,first_eligible_elapsed0,grace30_at30_base.0001_then.00005_per_second_prorated_div30_per_tick,incremental_negative_cost,any_movement_or_condition_break_resets_without_refund;fountain_purchase=any_confirmed_own_ItemBought_priority_before_condition_break_refunds_entire_open_period_including_drained_charges_then_resets_elapsed0_no_new_wait_interval,enemy_buy_ignored,no_price_intent_channel_saving_exceptions;wait_state=fountain_wait_ticks_u32_current_refundable_cost_f32;progress_flags=u16_or_per_tick_xp1_gold2_hero_damage4_structure_damage8_creep_kill16_creep_deny32_purchase64_fountain_aura128_pregame_movement256_nearby_wave_pressure512;progress_sources=own_xp_gain_own_paid_bounty_own_hero_to_enemy_hero_damage_own_hero_to_enemy_tower_barracks_ancient_damage_own_nondenied_creep_kill_including_zero_gold_own_creep_deny_any_confirmed_own_purchase;progress_snapshot=own_effect3_positive_ticks_even_full_without_regen_requirement_positive_prewave_center_increment_positive_existing_wave_increment_only_with_live_own_hero_within1500_of_visible_own_live_lane_creep;progress_detection=completed_tick_counter_deltas_before_journal_trim_and_retention_not_accumulated_interval_totals_no_passive_gold_enemy_progress_unknown_targets_clicks_empty_casts_or_other_hero_movement;progress_debt=baseline_free_all_completed_ticks_including_dead_clamp0to2700_any_reason_refreshes30tick_lease_current_tick_included_no_stacking_active_repay_min3_then_consume1_lease_inactive_add1;progress_penalty=base.02_at_first2700_no_rate_same_tick_latch_until_debt0_subsequent_inactive_ticks_at2700_cost.000002_partial_repay_preserves_latch_no_refund_no_reward_clipping;progress_state=stagnation_ticks_u32_activity_ticks_left_u32_stagnation_base_charged_bool_only;progress_purchase=lease_only_never_debt_reset_independent_of_unchanged_v2_fountain_full_refund;terminal_win1_loss-1_draw0_timecap0_distinct_lane_zero_tower_final_retained;finish_preserves_pregame_hint_wait_and_stagnation_totals_no_extra_charge_repayment_or_refund;v2_dense_bound=.4_v1+.005_center+.0001_times27900over30=.498,wait_rate_le_base_refund_le_charged_current_period_no_wait_clipping;progress_bounds=max_base_charges1plus27900minus2700_over2700plus900=8_cost_bound8times.02_plus27900times.000002=.2158;gamma1_only_full_episode_negative_absolute_bound.7138_positive_bound.255_from_positive_budgets.14_tower.1_terminal_lane.01_center.005_sum.9688_lt1_no_strategy_masks_or_teacher_inputs;"
 
 MAP2_REWARD_V6_DESCRIPTOR = "drysua-map2-reward/v6;map2_1v1_seat_snapshot_events_contiguous_tick_complete;units4096_events4096_identities8192_towers64_tick27900_amount1000000_xp1000000000;public_metadata=map2_rate30_terrain_axis1to512_pregame0to27900;identity_opaque_full_generation_public_scoreboard_heroes_retained_other_metadata480ticks;snapshot_capacity_preflight_death_structure_current_and_prior_role_validation_no_alive_victim_or_known_resurrection;gold_observed_paid_died_own_minus_enemy_no_cash_networth_passive_sales_or_lh_double_payment;xp_public_positive_increments_own_minus_enemy;hero_damage_positive_reported_mitigated_own_hero_to_opposing_hero_no_creep_damage;received_own_hero_from_enemy_hero_lane_or_neutral_creep_exclusive_known_Tower_any_team_other_unknown_environment_separate_no_healing_reward;known_Tower_never_charges_other_Ancient_Barracks_Fountain_remain_other;mana_positive_same_body_same_capacity_previous_minus_current_no_request_cost_capacity_change_unobserved;channels=own_gold:.03/300,enemy_gold:-.02/300,own_xp:.03/3000,enemy_xp:-.02/3000,hero_dealt:.08/1600,hero_taken:-.05/1600,creep_taken:-.1/1600,other_taken:-.005/500,mana:-.04/1200,tower_taken:-.1/500;channel_payout=budget*scale*amount/((scale+prior_count)*(scale+prior_count+amount));nonreplenishing_separate_unsigned_counts_state_remaining_scale_over_scale_plus_count;tower=.3*(mean_own_hp_fraction-mean_enemy_hp_fraction)_public_cached_no_absence_death;lane=.1*(mean_own_creep_axis+mean_enemy_creep_axis-1)_fountain_axis_public_both_cohorts_else_hold;potentials_exact_gamma1_deltas_not_budget_clipped_first_tick_resources_potentials_baseline_events_counted;pregame_movement=.005_times_one_minus_clamped_euclidean_distance_to9216_9216_over9216sqrt2,only_pending_tick_lt_public_pregame_ticks,first_complete_observed_body_baseline_free,missing_body_holds_last_observed_potential,reappearance_uses_observed_position,no_cutoff_or_terminal_reversal,no_postspawn_hero_position_reward;fountain_wait=own_live_full_projected_hp_mana_both_consecutive_snapshots_same_full_generation_raw_position_inside_observed_own_fountain1200_inclusive,first_eligible_elapsed0,grace30_at30_base.0001_then.00005_per_second_prorated_div30_per_tick,incremental_negative_cost,any_movement_or_condition_break_resets_without_refund;fountain_purchase=any_confirmed_own_ItemBought_priority_before_condition_break_refunds_entire_open_period_including_drained_charges_then_resets_elapsed0_no_new_wait_interval,enemy_buy_ignored,no_price_intent_channel_saving_exceptions;wait_state=fountain_wait_ticks_u32_current_refundable_cost_f32;progress_flags=u16_or_per_tick_xp1_gold2_hero_damage4_structure_damage8_creep_kill16_creep_deny32_purchase64_fountain_aura128_pregame_movement256_nearby_wave_pressure512;progress_sources=own_xp_gain_own_paid_bounty_own_hero_to_enemy_hero_damage_own_hero_to_enemy_tower_barracks_ancient_damage_own_nondenied_creep_kill_including_zero_gold_own_creep_deny_any_confirmed_own_purchase;progress_snapshot=own_effect3_positive_ticks_even_full_without_regen_requirement_positive_prewave_center_increment_positive_existing_wave_increment_only_with_live_own_hero_within1500_of_visible_own_live_lane_creep;progress_detection=completed_tick_counter_deltas_before_journal_trim_and_retention_not_accumulated_interval_totals_no_passive_gold_enemy_progress_unknown_targets_clicks_empty_casts_or_other_hero_movement;progress_debt=baseline_free_all_completed_ticks_including_dead_clamp0to2700_any_reason_refreshes30tick_lease_current_tick_included_no_stacking_active_repay_min3_then_consume1_lease_inactive_add1;progress_penalty=base.02_at_first2700_no_rate_same_tick_latch_until_debt0_subsequent_inactive_ticks_at2700_cost.000002_partial_repay_preserves_latch_no_refund_no_reward_clipping;progress_state=stagnation_ticks_u32_activity_ticks_left_u32_stagnation_base_charged_bool_only;progress_purchase=lease_only_never_debt_reset_independent_of_unchanged_v2_fountain_full_refund;opening_position=one_shot_first_own_live_not_dead_lane_creep_within1500inclusive_of_center9216_9216_during_public_pregame_to_pregame_plus900_exclusive_else_fallback_at_pregame_plus900_checked_u32_not_clamped_to_earlier_native_cap;first_complete_baseline_free_already_due_or_approaching_baseline_resolves_without_deferred_charge;cost=.1_times_clamp((Euclidean_hero_distance-1500)/1500,0,1)_negative_exact_raw_fixed_1500_and3000_boundaries_missing_or_dead_body_full_cost;resolve_including_zero_never_rearm_on_body_or_purchase_or_wait_changes_finish_cancels_pending_without_cost_no_later_retreat_penalty;state=opening_position_pending_bool;raw=opening_position_checks;terminal_win.2_loss-.2_draw0_timecap-.2_distinct_outcome_labels_lane_zero_tower_final_retained;infrastructure_errors_never_terminal_rewards;finish_preserves_pregame_hint_wait_and_stagnation_totals_no_extra_charge_repayment_or_refund;v2_dense_bound=.4_v1+.005_center+.0001_times27900over30=.498,wait_rate_le_base_refund_le_charged_current_period_no_wait_clipping;progress_bounds=max_base_charges1plus27900minus2700_over2700plus900=8_cost_bound8times.02_plus27900times.000002=.2158;bounds=event_positive.14_event_negative.335_center_abs.005_opening_negative.1_wait_negative.093_stagnation_negative.2158;normal_full_native_start_requires_initial_tower_phi0_lane_phi0_terminal_lane_net0_positive.445_negative1.0488_sum1.4938_exceeds_win_draw_gap.2_and_win_loss_gap.4_no_terminal_dominance;general_allowed_primed_baseline_tower_delta_abs.6_terminal_lane_abs.1_positive.845_negative1.4488_no_unconditional_terminal_dominance_no_clipping_or_budget_shrinking;"
 
 def rust_descriptor(module, name):
     pattern = rf"(?:pub(?:\((?:crate|super)\))? )?const {name}: &str = concat!\((.*?)\n\);"
-    match = None
-    for relative in (
-        f"drysua/src/{module}.rs",
-        f"drysua/src/tests/{module}.rs",
-        f"drysua/src/tests/{module}_test_support.rs",
-    ):
-        path = ROOT / relative
-        if not path.is_file():
-            continue
-        match = re.search(pattern, path.read_text(), re.S)
-        if match is not None:
-            break
+    match = re.search(pattern, (ROOT / f"drysua/src/{module}.rs").read_text(), re.S)
     assert match is not None, name
     strings = re.findall(r'"(?:[^"\\]|\\.)*"', match[1])
     assert strings, name
@@ -185,6 +176,8 @@ if role.startswith("build-") and os.environ.get("PLAY_TEST_BUILD") not in ("hold
 listener = None
 prefix = False
 peers, buffers, seats = [], {}, {}
+selected, ready = set(), set()
+start_requested = False
 read_closed = set()
 held = None
 def frame(payload):
@@ -201,6 +194,10 @@ if role in ("bota-client", "drysua"):
         hello(peer)
     report(connected=True)
 for _ in range(4096):
+    if start_requested and len(ready) == 2:
+        for peer, slot in seats.items():
+            peer.sendall(frame(bytes([3, 1, 1, slot])))
+        start_requested = False
     readers = [control] + [peer for peer in peers if peer not in read_closed] + ([listener] if listener else [])
     readable, _, _ = select.select(readers, [], [], 20)
     if not readable:
@@ -253,6 +250,19 @@ for _ in range(4096):
                 peer.sendall(frame(b"\x01\x02") + frame(b"\x02\x01"))
             elif role == "bota-client" and payload[0] == 7:
                 report(match_over=True)
+            elif role != "bota-server" and payload[0] == 3:
+                report(snapshot=payload.hex())
+                peer.sendall(frame(b"\x03\x01\x00\x00\x00"))
+            elif role == "bota-server" and payload[0] == 3:
+                report(order=payload.hex(), slot=seats[peer])
+            elif role == "bota-server" and payload[0] == 1:
+                assert payload == b"\x01\x02"
+                assert peer in seats
+                selected.add(peer)
+            elif role == "bota-server" and payload[0] == 2:
+                assert payload == b"\x02\x01"
+                assert peer in selected
+                ready.add(peer)
     if control not in readable:
         continue
     command = control.recv(1)
@@ -307,6 +317,8 @@ for _ in range(4096):
         for peer in peers:
             peer.sendall(frame(bytes([7, 0, 1, 2, 0] + [0] * 8 + [1] + [0] * 8)))
         report(terminal=True)
+    elif command == b"g":
+        start_requested = True
     elif command == b"o":
         peers[0].sendall(frame(b"\x03\x01\x00\x00\x00"))
         report(late_order=True)
@@ -315,10 +327,6 @@ else:
 '''
 
 
-NATIVE_BINARY = Path(os.environ.get("PLAY_TEST_REVIEW_BINARY", ROOT / REVIEW / "drysua"))
-NATIVE_WEIGHTS = Path(os.environ.get("PLAY_TEST_REVIEW_WEIGHTS", ROOT / REVIEW / "weights"))
-HISTORICAL_BASELINE = ROOT / "drysua/artifacts/temp/map0-baseline-observationfix-4096"
-HISTORICAL_SERVER_SHA = "24a8efccb285308810678c7e3a8717b57814c9d8fecef386ca923cdb7c04e97c"
 NATIVE_CLIENT = r'''
 import socket, struct, sys
 sys.path.insert(0, sys.argv[5])
@@ -471,12 +479,12 @@ class LauncherTests(unittest.TestCase):
     def record(self, name):
         return json.loads(self.child(name)["stream"].readline(8192))
 
-    def game(self, *arguments):
-        self.launch("--port", "0", *arguments)
+    def game(self, *arguments, **options):
+        self.launch("--port", "0", *arguments, **options)
         self.send("bota-server", b"r")
-        first = json.loads(self.child("bota-server")["stream"].readline(8192))
+        first = self.record("bota-server")
         self.send("bota-server", b"R")
-        self.assertEqual(json.loads(self.child("bota-server")["stream"].readline(8192)), first)
+        self.assertEqual(self.record("bota-server"), first)
         for name in ("bota-client", "drysua"):
             self.assertEqual(self.record(name), {"connected": True})
         for _ in range(2):
@@ -524,26 +532,6 @@ class LauncherTests(unittest.TestCase):
         self.assertIn(b"DISPLAY", error)
         self.assertFalse(list((self.root / "drysua/artifacts/temp").glob("play-*")))
 
-    def test_explicit_teacher_without_weights_preserves_admission_and_cleanup(self):
-        for side, slot in (("radiant", 0), ("dire", 1)):
-            with self.subTest(side=side):
-                self.launch("--no-build", "--port", "0", "--opponent", "teacher",
-                            "--human-side", side, weights=False)
-                self.send("bota-server", b"R")
-                self.assertIn("port", self.record("bota-server"))
-                for name in ("bota-client", "drysua"):
-                    self.assertEqual(self.record(name), {"connected": True})
-                for _ in range(2):
-                    self.assertIn("hello", self.record("bota-server"))
-                self.assertEqual(self.record("bota-client"), {"slot": slot})
-                self.assertEqual(self.record("drysua"), {"slot": 1 - slot})
-                arguments = self.child("drysua")["arguments"]
-                self.assertEqual(arguments[-2:], ["--policy", "teacher"])
-                self.assertNotIn("--weights-directory", arguments)
-                self.send("bota-client", b"0")
-                self.finish(0)
-                self.assert_children_stopped()
-
     def test_help_is_available_without_display(self):
         self.launch("--help", DISPLAY="")
         output, error = self.process.communicate(timeout=5)
@@ -586,6 +574,12 @@ class LauncherTests(unittest.TestCase):
         self.game("--no-build")
         self.assertNotIn("build-bota", self.children)
         self.assertNotIn("build-drysua", self.children)
+        self.send("bota-server", b"g")
+        for name, slot in (("bota-client", 0), ("drysua", 1)):
+            self.assertEqual(self.record(name), {"snapshot": bytes([3, 1, 1, slot]).hex()})
+        orders = [self.record("bota-server") for _ in range(2)]
+        self.assertEqual(sorted(orders, key=lambda record: record["slot"]),
+                         [{"order": "0301000000", "slot": slot} for slot in (0, 1)])
         self.send("bota-server", b"m")
         self.assertEqual(self.record("bota-server"), {"terminal": True})
         self.assertEqual(self.record("bota-client"), {"match_over": True})
@@ -660,43 +654,27 @@ class LauncherTests(unittest.TestCase):
         self.finish(143)
         self.assert_children_stopped()
 
-    def test_build_failure_stops_before_server_and_reports_log(self):
-        self.launch("--build", PLAY_TEST_BUILD="hold")
-        self.send("build-bota", b"7")
-        self.assertIn("build-bota exited", self.finish(1))
-        self.assert_children_stopped()
+    def test_build_failures_stop_before_server_without_fallback(self):
+        for name in ("build-bota", "build-drysua"):
+            with self.subTest(component=name):
+                self.launch("--build", PLAY_TEST_BUILD=name)
+                self.send(name, b"7")
+                self.assertIn(f"{name} exited with status 7", self.finish(1))
+                self.assertNotIn("bota-server", self.children)
+                self.assert_children_stopped()
 
-    def test_current_bot_build_failure_never_starts_server_or_falls_back(self):
-        self.launch("--build", PLAY_TEST_BUILD="build-drysua")
-        self.send("build-drysua", b"7")
-        self.assertIn("build-drysua exited with status 7", self.finish(1))
-        self.assertNotIn("bota-server", self.children)
-        self.assert_children_stopped()
-
-    def test_stderr_banner_does_not_hide_server_startup_failure(self):
-        self.launch("--no-build")
-        self.send("bota-server", b"s")
-        self.assertIn("server", self.finish(1))
-        self.assert_children_stopped()
-
-    def test_oversized_readiness_fails_promptly(self):
-        self.launch("--no-build")
-        self.send("bota-server", b"x")
-        self.assertIn("4096", self.finish(1))
-        self.assert_children_stopped()
-
-    def test_stdout_eof_before_readiness_fails_even_when_server_stays_alive(self):
-        self.launch("--no-build")
-        self.send("bota-server", b"q")
-        self.assertIn("stdout closed before readiness", self.finish(1))
-        self.assert_children_stopped()
+    def test_invalid_readiness_stops_server_and_reports_reason(self):
+        for command, message in ((b"s", "server"),
+                                 (b"x", "4096"), (b"q", "stdout closed before readiness")):
+            with self.subTest(command=command):
+                self.launch("--no-build")
+                self.send("bota-server", command)
+                self.assertIn(message, self.finish(1))
+                self.assert_children_stopped()
 
     def test_runtime_component_crashes_stop_the_match_and_retain_error_logs(self):
         for name in ("bota-client", "drysua", "bota-server"):
             with self.subTest(component=name):
-                if self.process is not None:
-                    self.clean_processes()
-                    self.children.clear()
                 self.game("--no-build")
                 self.send(name, b"7")
                 output = self.finish(1)
@@ -781,18 +759,22 @@ class LauncherTests(unittest.TestCase):
         self.assertIn("verified", self.finish(0))
         self.assert_children_stopped()
 
-    def test_either_side_option_derives_the_opposite_and_both_explicit_sides_work(self):
+    def test_side_options_and_weightless_teacher_preserve_admission_and_cleanup(self):
         for arguments, human_slot in ((("--human-side", "dire"), 1), (("--bot-side", "radiant"), 1),
                                       (("--human-side", "radiant"), 0), (("--bot-side", "dire"), 0),
                                       (("--human-side", "dire", "--bot-side", "radiant"), 1),
-                                      (("--human-side", "radiant", "--bot-side", "dire"), 0)):
+                                      (("--human-side", "radiant", "--bot-side", "dire"), 0),
+                                      (("--human-side", "radiant", "--opponent", "teacher"), 0),
+                                      (("--human-side", "dire", "--opponent", "teacher"), 1)):
             with self.subTest(arguments=arguments):
-                if self.process is not None:
-                    self.clean_processes()
-                    self.children.clear()
-                self.game("--no-build", *arguments)
+                teacher = "teacher" in arguments
+                self.game("--no-build", *arguments, weights=not teacher)
                 self.assertEqual(self.child("bota-client")["slot"], human_slot)
                 self.assertEqual(self.child("drysua")["slot"], 1 - human_slot)
+                if teacher:
+                    bot = self.child("drysua")["arguments"]
+                    self.assertEqual(bot[-2:], ["--policy", "teacher"])
+                    self.assertNotIn("--weights-directory", bot)
                 self.send("bota-client", b"0")
                 self.finish(0)
                 self.assert_children_stopped()
@@ -804,27 +786,21 @@ class LauncherTests(unittest.TestCase):
             self.assertEqual(self.process.returncode, 2)
             self.assertIn(b"must be opposite", error)
 
-    def test_wrong_welcome_slot_fails_and_cleans_both_clients_and_relays(self):
-        self.launch("--no-build", "--port", "0", PLAY_TEST_WRONG_SLOT="1")
-        self.send("bota-server", b"R")
-        self.record("bota-server")
-        for name in ("bota-client", "drysua"):
-            self.child(name)
-        self.assertIn("expected slot 0", self.finish(1))
-        self.assert_children_stopped()
-        self.assert_relay_ports_closed()
-
-    def test_second_welcome_is_also_checked_after_first_slot_is_verified(self):
-        self.launch("--no-build", "--port", "0", PLAY_TEST_WRONG_SECOND_SLOT="0")
-        self.send("bota-server", b"R")
-        self.record("bota-server")
-        for name in ("bota-client", "drysua"):
-            self.child(name)
-        output = self.finish(1)
-        self.assertIn("verified human Radiant: Welcome slot 0", output)
-        self.assertIn("expected slot 1, got 0", output)
-        self.assert_children_stopped()
-        self.assert_relay_ports_closed()
+    def test_either_wrong_welcome_slot_fails_and_cleans_clients_and_relays(self):
+        for slot in (0, 1):
+            with self.subTest(slot=slot):
+                self.launch("--no-build", "--port", "0", PLAY_TEST_WRONG_SLOT="0" if slot else "1",
+                            PLAY_TEST_WRONG_SECOND_SLOT="0")
+                self.send("bota-server", b"R")
+                self.record("bota-server")
+                for name in ("bota-client", "drysua"):
+                    self.child(name)
+                output = self.finish(1)
+                self.assertIn(f"expected slot {slot}, got {1 - slot}", output)
+                if slot:
+                    self.assertIn("verified human Radiant: Welcome slot 0", output)
+                self.assert_children_stopped()
+                self.assert_relay_ports_closed()
 
     def assert_relay_ports_closed(self):
         for name in ("bota-client", "drysua"):
@@ -906,102 +882,6 @@ class LauncherTests(unittest.TestCase):
 
 
 class RuntimeWeightsTests(unittest.TestCase):
-    def test_reward_v7_rejects_frozen_m21_reward5_and_m23_reward6_without_source_change(self):
-        reward6 = MAP2_REWARD_V6_DESCRIPTOR
-        self.assertEqual(self.module.fnv1a(reward6.encode()), 1084583101075978392)
-        reward5 = rust_descriptor("checkpoint_reward_v5", "DESCRIPTOR")
-        self.assertEqual(self.module.fnv1a(reward5.encode()), 10775256611790261869)
-        old = dict(CURRENT_METADATA, feature_schema_hash="7122484902143252742", model_schema_hash="2523644068281870656",
-                   ppo_schema_version="36", ppo_schema_hash="8680285590912502029", ppo_rules_audit_version="31",
-                   map2_reward_schema_version="6", map2_reward_schema_hash="1084583101075978392", map2_reward_schema_descriptor=reward6)
-        original = header_fixture(old)
-        self.path.write_bytes(original)
-        with self.assertRaisesRegex(RuntimeError, "expected exact nine-key F22/M24"):
-            self.module.read_runtime_metadata(self.directory)
-        self.assertEqual(self.path.read_bytes(), original)
-
-    def test_reward_v6_rejects_frozen_m21_reward5_without_source_change(self):
-        descriptor = rust_descriptor("checkpoint_reward_v5", "DESCRIPTOR")
-        self.assertEqual(self.module.fnv1a(descriptor.encode()), 10775256611790261869)
-        old = dict(CURRENT_METADATA, feature_schema_hash="11343334068766071417", model_schema_hash="13521186719558157260",
-                   ppo_schema_version="34", ppo_schema_hash="12153447298094992077", ppo_rules_audit_version="29",
-                   map2_reward_schema_version="5", map2_reward_schema_hash="10775256611790261869", map2_reward_schema_descriptor=descriptor)
-        original = header_fixture(old)
-        self.path.write_bytes(original)
-        with self.assertRaisesRegex(RuntimeError, "expected exact nine-key F22/M24"):
-            self.module.read_runtime_metadata(self.directory)
-        self.assertEqual(self.path.read_bytes(), original)
-
-    def test_reward_v6_rejects_frozen_m20_reward4_without_source_change(self):
-        descriptor = MAP2_REWARD_V3_DESCRIPTOR
-        descriptor = descriptor.replace("drysua-map2-reward/v3;", "drysua-map2-reward/v4;", 1)
-        descriptor = descriptor.replace("terminal_win1_loss-1_draw0_timecap0_distinct_lane_zero_tower_final_retained;",
-            "terminal_win1_loss-1_draw-1_timecap-1_distinct_outcome_labels_lane_zero_tower_final_retained;infrastructure_errors_never_terminal_rewards;", 1)
-        descriptor += "terminal_dominance=win1_minus_nonwin_neg1_minus_negative_dense.7138_minus_positive_dense.255=1.0312_gt0;"
-        self.assertEqual(self.module.fnv1a(descriptor.encode()), 14419233923370975736)
-        old = dict(CURRENT_METADATA, feature_schema_hash="5307034649837880808", model_schema_hash="17593713929660069669",
-            ppo_schema_version="33", ppo_schema_hash="3388911021249010403", ppo_rules_audit_version="28",
-            map2_reward_schema_version="4", map2_reward_schema_hash="14419233923370975736", map2_reward_schema_descriptor=descriptor)
-        original = header_fixture(old)
-        self.path.write_bytes(original)
-        with self.assertRaisesRegex(RuntimeError, "expected exact nine-key F22/M24"):
-            self.module.read_runtime_metadata(self.directory)
-        self.assertEqual(self.path.read_bytes(), original)
-
-    def test_reward_v6_rejects_exact_m19_reward3_without_relabel_or_source_change(self):
-        old = {
-            "action_schema_hash": "10658390830565586343",
-            "feature_schema_hash": "4298252436472980484",
-            "model_schema_hash": "7182549121935768714",
-            "ppo_schema_version": "32", "ppo_schema_hash": "9056229782321552319",
-            "ppo_rules_audit_version": "27", "map2_reward_schema_version": "3",
-            "map2_reward_schema_hash": "11643768462079275437",
-            "map2_reward_schema_descriptor": MAP2_REWARD_V3_DESCRIPTOR,
-        }
-        source = header_fixture(old)
-        self.path.write_bytes(source)
-        with self.assertRaisesRegex(RuntimeError, "expected exact nine-key F22/M24, A5, PPO37/rules32"):
-            self.module.read_runtime_metadata(self.directory)
-        self.assertEqual(self.path.read_bytes(), source)
-
-    def test_reward_v6_rejects_frozen_m18_metadata_without_source_rewrite(self):
-        self.assertEqual(self.module.CURRENT_METADATA["ppo_schema_version"], "37")
-        self.assertEqual(self.module.CURRENT_METADATA["ppo_rules_audit_version"], "32")
-        self.assertEqual(self.module.CURRENT_METADATA["map2_reward_schema_version"], "7")
-        old = {
-            "action_schema_hash": "10658390830565586343",
-            "feature_schema_hash": "17888785275670453418",
-            "model_schema_hash": "3900982062969752096",
-            "ppo_schema_version": "31", "ppo_schema_hash": "15379677344330093698",
-            "ppo_rules_audit_version": "26", "map2_reward_schema_version": "2",
-            "map2_reward_schema_hash": "699687995158557285",
-            "map2_reward_schema_descriptor": rust_descriptor(
-                "progress_debt_initialization", "MAP2_REWARD_V2_DESCRIPTOR"),
-        }
-        source = header_fixture(old)
-        self.path.write_bytes(source)
-        with self.assertRaisesRegex(RuntimeError, "expected exact nine-key F22/M24, A5, PPO37/rules32"):
-            self.module.read_runtime_metadata(self.directory)
-        self.assertEqual(self.path.read_bytes(), source)
-
-    def test_current_reward_requires_f19_m21_and_never_accepts_m17_runtime(self):
-        self.assertEqual(self.module.CURRENT_METADATA["ppo_schema_version"], "37")
-        self.assertEqual(self.module.CURRENT_METADATA["ppo_rules_audit_version"], "32")
-        self.assertEqual(self.module.CURRENT_METADATA["map2_reward_schema_version"], "7")
-        self.assertEqual(self.module.CURRENT_METADATA["map2_reward_schema_hash"], "7274660837025042530")
-        old = dict(zip(("action_schema_hash", "feature_schema_hash", "model_schema_hash",
-                        "ppo_schema_version", "ppo_schema_hash", "ppo_rules_audit_version",
-                        "map2_reward_schema_version", "map2_reward_schema_hash"),
-                       ("10658390830565586343", "1861607613534772372", "13592057279889489276",
-                        "30", "16275284022255703821", "25", "1", "798798703797057220")))
-        old["map2_reward_schema_descriptor"] = rust_descriptor(
-            "bota_rebase_schema", "MAP2_REWARD_V1_DESCRIPTOR")
-        source = header_fixture(old)
-        self.path.write_bytes(source)
-        with self.assertRaisesRegex(RuntimeError, "expected exact nine-key F22/M24, A5, PPO37/rules32"):
-            self.module.read_runtime_metadata(self.directory)
-        self.assertEqual(self.path.read_bytes(), source)
-
     def setUp(self):
         self.module = importlib.import_module("play_weights")
         TEMPORARY.mkdir(parents=True, exist_ok=True)
@@ -1019,21 +899,42 @@ class RuntimeWeightsTests(unittest.TestCase):
         self.assertEqual(actual, metadata)
         self.assertEqual(self.module.CURRENT_METADATA, CURRENT_METADATA)
 
-    def test_old_a4_f14_m16_nine_key_tuple_is_rejected_without_relabelling(self):
-        metadata = dict(metadata_fixture(), action_schema_hash="281345351372519059",
-                        feature_schema_hash="16612223928593971806",
-                        model_schema_hash="16105106472474017042", ppo_schema_version="29",
-                        ppo_schema_hash="6915425029811947603", ppo_rules_audit_version="24",
-                        map2_reward_schema_version="1", map2_reward_schema_hash="798798703797057220",
-                        map2_reward_schema_descriptor=rust_descriptor(
-                            "bota_rebase_schema", "MAP2_REWARD_V1_DESCRIPTOR"))
-        original = header_fixture(metadata)
-        self.path.write_bytes(original)
-
-        with self.assertRaisesRegex(RuntimeError, "expected exact nine-key F22/M24, A5, PPO37/rules32"):
-            self.module.read_runtime_metadata(self.directory)
-
-        self.assertEqual(self.path.read_bytes(), original)
+    def test_historical_nine_key_identities_are_rejected_without_relabelling(self):
+        reward4 = MAP2_REWARD_V3_DESCRIPTOR.replace("drysua-map2-reward/v3;", "drysua-map2-reward/v4;", 1)
+        reward4 = reward4.replace("terminal_win1_loss-1_draw0_timecap0_distinct_lane_zero_tower_final_retained;",
+            "terminal_win1_loss-1_draw-1_timecap-1_distinct_outcome_labels_lane_zero_tower_final_retained;infrastructure_errors_never_terminal_rewards;", 1)
+        reward4 += "terminal_dominance=win1_minus_nonwin_neg1_minus_negative_dense.7138_minus_positive_dense.255=1.0312_gt0;"
+        reward1 = MAP2_REWARD_V1_DESCRIPTOR
+        keys = ("action_schema_hash", "feature_schema_hash", "model_schema_hash", "ppo_schema_version",
+                "ppo_schema_hash", "ppo_rules_audit_version", "map2_reward_schema_version",
+                "map2_reward_schema_hash", "map2_reward_schema_descriptor")
+        identities = (
+            ("M16", "281345351372519059", "16612223928593971806", "16105106472474017042",
+             "29", "6915425029811947603", "24", "1", "798798703797057220", reward1),
+            ("M17", "10658390830565586343", "1861607613534772372", "13592057279889489276",
+             "30", "16275284022255703821", "25", "1", "798798703797057220", reward1),
+            ("M18", "10658390830565586343", "17888785275670453418", "3900982062969752096",
+             "31", "15379677344330093698", "26", "2", "699687995158557285",
+             MAP2_REWARD_V2_DESCRIPTOR),
+            ("M19", "10658390830565586343", "4298252436472980484", "7182549121935768714",
+             "32", "9056229782321552319", "27", "3", "11643768462079275437", MAP2_REWARD_V3_DESCRIPTOR),
+            ("M20", "10658390830565586343", "5307034649837880808", "17593713929660069669",
+             "33", "3388911021249010403", "28", "4", "14419233923370975736", reward4),
+            ("M21", "10658390830565586343", "11343334068766071417", "13521186719558157260",
+             "34", "12153447298094992077", "29", "5", "10775256611790261869",
+             rust_descriptor("checkpoint_reward_v5", "DESCRIPTOR")),
+            ("M23", "10658390830565586343", "7122484902143252742", "2523644068281870656",
+             "36", "8680285590912502029", "31", "6", "1084583101075978392", MAP2_REWARD_V6_DESCRIPTOR),
+        )
+        for model, *values in identities:
+            with self.subTest(model=model):
+                metadata = dict(zip(keys, values, strict=True))
+                self.assertEqual(str(self.module.fnv1a(values[-1].encode())), values[-2])
+                original = header_fixture(metadata)
+                self.path.write_bytes(original)
+                with self.assertRaisesRegex(RuntimeError, "expected exact nine-key F22/M24, A5, PPO37/rules32"):
+                    self.module.read_runtime_metadata(self.directory)
+                self.assertEqual(self.path.read_bytes(), original)
 
     def test_every_metadata_key_is_required_exactly_once_and_string_typed(self):
         metadata = metadata_fixture()
@@ -1135,8 +1036,8 @@ class RuntimeWeightsTests(unittest.TestCase):
         source = (ROOT / "drysua/src/ppo.rs").read_text()
         self.assertIn("pub const PPO_RULES_AUDIT_VERSION: u32 = 32;", source)
         source = (ROOT / "drysua/src/checkpoint.rs").read_text()
-        metadata = source.split("fn runtime_tensor_metadata()", 1)[1].split("\n}", 1)[0]
-        self.assertEqual(set(re.findall(r'"([a-z0-9_]+)"', metadata)), set(metadata_fixture()))
+        metadata = source.split("fn runtime_tensor_metadata(budget: PpoSampleBudget)", 1)[1].split("\n}", 1)[0]
+        self.assertEqual(re.findall(r'"([a-z0-9_]+)"', metadata), sorted(metadata_fixture()))
 
 
 class AdmissionTests(unittest.TestCase):
@@ -1475,42 +1376,6 @@ class TerminalLifecycleTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "client reset before final-frame drain"):
             relay.receive(0)
 
-    def test_normal_server_and_bot_exits_retain_gui_after_final_frame_and_late_order(self):
-        relay, human, server_peer = self.socket_relay()
-        terminal = self.frame(self.MATCH_OVER)
-        relay.endpoints[1].outgoing.extend(self.ORDER)
-        server_peer.sendall(terminal)
-        server_peer.close()
-        with tempfile.TemporaryDirectory(prefix="play-terminal-", dir=TEMPORARY) as temporary:
-            supervisor = self.launcher.Supervisor(Path(temporary))
-            self.addCleanup(supervisor.close)
-            supervisor.admission = SimpleNamespace(pacer=None, relays=[relay], welcomed=True, pump=relay.pump, close=relay.close)
-            server = SimpleNamespace(name="server", exit_status=lambda: 0)
-            bot = SimpleNamespace(name="bot", exit_status=lambda: 0)
-            client = SimpleNamespace(name="client", exit_status=lambda: None)
-            received, turns = bytearray(), 0
-
-            def check_gui():
-                nonlocal turns
-                turns += 1
-                if turns > 16:
-                    raise RuntimeError("GUI results still active")
-                try:
-                    data = human.recv(4096)
-                except BlockingIOError:
-                    return
-                received.extend(data)
-                if not data:
-                    human.sendall(self.ORDER)
-
-            with patch.object(supervisor.selector, "select", return_value=[]), \
-                    patch.object(supervisor, "check_stop", side_effect=check_gui), \
-                    patch.object(self.wire.time, "monotonic", side_effect=lambda: 100 + turns):
-                with self.assertRaisesRegex(RuntimeError, "GUI results still active"):
-                    supervisor.wait_game(server, bot, client)
-            self.assertEqual(received, terminal)
-            self.assertFalse(relay.endpoints[0].eof)
-
     def test_ready_relay_frame_does_not_wait_twice_on_idle_log_selector(self):
         relay, human, server = self.socket_relay()
         human.sendall(self.ORDER)
@@ -1547,6 +1412,13 @@ class SupervisorTests(unittest.TestCase):
         TEMPORARY.mkdir(parents=True, exist_ok=True)
         self.module = importlib.import_module("play_match")
 
+    def supervisor(self):
+        temporary = tempfile.TemporaryDirectory(prefix="play-unit-", dir=TEMPORARY)
+        self.addCleanup(temporary.cleanup)
+        supervisor = self.module.Supervisor(Path(temporary.name))
+        self.addCleanup(supervisor.close)
+        return supervisor
+
     def test_replay_limit_matches_bounded_local_budget(self):
         self.assertEqual(self.module.REPLAY_LIMIT, 2 * 1024**3)
 
@@ -1580,88 +1452,47 @@ class SupervisorTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "4096"):
             parse(b"x" * 4097, 0)
 
-    def test_successful_server_and_bot_exits_do_not_end_runtime_loop(self):
-        with tempfile.TemporaryDirectory(prefix="play-unit-", dir=TEMPORARY) as temporary:
-            supervisor = self.module.Supervisor(Path(temporary))
-            server = SimpleNamespace(name="server", exit_status=lambda: 0)
-            client = SimpleNamespace(name="client", exit_status=lambda: None)
-            bot = SimpleNamespace(name="bot", exit_status=lambda: 0)
-            supervisor.admission = SimpleNamespace(relays=[], welcomed=True, close=lambda: None)
-            try:
-                with patch.object(supervisor, "pump", side_effect=[None, RuntimeError("GUI still active")]):
-                    with self.assertRaisesRegex(RuntimeError, "GUI still active"):
-                        supervisor.wait_game(server, bot, client)
-            finally:
-                supervisor.close()
+    def test_signal_during_spawn_is_recorded_and_cleanup_stops_registered_child(self):
+        supervisor = self.supervisor()
+        original = subprocess.Popen
 
-    def test_signal_during_spawn_is_recorded_and_global_failure_still_cleans_child(self):
-        with tempfile.TemporaryDirectory(prefix="play-unit-", dir=TEMPORARY) as temporary:
-            supervisor = self.module.Supervisor(Path(temporary))
-            original = subprocess.Popen
+        def interrupted_spawn(*arguments, **keywords):
+            process = original(*arguments, **keywords)
+            supervisor.request_stop(signal.SIGINT, None)
+            return process
 
-            def interrupted_spawn(*arguments, **keywords):
-                process = original(*arguments, **keywords)
-                supervisor.request_stop(signal.SIGINT, None)
-                return process
-
-            try:
-                with patch.object(self.module.subprocess, "Popen", side_effect=interrupted_spawn):
-                    child = supervisor.spawn("build-bota", [sys.executable, "-c",
-                                             "import signal; signal.pause()"], ROOT)
-                self.assertEqual(supervisor.stop_status, 130)
-                self.assertEqual(len(supervisor.children), 1)
-                raise RuntimeError("injected supervisor failure")
-            except RuntimeError as error:
-                self.assertEqual(str(error), "injected supervisor failure")
-            finally:
-                supervisor.close()
-            self.assertIsNotNone(child.process.returncode)
+        with patch.object(self.module.subprocess, "Popen", side_effect=interrupted_spawn):
+            child = supervisor.spawn("build-bota", [sys.executable, "-c",
+                                     "import signal; signal.pause()"], ROOT)
+        self.assertEqual(supervisor.stop_status, 130)
+        self.assertEqual(len(supervisor.children), 1)
+        self.doCleanups()
+        self.assertIsNotNone(child.process.returncode)
 
     def test_readiness_deadline_uses_monotonic_time_without_sleep(self):
-        with tempfile.TemporaryDirectory(prefix="play-unit-", dir=TEMPORARY) as temporary:
-            supervisor = self.module.Supervisor(Path(temporary))
-            try:
-                child = supervisor.spawn("server", [sys.executable, "-c",
-                                         "import signal; signal.pause()"], ROOT)
-                with patch.object(self.module.time, "monotonic", side_effect=[100, 111]):
-                    with self.assertRaisesRegex(RuntimeError, "readiness.*10"):
-                        supervisor.wait_ready(child, 0)
-            finally:
-                supervisor.close()
+        supervisor = self.supervisor()
+        child = supervisor.spawn("server", [sys.executable, "-c", "import signal; signal.pause()"], ROOT)
+        with patch.object(self.module.time, "monotonic", side_effect=[100, 111]):
+            with self.assertRaisesRegex(RuntimeError, "readiness.*10"):
+                supervisor.wait_ready(child, 0)
 
-    def test_fragmented_client_error_is_detected_across_more_than_two_reads(self):
-        with tempfile.TemporaryDirectory(prefix="play-unit-", dir=TEMPORARY) as temporary:
-            supervisor = self.module.Supervisor(Path(temporary))
-            try:
-                child = supervisor.spawn("client", [sys.executable, "-c",
-                                         "import signal; signal.pause()"], ROOT)
+    def test_fragmented_and_final_drain_errors_cannot_become_success(self):
+        cases = ((False, [b"bota-", b"cli", b"ent: failure"], 128, "bota-client reported an error"),
+                 (True, [b"bota-client: late failure"], 128, "bota-client reported an error"),
+                 (True, [b"x" * 65], 64, "log limit"))
+        for final, chunks, limit, message in cases:
+            with self.subTest(final=final, message=message):
+                supervisor = self.supervisor()
+                child = supervisor.spawn("client", [sys.executable, "-c", "import signal; signal.pause()"], ROOT)
                 key = SimpleNamespace(fileobj=child.process.stderr, data=(child, False))
                 with patch.object(supervisor.selector, "select", return_value=[(key, 1)]), \
-                        patch.object(self.module.os, "read", side_effect=[b"bota-", b"cli", b"ent: failure"]):
-                    supervisor.pump(0)
-                    supervisor.pump(0)
-                    with self.assertRaisesRegex(RuntimeError, "bota-client reported an error"):
-                        supervisor.pump(0)
-            finally:
-                supervisor.close()
-
-    def test_final_drain_reports_errors_instead_of_turning_late_failures_into_success(self):
-        for data, limit, message in ((b"bota-client: late failure", 128, "bota-client"),
-                                     (b"x" * 65, 64, "log limit")):
-            with self.subTest(message=message), \
-                    tempfile.TemporaryDirectory(prefix="play-unit-", dir=TEMPORARY) as temporary:
-                supervisor = self.module.Supervisor(Path(temporary))
-                try:
-                    child = supervisor.spawn("client", [sys.executable, "-c",
-                                             "import signal; signal.pause()"], ROOT)
-                    key = SimpleNamespace(fileobj=child.process.stderr, data=(child, False))
-                    with patch.object(supervisor.selector, "select", return_value=[(key, 1)]), \
-                            patch.object(self.module.os, "read", return_value=data), \
-                            patch.object(self.module, "LOG_LIMIT", limit):
-                        with self.assertRaisesRegex(RuntimeError, message):
-                            supervisor.pump(0, final=True)
-                finally:
-                    supervisor.close()
+                        patch.object(self.module.os, "read", side_effect=chunks), \
+                        patch.object(self.module, "LOG_LIMIT", limit):
+                    for _ in chunks[:-1]:
+                        supervisor.pump(0, final=final)
+                    with self.assertRaisesRegex(RuntimeError, message):
+                        supervisor.pump(0, final=final)
+                self.doCleanups()
 
     def test_main_global_failure_cleans_child_with_inherited_sigchld_ignore(self):
         children = []
@@ -1709,55 +1540,6 @@ class SupervisorTests(unittest.TestCase):
                 supervisor.close()
             self.assertIn(server.process.returncode, (-signal.SIGTERM, -signal.SIGKILL))
 
-    def test_native_neural_review_and_player_verify_both_sides_in_realtime_and_lockstep(self):
-        server = self.historical_server()
-        if not NATIVE_BINARY.is_file() or not (NATIVE_WEIGHTS / "drysua.weights.safetensors").is_file():
-            self.skipTest("historical smoke needs frozen review bot and weights; never builds")
-        self.assertEqual(self.module.artifact_digest(NATIVE_BINARY), BINARY_SHA)
-        self.assertEqual(self.module.artifact_digest(NATIVE_WEIGHTS / "drysua.weights.safetensors"), WEIGHTS_SHA)
-        for mode, limit in ((0, 30), (1, 1000)):
-            for human_slot in (0, 1):
-                with self.subTest(mode=mode, human_slot=human_slot):
-                    self.native_match(mode, limit, human_slot, server, NATIVE_BINARY, "neural", 0, NATIVE_WEIGHTS)
-
-    def historical_server(self):
-        manifest = HISTORICAL_BASELINE / "baseline.json"
-        if not manifest.is_file() or manifest.is_symlink() or manifest.stat().st_size > 65536:
-            self.skipTest("historical smoke needs bounded pinned baseline.json; root server is never a fallback")
-        try:
-            with manifest.open("rb") as stream:
-                contents = stream.read(65537)
-            if len(contents) > 65536:
-                raise ValueError("baseline.json exceeds 64 KiB")
-            data = json.loads(contents)
-            if not isinstance(data, dict) or not isinstance(data.get("simulator"), dict):
-                raise ValueError("baseline.json lacks simulator object")
-        except (ValueError, OSError) as error:
-            self.skipTest(f"invalid historical baseline.json: {error}; root server is never a fallback")
-        simulator = data.get("simulator", {})
-        if (simulator.get("path") != "runtime/bota-server"
-                or simulator.get("sha256") != HISTORICAL_SERVER_SHA
-                or simulator.get("commit") != "18db0f62d9a2b94e755c43fd29a959db204cc20b"):
-            self.skipTest("historical server manifest pin mismatch; root server is never a fallback")
-        server = HISTORICAL_BASELINE / simulator["path"]
-        try:
-            digest = self.module.artifact_digest(server)
-        except RuntimeError as error:
-            self.skipTest(f"historical server unavailable: {error}; root server is never a fallback")
-        if digest != HISTORICAL_SERVER_SHA or not os.access(server, os.X_OK):
-            self.skipTest("historical server SHA/executable mismatch; root server is never a fallback")
-        return server
-
-    def test_historical_smoke_never_accepts_a_manifest_redirect_to_current_root_server(self):
-        with tempfile.TemporaryDirectory(prefix="play-archive-", dir=TEMPORARY) as temporary:
-            manifest = {"simulator": {"path": str(ROOT / "bota/target/release/bota-server"),
-                                     "sha256": HISTORICAL_SERVER_SHA,
-                                     "commit": "18db0f62d9a2b94e755c43fd29a959db204cc20b"}}
-            (Path(temporary) / "baseline.json").write_text(json.dumps(manifest))
-            with patch.dict(globals(), HISTORICAL_BASELINE=Path(temporary)):
-                with self.assertRaisesRegex(unittest.SkipTest, "root server is never a fallback"):
-                    self.historical_server()
-
     def test_current_native_map2_teacher_protocol_with_explicit_build_attestation(self):
         # An existing target path alone does not establish that the concurrent rebase build finished.
         bot = ROOT / "drysua/target/release/drysua"
@@ -1776,8 +1558,8 @@ class SupervisorTests(unittest.TestCase):
                 with self.subTest(mode=mode, human_slot=human_slot):
                     self.native_match(mode, limit, human_slot, server, bot, "teacher", 2)
 
-    def native_match(self, mode, limit, human_slot, server_binary, bot_binary, policy, map_id, weights=None):
-        with tempfile.TemporaryDirectory(prefix="play-native-review-", dir=TEMPORARY) as temporary:
+    def native_match(self, mode, limit, human_slot, server_binary, bot_binary, policy, map_id):
+        with tempfile.TemporaryDirectory(prefix="play-native-map2-", dir=TEMPORARY) as temporary:
             supervisor = self.module.Supervisor(Path(temporary))
             children, statuses, failure = [], None, None
             previous = {}
@@ -1795,8 +1577,6 @@ class SupervisorTests(unittest.TestCase):
                 supervisor.admission = admission
                 command = [str(bot_binary), "--addr", admission.addresses["bot"],
                            "--name", "drysua", "--policy", policy, "--limit", str(limit)]
-                if weights is not None:
-                    command += ["--weights-directory", str(weights)]
                 children.append(supervisor.spawn("bot", command, ROOT))
                 children.append(supervisor.spawn("client", [sys.executable, "-B", "-c", NATIVE_CLIENT,
                                                 admission.addresses["human"], str(human_slot), str(mode), str(limit),

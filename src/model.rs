@@ -15,9 +15,6 @@ mod host_folding;
 #[cfg(all(test, feature = "builtin"))]
 pub(crate) use host_folding::resolved_host_math_workers;
 
-#[cfg(feature = "builtin")]
-mod continue_sampling;
-
 #[cfg(test)]
 #[path = "tests/model_test_support.rs"]
 mod test_support;
@@ -1629,18 +1626,7 @@ impl PolicyModel {
     ) -> Result<Vec<BatchSelection>, ModelError> {
         let state = self.forward_frames(frames)?;
         let base = self.sampling_base_logits(&state)?;
-        let rows = initialize_sampling_rows(&base, action_spaces, &mut rngs)?;
-        self.finish_selection_stages_locked(state, base, rows, action_spaces, rngs)
-    }
-
-    fn finish_selection_stages_locked(
-        &self,
-        state: ForwardState,
-        base: SamplingBaseLogits,
-        mut rows: Vec<SamplingRow>,
-        action_spaces: &[ActionSpace],
-        mut rngs: Option<&mut [PpoRng]>,
-    ) -> Result<Vec<BatchSelection>, ModelError> {
+        let mut rows = initialize_sampling_rows(&base, action_spaces, &mut rngs)?;
         let kind = self.sampling_kind_logits(&state, &sampling_prefixes(&rows))?;
         select_sampling_units(&mut rows, &kind, action_spaces, &mut rngs)?;
         let unit = self.sampling_unit_logits(&state, &sampling_prefixes(&rows))?;
@@ -4116,41 +4102,21 @@ fn stage_units(frames: &[FeatureFrame]) -> StagedUnits {
 }
 
 fn stage_own_units(frames: &[FeatureFrame]) -> (Vec<f32>, Vec<f32>) {
-    let mut values = Vec::with_capacity(frames.len() * OWN_UNIT_FEATURE_TOKENS * UNIT_FEATURES);
-    let mut mask = Vec::with_capacity(frames.len() * OWN_UNIT_FEATURE_TOKENS);
-    for frame in frames {
-        append_present_rows(
-            &mut values,
-            &mut mask,
-            &frame.own_units,
-            unit_feature::TOKEN_PRESENT,
-        );
-    }
-    condition_rows(
-        &mut values,
-        UNIT_FEATURES,
+    stage_present_rows(
+        frames,
+        |frame| &frame.own_units,
+        unit_feature::TOKEN_PRESENT,
         &[(unit_feature::KIND_TOKEN, 12.0)],
         None,
-    );
-    assert_eq!(
-        values.len(),
-        frames.len() * OWN_UNIT_FEATURE_TOKENS * UNIT_FEATURES
-    );
-    assert_eq!(mask.len(), frames.len() * OWN_UNIT_FEATURE_TOKENS);
-    (values, mask)
+    )
 }
 
 fn stage_tokens(frames: &[FeatureFrame], field: TokenField) -> (Vec<f32>, Vec<f32>) {
-    let (tokens, features, presence) = field.shape();
-    let mut values = Vec::with_capacity(frames.len() * tokens * features);
-    let mut mask = Vec::with_capacity(frames.len() * tokens);
-    for frame in frames {
-        append_token_field(&mut values, &mut mask, frame, &field, presence);
-    }
     match field {
-        TokenField::Ability => condition_rows(
-            &mut values,
-            features,
+        TokenField::Ability => stage_present_rows(
+            frames,
+            |frame| &frame.abilities,
+            ability_feature::TOKEN_PRESENT,
             &[
                 (ability_feature::BODY_TOKEN, 2.0),
                 (ability_feature::SEMANTIC_SLOT_TOKEN, 8.0),
@@ -4158,9 +4124,10 @@ fn stage_tokens(frames: &[FeatureFrame], field: TokenField) -> (Vec<f32>, Vec<f3
             ],
             Some((ability_feature::ID_TOKEN, 65_547.0)),
         ),
-        TokenField::Item => condition_rows(
-            &mut values,
-            features,
+        TokenField::Item => stage_present_rows(
+            frames,
+            |frame| &frame.items,
+            item_feature::TOKEN_PRESENT,
             &[
                 (item_feature::LOCATION_TOKEN, 5.0),
                 (item_feature::SLOT_TOKEN, 64.0),
@@ -4169,9 +4136,10 @@ fn stage_tokens(frames: &[FeatureFrame], field: TokenField) -> (Vec<f32>, Vec<f3
             ],
             Some((item_feature::ITEM_TOKEN, 65_536.0)),
         ),
-        TokenField::Point => condition_rows(
-            &mut values,
-            features,
+        TokenField::Point => stage_present_rows(
+            frames,
+            |frame| &frame.points,
+            point_feature::TOKEN_PRESENT,
             &[
                 (point_feature::SOURCE_TOKEN, 8.0),
                 (point_feature::SOURCE_DIRECTION_TOKEN, 8.0),
@@ -4179,21 +4147,38 @@ fn stage_tokens(frames: &[FeatureFrame], field: TokenField) -> (Vec<f32>, Vec<f3
             ],
             None,
         ),
-        TokenField::Projectile => condition_rows(
-            &mut values,
-            features,
+        TokenField::Projectile => stage_present_rows(
+            frames,
+            |frame| &frame.projectiles,
+            projectile_feature::TOKEN_PRESENT,
             &[],
             Some((projectile_feature::ABILITY_TOKEN, 65_547.0)),
         ),
-        TokenField::Loot => condition_rows(
-            &mut values,
-            features,
+        TokenField::Loot => stage_present_rows(
+            frames,
+            |frame| &frame.loot,
+            loot_feature::TOKEN_PRESENT,
             &[],
             Some((loot_feature::ITEM_TOKEN, 65_536.0)),
         ),
     }
-    assert_eq!(values.len(), frames.len() * tokens * features);
-    assert_eq!(mask.len(), frames.len() * tokens);
+}
+
+fn stage_present_rows<const TOKENS: usize, const FEATURES: usize>(
+    frames: &[FeatureFrame],
+    rows: impl Fn(&FeatureFrame) -> &[[f32; FEATURES]; TOKENS],
+    presence: usize,
+    categories: &[(usize, f32)],
+    semantic_id: Option<(usize, f32)>,
+) -> (Vec<f32>, Vec<f32>) {
+    let mut values = Vec::with_capacity(frames.len() * TOKENS * FEATURES);
+    let mut mask = Vec::with_capacity(frames.len() * TOKENS);
+    for frame in frames {
+        append_present_rows(&mut values, &mut mask, rows(frame), presence);
+    }
+    condition_rows(&mut values, FEATURES, categories, semantic_id);
+    assert_eq!(values.len(), frames.len() * TOKENS * FEATURES);
+    assert_eq!(mask.len(), frames.len() * TOKENS);
     (values, mask)
 }
 
@@ -4333,38 +4318,6 @@ enum TokenField {
     Loot,
 }
 
-impl TokenField {
-    const fn shape(&self) -> (usize, usize, usize) {
-        match self {
-            Self::Ability => (
-                ABILITY_FEATURE_TOKENS,
-                ABILITY_FEATURES,
-                ability_feature::TOKEN_PRESENT,
-            ),
-            Self::Item => (
-                ITEM_FEATURE_TOKENS,
-                ITEM_FEATURES,
-                item_feature::TOKEN_PRESENT,
-            ),
-            Self::Point => (
-                POINT_FEATURE_TOKENS,
-                POINT_FEATURES,
-                point_feature::TOKEN_PRESENT,
-            ),
-            Self::Projectile => (
-                PROJECTILE_FEATURE_TOKENS,
-                PROJECTILE_FEATURES,
-                projectile_feature::TOKEN_PRESENT,
-            ),
-            Self::Loot => (
-                LOOT_FEATURE_TOKENS,
-                LOOT_FEATURES,
-                loot_feature::TOKEN_PRESENT,
-            ),
-        }
-    }
-}
-
 fn encode_tokens(
     encoder: &Mlp,
     rows: &Tensor,
@@ -4384,22 +4337,6 @@ fn encode_tokens(
         TOKEN_EMBEDDING,
     )?;
     Ok(TokenEncoding { pooled, encoded })
-}
-
-fn append_token_field(
-    values: &mut Vec<f32>,
-    mask: &mut Vec<f32>,
-    frame: &FeatureFrame,
-    field: &TokenField,
-    presence: usize,
-) {
-    match field {
-        TokenField::Ability => append_present_rows(values, mask, &frame.abilities, presence),
-        TokenField::Item => append_present_rows(values, mask, &frame.items, presence),
-        TokenField::Point => append_present_rows(values, mask, &frame.points, presence),
-        TokenField::Projectile => append_present_rows(values, mask, &frame.projectiles, presence),
-        TokenField::Loot => append_present_rows(values, mask, &frame.loot, presence),
-    }
 }
 
 fn append_present_rows<const TOKENS: usize, const FEATURES: usize>(

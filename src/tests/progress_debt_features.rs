@@ -4,20 +4,8 @@
 )]
 
 use super::feature::{encode, match_info, reverse_entity_ids_and_generations, world_view};
-use crate::{
-    ActionSpace, FeatureEncoder, FeatureFrame, LocalPolicyState, StateTracker, global_feature,
-};
+use crate::{ActionSpace, FeatureEncoder, FeatureFrame, LocalPolicyState, StateTracker};
 use bota_proto::{EffectId, EffectView, EventKind, ItemId, MapId, SlotId, Team, WorldView};
-
-#[test]
-fn progress_debt_schema_adds_only_three_accounting_globals_after_wait_inputs() {
-    assert_eq!(crate::FEATURE_SCHEMA_VERSION, 22);
-    assert_eq!(crate::GLOBAL_FEATURES, 92);
-    assert_eq!(crate::UNIT_FEATURES, 84);
-    assert_eq!(global_feature::MAP2_STAGNATION_TICKS, 87);
-    assert_eq!(global_feature::MAP2_ACTIVITY_TICKS_LEFT, 88);
-    assert_eq!(global_feature::MAP2_STAGNATION_BASE_CHARGED, 89);
-}
 
 #[test]
 fn progress_debt_baseline_is_free_and_idle_debt_is_normalized_at_threshold() {

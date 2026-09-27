@@ -4,23 +4,11 @@ import socket
 import struct
 import unittest
 
-from play_admission import Admission, Endpoint, SeatRelay
+from play_admission import Admission
 from play_match import parse_arguments, transport_arguments
 from play_pacing import PacedClock, PERIOD, STALL_TIMEOUT, ack_tick
-
-
-def integer(value):
-    output = bytearray()
-    for _ in range(5):
-        output.append((value & 127) | (128 if value > 127 else 0))
-        value >>= 7
-        if not value:
-            return bytes(output)
-    raise ValueError("fixture integer exceeds u32")
-
-
-def frame(payload):
-    return struct.pack("<I", len(payload)) + payload
+from test_play_reward import relay_fixture
+from test_release_wire import frame, integer
 
 
 class FakeClock:
@@ -42,6 +30,12 @@ class PacingTests(unittest.TestCase):
         for slot in (0, 1):
             self.pacer.observe_server(slot, b"\x03" + integer(tick))
             self.pacer.observe_server(slot, b"\x04" + integer(tick) + b"\x00")
+
+    def paced_relay(self, slot=0, role="human"):
+        self.observe_tick(1)
+        relay, pairs = relay_fixture(self, slot, role, mode=1, pacer=self.pacer)
+        relay.hello = relay.welcomed = True
+        return relay, pairs
 
     def test_both_original_acks_share_one_30hz_deadline(self):
         anchor = self.clock.now
@@ -106,30 +100,21 @@ class PacingTests(unittest.TestCase):
     def test_coalesced_orders_and_ack_remain_fifo_with_no_extra_ack(self):
         for slot, role in ((0, "human"), (1, "bot")):
             self.setUp()
-            self.observe_tick(1)
-            relay = SeatRelay(1, slot, role, 1, pacer=self.pacer)
-            pairs = [socket.socketpair(), socket.socketpair()]
-            relay.endpoints = [Endpoint(pair[0]) for pair in pairs]
-            relay.hello = relay.welcomed = True
+            relay, _ = self.paced_relay(slot, role)
             before = frame(b"\x03\x01\x00\x00")
             ack = frame(b"\x04\x01")
             after = frame(b"\x03\x02\x00\x00")
-            try:
-                self.clock.now = self.pacer.due - PERIOD / 2
-                for fragment in ((before + ack + after)[:3], (before + ack + after)[3:]):
-                    relay.endpoints[0].incoming.extend(fragment)
-                    relay.forward_frames(0)
-                self.assertEqual(bytes(relay.endpoints[1].outgoing), before)
-                self.assertEqual(bytes(relay.endpoints[0].incoming), ack + after)
-                self.clock.now = self.pacer.due
+            self.clock.now = self.pacer.due - PERIOD / 2
+            for fragment in ((before + ack + after)[:3], (before + ack + after)[3:]):
+                relay.endpoints[0].incoming.extend(fragment)
                 relay.forward_frames(0)
-                self.assertEqual(bytes(relay.endpoints[1].outgoing), before + ack + after)
-                self.assertEqual(bytes(relay.endpoints[0].incoming), b"")
-                self.assertEqual(relay.endpoints[0].frames, 3)
-            finally:
-                relay.close()
-                for pair in pairs:
-                    pair[1].close()
+            self.assertEqual(bytes(relay.endpoints[1].outgoing), before)
+            self.assertEqual(bytes(relay.endpoints[0].incoming), ack + after)
+            self.clock.now = self.pacer.due
+            relay.forward_frames(0)
+            self.assertEqual(bytes(relay.endpoints[1].outgoing), before + ack + after)
+            self.assertEqual(bytes(relay.endpoints[0].incoming), b"")
+            self.assertEqual(relay.endpoints[0].frames, 3)
 
     def test_only_reward_report_uses_paced_native_lockstep(self):
         for opponent in ("neural", "teacher"):
@@ -142,47 +127,29 @@ class PacingTests(unittest.TestCase):
             Admission(1, "radiant", paced=True)
 
     def test_held_ack_with_many_later_orders_drains_in_bounded_fifo_batches(self):
-        self.observe_tick(1)
-        relay = SeatRelay(1, 0, "human", 1, pacer=self.pacer)
-        pairs = [socket.socketpair(), socket.socketpair()]
-        relay.endpoints = [Endpoint(pair[0]) for pair in pairs]
-        relay.hello = relay.welcomed = True
+        relay, _ = self.paced_relay()
         wire = frame(b"\x04\x01") + frame(b"\x03\x01\x00\x00") * 14000
-        try:
-            relay.endpoints[0].incoming.extend(wire)
-            self.assertFalse(relay.forward_frames(0))
-            self.clock.now = self.pacer.due
-            for _ in range(3):
-                relay.forward_frames(0)
-            self.assertEqual(bytes(relay.endpoints[1].outgoing), wire)
-            self.assertEqual(relay.endpoints[0].frames, 14001)
-            self.assertEqual(relay.endpoints[0].incoming, b"")
-        finally:
-            relay.close()
-            for pair in pairs:
-                pair[1].close()
+        relay.endpoints[0].incoming.extend(wire)
+        self.assertFalse(relay.forward_frames(0))
+        self.clock.now = self.pacer.due
+        for _ in range(3):
+            relay.forward_frames(0)
+        self.assertEqual(bytes(relay.endpoints[1].outgoing), wire)
+        self.assertEqual(relay.endpoints[0].frames, 14001)
+        self.assertEqual(relay.endpoints[0].incoming, b"")
 
     def test_complete_ack_held_at_client_eof_is_not_mislabelled_truncated(self):
-        self.observe_tick(1)
-        relay = SeatRelay(1, 0, "human", 1, pacer=self.pacer)
-        pairs = [socket.socketpair(), socket.socketpair()]
-        relay.endpoints = [Endpoint(pair[0]) for pair in pairs]
-        relay.hello = relay.welcomed = True
+        relay, pairs = self.paced_relay()
         wire = frame(b"\x04\x01") + frame(b"\x03\x01\x00\x00")
-        try:
-            relay.endpoints[0].incoming.extend(wire)
-            pairs[0][1].shutdown(socket.SHUT_WR)
-            relay.receive(0)
-            self.assertTrue(relay.endpoints[0].eof)
-            self.assertEqual(bytes(relay.endpoints[0].incoming), wire)
-            self.clock.now = self.pacer.due
-            relay.forward_frames(0)
-            self.assertEqual(bytes(relay.endpoints[1].outgoing), wire)
-            self.assertFalse(relay.endpoints[1].write_closed)
-        finally:
-            relay.close()
-            for pair in pairs:
-                pair[1].close()
+        relay.endpoints[0].incoming.extend(wire)
+        pairs[0][1].shutdown(socket.SHUT_WR)
+        relay.receive(0)
+        self.assertTrue(relay.endpoints[0].eof)
+        self.assertEqual(bytes(relay.endpoints[0].incoming), wire)
+        self.clock.now = self.pacer.due
+        relay.forward_frames(0)
+        self.assertEqual(bytes(relay.endpoints[1].outgoing), wire)
+        self.assertFalse(relay.endpoints[1].write_closed)
 
     def test_poll_timeout_uses_due_time_without_spinning_on_late_client(self):
         self.observe_tick(1)
@@ -192,28 +159,19 @@ class PacingTests(unittest.TestCase):
         self.assertEqual(self.pacer.wait_timeout(0.01), 0.01)
 
     def test_pump_releases_due_ack_without_new_socket_read_and_rejects_truncated_eof(self):
-        self.observe_tick(1)
-        relay = SeatRelay(1, 0, "human", 1, pacer=self.pacer)
-        pairs = [socket.socketpair(), socket.socketpair()]
-        relay.endpoints = [Endpoint(pair[0]) for pair in pairs]
-        relay.hello = relay.welcomed = True
+        relay, pairs = self.paced_relay()
         wire = frame(b"\x04\x01")
-        try:
-            relay.endpoints[0].incoming.extend(wire)
-            self.assertFalse(relay.pump())
-            self.clock.now = self.pacer.due
-            self.assertTrue(relay.pump())
-            self.assertEqual(relay.endpoints[1].outgoing, b"")
-            pairs[1][1].setblocking(False)
-            self.assertEqual(pairs[1][1].recv(64), wire)
-            relay.endpoints[0].incoming.extend(struct.pack("<I", 6) + b"\x04")
-            relay.endpoints[0].eof = True
-            with self.assertRaisesRegex(ValueError, "truncated relay frame at EOF"):
-                relay.forward_frames(0)
-        finally:
-            relay.close()
-            for pair in pairs:
-                pair[1].close()
+        relay.endpoints[0].incoming.extend(wire)
+        self.assertFalse(relay.pump())
+        self.clock.now = self.pacer.due
+        self.assertTrue(relay.pump())
+        self.assertEqual(relay.endpoints[1].outgoing, b"")
+        pairs[1][1].setblocking(False)
+        self.assertEqual(pairs[1][1].recv(64), wire)
+        relay.endpoints[0].incoming.extend(struct.pack("<I", 6) + b"\x04")
+        relay.endpoints[0].eof = True
+        with self.assertRaisesRegex(ValueError, "truncated relay frame at EOF"):
+            relay.forward_frames(0)
 
     def test_both_human_sides_share_clock_and_keep_original_admission_roles(self):
         for side in ("radiant", "dire"):

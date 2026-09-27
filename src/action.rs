@@ -1648,11 +1648,8 @@ fn nearest_landing_cell(passability: &StaticPassability, center: Vec2, team: Tea
     let end_x = center_x
         .saturating_add(LANDING_SEARCH_CELLS)
         .min(passability.axis - 1);
-    // Direct grid scan with the same window, order, and `(distance, canonical
-    // cell index)` tie-break as `nearest_landing_cell_reference`. Cell raw
-    // coordinates and their squared distances from the center advance
-    // incrementally, so no `Vec2` is rebuilt and no coordinate is divided per
-    // cell; the winning cell is canonicalized once at the end.
+    // Incremental coordinates avoid rebuilding/dividing each cell while preserving
+    // the `(distance, canonical cell index)` tie-break. Canonicalize only the winner.
     let step = i64::from(TERRAIN_CELL_SIZE) << Fixed::FRAC_BITS;
     let half = i64::from(TERRAIN_CELL_SIZE / 2) << Fixed::FRAC_BITS;
     // A Dire canonical cell position is the mirrored cell center minus one raw

@@ -6,16 +6,3 @@ impl RaggedFeatureHeader {
         self.units.offset = u32::MAX;
     }
 }
-
-impl RaggedFeatureArena {
-    #[cfg(test)]
-    pub(crate) fn stored_rows(&self) -> usize {
-        self.units.len()
-            + self.remembered_units.len()
-            + self.points.len()
-            + self.abilities.len()
-            + self.items.len()
-            + self.projectiles.len()
-            + self.loot.len()
-    }
-}

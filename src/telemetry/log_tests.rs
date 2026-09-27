@@ -27,54 +27,60 @@ impl Write for GatedWriter {
 }
 
 #[test]
-fn blocked_sink_has_a_fixed_queue_and_overflow_drops_without_blocking_producer() {
-    let (entered, waiting) = mpsc::sync_channel(1);
-    let (release, gate) = mpsc::sync_channel(1);
-    let writes = Arc::new(AtomicUsize::new(0));
-    let (publisher, worker) = spawn_log_writer(GatedWriter {
-        entered,
-        release: Some(gate),
-        writes: writes.clone(),
-    })
-    .unwrap();
-    let mut output = publisher.writer();
-    writeln!(output, "first").unwrap();
-    waiting.recv().unwrap();
-    for _ in 0..LOG_QUEUE_CAPACITY {
-        writeln!(output, "queued").unwrap();
+fn blocked_sink_bounds_queue_loss_and_final_flush_without_blocking_producer() {
+    for queued in [0, LOG_QUEUE_CAPACITY] {
+        let (entered, waiting) = mpsc::sync_channel(1);
+        let (release, gate) = mpsc::sync_channel(1);
+        let writes = Arc::new(AtomicUsize::new(0));
+        let (publisher, worker) = spawn_log_writer(GatedWriter {
+            entered,
+            release: Some(gate),
+            writes: writes.clone(),
+        })
+        .unwrap();
+        let mut output = publisher.writer();
+        writeln!(output, "first").unwrap();
+        waiting.recv().unwrap();
+        for _ in 0..queued {
+            writeln!(output, "queued").unwrap();
+        }
+        if queued != 0 {
+            writeln!(output, "dropped").unwrap();
+        }
+        assert_eq!(publisher.dropped(), u64::from(queued != 0));
+        let error = publisher.flush(Duration::ZERO).unwrap_err();
+        let (kind, message) = if queued == 0 {
+            (
+                io::ErrorKind::TimedOut,
+                "performance log drain deadline exceeded",
+            )
+        } else {
+            (io::ErrorKind::WouldBlock, "performance log queue is full")
+        };
+        assert_eq!(error.kind(), kind);
+        assert_eq!(error.to_string(), message);
+        if queued != 0 {
+            publisher.dropped.store(u64::MAX, Ordering::Relaxed);
+            writeln!(output, "also dropped").unwrap();
+            assert_eq!(publisher.dropped(), u64::MAX);
+        }
+        release.send(()).unwrap();
+        drop(output);
+        drop(publisher);
+        worker.join().unwrap();
+        assert_eq!(writes.load(Ordering::Relaxed), queued + 1);
     }
-    writeln!(output, "dropped").unwrap();
-    assert_eq!(publisher.dropped(), 1);
-    let error = publisher.flush(Duration::ZERO).unwrap_err();
-    assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
-    assert_eq!(error.to_string(), "performance log queue is full");
-    release.send(()).unwrap();
-    drop(output);
-    drop(publisher);
-    worker.join().unwrap();
-    assert_eq!(writes.load(Ordering::Relaxed), LOG_QUEUE_CAPACITY + 1);
 }
 
 #[test]
-fn final_flush_deadline_does_not_wait_for_a_blocked_sink() {
-    let (entered, waiting) = mpsc::sync_channel(1);
-    let (release, gate) = mpsc::sync_channel(1);
-    let (publisher, worker) = spawn_log_writer(GatedWriter {
-        entered,
-        release: Some(gate),
-        writes: Arc::new(AtomicUsize::new(0)),
-    })
-    .unwrap();
+fn failed_sink_disconnects_the_publisher_without_retrying_gameplay() {
+    let (publisher, worker) = spawn_log_writer(io::Cursor::new([0_u8; 0])).unwrap();
     let mut output = publisher.writer();
-    writeln!(output, "first").unwrap();
-    waiting.recv().unwrap();
-    let error = publisher.flush(Duration::ZERO).unwrap_err();
-    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
-    assert_eq!(error.to_string(), "performance log drain deadline exceeded");
-    release.send(()).unwrap();
-    drop(output);
-    drop(publisher);
+    writeln!(output, "first record").unwrap();
     worker.join().unwrap();
+    let error = writeln!(output, "not retried").unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+    assert_eq!(error.to_string(), "performance log worker is unavailable");
 }
 
 #[test]
@@ -86,14 +92,4 @@ fn log_line_boundary_preserves_prefix_and_rejects_growth() {
     assert_eq!(error.to_string(), "performance log line exceeds 4096 bytes");
     assert_eq!(line.length, LOG_LINE_CAPACITY);
     assert_eq!(line.bytes[LOG_LINE_CAPACITY - 1], b'x');
-}
-
-#[test]
-fn dropped_log_counter_saturates_at_its_fixed_bound() {
-    let (publisher, worker) = spawn_log_writer(io::sink()).unwrap();
-    publisher.dropped.store(u64::MAX, Ordering::Relaxed);
-    publisher.note_drop();
-    assert_eq!(publisher.dropped(), u64::MAX);
-    drop(publisher);
-    worker.join().unwrap();
 }

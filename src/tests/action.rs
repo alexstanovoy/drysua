@@ -1,1374 +1,314 @@
-use std::collections::BTreeSet;
-
 use bota_proto::{
-    AbilityId, AbilitySlot, AbilityView, Aim, Attribute, Attributes, EntityId, Fixed, HeroId,
-    ItemId, ItemSlot, ItemView, LootView, MapId, MatchInfo, Order, PlayerView, ShopEntry, SlotId,
-    StatusFlags, Target, Team, TickMode, UnitKind, UnitView, Vec2, WorldView,
+    AbilityId, AbilitySlot, AbilityView, Aim, Attribute, Attributes, EntityId, HeroId, ItemId,
+    ItemSlot, ItemView, LootView, MapId, MatchInfo, Order, PlayerView, ShopEntry, SlotId, Target,
+    Team, UnitKind, UnitView, Vec2, WorldView,
 };
 
 use super::fixtures;
 use crate::{
-    ActionError, ActionKind, ActionSpace, ActionTarget, ControlledUnit, EntityIndex,
-    EntityRelation, LandmarkRelation, LootIndex, MAX_POINT_CANDIDATES, PointDirection, PointIndex,
-    PointSource, PutPointTarget, SHADOW_FIEND, ShopIndex, StateTracker, StructuredAction,
+    ActionError, ActionKind, ActionSpace, ActionTarget, ControlledUnit, EntityIndex, LootIndex,
+    PointIndex, PutPointTarget, SHADOW_FIEND, ShopIndex, StateTracker, StructuredAction,
     UNIT_TOKENS,
 };
 
-const HERO_ID: EntityId = entity(10, 1);
-const COURIER_ID: EntityId = entity(11, 1);
-const ENEMY_ID: EntityId = entity(20, 1);
-const HIDDEN_ENEMY_ID: EntityId = entity(999, 7);
-const LOOT_ID: EntityId = entity(50, 1);
+const HERO: EntityId = EntityId {
+    idx: 10,
+    generation: 1,
+};
+const COURIER: EntityId = EntityId {
+    idx: 11,
+    generation: 1,
+};
+const ENEMY: EntityId = EntityId {
+    idx: 20,
+    generation: 1,
+};
+const LOOT: EntityId = EntityId {
+    idx: 50,
+    generation: 1,
+};
 
 #[test]
-fn action_kind_indices_and_roundtrip_are_stable_for_all_sixteen_kinds() {
-    let expected = [
-        ActionKind::Continue,
-        ActionKind::Stop,
-        ActionKind::MovePoint,
-        ActionKind::FollowUnit,
-        ActionKind::Hold,
-        ActionKind::AttackMovePoint,
-        ActionKind::AttackUnit,
-        ActionKind::Cast,
-        ActionKind::Use,
-        ActionKind::PutPoint,
-        ActionKind::PutUnit,
-        ActionKind::Take,
-        ActionKind::Buy,
-        ActionKind::Sell,
-        ActionKind::Swap,
-        ActionKind::Learn,
-    ];
-
+fn public_decode_preserves_action_indices_wire_orders_and_rejects_injected_indices() {
+    let space = space(&match_info(), world_view(1));
+    assert_eq!(space.decode(StructuredAction::Continue), Ok(None));
     assert_eq!(ActionKind::COUNT, 16);
-    assert_eq!(ActionKind::ALL, expected);
-    for (index, kind) in expected.into_iter().enumerate() {
-        assert_eq!(kind.index(), index);
-        assert_eq!(ActionKind::from_index(index), Some(kind));
+    let cases = movement_orders(&space)
+        .into_iter()
+        .chain(ability_orders())
+        .chain(inventory_orders(&space));
+    for (index, (action, order)) in cases.enumerate() {
+        assert_eq!(action.kind().index(), index + 1);
+        assert_eq!(ActionKind::from_index(index + 1), Some(action.kind()));
+        assert_gate(&space, action, Some(order));
     }
     assert_eq!(ActionKind::from_index(16), None);
-}
-
-#[test]
-fn action_space_requires_a_snapshot_with_exact_error_message() {
-    let tracker = StateTracker::new(SlotId(0), &match_info()).expect("tracker");
-
-    let error = ActionSpace::from_tracker(&tracker)
-        .err()
-        .expect("snapshot required");
-
-    assert_eq!(error, ActionError::SnapshotRequired);
+    let issued = space
+        .decode(StructuredAction::Stop {
+            unit: ControlledUnit::Courier,
+        })
+        .expect("decode")
+        .expect("order");
+    assert_eq!(issued.unit, Some(COURIER));
+    let error = space
+        .decode(StructuredAction::AttackUnit {
+            unit: ControlledUnit::Hero,
+            target: EntityIndex(UNIT_TOKENS),
+        })
+        .expect_err("injected index");
     assert_eq!(
         error.to_string(),
-        "action space requires a validated snapshot"
+        format!(
+            "entity target index 96 is outside candidate count {}",
+            space.entity_candidates().len()
+        )
     );
 }
 
-#[test]
-fn entity_candidates_never_include_hidden_tracks_or_enemy_scoreboard_handles() {
-    let mut tracker = tracker_with_view(world_view(1));
-    let mut hidden_once = world_view(2);
-    hidden_once
-        .units
-        .push(enemy_creep(HIDDEN_ENEMY_ID, 2_300, 2_000));
-    hidden_once.units.sort_by_key(|unit| unit.id);
-    tracker
-        .observe_snapshot(&hidden_once)
-        .expect("visible once");
-    tracker
-        .observe_snapshot(&world_view(3))
-        .expect("hidden now");
+fn movement_orders(space: &ActionSpace) -> [(StructuredAction, Order); 6] {
+    let unit = ControlledUnit::Hero;
+    let point = PointIndex(
+        space
+            .point_candidates()
+            .iter()
+            .position(|p| p.walkable)
+            .expect("point"),
+    );
+    let position = Target::Pos(space.point_candidates()[point.0].position);
+    let courier = space.entity_index(COURIER).expect("courier");
+    let enemy = space.entity_index(ENEMY).expect("enemy");
+    [
+        (
+            StructuredAction::Stop { unit },
+            Order::Move {
+                target: Target::None,
+            },
+        ),
+        (
+            StructuredAction::MovePoint { unit, point },
+            Order::Move { target: position },
+        ),
+        (
+            StructuredAction::FollowUnit {
+                unit,
+                target: courier,
+            },
+            Order::Move {
+                target: Target::Unit(COURIER),
+            },
+        ),
+        (
+            StructuredAction::Hold { unit },
+            Order::Attack {
+                target: Target::None,
+            },
+        ),
+        (
+            StructuredAction::AttackMovePoint { unit, point },
+            Order::Attack { target: position },
+        ),
+        (
+            StructuredAction::AttackUnit {
+                unit,
+                target: enemy,
+            },
+            Order::Attack {
+                target: Target::Unit(ENEMY),
+            },
+        ),
+    ]
+}
 
-    let space = ActionSpace::from_tracker(&tracker).expect("space");
-    let decoded_ids = decoded_candidate_ids(&space);
+fn ability_orders() -> [(StructuredAction, Order); 2] {
+    let unit = ControlledUnit::Hero;
+    let ability = AbilitySlot(0);
+    let slot = ItemSlot(0);
+    [
+        (
+            StructuredAction::Cast {
+                unit,
+                slot: ability,
+                target: ActionTarget::None,
+            },
+            Order::Cast {
+                slot: ability,
+                target: Target::None,
+            },
+        ),
+        (
+            StructuredAction::Use {
+                unit,
+                slot,
+                target: ActionTarget::None,
+            },
+            Order::Use {
+                slot,
+                target: Target::None,
+            },
+        ),
+    ]
+}
 
-    assert!(!decoded_ids.contains(&HIDDEN_ENEMY_ID));
-    assert!(!decoded_ids.contains(&entity(777, 4)));
-    assert!(decoded_ids.contains(&ENEMY_ID));
+fn inventory_orders(space: &ActionSpace) -> [(StructuredAction, Order); 7] {
+    let unit = ControlledUnit::Hero;
+    let slot = ItemSlot(0);
+    let ability = AbilitySlot(0);
+    let courier = space.entity_index(COURIER).expect("courier");
+    [
+        (
+            StructuredAction::PutPoint {
+                unit,
+                source: slot,
+                target: PutPointTarget::Underfoot,
+            },
+            Order::Put {
+                slot,
+                target: Target::None,
+            },
+        ),
+        (
+            StructuredAction::PutUnit {
+                unit,
+                source: slot,
+                target: courier,
+            },
+            Order::Put {
+                slot,
+                target: Target::Unit(COURIER),
+            },
+        ),
+        (
+            StructuredAction::Take {
+                unit,
+                loot: LootIndex(0),
+            },
+            Order::Take {
+                target: Target::Unit(LOOT),
+            },
+        ),
+        (
+            StructuredAction::Buy {
+                unit,
+                item: ShopIndex(0),
+            },
+            Order::Buy { item: ItemId(0) },
+        ),
+        (StructuredAction::Sell { unit, slot }, Order::Sell { slot }),
+        (
+            StructuredAction::Swap {
+                unit,
+                from: slot,
+                to: ItemSlot(8),
+            },
+            Order::Swap {
+                from: slot,
+                to: ItemSlot(8),
+            },
+        ),
+        (
+            StructuredAction::Learn { slot: ability },
+            Order::Learn { slot: ability },
+        ),
+    ]
 }
 
 #[test]
-fn entity_truncation_is_deterministic_and_preserves_bodies_heroes_and_structures() {
-    let mut view = world_view(1);
-    for index in 100..=220 {
-        view.units.push(enemy_creep(
-            entity(index, 1),
-            3_000 + i32::try_from(index).expect("small id"),
+fn bounded_entity_selection_excludes_fog_and_retains_controlled_bodies() {
+    let mut tracker = tracker_with_info_and_view(&match_info(), world_view(1));
+    let mut view = world_view(2);
+    view.units.retain(|unit| unit.id != ENEMY);
+    for index in 100..220 {
+        view.units.push(unit(
+            EntityId {
+                idx: index,
+                generation: 1,
+            },
+            UnitKind::CreepMelee,
+            Team::Dire,
+            3_000 + index as i32,
             3_000,
         ));
     }
-    let important_hero = entity(900, 1);
-    let important_tower = entity(901, 1);
-    view.units.push(unit(
-        important_hero,
-        UnitKind::Hero,
-        Team::Dire,
-        7_000,
-        7_000,
-    ));
-    view.units.push(unit(
-        important_tower,
-        UnitKind::Tower,
-        Team::Dire,
-        7_100,
-        7_100,
-    ));
-    view.units.sort_by_key(|unit| unit.id);
-    let first = ActionSpace::from_tracker(&tracker_with_view(view.clone())).expect("first");
-    let second = ActionSpace::from_tracker(&tracker_with_view(view)).expect("second");
-
-    assert_eq!(first.entity_candidates().len(), UNIT_TOKENS);
-    assert_eq!(
-        decoded_candidate_ids(&first),
-        decoded_candidate_ids(&second)
-    );
-    let ids = decoded_candidate_ids(&first);
-    assert!(ids.contains(&HERO_ID));
-    assert!(ids.contains(&COURIER_ID));
-    assert!(ids.contains(&important_hero));
-    assert!(ids.contains(&important_tower));
-}
-
-#[test]
-fn point_candidates_are_bounded_deduplicated_and_cover_directions_landmarks_and_trees() {
-    let mut tracker = tracker_with_view(world_view(1));
-    let mut moved = world_view(3);
-    moved
-        .units
-        .iter_mut()
-        .find(|unit| unit.id == ENEMY_ID)
-        .expect("enemy")
-        .pos = Vec2::from_ints(2_364, 2_000);
-    tracker.observe_snapshot(&moved).expect("velocity snapshot");
-
-    let space = ActionSpace::from_tracker(&tracker).expect("space");
-    let points = space.point_candidates();
-    let unique: BTreeSet<Vec2> = points.iter().map(|point| point.position).collect();
-
-    assert!(points.len() <= MAX_POINT_CANDIDATES);
-    assert_eq!(unique.len(), points.len());
-    assert!(points.iter().any(|point| {
-        point.source
-            == PointSource::Tactical {
-                direction: PointDirection::East,
-                radius: 200,
-            }
-            && point.position == Vec2::from_ints(2_200, 2_000)
-    }));
-    assert!(points.iter().any(|point| {
-        point.source
-            == PointSource::Tactical {
-                direction: PointDirection::NorthEast,
-                radius: 200,
-            }
-            && point.position == Vec2::from_ints(2_141, 2_141)
-    }));
-    assert!(points.iter().any(|point| {
-        point.source == PointSource::StaticTree && point.position == Vec2::from_ints(2_100, 2_100)
-    }));
-    assert!(!points.iter().any(|point| {
-        matches!(point.source, PointSource::StaticTree)
-            && point.position == Vec2::from_ints(2_050, 2_050)
-    }));
-    assert!(points.iter().any(|point| {
-        point.source == PointSource::PredictedHero(EntityRelation::Enemy)
-            && point.position == Vec2::from_ints(2_428, 2_000)
-    }));
-    assert!(
-        points
-            .iter()
-            .any(|point| { point.source == PointSource::Fountain(LandmarkRelation::Own) })
-    );
-    assert!(
-        points
-            .iter()
-            .any(|point| { point.source == PointSource::Tower(LandmarkRelation::Enemy) })
-    );
-}
-
-#[test]
-fn terrain_rle_controls_point_walkability_at_the_explicit_cell_boundary() {
-    let blocked_cell = 31 * 128 + 34;
-    let mut info = match_info();
-    info.terrain_rle = terrain_with_blocked_cell(blocked_cell);
-    let mut tracker = StateTracker::new(SlotId(0), &info).expect("tracker");
-    tracker.observe_snapshot(&world_view(1)).expect("snapshot");
-
-    let space = ActionSpace::from_tracker(&tracker).expect("space");
-    let east = space
-        .point_candidates()
-        .iter()
-        .find(|point| {
-            point.source
-                == PointSource::Tactical {
-                    direction: PointDirection::East,
-                    radius: 200,
-                }
-        })
-        .expect("east point");
-
-    assert!(!east.walkable);
-}
-
-#[test]
-fn remote_tree_deltas_preserve_static_passability_while_structures_still_block() {
-    let mut info = match_info();
-    info.trees = vec![Vec2::from_ints(2_208, 2_016)];
-    let mut view = world_view(1);
-    view.felled_trees = vec![0];
-    view.planted_trees = vec![Vec2::from_ints(2_016, 2_208)];
-    view.units.push(unit(
-        entity(40, 1),
-        UnitKind::Tower,
-        Team::Dire,
-        1_824,
-        2_016,
-    ));
-    view.units.sort_by_key(|unit| unit.id);
-    let hero_index = hero_index(&view);
-    view.units[hero_index].items[0] = Some(item(Some(Aim::Point), 1_200));
-    let mut tracker = StateTracker::new(SlotId(0), &info).expect("tracker");
-    tracker.observe_snapshot(&view).expect("snapshot");
-
-    let space = ActionSpace::from_tracker(&tracker).expect("space");
-    let east = tactical_point(&space, PointDirection::East, 200);
-    let north = tactical_point(&space, PointDirection::North, 200);
-    let west = tactical_point(&space, PointDirection::West, 200);
-
-    assert!(!space.point_candidates()[east.0].walkable);
-    assert!(!space.move_point_mask(ControlledUnit::Hero)[east.0]);
-    assert!(
-        !space
-            .put_point_target_mask(ControlledUnit::Hero, ItemSlot(0))
-            .expect("put mask")[east.0]
-    );
-    assert!(space.point_candidates()[north.0].walkable);
-    assert!(space.move_point_mask(ControlledUnit::Hero)[north.0]);
-    assert!(!space.point_candidates()[west.0].walkable);
-}
-
-#[test]
-fn locally_proven_felled_static_tree_unblocks_walkability_and_tree_mask() {
-    let mut info = match_info();
-    info.trees = vec![Vec2::from_ints(2_000, 2_000)];
-    info.opaque_cells = vec![(31, 31)];
-    let mut standing = world_view(1);
-    standing.felled_trees.clear();
-    standing.planted_trees.clear();
-    let hero_index = hero_index(&standing);
-    standing.units[hero_index].items[0] = Some(item(Some(Aim::Point), 1_200));
-    let standing_space =
-        ActionSpace::from_tracker(&tracker_with_info_and_view(&info, standing.clone()))
-            .expect("standing tree space");
-    assert!(!standing_space.put_underfoot_mask(ControlledUnit::Hero)[0]);
-    assert!(
-        standing_space
-            .cast_target_mask(ControlledUnit::Hero, AbilitySlot(3))
-            .expect("tree mask")
-            .points()
-            .contains(&true)
-    );
-
-    standing.felled_trees.push(0);
-    let felled_space = ActionSpace::from_tracker(&tracker_with_info_and_view(&info, standing))
-        .expect("felled tree space");
-    assert!(felled_space.put_underfoot_mask(ControlledUnit::Hero)[0]);
-    assert!(
-        !felled_space
-            .cast_target_mask(ControlledUnit::Hero, AbilitySlot(3))
-            .expect("tree mask")
-            .points()
-            .contains(&true)
-    );
-}
-
-#[test]
-fn locally_proven_planted_tree_blocks_walkability_and_enters_tree_mask() {
-    let mut info = match_info();
-    info.trees.clear();
-    info.opaque_cells.clear();
-    let mut open = world_view(1);
-    open.felled_trees.clear();
-    open.planted_trees.clear();
-    let hero_index = hero_index(&open);
-    open.units[hero_index].items[0] = Some(item(Some(Aim::Point), 1_200));
-    let open_space = ActionSpace::from_tracker(&tracker_with_info_and_view(&info, open.clone()))
-        .expect("open space");
-    assert!(open_space.put_underfoot_mask(ControlledUnit::Hero)[0]);
-
-    open.planted_trees.push(Vec2::from_ints(2_000, 2_000));
-    let planted_space = ActionSpace::from_tracker(&tracker_with_info_and_view(&info, open))
-        .expect("planted tree space");
-    assert!(!planted_space.put_underfoot_mask(ControlledUnit::Hero)[0]);
-    assert!(
-        planted_space
-            .cast_target_mask(ControlledUnit::Hero, AbilitySlot(3))
-            .expect("tree mask")
-            .points()
-            .contains(&true)
-    );
-}
-
-#[test]
-fn remote_tree_deltas_leave_candidates_and_masks_invariant_until_visibility_is_proven() {
-    let mut info = match_info();
-    info.trees.push(Vec2::from_ints(7_000, 7_000));
-    let mut baseline = world_view(1);
-    baseline.felled_trees.clear();
-    baseline.planted_trees.clear();
-    let baseline_space =
-        ActionSpace::from_tracker(&tracker_with_info_and_view(&info, baseline.clone()))
-            .expect("baseline");
-
-    let mut remote = baseline.clone();
-    remote.felled_trees.push(3);
-    remote.planted_trees.push(Vec2::from_ints(7_100, 7_100));
-    let remote_space =
-        ActionSpace::from_tracker(&tracker_with_info_and_view(&info, remote)).expect("remote");
-    assert_eq!(
-        baseline_space.point_candidates(),
-        remote_space.point_candidates()
-    );
-    assert_eq!(
-        baseline_space
-            .cast_target_mask(ControlledUnit::Hero, AbilitySlot(3))
-            .expect("tree mask")
-            .points(),
-        remote_space
-            .cast_target_mask(ControlledUnit::Hero, AbilitySlot(3))
-            .expect("tree mask")
-            .points()
-    );
-
-    baseline.felled_trees.push(1);
-    let local_space = ActionSpace::from_tracker(&tracker_with_info_and_view(&info, baseline))
-        .expect("local delta");
-    assert_ne!(
-        baseline_space.point_candidates(),
-        local_space.point_candidates()
-    );
-}
-
-#[test]
-fn tree_selection_matches_full_sort_at_zero_eight_nine_and_maximum_counts() {
-    for team in [Team::Radiant, Team::Dire] {
-        for count in [0, 1, 7, 8, 9, 31, 184, crate::MAX_STATIC_TREES] {
-            let mut info = match_info();
-            info.trees = (0..count)
-                .rev()
-                .map(|index| Vec2::from_ints(2_001 + index as i32, 2_001))
-                .collect();
-            let tracker = tree_tracker(info, world_view(1), team);
-
-            let actual = crate::action::tree_points_for_test(&tracker, Vec::new());
-
-            assert_eq!(actual, reference_tree_points(&tracker, Vec::new()));
-            assert_eq!(actual.len(), count.min(8));
-        }
+    tracker.observe_snapshot(&view).expect("crowded snapshot");
+    let space = ActionSpace::from_tracker(&tracker).expect("bounded space");
+    assert_eq!(space.entity_candidates().len(), UNIT_TOKENS);
+    assert!(space.entity_index(ENEMY).is_none());
+    for id in [HERO, COURIER] {
+        assert!(space.entity_index(id).is_some());
     }
 }
 
 #[test]
-fn tree_selection_preserves_canonical_distance_ties_on_both_sides() {
-    let ring = [
-        (0, 5),
-        (3, 4),
-        (4, 3),
-        (5, 0),
-        (4, -3),
-        (3, -4),
-        (0, -5),
-        (-3, -4),
-        (-4, -3),
-        (-5, 0),
-        (-4, 3),
-        (-3, 4),
-    ];
-    for team in [Team::Radiant, Team::Dire] {
-        let mut info = match_info();
-        info.trees = ring
-            .iter()
-            .map(|(x, y)| Vec2::from_ints(2_000 + x, 2_000 + y))
-            .collect();
-        let tracker = tree_tracker(info, world_view(1), team);
-
-        let actual = crate::action::tree_points_for_test(&tracker, Vec::new());
-
-        assert_eq!(actual, reference_tree_points(&tracker, Vec::new()));
-        assert_eq!(actual.len(), 8);
-        let first_x = if team == Team::Radiant { 1_995 } else { 2_005 };
-        assert_eq!(actual[0].position, Vec2::from_ints(first_x, 2_000));
-    }
-}
-
-#[test]
-fn tree_selection_counts_duplicates_before_deduplication_and_keeps_static_source() {
-    for team in [Team::Radiant, Team::Dire] {
-        let mut info = match_info();
-        let duplicate = Vec2::from_ints(2_001, 2_000);
-        info.trees = vec![duplicate; 7];
-        info.trees.push(Vec2::from_ints(2_002, 2_000));
+fn public_range_and_ownership_masks_keep_exact_boundaries() {
+    for (range, allowed) in [(299, false), (300, true)] {
         let mut view = world_view(1);
-        view.felled_trees.clear();
-        view.planted_trees = vec![duplicate; 9];
-        let tracker = tree_tracker_with_deltas(info, view, team);
-
-        let actual = crate::action::tree_points_for_test(&tracker, Vec::new());
-
-        assert_eq!(actual, reference_tree_points(&tracker, Vec::new()));
-        assert_eq!(actual, [tree_candidate(duplicate, PointSource::StaticTree)]);
-    }
-}
-
-#[test]
-fn tree_selection_accepts_only_locally_proven_deltas_at_cell_boundaries() {
-    let positions = [
-        Vec2::from_ints(2_001, 2_001),
-        Vec2::from_ints(2_111, 2_000),
-        Vec2::from_ints(2_112, 2_000),
-        Vec2::from_ints(7_000, 7_000),
-    ];
-    for team in [Team::Radiant, Team::Dire] {
-        let mut info = match_info();
-        info.trees = positions.to_vec();
-        let mut view = world_view(1);
-        view.felled_trees = vec![3, 0, 2, 1, 0];
-        view.planted_trees = positions.to_vec();
-        let tracker = tree_tracker_with_deltas(info, view, team);
-
-        let actual = crate::action::tree_points_for_test(&tracker, Vec::new());
-
-        assert_eq!(actual, reference_tree_points(&tracker, Vec::new()));
-        assert_eq!(
-            actual,
-            [
-                tree_candidate(positions[0], PointSource::PlantedTree),
-                tree_candidate(positions[1], PointSource::PlantedTree),
-                tree_candidate(positions[2], PointSource::StaticTree),
-                tree_candidate(positions[3], PointSource::StaticTree),
-            ]
-        );
-    }
-}
-
-#[test]
-fn tree_selection_does_not_accept_deltas_from_dead_or_enemy_bodies() {
-    for (team, hp, statuses) in [
-        (Team::Dire, 1_000, 0),
-        (Team::Radiant, 0, 0),
-        (Team::Radiant, 1_000, StatusFlags::DEAD),
-    ] {
-        let position = Vec2::from_ints(7_000, 7_000);
-        let mut info = match_info();
-        info.trees = vec![position];
-        let mut view = world_view(1);
-        view.units.retain(|unit| unit.id == HERO_ID);
-        let mut observer = unit(ENEMY_ID, UnitKind::CreepMelee, team, 7_000, 7_000);
-        observer.hp = hp;
-        observer.statuses.bits = statuses;
-        view.units.push(observer);
-        view.felled_trees = vec![0];
-        view.planted_trees = vec![position];
-        let tracker = tracker_with_info_and_view(&info, view);
-
-        let actual = crate::action::tree_points_for_test(&tracker, Vec::new());
-
-        assert_eq!(actual, reference_tree_points(&tracker, Vec::new()));
-        assert_eq!(actual, [tree_candidate(position, PointSource::StaticTree)]);
-    }
-}
-
-#[test]
-fn tree_selection_preserves_point_capacity_and_merges_only_until_the_original_cutoff() {
-    for count in [0, 40, 46, 47, 48] {
-        let mut info = match_info();
-        info.trees = (1..=12)
-            .map(|index| Vec2::from_ints(2_000 + index, 2_000))
-            .collect();
-        let tracker = tree_tracker(info, world_view(1), Team::Radiant);
-        let mut prefix: Vec<_> = (0..count)
-            .map(|index| crate::PointCandidate {
-                position: Vec2::from_ints(2_001 + index, 2_000),
-                source: PointSource::Tactical {
-                    direction: PointDirection::East,
-                    radius: 200,
-                },
-                walkable: true,
-                standing_tree: false,
-                allied_building: true,
-            })
-            .collect();
-        if count == 47 {
-            prefix[1].position = Vec2::from_ints(6_000, 6_000);
-        }
-
-        let actual = crate::action::tree_points_for_test(&tracker, prefix.clone());
-
-        assert_eq!(actual, reference_tree_points(&tracker, prefix));
-        assert!(actual.len() <= MAX_POINT_CANDIDATES);
-        if count == 48 {
-            assert!(actual[0].standing_tree);
-            assert!(!actual[0].walkable);
-            assert!(actual[0].allied_building);
-            assert!(!actual[1].standing_tree);
-        }
-        if count == 47 {
-            assert_eq!(actual.len(), 48);
-            assert!(!actual[2].standing_tree);
-        }
-    }
-}
-
-#[test]
-fn tree_selection_matches_full_sort_for_bounded_generated_tree_and_delta_combinations() {
-    for case in 0..64usize {
-        let mut info = match_info();
-        info.map = MapId((case % 2) as u16);
-        info.trees = (0..case * 3)
-            .map(|index| {
-                Vec2::from_ints(
-                    1_900 + ((index * 37 + case * 13) % 257) as i32,
-                    1_900 + ((index * 17 + case * 31) % 257) as i32,
-                )
-            })
-            .collect();
-        let mut view = world_view(1);
-        view.felled_trees = (0..info.trees.len())
-            .filter(|index| (index + case) % 3 == 0)
-            .map(|index| index as u32)
-            .collect();
-        view.planted_trees = info.trees.iter().copied().step_by(2).collect();
-        for team in [Team::Radiant, Team::Dire] {
-            let tracker = tree_tracker_with_deltas(info.clone(), view.clone(), team);
-
-            let actual = crate::action::tree_points_for_test(&tracker, Vec::new());
-
-            assert_eq!(
-                actual,
-                reference_tree_points(&tracker, Vec::new()),
-                "case {case}, {team:?}"
-            );
-            assert!(actual.len() <= 8);
-        }
-    }
-}
-
-#[test]
-fn tree_selection_handles_maximum_combined_static_and_planted_counts() {
-    let mut info = match_info();
-    let duplicate = Vec2::from_ints(2_001, 2_001);
-    info.trees = vec![duplicate; crate::MAX_STATIC_TREES];
-    let mut view = world_view(1);
-    view.felled_trees.clear();
-    view.planted_trees = vec![duplicate; crate::MAX_PLANTED_TREES];
-    let tracker = tree_tracker_with_deltas(info, view, Team::Radiant);
-
-    let actual = crate::action::tree_points_for_test(&tracker, Vec::new());
-
-    assert_eq!(actual, reference_tree_points(&tracker, Vec::new()));
-    assert_eq!(actual, [tree_candidate(duplicate, PointSource::StaticTree)]);
-}
-
-#[test]
-fn tree_selection_at_full_point_capacity_does_not_merge_a_later_duplicate() {
-    let mut info = match_info();
-    info.trees = vec![Vec2::from_ints(2_001, 2_000), Vec2::from_ints(2_002, 2_000)];
-    let tracker = tree_tracker(info, world_view(1), Team::Radiant);
-    let prefix: Vec<_> = (0..MAX_POINT_CANDIDATES)
-        .map(|index| crate::PointCandidate {
-            position: Vec2::from_ints(2_002 + index as i32, 2_000),
-            source: PointSource::Fountain(LandmarkRelation::Own),
-            walkable: true,
-            standing_tree: false,
-            allied_building: false,
-        })
-        .collect();
-
-    let actual = crate::action::tree_points_for_test(&tracker, prefix.clone());
-
-    assert_eq!(actual, reference_tree_points(&tracker, prefix.clone()));
-    assert_eq!(actual, prefix);
-}
-
-#[test]
-fn tree_selection_preserves_full_point_order_tree_legality_and_decoded_targets() {
-    for team in [Team::Radiant, Team::Dire] {
-        let mut info = match_info();
-        info.trees = vec![Vec2::from_ints(2_200, 2_000); 3];
-        info.trees
-            .extend((1..=9).map(|index| Vec2::from_ints(2_200, 2_000 + index)));
-        let tracker = tree_tracker(info, world_view(1), team);
-        let space = ActionSpace::from_tracker(&tracker).expect("tree action space");
-        let tactical_prefix = space.point_candidates()[..24]
-            .iter()
-            .map(|point| crate::PointCandidate {
-                standing_tree: false,
-                ..*point
-            })
-            .collect();
-        let expected = reference_tree_points(&tracker, tactical_prefix);
-
-        assert_eq!(space.point_candidates(), expected);
-        assert_eq!(
-            space.move_point_mask(ControlledUnit::Hero),
-            expected
-                .iter()
-                .map(|point| point.walkable)
-                .collect::<Vec<_>>()
-        );
-        for (index, point) in expected.iter().enumerate() {
-            let action = StructuredAction::Cast {
-                unit: ControlledUnit::Hero,
-                slot: AbilitySlot(3),
-                target: ActionTarget::Point(PointIndex(index)),
-            };
-            let allowed = point.standing_tree
-                && point
-                    .position
-                    .within(Vec2::from_ints(2_000, 2_000), Fixed::from_int(1_200));
-            assert_eq!(space.allows(action), allowed);
-            if allowed {
-                assert_order(
-                    &space,
-                    action,
-                    None,
-                    Order::Cast {
-                        slot: AbilitySlot(3),
-                        target: Target::Pos(point.position),
-                    },
-                );
-            } else {
-                assert_eq!(
-                    space
-                        .decode(action)
-                        .expect_err("non-tree target")
-                        .to_string(),
-                    "action Cast is masked by the current action space"
-                );
-            }
-        }
-    }
-}
-
-fn tree_tracker(info: MatchInfo, mut view: WorldView, team: Team) -> StateTracker {
-    view.felled_trees.clear();
-    view.planted_trees.clear();
-    tree_tracker_with_deltas(info, view, team)
-}
-
-fn tree_tracker_with_deltas(mut info: MatchInfo, mut view: WorldView, team: Team) -> StateTracker {
-    let enemy = if team == Team::Radiant {
-        Team::Dire
-    } else {
-        Team::Radiant
-    };
-    info.picks[0].team = team;
-    info.picks[1].team = enemy;
-    view.viewer = Some(team);
-    view.players[0].team = team;
-    view.players[1].team = enemy;
-    view.units.retain(|unit| unit.id == HERO_ID);
-    view.units[0].team = team;
-    tracker_with_info_and_view(&info, view)
-}
-
-fn tree_candidate(position: Vec2, source: PointSource) -> crate::PointCandidate {
-    crate::PointCandidate {
-        position,
-        source,
-        walkable: false,
-        standing_tree: true,
-        allied_building: false,
-    }
-}
-
-fn reference_tree_points(
-    tracker: &StateTracker,
-    mut points: Vec<crate::PointCandidate>,
-) -> Vec<crate::PointCandidate> {
-    let current = tracker.current().expect("tree snapshot");
-    let center = tracker.own_hero().expect("tree hero").pos;
-    let mut trees = Vec::with_capacity(tracker.static_trees().len() + current.planted_trees.len());
-    for (index, position) in tracker.static_trees().iter().copied().enumerate() {
-        let observable = tracker.position_locally_observable_to_own_seat(position);
-        if !current.felled_trees.contains(&(index as u32)) || !observable {
-            trees.push((center.distance_squared(position), position, false));
-        }
-    }
-    for position in current.planted_trees.iter().copied() {
-        if tracker.position_locally_observable_to_own_seat(position) {
-            trees.push((center.distance_squared(position), position, true));
-        }
-    }
-    trees.sort_by_key(|(distance, position, planted)| {
-        let sign = if tracker.team() == Team::Dire {
-            -1i64
-        } else {
-            1
-        };
-        (
-            *distance,
-            sign * i64::from(position.x.raw),
-            sign * i64::from(position.y.raw),
-            *planted,
-        )
-    });
-    for (_, position, planted) in trees.into_iter().take(8) {
-        if let Some(existing) = points.iter_mut().find(|point| point.position == position) {
-            existing.walkable = false;
-            existing.standing_tree = true;
-        } else if points.len() < MAX_POINT_CANDIDATES {
-            let source = if planted {
-                PointSource::PlantedTree
-            } else {
-                PointSource::StaticTree
-            };
-            points.push(tree_candidate(position, source));
-        }
-        if points.len() == MAX_POINT_CANDIDATES {
-            break;
-        }
-    }
-    points
-}
-
-#[test]
-fn town_portal_landings_allow_move_but_not_attack_move_and_keep_tp_provenance() {
-    let mut view = world_view(1);
-    let hero_index = hero_index(&view);
-    view.units[hero_index].pos = Vec2::from_ints(6_000, 6_000);
-    view.units[hero_index].items[0] =
-        Some(item_with_id(ItemId(8), Some(Aim::Building), 600, false));
-    let space = ActionSpace::from_tracker(&tracker_with_view(view)).expect("space");
-    let mask = space
-        .use_target_mask(ControlledUnit::Hero, ItemSlot(0))
-        .expect("town portal mask");
-
-    let allowed: Vec<usize> = mask
-        .points()
-        .iter()
-        .enumerate()
-        .filter_map(|(index, allowed)| allowed.then_some(index))
-        .collect();
-    assert!(!allowed.is_empty());
-    for index in allowed {
-        let candidate = space.point_candidates()[index];
-        assert!(candidate.walkable);
-        assert!(candidate.allied_building);
-        assert!(matches!(candidate.source, PointSource::BuildingLanding(_)));
-        for unit in [ControlledUnit::Hero, ControlledUnit::Courier] {
-            // Native navigation proves these are landing cells, not occupied building centers.
-            assert!(space.move_point_mask(unit)[index]);
-            assert_order(
-                &space,
-                StructuredAction::MovePoint {
-                    unit,
-                    point: PointIndex(index),
-                },
-                if unit == ControlledUnit::Hero {
-                    None
-                } else {
-                    Some(COURIER_ID)
-                },
-                Order::Move {
-                    target: Target::Pos(candidate.position),
-                },
-            );
-            assert!(!space.attack_move_point_mask(unit)[index]);
-        }
-        assert!(
-            !candidate
-                .position
-                .within(Vec2::from_ints(6_000, 6_000), Fixed::from_int(600))
-        );
-    }
-    for (index, candidate) in space.point_candidates().iter().enumerate() {
-        if matches!(
-            candidate.source,
-            PointSource::Tower(LandmarkRelation::Own)
-                | PointSource::Fountain(LandmarkRelation::Own)
-        ) {
-            assert!(!mask.points()[index]);
-            assert!(!candidate.walkable);
-        }
-    }
-}
-
-#[test]
-fn landing_cell_direct_grid_scan_matches_cell_centre_reference_on_synthetic_grids() {
-    let cell = crate::TERRAIN_CELL_SIZE;
-    for axis in [1usize, 2, 7, 16] {
-        let mut open = vec![true; axis * axis];
-        for (index, walkable) in open.iter_mut().enumerate() {
-            // Deterministic asymmetric pattern: blocked cells are not mirrored
-            // onto each other, so the two teams must resolve different cells.
-            *walkable = (index * 37 + index / axis * 11) % 9 != 0;
-        }
-        for cell_y in 0..=axis {
-            for cell_x in 0..=axis {
-                for offset_x in [0, 5, 31, 32, 63] {
-                    for offset_y in [0, 17, 32, 63] {
-                        let center = Vec2::from_ints(
-                            cell_x as i32 * cell + offset_x,
-                            cell_y as i32 * cell + offset_y,
-                        );
-                        for team in [Team::Radiant, Team::Dire] {
-                            let (expected, actual) =
-                                crate::action::nearest_landing_cell_pair_for_test(
-                                    axis,
-                                    open.clone(),
-                                    center,
-                                    team,
-                                );
-                            assert_eq!(
-                                actual, expected,
-                                "axis {axis} center {center:?} team {team:?}"
-                            );
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
-#[test]
-fn landing_cell_direct_grid_scan_keeps_ties_and_out_of_grid_centers_exact() {
-    let cell = crate::TERRAIN_CELL_SIZE;
-    // An all-open grid maximizes exact distance ties, where the canonical cell
-    // index decides; an odd axis keeps the centre on an actual cell.
-    let axis = 9usize;
-    let open = vec![true; axis * axis];
-    let center = Vec2::from_ints(4 * cell + cell, 4 * cell + cell);
-    for team in [Team::Radiant, Team::Dire] {
-        let (expected, actual) =
-            crate::action::nearest_landing_cell_pair_for_test(axis, open.clone(), center, team);
-        assert_eq!(actual, expected, "tie center team {team:?}");
-    }
-    // Centers outside the grid have no landing cell at all.
-    for center in [Vec2::from_ints(-1, 0), Vec2::from_ints(-cell, -cell)] {
-        for team in [Team::Radiant, Team::Dire] {
-            let (expected, actual) =
-                crate::action::nearest_landing_cell_pair_for_test(axis, open.clone(), center, team);
-            assert_eq!(expected, None, "out-of-grid reference center {center:?}");
-            assert_eq!(actual, None, "out-of-grid center {center:?} team {team:?}");
-        }
-    }
-    // A center exactly on a cell boundary resolves to the cell that owns it.
-    let boundary = Vec2::from_ints(2 * cell, 3 * cell);
-    for team in [Team::Radiant, Team::Dire] {
-        let (expected, actual) =
-            crate::action::nearest_landing_cell_pair_for_test(axis, open.clone(), boundary, team);
-        assert_eq!(actual, expected, "boundary center team {team:?}");
-    }
-}
-
-#[test]
-fn building_landing_moves_keep_dead_stunned_rooted_gates_but_item_mute_only_blocks_tp() {
-    for status in [
-        0,
-        StatusFlags::DEAD,
-        StatusFlags::STUNNED,
-        StatusFlags::ROOTED,
-    ] {
-        let mut view = world_view(1);
-        let hero = hero_index(&view);
-        view.units[hero].statuses.bits = status;
-        view.units[hero].pos = Vec2::from_ints(6_000, 6_000);
-        let mut scroll = item_with_id(ItemId(8), Some(Aim::Building), 600, false);
-        scroll.mute_left = 1;
-        view.units[hero].items[0] = Some(scroll);
-        let space = ActionSpace::from_tracker(&tracker_with_view(view)).expect("landing gates");
-        let index = space
-            .point_candidates()
-            .iter()
-            .position(|candidate| {
-                matches!(candidate.source, PointSource::BuildingLanding(_)) && candidate.walkable
-            })
-            .expect("existing landing");
-        let action = StructuredAction::MovePoint {
-            unit: ControlledUnit::Hero,
-            point: PointIndex(index),
-        };
-        assert_eq!(
-            space.move_point_mask(ControlledUnit::Hero)[index],
-            status == 0
-        );
-        assert_eq!(space.allows(action), status == 0);
-        if status == 0 {
-            assert_order(
-                &space,
-                action,
-                None,
-                Order::Move {
-                    target: Target::Pos(space.point_candidates()[index].position),
-                },
-            );
-        } else {
-            let error = space.decode(action).expect_err("disabled hero cannot move");
-            assert_eq!(error, ActionError::NotAllowed(ActionKind::MovePoint));
-            assert_eq!(
-                error.to_string(),
-                "action MovePoint is masked by the current action space"
-            );
-        }
-        let teleport = StructuredAction::Use {
-            unit: ControlledUnit::Hero,
-            slot: ItemSlot(0),
-            target: ActionTarget::Point(PointIndex(index)),
-        };
-        assert!(!space.allows(teleport));
-        assert_eq!(
-            space.decode(teleport),
-            Err(ActionError::NotAllowed(ActionKind::Use))
-        );
-    }
-}
-
-#[test]
-fn hero_and_courier_masks_follow_availability_and_status_boundaries() {
-    let baseline = ActionSpace::from_tracker(&tracker_with_view(world_view(1))).expect("baseline");
-    assert!(
-        baseline
-            .controlled_unit_mask(ActionKind::Stop)
-            .allows(ControlledUnit::Hero)
-    );
-    assert!(
-        baseline
-            .controlled_unit_mask(ActionKind::Stop)
-            .allows(ControlledUnit::Courier)
-    );
-
-    let mut dead_hero = world_view(1);
-    dead_hero.players[0].unit = None;
-    dead_hero.players[0].kit = Some(bota_proto::Kit {
-        abilities: hero().abilities,
-        items: hero().items,
-    });
-    dead_hero.units.retain(|unit| unit.id != HERO_ID);
-    let dead = ActionSpace::from_tracker(&tracker_with_view(dead_hero)).expect("dead hero space");
-    assert!(
-        !dead
-            .controlled_unit_mask(ActionKind::Stop)
-            .allows(ControlledUnit::Hero)
-    );
-    assert!(
-        dead.controlled_unit_mask(ActionKind::Stop)
-            .allows(ControlledUnit::Courier)
-    );
-
-    let mut disabled = world_view(1);
-    let disabled_hero = hero_index(&disabled);
-    disabled.units[disabled_hero].statuses.bits =
-        StatusFlags::STUNNED | StatusFlags::ROOTED | StatusFlags::DISARMED;
-    let disabled = ActionSpace::from_tracker(&tracker_with_view(disabled)).expect("disabled");
-    assert!(disabled.allows(StructuredAction::Stop {
-        unit: ControlledUnit::Hero,
-    }));
-    assert!(
-        !disabled
-            .controlled_unit_mask(ActionKind::MovePoint)
-            .allows(ControlledUnit::Hero)
-    );
-    assert!(
-        !disabled
-            .controlled_unit_mask(ActionKind::Hold)
-            .allows(ControlledUnit::Hero)
-    );
-}
-
-#[test]
-fn ability_masks_apply_aim_passive_learning_cooldown_mana_silence_and_strict_range() {
-    let mut view = world_view(1);
-    let hero_index = hero_index(&view);
-    view.units[hero_index].abilities = vec![
-        ability(Aim::Own, 0),
-        ability(Aim::Unit, 300),
-        ability(Aim::Point, 1_200),
-        AbilityView {
-            passive: true,
-            ..ability(Aim::Own, 0)
-        },
-        AbilityView {
-            level: 0,
-            ..ability(Aim::Own, 0)
-        },
-        AbilityView {
-            cooldown_left: 1,
-            mana_cost: 10_000,
-            ..ability(Aim::Own, 0)
-        },
-    ];
-    let space = ActionSpace::from_tracker(&tracker_with_view(view.clone())).expect("space");
-    assert_eq!(
-        space.ability_slot_mask(ControlledUnit::Hero),
-        [true, true, true, false, false, false]
-    );
-    let enemy = entity_candidate(&space, EntityRelation::Enemy, UnitKind::Hero);
-    assert!(space.allows(StructuredAction::Cast {
-        unit: ControlledUnit::Hero,
-        slot: AbilitySlot(1),
-        target: ActionTarget::Entity(enemy),
-    }));
-
-    view.units[hero_index].abilities[1].range = 299;
-    let short = ActionSpace::from_tracker(&tracker_with_view(view.clone())).expect("short range");
-    let enemy = entity_candidate(&short, EntityRelation::Enemy, UnitKind::Hero);
-    assert!(!short.allows(StructuredAction::Cast {
-        unit: ControlledUnit::Hero,
-        slot: AbilitySlot(1),
-        target: ActionTarget::Entity(enemy),
-    }));
-
-    view.units[hero_index].statuses.bits = StatusFlags::SILENCED;
-    let silenced = ActionSpace::from_tracker(&tracker_with_view(view)).expect("silenced");
-    assert!(
-        silenced
-            .ability_slot_mask(ControlledUnit::Hero)
-            .iter()
-            .all(|allowed| !allowed)
-    );
-}
-
-#[test]
-fn item_masks_cover_all_aims_and_reject_backpack_cooldown_charges_mana_and_range() {
-    let mut view = world_view(1);
-    let hero_index = hero_index(&view);
-    view.units[hero_index].items = action_items();
-    let space = ActionSpace::from_tracker(&tracker_with_view(view.clone())).expect("space");
-
-    assert_eq!(
-        space.item_slot_mask(ControlledUnit::Hero),
-        [true, true, true, true, true, false]
-    );
-    let ally = entity_candidate(&space, EntityRelation::Own, UnitKind::Courier);
-    assert!(space.allows(StructuredAction::Use {
-        unit: ControlledUnit::Hero,
-        slot: ItemSlot(1),
-        target: ActionTarget::Entity(ally),
-    }));
-    assert!(!space.allows(StructuredAction::Use {
-        unit: ControlledUnit::Hero,
-        slot: ItemSlot(1),
-        target: ActionTarget::Entity(entity_candidate(
+        view.units[0].abilities[1].range = range;
+        view.units[0].items[0].as_mut().expect("item").for_sale = allowed;
+        let space = space(&match_info(), view);
+        let target = space.entity_index(ENEMY).expect("enemy");
+        assert_gate(
             &space,
-            EntityRelation::Enemy,
-            UnitKind::Hero,
-        )),
-    }));
-    assert!(!space.allows(StructuredAction::Use {
-        unit: ControlledUnit::Hero,
-        slot: ItemSlot(6),
-        target: ActionTarget::None,
-    }));
-
-    view.units[hero_index].items[0]
-        .as_mut()
-        .expect("item")
-        .charges = Some(0);
-    view.units[hero_index].items[1]
-        .as_mut()
-        .expect("item")
-        .cooldown_left = 1;
-    view.units[hero_index].items[2]
-        .as_mut()
-        .expect("item")
-        .mana_cost = 10_000;
-    view.units[hero_index].items[3]
-        .as_mut()
-        .expect("item")
-        .mute_left = 1;
-    let blocked = ActionSpace::from_tracker(&tracker_with_view(view)).expect("blocked");
-    assert!(!blocked.item_slot_mask(ControlledUnit::Hero)[0]);
-    assert!(!blocked.item_slot_mask(ControlledUnit::Hero)[1]);
-    assert!(!blocked.item_slot_mask(ControlledUnit::Hero)[2]);
-    assert!(!blocked.item_slot_mask(ControlledUnit::Hero)[3]);
-}
-
-#[test]
-fn feared_items_are_masked_but_no_disable_or_silence_alone_allows_use() {
-    let action = StructuredAction::Use {
-        unit: ControlledUnit::Hero,
-        slot: ItemSlot(2),
-        target: ActionTarget::None,
-    };
-    for (statuses, allowed) in [
-        (StatusFlags::FEARED, false),
-        (StatusFlags::STUNNED, false),
-        (StatusFlags::CHANNELLING, false),
-        (0, true),
-        (StatusFlags::SILENCED, true),
-    ] {
-        let mut view = world_view(1);
-        let hero_index = hero_index(&view);
-        view.units[hero_index].items[2] = Some(item(Some(Aim::Own), 0));
-        view.units[hero_index].statuses.bits = statuses;
-
-        let space = ActionSpace::from_tracker(&tracker_with_view(view)).expect("item status space");
-
-        assert_eq!(space.item_slot_mask(ControlledUnit::Hero)[2], allowed);
-        assert_eq!(space.allows(action), allowed);
-        if allowed {
-            assert_eq!(
-                space
-                    .decode(action)
-                    .expect("legal item")
-                    .expect("order")
-                    .order,
-                Order::Use {
-                    slot: ItemSlot(2),
-                    target: Target::None
-                }
-            );
-        } else {
-            assert_eq!(
-                space.decode(action),
-                Err(ActionError::NotAllowed(ActionKind::Use))
-            );
-        }
+            StructuredAction::Cast {
+                unit: ControlledUnit::Hero,
+                slot: AbilitySlot(1),
+                target: ActionTarget::Entity(target),
+            },
+            allowed.then_some(Order::Cast {
+                slot: AbilitySlot(1),
+                target: Target::Unit(ENEMY),
+            }),
+        );
+        assert_gate(
+            &space,
+            StructuredAction::Sell {
+                unit: ControlledUnit::Hero,
+                slot: ItemSlot(0),
+            },
+            allowed.then_some(Order::Sell { slot: ItemSlot(0) }),
+        );
     }
 }
 
 #[test]
-fn feared_casts_are_masked_but_no_disable_allows_cast() {
-    let action = StructuredAction::Cast {
-        unit: ControlledUnit::Hero,
-        slot: AbilitySlot(0),
-        target: ActionTarget::None,
-    };
-    for (statuses, allowed) in [
-        (StatusFlags::FEARED, false),
-        (StatusFlags::STUNNED, false),
-        (StatusFlags::CHANNELLING, false),
-        (StatusFlags::SILENCED, false),
-        (0, true),
+fn missing_snapshot_and_invalid_recipe_schemas_report_specific_errors() {
+    let tracker = StateTracker::new(SlotId(0), &match_info()).expect("tracker");
+    assert_eq!(
+        ActionSpace::from_tracker(&tracker)
+            .err()
+            .expect("snapshot required")
+            .to_string(),
+        "action space requires a validated snapshot"
+    );
+    for (parts, message) in [
+        ([vec![ItemId(1)], vec![ItemId(0)]], "cyclic shop recipe"),
+        ([vec![ItemId(99)], vec![]], "unknown recipe component"),
     ] {
-        let mut view = world_view(1);
-        let hero_index = hero_index(&view);
-        view.units[hero_index].abilities = vec![ability(Aim::Own, 0)];
-        view.units[hero_index].statuses.bits = statuses;
-
-        let space = ActionSpace::from_tracker(&tracker_with_view(view)).expect("cast status space");
-
-        assert_eq!(space.ability_slot_mask(ControlledUnit::Hero)[0], allowed);
-        assert_eq!(space.allows(action), allowed);
-        if allowed {
-            assert_eq!(
-                space
-                    .decode(action)
-                    .expect("legal cast")
-                    .expect("order")
-                    .order,
-                Order::Cast {
-                    slot: AbilitySlot(0),
-                    target: Target::None
-                }
-            );
-        } else {
-            assert_eq!(
-                space.decode(action),
-                Err(ActionError::NotAllowed(ActionKind::Cast))
-            );
+        let mut info = match_info();
+        for (entry, parts) in info.shop.iter_mut().zip(parts) {
+            entry.components = parts;
         }
+        let tracker = tracker_with_info_and_view(&info, world_view(1));
+        assert_eq!(
+            ActionSpace::from_tracker(&tracker).err(),
+            Some(ActionError::InvalidSchema(message))
+        );
     }
-}
-
-#[test]
-fn channelling_masks_casts_and_items_but_keeps_interrupting_movement_legal() {
-    let mut view = world_view(1);
-    let hero_index = hero_index(&view);
-    view.units[hero_index].abilities = vec![ability(Aim::Own, 0)];
-    view.units[hero_index].items = action_items();
-    view.units[hero_index].statuses.bits = StatusFlags::CHANNELLING;
-
-    let space = ActionSpace::from_tracker(&tracker_with_view(view)).expect("channel space");
-
-    assert!(
-        space
-            .ability_slot_mask(ControlledUnit::Hero)
-            .iter()
-            .all(|allowed| !allowed)
-    );
-    assert!(
-        space
-            .item_slot_mask(ControlledUnit::Hero)
-            .iter()
-            .all(|allowed| !allowed)
-    );
-    assert!(
-        space
-            .controlled_unit_mask(ActionKind::MovePoint)
-            .allows(ControlledUnit::Hero)
-    );
-}
-
-#[test]
-fn inventory_economy_and_learning_masks_cover_positive_and_negative_boundaries() {
-    let mut view = world_view(1);
-    let hero_index = hero_index(&view);
-    view.units[hero_index].items = action_items();
-    view.units[hero_index].items[8] = None;
-    view.players[0].stash = Some(vec![Some(item(Some(Aim::Own), 0)); 6]);
-    let full_stash = ActionSpace::from_tracker(&tracker_with_view(view.clone())).expect("space");
-    assert!(full_stash.take_mask(ControlledUnit::Hero)[0]);
-    assert!(full_stash.sell_slot_mask(ControlledUnit::Hero)[0]);
-    assert!(!full_stash.sell_slot_mask(ControlledUnit::Hero)[1]);
-    assert!(
-        full_stash
-            .swap_destination_mask(ControlledUnit::Hero, ItemSlot(0))
-            .expect("source")[8]
-    );
-    assert!(full_stash.learn_slot_mask()[0]);
-    assert!(full_stash.buy_mask(ControlledUnit::Hero)[0]);
-
-    view.units[hero_index].items[8] = Some(item(Some(Aim::Own), 0));
-    view.units[hero_index].items[7] = Some(item(Some(Aim::Own), 0));
-    view.players[0].gold = Some(0);
-    let no_capacity_or_gold =
-        ActionSpace::from_tracker(&tracker_with_view(view)).expect("blocked economy");
-    assert!(
-        no_capacity_or_gold
-            .take_mask(ControlledUnit::Hero)
-            .iter()
-            .all(|allowed| !allowed)
-    );
-    assert!(
-        no_capacity_or_gold
-            .buy_mask(ControlledUnit::Hero)
-            .iter()
-            .all(|allowed| !allowed)
-    );
-    assert!(
-        !no_capacity_or_gold
-            .swap_destination_mask(ControlledUnit::Hero, ItemSlot(0))
-            .expect("source")[0]
-    );
-}
-
-#[test]
-fn sell_requires_for_sale_as_prior_ownership_proof() {
-    let mut view = world_view(1);
-    let hero_index = hero_index(&view);
-    view.units[hero_index].items[0] = Some(item_with_id(ItemId(0), None, 0, false));
-    view.units[hero_index].items[1] = Some(item_with_id(ItemId(1), None, 0, true));
-
-    let space = ActionSpace::from_tracker(&tracker_with_view(view)).expect("space");
-
-    assert!(!space.sell_slot_mask(ControlledUnit::Hero)[0]);
-    assert!(space.sell_slot_mask(ControlledUnit::Hero)[1]);
-}
-
-#[test]
-fn composite_buy_requires_each_missing_part_slot_and_courier_buy_is_masked() {
-    let mut info = match_info();
-    info.shop = vec![
-        ShopEntry {
-            id: ItemId(0),
-            cost: 400,
-            components: Vec::new(),
-        },
-        ShopEntry {
-            id: ItemId(1),
-            cost: 400,
-            components: Vec::new(),
-        },
-        ShopEntry {
-            id: ItemId(2),
-            cost: 900,
-            components: vec![ItemId(0), ItemId(1)],
-        },
-    ];
-    let mut view = world_view(1);
-    let hero_index = hero_index(&view);
-    view.units[hero_index].items = vec![Some(item_with_id(ItemId(9), None, 0, false)); 9];
-    view.players[0].stash = Some(vec![Some(item_with_id(ItemId(9), None, 0, false)); 5]);
-    view.players[0].stash.as_mut().expect("stash").push(None);
-    view.players[0].gold = Some(1_000);
-    let mut tracker = StateTracker::new(SlotId(0), &info).expect("tracker");
-    tracker.observe_snapshot(&view).expect("snapshot");
-
-    let no_parts = ActionSpace::from_tracker(&tracker).expect("space");
-    assert!(!no_parts.buy_mask(ControlledUnit::Hero)[2]);
-    assert!(
-        no_parts
-            .buy_mask(ControlledUnit::Courier)
-            .iter()
-            .all(|allowed| !allowed)
-    );
-
-    view.units[hero_index].items[0] = Some(item_with_id(ItemId(0), None, 0, false));
-    tracker
-        .observe_snapshot(&WorldView { tick: 2, ..view })
-        .expect("second snapshot");
-    let one_part_held = ActionSpace::from_tracker(&tracker).expect("space");
-    assert!(one_part_held.buy_mask(ControlledUnit::Hero)[2]);
-}
-
-#[test]
-fn composite_buy_requires_full_price_and_missing_leaf_price() {
-    let mut info = match_info();
-    // Server validation checks the 250 full cost, but execution pays the 300
-    // missing leaf sum: gold 280 passes validation yet silently buys nothing.
-    info.shop = vec![
-        ShopEntry {
-            id: ItemId(0),
-            cost: 150,
-            components: Vec::new(),
-        },
-        ShopEntry {
-            id: ItemId(1),
-            cost: 150,
-            components: Vec::new(),
-        },
-        ShopEntry {
-            id: ItemId(2),
-            cost: 250,
-            components: vec![ItemId(0), ItemId(1)],
-        },
-    ];
-    let mut view = world_view(1);
-    view.players[0].gold = Some(200);
-    let mut tracker = StateTracker::new(SlotId(0), &info).expect("tracker");
-    tracker.observe_snapshot(&view).expect("snapshot");
-
-    let below_full = ActionSpace::from_tracker(&tracker).expect("space");
-    assert!(!below_full.buy_mask(ControlledUnit::Hero)[2]);
-
-    view.players[0].gold = Some(280);
-    tracker
-        .observe_snapshot(&WorldView {
-            tick: 2,
-            ..view.clone()
-        })
-        .expect("second snapshot");
-    let validation_only = ActionSpace::from_tracker(&tracker).expect("space");
-    assert!(!validation_only.buy_mask(ControlledUnit::Hero)[2]);
-
-    view.players[0].gold = Some(300);
-    tracker
-        .observe_snapshot(&WorldView { tick: 3, ..view })
-        .expect("third snapshot");
-    let enough_for_both = ActionSpace::from_tracker(&tracker).expect("space");
-    assert!(enough_for_both.buy_mask(ControlledUnit::Hero)[2]);
 }
 
 #[cfg(feature = "builtin")]
 #[test]
-fn composite_buy_at_missing_cost_decodes_to_legal_recipe_and_assembles_wraith_band() {
-    let (mut world, info) = wraith_upgrade_world(210);
-    let order = Order::Buy { item: ItemId(33) };
-    assert_eq!(
-        world.validate_order(SlotId(0), None, &order),
-        Err(bota_proto::RejectReason::NotEnoughGold)
-    );
-    let tracker = tracker_with_info_and_view(&info, world.view(Team::Radiant));
-    let space = ActionSpace::from_tracker(&tracker).expect("upgrade space");
-    let action = buy_action(&space, ItemId(33));
-
-    assert!(space.allows(action), "the remaining recipe costs only 210");
-    let issued = space.decode(action).expect("upgrade decodes").expect("buy");
-    assert_eq!(issued.order, Order::Buy { item: ItemId(39) });
+fn native_upgrade_trace_rejects_underpayment_then_executes_the_decoded_leaf() {
+    let (mut world, info) = wraith_upgrade_world(209);
+    let rejected = space(&info, world.view(Team::Radiant));
+    assert_gate(&rejected, buy_action(&rejected, ItemId(33)), None);
+    world.seats[0].gold = 210;
+    let ready = space(&info, world.view(Team::Radiant));
+    let action = buy_action(&ready, ItemId(33));
+    assert_gate(&ready, action, Some(Order::Buy { item: ItemId(39) }));
+    let issued = ready
+        .decode(action)
+        .expect("decode")
+        .expect("leaf purchase");
     assert_eq!(
         world.validate_order(SlotId(0), issued.unit, &issued.order),
         Ok(())
@@ -1378,180 +318,23 @@ fn composite_buy_at_missing_cost_decodes_to_legal_recipe_and_assembles_wraith_ba
         unit: issued.unit,
         order: issued.order,
     }]);
-
     assert_eq!(world.seats[0].gold, 0);
-    let hero = world.seats[0].unit.expect("hero");
-    let bag = &world.inventory.get(hero).expect("inventory").slots;
+    let view = world.view(Team::Radiant);
+    let hero = view.players[0].unit.expect("hero");
+    let items = &view
+        .units
+        .iter()
+        .find(|unit| unit.id == hero)
+        .expect("hero body")
+        .items;
     assert_eq!(
-        bag.iter().flatten().map(|item| item.id).collect::<Vec<_>>(),
+        items
+            .iter()
+            .flatten()
+            .map(|item| item.id)
+            .collect::<Vec<_>>(),
         [ItemId(33)]
     );
-}
-
-#[cfg(feature = "builtin")]
-#[test]
-fn composite_buy_below_missing_cost_is_masked_with_exact_decode_error() {
-    let (world, info) = wraith_upgrade_world(209);
-    let tracker = tracker_with_info_and_view(&info, world.view(Team::Radiant));
-    let space = ActionSpace::from_tracker(&tracker).expect("upgrade space");
-    let action = buy_action(&space, ItemId(33));
-
-    assert!(!space.allows(action));
-    let error = space.decode(action).expect_err("cannot afford the recipe");
-    assert_eq!(error, ActionError::NotAllowed(ActionKind::Buy));
-    assert_eq!(
-        error.to_string(),
-        "action Buy is masked by the current action space"
-    );
-}
-
-#[cfg(feature = "builtin")]
-#[test]
-fn composite_buy_with_full_gold_keeps_root_order_and_pays_only_missing_cost() {
-    let (mut world, info) = wraith_upgrade_world(505);
-    let tracker = tracker_with_info_and_view(&info, world.view(Team::Radiant));
-    let space = ActionSpace::from_tracker(&tracker).expect("upgrade space");
-    let action = buy_action(&space, ItemId(33));
-
-    let issued = space.decode(action).expect("upgrade decodes").expect("buy");
-    assert_eq!(issued.order, Order::Buy { item: ItemId(33) });
-    assert_eq!(
-        world.validate_order(SlotId(0), issued.unit, &issued.order),
-        Ok(())
-    );
-    world.advance(&[bota_server::game::Command {
-        slot: SlotId(0),
-        unit: issued.unit,
-        order: issued.order,
-    }]);
-    assert_eq!(world.seats[0].gold, 295);
-}
-
-#[cfg(feature = "builtin")]
-#[test]
-fn composite_buy_with_no_delivery_capacity_is_masked_and_recipe_is_rejected() {
-    let (mut world, info) = wraith_upgrade_world(210);
-    let hero = world.seats[0].unit.expect("hero");
-    let bag = world.inventory.get_mut(hero).expect("inventory");
-    let filler = bag.slots[0];
-    for slot in &mut bag.slots[2..] {
-        *slot = filler;
-    }
-    world.seats[0].stash.slots.fill(filler);
-    let tracker = tracker_with_info_and_view(&info, world.view(Team::Radiant));
-    let space = ActionSpace::from_tracker(&tracker).expect("full inventory");
-
-    assert!(!space.allows(buy_action(&space, ItemId(33))));
-    assert_eq!(
-        world.validate_order(SlotId(0), None, &Order::Buy { item: ItemId(39) }),
-        Err(bota_proto::RejectReason::InventoryFull)
-    );
-}
-
-#[cfg(feature = "builtin")]
-#[test]
-fn composite_buy_does_not_discount_parts_on_courier_but_does_discount_stash() {
-    for in_stash in [true, false] {
-        let (mut world, info) = wraith_upgrade_world(210);
-        let hero = world.seats[0].unit.expect("hero");
-        let circlet = world.inventory.get_mut(hero).expect("inventory").slots[0].take();
-        if in_stash {
-            world.seats[0].stash.slots[0] = circlet;
-        } else {
-            let courier = world.seats[0].courier.expect("courier");
-            world.inventory.get_mut(courier).expect("courier bag").slots[0] = circlet;
-        }
-        let tracker = tracker_with_info_and_view(&info, world.view(Team::Radiant));
-        let space = ActionSpace::from_tracker(&tracker).expect("component locations");
-
-        assert_eq!(space.allows(buy_action(&space, ItemId(33))), in_stash);
-        assert!(space.allows(buy_action(&space, ItemId(39))));
-    }
-}
-
-#[test]
-fn composite_buy_buys_missing_leaves_in_recipe_order_without_overspending() {
-    let mut info = match_info();
-    info.shop = vec![
-        ShopEntry {
-            id: ItemId(0),
-            cost: 100,
-            components: Vec::new(),
-        },
-        ShopEntry {
-            id: ItemId(1),
-            cost: 150,
-            components: Vec::new(),
-        },
-        ShopEntry {
-            id: ItemId(2),
-            cost: 500,
-            components: vec![ItemId(1), ItemId(0)],
-        },
-    ];
-    let mut view = world_view(1);
-    view.players[0].gold = Some(250);
-    let tracker = tracker_with_info_and_view(&info, view.clone());
-    let space = ActionSpace::from_tracker(&tracker).expect("first component");
-
-    assert_order(
-        &space,
-        buy_action(&space, ItemId(2)),
-        None,
-        Order::Buy { item: ItemId(1) },
-    );
-
-    let hero = hero_index(&view);
-    view.units[hero].items[0] = Some(item_with_id(ItemId(1), None, 0, false));
-    view.players[0].gold = Some(100);
-    let tracker = tracker_with_info_and_view(&info, view);
-    let space = ActionSpace::from_tracker(&tracker).expect("second component");
-    assert_order(
-        &space,
-        buy_action(&space, ItemId(2)),
-        None,
-        Order::Buy { item: ItemId(0) },
-    );
-}
-
-#[test]
-fn composite_buy_with_no_missing_parts_is_masked_instead_of_issuing_a_noop() {
-    let mut info = match_info();
-    info.shop.push(ShopEntry {
-        id: ItemId(2),
-        cost: 750,
-        components: vec![ItemId(0), ItemId(1)],
-    });
-    let mut view = world_view(1);
-    let hero = hero_index(&view);
-    for (slot, id) in [ItemId(0), ItemId(1)].into_iter().enumerate() {
-        view.units[hero].items[slot] = Some(item_with_id(id, None, 0, false));
-    }
-    view.players[0].gold = Some(1_000);
-    let tracker = tracker_with_info_and_view(&info, view);
-    let space = ActionSpace::from_tracker(&tracker).expect("all parts held");
-
-    assert!(!space.allows(buy_action(&space, ItemId(2))));
-    assert!(space.allows(buy_action(&space, ItemId(0))));
-}
-
-#[test]
-fn composite_component_decoding_is_preserved_by_navigation_action_schema_five() {
-    assert_eq!(crate::ACTION_SCHEMA_VERSION, 5);
-    assert!(crate::ACTION_SCHEMA_DESCRIPTOR.contains("buy_decode=root_or_first_missing_leaf"));
-    assert_eq!(crate::ACTION_SCHEMA_HASH, 10_658_390_830_565_586_343);
-}
-
-fn buy_action(space: &ActionSpace, item: ItemId) -> StructuredAction {
-    let index = space
-        .shop_candidates()
-        .iter()
-        .position(|candidate| candidate.item == item)
-        .expect("shop item");
-    StructuredAction::Buy {
-        unit: ControlledUnit::Hero,
-        item: ShopIndex(index),
-    }
 }
 
 #[cfg(feature = "builtin")]
@@ -1562,460 +345,77 @@ fn wraith_upgrade_world(gold: i32) -> (bota_server::game::World, MatchInfo) {
         picks: match_info().picks,
         map: MapId(1),
         tick_rate: 30,
-        mode: TickMode::Lockstep,
+        mode: bota_proto::TickMode::Lockstep,
         ack_timeout_ticks: 30,
         cheats: false,
         spawn_modifiers: Vec::new(),
     };
     let mut world = bota_server::game::World::for_match(&config, config.rng());
-    let mut events = Vec::new();
     for item in [ItemId(9), ItemId(11)] {
         assert_eq!(
             world.validate_order(SlotId(0), None, &Order::Buy { item }),
             Ok(())
         );
-        assert!(world.buy(SlotId(0), item, &mut events));
+        assert!(world.buy(SlotId(0), item, &mut Vec::new()));
     }
     world.step();
     world.seats[0].gold = gold;
     (world, config.info())
 }
 
-#[test]
-fn cyclic_and_unknown_recipe_schemas_return_action_error() {
-    let mut cyclic_info = match_info();
-    cyclic_info.shop = vec![
-        ShopEntry {
-            id: ItemId(0),
-            cost: 100,
-            components: vec![ItemId(1)],
-        },
-        ShopEntry {
-            id: ItemId(1),
-            cost: 100,
-            components: vec![ItemId(0)],
-        },
-    ];
-    let cyclic = tracker_with_info_and_view(&cyclic_info, world_view(1));
-    assert_eq!(
-        ActionSpace::from_tracker(&cyclic).err(),
-        Some(ActionError::InvalidSchema("cyclic shop recipe"))
-    );
-
-    let mut unknown_info = match_info();
-    unknown_info.shop[0].components = vec![ItemId(99)];
-    let unknown = tracker_with_info_and_view(&unknown_info, world_view(1));
-    assert_eq!(
-        ActionSpace::from_tracker(&unknown).err(),
-        Some(ActionError::InvalidSchema("unknown recipe component"))
-    );
-}
-
-#[test]
-fn schema_decode_maps_every_action_family_to_wire_order_and_rejects_injected_indices() {
-    let mut view = world_view(1);
-    let hero_index = hero_index(&view);
-    view.units[hero_index].items = action_items();
-    let space = ActionSpace::from_tracker(&tracker_with_view(view)).expect("space");
-    let point = walkable_point(&space);
-    let courier = entity_candidate(&space, EntityRelation::Own, UnitKind::Courier);
-    let enemy = entity_candidate(&space, EntityRelation::Enemy, UnitKind::Hero);
-    assert!(space.put_underfoot_mask(ControlledUnit::Hero)[0]);
-    assert!(
-        space
-            .put_point_target_mask(ControlledUnit::Hero, ItemSlot(0))
-            .expect("put point mask")
-            .iter()
-            .all(|allowed| !allowed)
-    );
-
-    assert_eq!(
-        space.decode(StructuredAction::Continue).expect("continue"),
-        None
-    );
-    assert_order(
-        &space,
-        StructuredAction::Stop {
-            unit: ControlledUnit::Hero,
-        },
-        None,
-        Order::Move {
-            target: Target::None,
-        },
-    );
-    assert_order(
-        &space,
-        StructuredAction::MovePoint {
-            unit: ControlledUnit::Hero,
-            point,
-        },
-        None,
-        Order::Move {
-            target: Target::Pos(space.point_candidates()[point.0].position),
-        },
-    );
-    assert_order(
-        &space,
-        StructuredAction::FollowUnit {
-            unit: ControlledUnit::Hero,
-            target: courier,
-        },
-        None,
-        Order::Move {
-            target: Target::Unit(COURIER_ID),
-        },
-    );
-    assert_order(
-        &space,
-        StructuredAction::Hold {
-            unit: ControlledUnit::Hero,
-        },
-        None,
-        Order::Attack {
-            target: Target::None,
-        },
-    );
-    assert_order(
-        &space,
-        StructuredAction::AttackMovePoint {
-            unit: ControlledUnit::Hero,
-            point,
-        },
-        None,
-        Order::Attack {
-            target: Target::Pos(space.point_candidates()[point.0].position),
-        },
-    );
-    assert_order(
-        &space,
-        StructuredAction::AttackUnit {
-            unit: ControlledUnit::Hero,
-            target: enemy,
-        },
-        None,
-        Order::Attack {
-            target: Target::Unit(ENEMY_ID),
-        },
-    );
-    assert_order(
-        &space,
-        StructuredAction::Cast {
-            unit: ControlledUnit::Hero,
-            slot: AbilitySlot(0),
-            target: ActionTarget::None,
-        },
-        None,
-        Order::Cast {
-            slot: AbilitySlot(0),
-            target: Target::None,
-        },
-    );
-    assert_order(
-        &space,
-        StructuredAction::Use {
-            unit: ControlledUnit::Hero,
-            slot: ItemSlot(0),
-            target: ActionTarget::None,
-        },
-        None,
-        Order::Use {
-            slot: ItemSlot(0),
-            target: Target::None,
-        },
-    );
-    assert_order(
-        &space,
-        StructuredAction::PutPoint {
-            unit: ControlledUnit::Hero,
-            source: ItemSlot(0),
-            target: PutPointTarget::Underfoot,
-        },
-        None,
-        Order::Put {
-            slot: ItemSlot(0),
-            target: Target::None,
-        },
-    );
-    assert_order(
-        &space,
-        StructuredAction::PutUnit {
-            unit: ControlledUnit::Hero,
-            source: ItemSlot(0),
-            target: courier,
-        },
-        None,
-        Order::Put {
-            slot: ItemSlot(0),
-            target: Target::Unit(COURIER_ID),
-        },
-    );
-    assert_order(
-        &space,
-        StructuredAction::Take {
-            unit: ControlledUnit::Hero,
-            loot: LootIndex(0),
-        },
-        None,
-        Order::Take {
-            target: Target::Unit(LOOT_ID),
-        },
-    );
-    assert_order(
-        &space,
-        StructuredAction::Buy {
-            unit: ControlledUnit::Hero,
-            item: ShopIndex(0),
-        },
-        None,
-        Order::Buy { item: ItemId(0) },
-    );
-    assert_order(
-        &space,
-        StructuredAction::Sell {
-            unit: ControlledUnit::Hero,
-            slot: ItemSlot(0),
-        },
-        None,
-        Order::Sell { slot: ItemSlot(0) },
-    );
-    assert_order(
-        &space,
-        StructuredAction::Swap {
-            unit: ControlledUnit::Hero,
-            from: ItemSlot(0),
-            to: ItemSlot(8),
-        },
-        None,
-        Order::Swap {
-            from: ItemSlot(0),
-            to: ItemSlot(8),
-        },
-    );
-    assert_order(
-        &space,
-        StructuredAction::Learn {
-            slot: AbilitySlot(0),
-        },
-        None,
-        Order::Learn {
-            slot: AbilitySlot(0),
-        },
-    );
-    assert_order(
-        &space,
-        StructuredAction::Stop {
-            unit: ControlledUnit::Courier,
-        },
-        Some(COURIER_ID),
-        Order::Move {
-            target: Target::None,
-        },
-    );
-
-    let error = space
-        .decode(StructuredAction::AttackUnit {
-            unit: ControlledUnit::Hero,
-            target: EntityIndex(UNIT_TOKENS),
-        })
-        .expect_err("fabricated target");
-    assert_eq!(
-        error.to_string(),
-        format!(
-            "entity target index 96 is outside candidate count {}",
-            space.entity_candidates().len()
-        )
-    );
-}
-
 #[cfg(feature = "builtin")]
-#[test]
-fn real_builtin_map_zero_and_one_snapshots_build_and_safe_allowed_actions_validate() {
-    for map in [MapId(0), MapId(1)] {
-        let (mut arena, start) = crate::Arena::new(crate::ArenaConfig {
-            seats: 2,
-            map,
-            seed: 919,
-        })
-        .expect("arena");
-        let (info, view) = start_info_and_view(&start.messages[0]);
-        let mut tracker = StateTracker::new(SlotId(0), info).expect("tracker");
-        tracker.observe_snapshot(view).expect("snapshot");
-        let space = ActionSpace::from_tracker(&tracker).expect("real action space");
-        let actions = [
-            StructuredAction::Continue,
-            StructuredAction::Stop {
-                unit: ControlledUnit::Hero,
-            },
-            StructuredAction::Hold {
-                unit: ControlledUnit::Hero,
-            },
-        ];
-        for (sequence, action) in actions.into_iter().enumerate() {
-            assert!(space.allows(action));
-            let decoded = space.decode(action).expect("allowed action decodes");
-            let request = decoded.map(|issued| crate::Request {
-                seq: u32::try_from(sequence).expect("small sequence"),
-                unit: issued.unit,
-                order: issued.order,
-            });
-            let step = arena.step(&[request, None]).expect("arena step");
-            assert!(
-                !step.messages[0]
-                    .iter()
-                    .any(|message| matches!(message, bota_proto::ServerMsg::OrderRejected { .. }))
-            );
-        }
+fn buy_action(space: &ActionSpace, item: ItemId) -> StructuredAction {
+    let index = space
+        .shop_candidates()
+        .iter()
+        .position(|candidate| candidate.item == item)
+        .expect("item");
+    StructuredAction::Buy {
+        unit: ControlledUnit::Hero,
+        item: ShopIndex(index),
     }
 }
 
-fn decoded_candidate_ids(space: &ActionSpace) -> Vec<EntityId> {
-    let mut ids = Vec::new();
-    for unit in [ControlledUnit::Hero, ControlledUnit::Courier] {
-        for index in 0..space.entity_candidates().len() {
-            let decoded = space
-                .decode(StructuredAction::FollowUnit {
-                    unit,
-                    target: EntityIndex(index),
-                })
-                .ok()
-                .flatten();
-            if let Some(crate::IssuedOrder {
-                order: Order::Move {
-                    target: Target::Unit(id),
-                },
-                ..
-            }) = decoded
-                && !ids.contains(&id)
-            {
-                ids.push(id);
-            }
-        }
+pub(super) fn assert_gate(space: &ActionSpace, action: StructuredAction, order: Option<Order>) {
+    assert_eq!(space.allows(action), order.is_some(), "{action:?}");
+    if let Some(order) = order {
+        let issued = space.decode(action).expect("decode").expect("wire order");
+        assert_eq!(issued.unit, None);
+        assert_eq!(issued.order, order);
+    } else {
+        let error = space.decode(action).expect_err("masked action");
+        assert_eq!(error, ActionError::NotAllowed(action.kind()));
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "action {:?} is masked by the current action space",
+                action.kind()
+            )
+        );
     }
-    ids.sort_unstable();
-    ids
 }
 
-fn entity_candidate(space: &ActionSpace, relation: EntityRelation, kind: UnitKind) -> EntityIndex {
-    EntityIndex(
-        space
-            .entity_candidates()
-            .iter()
-            .position(|candidate| candidate.relation == relation && candidate.kind == kind)
-            .expect("entity candidate"),
-    )
+pub(super) fn space(info: &MatchInfo, view: WorldView) -> ActionSpace {
+    ActionSpace::from_tracker(&tracker_with_info_and_view(info, view)).expect("space")
 }
 
-fn walkable_point(space: &ActionSpace) -> PointIndex {
-    PointIndex(
-        space
-            .point_candidates()
-            .iter()
-            .position(|point| point.walkable)
-            .expect("walkable point"),
-    )
-}
-
-fn assert_order(
-    space: &ActionSpace,
-    action: StructuredAction,
-    unit: Option<EntityId>,
-    order: Order,
-) {
-    assert!(space.allows(action), "{action:?}");
-    let issued = space.decode(action).expect("decode").expect("wire order");
-    assert_eq!(issued.unit, unit);
-    assert_eq!(issued.order, order);
-}
-
-fn tracker_with_view(view: WorldView) -> StateTracker {
-    tracker_with_info_and_view(&match_info(), view)
-}
-
-fn tracker_with_info_and_view(info: &MatchInfo, view: WorldView) -> StateTracker {
+pub(super) fn tracker_with_info_and_view(info: &MatchInfo, view: WorldView) -> StateTracker {
     let mut tracker = StateTracker::new(SlotId(0), info).expect("tracker");
     tracker.observe_snapshot(&view).expect("snapshot");
     tracker
 }
 
-fn tactical_point(space: &ActionSpace, direction: PointDirection, radius: i32) -> PointIndex {
-    PointIndex(
-        space
-            .point_candidates()
-            .iter()
-            .position(|point| point.source == PointSource::Tactical { direction, radius })
-            .expect("tactical point"),
-    )
-}
-
-fn item_with_id(id: ItemId, aim: Option<Aim>, range: i32, for_sale: bool) -> ItemView {
-    ItemView {
-        id,
-        for_sale,
-        ..item(aim, range)
-    }
-}
-
-fn match_info() -> MatchInfo {
+pub(super) fn match_info() -> MatchInfo {
     fixtures::MatchInfoFixture::new(1, MapId(0), fixtures::two_seat_picks(Team::Radiant))
         .pregame_ticks(90)
-        .trees(vec![
-            Vec2::from_ints(2_050, 2_050),
-            Vec2::from_ints(2_100, 2_100),
-            Vec2::from_ints(2_200, 1_900),
-        ])
         .terrain_cells(128)
         .terrain_rle(vec![(16_384, 0x80)])
-        .shop(vec![
-            ShopEntry {
-                id: ItemId(0),
-                cost: 50,
-                components: Vec::new(),
-            },
-            ShopEntry {
-                id: ItemId(1),
-                cost: 700,
-                components: Vec::new(),
-            },
-        ])
+        .shop(shop_entries(&[(0, 50, &[]), (1, 700, &[])]))
         .build()
 }
 
-fn world_view(tick: u32) -> WorldView {
-    let mut units = vec![
-        hero(),
-        courier(),
-        unit(ENEMY_ID, UnitKind::Hero, Team::Dire, 2_300, 2_000),
-        unit(
-            entity(30, 1),
-            UnitKind::Fountain,
-            Team::Radiant,
-            1_500,
-            1_500,
-        ),
-        unit(entity(31, 1), UnitKind::Fountain, Team::Dire, 7_000, 7_000),
-        unit(entity(32, 1), UnitKind::Tower, Team::Radiant, 2_500, 2_000),
-        unit(entity(33, 1), UnitKind::Tower, Team::Dire, 3_000, 2_000),
-    ];
-    units.sort_by_key(|unit| unit.id);
-    WorldView {
-        tick,
-        viewer: Some(Team::Radiant),
-        units,
-        projectiles: Vec::new(),
-        players: vec![own_player(), enemy_player()],
-        felled_trees: vec![0],
-        planted_trees: vec![Vec2::from_ints(1_900, 2_100)],
-        loot: vec![LootView {
-            id: LOOT_ID,
-            pos: Vec2::from_ints(2_050, 2_000),
-            item: ItemId(0),
-            charges: Some(1),
-        }],
-    }
-}
-
-fn hero() -> UnitView {
-    let mut hero = unit(HERO_ID, UnitKind::Hero, Team::Radiant, 2_000, 2_000);
+pub(super) fn world_view(tick: u32) -> WorldView {
+    let mut hero = unit(HERO, UnitKind::Hero, Team::Radiant, 2_000, 2_000);
     hero.hero = Some(SHADOW_FIEND);
     hero.owner = Some(SlotId(0));
     hero.mana = 500;
@@ -2029,23 +429,78 @@ fn hero() -> UnitView {
         ability(Aim::Unit, 300),
         ability(Aim::Point, 1_200),
         ability(Aim::Tree, 1_200),
-        ability(Aim::Building, 1_200),
-        ability(Aim::Own, 0),
     ];
     hero.items = vec![None; 9];
-    hero
-}
-
-fn courier() -> UnitView {
-    let mut courier = unit(COURIER_ID, UnitKind::Courier, Team::Radiant, 2_100, 2_000);
+    hero.items[0] = Some(ItemView {
+        for_sale: true,
+        ..item(Some(Aim::Own), 0)
+    });
+    let mut courier = unit(COURIER, UnitKind::Courier, Team::Radiant, 2_100, 2_000);
     courier.owner = Some(SlotId(0));
     courier.items = vec![None; 6];
     courier.attack_damage = 0;
-    courier
+    let own = own_player();
+    let enemy = PlayerView {
+        slot: SlotId(1),
+        team: Team::Dire,
+        unit: Some(EntityId {
+            idx: 777,
+            generation: 4,
+        }),
+        level: 1,
+        gold: None,
+        stash: None,
+        ..own.clone()
+    };
+    WorldView {
+        tick,
+        viewer: Some(Team::Radiant),
+        units: vec![
+            hero,
+            courier,
+            unit(ENEMY, UnitKind::Hero, Team::Dire, 2_300, 2_000),
+            unit(
+                EntityId {
+                    idx: 30,
+                    generation: 1,
+                },
+                UnitKind::Fountain,
+                Team::Radiant,
+                1_500,
+                1_500,
+            ),
+        ],
+        projectiles: Vec::new(),
+        players: vec![own, enemy],
+        felled_trees: Vec::new(),
+        planted_trees: Vec::new(),
+        loot: vec![LootView {
+            id: LOOT,
+            pos: Vec2::from_ints(2_050, 2_000),
+            item: ItemId(0),
+            charges: Some(1),
+        }],
+    }
 }
 
-fn enemy_creep(id: EntityId, x: i32, y: i32) -> UnitView {
-    unit(id, UnitKind::CreepMelee, Team::Dire, x, y)
+fn own_player() -> PlayerView {
+    PlayerView {
+        slot: SlotId(0),
+        team: Team::Radiant,
+        hero: SHADOW_FIEND,
+        unit: Some(HERO),
+        level: 6,
+        xp: 0,
+        gold: Some(600),
+        stash: Some(vec![None; 6]),
+        kit: None,
+        kills: 0,
+        deaths: 0,
+        assists: 0,
+        last_hits: 0,
+        denies: 0,
+        respawn_left: 0,
+    }
 }
 
 fn unit(id: EntityId, kind: UnitKind, team: Team, x: i32, y: i32) -> UnitView {
@@ -2066,7 +521,22 @@ fn unit(id: EntityId, kind: UnitKind, team: Team, x: i32, y: i32) -> UnitView {
     .build()
 }
 
-fn ability(aim: Aim, range: i32) -> AbilityView {
+pub(super) fn shop_entries(rows: &[(u16, i32, &[u16])]) -> Vec<ShopEntry> {
+    assert!(rows.len() <= crate::MAX_SHOP_ITEMS);
+    assert!(
+        rows.iter()
+            .all(|(_, _, parts)| parts.len() <= crate::MAX_SHOP_ITEMS)
+    );
+    rows.iter()
+        .map(|&(id, cost, parts)| ShopEntry {
+            id: ItemId(id),
+            cost,
+            components: parts.iter().copied().map(ItemId).collect(),
+        })
+        .collect()
+}
+
+pub(super) fn ability(aim: Aim, range: i32) -> AbilityView {
     AbilityView {
         id: AbilityId(13),
         level: 1,
@@ -2081,23 +551,7 @@ fn ability(aim: Aim, range: i32) -> AbilityView {
     }
 }
 
-fn action_items() -> Vec<Option<ItemView>> {
-    let mut first = item(Some(Aim::Own), 0);
-    first.for_sale = true;
-    vec![
-        Some(first),
-        Some(item(Some(Aim::Unit), 250)),
-        Some(item(Some(Aim::Point), 1_200)),
-        Some(item(Some(Aim::Tree), 1_200)),
-        Some(item(Some(Aim::Building), 1_200)),
-        Some(item(None, 0)),
-        Some(item(Some(Aim::Own), 0)),
-        None,
-        None,
-    ]
-}
-
-fn item(aim: Option<Aim>, range: i32) -> ItemView {
+pub(super) fn item(aim: Option<Aim>, range: i32) -> ItemView {
     ItemView {
         id: ItemId(0),
         charges: Some(1),
@@ -2109,80 +563,4 @@ fn item(aim: Option<Aim>, range: i32) -> ItemView {
         aim,
         for_sale: false,
     }
-}
-
-fn own_player() -> PlayerView {
-    PlayerView {
-        slot: SlotId(0),
-        team: Team::Radiant,
-        hero: SHADOW_FIEND,
-        unit: Some(HERO_ID),
-        level: 6,
-        xp: 0,
-        gold: Some(600),
-        stash: Some(vec![None; 6]),
-        kit: None,
-        kills: 0,
-        deaths: 0,
-        assists: 0,
-        last_hits: 0,
-        denies: 0,
-        respawn_left: 0,
-    }
-}
-
-fn enemy_player() -> PlayerView {
-    PlayerView {
-        slot: SlotId(1),
-        team: Team::Dire,
-        hero: SHADOW_FIEND,
-        unit: Some(entity(777, 4)),
-        level: 1,
-        xp: 0,
-        gold: None,
-        stash: None,
-        kit: None,
-        kills: 0,
-        deaths: 0,
-        assists: 0,
-        last_hits: 0,
-        denies: 0,
-        respawn_left: 0,
-    }
-}
-
-fn hero_index(view: &WorldView) -> usize {
-    view.units
-        .iter()
-        .position(|unit| unit.id == HERO_ID)
-        .expect("hero")
-}
-
-fn terrain_with_blocked_cell(blocked: usize) -> Vec<(u16, u8)> {
-    let before = u16::try_from(blocked).expect("before fits");
-    let after = u16::try_from(16_384 - blocked - 1).expect("after fits");
-    vec![(before, 0x80), (1, 0), (after, 0x80)]
-}
-
-const fn entity(idx: u32, generation: u32) -> EntityId {
-    EntityId { idx, generation }
-}
-
-#[cfg(feature = "builtin")]
-fn start_info_and_view(messages: &[bota_proto::ServerMsg]) -> (&MatchInfo, &WorldView) {
-    let info = messages
-        .iter()
-        .find_map(|message| match message {
-            bota_proto::ServerMsg::MatchStart { info } => Some(info),
-            _ => None,
-        })
-        .expect("match info");
-    let view = messages
-        .iter()
-        .find_map(|message| match message {
-            bota_proto::ServerMsg::Snapshot { view } => Some(view),
-            _ => None,
-        })
-        .expect("snapshot");
-    (info, view)
 }

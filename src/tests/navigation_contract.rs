@@ -1,11 +1,9 @@
-use std::sync::LazyLock;
-
 use bota_proto::{
     Fixed, ItemId, ItemSlot, MatchInfo, Order, Pick, RejectReason, SlotId, Target, Team, TickMode,
     UnitKind, Vec2,
 };
 use bota_server::game::{
-    Command, ItemStack, MatchConfig, UnitOrder, World, find_path, isqrt64, rules, wire_id,
+    Command, ItemStack, MatchConfig, UnitOrder, World, find_path, rules, wire_id,
 };
 
 use crate::{
@@ -40,71 +38,34 @@ struct Evidence {
 }
 
 #[test]
-fn radiant_barracks_native_walkable_landing_moves_must_be_allowed() {
-    assert_landing_moves_allowed(0);
-}
-
-#[test]
-fn dire_barracks_native_walkable_landing_moves_must_be_allowed() {
-    assert_landing_moves_allowed(1);
-}
-
-#[test]
-fn radiant_lane_native_walkable_landing_moves_must_be_allowed() {
-    assert_landing_moves_allowed(2);
-}
-
-#[test]
-fn dire_lane_native_walkable_landing_moves_must_be_allowed() {
-    assert_landing_moves_allowed(3);
-}
-
-#[test]
-fn native_one_move_then_continue_reaches_existing_fountain_pointer_and_regenerates() {
-    for (index, evidence) in evidence().iter().enumerate() {
+fn native_landings_allow_movement_and_fountain_regeneration_without_relaxing_tp_masks() {
+    let mut closed = 0;
+    for (side, place) in [
+        (0, Place::Barracks),
+        (1, Place::Barracks),
+        (0, Place::Lane),
+        (1, Place::Lane),
+    ] {
+        let evidence = inspect_fixture(side, place);
         assert!(evidence.landings > 0);
         assert!(
+            evidence.denied.is_empty(),
+            "side={side} place={place:?}: {:?}",
+            evidence.denied
+        );
+        assert!(
             evidence.arrival.is_some(),
-            "fixture {index}: no native arrival"
+            "side={side} place={place:?}: no native arrival"
         );
         assert!(
             evidence.fountain_regeneration,
-            "fixture {index}: no fountain regeneration"
+            "side={side} place={place:?}: no fountain regeneration"
         );
+        assert!(evidence.trees > 0);
+        assert!(evidence.non_teleport > 0);
+        closed += evidence.closed;
     }
-}
-
-#[test]
-fn closed_ground_and_standing_trees_stay_masked_and_tp_requires_building_provenance() {
-    let evidence = evidence();
-    assert!(evidence.iter().all(|case| case.trees > 0));
-    assert!(evidence.iter().map(|case| case.closed).sum::<usize>() > 0);
-    assert!(evidence.iter().all(|case| case.non_teleport > 0));
-}
-
-fn assert_landing_moves_allowed(index: usize) {
-    assert!(index < 4);
-    let case = &evidence()[index];
-    assert!(case.landings > 0);
-    assert!(
-        case.denied.is_empty(),
-        "Native walkable, path-connected, accepted Move pointers must be allowed; fixture {index}, masked={:?}",
-        case.denied
-    );
-}
-
-fn evidence() -> &'static [Evidence; 4] {
-    // Share the bounded native runs across red assertions and passing controls.
-    static EVIDENCE: LazyLock<[Evidence; 4]> = LazyLock::new(|| {
-        [
-            (0, Place::Barracks),
-            (1, Place::Barracks),
-            (0, Place::Lane),
-            (1, Place::Lane),
-        ]
-        .map(|(side, place)| inspect_fixture(side, place))
-    });
-    &EVIDENCE
+    assert!(closed > 0);
 }
 
 fn fixture(side: usize, place: Place) -> (World, MatchInfo) {
@@ -242,25 +203,14 @@ fn inspect_fixture(side: usize, place: Place) -> Evidence {
             }
         }
     }
-    let (index, fountain) = space
+    let fountain = space
         .point_candidates()
         .iter()
         .copied()
-        .enumerate()
-        .find(|(_, point)| point.source == PointSource::BuildingLanding(UnitKind::Fountain))
+        .find(|point| point.source == PointSource::BuildingLanding(UnitKind::Fountain))
         .expect("existing fountain pointer, not a new goal feature");
     (result.arrival, result.fountain_regeneration) =
-        fountain_trip(&mut world, side, place, index, fountain.position);
-    eprintln!(
-        "navigation_summary side={side} place={place:?} landings={} denied={} trees={} closed={} non_tp={} arrival={:?} regeneration={}",
-        result.landings,
-        result.denied.len(),
-        result.trees,
-        result.closed,
-        result.non_teleport,
-        result.arrival,
-        result.fountain_regeneration
-    );
+        fountain_trip(&mut world, side, place, fountain.position);
     result
 }
 
@@ -315,31 +265,15 @@ fn inspect_landing(
         unit,
         point: PointIndex(index),
     };
-    let allowed = space.allows(action);
     let body_mask = space.controlled_unit_mask(ActionKind::MovePoint);
     assert!(body_mask.allows(unit));
     assert_move_decoding(space, action, command);
     world.advance(&[command]);
-    let end = world.transform.get(body).expect("native first step").pos;
     assert_eq!(
         world.orders.get(body).expect("persistent order").current,
         UnitOrder::Move {
             pos: candidate.position
         }
-    );
-    eprintln!(
-        "navigation_candidate side={side} place={place:?} unit={unit:?} index={index} candidate={candidate:?} pointer_present=1 pointer_valid=1 move_allowed={allowed} attack_move_allowed={} native_validate=Ok native_grid=true route_corners={} start={start:?} first={end:?} first_distance={} initial_distance={} displacement={} arrived={} tp_mask={} native_tp={}",
-        space.attack_move_point_mask(unit)[index],
-        route.len(),
-        distance(end, candidate.position),
-        distance(start, candidate.position),
-        distance(start, end),
-        end == candidate.position,
-        space
-            .use_target_mask(ControlledUnit::Hero, ItemSlot(0))
-            .expect("TP mask")
-            .points()[index],
-        world.teleport_spot(world.seats[side].team, candidate.position, 600)
     );
 }
 
@@ -452,13 +386,7 @@ fn assert_tp_target_kinds(world: &World, side: usize, space: &ActionSpace) {
     }
 }
 
-fn fountain_trip(
-    world: &mut World,
-    side: usize,
-    place: Place,
-    index: usize,
-    goal: Vec2,
-) -> (Option<u32>, bool) {
+fn fountain_trip(world: &mut World, side: usize, place: Place, goal: Vec2) -> (Option<u32>, bool) {
     let hero = world.seats[side].unit.expect("hero");
     let start = world.transform.get(hero).expect("start").pos;
     let limit = match place {
@@ -502,15 +430,6 @@ fn fountain_trip(
             && mana - previous_mana >= Fixed::from_int(10)
         {
             regenerated = true;
-        }
-        if [1, 60, 300, 600, 1_200].contains(&elapsed) || position == goal {
-            eprintln!(
-                "navigation_trip side={side} place={place:?} index={index} elapsed={elapsed} orders_sent=1 position={position:?} goal={goal:?} initial_distance={} remaining={} hp={} mana={} fountain_range={fountain_range} regenerated={regenerated}",
-                distance(start, goal),
-                distance(position, goal),
-                health.to_int(),
-                mana.to_int()
-            );
         }
         if position == goal {
             arrival = Some(elapsed);
@@ -557,12 +476,4 @@ fn selector(world: &World, side: usize, unit: ControlledUnit) -> Option<bota_pro
         ControlledUnit::Hero => None,
         ControlledUnit::Courier => Some(wire_id(world.seats[side].courier.expect("stock courier"))),
     }
-}
-
-fn distance(source: Vec2, target: Vec2) -> i64 {
-    let squared = source.distance_squared(target);
-    assert!(squared >= 0);
-    let distance = isqrt64(squared) / i64::from(Fixed::ONE.raw);
-    assert!(distance >= 0);
-    distance
 }

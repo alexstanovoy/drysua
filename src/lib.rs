@@ -19,6 +19,7 @@ mod policy_snapshot;
 mod ppo;
 #[cfg(feature = "builtin")]
 mod ppo_arena;
+#[cfg(any(feature = "builtin", test))]
 mod randomization;
 mod readiness;
 mod reward_observer;
