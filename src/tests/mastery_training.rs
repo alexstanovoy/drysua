@@ -74,6 +74,7 @@ fn checkpoint_fixture(settings: &TrainingJobConfig, completed: bool) -> Training
     )
     .expect("mastery state");
     let progress = CheckpointProgress {
+        adaptive_environment: None,
         mastery: Some(mastery),
         global_update: 2,
         policy_version: 2,

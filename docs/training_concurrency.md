@@ -1,6 +1,9 @@
 # Training concurrency decisions
 
-Keep serial execution as the default. Retain opt-in C/host gradient folding;
+Keep serial host gradient folding as the library and CLI default. The annealed
+CLI separately defaults to the [M40/B20/G2 micro256/reuse profile](training_microbatch.md);
+this does not change `train-full` or library execution defaults.
+Retain opt-in C/host gradient folding;
 retire A/early Continue and B/minibatch prefetch because measured full-update
 benefit was absent. [Current options, evidence and probes](training_concurrency_prototypes.md)
 replace the historical implementation diary, available at

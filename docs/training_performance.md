@@ -8,7 +8,11 @@ capacity is 32,768 transitions; expanded M40/B40 uses the distinct
 
 ## Current decisions
 
-- Keep one collection group on CUDA. Historical E16 groups=2/4 achieved only
+- The `train-annealed` CLI defaults to M40/B20/G2, microbatch256 and actor-value
+  reuse. Parallel20 is independent of CPU count; CUDA still requires explicit
+  `--device cuda`. This is distinct from the `train-full` group experiments below.
+  [Profile and legacy-resume settings](training_microbatch.md) remain scope-bound.
+- Keep one collection group for `train-full` and library defaults. Historical E16 groups=2/4 achieved only
   0.84x/0.58x default end-to-end throughput despite favorable CPU-window results.
 - `train-full --pipeline-groups 1|2|4` is supported for complete episodes only,
   with at least one environment pair per group. Groups own disjoint whole pairs;

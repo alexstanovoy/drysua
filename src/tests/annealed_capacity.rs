@@ -37,13 +37,18 @@ fn wide_capacity_m64_b64_and_m80_b40_collect_one_ppo_step_and_resume_exactly() {
 }
 
 fn wide_settings(games: usize, parallel: usize) -> AnnealedJobConfig {
-    let mut config = crate::cli::annealed_settings_for_test(&[
+    let mut config = crate::cli::legacy_fixed_annealed_settings_for_test(&[
         "--updates",
         "2",
         "--games",
         &games.to_string(),
         "--parallel",
         &parallel.to_string(),
+        "--actor-pipeline-groups",
+        "1",
+        "--training-microbatch",
+        "64",
+        "--reuse-actor-values=false",
         "--generation-games",
         &(games * 5).to_string(),
         "--epochs",
@@ -271,13 +276,18 @@ fn completed_episode_capacity_rejects_overflow_and_duplicate_merge_atomically() 
 }
 
 fn expanded_settings(updates: u64) -> AnnealedJobConfig {
-    let mut config = crate::cli::annealed_settings_for_test(&[
+    let mut config = crate::cli::legacy_fixed_annealed_settings_for_test(&[
         "--updates",
         "6",
         "--games",
         "40",
         "--parallel",
         "8",
+        "--actor-pipeline-groups",
+        "1",
+        "--training-microbatch",
+        "64",
+        "--reuse-actor-values=false",
         "--generation-games",
         "200",
         "--epochs",

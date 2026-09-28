@@ -15,7 +15,7 @@ fn training_arguments(operation: &str) -> Vec<&str> {
     arguments
         .extend("--updates 8 --checkpoint-directory unused-checkpoints".split_ascii_whitespace());
     if operation == "train-annealed" {
-        arguments.extend(["--generation-games", "8", "--parallel", "2"]);
+        arguments.extend(["--generation-games", "160"]);
     }
     arguments
 }

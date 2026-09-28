@@ -1,5 +1,7 @@
 use std::collections::VecDeque;
 mod annealed;
+pub(crate) use annealed::preflight_annealed_resume;
+pub(crate) use annealed::validate_annealed;
 pub use annealed::{
     AnnealedJobConfig, AnnealedJobReport, AnnealedOpponent,
     run_annealed_job_on_with_initial_weights,
@@ -892,6 +894,7 @@ pub(crate) fn device_name(device: PolicyDevice) -> &'static str {
 
 /// Checkpoint-owned state shared by both orchestrators; collectors remain mode-specific.
 struct TrainingSession {
+    adaptive_environment: Option<crate::AdaptiveEnvironmentCheckpoint>,
     mastery: Option<crate::MasteryProgress>,
     counters: SmokeCounters,
     model: PolicyModel,
@@ -986,6 +989,7 @@ impl TrainingSession {
         } else {
             let trainer = PpoTrainer::new(&model, config, run.run_seed ^ 0x51a9)?;
             RestoredTrainingSession {
+                adaptive_environment: None,
                 trainer,
                 sampling: PpoRng::new(run.run_seed ^ 0xa17e),
                 completed_updates: 0,
@@ -1002,6 +1006,7 @@ impl TrainingSession {
                 .fingerprint();
         Ok(Self {
             mastery: restored.mastery,
+            adaptive_environment: restored.adaptive_environment,
             model,
             trainer: restored.trainer,
             counters: SmokeCounters::default(),
@@ -1172,6 +1177,7 @@ impl TrainingSession {
     ) -> Result<TrainingCheckpointReport, PpoError> {
         let (state, draws) = self.sampling.checkpoint();
         let progress = CheckpointProgress {
+            adaptive_environment: self.adaptive_environment,
             mastery: self.mastery.clone(),
             global_update: self.completed_updates,
             policy_version: self.completed_updates,
@@ -1587,6 +1593,7 @@ fn restore_training_session(
 }
 
 struct RestoredTrainingSession {
+    adaptive_environment: Option<crate::AdaptiveEnvironmentCheckpoint>,
     trainer: PpoTrainer,
     sampling: PpoRng,
     completed_updates: u64,
@@ -1617,6 +1624,7 @@ fn restore_loaded_session(
     let progress = progress.clone();
     let (trainer, _, _) = restored.into_parts();
     Ok(RestoredTrainingSession {
+        adaptive_environment: progress.adaptive_environment,
         trainer,
         sampling,
         completed_updates: progress.global_update,

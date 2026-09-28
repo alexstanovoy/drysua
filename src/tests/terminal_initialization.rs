@@ -162,6 +162,7 @@ fn initialize_authorized_u300_terminal02_artifact_only() {
     assert_eq!(trainer.optimizer_step(), 0);
     let run = initialization_run(config, provenance.clone());
     let progress = crate::CheckpointProgress {
+        adaptive_environment: None,
         mastery: None,
         global_update: 0,
         policy_version: 0,

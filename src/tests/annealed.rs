@@ -6,12 +6,21 @@ use std::path::PathBuf;
 use super::*;
 use crate::randomization::{AnnealSchedule, RANDOMIZATION_DIRECTORY, draw_generation};
 
+#[path = "actor_pipeline_scope.rs"]
+mod actor_pipeline_scope;
+#[path = "adaptive_annealed.rs"]
+mod adaptive_annealed;
 #[path = "annealed_capacity.rs"]
 mod capacity_tests;
 #[path = "training_concurrency.rs"]
 mod concurrency_tests;
+#[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
+#[path = "graph_full_update.rs"]
+mod graph_full_update;
 #[path = "annealed_invocation.rs"]
 mod invocation_tests;
+#[path = "training_microbatch_scope.rs"]
+mod training_microbatch_scope;
 
 #[test]
 fn resume_requires_intact_generation_history_without_mutating_checkpoint() {
@@ -126,6 +135,7 @@ fn checkpoint_job_modes_reject_cross_resume_without_mutation() {
 
 fn settings(seed: u64, updates: u64) -> AnnealedJobConfig {
     AnnealedJobConfig {
+        environment_schedule: crate::EnvironmentSchedule::Fixed,
         execution: crate::TrainingExecutionOptions::default(),
         updates,
         invocation_updates: None,

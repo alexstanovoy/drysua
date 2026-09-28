@@ -5,6 +5,8 @@ pub(super) mod candidate_kl_tests;
 
 #[path = "model_concurrency.rs"]
 mod concurrency_tests;
+#[path = "training_microbatch.rs"]
+mod microbatch_tests;
 
 #[test]
 fn gradient_readback_preserves_view_bits_and_rejects_unbounded_descriptors() {

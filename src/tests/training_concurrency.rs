@@ -2,7 +2,7 @@ use super::*;
 use crate::TrainingExecutionOptions;
 
 #[test]
-fn actor_value_reuse_cli_is_annealed_only_default_off_and_canonically_scoped() {
+fn actor_value_reuse_cli_is_annealed_only_with_legacy_off_and_canonical_enabled_scope() {
     let mut arguments = vec![
         "--updates",
         "2",
@@ -13,7 +13,8 @@ fn actor_value_reuse_cli_is_annealed_only_default_off_and_canonically_scoped() {
         "--generation-games",
         "2",
     ];
-    let baseline = crate::cli::annealed_settings_for_test(&arguments).expect("default options");
+    let baseline = crate::cli::legacy_fixed_annealed_settings_for_test(&arguments)
+        .expect("legacy execution options");
     assert!(!TrainingExecutionOptions::default().reuse_actor_values);
     assert!(!baseline.execution.reuse_actor_values);
     let scope = |settings: &AnnealedJobConfig| {
@@ -29,7 +30,8 @@ fn actor_value_reuse_cli_is_annealed_only_default_off_and_canonically_scoped() {
         "4",
         "--balanced-minibatches",
     ]);
-    let enabled = crate::cli::annealed_settings_for_test(&arguments).expect("reuse options");
+    let enabled =
+        crate::cli::legacy_fixed_annealed_settings_for_test(&arguments).expect("reuse options");
     assert!(enabled.execution.reuse_actor_values);
     assert_eq!(
         scope(&enabled),
@@ -173,7 +175,8 @@ fn concurrency_cli_rejects_retired_flags_and_bounds_scope_workers() {
         vec!["--actor-overlap", "continue-v1"],
         vec!["--learner-prefetch"],
     ] {
-        let error = crate::cli::annealed_settings_for_test(&arguments).expect_err("retired option");
+        let error = crate::cli::legacy_fixed_annealed_settings_for_test(&arguments)
+            .expect_err("retired option");
         assert!(
             error
                 .to_string()
@@ -191,7 +194,7 @@ fn concurrency_cli_rejects_retired_flags_and_bounds_scope_workers() {
     assert!(!original.contains("--host-math-workers"));
     for workers in [2, 4, 32] {
         let value = workers.to_string();
-        let parsed = crate::cli::annealed_settings_for_test(&[
+        let parsed = crate::cli::legacy_fixed_annealed_settings_for_test(&[
             "--updates",
             "2",
             "--generation-games",
@@ -373,6 +376,44 @@ fn parse_probe_reuse(value: Option<&std::ffi::OsStr>) -> Result<bool, &'static s
 }
 
 #[test]
+fn probe_training_microbatch_is_closed_and_rejects_invalid_values() {
+    use std::ffi::OsStr;
+    assert_eq!(parse_probe_training_microbatch(None), Ok(64));
+    for (value, expected) in [("64", 64), ("128", 128), ("256", 256)] {
+        assert_eq!(
+            parse_probe_training_microbatch(Some(OsStr::new(value))),
+            Ok(expected)
+        );
+    }
+    for value in ["", "0", "65", "512", " 64", "064", "-1"] {
+        assert_eq!(
+            parse_probe_training_microbatch(Some(OsStr::new(value))),
+            Err("training microbatch must be 64, 128 or 256")
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        assert_eq!(
+            parse_probe_training_microbatch(Some(OsStr::from_bytes(&[255]))),
+            Err("training microbatch must be 64, 128 or 256")
+        );
+    }
+}
+
+pub(super) fn parse_probe_training_microbatch(
+    value: Option<&std::ffi::OsStr>,
+) -> Result<usize, &'static str> {
+    match value {
+        None => Ok(64),
+        Some(value) => value
+            .to_str()
+            .ok_or("training microbatch must be 64, 128 or 256")
+            .and_then(crate::training_execution::parse_training_microbatch),
+    }
+}
+
+#[test]
 fn probe_actor_value_reuse_is_default_off_and_rejects_non_boolean_values() {
     use std::ffi::OsStr;
     assert_eq!(parse_probe_reuse(None), Ok(false));
@@ -432,6 +473,10 @@ fn concurrency_probe(device: PolicyDevice) {
         probe_count(std::env::var_os(name).as_deref(), default, maximum).expect(name)
     };
     let rounds = count("DRYSUA_PROBE_ROUNDS", 40, ANNEALED_EPISODE_DECISIONS);
+    let training_microbatch = parse_probe_training_microbatch(
+        std::env::var_os("DRYSUA_PROBE_TRAINING_MICROBATCH").as_deref(),
+    )
+    .expect("training microbatch mode");
     let mode = std::env::var("DRYSUA_PROBE_MODE").unwrap_or_else(|_| "c".to_owned());
     let execution = match mode.as_str() {
         "base" => TrainingExecutionOptions::default(),
@@ -462,7 +507,7 @@ fn concurrency_probe(device: PolicyDevice) {
         &[false, true]
     };
     eprintln!(
-        "concurrency-workload mode={mode} device={device:?} worlds=40 rounds={rounds} epochs={} effective_minibatch={} microbatch=64 seed=9001 balanced={balanced} reuse_actor_values={reuse_actor_values}",
+        "concurrency-workload mode={mode} device={device:?} worlds=40 rounds={rounds} epochs={} effective_minibatch={} microbatch={training_microbatch} seed=9001 balanced={balanced} reuse_actor_values={reuse_actor_values}",
         options.ppo.epochs, options.ppo.minibatch
     );
     let mut trials = Vec::with_capacity(order.len());
@@ -473,6 +518,8 @@ fn concurrency_probe(device: PolicyDevice) {
             TrainingExecutionOptions::default()
         };
         options.execution.reuse_actor_values = reuse_actor_values;
+        // Both fresh trials use one numerical mode; cross-mode bit equality is not promised.
+        options.execution.training_microbatch = training_microbatch;
         let directory = test_directory("concurrency-probe");
         let measured = !balanced || index != 0;
         eprintln!(
@@ -525,7 +572,10 @@ fn concurrency_probe(device: PolicyDevice) {
     }
 }
 
-fn assert_probe_report_bits(source: &crate::PpoUpdateReport, target: &crate::PpoUpdateReport) {
+pub(super) fn assert_probe_report_bits(
+    source: &crate::PpoUpdateReport,
+    target: &crate::PpoUpdateReport,
+) {
     let bits = |report: &crate::PpoUpdateReport| {
         [
             report.policy_loss,
@@ -543,7 +593,11 @@ fn assert_probe_report_bits(source: &crate::PpoUpdateReport, target: &crate::Ppo
     assert_eq!(source, target);
 }
 
-fn assert_artifact_bits(source: &std::path::Path, target: &std::path::Path, device: PolicyDevice) {
+pub(super) fn assert_artifact_bits(
+    source: &std::path::Path,
+    target: &std::path::Path,
+    device: PolicyDevice,
+) {
     let source = TrainingArtifact::load(source).expect("source artifact");
     let target = TrainingArtifact::load(target).expect("target artifact");
     assert_eq!(source.progress(), target.progress());
@@ -569,7 +623,7 @@ fn assert_artifact_bits(source: &std::path::Path, target: &std::path::Path, devi
     assert_eq!(source_updates, target_updates);
 }
 
-fn artifact_hash(directory: &std::path::Path, device: PolicyDevice) -> u64 {
+pub(super) fn artifact_hash(directory: &std::path::Path, device: PolicyDevice) -> u64 {
     use std::hash::Hasher;
     let artifact = TrainingArtifact::load(directory).expect("probe artifact");
     let (snapshot, shuffle, updates) = probe_state(&artifact, device);

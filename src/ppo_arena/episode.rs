@@ -7,8 +7,12 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use super::*;
 
+#[path = "actor_pipeline.rs"]
+mod actor_pipeline;
 #[path = "actor_values.rs"]
 mod actor_values;
+
+pub(super) use actor_pipeline::{ActorGroup, collect_actor_pipeline, validate_pipeline_memory};
 
 #[cfg(test)]
 #[path = "../tests/actor_value_reuse.rs"]
@@ -1244,22 +1248,57 @@ pub(super) fn collect_batch_with_actor_values(
     if rounds == 0 || rounds > ACTOR_DECISIONS {
         return Err(PpoError::InvalidConfig("annealed collection rounds"));
     }
-    let completed = collect_with_workers(
-        model,
-        config,
-        stream_base,
-        thread_prefix,
-        environments,
-        streams,
-        random,
-        rounds,
-        None,
-        None,
-        rollout,
-        report,
-        reuse_actor_values,
-    )?;
-    assert!(completed, "an annealed batch cannot cancel");
+    #[cfg(all(
+        test,
+        feature = "cuda",
+        any(target_os = "linux", target_os = "windows")
+    ))]
+    let graph = actor_graph_collection_mode(config, stream_base, environments, reuse_actor_values)?;
+    let mut collect = || {
+        let completed = collect_with_workers(
+            model,
+            config,
+            stream_base,
+            thread_prefix,
+            environments,
+            streams,
+            random,
+            rounds,
+            None,
+            None,
+            rollout,
+            report,
+            reuse_actor_values,
+        )?;
+        assert!(completed, "an annealed batch cannot cancel");
+        finish_annealed_batch(streams, rounds);
+        #[cfg(all(
+            test,
+            feature = "cuda",
+            any(target_os = "linux", target_os = "windows")
+        ))]
+        if graph.is_some() {
+            record_graph_actor_trace(streams.iter().zip(random.iter()))?;
+        }
+        Ok(())
+    };
+    #[cfg(all(
+        test,
+        feature = "cuda",
+        any(target_os = "linux", target_os = "windows")
+    ))]
+    if let Some(graph) = graph {
+        return crate::model::cuda_graph_probe::with_actor_graph_for_test(
+            model, graph, 40, collect,
+        )
+        .map_err(text_error)?;
+    }
+    collect()
+}
+
+fn finish_annealed_batch(streams: &[EpisodeStream], rounds: usize) {
+    assert!(!streams.is_empty());
+    assert!(streams.len() <= MAX_ACTOR_ENVIRONMENTS);
     #[cfg(test)]
     test_support::emit_concurrency_probe_counts(streams, false);
     if rounds == ACTOR_DECISIONS {
@@ -1268,7 +1307,61 @@ pub(super) fn collect_batch_with_actor_values(
             "a full annealed batch finishes every episode"
         );
     }
-    Ok(())
+}
+
+#[cfg(all(
+    test,
+    feature = "cuda",
+    any(target_os = "linux", target_os = "windows")
+))]
+fn actor_graph_collection_mode(
+    config: PpoConfig,
+    stream_base: usize,
+    environments: &[TrainingEnvironment],
+    reuse: bool,
+) -> Result<Option<bool>, PpoError> {
+    let mode = crate::model::cuda_graph_probe::parse_graph_mode(
+        std::env::var_os("DRYSUA_PROBE_ACTOR_GRAPH").as_deref(),
+    )
+    .map_err(text_error)?;
+    if mode.is_some()
+        && (config.environments != 40
+            || environments.len() != 40
+            || stream_base != 0
+            || !reuse
+            || config.sample_budget != crate::PpoSampleBudget::Annealed
+            || environments
+                .iter()
+                .any(|world| !matches!(world.opponent, OpponentRuntime::Teacher)))
+    {
+        return Err(PpoError::InvalidConfig(
+            "actor graph probe requires one M40 B40 Teacher batch with actor value reuse",
+        ));
+    }
+    Ok(mode)
+}
+
+#[cfg(all(
+    test,
+    feature = "cuda",
+    any(target_os = "linux", target_os = "windows")
+))]
+fn record_graph_actor_trace<'a>(
+    rows: impl IntoIterator<Item = (&'a EpisodeStream, &'a PpoRng)>,
+) -> Result<(), PpoError> {
+    use std::hash::Hasher;
+    let mut iterator = rows.into_iter();
+    let rows: [(&EpisodeStream, &PpoRng); 40] =
+        std::array::from_fn(|_| iterator.next().expect("40 graph actor streams"));
+    assert!(iterator.next().is_none());
+    let trace = crate::model::cuda_graph_probe::ActorTrace {
+        hashes: std::array::from_fn(|index| rows[index].0.trace.finish()),
+        random: std::array::from_fn(|index| rows[index].1.checkpoint()),
+        decisions: std::array::from_fn(|index| rows[index].0.decisions),
+        retained: std::array::from_fn(|index| rows[index].0.retained),
+    };
+    eprintln!("graph-actor-trace {trace:?}");
+    crate::model::cuda_graph_probe::record_actor_trace(trace).map_err(text_error)
 }
 
 /// Bootstrap barrier: every stream prepares its first decision frame.
@@ -1460,6 +1553,7 @@ fn advance_stream(
     )
 }
 
+#[derive(Clone, Copy)]
 struct CompletedAdvance {
     end_tick: u32,
     ticks: u32,
@@ -1682,6 +1776,43 @@ fn record_episode(
     report: &mut PpoSmokeReport,
     opponent: &'static str,
 ) -> Result<(), PpoError> {
+    let label = accumulate_episode(stream, tick, state, outcome, report)?;
+    emit_episode_logs(
+        prometheus::enabled(),
+        || {
+            eprintln!(
+                "episode: stream={stream} map=2 opponent={opponent} tick={tick} outcome={label} actor_decisions={} retained={} terminal_sample={} raw_return={:.9} discounted_return={:.9} terminal_reward={} shaping_return={:.9} actions={:?} noncontinue={} retention_phase={}",
+                state.decisions,
+                state.retained,
+                state.retained > 0,
+                state.raw_return,
+                state.discounted_return,
+                state.terminal_reward,
+                state.shaping_return,
+                state.actions,
+                state.decisions - state.actions[ActionKind::Continue.index()] as usize,
+                state.retention_phase
+            )
+        },
+        || {
+            crate::telemetry::PerformanceOutput::new(crate::telemetry::AsyncLogWriter::default()).emit(
+                &format_args!(
+                    "level=INFO event=map2_episode_reward stream={stream} tick={tick} outcome={label} opponent={opponent} {}",
+                    state.map2_reward
+                ),
+            )
+        },
+    );
+    Ok(())
+}
+
+fn accumulate_episode(
+    stream: usize,
+    tick: u32,
+    state: &EpisodeStream,
+    outcome: Option<PpoTerminalOutcome>,
+    report: &mut PpoSmokeReport,
+) -> Result<&'static str, PpoError> {
     assert!(state.done);
     assert!(tick <= TICK_CAP);
     let (label, counter) = match outcome {
@@ -1702,33 +1833,7 @@ fn record_episode(
             None => crate::TrainingGameOutcome::TimeCap,
         },
     )?;
-    emit_episode_logs(
-        prometheus::enabled(),
-        || {
-            eprintln!(
-                "episode: stream={stream} map=2 opponent={opponent} tick={tick} outcome={label} actor_decisions={} retained={} terminal_sample={} raw_return={:.9} discounted_return={:.9} terminal_reward={} shaping_return={:.9} actions={:?} noncontinue={} retention_phase={}",
-                state.decisions,
-                state.retained,
-                state.retained > 0,
-                state.raw_return,
-                state.discounted_return,
-                state.terminal_reward,
-                state.shaping_return,
-                state.actions,
-                state.decisions - state.actions[ActionKind::Continue.index()] as usize,
-                state.retention_phase
-            )
-        },
-        || {
-            crate::telemetry::PerformanceOutput::new(crate::telemetry::AsyncLogWriter::default()).emit(
-        &format_args!(
-            "level=INFO event=map2_episode_reward stream={stream} tick={tick} outcome={label} opponent={opponent} {}",
-            state.map2_reward
-        ),
-    )
-        },
-    );
-    Ok(())
+    Ok(label)
 }
 
 fn emit_episode_logs(prometheus_mode: bool, audit: impl FnOnce(), reward: impl FnOnce()) {

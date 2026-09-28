@@ -10,9 +10,17 @@ use bota_proto::{HeroId, MapId};
 use safetensors::tensor::{Dtype, SafeTensors, TensorView, serialize};
 use sha2::{Digest, Sha256};
 
+#[path = "checkpoint_adaptive.rs"]
+mod adaptive;
+#[cfg(test)]
+#[path = "tests/checkpoint_adaptive.rs"]
+mod adaptive_tests;
 #[cfg(test)]
 #[path = "tests/checkpoint_capacity.rs"]
 mod capacity_tests;
+#[cfg(test)]
+#[path = "tests/checkpoint_fixed_golden.rs"]
+mod fixed_golden_tests;
 #[path = "checkpoint_mastery.rs"]
 mod mastery;
 #[cfg(test)]
@@ -27,6 +35,8 @@ use crate::{
     MODEL_SCHEMA_VERSION, PPO_RULES_AUDIT_VERSION, PPO_SCHEMA_HASH, PPO_SCHEMA_VERSION,
     PolicyDevice, PolicyModel, PpoConfig, PpoSampleBudget, PpoTrainer, SHADOW_FIEND,
 };
+
+pub use adaptive::AdaptiveEnvironmentCheckpoint;
 
 const CHECKPOINT_MAGIC: &[u8; 8] = b"DRYCKP18";
 /// Version of the strict on-disk tensor and manifest contract.
@@ -186,6 +196,8 @@ impl RngCheckpoint {
 /// Scheduler, curriculum, rollout, evaluation, league, and RNG resume state.
 #[derive(Clone, Debug, PartialEq)]
 pub struct CheckpointProgress {
+    /// Typed adaptive controller and snapshot commitment, or None for fixed schedules.
+    pub adaptive_environment: Option<AdaptiveEnvironmentCheckpoint>,
     /// Current mastery stage and complete ordered recent window, or None outside mastery.
     pub mastery: Option<crate::MasteryProgress>,
     pub global_update: u64,
@@ -344,6 +356,7 @@ impl TrainingArtifact {
     ) -> Result<Self, CheckpointError> {
         validate_run(&run, model, trainer.config())?;
         validate_progress(&progress, trainer.updates(), trainer.config())?;
+        adaptive::validate_scope(&run, &progress, trainer.config())?;
         mastery::validate_scope(
             run.mastery_config,
             progress.mastery.as_ref(),
@@ -447,6 +460,17 @@ impl TrainingArtifact {
         let manifest = read_recoverable(&directory.join(CHECKPOINT_META_FILE), MAX_META_BYTES)?;
         let artifact = decode_manifest(&manifest)?;
         Ok(artifact.run)
+    }
+
+    /// Validated metadata only, for read-only orchestration preflight before acquiring a lock.
+    #[cfg(feature = "builtin")]
+    pub(crate) fn load_resume_metadata(
+        directory: &Path,
+    ) -> Result<(CheckpointRun, CheckpointProgress), CheckpointError> {
+        validate_directory(directory)?;
+        let manifest = read_recoverable(&directory.join(CHECKPOINT_META_FILE), MAX_META_BYTES)?;
+        let artifact = decode_manifest(&manifest)?;
+        Ok((artifact.run, artifact.progress))
     }
 
     fn load_inner(
@@ -554,6 +578,7 @@ impl TrainingArtifact {
     fn validate(&self) -> Result<(), CheckpointError> {
         validate_run_without_model(&self.run, self.config)?;
         validate_progress(&self.progress, self.trainer_updates, self.config)?;
+        adaptive::validate_scope(&self.run, &self.progress, self.config)?;
         mastery::validate_scope(
             self.run.mastery_config,
             self.progress.mastery.as_ref(),
@@ -998,7 +1023,11 @@ fn encode_manifest(
 ) -> Result<Vec<u8>, CheckpointError> {
     let mut writer = ManifestWriter::default();
     let budget = artifact.config.sample_budget;
-    let (version, hash) = checkpoint_schema_identity(budget);
+    let (version, hash) = if artifact.progress.adaptive_environment.is_some() {
+        adaptive::schema_identity(budget)
+    } else {
+        checkpoint_schema_identity(budget)
+    };
     writer.bytes.extend(CHECKPOINT_MAGIC);
     writer.u32(version);
     writer.u64(hash);
@@ -1011,18 +1040,27 @@ fn encode_manifest(
     writer.u64(artifact.shuffle.0);
     writer.u64(artifact.shuffle.1);
     writer.bytes.extend(tensor_hash);
+    if let Some(checkpoint) = &artifact.progress.adaptive_environment {
+        adaptive::encode(&mut writer, checkpoint);
+    }
+    if writer.bytes.len() > MAX_META_BYTES as usize {
+        return Err(CheckpointError::InvalidManifest("manifest size"));
+    }
     Ok(writer.bytes)
 }
 
 fn decode_manifest(bytes: &[u8]) -> Result<TrainingArtifact, CheckpointError> {
+    if bytes.len() > MAX_META_BYTES as usize {
+        return Err(CheckpointError::InvalidManifest("manifest size"));
+    }
     let mut reader = ManifestReader::new(bytes);
     if reader.take(8)? != CHECKPOINT_MAGIC {
         return Err(CheckpointError::ManifestMagic);
     }
-    let budget = decode_checkpoint_identity(&mut reader)?;
+    let (budget, is_adaptive) = decode_checkpoint_identity(&mut reader)?;
     decode_schema(&mut reader, budget)?;
     let run = decode_run(&mut reader)?;
-    let progress = decode_progress(&mut reader, run.mastery_config)?;
+    let mut progress = decode_progress(&mut reader, run.mastery_config)?;
     let config = decode_config(&mut reader, budget)?;
     validate_run_without_model(&run, config)?;
     mastery::validate_scope(
@@ -1036,7 +1074,11 @@ fn decode_manifest(bytes: &[u8]) -> Result<TrainingArtifact, CheckpointError> {
     let step = reader.u64()?;
     let shuffle = (reader.u64()?, reader.u64()?);
     let tensor_hash = reader.array_32()?;
+    if is_adaptive {
+        progress.adaptive_environment = Some(adaptive::decode(&mut reader)?);
+    }
     reader.finish()?;
+    adaptive::validate_scope(&run, &progress, config)?;
     Ok(TrainingArtifact {
         run,
         progress,
@@ -1081,26 +1123,21 @@ const fn checkpoint_profile_hash(
 
 fn decode_checkpoint_identity(
     reader: &mut ManifestReader<'_>,
-) -> Result<PpoSampleBudget, CheckpointError> {
+) -> Result<(PpoSampleBudget, bool), CheckpointError> {
     let identity = (reader.u32()?, reader.u64()?);
-    match identity.0 {
-        CHECKPOINT_SCHEMA_VERSION
-            if identity == checkpoint_schema_identity(PpoSampleBudget::Standard) =>
-        {
-            Ok(PpoSampleBudget::Standard)
+    for budget in [
+        PpoSampleBudget::Standard,
+        PpoSampleBudget::Annealed,
+        PpoSampleBudget::WideAnnealed,
+    ] {
+        if identity == checkpoint_schema_identity(budget) {
+            return Ok((budget, false));
         }
-        CHECKPOINT_ANNEALED_SCHEMA_VERSION
-            if identity == checkpoint_schema_identity(PpoSampleBudget::Annealed) =>
-        {
-            Ok(PpoSampleBudget::Annealed)
+        if identity == adaptive::schema_identity(budget) {
+            return Ok((budget, true));
         }
-        CHECKPOINT_WIDE_ANNEALED_SCHEMA_VERSION
-            if identity == checkpoint_schema_identity(PpoSampleBudget::WideAnnealed) =>
-        {
-            Ok(PpoSampleBudget::WideAnnealed)
-        }
-        _ => Err(CheckpointError::SchemaMismatch),
     }
+    Err(CheckpointError::SchemaMismatch)
 }
 
 const fn linked_schemas(budget: PpoSampleBudget) -> [(u32, u64); 5] {
@@ -1232,6 +1269,7 @@ fn decode_progress(
         league_references.push(reader.u64()?);
     }
     Ok(CheckpointProgress {
+        adaptive_environment: None,
         mastery: mastery::decode_progress(reader, mastery_config)?,
         global_update,
         policy_version,

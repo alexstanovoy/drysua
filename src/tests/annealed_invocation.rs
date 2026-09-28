@@ -25,7 +25,7 @@ fn invocation_limits_reject_zero_overflow_and_values_above_the_counter_bound() {
             "number too large to fit in target type".to_owned(),
         ),
     ] {
-        let error = crate::cli::annealed_settings_for_test(&[
+        let error = crate::cli::legacy_fixed_annealed_settings_for_test(&[
             "--updates",
             "3",
             "--generation-games",

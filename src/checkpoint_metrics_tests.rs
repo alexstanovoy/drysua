@@ -122,7 +122,8 @@ fn metrics_manifest_identity_hashes_input_bytes_without_reencoding() {
     let mut encoded = encode_manifest(&artifact, artifact.tensor_hash).unwrap();
     let mut reader = ManifestReader::new(&encoded);
     reader.take(8).unwrap();
-    let budget = decode_checkpoint_identity(&mut reader).unwrap();
+    let (budget, adaptive) = decode_checkpoint_identity(&mut reader).unwrap();
+    assert!(!adaptive);
     decode_schema(&mut reader, budget).unwrap();
     decode_run(&mut reader).unwrap();
     reader.take(4 * 8 + 4 + 1).unwrap();
@@ -152,6 +153,7 @@ fn manifest_artifact() -> TrainingArtifact {
             rules_audit_version: PPO_RULES_AUDIT_VERSION,
         },
         progress: CheckpointProgress {
+            adaptive_environment: None,
             mastery: None,
             global_update: 3,
             policy_version: 3,

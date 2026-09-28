@@ -360,7 +360,11 @@ fn public_loaders_reject_empty_and_oversized_files_before_decoding() {
     fs::remove_dir_all(directory).expect("cleanup");
 }
 
-fn manifest_artifact(budget: PpoSampleBudget, updates: u64, samples: u64) -> TrainingArtifact {
+pub(super) fn manifest_artifact(
+    budget: PpoSampleBudget,
+    updates: u64,
+    samples: u64,
+) -> TrainingArtifact {
     TrainingArtifact {
         run: CheckpointRun {
             mastery_config: None,
@@ -376,6 +380,7 @@ fn manifest_artifact(budget: PpoSampleBudget, updates: u64, samples: u64) -> Tra
             rules_audit_version: PPO_RULES_AUDIT_VERSION,
         },
         progress: CheckpointProgress {
+            adaptive_environment: None,
             mastery: None,
             global_update: updates,
             policy_version: updates,

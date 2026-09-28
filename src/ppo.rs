@@ -3,6 +3,10 @@
     reason = "PPO optimization and metrics use floating-point arithmetic"
 )]
 
+#[cfg(feature = "builtin")]
+mod actor_order;
+#[cfg(test)]
+mod learning_fork;
 mod minibatch;
 #[cfg(test)]
 mod rnd;
@@ -942,13 +946,24 @@ impl PpoTrainer {
         &mut self,
         execution: crate::TrainingExecutionOptions,
     ) -> Result<(), PpoError> {
+        if execution.actor_pipeline_groups != 1 {
+            return Err(PpoError::InvalidConfig(
+                "actor pipeline groups requires the annealed collector",
+            ));
+        }
         if execution.reuse_actor_values {
             return Err(PpoError::InvalidConfig(
                 "reuse actor values requires the annealed collector",
             ));
         }
+        execution.validate_ppo_memory(self.config.sample_budget)?;
         self.execution = execution.validate()?;
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) const fn execution_for_test(&self) -> crate::TrainingExecutionOptions {
+        self.execution
     }
 
     pub const fn optimizer_step(&self) -> u64 {

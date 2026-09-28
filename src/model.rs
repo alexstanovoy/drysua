@@ -11,6 +11,12 @@ use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use candle_core::{DType, Device, Tensor, Var};
 
+#[cfg(all(
+    test,
+    feature = "cuda",
+    any(target_os = "linux", target_os = "windows")
+))]
+pub(crate) mod cuda_graph_probe;
 mod host_folding;
 mod sampling;
 #[cfg(test)]
@@ -52,6 +58,13 @@ pub const MODEL_MAX_BATCH: usize = 8_192;
 pub const MODEL_EVALUATION_MICROBATCH: usize = 64;
 /// Maximum frame count in one autograd-preserving tensor forward pass.
 pub const MODEL_TRAINING_BATCH: usize = 64;
+/// Private PPO tensor ceiling; public training forward and actor APIs remain bounded at 64.
+pub const MODEL_PPO_MAX_MICROBATCH: usize = 256;
+/// Conservative per-row admission reserve for autograd activations and backward temporaries.
+/// This is not measured allocator usage; runtime RAM/VRAM guards remain authoritative.
+pub const MODEL_PPO_GRAPH_ROW_RESERVE_BYTES: u64 = 16 * 1024 * 1024;
+const _: () = assert!(MODEL_TRAINING_BATCH <= MODEL_PPO_MAX_MICROBATCH);
+const _: () = assert!(MODEL_PPO_MAX_MICROBATCH <= MODEL_MAX_BATCH);
 /// Number of append-only action-kind logits.
 pub const MODEL_KIND_HEAD: usize = 16;
 /// Number of controlled-unit logits.
@@ -82,6 +95,24 @@ const UNIT_EMBEDDING: usize = 128;
 const TOKEN_HIDDEN: usize = 64;
 const TOKEN_EMBEDDING: usize = 64;
 const UNIT_GROUPS: usize = 5;
+// Reserve four live copies for forward/backward work, including four full-width pool intermediates.
+const PPO_TOKEN_ROWS: usize = ABILITY_FEATURE_TOKENS
+    + ITEM_FEATURE_TOKENS
+    + POINT_FEATURE_TOKENS
+    + PROJECTILE_FEATURE_TOKENS
+    + LOOT_FEATURE_TOKENS;
+const PPO_ENCODER_ROW_ELEMENTS: usize = 2
+    * (ENCODER_UNIT_TOKENS + OWN_UNIT_FEATURE_TOKENS)
+    * (UNIT_HIDDEN + 2 * UNIT_EMBEDDING)
+    + 2 * PPO_TOKEN_ROWS * (TOKEN_HIDDEN + TOKEN_EMBEDDING)
+    + 4 * (UNIT_GROUPS * ENCODER_UNIT_TOKENS * UNIT_EMBEDDING + PPO_TOKEN_ROWS * TOKEN_EMBEDDING)
+    + 4 * TRUNK_INPUT
+    + 2 * (TRUNK_WIDE + 2 * TRUNK_WIDTH);
+const _: () = assert!(
+    4 * PPO_ENCODER_ROW_ELEMENTS as u64 * std::mem::size_of::<f32>() as u64
+        + 2 * (std::mem::size_of::<FeatureFrame>() as u64)
+        < MODEL_PPO_GRAPH_ROW_RESERVE_BYTES
+);
 const TRUNK_INPUT: usize = GLOBAL_FEATURES
     + HISTORY_SAMPLES * HISTORY_FEATURES
     + MAX_POLICY_HISTORY * POLICY_HISTORY_FEATURES
@@ -1210,6 +1241,18 @@ pub fn probe_nvfp4(ordinal: usize) -> Result<(), ModelError> {
 
 /// F32 DeepSets policy with an autoregressive masked decoder.
 pub struct PolicyModel {
+    #[cfg(all(
+        test,
+        feature = "cuda",
+        any(target_os = "linux", target_os = "windows")
+    ))]
+    creation_thread: std::thread::ThreadId,
+    #[cfg(all(
+        test,
+        feature = "cuda",
+        any(target_os = "linux", target_os = "windows")
+    ))]
+    foreign_thread_used: std::sync::atomic::AtomicBool,
     parameter_lock: RwLock<()>,
     lineage: NonZeroU64,
     parameter_revision: AtomicU64,
@@ -1327,6 +1370,18 @@ impl PolicyModel {
         )?;
         let lineage = allocate_lineage(&NEXT_MODEL_LINEAGE, ModelError::ModelLineageUnavailable)?;
         Ok(Self {
+            #[cfg(all(
+                test,
+                feature = "cuda",
+                any(target_os = "linux", target_os = "windows")
+            ))]
+            creation_thread: std::thread::current().id(),
+            #[cfg(all(
+                test,
+                feature = "cuda",
+                any(target_os = "linux", target_os = "windows")
+            ))]
+            foreign_thread_used: std::sync::atomic::AtomicBool::new(false),
             parameter_lock: RwLock::new(()),
             lineage,
             parameter_revision: AtomicU64::new(0),
@@ -1613,8 +1668,27 @@ impl PolicyModel {
         validate_sampling_rng_count(frames.len(), rngs.len())?;
         let mut staged_rngs = rngs.to_vec();
         let _guard = self.read_parameter_lock()?;
-        let selected =
-            self.selection_batch_locked(frames, action_spaces, Some(staged_rngs.as_mut_slice()))?;
+        #[cfg(all(
+            test,
+            feature = "cuda",
+            any(target_os = "linux", target_os = "windows")
+        ))]
+        let graph_selected =
+            cuda_graph_probe::sample_selection(self, frames, action_spaces, &mut staged_rngs)?;
+        #[cfg(not(all(
+            test,
+            feature = "cuda",
+            any(target_os = "linux", target_os = "windows")
+        )))]
+        let graph_selected: Option<Vec<BatchSelection>> = None;
+        let selected = match graph_selected {
+            Some(selected) => selected,
+            None => self.selection_batch_locked(
+                frames,
+                action_spaces,
+                Some(staged_rngs.as_mut_slice()),
+            )?,
+        };
         let choices = finish_sampled_choices(
             frames,
             action_spaces,
@@ -1629,9 +1703,18 @@ impl PolicyModel {
         &self,
         frames: &[FeatureFrame],
         action_spaces: &[ActionSpace],
-        mut rngs: Option<&mut [PpoRng]>,
+        rngs: Option<&mut [PpoRng]>,
     ) -> Result<Vec<BatchSelection>, ModelError> {
         let state = self.forward_frames(frames)?;
+        self.selection_from_state_locked(state, action_spaces, rngs)
+    }
+
+    fn selection_from_state_locked(
+        &self,
+        state: ForwardState,
+        action_spaces: &[ActionSpace],
+        mut rngs: Option<&mut [PpoRng]>,
+    ) -> Result<Vec<BatchSelection>, ModelError> {
         let base = self.sampling_base_logits(&state)?;
         let mut rows = initialize_sampling_rows(&base, action_spaces, &mut rngs)?;
         let kind = self.sampling_kind_logits(&state, &sampling_prefixes(&rows))?;
@@ -1949,14 +2032,18 @@ impl PolicyModel {
         config: PpoConfig,
         execution: crate::TrainingExecutionOptions,
     ) -> Result<PpoMinibatchReport, ModelError> {
-        if execution.host_math_workers == 1 {
+        execution
+            .validate()
+            .map_err(|error| ModelError::Backend(error.to_string()))?;
+        if execution.host_math_workers == 1 && execution.training_microbatch == MODEL_TRAINING_BATCH
+        {
             return self.ppo_update(examples, adam, config);
         }
         self.ppo_update_with_microbatch_and_workers(
             examples,
             adam,
             config,
-            MODEL_TRAINING_BATCH,
+            execution.training_microbatch,
             execution.host_math_workers,
             #[cfg(test)]
             PpoTestFaults::default(),
@@ -1976,7 +2063,7 @@ impl PolicyModel {
         if examples.is_empty() || examples.len() > MODEL_MAX_BATCH {
             return Err(ModelError::InvalidModelState("PPO minibatch count"));
         }
-        if !(1..=MODEL_TRAINING_BATCH).contains(&microbatch_size) {
+        if !(1..=MODEL_PPO_MAX_MICROBATCH).contains(&microbatch_size) {
             return Err(ModelError::InvalidModelState("PPO microbatch size"));
         }
         if !(1..=32).contains(&requested_workers) {
@@ -2064,7 +2151,7 @@ impl PolicyModel {
         #[cfg(test)] inject_failure: bool,
     ) -> Result<f64, ModelError> {
         assert!(!examples.is_empty());
-        assert!((1..=MODEL_TRAINING_BATCH).contains(&microbatch_size));
+        assert!((1..=MODEL_PPO_MAX_MICROBATCH).contains(&microbatch_size));
         let mut kl = 0.0;
         for chunk in examples.chunks(microbatch_size) {
             let frames = chunk
@@ -2116,7 +2203,7 @@ impl PolicyModel {
             .iter()
             .map(|sample| sample.transition.target.prefix())
             .collect::<Vec<_>>();
-        validate_training_batch(&frames, &prefixes)?;
+        validate_ppo_training_batch(&frames, &prefixes)?;
         let output = self.training_forward_value_gradient_locked(&frames, &prefixes, false)?;
         validate_training_tensors_finite(&output)?;
         let (loss, report) = ppo_loss(&output, examples, config)?;
@@ -2386,15 +2473,43 @@ impl PolicyModel {
     }
 
     fn read_parameter_lock(&self) -> Result<RwLockReadGuard<'_, ()>, ModelError> {
-        self.parameter_lock
+        #[cfg(all(
+            test,
+            feature = "cuda",
+            any(target_os = "linux", target_os = "windows")
+        ))]
+        cuda_graph_probe::check_owner(self)?;
+        let guard = self
+            .parameter_lock
             .read()
-            .map_err(|_| ModelError::ParameterLockPoisoned)
+            .map_err(|_| ModelError::ParameterLockPoisoned)?;
+        #[cfg(all(
+            test,
+            feature = "cuda",
+            any(target_os = "linux", target_os = "windows")
+        ))]
+        cuda_graph_probe::check_owner(self)?;
+        Ok(guard)
     }
 
     fn write_parameter_lock(&self) -> Result<RwLockWriteGuard<'_, ()>, ModelError> {
-        self.parameter_lock
+        #[cfg(all(
+            test,
+            feature = "cuda",
+            any(target_os = "linux", target_os = "windows")
+        ))]
+        cuda_graph_probe::check_owner(self)?;
+        let guard = self
+            .parameter_lock
             .write()
-            .map_err(|_| ModelError::ParameterLockPoisoned)
+            .map_err(|_| ModelError::ParameterLockPoisoned)?;
+        #[cfg(all(
+            test,
+            feature = "cuda",
+            any(target_os = "linux", target_os = "windows")
+        ))]
+        cuda_graph_probe::check_owner(self)?;
+        Ok(guard)
     }
 
     fn policy_identity_locked(&self) -> PolicyIdentity {
@@ -2429,158 +2544,36 @@ impl PolicyModel {
     }
 
     fn forward_frames(&self, frames: &[FeatureFrame]) -> Result<ForwardState, ModelError> {
-        let batch = frames.len();
-        let device = self.tensor_device();
-        let units = stage_units(frames);
-        let (own_values, own_mask) = stage_own_units(frames);
-        let (ability_values, ability_mask) = stage_tokens(frames, TokenField::Ability);
-        let (item_values, item_mask) = stage_tokens(frames, TokenField::Item);
-        let (point_values, point_mask) = stage_tokens(frames, TokenField::Point);
-        let (projectile_values, projectile_mask) = stage_tokens(frames, TokenField::Projectile);
-        let (loot_values, loot_mask) = stage_tokens(frames, TokenField::Loot);
-        let scalars = stage_scalars(frames);
-        let mut parts: Vec<&[f32]> = Vec::with_capacity(3 + UNIT_GROUPS + 12);
-        parts.push(&units.values);
-        parts.push(&units.presence);
-        for group in &units.groups {
-            parts.push(group);
-        }
-        parts.push(&own_values);
-        parts.push(&own_mask);
-        for values in [
-            &ability_values,
-            &ability_mask,
-            &item_values,
-            &item_mask,
-            &point_values,
-            &point_mask,
-            &projectile_values,
-            &projectile_mask,
-            &loot_values,
-            &loot_mask,
-            &scalars,
-        ] {
-            parts.push(values);
-        }
-        let views = upload_parts(&parts, device)?;
-        let mut views = views.into_iter();
-        let unit_rows = views
-            .next()
-            .expect("unit rows view")
-            .reshape((batch * ENCODER_UNIT_TOKENS, UNIT_FEATURES))?;
-        let unit_presence =
-            views
-                .next()
-                .expect("unit presence view")
-                .reshape((batch, ENCODER_UNIT_TOKENS, 1))?;
-        let mut unit_groups = Vec::with_capacity(UNIT_GROUPS);
-        for _ in 0..UNIT_GROUPS {
-            unit_groups.push(views.next().expect("unit group view").reshape((
-                batch,
-                ENCODER_UNIT_TOKENS,
-                1,
-            ))?);
-        }
-        let own_rows = views
-            .next()
-            .expect("own rows view")
-            .reshape((batch * OWN_UNIT_FEATURE_TOKENS, UNIT_FEATURES))?;
-        let own_mask =
-            views
-                .next()
-                .expect("own mask view")
-                .reshape((batch, OWN_UNIT_FEATURE_TOKENS, 1))?;
-        let ability_rows = views
-            .next()
-            .expect("ability rows view")
-            .reshape((batch * ABILITY_FEATURE_TOKENS, ABILITY_FEATURES))?;
-        let ability_presence = views.next().expect("ability presence view").reshape((
-            batch,
-            ABILITY_FEATURE_TOKENS,
-            1,
-        ))?;
-        let item_rows = views
-            .next()
-            .expect("item rows view")
-            .reshape((batch * ITEM_FEATURE_TOKENS, ITEM_FEATURES))?;
-        let item_presence =
-            views
-                .next()
-                .expect("item presence view")
-                .reshape((batch, ITEM_FEATURE_TOKENS, 1))?;
-        let point_rows = views
-            .next()
-            .expect("point rows view")
-            .reshape((batch * POINT_FEATURE_TOKENS, POINT_FEATURES))?;
-        let point_presence =
-            views
-                .next()
-                .expect("point presence view")
-                .reshape((batch, POINT_FEATURE_TOKENS, 1))?;
-        let projectile_rows = views
-            .next()
-            .expect("projectile rows view")
-            .reshape((batch * PROJECTILE_FEATURE_TOKENS, PROJECTILE_FEATURES))?;
-        let projectile_presence = views.next().expect("projectile presence view").reshape((
-            batch,
-            PROJECTILE_FEATURE_TOKENS,
-            1,
-        ))?;
-        let loot_rows = views
-            .next()
-            .expect("loot rows view")
-            .reshape((batch * LOOT_FEATURE_TOKENS, LOOT_FEATURES))?;
-        let loot_presence =
-            views
-                .next()
-                .expect("loot presence view")
-                .reshape((batch, LOOT_FEATURE_TOKENS, 1))?;
-        let scalars = views
-            .next()
-            .expect("scalars view")
-            .reshape((batch, ENCODER_SCALARS))?;
-        assert!(views.next().is_none());
+        let (flat, lengths) = stage_frame_buffer(frames, self.tensor_device())?;
+        let inputs = EncoderInputs::from_buffer(&flat, &lengths, frames.len())?;
+        self.forward_encoder_inputs(&inputs)
+    }
 
-        let units = encode_units(self, &unit_rows, &unit_presence, &unit_groups, batch)?;
-        let own_units = encode_own_units(self, &own_rows, &own_mask, batch)?;
-        let abilities = encode_tokens(
-            &self.ability,
-            &ability_rows,
-            &ability_presence,
-            ABILITY_FEATURE_TOKENS,
+    fn forward_encoder_inputs(&self, inputs: &EncoderInputs) -> Result<ForwardState, ModelError> {
+        let batch = inputs.batch;
+        let units = encode_units(
+            self,
+            &inputs.units.0,
+            &inputs.units.1,
+            &inputs.unit_groups,
             batch,
         )?;
-        let items = encode_tokens(
-            &self.item,
-            &item_rows,
-            &item_presence,
-            ITEM_FEATURE_TOKENS,
-            batch,
-        )?;
-        let points = encode_tokens(
-            &self.point,
-            &point_rows,
-            &point_presence,
-            POINT_FEATURE_TOKENS,
-            batch,
-        )?;
-        let projectiles = encode_tokens(
+        let own_units = encode_own_units(self, &inputs.own.0, &inputs.own.1, batch)?;
+        let encode = |encoder: &Mlp, pair: &(Tensor, Tensor), tokens| {
+            encode_tokens(encoder, &pair.0, &pair.1, tokens, batch)
+        };
+        let abilities = encode(&self.ability, &inputs.abilities, ABILITY_FEATURE_TOKENS)?;
+        let items = encode(&self.item, &inputs.items, ITEM_FEATURE_TOKENS)?;
+        let points = encode(&self.point, &inputs.points, POINT_FEATURE_TOKENS)?;
+        let projectiles = encode(
             &self.projectile,
-            &projectile_rows,
-            &projectile_presence,
+            &inputs.projectiles,
             PROJECTILE_FEATURE_TOKENS,
-            batch,
         )?;
-        let loot = encode_tokens(
-            &self.loot,
-            &loot_rows,
-            &loot_presence,
-            LOOT_FEATURE_TOKENS,
-            batch,
-        )?;
+        let loot = encode(&self.loot, &inputs.loot, LOOT_FEATURE_TOKENS)?;
         let trunk_input = Tensor::cat(
             &[
-                &scalars,
+                &inputs.scalars,
                 &own_units.fixed,
                 &units.pooled,
                 &abilities.pooled,
@@ -2853,10 +2846,10 @@ fn ppo_candidate_kl(
     examples: &[&PpoPreparedSample],
 ) -> Result<f64, ModelError> {
     assert!(!examples.is_empty());
-    assert!(examples.len() <= MODEL_TRAINING_BATCH);
+    assert!(examples.len() <= MODEL_PPO_MAX_MICROBATCH);
     let negative_log_probability = ppo_negative_log_probability(output, examples)?;
     let new_log_probability = negative_log_probability.neg()?;
-    let mut old_values = [0.0f32; MODEL_TRAINING_BATCH];
+    let mut old_values = [0.0f32; MODEL_PPO_MAX_MICROBATCH];
     for (value, sample) in old_values.iter_mut().zip(examples) {
         *value = sample.transition.old_log_probability;
     }
@@ -3705,6 +3698,29 @@ fn validate_training_batch(
     prefixes: &[TrainingPrefix],
 ) -> Result<(), ModelError> {
     validate_training_batch_count(frames.len())?;
+    validate_training_batch_inputs(frames, prefixes)
+}
+
+fn validate_ppo_training_batch(
+    frames: &[FeatureFrame],
+    prefixes: &[TrainingPrefix],
+) -> Result<(), ModelError> {
+    if frames.is_empty() {
+        return Err(ModelError::EmptyTrainingBatch);
+    }
+    if frames.len() > MODEL_PPO_MAX_MICROBATCH {
+        return Err(ModelError::TrainingBatchTooLarge {
+            count: frames.len(),
+            maximum: MODEL_PPO_MAX_MICROBATCH,
+        });
+    }
+    validate_training_batch_inputs(frames, prefixes)
+}
+
+fn validate_training_batch_inputs(
+    frames: &[FeatureFrame],
+    prefixes: &[TrainingPrefix],
+) -> Result<(), ModelError> {
     if prefixes.len() != frames.len() {
         return Err(ModelError::TrainingPrefixCount {
             prefixes: prefixes.len(),
@@ -4042,6 +4058,91 @@ struct ForwardState {
     points: Tensor,
 }
 
+struct EncoderInputs {
+    batch: usize,
+    units: (Tensor, Tensor),
+    unit_groups: Vec<Tensor>,
+    own: (Tensor, Tensor),
+    abilities: (Tensor, Tensor),
+    items: (Tensor, Tensor),
+    points: (Tensor, Tensor),
+    projectiles: (Tensor, Tensor),
+    loot: (Tensor, Tensor),
+    scalars: Tensor,
+}
+
+impl EncoderInputs {
+    fn from_buffer(flat: &Tensor, lengths: &[usize], batch: usize) -> Result<Self, ModelError> {
+        assert_eq!(lengths.len(), 3 + UNIT_GROUPS + 12);
+        assert!((1..=MODEL_PPO_MAX_MICROBATCH).contains(&batch));
+        let mut offset = 0usize;
+        let mut views = Vec::with_capacity(lengths.len());
+        for &length in lengths {
+            views.push(flat.narrow(0, offset, length)?);
+            offset = offset
+                .checked_add(length)
+                .ok_or(ModelError::InvalidModelState("staged input overflow"))?;
+        }
+        assert_eq!(offset, flat.elem_count());
+        let mut views = views.into_iter();
+        let units = encoder_input_pair(&mut views, batch, ENCODER_UNIT_TOKENS, UNIT_FEATURES)?;
+        let mut unit_groups = Vec::with_capacity(UNIT_GROUPS);
+        for _ in 0..UNIT_GROUPS {
+            unit_groups.push(views.next().expect("unit group view").reshape((
+                batch,
+                ENCODER_UNIT_TOKENS,
+                1,
+            ))?);
+        }
+        let own = encoder_input_pair(&mut views, batch, OWN_UNIT_FEATURE_TOKENS, UNIT_FEATURES)?;
+        let abilities =
+            encoder_input_pair(&mut views, batch, ABILITY_FEATURE_TOKENS, ABILITY_FEATURES)?;
+        let items = encoder_input_pair(&mut views, batch, ITEM_FEATURE_TOKENS, ITEM_FEATURES)?;
+        let points = encoder_input_pair(&mut views, batch, POINT_FEATURE_TOKENS, POINT_FEATURES)?;
+        let projectiles = encoder_input_pair(
+            &mut views,
+            batch,
+            PROJECTILE_FEATURE_TOKENS,
+            PROJECTILE_FEATURES,
+        )?;
+        let loot = encoder_input_pair(&mut views, batch, LOOT_FEATURE_TOKENS, LOOT_FEATURES)?;
+        let scalars = views
+            .next()
+            .expect("scalars view")
+            .reshape((batch, ENCODER_SCALARS))?;
+        assert!(views.next().is_none());
+        Ok(Self {
+            batch,
+            units,
+            unit_groups,
+            own,
+            abilities,
+            items,
+            points,
+            projectiles,
+            loot,
+            scalars,
+        })
+    }
+}
+
+fn encoder_input_pair(
+    views: &mut std::vec::IntoIter<Tensor>,
+    batch: usize,
+    tokens: usize,
+    features: usize,
+) -> Result<(Tensor, Tensor), ModelError> {
+    let rows = views
+        .next()
+        .expect("encoder rows view")
+        .reshape((batch * tokens, features))?;
+    let presence = views
+        .next()
+        .expect("encoder presence view")
+        .reshape((batch, tokens, 1))?;
+    Ok((rows, presence))
+}
+
 struct SamplingBaseLogits {
     value: Vec<f32>,
     kind: Vec<Vec<f32>>,
@@ -4309,13 +4410,49 @@ fn stage_scalars(frames: &[FeatureFrame]) -> Vec<f32> {
     values
 }
 
+fn stage_frame_buffer(
+    frames: &[FeatureFrame],
+    device: &Device,
+) -> Result<(Tensor, Vec<usize>), ModelError> {
+    let units = stage_units(frames);
+    let (own_values, own_mask) = stage_own_units(frames);
+    let (ability_values, ability_mask) = stage_tokens(frames, TokenField::Ability);
+    let (item_values, item_mask) = stage_tokens(frames, TokenField::Item);
+    let (point_values, point_mask) = stage_tokens(frames, TokenField::Point);
+    let (projectile_values, projectile_mask) = stage_tokens(frames, TokenField::Projectile);
+    let (loot_values, loot_mask) = stage_tokens(frames, TokenField::Loot);
+    let scalars = stage_scalars(frames);
+    let mut parts: Vec<&[f32]> = Vec::with_capacity(3 + UNIT_GROUPS + 12);
+    parts.push(&units.values);
+    parts.push(&units.presence);
+    for group in &units.groups {
+        parts.push(group);
+    }
+    parts.push(&own_values);
+    parts.push(&own_mask);
+    for values in [
+        &ability_values,
+        &ability_mask,
+        &item_values,
+        &item_mask,
+        &point_values,
+        &point_mask,
+        &projectile_values,
+        &projectile_mask,
+        &loot_values,
+        &loot_mask,
+        &scalars,
+    ] {
+        parts.push(values);
+    }
+    upload_parts(&parts, device)
+}
+
 /// Uploads every encoder input part with one device allocation and copy.
 ///
-/// Each part becomes a contiguous 1-D view of the same allocation. The host
-/// values and every downstream op are unchanged; only the number of device
-/// allocations and host-to-device copies shrinks from one per part to one per
-/// forward.
-fn upload_parts(parts: &[&[f32]], device: &Device) -> Result<Vec<Tensor>, ModelError> {
+/// Part lengths let the tensor-only encoder recreate the original contiguous
+/// views and offsets without uploading changing data inside CUDA graph capture.
+fn upload_parts(parts: &[&[f32]], device: &Device) -> Result<(Tensor, Vec<usize>), ModelError> {
     let total = parts.iter().try_fold(0usize, |total, part| {
         total
             .checked_add(part.len())
@@ -4329,15 +4466,7 @@ fn upload_parts(parts: &[&[f32]], device: &Device) -> Result<Vec<Tensor>, ModelE
         host.extend_from_slice(part);
     }
     let flat = Tensor::from_vec(host, total, device)?;
-    let mut offset = 0usize;
-    let mut views = Vec::with_capacity(parts.len());
-    for part in parts {
-        views.push(flat.narrow(0, offset, part.len())?);
-        offset += part.len();
-    }
-    assert_eq!(offset, total);
-    assert_eq!(views.len(), parts.len());
-    Ok(views)
+    Ok((flat, parts.iter().map(|part| part.len()).collect()))
 }
 
 fn encode_units(

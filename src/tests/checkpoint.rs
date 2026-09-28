@@ -398,6 +398,7 @@ fn run_metadata() -> CheckpointRun {
 
 fn progress_metadata(global_update: u64) -> CheckpointProgress {
     CheckpointProgress {
+        adaptive_environment: None,
         mastery: None,
         global_update,
         policy_version: global_update,

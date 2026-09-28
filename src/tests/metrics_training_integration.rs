@@ -88,6 +88,7 @@ fn run_job(annealed: bool, directory: &Path, target: u64, resume: bool) -> Count
                 episode_decisions: Some(15),
                 stop_after: None,
                 stop_after_games: None,
+                adaptive_wins: None,
             },
             PolicyDevice::Cpu,
             directory,
@@ -142,6 +143,7 @@ fn full_settings(updates: u64) -> crate::TrainingJobConfig {
 
 fn annealed_settings(settings: crate::TrainingJobConfig) -> AnnealedJobConfig {
     AnnealedJobConfig {
+        environment_schedule: crate::EnvironmentSchedule::Fixed,
         execution: crate::TrainingExecutionOptions::default(),
         updates: 2,
         invocation_updates: None,

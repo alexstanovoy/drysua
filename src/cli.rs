@@ -191,6 +191,12 @@ enum AnnealedOpponentArg {
     Weights,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum EnvironmentScheduleArg {
+    Adaptive,
+    Fixed,
+}
+
 /// Options for the annealed domain-randomization loop.
 #[derive(Args)]
 struct TrainAnnealedArgs {
@@ -203,12 +209,18 @@ struct TrainAnnealedArgs {
     /// Local gradient-fold worker ceiling (1 is the historical serial path).
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=32))]
     host_math_workers: u8,
+    /// PPO tensor microbatch (64/128/256); larger modes change reductions and checkpoint scope.
+    #[arg(long, default_value_t = 256, value_parser = crate::training_execution::parse_training_microbatch)]
+    training_microbatch: usize,
     /// Spread all rollout rows across nearly equal minibatches; recorded in checkpoint scope.
     #[arg(long)]
     balanced_minibatches: bool,
     /// Reuse next-actor bootstrap values; may change PPO numerics, recorded in checkpoint scope.
-    #[arg(long)]
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
     reuse_actor_values: bool,
+    /// Actor groups per wave (1/2/4); two or four require Teacher, at most 64 live worlds, and whole waves per update.
+    #[arg(long, default_value_t = 2, value_parser = crate::training_execution::parse_actor_pipeline_groups)]
+    actor_pipeline_groups: u8,
     /// Total PPO updates; each may perform multiple Adam minibatch steps.
     #[arg(long)]
     updates: u64,
@@ -216,18 +228,33 @@ struct TrainAnnealedArgs {
     #[arg(long, value_parser = clap::builder::RangedU64ValueParser::<std::num::NonZeroU64>::new().range(1..=crate::MAX_TRAINING_COUNTER))]
     invocation_updates: Option<std::num::NonZeroU64>,
     /// Games per update, even from 2 to 80; above 40 selects the wide annealed budget.
-    #[arg(long, default_value_t = 8)]
+    #[arg(long, default_value_t = 40)]
     games: usize,
-    /// Worlds advanced in parallel per batch (1..=64); must divide games and generation
-    /// games. Defaults to the largest divisor of their gcd within the available
-    /// cores and the resolved value is printed, recorded in the run scope, and
-    /// compared on resume; pass it explicitly when a run must resume on a host
-    /// with a different core count.
-    #[arg(long)]
-    parallel: Option<usize>,
-    /// Games per environment generation, on the global game counter.
+    /// Worlds per actor group (1..=64); defaults to 20 independently of CPU count.
+    /// Must divide games and generation games; incompatible overrides are rejected.
+    #[arg(long, default_value_t = 20)]
+    parallel: usize,
+    /// Games per generation; adaptive requires a positive whole multiple of --games.
     #[arg(long)]
     generation_games: u64,
+    /// Environment transitions; legacy checkpoint resume requires explicit fixed.
+    #[arg(long, value_enum, default_value_t = EnvironmentScheduleArg::Adaptive)]
+    environment_schedule: EnvironmentScheduleArg,
+    /// Consecutive successful updates (adaptive only; default 2).
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=crate::MAX_TRAINING_COUNTER))]
+    environment_success_updates: Option<u64>,
+    /// Inclusive success win-rate threshold in [0, 1] (adaptive only; default 0.8).
+    #[arg(long)]
+    environment_success_rate: Option<crate::EnvironmentDecimal>,
+    /// Consecutive poor updates before extension awards (adaptive only; default 1).
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=crate::MAX_TRAINING_COUNTER))]
+    environment_poor_updates: Option<u64>,
+    /// Inclusive poor win-rate threshold in [0, 1] (adaptive only; default 0.2).
+    #[arg(long)]
+    environment_poor_rate: Option<crate::EnvironmentDecimal>,
+    /// Exact extra-update credit per poor award; may exceed 1 (adaptive only; default 0.75).
+    #[arg(long)]
+    environment_extension: Option<crate::EnvironmentDecimal>,
     /// Final updates with no modifiers; defaults to one fifth of the update budget.
     #[arg(long)]
     zero_updates: Option<u64>,
@@ -451,8 +478,26 @@ fn run_train_annealed(arguments: TrainAnnealedArgs) -> std::io::Result<()> {
         embedded_commit("DRYSUA_GIT_COMMIT", option_env!("DRYSUA_GIT_COMMIT"))?,
         embedded_commit("BOTA_GIT_COMMIT", option_env!("BOTA_GIT_COMMIT"))?,
     )?;
+    run_train_annealed_with_settings(arguments, settings)
+}
+
+#[cfg(feature = "builtin")]
+fn run_train_annealed_with_settings(
+    arguments: TrainAnnealedArgs,
+    settings: crate::AnnealedJobConfig,
+) -> std::io::Result<()> {
+    crate::ppo_arena::validate_annealed(&settings, Default::default())
+        .map_err(std::io::Error::other)?;
     let device = arguments.device.policy_device(arguments.device_ordinal)?;
     arguments.checkpoint.validate(&arguments.metrics)?;
+    if arguments.checkpoint.resume {
+        crate::ppo_arena::preflight_annealed_resume(
+            &settings,
+            device,
+            &arguments.checkpoint.checkpoint_directory,
+        )
+        .map_err(std::io::Error::other)?;
+    }
     let metrics = arguments.metrics.start()?;
     eprintln!(
         "annealed: updates={} games={} parallel={} generation_games={} zero_updates={} seed={} opponent={:?}",
@@ -632,6 +677,66 @@ pub(crate) fn training_settings_for_test(
     )
 }
 
+#[cfg(any(feature = "builtin", test))]
+impl TrainAnnealedArgs {
+    fn environment_schedule(&self) -> std::io::Result<crate::EnvironmentSchedule> {
+        if self.environment_schedule == EnvironmentScheduleArg::Fixed {
+            if self.environment_success_updates.is_some()
+                || self.environment_success_rate.is_some()
+                || self.environment_poor_updates.is_some()
+                || self.environment_poor_rate.is_some()
+                || self.environment_extension.is_some()
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "environment tuning options require --environment-schedule adaptive",
+                ));
+            }
+            return Ok(crate::EnvironmentSchedule::Fixed);
+        }
+        let defaults = crate::AdaptiveEnvironmentConfig::default();
+        let config = crate::AdaptiveEnvironmentConfig {
+            success_updates: self
+                .environment_success_updates
+                .unwrap_or(defaults.success_updates),
+            success_rate: self
+                .environment_success_rate
+                .unwrap_or(defaults.success_rate),
+            poor_updates: self
+                .environment_poor_updates
+                .unwrap_or(defaults.poor_updates),
+            poor_rate: self.environment_poor_rate.unwrap_or(defaults.poor_rate),
+            extension: self.environment_extension.unwrap_or(defaults.extension),
+        }
+        .validate()
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+        self.validate_environment_limits()?;
+        Ok(crate::EnvironmentSchedule::Adaptive(config))
+    }
+
+    fn validate_environment_limits(&self) -> std::io::Result<()> {
+        if self.games == 0
+            || self.generation_games == 0
+            || !self.generation_games.is_multiple_of(self.games as u64)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "adaptive environment generation games must be a positive whole multiple of games per update",
+            ));
+        }
+        crate::AdaptiveEnvironmentLimits {
+            base_updates: self.generation_games / self.games as u64,
+            total_updates: self.updates,
+            zero_updates: self
+                .zero_updates
+                .unwrap_or_else(|| self.updates.div_ceil(5)),
+        }
+        .validate()
+        .map(|_| ())
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))
+    }
+}
+
 #[cfg(feature = "builtin")]
 impl TrainAnnealedArgs {
     fn annealed_settings(
@@ -639,6 +744,7 @@ impl TrainAnnealedArgs {
         git_commit: String,
         simulator_commit: String,
     ) -> std::io::Result<crate::AnnealedJobConfig> {
+        let environment_schedule = self.environment_schedule()?;
         if self.updates == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -658,10 +764,6 @@ impl TrainAnnealedArgs {
             ));
         }
         let opponent = self.frozen_opponent()?;
-        let parallel = match self.parallel {
-            Some(parallel) => parallel,
-            None => default_parallel_worlds(self.games, self.generation_games),
-        };
         let zero_updates = self
             .zero_updates
             .unwrap_or_else(|| self.updates.div_ceil(5));
@@ -673,15 +775,18 @@ impl TrainAnnealedArgs {
             ..crate::PpoConfig::default()
         });
         Ok(crate::AnnealedJobConfig {
+            environment_schedule,
             execution: crate::TrainingExecutionOptions {
+                actor_pipeline_groups: usize::from(self.actor_pipeline_groups),
                 balanced_minibatches: self.balanced_minibatches,
                 host_math_workers: usize::from(self.host_math_workers),
+                training_microbatch: self.training_microbatch,
                 reuse_actor_values: self.reuse_actor_values,
             },
             updates: self.updates,
             invocation_updates: self.invocation_updates,
             games_per_update: self.games,
-            parallel_worlds: parallel,
+            parallel_worlds: self.parallel,
             games_per_generation: self.generation_games,
             zero_updates,
             seed: self.seed,
@@ -709,38 +814,6 @@ impl TrainAnnealedArgs {
             )),
         }
     }
-}
-
-/// Largest divisor of `gcd(games, generation_games)` within the core budget.
-#[cfg(feature = "builtin")]
-fn default_parallel_worlds(games: usize, generation_games: u64) -> usize {
-    let cores = std::thread::available_parallelism()
-        .map(std::num::NonZeroUsize::get)
-        .unwrap_or(1);
-    default_parallel_worlds_for(games, generation_games, cores)
-}
-
-/// Largest divisor of `gcd(games, generation_games)` not past `cores`.
-#[cfg(feature = "builtin")]
-pub(crate) fn default_parallel_worlds_for(
-    games: usize,
-    generation_games: u64,
-    cores: usize,
-) -> usize {
-    let gcd = greatest_common_divisor(games as u64, generation_games).max(1);
-    let cores = cores.clamp(1, crate::MAX_TRAINING_ENVIRONMENTS);
-    (1..=cores)
-        .rev()
-        .find(|candidate| gcd.is_multiple_of(*candidate as u64))
-        .unwrap_or(1)
-}
-
-#[cfg(feature = "builtin")]
-fn greatest_common_divisor(mut left: u64, mut right: u64) -> u64 {
-    while right != 0 {
-        (left, right) = (right, left % right);
-    }
-    left
 }
 
 #[cfg(all(test, feature = "builtin"))]

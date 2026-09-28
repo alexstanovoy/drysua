@@ -1,4 +1,7 @@
 mod action;
+mod adaptive_environment;
+#[cfg(any(feature = "builtin", test))]
+mod adaptive_randomization;
 #[cfg(feature = "builtin")]
 mod arena;
 mod behavioral_target;
@@ -34,6 +37,7 @@ mod training_outcomes;
 mod wire;
 
 pub use action::*;
+pub use adaptive_environment::*;
 #[cfg(feature = "builtin")]
 pub use arena::*;
 pub use behavioral_target::*;

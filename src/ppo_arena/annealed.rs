@@ -10,6 +10,8 @@
 //! committed update replays the interrupted update byte for byte.
 
 use std::path::{Path, PathBuf};
+#[path = "annealed_adaptive.rs"]
+mod adaptive;
 #[cfg(all(
     test,
     feature = "cuda",
@@ -74,6 +76,8 @@ pub enum AnnealedOpponent {
 /// Bounded, resumable annealed-loop settings.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AnnealedJobConfig {
+    /// Adaptive transitions or the byte-compatible historical fixed schedule.
+    pub environment_schedule: crate::EnvironmentSchedule,
     /// Experimental execution choices, bound to command scope rather than PPO codecs.
     pub execution: crate::TrainingExecutionOptions,
     /// Total updates in the run.
@@ -117,6 +121,9 @@ pub struct AnnealedJobConfig {
 /// shortens it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct AnnealedHarness {
+    /// Explicit controller-only outcome fixture; never exposed by production entry points.
+    #[cfg(test)]
+    pub(crate) adaptive_wins: Option<&'static [u64]>,
     /// Decisions per episode; `None` runs the production ceiling.
     pub(crate) episode_decisions: Option<usize>,
     /// Stop after this many completed updates in one invocation.
@@ -231,6 +238,32 @@ where
         .map_err(|_| PpoError::Model("annealed worker panicked".to_owned()))?
 }
 
+/// Read-only CLI admission before metrics storage or listeners are started.
+pub(crate) fn preflight_annealed_resume(
+    settings: &AnnealedJobConfig,
+    device: PolicyDevice,
+    directory: &Path,
+) -> Result<(), PpoError> {
+    let harness = AnnealedHarness::default();
+    let config = validate_annealed(settings, harness)?;
+    validate_training_directory(directory, true)?;
+    let opponent = load_opponent(&settings.opponent, device)?;
+    let run = annealed_run(settings, device, config, harness, opponent.fingerprint)?;
+    check_resume_scope(settings, &run, directory)
+}
+
+fn check_resume_scope(
+    settings: &AnnealedJobConfig,
+    run: &CheckpointRun,
+    directory: &Path,
+) -> Result<(), PpoError> {
+    let stored = TrainingArtifact::load_run_scope(directory).map_err(text_error)?;
+    if let Some(difference) = scope_command_line_difference(&stored, run) {
+        return Err(PpoError::ScopeMismatch(difference));
+    }
+    adaptive::preflight_resume(settings, run, directory)
+}
+
 fn run_annealed_inner<F>(
     settings: AnnealedJobConfig,
     harness: AnnealedHarness,
@@ -253,15 +286,12 @@ where
         ));
     }
     validate_training_directory(directory, resume)?;
-    let _lock = TrainingDirectoryLock::acquire(directory)?;
     let opponent = load_opponent(&settings.opponent, device)?;
     let run = annealed_run(&settings, device, config, harness, opponent.fingerprint)?;
     if resume {
-        let stored = TrainingArtifact::load_run_scope(directory).map_err(text_error)?;
-        if let Some(difference) = scope_command_line_difference(&stored, &run) {
-            return Err(PpoError::ScopeMismatch(difference));
-        }
+        check_resume_scope(&settings, &run, directory)?;
     }
+    let _lock = TrainingDirectoryLock::acquire(directory)?;
     let random_directory = directory.join(RANDOMIZATION_DIRECTORY);
     if !resume {
         std::fs::create_dir_all(&random_directory)
@@ -330,22 +360,16 @@ impl AnnealedSession {
             std::fs::metadata(random_directory).map_err(|_| {
                 PpoError::InvalidConfig("domain randomization snapshots are missing on resume")
             })?;
-            let schedule = anneal_schedule(settings);
-            verify_generation_snapshots(
-                random_directory,
-                settings.seed,
-                settings.games_per_generation,
-                settings.games_per_update as u64,
-                schedule,
-                games,
-            )?
+            adaptive::verified_generation_count(settings, random_directory, &state, games)?
         } else {
+            state.adaptive_environment = adaptive::initial_checkpoint(settings)?;
             0
         };
         state
             .trainer
             .set_execution(crate::TrainingExecutionOptions {
-                // Bootstrap reuse belongs to collection, not optimizer execution.
+                // Actor pipelining and bootstrap reuse belong to collection, not optimization.
+                actor_pipeline_groups: 1,
                 reuse_actor_values: false,
                 ..settings.execution
             })?;
@@ -386,6 +410,7 @@ impl AnnealedSession {
             anneal,
             self.generations,
         );
+        generations.adaptive = self.state.adaptive_environment;
         while self.state.completed_updates < invocation_target {
             self.train_update(settings, harness, config, &mut generations)?;
             let final_update = self.state.completed_updates == invocation_target;
@@ -444,9 +469,10 @@ impl AnnealedSession {
         let mut rollout = PpoRollout::for_config(config, policy_identity)?;
         let mut report = PpoSmokeReport::default();
         let seats = balanced_policy_seats(settings.seed, update, games)?;
+        let wave_worlds = settings.parallel_worlds * settings.execution.actor_pipeline_groups;
         timing.enter(TrainingStage::Collection);
-        for local in (0..games).step_by(settings.parallel_worlds) {
-            self.collect_update_batch(
+        for local in (0..games).step_by(wave_worlds) {
+            self.collect_update_wave(
                 settings,
                 harness,
                 config,
@@ -458,11 +484,11 @@ impl AnnealedSession {
             )?;
             self.games = self
                 .games
-                .checked_add(settings.parallel_worlds as u64)
+                .checked_add(wave_worlds as u64)
                 .ok_or(PpoError::CounterOverflow)?;
             if harness
                 .stop_after_games
-                .is_some_and(|stop| local + settings.parallel_worlds >= stop)
+                .is_some_and(|stop| local + wave_worlds >= stop)
             {
                 return Err(PpoError::InvalidTransition(
                     "annealed invocation stopped mid-update",
@@ -470,6 +496,7 @@ impl AnnealedSession {
             }
         }
         let samples = rollout.len();
+        let next_adaptive = generations.next_adaptive(settings, harness, update, &report)?;
         timing.set_samples(samples);
         timing.enter(TrainingStage::BatchPreparation);
         let batch = rollout.finish(config)?;
@@ -485,7 +512,103 @@ impl AnnealedSession {
             .checked_add(samples as u64)
             .ok_or(PpoError::CounterOverflow)?;
         self.state.counters.merge(&report)?;
+        generations.commit_adaptive(next_adaptive, self.state.completed_updates);
+        self.state.adaptive_environment = next_adaptive;
         Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn collect_update_wave(
+        &mut self,
+        settings: &AnnealedJobConfig,
+        harness: AnnealedHarness,
+        config: PpoConfig,
+        generations: &mut GenerationCache,
+        local: usize,
+        seats: &[usize],
+        rollout: &mut PpoRollout,
+        report: &mut PpoSmokeReport,
+    ) -> Result<(), PpoError> {
+        if settings.execution.actor_pipeline_groups == 1 {
+            return self.collect_update_batch(
+                settings,
+                harness,
+                config,
+                generations,
+                local,
+                seats,
+                rollout,
+                report,
+            );
+        }
+        let group_count = settings.execution.actor_pipeline_groups;
+        assert!(matches!(group_count, 2 | 4));
+        assert!(settings.parallel_worlds * group_count <= crate::PPO_ANNEALED_MAX_PARALLEL_WORLDS);
+        let mut groups = Vec::new();
+        groups.try_reserve_exact(group_count).map_err(|error| {
+            PpoError::Model(format!("actor pipeline groups allocation: {error}"))
+        })?;
+        for group in 0..group_count {
+            groups.push(self.build_actor_group(
+                settings,
+                generations,
+                local + group * settings.parallel_worlds,
+                seats,
+            )?);
+        }
+        episode::collect_actor_pipeline(
+            &self.state.model,
+            config,
+            &mut groups,
+            harness.episode_decisions(),
+            rollout,
+            report,
+            settings.execution.reuse_actor_values,
+        )?;
+        for group in &groups {
+            for environment in &group.environments {
+                reject_production_rejection(environment, "annealed collection")?;
+            }
+        }
+        Ok(())
+    }
+
+    fn build_actor_group(
+        &mut self,
+        settings: &AnnealedJobConfig,
+        generations: &mut GenerationCache,
+        local: usize,
+        seats: &[usize],
+    ) -> Result<episode::ActorGroup, PpoError> {
+        let global_game = self
+            .state
+            .completed_updates
+            .checked_mul(settings.games_per_update as u64)
+            .and_then(|base| base.checked_add(local as u64))
+            .ok_or(PpoError::CounterOverflow)?;
+        let draw = generations.draw_for_game(global_game)?;
+        let batch_len = settings.parallel_worlds;
+        assert!(local + batch_len <= settings.games_per_update);
+        assert!(global_game + batch_len as u64 <= draw.end_game);
+        let (generation, scale_bp) = generation_metrics(&draw, global_game);
+        prometheus::set_generation(generation, scale_bp);
+        let environments = batch_environments(
+            settings,
+            global_game,
+            &seats[local..local + batch_len],
+            &self.opponent,
+            &draw,
+        )?;
+        let streams = (0..batch_len)
+            .map(|offset| episode::game_stream(settings.seed, global_game + offset as u64))
+            .collect::<Result<Vec<_>, _>>()?;
+        let random = actor_stream_rngs(&mut self.state.sampling, batch_len)?;
+        Ok(episode::ActorGroup {
+            stream_base: local,
+            environments,
+            streams,
+            random,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -506,8 +629,7 @@ impl AnnealedSession {
             .checked_mul(settings.games_per_update as u64)
             .and_then(|base| base.checked_add(local as u64))
             .ok_or(PpoError::CounterOverflow)?;
-        let generation = global_game / settings.games_per_generation;
-        let draw = generations.draw(generation)?;
+        let draw = generations.draw_for_game(global_game)?;
         let batch_len = settings.parallel_worlds;
         assert!(
             local + batch_len <= settings.games_per_update,
@@ -706,6 +828,7 @@ fn push_spawn_rule(rules: &mut Vec<SpawnModifier>, targets: &[SpawnTarget], spec
 
 /// One generation's draw, cached between the games that share it.
 struct GenerationCache {
+    adaptive: Option<crate::AdaptiveEnvironmentCheckpoint>,
     directory: PathBuf,
     seed: u64,
     games_per_generation: u64,
@@ -726,6 +849,7 @@ impl GenerationCache {
         verified: u64,
     ) -> Self {
         Self {
+            adaptive: None,
             directory,
             seed,
             games_per_generation,
@@ -768,7 +892,8 @@ impl GenerationCache {
     }
 
     fn counted_through(&self) -> u64 {
-        self.counted_through
+        self.adaptive
+            .map_or(self.counted_through, |state| state.snapshot_count)
     }
 }
 
@@ -826,6 +951,7 @@ fn annealed_run(
     harness: AnnealedHarness,
     opponent_fingerprint: Option<u64>,
 ) -> Result<CheckpointRun, PpoError> {
+    settings.execution.validate()?;
     let device_name = device_name(device);
     let mut command_line = format!(
         "train-annealed --updates {} --games {} --parallel {} --generation-games {} --zero-updates {} --epochs {} --minibatch {} --seed {} --map 2 --device {device_name}",
@@ -872,6 +998,7 @@ fn annealed_run(
         ));
     }
     settings.execution.append_scope(&mut command_line);
+    adaptive::append_scope(settings, harness, &mut command_line);
     Ok(CheckpointRun {
         mastery_config: None,
         git_commit: settings.git_commit.clone(),
@@ -888,11 +1015,13 @@ fn annealed_run(
 }
 
 /// Validates every annealed parameter without silently changing its PPO profile.
-fn validate_annealed(
+pub(crate) fn validate_annealed(
     settings: &AnnealedJobConfig,
     harness: AnnealedHarness,
 ) -> Result<PpoConfig, PpoError> {
-    settings.execution.validate()?;
+    settings
+        .execution
+        .validate_ppo_memory(settings.ppo.sample_budget)?;
     if settings.updates == 0 || settings.updates > MAX_TRAINING_COUNTER {
         return Err(PpoError::InvalidConfig("annealed updates"));
     }
@@ -905,6 +1034,7 @@ fn validate_annealed(
         ));
     }
     validate_annealed_batches(settings)?;
+    adaptive::validate(settings, harness)?;
     if settings.zero_updates > settings.updates {
         return Err(PpoError::InvalidConfig(
             "annealed zero updates cannot exceed the update budget",
@@ -926,6 +1056,7 @@ fn validate_annealed(
         return Err(PpoError::InvalidConfig("annealed opponent weights"));
     }
     let config = validate_annealed_ppo(settings)?;
+    validate_actor_pipeline(settings, config)?;
     validate_annealed_counters(settings, config)?;
     Ok(config)
 }
@@ -944,12 +1075,24 @@ fn validate_annealed_batches(settings: &AnnealedJobConfig) -> Result<(), PpoErro
     {
         return Err(PpoError::InvalidConfig("annealed parallel worlds"));
     }
+    let wave_worlds = settings
+        .parallel_worlds
+        .checked_mul(settings.execution.actor_pipeline_groups)
+        .filter(|worlds| *worlds <= crate::PPO_ANNEALED_MAX_PARALLEL_WORLDS)
+        .ok_or(PpoError::InvalidConfig(
+            "annealed actor pipeline active worlds must not exceed 64",
+        ))?;
     if !settings
         .games_per_update
         .is_multiple_of(settings.parallel_worlds)
     {
         return Err(PpoError::InvalidConfig(
             "annealed parallel worlds must divide games per update",
+        ));
+    }
+    if !settings.games_per_update.is_multiple_of(wave_worlds) {
+        return Err(PpoError::InvalidConfig(
+            "annealed actor pipeline wave must divide games per update",
         ));
     }
     if settings.games_per_generation == 0
@@ -963,6 +1106,27 @@ fn validate_annealed_batches(settings: &AnnealedJobConfig) -> Result<(), PpoErro
         ));
     }
     Ok(())
+}
+
+fn validate_actor_pipeline(
+    settings: &AnnealedJobConfig,
+    config: PpoConfig,
+) -> Result<(), PpoError> {
+    if settings.execution.actor_pipeline_groups == 1 {
+        return Ok(());
+    }
+    assert!(matches!(settings.execution.actor_pipeline_groups, 2 | 4));
+    assert_eq!(settings.ppo, config);
+    if !matches!(settings.opponent, AnnealedOpponent::Teacher) {
+        return Err(PpoError::InvalidConfig(
+            "annealed actor pipeline requires a teacher opponent",
+        ));
+    }
+    episode::validate_pipeline_memory(
+        config,
+        settings.parallel_worlds,
+        settings.execution.actor_pipeline_groups,
+    )
 }
 
 fn validate_annealed_ppo(settings: &AnnealedJobConfig) -> Result<PpoConfig, PpoError> {

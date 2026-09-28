@@ -290,6 +290,67 @@ pub fn draw_generation(
         .checked_mul(games_per_update)
         .ok_or(PpoError::CounterOverflow)?;
     let applied_games = end_game.min(zero_from_game).saturating_sub(start_game);
+    let (deltas, spec) = draw_modifiers(seed, generation, scale_bp)?;
+    Ok(GenerationDraw {
+        generation,
+        start_game,
+        end_game,
+        start_update,
+        scale_bp,
+        applied_games,
+        deltas,
+        spec,
+    })
+}
+
+/// Draws at an actual controller start, retaining the original generation seed.
+/// End and applied-game counts are global bounds, not an adaptive duration.
+pub(crate) fn draw_generation_at_start(
+    seed: u64,
+    generation: u64,
+    start_update: u64,
+    games_per_update: u64,
+    schedule: AnnealSchedule,
+) -> Result<GenerationDraw, PpoError> {
+    if games_per_update == 0 || start_update >= schedule.updates {
+        return Err(PpoError::InvalidConfig(
+            "adaptive randomization draw requires positive games and a start before total updates",
+        ));
+    }
+    let start_game = start_update
+        .checked_mul(games_per_update)
+        .ok_or(PpoError::CounterOverflow)?;
+    let end_game = schedule
+        .updates
+        .checked_mul(games_per_update)
+        .ok_or(PpoError::CounterOverflow)?;
+    let applied_games = schedule
+        .zero_from_update()
+        .saturating_sub(start_update)
+        .checked_mul(games_per_update)
+        .ok_or(PpoError::CounterOverflow)?;
+    let scale_bp = schedule.scale_bp(start_update);
+    let (deltas, spec) = draw_modifiers(seed, generation, scale_bp)?;
+    debug_assert!(start_game < end_game);
+    debug_assert!(applied_games <= end_game - start_game);
+    Ok(GenerationDraw {
+        generation,
+        start_game,
+        end_game,
+        start_update,
+        scale_bp,
+        applied_games,
+        deltas,
+        spec,
+    })
+}
+
+fn draw_modifiers(
+    seed: u64,
+    generation: u64,
+    scale_bp: i32,
+) -> Result<([i32; VARIABLES.len()], ModifierSpec), PpoError> {
+    assert!((0..=NOMINAL_BP).contains(&scale_bp));
     let mut deltas = [0i32; VARIABLES.len()];
     let mut spec = ModifierSpec::NOMINAL;
     if scale_bp > 0 {
@@ -305,16 +366,7 @@ pub fn draw_generation(
         }
     }
     assert!(spec.is_bounded(), "a draw stays inside the spec bounds");
-    Ok(GenerationDraw {
-        generation,
-        start_game,
-        end_game,
-        start_update,
-        scale_bp,
-        applied_games,
-        deltas,
-        spec,
-    })
+    Ok((deltas, spec))
 }
 
 /// One bounded normal draw in spec units, from twelve uniform words.

@@ -1,10 +1,18 @@
 # Sequential annealed games and sample budgets
 
 `train-annealed` admits an even **M = 2..=80** games per PPO update, with
-**B = 1..=64** concurrent worlds. B must still divide both M and K (games per
-generation). M40/B8/K200 runs five sequential eight-world batches per update;
-one generation spans five updates. Collection does not split PPO updates or
-reduce episode decisions, retention, or matches.
+**B = 1..=64** worlds per actor group. B divides both M and K (generation games),
+and B times the actor-group count G must divide M and not exceed 64 live worlds.
+The CLI defaults to **M40/B20/G2, microbatch256, actor-value reuse enabled**;
+B is fixed independently of available CPU cores. The learner backend remains CPU;
+pass `--device cuda` for the measured CUDA profile. See
+[execution settings](training_microbatch.md) for the complete default and legacy profiles.
+
+With explicit G1 and a fixed environment schedule, M40/B8/K200 runs five sequential
+eight-world batches per update and one generation spans five updates. Under the
+default adaptive schedule, K/M is an initial budget, not a fixed duration. K remains
+a required CLI argument: K160 gives base4 with M40. Collection does not split PPO
+updates or reduce episode decisions, retention, or matches.
 
 The CLI chooses `PpoSampleBudget::Standard` for M <= 26, `Annealed` for M28..40,
 and the closed `WideAnnealed` profile for M42..80.
@@ -12,18 +20,20 @@ Library callers must set the canonical profile explicitly: validation rejects
 either mismatch. Expanded updates reserve M × 1,163 retained samples, up to
 93,040 in the wide profile (the old profile remains capped at 46,520).
 Completed-outcome storage has 80 slots independently of the unchanged
-26-world standard train-full limit. Explicit `--parallel 40` collects M40 in one
-batch. Automatic parallel selection retains its previous 26-core ceiling, so
-existing invocations without an explicit parallel setting do not change.
+26-world standard train-full limit. Explicit `--parallel 40 --actor-pipeline-groups 1`
+collects M40 in one batch. Existing runs must pass their original M/B/G/microbatch/
+reuse settings on resume; the new CLI defaults do not migrate old checkpoints.
 
 Only expanded canonical run scopes add `--sample-budget annealed-v1`; existing
 M <= 26 command-line bytes are unchanged. This is a generated scope marker,
 not a user-selectable CLI override: `--games` determines the profile. Strict
 resume still rejects changed M, B, K, PPO configuration, and other run scope.
 Wide scopes use `--sample-budget wide-annealed-v1`; all M<=40 scope bytes stay
-unchanged. Candidate M48/B48, M64/B64 and M80/B40 can use K240, K320 and K400,
-respectively, for five updates per generation. M80/B64 is not divisible and is
-rejected rather than truncating or inventing a partial batch.
+unchanged for an unchanged resolved execution profile. Candidate M48/B48, M64/B64
+and M80/B40 explicitly select G1 and microbatch64; they can use K240, K320 and K400
+for a base budget of five updates. Fixed mode makes that duration exact; adaptive
+mode can shorten or extend it. M80/B64 is not divisible and is rejected rather
+than truncating or inventing a partial batch.
 
 Before constructing worlds or loading weights, preflight bounds cumulative
 samples, actor seed draws, optimizer steps, and shuffle draws. Each actor's
@@ -35,8 +45,10 @@ test episodes do not weaken production preflight.
 
 ## Compatibility and memory
 
-Wide capacity has explicit PPO39/checkpoint14 identities, linked to unchanged
-PPO38/checkpoint13. All three exact runtime tuples are accepted; tensor shapes
+Wide capacity has explicit PPO39/fixed-checkpoint14 identities, linked to unchanged
+PPO38/fixed-checkpoint13. Adaptive state adds the separate checkpoint15/16/17 profiles;
+see [environment recovery](adaptive_environments.md#checkpoint-and-generation-recovery).
+All three exact runtime tuples are accepted; tensor shapes
 and inference semantics are unchanged. Checkpoints keep the 64-byte config
 encoding and validate cumulative samples against U*M*1163. No old initializer
 is rewritten, and no profile transition is accepted as an implicit resume.
@@ -81,11 +93,13 @@ This excludes allocator overhead, model/optimizer tensors and native worlds:
 it is not a whole-process memory guarantee. The unchanged
 [resource guard](experiment-safety.md) is mandatory.
 
-## Opt-in actor bootstrap reuse
+## Scoped actor bootstrap reuse
 
 `train-annealed --reuse-actor-values` reuses the next actor batch's value for a
 retained transition instead of running a separate batch-one flush evaluator.
-It is **off by default**. Actor batch membership, action sampling, reward
+It is **on by default for the train-annealed CLI**, and remains off in library
+execution defaults. `--reuse-actor-values=false` disables it; bare or `=true` enables
+it. Actor batch membership, action sampling, reward
 accounting, and retained-row order stay unchanged; terminal bootstraps stay zero.
 Bounded test windows use a final batch-one fallback without another actor draw.
 
@@ -93,8 +107,9 @@ Batch-one and actor-batch GEMMs can differ in floating-point bits. Reuse therefo
 may change GAE and subsequent PPO parameters even when collection trajectories
 match. The flag is recorded in canonical checkpoint scope, and changing it on
 resume is rejected. It is an annealed-collector option, not a public trainer or
-standard `train`/`train-full` option. Enabling it requires an explicit operational
-decision; performance qualification does not authorize production training.
+standard `train`/`train-full` option. Old checkpoints still require their original
+reuse setting explicitly; performance qualification does not authorize a new
+production training launch or implicit resume migration.
 
 ## Regression tests
 

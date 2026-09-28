@@ -1,9 +1,17 @@
+const _: () = assert!(super::PPO_WIDE_ANNEALED_MAX_SAMPLES >= super::PPO_ANNEALED_MAX_SAMPLES);
+const _: () = assert!(super::PPO_WIDE_ANNEALED_MAX_SAMPLES >= super::PPO_MAX_SAMPLES);
+
 pub(super) fn partition(
     order: &[usize],
     maximum: usize,
     balanced: bool,
 ) -> impl Iterator<Item = &[usize]> {
-    assert!(order.len() <= super::PPO_ANNEALED_MAX_SAMPLES);
+    assert!(
+        order.len() <= super::PPO_WIDE_ANNEALED_MAX_SAMPLES,
+        "PPO partition row count {} exceeds maximum {}",
+        order.len(),
+        super::PPO_WIDE_ANNEALED_MAX_SAMPLES
+    );
     assert!((1..=super::MODEL_MAX_BATCH).contains(&maximum));
     let chunks = order.chunks(maximum);
     let count = chunks.len();
@@ -22,6 +30,52 @@ pub(super) fn partition(
 #[cfg(test)]
 mod tests {
     use super::super::*;
+
+    #[test]
+    fn partition_wide_capacity_preserves_every_row_and_order_in_both_modes() {
+        let order: Vec<_> = (0..PPO_WIDE_ANNEALED_MAX_SAMPLES).rev().collect();
+        assert_eq!(order.len(), 93_040);
+        for balanced in [false, true] {
+            let chunks = minibatch::partition(&order, 2048, balanced).collect::<Vec<_>>();
+            assert_eq!(chunks.len(), order.len().div_ceil(2048));
+            assert_eq!(
+                chunks.iter().map(|chunk| chunk.len()).sum::<usize>(),
+                order.len()
+            );
+            assert!(
+                chunks
+                    .iter()
+                    .all(|chunk| !chunk.is_empty() && chunk.len() <= 2048)
+            );
+            assert_eq!(chunks.concat(), order);
+            if balanced {
+                let smallest = chunks.iter().map(|chunk| chunk.len()).min().unwrap();
+                let largest = chunks.iter().map(|chunk| chunk.len()).max().unwrap();
+                assert!(largest - smallest <= 1);
+            } else {
+                assert!(chunks.into_iter().eq(order.chunks(2048)));
+            }
+        }
+    }
+
+    #[test]
+    fn partition_wide_capacity_rejects_maximum_plus_one_with_the_bound() {
+        let order = vec![0; PPO_WIDE_ANNEALED_MAX_SAMPLES + 1];
+        assert_eq!(order.len(), 93_041);
+        for balanced in [false, true] {
+            let panic =
+                std::panic::catch_unwind(|| minibatch::partition(&order, 2048, balanced).count())
+                    .expect_err("partition must reject above the largest admitted PPO capacity");
+            let message = panic
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| panic.downcast_ref::<&str>().copied());
+            assert_eq!(
+                message,
+                Some("PPO partition row count 93041 exceeds maximum 93040")
+            );
+        }
+    }
 
     #[test]
     fn balanced_partitions_preserve_order_and_bound_sizes_without_a_tiny_tail() {
