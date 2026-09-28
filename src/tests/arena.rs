@@ -1,3 +1,6 @@
+#[path = "action_execution.rs"]
+mod action_execution;
+
 #[path = "arena_feared.rs"]
 mod feared_tests;
 

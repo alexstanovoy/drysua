@@ -16,15 +16,17 @@ WORKDIR /src
 COPY bota/ bota/
 COPY drysua/ drysua/
 ARG CUDA_COMPUTE_CAP
-RUN test -n "$CUDA_COMPUTE_CAP" && \
+ARG RUST_TARGET_CPU=native
+ENV RUSTFLAGS="-C target-cpu=${RUST_TARGET_CPU}"
+RUN test -n "$CUDA_COMPUTE_CAP" && test -n "$RUST_TARGET_CPU" && \
     python3 /src/drysua/docker/source_identity.py && \
     . /opt/drysua/source.env && \
-    export CUDA_COMPUTE_CAP && \
+    export CUDA_COMPUTE_CAP RUST_TARGET_CPU && \
     cargo build --manifest-path /src/drysua/Cargo.toml --locked --release --quiet \
       --no-default-features --features builtin,cuda --bin drysua && \
     binary_hash="$(sha256sum /src/drysua/target/release/drysua)" && \
     export DRYSUA_BINARY_SHA256="${binary_hash%% *}" && \
-    python3 -c 'import json,os,pathlib; p=pathlib.Path; source=p("/opt/drysua/source.sha256").read_text().strip(); p("/opt/drysua/provenance.json").write_text(json.dumps({"source_sha256":source,"binary_sha256":os.environ["DRYSUA_BINARY_SHA256"],"rust":"1.98.0","cuda":"13.3.1","cuda_compute_cap":os.environ["CUDA_COMPUTE_CAP"],"features":"builtin,cuda","scope":"fresh source build, not frozen B40"})+"\n")'
+    python3 -c 'import json,os,pathlib; p=pathlib.Path; source=p("/opt/drysua/source.sha256").read_text().strip(); p("/opt/drysua/provenance.json").write_text(json.dumps({"source_sha256":source,"binary_sha256":os.environ["DRYSUA_BINARY_SHA256"],"rust":"1.98.0","rust_target_cpu":os.environ["RUST_TARGET_CPU"],"rustflags":os.environ["RUSTFLAGS"],"cuda":"13.3.1","cuda_compute_cap":os.environ["CUDA_COMPUTE_CAP"],"features":"builtin,cuda","scope":"fresh source build, not frozen B40"})+"\n")'
 
 FROM docker.io/nvidia/cuda:13.3.1-runtime-ubuntu26.04@sha256:b9321b748007329ae6a63261eb041612d18b802e23a485717cfa3584d640dd57 AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \

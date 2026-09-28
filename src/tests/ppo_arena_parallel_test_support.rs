@@ -1,7 +1,7 @@
 use super::*;
 
 pub(crate) fn assert_worker_capacity_for_test() {
-    for count in [0, 41] {
+    for count in [0, 65] {
         let mut worlds = vec![0; count];
         std::thread::scope(|scope| {
             assert_eq!(

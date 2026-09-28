@@ -12,6 +12,13 @@ use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use candle_core::{DType, Device, Tensor, Var};
 
 mod host_folding;
+mod sampling;
+#[cfg(test)]
+pub(crate) use sampling::{take_sampling_dispatches_for_test, with_eager_sampling_for_test};
+#[cfg(test)]
+mod memory_probe;
+#[cfg(test)]
+mod self_imitation;
 #[cfg(all(test, feature = "builtin"))]
 pub(crate) use host_folding::resolved_host_math_workers;
 
@@ -2052,7 +2059,7 @@ impl PolicyModel {
     fn ppo_candidate_kl_locked(
         &self,
         examples: &[&PpoPreparedSample],
-        config: PpoConfig,
+        _config: PpoConfig,
         microbatch_size: usize,
         #[cfg(test)] inject_failure: bool,
     ) -> Result<f64, ModelError> {
@@ -2070,8 +2077,12 @@ impl PolicyModel {
                 .collect::<Vec<_>>();
             let output = self.training_forward_locked(&frames, &prefixes)?;
             validate_training_tensors_finite(&output)?;
-            let (_, report) = ppo_loss(&output, chunk, config)?;
-            kl += report.approximate_kl * chunk.len() as f64;
+            #[cfg(not(test))]
+            let approximate_kl = ppo_candidate_kl(&output, chunk)?;
+            #[cfg(test)]
+            let approximate_kl =
+                transfer_tests::candidate_kl_tests::evaluate(&output, chunk, _config)?;
+            kl += approximate_kl * chunk.len() as f64;
             #[cfg(test)]
             if inject_failure {
                 return Err(ModelError::Backend(format!(
@@ -2163,10 +2174,19 @@ impl PolicyModel {
         state: &ForwardState,
         prefixes: &[TrainingPrefix],
     ) -> Result<SamplingKindLogits, ModelError> {
+        let [controlled, learn] = sampling::needed(prefixes, |kind| {
+            [
+                !matches!(kind, ActionKind::Continue | ActionKind::Learn),
+                kind == ActionKind::Learn,
+            ]
+        });
+        if !controlled && !learn {
+            return Ok(SamplingKindLogits::default());
+        }
         let context = self.sampling_context(&state.trunk, prefixes, SamplingContext::Kind)?;
         Ok(SamplingKindLogits {
-            controlled: self.controlled.forward(&context)?.to_vec2()?,
-            learn: self.learn_head.forward(&context)?.to_vec2()?,
+            controlled: sampling::head(controlled, &self.controlled, &context)?,
+            learn: sampling::head(learn, &self.learn_head, &context)?,
         })
     }
 
@@ -2175,18 +2195,39 @@ impl PolicyModel {
         state: &ForwardState,
         prefixes: &[TrainingPrefix],
     ) -> Result<SamplingUnitLogits, ModelError> {
+        let needed = sampling::needed(prefixes, |kind| {
+            use ActionKind::*;
+            [
+                kind == Cast,
+                matches!(kind, Use | PutPoint | PutUnit | Sell | Swap),
+                kind == Buy,
+                kind == Take,
+                matches!(kind, FollowUnit | AttackUnit),
+                matches!(kind, MovePoint | AttackMovePoint),
+            ]
+        });
+        if !needed.contains(&true) {
+            return Ok(SamplingUnitLogits::default());
+        }
+        let [ability, item, shop, loot, entity, point] = needed;
         let context = self.sampling_context(&state.trunk, prefixes, SamplingContext::Unit)?;
         Ok(SamplingUnitLogits {
-            ability: self.ability_head.forward(&context)?.to_vec2()?,
-            item: self.item_head.forward(&context)?.to_vec2()?,
-            shop: self.shop_head.forward(&context)?.to_vec2()?,
-            loot: self.loot_head.forward(&context)?.to_vec2()?,
+            ability: sampling::head(ability, &self.ability_head, &context)?,
+            item: sampling::head(item, &self.item_head, &context)?,
+            shop: sampling::head(shop, &self.shop_head, &context)?,
+            loot: sampling::head(loot, &self.loot_head, &context)?,
             entity: self.sampling_pointer_logits(
+                entity,
                 &context,
                 &state.current_units,
                 &self.entity_query,
             )?,
-            point: self.sampling_pointer_logits(&context, &state.points, &self.point_query)?,
+            point: self.sampling_pointer_logits(
+                point,
+                &context,
+                &state.points,
+                &self.point_query,
+            )?,
         })
     }
 
@@ -2195,28 +2236,55 @@ impl PolicyModel {
         state: &ForwardState,
         prefixes: &[TrainingPrefix],
     ) -> Result<SamplingSlotLogits, ModelError> {
+        let needed = sampling::needed(prefixes, |kind| {
+            use ActionKind::*;
+            // Target/put mode has not been sampled: keep every potentially traversed pointer.
+            [
+                kind == Swap,
+                matches!(kind, Cast | Use),
+                kind == PutPoint,
+                matches!(kind, Cast | Use | PutUnit),
+                matches!(kind, Cast | Use | PutPoint),
+            ]
+        });
+        if !needed.contains(&true) {
+            return Ok(SamplingSlotLogits::default());
+        }
+        let [swap, target_mode, put_mode, entity, point] = needed;
         let context = self.sampling_context(&state.trunk, prefixes, SamplingContext::Slot)?;
         Ok(SamplingSlotLogits {
-            swap: self.swap_head.forward(&context)?.to_vec2()?,
-            target_mode: self.target_mode.forward(&context)?.to_vec2()?,
-            put_mode: self.put_mode.forward(&context)?.to_vec2()?,
+            swap: sampling::head(swap, &self.swap_head, &context)?,
+            target_mode: sampling::head(target_mode, &self.target_mode, &context)?,
+            put_mode: sampling::head(put_mode, &self.put_mode, &context)?,
             entity: self.sampling_pointer_logits(
+                entity,
                 &context,
                 &state.current_units,
                 &self.entity_query,
             )?,
-            point: self.sampling_pointer_logits(&context, &state.points, &self.point_query)?,
+            point: self.sampling_pointer_logits(
+                point,
+                &context,
+                &state.points,
+                &self.point_query,
+            )?,
         })
     }
 
     fn sampling_pointer_logits(
         &self,
+        needed: bool,
         context: &Tensor,
         tokens: &Tensor,
         head: &Linear,
-    ) -> Result<Vec<Vec<f32>>, ModelError> {
+    ) -> Result<Option<Vec<Vec<f32>>>, ModelError> {
+        if !needed {
+            return Ok(None);
+        }
+        #[cfg(test)]
+        sampling::record_dispatch(context.dim(0)?);
         let query = head.forward(context)?.unsqueeze(1)?;
-        Ok(scaled_pointer_dot(tokens, &query)?.to_vec2()?)
+        Ok(Some(scaled_pointer_dot(tokens, &query)?.to_vec2()?))
     }
 
     fn sampling_context(
@@ -2778,6 +2846,32 @@ fn host_head_statistics<const WIDTH: usize>(
         })
         .sum();
     Ok((log_probability, entropy))
+}
+
+fn ppo_candidate_kl(
+    output: &PolicyTensorTensors,
+    examples: &[&PpoPreparedSample],
+) -> Result<f64, ModelError> {
+    assert!(!examples.is_empty());
+    assert!(examples.len() <= MODEL_TRAINING_BATCH);
+    let negative_log_probability = ppo_negative_log_probability(output, examples)?;
+    let new_log_probability = negative_log_probability.neg()?;
+    let mut old_values = [0.0f32; MODEL_TRAINING_BATCH];
+    for (value, sample) in old_values.iter_mut().zip(examples) {
+        *value = sample.transition.old_log_probability;
+    }
+    let old_log_probability = Tensor::from_slice(
+        &old_values[..examples.len()],
+        examples.len(),
+        output.value.device(),
+    )?;
+    let log_ratio = (&new_log_probability - &old_log_probability)?;
+    let ratio = log_ratio.exp()?;
+    // Preserve ppo_loss_report's F32 operations and reduction, not an expm1 rewrite.
+    let approximate_kl = (&ratio.affine(1.0, -1.0)? - &log_ratio)?
+        .mean_all()?
+        .to_scalar::<f32>()?;
+    Ok(f64::from(approximate_kl))
 }
 
 fn ppo_loss(
@@ -3717,7 +3811,7 @@ fn select_sampling_units(
         let scores = sample_sampling_head(
             "controlled",
             index,
-            &logits.controlled,
+            logits.controlled.as_deref(),
             batch_row_rng(rngs, index),
             &mut rows[index].observed.controlled,
             &mut rows[index].perturbed.controlled,
@@ -3770,7 +3864,7 @@ fn select_sampling_slot(
             let scores = sample_sampling_head(
                 "ability",
                 batch,
-                &logits.ability,
+                logits.ability.as_deref(),
                 rng,
                 &mut row.observed.ability,
                 &mut row.perturbed.ability,
@@ -3810,7 +3904,7 @@ fn select_sampling_item_slot(
     let scores = sample_sampling_head(
         "item",
         batch,
-        &logits.item,
+        logits.item.as_deref(),
         rng,
         &mut row.observed.item,
         &mut row.perturbed.item,
@@ -3864,7 +3958,7 @@ fn finite_sampling_array<const WIDTH: usize>(
 fn sample_sampling_head<const WIDTH: usize>(
     field: &'static str,
     batch: usize,
-    rows: &[Vec<f32>],
+    rows: Option<&[Vec<f32>]>,
     rng: Option<&mut PpoRng>,
     observed: &mut Option<[f32; WIDTH]>,
     perturbed: &mut Option<[f32; WIDTH]>,
@@ -3877,6 +3971,9 @@ fn sample_sampling_head<const WIDTH: usize>(
         }
         return Ok(values);
     }
+    let rows = rows.ok_or(ModelError::InvalidModelState(
+        "requested skipped sampling head",
+    ))?;
     let raw = finite_sampling_array(field, batch, rows)?;
     let sampled = perturb_logits(raw, rng)?;
     *observed = Some(raw);
@@ -3950,26 +4047,29 @@ struct SamplingBaseLogits {
     kind: Vec<Vec<f32>>,
 }
 
+#[derive(Default)]
 struct SamplingKindLogits {
-    controlled: Vec<Vec<f32>>,
-    learn: Vec<Vec<f32>>,
+    controlled: Option<Vec<Vec<f32>>>,
+    learn: Option<Vec<Vec<f32>>>,
 }
 
+#[derive(Default)]
 struct SamplingUnitLogits {
-    ability: Vec<Vec<f32>>,
-    item: Vec<Vec<f32>>,
-    shop: Vec<Vec<f32>>,
-    loot: Vec<Vec<f32>>,
-    entity: Vec<Vec<f32>>,
-    point: Vec<Vec<f32>>,
+    ability: Option<Vec<Vec<f32>>>,
+    item: Option<Vec<Vec<f32>>>,
+    shop: Option<Vec<Vec<f32>>>,
+    loot: Option<Vec<Vec<f32>>>,
+    entity: Option<Vec<Vec<f32>>>,
+    point: Option<Vec<Vec<f32>>>,
 }
 
+#[derive(Default)]
 struct SamplingSlotLogits {
-    swap: Vec<Vec<f32>>,
-    target_mode: Vec<Vec<f32>>,
-    put_mode: Vec<Vec<f32>>,
-    entity: Vec<Vec<f32>>,
-    point: Vec<Vec<f32>>,
+    swap: Option<Vec<Vec<f32>>>,
+    target_mode: Option<Vec<Vec<f32>>>,
+    put_mode: Option<Vec<Vec<f32>>>,
+    entity: Option<Vec<Vec<f32>>>,
+    point: Option<Vec<Vec<f32>>>,
 }
 
 struct SamplingLogits {
@@ -4955,11 +5055,16 @@ macro_rules! sampling_decoder_head {
 
 impl DecoderSource for SamplingDecoder<'_, '_> {
     fn kind(&mut self) -> Result<[f32; 16], ModelError> {
-        sampling_decoder_head!(self, "kind", &self.logits.base.kind, kind)
+        sampling_decoder_head!(self, "kind", Some(self.logits.base.kind.as_slice()), kind)
     }
 
     fn controlled(&mut self, _: ActionKind) -> Result<[f32; 2], ModelError> {
-        sampling_decoder_head!(self, "controlled", &self.logits.kind.controlled, controlled)
+        sampling_decoder_head!(
+            self,
+            "controlled",
+            self.logits.kind.controlled.as_deref(),
+            controlled
+        )
     }
 
     fn ability(
@@ -4967,11 +5072,16 @@ impl DecoderSource for SamplingDecoder<'_, '_> {
         _: ActionKind,
         _: Option<ControlledUnit>,
     ) -> Result<[f32; 8], ModelError> {
-        sampling_decoder_head!(self, "ability", &self.logits.unit.ability, ability)
+        sampling_decoder_head!(
+            self,
+            "ability",
+            self.logits.unit.ability.as_deref(),
+            ability
+        )
     }
 
     fn item(&mut self, _: ActionKind, _: ControlledUnit) -> Result<[f32; 15], ModelError> {
-        sampling_decoder_head!(self, "item", &self.logits.unit.item, item)
+        sampling_decoder_head!(self, "item", self.logits.unit.item.as_deref(), item)
     }
 
     fn swap(
@@ -4980,19 +5090,19 @@ impl DecoderSource for SamplingDecoder<'_, '_> {
         _: ControlledUnit,
         _: usize,
     ) -> Result<[f32; 15], ModelError> {
-        sampling_decoder_head!(self, "swap", &self.logits.slot.swap, swap)
+        sampling_decoder_head!(self, "swap", self.logits.slot.swap.as_deref(), swap)
     }
 
     fn learn(&mut self, _: ActionKind) -> Result<[f32; 6], ModelError> {
-        sampling_decoder_head!(self, "learn", &self.logits.kind.learn, learn)
+        sampling_decoder_head!(self, "learn", self.logits.kind.learn.as_deref(), learn)
     }
 
     fn shop(&mut self, _: ActionKind, _: ControlledUnit) -> Result<[f32; 64], ModelError> {
-        sampling_decoder_head!(self, "shop", &self.logits.unit.shop, shop)
+        sampling_decoder_head!(self, "shop", self.logits.unit.shop.as_deref(), shop)
     }
 
     fn loot(&mut self, _: ActionKind, _: ControlledUnit) -> Result<[f32; 16], ModelError> {
-        sampling_decoder_head!(self, "loot", &self.logits.unit.loot, loot)
+        sampling_decoder_head!(self, "loot", self.logits.unit.loot.as_deref(), loot)
     }
 
     fn target_mode(
@@ -5004,7 +5114,7 @@ impl DecoderSource for SamplingDecoder<'_, '_> {
         sampling_decoder_head!(
             self,
             "target mode",
-            &self.logits.slot.target_mode,
+            self.logits.slot.target_mode.as_deref(),
             target_mode
         )
     }
@@ -5015,7 +5125,12 @@ impl DecoderSource for SamplingDecoder<'_, '_> {
         _: ControlledUnit,
         _: usize,
     ) -> Result<[f32; 2], ModelError> {
-        sampling_decoder_head!(self, "put mode", &self.logits.slot.put_mode, put_mode)
+        sampling_decoder_head!(
+            self,
+            "put mode",
+            self.logits.slot.put_mode.as_deref(),
+            put_mode
+        )
     }
 
     fn entity(
@@ -5029,7 +5144,7 @@ impl DecoderSource for SamplingDecoder<'_, '_> {
         } else {
             &self.logits.unit.entity
         };
-        sampling_decoder_head!(self, "entity pointer", rows, entity_pointer)
+        sampling_decoder_head!(self, "entity pointer", rows.as_deref(), entity_pointer)
     }
 
     fn point(
@@ -5043,7 +5158,7 @@ impl DecoderSource for SamplingDecoder<'_, '_> {
         } else {
             &self.logits.unit.point
         };
-        sampling_decoder_head!(self, "point pointer", rows, point_pointer)
+        sampling_decoder_head!(self, "point pointer", rows.as_deref(), point_pointer)
     }
 }
 

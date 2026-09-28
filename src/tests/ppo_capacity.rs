@@ -2,6 +2,64 @@ use super::*;
 use crate::{PPO_ANNEALED_MAX_SAMPLES, PPO_MAX_SAMPLES, PpoError, PpoSampleBudget};
 
 #[test]
+fn wide_capacity_enforces_profile_and_memory_boundaries_without_relabeling_m40() {
+    let model = PolicyModel::fresh(726).expect("model");
+    let policy = model.policy_identity().expect("identity");
+    let config = PpoConfig {
+        sample_budget: PpoSampleBudget::WideAnnealed,
+        environments: 80,
+        ..annealed_config()
+    };
+    assert_eq!(config.validate(), Ok(config));
+    for environments in [81, 82] {
+        assert_eq!(
+            PpoConfig {
+                environments,
+                ..config
+            }
+            .validate(),
+            Err(PpoError::InvalidConfig("annealed full-episode dimensions"))
+        );
+    }
+    assert_eq!(
+        PpoConfig {
+            sample_budget: PpoSampleBudget::Annealed,
+            ..config
+        }
+        .validate(),
+        Err(PpoError::InvalidConfig("annealed full-episode dimensions"))
+    );
+    let rollout =
+        PpoRollout::with_budget(93_040, policy, config.sample_budget).expect("wide maximum");
+    assert!(rollout.is_empty());
+    assert_eq!(
+        PpoRollout::with_budget(93_041, policy, config.sample_budget)
+            .err()
+            .expect("overflow")
+            .to_string(),
+        "PPO wide annealed rollout capacity 93041 is outside 1..=93040"
+    );
+    let mut rollout = PpoRollout::with_budget(1, policy, config.sample_budget).expect("sparse");
+    let mut sample = transition(&model);
+    sample.stream = 80;
+    assert_eq!(
+        rollout.push(sample.clone()),
+        Err(PpoError::StreamOutOfRange { stream: 80 })
+    );
+    sample.stream = 79;
+    rollout.push(sample).expect("last valid stream");
+    assert_eq!(
+        rollout.finish(annealed_config()).err(),
+        Some(PpoError::InvalidConfig("rollout sample budget"))
+    );
+    let bound = crate::PPO_WIDE_ANNEALED_PAYLOAD_BOUND_BYTES;
+    assert_eq!(bound, 12_557_484_608);
+    assert_eq!(PpoSampleBudget::Annealed.schema_version(), 38);
+    assert_eq!(PpoSampleBudget::Annealed.max_samples(), 46_520);
+    assert_eq!(PpoSampleBudget::WideAnnealed.schema_version(), 39);
+}
+
+#[test]
 fn rollout_capacity_bounds_include_annealed_peak_memory_and_reject_overflow() {
     const {
         assert!(

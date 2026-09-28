@@ -87,6 +87,7 @@ fn folded_updates_preserve_shuffle_parameters_and_optimizer_state() {
     actual
         .set_execution(crate::TrainingExecutionOptions {
             host_math_workers: 4,
+            ..Default::default()
         })
         .expect("options");
     let first = learner_batch(&model, config);
@@ -132,6 +133,7 @@ fn folded_updates_skip_unused_error_on_kl_stop_and_roll_back_consumed_error() {
         actual
             .set_execution(crate::TrainingExecutionOptions {
                 host_math_workers: 4,
+                ..Default::default()
             })
             .expect("options");
         let mut first = learner_batch(&model, config);

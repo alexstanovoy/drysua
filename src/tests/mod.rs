@@ -40,6 +40,7 @@ mod progress_debt_features;
 mod progress_debt_initialization;
 mod readiness;
 mod reward_observer;
+mod sampling_dispatch;
 mod seat;
 pub(crate) mod support;
 mod teacher;

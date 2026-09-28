@@ -1,6 +1,21 @@
 use super::*;
 
 #[test]
+fn wide_capacity_arena_is_capped_and_preserves_the_old_constructor_bound() {
+    let arena = RaggedFeatureArena::new_wide_bounded(93_040).expect("wide maximum");
+    assert_eq!(arena_capacities(&arena), [0; 7]);
+    assert_eq!(
+        RaggedFeatureArena::new_wide_bounded(93_041).err(),
+        Some("wide ragged feature sample capacity is outside 1..=93040")
+    );
+    assert_eq!(
+        RaggedFeatureArena::new_bounded(46_521).err(),
+        Some("bounded ragged feature sample capacity is outside 1..=46520")
+    );
+    assert_eq!(wide_feature_arena_peak_bytes(), 9_074_377_280);
+}
+
+#[test]
 fn bounded_sparse_rows_roundtrip_through_exact_capacity_and_preserve_prior_headers() {
     let mut frame = FeatureFrame::new();
     frame.units[UNIT_FEATURE_TOKENS - 1][unit_feature::TOKEN_PRESENT] = 1.0;

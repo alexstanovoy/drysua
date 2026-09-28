@@ -1,5 +1,8 @@
 use super::*;
 
+#[path = "candidate_kl.rs"]
+pub(super) mod candidate_kl_tests;
+
 #[path = "model_concurrency.rs"]
 mod concurrency_tests;
 

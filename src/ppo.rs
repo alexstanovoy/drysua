@@ -3,6 +3,12 @@
     reason = "PPO optimization and metrics use floating-point arithmetic"
 )]
 
+mod minibatch;
+#[cfg(test)]
+mod rnd;
+#[cfg(test)]
+pub(crate) use rnd::{Rnd, RndReport};
+
 use std::error::Error;
 use std::fmt;
 
@@ -27,6 +33,29 @@ pub const PPO_MAX_SAMPLES: usize = 32_768;
 pub const PPO_ANNEALED_MAX_GAMES: usize = 40;
 /// Annealed capacity does not increase concurrent worlds or optimizer minibatches.
 pub const PPO_ANNEALED_MAX_SAMPLES: usize = PPO_ANNEALED_MAX_GAMES * crate::MAP2_RETAINED_DECISIONS;
+/// Wide full-episode profile; episodes and simultaneously active worlds are independent.
+pub const PPO_WIDE_ANNEALED_MAX_GAMES: usize = 80;
+pub const PPO_ANNEALED_MAX_PARALLEL_WORLDS: usize = 64;
+pub const PPO_WIDE_ANNEALED_MAX_SAMPLES: usize =
+    PPO_WIDE_ANNEALED_MAX_GAMES * crate::MAP2_RETAINED_DECISIONS;
+/// Admission ledger: capped arena peak, compact/prepared/shuffle rows, one dense minibatch,
+/// and 2 GiB reserved for native worlds, actor buffers/stacks, model state and allocator overhead.
+/// The runtime guard still enforces total RSS; optional learning-side storage shares the reserve.
+pub const PPO_WIDE_ANNEALED_PAYLOAD_BOUND_BYTES: u64 =
+    crate::feature::wide_feature_arena_peak_bytes()
+        + PPO_WIDE_ANNEALED_MAX_SAMPLES as u64 * 8_192
+        + MODEL_MAX_BATCH as u64 * 70_000
+        + 2 * 1024 * 1024 * 1024;
+const _: () = assert!(
+    std::mem::size_of::<CompactPpoTransition>()
+        + std::mem::size_of::<CompactPreparedSample>()
+        + std::mem::size_of::<usize>()
+        <= 8_192
+);
+const _: () = assert!(std::mem::size_of::<PpoPreparedSample>() <= 70_000);
+const _: () = assert!(PPO_WIDE_ANNEALED_PAYLOAD_BOUND_BYTES <= 12 * 1024 * 1024 * 1024);
+const _: () = assert!(PPO_WIDE_ANNEALED_MAX_GAMES <= PPO_MAX_STREAMS);
+const _: () = assert!(PPO_ANNEALED_MAX_PARALLEL_WORLDS <= crate::MODEL_TRAINING_BATCH);
 /// Conservative rollout storage plus one fully materialized effective minibatch.
 /// Includes arena reallocation overlap, both preparation vectors and shuffle order;
 /// excludes allocator overhead, model/optimizer tensors and native simulator worlds.
@@ -118,12 +147,28 @@ pub const PPO_ANNEALED_SCHEMA_HASH: u64 = crate::model::linked_schema_hash(
     &[(PPO_SCHEMA_VERSION, PPO_SCHEMA_HASH)],
 );
 
+/// Separate capacity identity: existing PPO37/38 descriptors and hashes stay immutable.
+pub const PPO_WIDE_ANNEALED_SCHEMA_VERSION: u32 = 39;
+pub const PPO_WIDE_ANNEALED_SCHEMA_DESCRIPTOR: &str = concat!(
+    "bota-drysua-ppo/v39;linked_schemas=ppo38;extension=wide_annealed_full_episode_capacity_v1;",
+    "bounds=rollout93040,episodes_even2to80,retained_per_episode1163,parallel_worlds1to64,actor_batch64;",
+    "collection=sequential_batches_one_frozen_policy_one_PPO_update_all_retained_samples;",
+    "storage=capped_fallible_arenas,conservative_payload_ledger_le12GiB_including2GiB_nonrollout_reserve;",
+    "unchanged=tensors_inference_feature_action_reward_retention_GAE_optimizer_minibatch_microbatch;",
+    "runtime=exact_ppo37_or_ppo38_or_ppo39_tuple;checkpoint=explicit_profile_no_cross_profile_resume;"
+);
+pub const PPO_WIDE_ANNEALED_SCHEMA_HASH: u64 = crate::model::linked_schema_hash(
+    PPO_WIDE_ANNEALED_SCHEMA_DESCRIPTOR,
+    &[(PPO_ANNEALED_SCHEMA_VERSION, PPO_ANNEALED_SCHEMA_HASH)],
+);
+
 /// Closed set of audited rollout capacities, not an arbitrary allocation limit.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum PpoSampleBudget {
     #[default]
     Standard,
     Annealed,
+    WideAnnealed,
 }
 
 impl PpoSampleBudget {
@@ -131,6 +176,26 @@ impl PpoSampleBudget {
         match self {
             Self::Standard => PPO_MAX_SAMPLES,
             Self::Annealed => PPO_ANNEALED_MAX_SAMPLES,
+            Self::WideAnnealed => PPO_WIDE_ANNEALED_MAX_SAMPLES,
+        }
+    }
+
+    pub const fn max_games(self) -> usize {
+        match self {
+            Self::Standard => 128,
+            Self::Annealed => PPO_ANNEALED_MAX_GAMES,
+            Self::WideAnnealed => PPO_WIDE_ANNEALED_MAX_GAMES,
+        }
+    }
+
+    /// Canonical annealed selection; callers still validate game counts and dimensions.
+    pub const fn for_annealed_games(games: usize) -> Self {
+        if games > PPO_ANNEALED_MAX_GAMES {
+            Self::WideAnnealed
+        } else if games > crate::MAX_TRAINING_ENVIRONMENTS {
+            Self::Annealed
+        } else {
+            Self::Standard
         }
     }
 
@@ -138,6 +203,7 @@ impl PpoSampleBudget {
         match self {
             Self::Standard => PPO_SCHEMA_VERSION,
             Self::Annealed => PPO_ANNEALED_SCHEMA_VERSION,
+            Self::WideAnnealed => PPO_WIDE_ANNEALED_SCHEMA_VERSION,
         }
     }
 
@@ -145,6 +211,7 @@ impl PpoSampleBudget {
         match self {
             Self::Standard => PPO_SCHEMA_HASH,
             Self::Annealed => PPO_ANNEALED_SCHEMA_HASH,
+            Self::WideAnnealed => PPO_WIDE_ANNEALED_SCHEMA_HASH,
         }
     }
 }
@@ -226,8 +293,8 @@ impl PpoConfig {
     }
 
     fn validate_sample_budget(self) -> Result<(), PpoError> {
-        if self.sample_budget == PpoSampleBudget::Annealed
-            && (!(2..=PPO_ANNEALED_MAX_GAMES).contains(&self.environments)
+        if self.sample_budget != PpoSampleBudget::Standard
+            && (!(2..=self.sample_budget.max_games()).contains(&self.environments)
                 || !self.environments.is_multiple_of(2)
                 || self.rollout_decisions != crate::MAP2_RETAINED_DECISIONS
                 || self.decision_interval_ticks != crate::MAP2_DECISION_INTERVAL_TICKS
@@ -289,6 +356,9 @@ pub enum PpoError {
     AnnealedCapacity {
         capacity: usize,
     },
+    WideAnnealedCapacity {
+        capacity: usize,
+    },
     RolloutFull {
         capacity: usize,
     },
@@ -330,6 +400,10 @@ impl fmt::Display for PpoError {
             Self::AnnealedCapacity { capacity } => write!(
                 formatter,
                 "PPO annealed rollout capacity {capacity} is outside 1..={PPO_ANNEALED_MAX_SAMPLES}"
+            ),
+            Self::WideAnnealedCapacity { capacity } => write!(
+                formatter,
+                "PPO wide annealed rollout capacity {capacity} is outside 1..={PPO_WIDE_ANNEALED_MAX_SAMPLES}"
             ),
             Self::RolloutFull { capacity } => {
                 write!(formatter, "PPO rollout reached capacity {capacity}")
@@ -615,16 +689,19 @@ impl PpoRollout {
             return Err(match sample_budget {
                 PpoSampleBudget::Standard => PpoError::Capacity { capacity },
                 PpoSampleBudget::Annealed => PpoError::AnnealedCapacity { capacity },
+                PpoSampleBudget::WideAnnealed => PpoError::WideAnnealedCapacity { capacity },
             });
         }
         Ok(Self {
             policy,
             sample_budget,
             capacity,
-            transitions: Vec::with_capacity(capacity),
+            transitions: rollout_storage(capacity, sample_budget)?,
             frames: match sample_budget {
                 PpoSampleBudget::Standard => RaggedFeatureArena::new(capacity),
                 PpoSampleBudget::Annealed => RaggedFeatureArena::new_bounded(capacity)
+                    .map_err(PpoError::InvalidTransition)?,
+                PpoSampleBudget::WideAnnealed => RaggedFeatureArena::new_wide_bounded(capacity)
                     .map_err(PpoError::InvalidTransition)?,
             },
             next_decision: [None; PPO_MAX_STREAMS],
@@ -642,7 +719,7 @@ impl PpoRollout {
             });
         }
         self.validate_episode_transition(&transition)?;
-        let first = if self.sample_budget == PpoSampleBudget::Annealed {
+        let first = if self.sample_budget != PpoSampleBudget::Standard {
             0
         } else {
             transition.decision
@@ -682,8 +759,8 @@ impl PpoRollout {
     }
 
     fn validate_episode_transition(&self, transition: &PpoTransition) -> Result<(), PpoError> {
-        if self.sample_budget == PpoSampleBudget::Annealed {
-            if transition.stream >= PPO_ANNEALED_MAX_GAMES {
+        if self.sample_budget != PpoSampleBudget::Standard {
+            if transition.stream >= self.sample_budget.max_games() {
                 return Err(PpoError::StreamOutOfRange {
                     stream: transition.stream,
                 });
@@ -751,7 +828,7 @@ impl PpoRollout {
         if self.sample_budget != config.sample_budget {
             return Err(PpoError::InvalidConfig("rollout sample budget"));
         }
-        if self.sample_budget == PpoSampleBudget::Annealed
+        if self.sample_budget != PpoSampleBudget::Standard
             && (self.len() > config.environments * config.rollout_decisions
                 || self.next_decision[config.environments..]
                     .iter()
@@ -865,12 +942,35 @@ impl PpoTrainer {
         &mut self,
         execution: crate::TrainingExecutionOptions,
     ) -> Result<(), PpoError> {
+        if execution.reuse_actor_values {
+            return Err(PpoError::InvalidConfig(
+                "reuse actor values requires the annealed collector",
+            ));
+        }
         self.execution = execution.validate()?;
         Ok(())
     }
 
     pub const fn optimizer_step(&self) -> u64 {
         self.adam.step()
+    }
+
+    /// Research-only, off-policy SIL-inspired actor loss, not a PPO update.
+    /// Callers supply complete-episode gamma-one Monte Carlo returns in `return_value`.
+    /// Accepted steps advance shared Adam, but freeze value-head weights and moments.
+    /// Reported KL is pre-auxiliary versus candidate on replay actions, not on-policy KL.
+    /// Replay is not checkpointed; this does not define a resumable production profile.
+    /// `applied = false` means zero weight/coefficient or KL rejection, not PPO early stop.
+    #[cfg(test)]
+    pub(crate) fn self_imitation_update(
+        &mut self,
+        model: &PolicyModel,
+        samples: &[PpoPreparedSample],
+        coefficient: f32,
+    ) -> Result<PpoMinibatchReport, PpoError> {
+        model
+            .self_imitation_update(samples, &mut self.adam, self.config, coefficient)
+            .map_err(|error| PpoError::Model(error.to_string()))
     }
 
     pub const fn updates(&self) -> u64 {
@@ -1002,7 +1102,7 @@ impl PpoTrainer {
         {
             return Err(PpoError::InvalidConfig("batch sample budget"));
         }
-        if batch.sample_budget == PpoSampleBudget::Annealed
+        if batch.sample_budget != PpoSampleBudget::Standard
             && (batch.environments != self.config.environments
                 || batch.len() > self.config.environments * self.config.rollout_decisions)
         {
@@ -1020,7 +1120,11 @@ impl PpoTrainer {
         let mut order = (0..batch.samples.len()).collect::<Vec<_>>();
         'epochs: for epoch in 0..self.config.epochs {
             self.shuffle.shuffle(&mut order)?;
-            for indices in order.chunks(self.config.minibatch) {
+            for indices in minibatch::partition(
+                &order,
+                self.config.minibatch,
+                self.execution.balanced_minibatches,
+            ) {
                 let samples = batch.materialize(indices)?;
                 let references = samples.iter().collect::<Vec<_>>();
                 let report = model
@@ -1139,6 +1243,24 @@ impl PpoBatch {
     }
 }
 
+fn rollout_storage<T>(capacity: usize, budget: PpoSampleBudget) -> Result<Vec<T>, PpoError> {
+    assert!(std::mem::size_of::<T>() > 0);
+    assert!(capacity <= budget.max_samples());
+    if budget != PpoSampleBudget::WideAnnealed {
+        return Ok(Vec::with_capacity(capacity));
+    }
+    let mut storage = Vec::new();
+    storage
+        .try_reserve_exact(capacity)
+        .map_err(|_| PpoError::InvalidTransition("wide rollout allocation failed"))?;
+    if storage.capacity() > capacity {
+        return Err(PpoError::InvalidTransition(
+            "wide rollout allocation exceeds capacity",
+        ));
+    }
+    Ok(storage)
+}
+
 fn prepare_batch(
     policy: PolicyIdentity,
     transitions: Vec<CompactPpoTransition>,
@@ -1147,7 +1269,7 @@ fn prepare_batch(
 ) -> Result<PpoBatch, PpoError> {
     let mut next_advantage = [0.0f32; PPO_MAX_STREAMS];
     let mut next_return = [None; PPO_MAX_STREAMS];
-    let mut prepared = Vec::with_capacity(transitions.len());
+    let mut prepared = rollout_storage(transitions.len(), config.sample_budget)?;
     for transition in transitions.into_iter().rev() {
         let discount = tick_discount(config.gamma_tick, transition.ticks)?;
         let continuation = if transition.terminal { 0.0 } else { 1.0 };

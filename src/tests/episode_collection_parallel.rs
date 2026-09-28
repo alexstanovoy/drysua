@@ -101,7 +101,8 @@ fn comparison_collection(
                 None,
                 None,
                 &mut rollout,
-                &mut report
+                &mut report,
+                false,
             )
             .expect("production persistent collector")
         );

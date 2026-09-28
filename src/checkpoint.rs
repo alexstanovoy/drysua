@@ -63,6 +63,32 @@ pub const CHECKPOINT_ANNEALED_SCHEMA_DESCRIPTOR: &str = concat!(
     "capacity=even_games2to40,retained1163_per_game,samples46520_max,decision_interval3,gamma_tick1,concurrent_world_limit_unchanged;progress=committed_rollout_samples_le_updates_times_configured_games_times1163_checked;mastery=forbidden;actor_learner_pipeline=forbidden;",
     "runtime=explicit_annealed_PPO_version_hash_same_other_metadata_fields_and_tensor_contract,accept_only_exact_standard_or_annealed_tuple_no_relabel;standard=checkpoint12_and_PPO37_bytes_unchanged;"
 );
+/// Unchanged checkpoint thirteen identity linked to checkpoint twelve.
+pub const CHECKPOINT_ANNEALED_SCHEMA_HASH: u64 = checkpoint_profile_hash(
+    PpoSampleBudget::Annealed,
+    CHECKPOINT_ANNEALED_SCHEMA_DESCRIPTOR,
+    (CHECKPOINT_SCHEMA_VERSION, CHECKPOINT_SCHEMA_HASH),
+);
+/// Version of the opt-in wide annealed sample-budget checkpoint contract.
+pub const CHECKPOINT_WIDE_ANNEALED_SCHEMA_VERSION: u32 = 14;
+/// Capacity extension of checkpoint thirteen, without redefining either legacy profile.
+pub const CHECKPOINT_WIDE_ANNEALED_SCHEMA_DESCRIPTOR: &str = concat!(
+    "bota-drysua-checkpoint/v14;profile=wide_annealed;",
+    "linked_schemas=action,feature,model,ppo_wide_annealed39,map2_reward,base_checkpoint13;linked_hash=fnv1a_descriptor_then_ordered_version_le32_hash_le64_then_map2_reward_descriptor_utf8;",
+    "base=exact_linked_checkpoint13_tensor_names_shapes_dtype_finite_SHA256_run_progress_rng_device_features_and_durable_commit_contract;",
+    "manifest=unchanged_checkpoint13_field_order_and_five_encoded_linked_schemas,base_checkpoint13_identity_hash_link_only;config=unchanged64bytes_five_le32_dimensions_eleven_f32,budget_derived_from_exact_header_and_linked_PPO_profile_no_extra_tag;",
+    "capacity=even_games2to80,retained1163_per_game,samples93040_max,decision_interval3,gamma_tick1,concurrent_worlds1to64;progress=committed_rollout_samples_le_updates_times_configured_games_times1163_checked;mastery=forbidden;actor_learner_pipeline=forbidden;",
+    "runtime=explicit_wide_annealed_PPO39_version_hash_same_other_metadata_fields_and_tensor_contract,accept_only_exact_standard_or_annealed_or_wide_annealed_tuple_no_relabel;legacy=checkpoint12_PPO37_and_checkpoint13_PPO38_bytes_unchanged;"
+);
+/// FNV-1a identity linked to wide PPO39 and unchanged checkpoint thirteen.
+pub const CHECKPOINT_WIDE_ANNEALED_SCHEMA_HASH: u64 = checkpoint_profile_hash(
+    PpoSampleBudget::WideAnnealed,
+    CHECKPOINT_WIDE_ANNEALED_SCHEMA_DESCRIPTOR,
+    (
+        CHECKPOINT_ANNEALED_SCHEMA_VERSION,
+        CHECKPOINT_ANNEALED_SCHEMA_HASH,
+    ),
+);
 const CHECKPOINT_TENSOR_FILE: &str = "checkpoint.safetensors";
 const CHECKPOINT_META_FILE: &str = "checkpoint.meta";
 const RUNTIME_TENSOR_FILE: &str = "drysua.weights.safetensors";
@@ -290,7 +316,7 @@ impl RestoredTrainingState {
         workers: usize,
         model: &PolicyModel,
     ) -> Result<crate::ActorLearnerPipeline, CheckpointError> {
-        if self.trainer.config().sample_budget == PpoSampleBudget::Annealed {
+        if self.trainer.config().sample_budget != PpoSampleBudget::Standard {
             return Err(CheckpointError::InvalidManifest(
                 "annealed actor-learner pipeline",
             ));
@@ -509,7 +535,7 @@ impl TrainingArtifact {
         sync_directory(directory)
     }
 
-    /// Loads either exact current Map2 capacity profile; older semantic tuples stay rejected.
+    /// Loads one of three exact Map2 capacity profiles; older semantic tuples stay rejected.
     pub fn load_runtime_weights(
         model: &PolicyModel,
         directory: &Path,
@@ -640,7 +666,7 @@ fn validate_run_without_model(
     config
         .validate()
         .map_err(|_| CheckpointError::InvalidManifest("PPO config"))?;
-    if config.sample_budget == PpoSampleBudget::Annealed && run.mastery_config.is_some() {
+    if config.sample_budget != PpoSampleBudget::Standard && run.mastery_config.is_some() {
         return Err(CheckpointError::InvalidManifest("annealed mastery"));
     }
     for (field, value) in [
@@ -673,7 +699,7 @@ fn validate_progress(
     trainer_updates: u64,
     config: PpoConfig,
 ) -> Result<(), CheckpointError> {
-    if config.sample_budget == PpoSampleBudget::Annealed && progress.mastery.is_some() {
+    if config.sample_budget != PpoSampleBudget::Standard && progress.mastery.is_some() {
         return Err(CheckpointError::InvalidManifest("annealed mastery"));
     }
     if progress.global_update != trainer_updates || trainer_updates > MAX_TRAINING_COUNTER {
@@ -727,7 +753,7 @@ fn maximum_rollout_samples(config: PpoConfig, updates: u64) -> Result<u64, Check
         PpoSampleBudget::Standard => Ok(updates
             .saturating_add(1)
             .saturating_mul(crate::PPO_MAX_SAMPLES as u64)),
-        PpoSampleBudget::Annealed => updates
+        PpoSampleBudget::Annealed | PpoSampleBudget::WideAnnealed => updates
             .checked_mul(config.environments as u64)
             .and_then(|count| count.checked_mul(crate::MAP2_RETAINED_DECISIONS as u64))
             .ok_or(CheckpointError::InvalidManifest("rollout sample counter")),
@@ -896,6 +922,7 @@ fn decode_runtime_tensor(bytes: &[u8]) -> Result<Vec<f32>, CheckpointError> {
         &[
             runtime_tensor_metadata_map(PpoSampleBudget::Standard),
             runtime_tensor_metadata_map(PpoSampleBudget::Annealed),
+            runtime_tensor_metadata_map(PpoSampleBudget::WideAnnealed),
         ],
     )
 }
@@ -1027,23 +1054,29 @@ fn decode_manifest(bytes: &[u8]) -> Result<TrainingArtifact, CheckpointError> {
 }
 
 fn checkpoint_schema_identity(budget: PpoSampleBudget) -> (u32, u64) {
-    let version = match budget {
-        PpoSampleBudget::Standard => return (CHECKPOINT_SCHEMA_VERSION, CHECKPOINT_SCHEMA_HASH),
-        PpoSampleBudget::Annealed => CHECKPOINT_ANNEALED_SCHEMA_VERSION,
-    };
+    match budget {
+        PpoSampleBudget::Standard => (CHECKPOINT_SCHEMA_VERSION, CHECKPOINT_SCHEMA_HASH),
+        PpoSampleBudget::Annealed => (
+            CHECKPOINT_ANNEALED_SCHEMA_VERSION,
+            CHECKPOINT_ANNEALED_SCHEMA_HASH,
+        ),
+        PpoSampleBudget::WideAnnealed => (
+            CHECKPOINT_WIDE_ANNEALED_SCHEMA_VERSION,
+            CHECKPOINT_WIDE_ANNEALED_SCHEMA_HASH,
+        ),
+    }
+}
+
+const fn checkpoint_profile_hash(
+    budget: PpoSampleBudget,
+    descriptor: &str,
+    base: (u32, u64),
+) -> u64 {
     let schemas = linked_schemas(budget);
     let linked = [
-        schemas[0],
-        schemas[1],
-        schemas[2],
-        schemas[3],
-        schemas[4],
-        (CHECKPOINT_SCHEMA_VERSION, CHECKPOINT_SCHEMA_HASH),
+        schemas[0], schemas[1], schemas[2], schemas[3], schemas[4], base,
     ];
-    (
-        version,
-        crate::model::linked_schema_hash(CHECKPOINT_ANNEALED_SCHEMA_DESCRIPTOR, &linked),
-    )
+    crate::model::linked_schema_hash(descriptor, &linked)
 }
 
 fn decode_checkpoint_identity(
@@ -1061,11 +1094,16 @@ fn decode_checkpoint_identity(
         {
             Ok(PpoSampleBudget::Annealed)
         }
+        CHECKPOINT_WIDE_ANNEALED_SCHEMA_VERSION
+            if identity == checkpoint_schema_identity(PpoSampleBudget::WideAnnealed) =>
+        {
+            Ok(PpoSampleBudget::WideAnnealed)
+        }
         _ => Err(CheckpointError::SchemaMismatch),
     }
 }
 
-fn linked_schemas(budget: PpoSampleBudget) -> [(u32, u64); 5] {
+const fn linked_schemas(budget: PpoSampleBudget) -> [(u32, u64); 5] {
     let mut schemas = LINKED_SCHEMAS;
     schemas[3] = (budget.schema_version(), budget.schema_hash());
     schemas

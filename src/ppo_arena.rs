@@ -2111,7 +2111,7 @@ fn collect_update(
 }
 
 fn actor_stream_rngs(master: &mut PpoRng, count: usize) -> Result<Vec<PpoRng>, PpoError> {
-    if count == 0 || count > crate::PPO_ANNEALED_MAX_GAMES {
+    if count == 0 || count > crate::PPO_ANNEALED_MAX_PARALLEL_WORLDS {
         return Err(PpoError::InvalidConfig("actor RNG streams"));
     }
     (0..count)

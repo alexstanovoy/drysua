@@ -1,6 +1,8 @@
 # Context is the parent containing drysua/ and bota/. Start by excluding everything.
 **
 !drysua/
+!drysua/.cargo/
+!drysua/.cargo/config.toml
 !drysua/Cargo.toml
 !drysua/Cargo.lock
 !drysua/rust-toolchain.toml
@@ -19,6 +21,8 @@
 !drysua/docker/runtime_guard.py
 !drysua/docker/source_identity.py
 !bota/
+!bota/.cargo/
+!bota/.cargo/config.toml
 !bota/Cargo.toml
 !bota/Cargo.lock
 !bota/crates/

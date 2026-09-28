@@ -57,6 +57,7 @@ const STRUCTURE_CLEARANCE: i32 = 24 + 8;
 const MAX_PURCHASE_SLOTS: usize = WIRE_ITEM_SLOTS;
 const MANGO_ITEM: ItemId = ItemId(42);
 const MANGO_STACK_MAX: u8 = 3;
+const TANGO_ITEM: ItemId = ItemId(7);
 const TACTICAL_RADII: [i32; 3] = [200, 600, 1_200];
 /// Cells scanned around a structure for a teleport landing; covers its range.
 const LANDING_SEARCH_CELLS: usize = 10;
@@ -2267,6 +2268,15 @@ fn fill_use_masks(
                     .is_some_and(|charges| (1..=MANGO_STACK_MAX).contains(&charges))
                 && state.unit.mana >= 0
                 && state.unit.mana < state.unit.max_mana;
+            masks.uses.push(mask);
+            continue;
+        }
+        if item.id == TANGO_ITEM && item.aim == Some(Aim::Tree) {
+            // Native Tango Use approaches the selected trunk before consuming a charge.
+            let mut mask = empty_target_mask(space);
+            for (allowed, point) in mask.points.iter_mut().zip(&space.points) {
+                *allowed = ready && point.standing_tree;
+            }
             masks.uses.push(mask);
             continue;
         }

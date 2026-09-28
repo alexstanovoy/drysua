@@ -10,6 +10,13 @@
 //! committed update replays the interrupted update byte for byte.
 
 use std::path::{Path, PathBuf};
+#[cfg(all(
+    test,
+    feature = "cuda",
+    any(target_os = "linux", target_os = "windows")
+))]
+#[path = "../tests/autonomous_learning.rs"]
+mod autonomous_learning;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -71,9 +78,9 @@ pub struct AnnealedJobConfig {
     pub execution: crate::TrainingExecutionOptions,
     /// Total updates in the run.
     pub updates: u64,
-    /// Games per update, even from 2 to 40 so sides split exactly.
+    /// Games per update, even from 2 to 80 so sides split exactly.
     pub games_per_update: usize,
-    /// Worlds per batch, from 1 to 40; divides games and generation games.
+    /// Worlds per batch, from 1 to 64; divides games and generation games.
     pub parallel_worlds: usize,
     /// Games per environment generation, on the global game counter.
     pub games_per_generation: u64,
@@ -85,7 +92,7 @@ pub struct AnnealedJobConfig {
     pub opponent: AnnealedOpponent,
     /// PPO dimensions and hyperparameters; `environments` and `rollout_decisions`
     /// are the loop's, not free choices. Select `Standard` through 26 games and
-    /// `Annealed` above 26; library settings never silently change profiles.
+    /// `Annealed` from 28 to 40, `WideAnnealed` above 40; never changed implicitly.
     pub ppo: PpoConfig,
     /// When to write a durable checkpoint.
     pub checkpoint_cadence: crate::TrainingCheckpointCadence,
@@ -335,7 +342,13 @@ impl AnnealedSession {
         } else {
             0
         };
-        state.trainer.set_execution(settings.execution)?;
+        state
+            .trainer
+            .set_execution(crate::TrainingExecutionOptions {
+                // Bootstrap reuse belongs to collection, not optimizer execution.
+                reuse_actor_values: false,
+                ..settings.execution
+            })?;
         Ok(Self {
             state,
             opponent,
@@ -517,7 +530,7 @@ impl AnnealedSession {
             .map(|offset| episode::game_stream(settings.seed, global_game + offset as u64))
             .collect::<Result<Vec<_>, _>>()?;
         let mut random = actor_stream_rngs(&mut self.state.sampling, batch_len)?;
-        episode::collect_batch(
+        episode::collect_batch_with_actor_values(
             &self.state.model,
             config,
             local,
@@ -528,6 +541,7 @@ impl AnnealedSession {
             harness.episode_decisions(),
             rollout,
             report,
+            settings.execution.reuse_actor_values,
         )?;
         for environment in &environments {
             reject_production_rejection(environment, "annealed collection")?;
@@ -563,7 +577,7 @@ fn batch_environments(
     draw: &GenerationDraw,
 ) -> Result<Vec<TrainingEnvironment>, PpoError> {
     assert_eq!(seats.len(), settings.parallel_worlds);
-    assert!(seats.len() <= PPO_ANNEALED_MAX_GAMES);
+    assert!(seats.len() <= crate::PPO_ANNEALED_MAX_PARALLEL_WORLDS);
     let rules = generation_rules(draw, global_game);
     let mut environments = Vec::with_capacity(seats.len());
     for (offset, seat) in seats.iter().copied().enumerate() {
@@ -760,7 +774,7 @@ impl GenerationCache {
 
 /// One balanced seat assignment per update: exactly half of the games per side.
 fn balanced_policy_seats(seed: u64, update: u64, games: usize) -> Result<Vec<usize>, PpoError> {
-    assert!((2..=PPO_ANNEALED_MAX_GAMES).contains(&games));
+    assert!((2..=crate::PPO_WIDE_ANNEALED_MAX_GAMES).contains(&games));
     assert!(games.is_multiple_of(2), "sides need an even game count");
     let mut seats = (0..games).map(|index| index % 2).collect::<Vec<_>>();
     let mut rng = PpoRng::new(derive_training_seed(seed, update, SEAT_DOMAIN));
@@ -826,6 +840,8 @@ fn annealed_run(
     );
     if config.sample_budget == PpoSampleBudget::Annealed {
         command_line.push_str(" --sample-budget annealed-v1");
+    } else if config.sample_budget == PpoSampleBudget::WideAnnealed {
+        command_line.push_str(" --sample-budget wide-annealed-v1");
     }
     if harness.episode_decisions() != ACTOR_DECISIONS {
         command_line.push_str(&format!(
@@ -916,14 +932,16 @@ fn validate_annealed(
 
 fn validate_annealed_batches(settings: &AnnealedJobConfig) -> Result<(), PpoError> {
     if settings.games_per_update < 2
-        || settings.games_per_update > PPO_ANNEALED_MAX_GAMES
+        || settings.games_per_update > crate::PPO_WIDE_ANNEALED_MAX_GAMES
         || !settings.games_per_update.is_multiple_of(2)
     {
         return Err(PpoError::InvalidConfig(
-            "annealed games per update must be even and within 2..=40",
+            "annealed games per update must be even and within 2..=80",
         ));
     }
-    if settings.parallel_worlds == 0 || settings.parallel_worlds > PPO_ANNEALED_MAX_GAMES {
+    if settings.parallel_worlds == 0
+        || settings.parallel_worlds > crate::PPO_ANNEALED_MAX_PARALLEL_WORLDS
+    {
         return Err(PpoError::InvalidConfig("annealed parallel worlds"));
     }
     if !settings
@@ -969,11 +987,7 @@ fn validate_annealed_ppo(settings: &AnnealedJobConfig) -> Result<PpoConfig, PpoE
             "annealed Map2 reward requires gamma per tick one",
         ));
     }
-    let expected = if settings.games_per_update > TRAINING_MAX_ENVIRONMENTS {
-        PpoSampleBudget::Annealed
-    } else {
-        PpoSampleBudget::Standard
-    };
+    let expected = PpoSampleBudget::for_annealed_games(settings.games_per_update);
     if config.sample_budget != expected {
         return Err(PpoError::InvalidConfig(
             "annealed PPO sample budget must match games per update",
@@ -1111,3 +1125,7 @@ mod metrics_integration_tests;
 #[cfg(test)]
 #[path = "../tests/annealed.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../tests/newlearning_signal.rs"]
+pub(super) mod learning_signal;

@@ -747,11 +747,23 @@ pub(crate) const ANNEALED_FEATURE_ARENA_PEAK_BYTES: u64 = {
     total + largest
 };
 
+pub(crate) const fn wide_feature_arena_peak_bytes() -> u64 {
+    const {
+        assert!(
+            ANNEALED_FEATURE_ARENA_PEAK_BYTES
+                .is_multiple_of(crate::PPO_ANNEALED_MAX_SAMPLES as u64)
+        );
+    }
+    ANNEALED_FEATURE_ARENA_PEAK_BYTES / crate::PPO_ANNEALED_MAX_SAMPLES as u64
+        * crate::PPO_WIDE_ANNEALED_MAX_SAMPLES as u64
+}
+
 const fn annealed_feature_row_bytes<const TOKENS: usize, const FEATURES: usize>() -> u64 {
     assert!(TOKENS > 0);
     assert!(TOKENS <= u16::MAX as usize);
     let rows = crate::PPO_ANNEALED_MAX_SAMPLES as u64 * TOKENS as u64;
     assert!(rows <= u32::MAX as u64);
+    assert!(crate::PPO_WIDE_ANNEALED_MAX_SAMPLES as u64 * TOKENS as u64 <= u32::MAX as u64);
     rows * std::mem::size_of::<IndexedFeatureRow<FEATURES>>() as u64
 }
 
@@ -809,6 +821,16 @@ impl RaggedFeatureArena {
     pub(crate) fn new_bounded(sample_capacity: usize) -> Result<Self, &'static str> {
         if !(1..=crate::PPO_ANNEALED_MAX_SAMPLES).contains(&sample_capacity) {
             return Err("bounded ragged feature sample capacity is outside 1..=46520");
+        }
+        Ok(Self {
+            bounded_growth: true,
+            ..Self::new(sample_capacity)
+        })
+    }
+
+    pub(crate) fn new_wide_bounded(sample_capacity: usize) -> Result<Self, &'static str> {
+        if !(1..=crate::PPO_WIDE_ANNEALED_MAX_SAMPLES).contains(&sample_capacity) {
+            return Err("wide ragged feature sample capacity is outside 1..=93040");
         }
         Ok(Self {
             bounded_growth: true,
@@ -884,7 +906,7 @@ impl RaggedFeatureArena {
 
     fn reserve_frame(&mut self, frame: &FeatureFrame) -> Result<(), &'static str> {
         assert!(self.bounded_growth);
-        assert!(self.sample_capacity <= crate::PPO_ANNEALED_MAX_SAMPLES);
+        assert!(self.sample_capacity <= crate::PPO_WIDE_ANNEALED_MAX_SAMPLES);
         // Reserve all seven arenas first so an allocation failure cannot append partial rows.
         reserve_feature_rows(
             &mut self.units,

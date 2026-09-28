@@ -7,6 +7,13 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use super::*;
 
+#[path = "actor_values.rs"]
+mod actor_values;
+
+#[cfg(test)]
+#[path = "../tests/actor_value_reuse.rs"]
+mod actor_value_reuse_tests;
+
 #[cfg(test)]
 #[path = "../tests/episode_log_contract.rs"]
 mod log_contract_tests;
@@ -38,7 +45,7 @@ const RETENTION_STREAM_DOMAIN: u64 = 0x7068_6173_655f_726e;
 const _: () = assert!(RETENTION_STRIDE.is_power_of_two());
 const RETAINED_PER_EPISODE: usize = crate::MAP2_RETAINED_DECISIONS;
 const MAX_EPISODE_ENVIRONMENTS: usize = super::TRAINING_MAX_ENVIRONMENTS;
-const MAX_ACTOR_ENVIRONMENTS: usize = crate::PPO_ANNEALED_MAX_GAMES;
+const MAX_ACTOR_ENVIRONMENTS: usize = crate::PPO_ANNEALED_MAX_PARALLEL_WORLDS;
 const _: () = assert!(MAX_EPISODE_ENVIRONMENTS <= MAX_ACTOR_ENVIRONMENTS);
 const _: () = assert!(MAX_ACTOR_ENVIRONMENTS <= crate::MODEL_TRAINING_BATCH);
 const RETAINED_BYTES_PER_ENVIRONMENT: usize = 3
@@ -612,6 +619,7 @@ pub(super) fn collect_groups_bounded(
             phases.map(|phases| &phases[0]),
             rollout,
             report,
+            false,
         )?;
         assert!(completed, "the one-group collector cannot cancel");
         finish_collection(&streams, environments, require_complete, report)?;
@@ -750,6 +758,7 @@ fn collect_group(
         phases,
         &mut rollout,
         &mut report,
+        false,
     )?;
     if !completed {
         return Ok(GroupOutcome::Cancelled);
@@ -791,9 +800,9 @@ fn merge_group_outcomes(
     Ok(())
 }
 
-/// Runs one bounded worker pool: dedicated flush evaluator, one persistent
-/// stream worker per environment, and the round loop that batches one forward
-/// per decision and applies replies in stream order.
+/// Runs one bounded worker pool and applies completions in stream order.
+/// Actor-value reuse replaces the default flush evaluator with one pending round;
+/// a failed sample/completion aborts the uncommitted update, never retries its worlds.
 ///
 /// Returns `false` when `cancel` was observed at a round boundary, leaving
 /// every worker idle; all exits join the pool and close the evaluator through
@@ -812,6 +821,7 @@ fn collect_with_workers(
     phases: Option<&CollectionPhases>,
     rollout: &mut PpoRollout,
     report: &mut PpoSmokeReport,
+    reuse_actor_values: bool,
 ) -> Result<bool, PpoError> {
     assert_eq!(streams.len(), environments.len());
     assert_eq!(random.len(), environments.len());
@@ -820,7 +830,8 @@ fn collect_with_workers(
     assert!(!environments.is_empty());
     let maximum_worlds = match config.sample_budget {
         crate::PpoSampleBudget::Standard => MAX_EPISODE_ENVIRONMENTS,
-        crate::PpoSampleBudget::Annealed => MAX_ACTOR_ENVIRONMENTS,
+        crate::PpoSampleBudget::Annealed => crate::PPO_ANNEALED_MAX_GAMES,
+        crate::PpoSampleBudget::WideAnnealed => MAX_ACTOR_ENVIRONMENTS,
     };
     if environments.len() > maximum_worlds
         || stream_base
@@ -831,84 +842,40 @@ fn collect_with_workers(
             "episode collection worlds or streams",
         ));
     }
-    // Preserve the queue size for existing batches; expanded batches need one slot per world.
-    let flush_capacity = MAX_EPISODE_ENVIRONMENTS.max(environments.len());
-    let (flush_sender, flush_receiver) =
-        std::sync::mpsc::sync_channel::<FlushRequest>(flush_capacity);
-    let flush_evaluator = FlushEvaluator {
-        sender: std::sync::Mutex::new(Some(flush_sender)),
+    let (flush_evaluator, flush_receiver) = if reuse_actor_values {
+        assert!(cancel.is_none(), "actor value reuse is annealed-only");
+        (None, None)
+    } else {
+        // Preserve the queue size for existing batches; expanded batches need one slot per world.
+        let capacity = MAX_EPISODE_ENVIRONMENTS.max(environments.len());
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<FlushRequest>(capacity);
+        (
+            Some(FlushEvaluator {
+                sender: std::sync::Mutex::new(Some(sender)),
+            }),
+            Some(receiver),
+        )
     };
     std::thread::scope(|scope| -> Result<bool, PpoError> {
-        std::thread::Builder::new()
-            .name(format!("{thread_prefix}-flush-eval"))
-            .spawn_scoped(scope, move || {
-                flush_evaluator_loop(model, &flush_receiver, phases)
-            })
-            .map_err(|error| PpoError::EpisodeWorker {
-                stream: stream_base,
-                cause: error.to_string(),
-            })?;
-        let _flush_guard = FlushThreadGuard(&flush_evaluator);
-        let flush_evaluator_ref = &flush_evaluator;
+        if let Some(receiver) = flush_receiver {
+            std::thread::Builder::new()
+                .name(format!("{thread_prefix}-flush-eval"))
+                .spawn_scoped(scope, move || {
+                    flush_evaluator_loop(model, &receiver, phases)
+                })
+                .map_err(|error| PpoError::EpisodeWorker {
+                    stream: stream_base,
+                    cause: error.to_string(),
+                })?;
+        }
+        let _flush_guard = flush_evaluator.as_ref().map(FlushThreadGuard);
+        let flush_evaluator_ref = flush_evaluator.as_ref();
         let workers = super::parallel::StreamWorkers::spawn(
             scope,
             environments,
             thread_prefix,
-            |_, environment, job| {
-                match job {
-                    StreamJob::Prepare => {
-                        let started = phases.map(|_| Instant::now());
-                        let sample = prepare_policy_sample(environment);
-                        CollectionPhases::record(started, phases.map(|phases| &phases.prepare_ns));
-                        sample.map(|sample| StreamReply::Prepared(Box::new(sample)))
-                    }
-                    StreamJob::Advance {
-                        state,
-                        choice,
-                        space,
-                    } => {
-                        let mut state = state;
-                        let started = phases.map(|_| Instant::now());
-                        let advanced = advance_cpu(environment, &mut state, choice, space, config);
-                        CollectionPhases::record(started, phases.map(|phases| &phases.advance_ns));
-                        let completed = advanced?;
-                        // A terminal flush uses a zero next value and never
-                        // encodes a frame, exactly like the serial collector.
-                        // A non-terminal flush queues the exact next frame for
-                        // the dedicated evaluator; the frame is reused as the
-                        // next decision's prepared sample.
-                        let (value, prepared) = if state.done {
-                            (None, None)
-                        } else if state.should_flush() {
-                            let started = phases.map(|_| Instant::now());
-                            let sample = prepare_policy_sample(environment);
-                            CollectionPhases::record(
-                                started,
-                                phases.map(|phases| &phases.prepare_ns),
-                            );
-                            let sample = sample?;
-                            let (value_sender, value_receiver) = std::sync::mpsc::sync_channel(1);
-                            flush_evaluator_ref.submit(sample.0.clone(), value_sender)?;
-                            (Some(value_receiver), Some(Box::new(sample)))
-                        } else {
-                            let started = phases.map(|_| Instant::now());
-                            let sample = prepare_policy_sample(environment);
-                            CollectionPhases::record(
-                                started,
-                                phases.map(|phases| &phases.prepare_ns),
-                            );
-                            (None, Some(Box::new(sample?)))
-                        };
-                        let opponent = opponent_name(&environment.opponent);
-                        Ok(StreamReply::Advanced(Box::new(AdvancedReply {
-                            state,
-                            completed,
-                            value,
-                            opponent,
-                            prepared,
-                        })))
-                    }
-                }
+            move |_, environment, job| {
+                run_stream_job(environment, job, config, flush_evaluator_ref, phases)
             },
         )?;
         // Bootstrap: every stream builds its first frame before any action.
@@ -916,6 +883,9 @@ fn collect_with_workers(
         // Reused across decisions: the active set never changes shape between
         // rounds, only membership.
         let mut active: Vec<usize> = Vec::with_capacity(streams.len());
+        let mut pending =
+            reuse_actor_values.then(|| actor_values::PendingRound::new(streams.len()));
+        let mut staged_random = reuse_actor_values.then(|| random.to_vec());
         let mut completed = true;
         for _ in 0..rounds {
             if cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
@@ -937,9 +907,30 @@ fn collect_with_workers(
                 spaces.push(sample.1);
             }
             let started = phases.map(|_| Instant::now());
-            let sampled = sample_choices(model, random, &active, frames, spaces);
+            if let Some(staged) = &mut staged_random {
+                staged.clone_from_slice(random);
+            }
+            let sampled = sample_choices(
+                model,
+                staged_random.as_deref_mut().unwrap_or(&mut *random),
+                &active,
+                frames,
+                spaces,
+            );
             CollectionPhases::record(started, phases.map(|phases| &phases.forward_ns));
             let (choices, spaces) = sampled?;
+            if let Some(pending) = &mut pending {
+                let started = phases.map(|_| Instant::now());
+                pending.finish_sampled(
+                    streams,
+                    stream_base,
+                    (&active, &choices),
+                    rollout,
+                    report,
+                )?;
+                CollectionPhases::record(started, phases.map(|phases| &phases.apply_ns));
+                random.clone_from_slice(staged_random.as_ref().expect("staged actor RNGs"));
+            }
             let mut samples = choices.into_iter().zip(spaces);
             for &stream in &active {
                 let (choice, space) = samples.next().expect("one sample per active stream");
@@ -968,6 +959,14 @@ fn collect_with_workers(
                 streams[stream] = std::mem::take(&mut reply.state);
                 prepared[stream] = reply.prepared.map(|sample| *sample);
                 assert_eq!(prepared[stream].is_none(), streams[stream].done);
+                if let Some(pending) = &mut pending {
+                    assert!(
+                        reply.value.is_none(),
+                        "actor reuse never submits a flush forward"
+                    );
+                    pending.push(stream, reply.completed, reply.opponent);
+                    continue;
+                }
                 let value = match reply.value {
                     Some(receiver) => {
                         let started = phases.map(|_| Instant::now());
@@ -995,9 +994,62 @@ fn collect_with_workers(
             }
             CollectionPhases::record(apply_started, phases.map(|phases| &phases.apply_ns));
         }
+        if let Some(pending) = &mut pending {
+            pending.finish_fallback(model, streams, stream_base, &prepared, rollout, report)?;
+        }
         workers.finish()?;
         Ok(completed)
     })
+}
+
+fn run_stream_job(
+    environment: &mut TrainingEnvironment,
+    job: StreamJob,
+    config: PpoConfig,
+    evaluator: Option<&FlushEvaluator>,
+    phases: Option<&CollectionPhases>,
+) -> Result<StreamReply, PpoError> {
+    let StreamJob::Advance {
+        mut state,
+        choice,
+        space,
+    } = job
+    else {
+        let started = phases.map(|_| Instant::now());
+        let sample = prepare_policy_sample(environment);
+        CollectionPhases::record(started, phases.map(|phases| &phases.prepare_ns));
+        return sample.map(|sample| StreamReply::Prepared(Box::new(sample)));
+    };
+    let started = phases.map(|_| Instant::now());
+    let advanced = advance_cpu(environment, &mut state, choice, space, config);
+    CollectionPhases::record(started, phases.map(|phases| &phases.advance_ns));
+    let completed = advanced?;
+    let mut value = None;
+    let prepared = if state.done {
+        None
+    } else {
+        let started = phases.map(|_| Instant::now());
+        let sample = prepare_policy_sample(environment);
+        CollectionPhases::record(started, phases.map(|phases| &phases.prepare_ns));
+        let sample = sample?;
+        if state.should_flush()
+            && let Some(evaluator) = evaluator
+        {
+            let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+            evaluator.submit(sample.0.clone(), sender)?;
+            value = Some(receiver);
+        }
+        Some(Box::new(sample))
+    };
+    assert_eq!(prepared.is_none(), state.done);
+    assert!(value.is_none() || state.should_flush());
+    Ok(StreamReply::Advanced(Box::new(AdvancedReply {
+        state,
+        completed,
+        value,
+        opponent: opponent_name(&environment.opponent),
+        prepared,
+    })))
 }
 
 /// Applies the shared completion contract to one finished group.
@@ -1135,11 +1187,8 @@ pub(super) fn game_stream(seed: u64, game: u64) -> Result<EpisodeStream, PpoErro
     })
 }
 
-/// Runs one annealed batch of episodes over already built environments.
-///
-/// `rounds` is the production episode ceiling or a test-only shorter window.
-/// A full ceiling asserts every stream reached its terminal; a shorter window
-/// stops each stream mid-episode exactly like the bounded benchmark slice.
+/// Runs the historical annealed collector for test/reference callers.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn collect_batch(
     model: &PolicyModel,
@@ -1152,6 +1201,42 @@ pub(super) fn collect_batch(
     rounds: usize,
     rollout: &mut PpoRollout,
     report: &mut PpoSmokeReport,
+) -> Result<(), PpoError> {
+    collect_batch_with_actor_values(
+        model,
+        config,
+        stream_base,
+        thread_prefix,
+        environments,
+        streams,
+        random,
+        rounds,
+        rollout,
+        report,
+        false,
+    )
+}
+
+/// Runs one annealed batch of episodes over already built environments.
+/// Reuse keeps actor batches unchanged but permits different bootstrap bits from
+/// their larger GEMMs; the caller must bind this choice to the checkpoint scope.
+///
+/// `rounds` is the production episode ceiling or a test-only shorter window.
+/// A full ceiling asserts every stream reached its terminal; a shorter window
+/// stops each stream mid-episode exactly like the bounded benchmark slice.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn collect_batch_with_actor_values(
+    model: &PolicyModel,
+    config: PpoConfig,
+    stream_base: usize,
+    thread_prefix: &str,
+    environments: &mut [TrainingEnvironment],
+    streams: &mut [EpisodeStream],
+    random: &mut [PpoRng],
+    rounds: usize,
+    rollout: &mut PpoRollout,
+    report: &mut PpoSmokeReport,
+    reuse_actor_values: bool,
 ) -> Result<(), PpoError> {
     assert!(!environments.is_empty());
     assert_eq!(streams.len(), environments.len());
@@ -1172,6 +1257,7 @@ pub(super) fn collect_batch(
         None,
         rollout,
         report,
+        reuse_actor_values,
     )?;
     assert!(completed, "an annealed batch cannot cancel");
     #[cfg(test)]
@@ -1260,7 +1346,9 @@ fn select_choices(
 #[derive(Default)]
 pub(super) struct EpisodeStream {
     #[cfg(test)]
-    trace: std::collections::hash_map::DefaultHasher,
+    pub(super) learning_signal: Option<Vec<super::annealed::learning_signal::Decision>>,
+    #[cfg(test)]
+    pub(super) trace: std::collections::hash_map::DefaultHasher,
     #[cfg(test)]
     last_requests: Option<Vec<Option<Request>>>,
     retention_phase: usize,
@@ -1387,6 +1475,15 @@ fn advance_cpu(
 ) -> Result<CompletedAdvance, PpoError> {
     assert!(!state.done);
     assert!(state.decisions < ACTOR_DECISIONS);
+    #[cfg(test)]
+    let learning_signal = state.learning_signal.as_ref().map(|_| {
+        super::annealed::learning_signal::Decision::capture(
+            environment,
+            &choice,
+            state.decisions,
+            state.begins_interval(),
+        )
+    });
     if state.begins_interval() {
         assert!(state.choice.is_none());
         assert_eq!(state.interval.steps, 0);
@@ -1423,6 +1520,19 @@ fn advance_cpu(
     )?;
     state.actions[choice.action().kind().index()] += 1;
     state.append_retained_reward(reward, advanced.ticks, config.gamma_tick)?;
+    #[cfg(test)]
+    if let Some(mut row) = learning_signal {
+        row.reward = reward;
+        row.ticks = advanced.ticks;
+        row.terminal = state.done;
+        let tape = state
+            .learning_signal
+            .as_mut()
+            .expect("enabled learning tape");
+        assert_eq!(tape.len(), state.decisions);
+        assert!(tape.len() < ACTOR_DECISIONS);
+        tape.push(row);
+    }
     state.decisions += 1;
     Ok(CompletedAdvance {
         end_tick: tick + advanced.ticks,

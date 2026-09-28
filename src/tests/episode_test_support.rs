@@ -7,7 +7,7 @@ pub(super) fn emit_concurrency_probe_counts(streams: &[EpisodeStream], overlap: 
     if std::env::var_os("DRYSUA_PROBE_MODE").is_none() {
         return;
     }
-    assert!(streams.len() <= crate::PPO_ANNEALED_MAX_GAMES);
+    assert!(streams.len() <= crate::PPO_ANNEALED_MAX_PARALLEL_WORLDS);
     let decisions = streams.iter().map(|stream| stream.decisions).sum::<usize>();
     let continues = streams
         .iter()
@@ -368,25 +368,25 @@ fn assert_mc_batch_and_timeout(batch: &PpoBatch, choice: PpoPolicyChoice, config
 }
 
 #[test]
-fn forty_actor_streams_preserve_rng_order_and_reject_overflow_without_draws() {
+fn wide_capacity_actor_streams_preserve_rng_order_and_reject_overflow_without_draws() {
     let mut master = PpoRng::new(7);
     let mut expected = master.clone();
-    let random = actor_stream_rngs(&mut master, 40).expect("forty actor RNGs");
-    assert_eq!(random.len(), 40);
+    let random = actor_stream_rngs(&mut master, 64).expect("sixty-four actor RNGs");
+    assert_eq!(random.len(), 64);
     for state in &random {
         assert_eq!(*state, PpoRng::new(expected.next_word().expect("seed")));
     }
     assert_eq!(master, expected);
     assert_eq!(
-        validate_active(&random, &(0..40).collect::<Vec<_>>()),
+        validate_active(&random, &(0..64).collect::<Vec<_>>()),
         Ok(())
     );
     assert_eq!(
-        validate_active(&random, &[39, 40]),
+        validate_active(&random, &[63, 64]),
         Err(PpoError::InvalidConfig("episode active streams"))
     );
     assert_eq!(
-        actor_stream_rngs(&mut master, 41),
+        actor_stream_rngs(&mut master, 65),
         Err(PpoError::InvalidConfig("actor RNG streams"))
     );
     assert_eq!(master, expected);

@@ -4,6 +4,110 @@ use super::*;
 use crate::{CompletedTrainingEpisodes, TrainingGameOutcome};
 
 #[test]
+fn wide_capacity_m64_b64_and_m80_b40_collect_one_ppo_step_and_resume_exactly() {
+    for (games, parallel) in [(64, 64), (80, 40)] {
+        let baseline = test_directory("wide-baseline");
+        let resumed = test_directory("wide-resumed");
+        let config = wide_settings(games, parallel);
+        let expected = run(config.clone(), &baseline, false).expect("wide collection");
+        assert_eq!(expected.games, 2 * games as u64);
+        assert_eq!(
+            expected.optimizer_step, 2,
+            "one full minibatch per shortened update"
+        );
+        let first = run_with(
+            config.clone(),
+            AnnealedHarness {
+                stop_after: Some(1),
+                ..harness()
+            },
+            &resumed,
+            false,
+        )
+        .expect("first committed update");
+        assert_eq!(first.games, games as u64);
+        assert_eq!(first.optimizer_step, 1);
+        let actual = run(config, &resumed, true).expect("wide resume");
+        assert_eq!(actual.rollout_samples, expected.rollout_samples);
+        assert_eq!(actual.optimizer_step, expected.optimizer_step);
+        assert_trajectory_equal(&baseline, &resumed);
+        std::fs::remove_dir_all(baseline).expect("cleanup baseline");
+        std::fs::remove_dir_all(resumed).expect("cleanup resumed");
+    }
+}
+
+fn wide_settings(games: usize, parallel: usize) -> AnnealedJobConfig {
+    let mut config = crate::cli::annealed_settings_for_test(&[
+        "--updates",
+        "2",
+        "--games",
+        &games.to_string(),
+        "--parallel",
+        &parallel.to_string(),
+        "--generation-games",
+        &(games * 5).to_string(),
+        "--epochs",
+        "1",
+        "--minibatch",
+        "160",
+        "--zero-updates",
+        "0",
+        "--seed",
+        "9001",
+    ])
+    .expect("wide CLI settings");
+    config.checkpoint_cadence = crate::TrainingCheckpointCadence::Updates(1);
+    config
+}
+
+#[test]
+fn wide_capacity_profiles_and_partitions_admit_candidates_and_reject_overflow() {
+    for (games, worlds, budget) in [
+        (40, 40, crate::PpoSampleBudget::Annealed),
+        (48, 48, crate::PpoSampleBudget::WideAnnealed),
+        (64, 64, crate::PpoSampleBudget::WideAnnealed),
+        (80, 40, crate::PpoSampleBudget::WideAnnealed),
+    ] {
+        let config = wide_settings(games, worlds);
+        assert_eq!(
+            validate_annealed(&config, harness())
+                .expect("candidate")
+                .sample_budget,
+            budget
+        );
+        assert_eq!(
+            config.ppo.environments * config.ppo.rollout_decisions,
+            games * 1163
+        );
+    }
+    let mut invalid = wide_settings(80, 40);
+    invalid.parallel_worlds = 65;
+    assert_eq!(
+        validate_annealed(&invalid, harness()),
+        Err(PpoError::InvalidConfig("annealed parallel worlds"))
+    );
+    invalid.parallel_worlds = 40;
+    invalid.games_per_update = 81;
+    assert_eq!(
+        validate_annealed(&invalid, harness()),
+        Err(PpoError::InvalidConfig(
+            "annealed games per update must be even and within 2..=80"
+        ))
+    );
+    let mut completed = CompletedTrainingEpisodes::default();
+    completed
+        .record(1, 79, TrainingGameOutcome::Win)
+        .expect("last wide game");
+    assert_eq!(
+        completed.record(1, 80, TrainingGameOutcome::Win),
+        Err(PpoError::InvalidTransition(
+            "completed episode tick or stream"
+        ))
+    );
+    assert_eq!(completed.ordered_outcomes(), [TrainingGameOutcome::Win]);
+}
+
+#[test]
 fn m40_sequential_and_b40_updates_resume_model_optimizer_rng_and_generation_bytes() {
     for (parallel, updates, stop, interrupt) in [(8, 6, 5, Some(24)), (40, 2, 1, None)] {
         let baseline = test_directory("capacity-baseline");
@@ -67,12 +171,12 @@ fn expanded_jobs_enforce_capacity_and_partition_boundaries() {
     let directory = test_directory("invalid-capacity");
     for (games, parallel, generation, message) in [
         (
-            42,
+            82,
             40,
             200,
-            "annealed games per update must be even and within 2..=40",
+            "annealed games per update must be even and within 2..=80",
         ),
-        (40, 41, 200, "annealed parallel worlds"),
+        (40, 65, 200, "annealed parallel worlds"),
         (
             40,
             6,
@@ -109,12 +213,22 @@ fn expanded_jobs_enforce_capacity_and_partition_boundaries() {
 
 #[test]
 fn shuffle_sample_and_optimizer_preflight_accept_max_updates_and_reject_max_plus_one() {
-    for (epochs, minibatch, per_update, field) in [
-        (4, 80, 4 * (46_520 - 1), "annealed shuffle RNG counter"),
-        (1, 80, 46_520, "annealed sample counter"),
-        (2, 1, 2 * 46_520, "annealed optimizer counter"),
+    for (games, epochs, minibatch, per_update, field) in [
+        (40, 4, 80, 4 * (46_520 - 1), "annealed shuffle RNG counter"),
+        (40, 1, 80, 46_520, "annealed sample counter"),
+        (40, 2, 1, 2 * 46_520, "annealed optimizer counter"),
+        (
+            80,
+            4,
+            2048,
+            4 * (93_040 - 1),
+            "annealed shuffle RNG counter",
+        ),
     ] {
         let mut config = expanded_settings(MAX_TRAINING_COUNTER / per_update);
+        config.games_per_update = games;
+        config.ppo.environments = games;
+        config.ppo.sample_budget = crate::PpoSampleBudget::for_annealed_games(games);
         config.ppo.epochs = epochs;
         config.ppo.minibatch = minibatch;
         assert_eq!(
@@ -137,11 +251,11 @@ fn shuffle_sample_and_optimizer_preflight_accept_max_updates_and_reject_max_plus
 fn completed_episode_capacity_rejects_overflow_and_duplicate_merge_atomically() {
     let mut completed = CompletedTrainingEpisodes::default();
     completed
-        .record(crate::MAP2_TICK_CAP, 39, TrainingGameOutcome::TimeCap)
+        .record(crate::MAP2_TICK_CAP, 79, TrainingGameOutcome::TimeCap)
         .expect("last valid tick and stream");
     let before = completed;
     assert_eq!(
-        completed.record(1, 40, TrainingGameOutcome::Win),
+        completed.record(1, 80, TrainingGameOutcome::Win),
         Err(PpoError::InvalidTransition(
             "completed episode tick or stream"
         ))

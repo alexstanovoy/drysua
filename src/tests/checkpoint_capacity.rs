@@ -2,10 +2,43 @@ use super::*;
 use crate::ppo::test_directory;
 
 #[test]
+fn profile_manifests_preserve_exact_identity_and_64_byte_config() {
+    let standard = encoded_manifest(PpoSampleBudget::Standard, 0, 0);
+    for (budget, checkpoint_version, ppo_version) in [
+        (PpoSampleBudget::Standard, 12u32, 37u32),
+        (PpoSampleBudget::Annealed, 13, 38),
+        (PpoSampleBudget::WideAnnealed, 14, 39),
+    ] {
+        let mut artifact = manifest_artifact(budget, 0, 0);
+        artifact.config.environments = 2;
+        let bytes = encode_manifest(&artifact, artifact.tensor_hash).expect("manifest");
+        assert_eq!(&bytes[8..12], &checkpoint_version.to_le_bytes());
+        assert_eq!(&bytes[56..60], &ppo_version.to_le_bytes());
+        assert_eq!(&bytes[80..], &standard[80..]);
+        let mut writer = ManifestWriter::default();
+        encode_config(&mut writer, artifact.config).expect("config");
+        assert_eq!(writer.bytes.len(), 64);
+        assert_eq!(
+            &bytes[bytes.len() - 128..bytes.len() - 64],
+            writer.bytes.as_slice()
+        );
+        assert_eq!(
+            decode_manifest(&bytes).expect("roundtrip").config(),
+            artifact.config
+        );
+    }
+}
+
+#[test]
 fn profile_manifests_reject_truncation_trailing_bytes_and_mixed_identities() {
     let standard = encoded_manifest(PpoSampleBudget::Standard, 0, 0);
     let annealed = encoded_manifest(PpoSampleBudget::Annealed, 0, 0);
-    for budget in [PpoSampleBudget::Standard, PpoSampleBudget::Annealed] {
+    let wide = encoded_manifest(PpoSampleBudget::WideAnnealed, 0, 0);
+    for budget in [
+        PpoSampleBudget::Standard,
+        PpoSampleBudget::Annealed,
+        PpoSampleBudget::WideAnnealed,
+    ] {
         let encoded = encoded_manifest(budget, 0, 0);
         assert_eq!(
             decode_manifest(&encoded[..encoded.len() - 1]).expect_err("truncated"),
@@ -18,7 +51,14 @@ fn profile_manifests_reject_truncation_trailing_bytes_and_mixed_identities() {
             CheckpointError::ManifestTrailingBytes
         );
     }
-    for (source, other) in [(&standard, &annealed), (&annealed, &standard)] {
+    for (source, other) in [
+        (&standard, &annealed),
+        (&annealed, &standard),
+        (&standard, &wide),
+        (&wide, &standard),
+        (&annealed, &wide),
+        (&wide, &annealed),
+    ] {
         for range in [8..12, 12..20, 8..20, 56..60, 60..68, 56..68] {
             let mut mixed = source.clone();
             mixed[range.clone()].copy_from_slice(&other[range]);
@@ -30,38 +70,52 @@ fn profile_manifests_reject_truncation_trailing_bytes_and_mixed_identities() {
             );
         }
     }
-    let mut downgraded = annealed;
-    downgraded[..80].copy_from_slice(&standard[..80]);
-    assert_eq!(
-        decode_manifest(&downgraded).expect_err("capacity downgrade"),
-        CheckpointError::InvalidManifest("PPO config")
-    );
+    for (source, other) in [
+        (&annealed, &standard),
+        (&wide, &standard),
+        (&wide, &annealed),
+    ] {
+        let mut downgraded = source.clone();
+        downgraded[..80].copy_from_slice(&other[..80]);
+        assert_eq!(
+            decode_manifest(&downgraded).expect_err("capacity downgrade"),
+            CheckpointError::InvalidManifest("PPO config")
+        );
+    }
 }
 
 #[test]
-fn invalid_annealed_config_rejects_before_tensor_io() {
+fn invalid_nonstandard_config_rejects_before_tensor_io() {
     let directory = test_directory("invalid-config");
-    let original = encoded_manifest(PpoSampleBudget::Annealed, 0, 0);
-    for (offset, value) in [
-        (0, 0u32),
-        (4, 1_162),
-        (8, 41),
-        (8, 42),
-        (12, 17),
-        (16, 8_193),
-        (32, f32::NAN.to_bits()),
-        (52, 0.0f32.to_bits()),
+    for (budget, maximum_games) in [
+        (PpoSampleBudget::Annealed, 40),
+        (PpoSampleBudget::WideAnnealed, 80),
     ] {
-        let mut encoded = original.clone();
-        let start = encoded.len() - 128 + offset;
-        encoded[start..start + 4].copy_from_slice(&value.to_le_bytes());
-        fs::write(directory.join(CHECKPOINT_META_FILE), encoded).expect("manifest only");
-        let error = TrainingArtifact::load(&directory).expect_err("config before missing tensors");
-        assert_eq!(error, CheckpointError::InvalidManifest("PPO config"));
-        assert_eq!(
-            error.to_string(),
-            "checkpoint manifest has invalid PPO config"
-        );
+        let original = encoded_manifest(budget, 0, 0);
+        for (offset, value) in [
+            (0, 0u32),
+            (4, 1_162),
+            (8, 1),
+            (8, 3),
+            (8, maximum_games + 1),
+            (8, maximum_games + 2),
+            (12, 17),
+            (16, 8_193),
+            (32, f32::NAN.to_bits()),
+            (52, 0.0f32.to_bits()),
+        ] {
+            let mut encoded = original.clone();
+            let start = encoded.len() - 128 + offset;
+            encoded[start..start + 4].copy_from_slice(&value.to_le_bytes());
+            fs::write(directory.join(CHECKPOINT_META_FILE), encoded).expect("manifest only");
+            let error =
+                TrainingArtifact::load(&directory).expect_err("config before missing tensors");
+            assert_eq!(error, CheckpointError::InvalidManifest("PPO config"));
+            assert_eq!(
+                error.to_string(),
+                "checkpoint manifest has invalid PPO config"
+            );
+        }
     }
     fs::remove_dir_all(directory).expect("cleanup");
 }
@@ -76,6 +130,12 @@ fn profile_sample_counters_accept_configured_boundary_and_reject_one_more() {
         (PpoSampleBudget::Annealed, 40, 2, 93_040),
         (PpoSampleBudget::Annealed, 40, 3, 139_560),
         (PpoSampleBudget::Annealed, 2, 3, 6_978),
+        (PpoSampleBudget::WideAnnealed, 80, 0, 0),
+        (PpoSampleBudget::WideAnnealed, 80, 1, 93_040),
+        (PpoSampleBudget::WideAnnealed, 80, 2, 186_080),
+        (PpoSampleBudget::WideAnnealed, 80, 3, 279_120),
+        (PpoSampleBudget::WideAnnealed, 40, 3, 139_560),
+        (PpoSampleBudget::WideAnnealed, 2, 3, 6_978),
     ] {
         let mut artifact = manifest_artifact(budget, updates, maximum);
         artifact.config.environments = games;
@@ -102,43 +162,74 @@ fn profile_sample_counters_accept_configured_boundary_and_reject_one_more() {
 }
 
 #[test]
-fn public_annealed_checkpoint_preserves_state_and_rejects_invalid_capture_restore() {
-    let directory = test_directory("roundtrip");
-    let fixture = manifest_artifact(PpoSampleBudget::Annealed, 0, 0);
-    let source = PolicyModel::fresh(40_008).expect("source");
-    let trainer = PpoTrainer::new(&source, fixture.config, 91).expect("trainer");
-    let artifact = TrainingArtifact::capture(&source, &trainer, fixture.run, fixture.progress)
-        .expect("capture");
-    artifact.save(&directory).expect("save");
-    let loaded = TrainingArtifact::load_compatible(&directory, artifact.run()).expect("load");
-    let target = PolicyModel::fresh(40_009).expect("target");
-    let state = loaded.restore(&target, artifact.run()).expect("restore");
-    assert_eq!(state.trainer().config(), trainer.config());
-    assert_eq!(
-        target.export_parameters().expect("restored parameters"),
-        artifact.parameters
-    );
-    assert_eq!(
-        state
+fn public_nonstandard_checkpoint_preserves_state_and_rejects_invalid_capture_restore() {
+    for budget in [PpoSampleBudget::Annealed, PpoSampleBudget::WideAnnealed] {
+        let directory = test_directory("roundtrip");
+        let fixture = manifest_artifact(budget, 0, 0);
+        let source = PolicyModel::fresh(40_008).expect("source");
+        let trainer = PpoTrainer::new(&source, fixture.config, 91).expect("trainer");
+        let artifact = TrainingArtifact::capture(&source, &trainer, fixture.run, fixture.progress)
+            .expect("capture");
+        artifact.save(&directory).expect("save");
+        let loaded = TrainingArtifact::load_compatible(&directory, artifact.run()).expect("load");
+        let target = PolicyModel::fresh(40_009).expect("target");
+        let state = loaded.restore(&target, artifact.run()).expect("restore");
+        assert_eq!(state.trainer().config(), trainer.config());
+        assert_eq!(state.progress(), artifact.progress());
+        assert_eq!(state.trainer().rng_checkpoint(), trainer.rng_checkpoint());
+        assert_eq!(state.trainer().optimizer_step(), trainer.optimizer_step());
+        let snapshot = state
+            .trainer()
+            .checkpoint_snapshot(&target)
+            .expect("restored snapshot");
+        assert_eq!(
+            snapshot.adam.moments(),
+            trainer
+                .checkpoint_snapshot(&source)
+                .expect("source snapshot")
+                .adam
+                .moments()
+        );
+        assert_eq!(snapshot.parameters, artifact.parameters);
+        let error = state
             .pipeline(1, 1, &target)
             .err()
-            .expect("standard-only pipeline"),
-        CheckpointError::InvalidManifest("annealed actor-learner pipeline")
-    );
-    drop(state);
-    for mastery in [false, true] {
+            .expect("standard-only pipeline");
+        assert_eq!(
+            error,
+            CheckpointError::InvalidManifest("annealed actor-learner pipeline")
+        );
+        assert_eq!(
+            error.to_string(),
+            "checkpoint manifest has invalid annealed actor-learner pipeline"
+        );
+        drop(state);
+        assert_invalid_capture_restore(&source, &trainer, &target, &loaded);
+        fs::remove_dir_all(directory).expect("cleanup");
+    }
+}
+
+fn assert_invalid_capture_restore(
+    source: &PolicyModel,
+    trainer: &PpoTrainer,
+    target: &PolicyModel,
+    loaded: &TrainingArtifact,
+) {
+    for (mastery_config, mastery_progress) in
+        [(false, false), (true, true), (true, false), (false, true)]
+    {
         let mut invalid = loaded.clone();
-        let field = if mastery {
-            invalid.run.mastery_config = Some(crate::MasteryConfig::default());
-            invalid.progress.mastery = Some(crate::MasteryProgress::default());
+        let field = if mastery_config || mastery_progress {
+            invalid.run.mastery_config = mastery_config.then(crate::MasteryConfig::default);
+            invalid.progress.mastery = mastery_progress.then(crate::MasteryProgress::default);
             "annealed mastery"
         } else {
             invalid.progress.rollout_samples = 1;
             "rollout sample counter"
         };
         let error = TrainingArtifact::capture(
-            &source,
-            &trainer,
+            source,
+            trainer,
             invalid.run.clone(),
             invalid.progress.clone(),
         )
@@ -149,18 +240,25 @@ fn public_annealed_checkpoint_preserves_state_and_rejects_invalid_capture_restor
             format!("checkpoint manifest has invalid {field}")
         );
         let bytes = encode_manifest(&invalid, invalid.tensor_hash).expect("invalid fixture");
-        assert_eq!(decode_manifest(&bytes).expect_err("invalid decode"), error);
+        let decode_field = if mastery_progress && !mastery_config {
+            "mastery configuration/state mismatch"
+        } else {
+            field
+        };
+        assert_eq!(
+            decode_manifest(&bytes).expect_err("invalid decode"),
+            CheckpointError::InvalidManifest(decode_field)
+        );
         let before = target.export_parameters().expect("before");
         assert_eq!(
             invalid
-                .restore(&target, invalid.run())
+                .restore(target, invalid.run())
                 .err()
                 .expect("invalid restore"),
             error
         );
         assert_eq!(target.export_parameters().expect("after"), before);
     }
-    fs::remove_dir_all(directory).expect("cleanup");
 }
 
 #[test]
@@ -175,6 +273,10 @@ fn runtime_profiles_roundtrip_and_reject_mixed_schema_without_mutation() {
     for (budget, other) in [
         (PpoSampleBudget::Standard, PpoSampleBudget::Annealed),
         (PpoSampleBudget::Annealed, PpoSampleBudget::Standard),
+        (PpoSampleBudget::Standard, PpoSampleBudget::WideAnnealed),
+        (PpoSampleBudget::WideAnnealed, PpoSampleBudget::Standard),
+        (PpoSampleBudget::Annealed, PpoSampleBudget::WideAnnealed),
+        (PpoSampleBudget::WideAnnealed, PpoSampleBudget::Annealed),
     ] {
         TrainingArtifact::save_runtime_weights_with_budget(&source, &directory, budget)
             .expect("export");
@@ -209,9 +311,11 @@ fn runtime_profiles_roundtrip_and_reject_mixed_schema_without_mutation() {
             if !invalid {
                 result.expect("valid unordered metadata");
             } else {
+                let error = result.expect_err("mixed import");
+                assert_eq!(error, CheckpointError::SchemaMismatch);
                 assert_eq!(
-                    result.expect_err("mixed import"),
-                    CheckpointError::SchemaMismatch
+                    error.to_string(),
+                    "checkpoint schema does not match this build"
                 );
                 assert_eq!(model.policy_identity().expect("identity"), identity);
             }
@@ -284,10 +388,10 @@ fn manifest_artifact(budget: PpoSampleBudget, updates: u64, samples: u64) -> Tra
         },
         config: PpoConfig {
             sample_budget: budget,
-            environments: if budget == PpoSampleBudget::Annealed {
-                40
-            } else {
-                2
+            environments: match budget {
+                PpoSampleBudget::Standard => 2,
+                PpoSampleBudget::Annealed => 40,
+                PpoSampleBudget::WideAnnealed => 80,
             },
             rollout_decisions: 1_163,
             decision_interval_ticks: 3,

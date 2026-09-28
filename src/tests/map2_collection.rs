@@ -492,7 +492,7 @@ fn victim_only_damage_and_warmup_drains_preserve_seat_credit_and_lifetime_budget
     }
 }
 
-fn configured_environment(
+pub(super) fn configured_environment(
     tick: u32,
     policy_seat: usize,
     opponent_spec: OpponentSpec,

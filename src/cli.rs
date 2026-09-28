@@ -203,16 +203,22 @@ struct TrainAnnealedArgs {
     /// Local gradient-fold worker ceiling (1 is the historical serial path).
     #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=32))]
     host_math_workers: u8,
+    /// Spread all rollout rows across nearly equal minibatches; recorded in checkpoint scope.
+    #[arg(long)]
+    balanced_minibatches: bool,
+    /// Reuse next-actor bootstrap values; may change PPO numerics, recorded in checkpoint scope.
+    #[arg(long)]
+    reuse_actor_values: bool,
     /// Total PPO updates; each may perform multiple Adam minibatch steps.
     #[arg(long)]
     updates: u64,
     /// Additional committed updates this invocation; leaves the total target and annealing unchanged.
     #[arg(long, value_parser = clap::builder::RangedU64ValueParser::<std::num::NonZeroU64>::new().range(1..=crate::MAX_TRAINING_COUNTER))]
     invocation_updates: Option<std::num::NonZeroU64>,
-    /// Games per update, even from 2 to 40; above 26 selects the annealed sample budget.
+    /// Games per update, even from 2 to 80; above 40 selects the wide annealed budget.
     #[arg(long, default_value_t = 8)]
     games: usize,
-    /// Worlds advanced in parallel per batch (1..=40); must divide games and generation
+    /// Worlds advanced in parallel per batch (1..=64); must divide games and generation
     /// games. Defaults to the largest divisor of their gcd within the available
     /// cores and the resolved value is printed, recorded in the run scope, and
     /// compared on resume; pass it explicitly when a run must resume on a host
@@ -661,18 +667,16 @@ impl TrainAnnealedArgs {
             .unwrap_or_else(|| self.updates.div_ceil(5));
         let ppo = self.optimizer.ppo(crate::PpoConfig {
             environments: self.games,
-            sample_budget: if self.games > crate::MAX_TRAINING_ENVIRONMENTS {
-                crate::PpoSampleBudget::Annealed
-            } else {
-                crate::PpoSampleBudget::Standard
-            },
+            sample_budget: crate::PpoSampleBudget::for_annealed_games(self.games),
             rollout_decisions: crate::MAP2_RETAINED_DECISIONS,
             gamma_tick: crate::MAP2_REWARD_GAMMA_TICK,
             ..crate::PpoConfig::default()
         });
         Ok(crate::AnnealedJobConfig {
             execution: crate::TrainingExecutionOptions {
+                balanced_minibatches: self.balanced_minibatches,
                 host_math_workers: usize::from(self.host_math_workers),
+                reuse_actor_values: self.reuse_actor_values,
             },
             updates: self.updates,
             invocation_updates: self.invocation_updates,

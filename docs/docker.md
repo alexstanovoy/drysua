@@ -1,11 +1,59 @@
-# Docker deployment: prepared, not runtime-qualified
+# Docker deployment: rootless probes passed, production stack pending
 
-Docker daemon access remains denied. No image build, container start or migration
-is established by native Rust/Python qualification. Training is OFF; existing
-monitoring stays in place. Do not bypass socket permissions, escalate privileges,
-control host services, or replay historical launchers. Future deployment requires
-authorized daemon access, bounded builder/runtime qualification and an explicit
-data/port handoff. This document does not authorize execution now.
+Rootless Docker access is now available (2026-09-27); the earlier socket-access
+blocker is resolved for the `rootless` context. Contained toolchain, test and actual
+CUDA kernel/learning-diagnostic workloads passed as described below. This does not qualify the production Compose
+stack or establish a training migration. Existing monitoring stays in place; no
+full training is authorized. Do not escalate privileges or control host services.
+Production deployment still requires runtime qualification and a data/port handoff.
+
+## Current rootless experiment qualification
+
+Ignored runner/evidence: `artifacts/deslop-20260922/learning-experiments/` (see
+`QUALIFICATION.md`). `docker_run.py` explicitly selects context `rootless`, socket
+`unix:///run/user/1000/docker.sock`, Docker 29.8/cgroup v2. The daemon's `systemd`
+cgroup driver does not require this runner to call a service manager or D-Bus.
+Verified container UID 0 maps to unprivileged host UID 1000, not host root.
+
+Official Ubuntu 26.04 pin/local image ID:
+`sha256:61ebaa5cc23ca45450db85eac015435199ec569e28ec222ea13f2aed2110b8a6`.
+Host toolchain/loader/libraries are read-only mounts; workspace and Cargo/target
+caches retain their absolute paths and write access. Artifacts remain read-only
+except the unique job output at `/out`. This is host-dependent experiment packaging,
+not a reproducible production image. No image build was performed; Cargo compilation
+and tests used this container with the mounted host toolchain.
+
+The parent holds both original heavy locks plus a probe lock until owned-container
+exit. Actual verified cgroup values: hard memory 12 GiB, swap 0, PIDs 1024, unlimited
+CPU; zero resource events. Host telemetry monitoring, a 240-second watchdog,
+235-second payload timeout plus five-second kill grace, 16-MiB logs, unique names,
+no retries, network none, dropped caps and no-new-privileges apply. No socket mount.
+Only one heavy job runs at a time, after source editing is coordinated. Test temporary
+files use the job's `/out` directory rather than raising the 512-MiB `/tmp` limit.
+
+`cpu-toolchain-02` passed glibc 2.43, Rust/Cargo 1.98, g++ 15.3, NVCC 13.3 and
+offline Cargo metadata probes. `gpu-query-02` passed GPU0/UUID query: RTX 5090,
+driver 610.57.04, capability 12.0. No NVIDIA runtime/CDI specs were installed;
+explicit device-node passthrough plus host libraries worked. Subsequent integration
+passed bota workspace debug/release tests, drysua all-feature/no-default checks and
+real Candle CUDA backward/readback. Frozen U428 40-game collection plus isolated
+CPU readout fits also executed successfully; U428 parameters stayed bit-identical.
+The unsupported head prototypes were then archived and removed from compilation;
+the retained diagnostic is a census with no head fitting or new policy architecture.
+This qualifies the adapter for the measured workloads, not learning improvement or
+production resume. See `artifacts/deslop-20260922/learning-experiments/REPORT.md`.
+Resource-failure/timeout cleanup paths were not deliberately fault-injected. No
+production training, native fallback, Compose migration or service restart occurred.
+
+Run only a separately approved short workload, with a new label each time:
+
+```sh
+python3 -B artifacts/deslop-20260922/learning-experiments/docker_run.py cpu metadata-NEXT cargo metadata --offline --no-deps --format-version 1
+python3 -B artifacts/deslop-20260922/learning-experiments/docker_run.py gpu gpu-query-NEXT nvidia-smi --id=GPU-1cd1082a-71fa-610e-1d1a-86a3328c6b6e --query-gpu=uuid,memory.free,temperature.gpu --format=csv,noheader,nounits
+```
+
+Replace `NEXT` with a unique lowercase/digit label. The runner accepts direct command
+arguments after the label and preserves per-job commands, inspect, logs and telemetry.
 
 ## Stack and security
 
@@ -38,6 +86,7 @@ Keep real configuration in ignored `docker/local.env`; never log its expanded se
 | Variables | Contract |
 |---|---|
 | `DRYSUA_IMAGE`, `CUDA_COMPUTE_CAP`, `GPU_UUID` | Approved local image, selected GPU capability and exact UUID; no opportunistic discovery |
+| `RUST_TARGET_CPU` | Docker build argument, default `native`; use `x86-64` for baseline CPU ISA |
 | `DRYSUA_UID/GID`, `MONITORING_UID/GID` | Match owned data and readable secret files; no root chown/init service |
 | `TRAINING_DIRECTORY` | New private accepted copy, never live campaign state |
 | `INITIAL_WEIGHTS_DIRECTORY`, `PROVENANCE_DIRECTORY` | Immutable weights and truthful image/source evidence plus acceptance.json |
@@ -86,6 +135,38 @@ the frozen B40 binary; annealed has no provenance migration operation. Scope mis
 must fail, never be bypassed by editing metadata or switching to initial weights.
 Accepted U428 paths/hashes and future resume requirements are in the local
 `artifacts/deslop-20260922/RESUME.md`; its preserved frozen runtime is a separate lineage.
+
+## Rust CPU code generation
+
+Both `drysua/.cargo/config.toml` and `bota/.cargo/config.toml` set
+`build.rustflags = ["-C", "target-cpu=native"]`. Cargo invoked from either project
+root or its descendants inherits that project's config. Invocation from their
+parent with `--manifest-path` does **not** discover the child config; pass
+`RUSTFLAGS='-C target-cpu=native'` explicitly there. Without `--target`, these flags
+apply to all Rust crates Cargo compiles, including bota path dependencies, build
+scripts and proc macros; the toolchain's prebuilt standard library is not rebuilt.
+
+Docker keeps `WORKDIR /src` and explicitly sets `RUSTFLAGS` from build argument
+`RUST_TARGET_CPU` (default `native`), rather than relying on child config discovery.
+For baseline-ISA builds, override locally with `RUSTFLAGS='-C target-cpu=x86-64'`
+on the Cargo command, or pass Docker `--build-arg RUST_TARGET_CPU=x86-64`.
+`RUSTFLAGS` replaces config rustflags; unset `CARGO_ENCODED_RUSTFLAGS` if present
+because it takes precedence. Preserve any other required flags in the override.
+
+`native` means the **builder's visible CPU**, including inside Docker, not the GPU
+or the eventual runtime host. The intended host is AMD Ryzen 9 9950X3D (Zen 5),
+8 online cores with SMT off, Rust 1.98; this config changes no CPU/thread limits.
+CUDA 13.3 / `CUDA_COMPUTE_CAP=120` is separate; no CFLAGS, NVCC or fast-math changes.
+The target triple stays `x86_64-unknown-linux-gnu`, never `native`. Run the resulting
+binary only on compatible CPU ISA/OS support; baseline ISA does not remove ELF,
+system-library or CUDA ABI requirements. Native kernels may change timings and
+floating-point bits even without fast-math; requalify rather than assume identical
+results or performance. No native rebuild or profiling is established by this edit.
+
+The Docker allowlist admits both configs, so `sources.json` and `source.sha256`
+include them. `provenance.json` also records `rust_target_cpu` and exact `rustflags`;
+profiling receipts must retain effective flags and builder CPU/ISA. These describe
+a new source build, not a replacement for frozen binary/checkpoint hashes or scope.
 
 ## Guard contract
 
@@ -148,6 +229,7 @@ bounds and worker cleanup; the runtime guard does **not** contain build steps.
 ```sh
 docker build --platform linux/amd64 --file Dockerfile \
   --build-arg CUDA_COMPUTE_CAP="${CUDA_COMPUTE_CAP:?Set selected GPU capability}" \
+  --build-arg RUST_TARGET_CPU="${RUST_TARGET_CPU:-native}" \
   --tag "${DRYSUA_IMAGE:?Set approved image tag}" ..
 docker compose --env-file docker/local.env up -d --pull never --no-build metrics prometheus grafana
 docker compose --env-file docker/local.env --profile training up -d --pull never --no-build training

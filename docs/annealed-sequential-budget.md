@@ -1,15 +1,17 @@
 # Sequential annealed games and sample budgets
 
-`train-annealed` admits an even **M = 2..=40** games per PPO update, with
-**B = 1..=40** concurrent worlds. B must still divide both M and K (games per
+`train-annealed` admits an even **M = 2..=80** games per PPO update, with
+**B = 1..=64** concurrent worlds. B must still divide both M and K (games per
 generation). M40/B8/K200 runs five sequential eight-world batches per update;
 one generation spans five updates. Collection does not split PPO updates or
 reduce episode decisions, retention, or matches.
 
-The CLI chooses `PpoSampleBudget::Standard` for M <= 26 and `Annealed` above 26.
+The CLI chooses `PpoSampleBudget::Standard` for M <= 26, `Annealed` for M28..40,
+and the closed `WideAnnealed` profile for M42..80.
 Library callers must set the canonical profile explicitly: validation rejects
 either mismatch. Expanded updates reserve M × 1,163 retained samples, up to
-46,520. Completed-outcome storage has 40 slots independently of the unchanged
+93,040 in the wide profile (the old profile remains capped at 46,520).
+Completed-outcome storage has 80 slots independently of the unchanged
 26-world standard train-full limit. Explicit `--parallel 40` collects M40 in one
 batch. Automatic parallel selection retains its previous 26-core ceiling, so
 existing invocations without an explicit parallel setting do not change.
@@ -18,6 +20,10 @@ Only expanded canonical run scopes add `--sample-budget annealed-v1`; existing
 M <= 26 command-line bytes are unchanged. This is a generated scope marker,
 not a user-selectable CLI override: `--games` determines the profile. Strict
 resume still rejects changed M, B, K, PPO configuration, and other run scope.
+Wide scopes use `--sample-budget wide-annealed-v1`; all M<=40 scope bytes stay
+unchanged. Candidate M48/B48, M64/B64 and M80/B40 can use K240, K320 and K400,
+respectively, for five updates per generation. M80/B64 is not divisible and is
+rejected rather than truncating or inventing a partial batch.
 
 Before constructing worlds or loading weights, preflight bounds cumulative
 samples, actor seed draws, optimizer steps, and shuffle draws. Each actor's
@@ -28,6 +34,21 @@ is 186,076,000 shuffle draws, within the existing counter limit. Shortened
 test episodes do not weaken production preflight.
 
 ## Compatibility and memory
+
+Wide capacity has explicit PPO39/checkpoint14 identities, linked to unchanged
+PPO38/checkpoint13. All three exact runtime tuples are accepted; tensor shapes
+and inference semantics are unchanged. Checkpoints keep the 64-byte config
+encoding and validate cumulative samples against U*M*1163. No old initializer
+is rewritten, and no profile transition is accepted as an implicit resume.
+
+The wide admission ledger is 12,557,484,608 bytes: 9,074,377,280 for capped arena
+storage plus worst reallocation overlap, 93,040*8,192 for both compact vectors
+and shuffle, 8,192*70,000 for a materialized minibatch, and a 2 GiB non-rollout
+reserve. Compile-time size checks enforce both row ceilings and the 12 GiB
+total, retaining the original M40 <6 GiB assertion. The reserve is an admission
+assumption, not a source-proven whole-process RSS bound; native/model storage
+and optional SIL/RND state share it. The unchanged 12 GiB runtime guard remains
+mandatory, and actual memory qualification is deferred to the authorized runner.
 
 Standard PPO37 and checkpoint12 descriptors, hashes and encodings are unchanged.
 Expanded training uses the explicitly linked PPO38 / checkpoint13 identities.
@@ -43,7 +64,7 @@ PPO configuration encoding. Expanded committed sample counts are bounded by
 `updates × configured_games × 1,163`, not by the old 32,768-sample ceiling.
 Mastery and the actor/learner pipeline remain standard-only.
 
-Runtime readers accept exactly either audited metadata tuple: tensors, feature,
+The original two runtime metadata tuples remain accepted: tensors, feature,
 action and inference semantics are identical. Existing PPO37 initializers load
 without conversion or rewriting; expanded runtime exports honestly identify
 PPO38. Older binaries cannot read these new exports/checkpoints. No migration
@@ -60,10 +81,25 @@ This excludes allocator overhead, model/optimizer tensors and native worlds:
 it is not a whole-process memory guarantee. The unchanged
 [resource guard](experiment-safety.md) is mandatory.
 
+## Opt-in actor bootstrap reuse
+
+`train-annealed --reuse-actor-values` reuses the next actor batch's value for a
+retained transition instead of running a separate batch-one flush evaluator.
+It is **off by default**. Actor batch membership, action sampling, reward
+accounting, and retained-row order stay unchanged; terminal bootstraps stay zero.
+Bounded test windows use a final batch-one fallback without another actor draw.
+
+Batch-one and actor-batch GEMMs can differ in floating-point bits. Reuse therefore
+may change GAE and subsequent PPO parameters even when collection trajectories
+match. The flag is recorded in canonical checkpoint scope, and changing it on
+resume is rejected. It is an annealed-collector option, not a public trainer or
+standard `train`/`train-full` option. Enabling it requires an explicit operational
+decision; performance qualification does not authorize production training.
+
 ## Regression tests
 
 Boundary and compatibility tests precede their implementation. Heavy checks
-must execute serially under the original guard; neither these tests nor this
+must execute under the currently authorized guard; neither these tests nor this
 extension authorize a production training launch.
 
 Current contracts in `src/tests/annealed_capacity.rs`, included by `src/tests/annealed.rs`:
@@ -72,6 +108,8 @@ Current contracts in `src/tests/annealed_capacity.rs`, included by `src/tests/an
 - `expanded_jobs_enforce_capacity_and_partition_boundaries`
 - `shuffle_sample_and_optimizer_preflight_accept_max_updates_and_reject_max_plus_one`
 - `completed_episode_capacity_rejects_overflow_and_duplicate_merge_atomically`
+- `wide_capacity_m64_b64_and_m80_b40_collect_one_ppo_step_and_resume_exactly`
+- `wide_capacity_profiles_and_partitions_admit_candidates_and_reject_overflow`
 
 The parameterized simulator integration test uses only the existing private
 16-decision harness, one epoch, and minibatch 80. It compares six uninterrupted

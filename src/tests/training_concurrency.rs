@@ -1,9 +1,169 @@
 use super::*;
 use crate::TrainingExecutionOptions;
 
+#[test]
+fn actor_value_reuse_cli_is_annealed_only_default_off_and_canonically_scoped() {
+    let mut arguments = vec![
+        "--updates",
+        "2",
+        "--games",
+        "2",
+        "--parallel",
+        "2",
+        "--generation-games",
+        "2",
+    ];
+    let baseline = crate::cli::annealed_settings_for_test(&arguments).expect("default options");
+    assert!(!TrainingExecutionOptions::default().reuse_actor_values);
+    assert!(!baseline.execution.reuse_actor_values);
+    let scope = |settings: &AnnealedJobConfig| {
+        annealed_run(settings, PolicyDevice::Cpu, settings.ppo, harness(), None)
+            .expect("scope")
+            .command_line
+    };
+    let original = scope(&baseline);
+    assert!(!original.contains("--reuse-actor-values"));
+    arguments.extend([
+        "--reuse-actor-values",
+        "--host-math-workers",
+        "4",
+        "--balanced-minibatches",
+    ]);
+    let enabled = crate::cli::annealed_settings_for_test(&arguments).expect("reuse options");
+    assert!(enabled.execution.reuse_actor_values);
+    assert_eq!(
+        scope(&enabled),
+        format!("{original} --balanced-minibatches --host-math-workers 4 --reuse-actor-values")
+    );
+    for operation in ["train", "train-full"] {
+        let error = crate::cli::parse_from(["drysua", operation, "--reuse-actor-values"])
+            .expect_err("annealed-only option");
+        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+        assert!(
+            error
+                .to_string()
+                .contains("unexpected argument '--reuse-actor-values'")
+        );
+    }
+}
+
+#[test]
+fn actor_value_reuse_resumes_exactly_after_scope_rejection_and_late_abort() {
+    let uninterrupted = test_directory("actor-values-uninterrupted");
+    let resumed = test_directory("actor-values-resumed");
+    let mut options = settings(9001, 2);
+    options.execution.reuse_actor_values = true;
+    options.games_per_update = 4;
+    options.ppo.environments = 4;
+    assert!(harness().episode_decisions() >= 9);
+    let expected = run(options.clone(), &uninterrupted, false).expect("reuse updates");
+    let first = run_with(
+        options.clone(),
+        AnnealedHarness {
+            stop_after: Some(1),
+            ..harness()
+        },
+        &resumed,
+        false,
+    )
+    .expect("first reuse update");
+    assert_eq!(first.completed_updates, 1);
+    assert!(first.optimizer_step > 0);
+    assert_eq!(generation_files(&resumed).len(), 2);
+    let before = checkpoint_digests(&resumed);
+    options.execution.reuse_actor_values = false;
+    assert_eq!(
+        run(options.clone(), &resumed, true)
+            .expect_err("scope mismatch")
+            .to_string(),
+        "checkpoint scope mismatch: --reuse-actor-values: recorded <present>, requested <absent>"
+    );
+    assert_eq!(checkpoint_digests(&resumed), before);
+    options.execution.reuse_actor_values = true;
+    assert_eq!(
+        run_with(
+            options.clone(),
+            AnnealedHarness {
+                stop_after_games: Some(4),
+                ..harness()
+            },
+            &resumed,
+            true,
+        )
+        .expect_err("stop after all games before optimizer commit")
+        .to_string(),
+        "invalid PPO transition: annealed invocation stopped mid-update"
+    );
+    assert_eq!(checkpoint_digests(&resumed), before);
+    assert_eq!(generation_files(&resumed).len(), 4);
+    let actual = run(options, &resumed, true).expect("replay aborted reuse update");
+    assert_eq!(actual.completed_updates, 2);
+    assert_eq!(actual.rollout_samples, expected.rollout_samples);
+    assert_eq!(actual.optimizer_step, expected.optimizer_step);
+    assert_probe_report_bits(&actual.latest, &expected.latest);
+    assert_trajectory_equal(&uninterrupted, &resumed);
+    for directory in [uninterrupted, resumed] {
+        std::fs::remove_dir_all(directory).expect("remove own checkpoint");
+    }
+}
+
+#[test]
+fn actor_value_reuse_is_rejected_by_the_public_trainer_without_changing_state() {
+    let model = PolicyModel::fresh(9001).expect("model");
+    let mut trainer = crate::PpoTrainer::new(&model, settings(9001, 1).ppo, 19).expect("trainer");
+    let random = trainer.rng_checkpoint();
+    let error = trainer
+        .set_execution(TrainingExecutionOptions {
+            reuse_actor_values: true,
+            ..Default::default()
+        })
+        .expect_err("collector-only option");
+    assert_eq!(
+        error.to_string(),
+        "invalid PPO config field: reuse actor values requires the annealed collector"
+    );
+    assert_eq!(trainer.rng_checkpoint(), random);
+    assert_eq!(trainer.optimizer_step(), 0);
+}
+
+#[test]
+fn balanced_minibatches_resume_only_with_the_recorded_execution_scope() {
+    let directory = test_directory("balanced-minibatch-scope");
+    let mut options = settings(9001, 2);
+    options.execution.balanced_minibatches = true;
+    run_with(
+        options.clone(),
+        AnnealedHarness {
+            stop_after: Some(1),
+            ..harness()
+        },
+        &directory,
+        false,
+    )
+    .expect("first balanced update");
+    let before = checkpoint_digests(&directory);
+    options.execution.balanced_minibatches = false;
+    assert_eq!(
+        run(options.clone(), &directory, true)
+            .unwrap_err()
+            .to_string(),
+        "checkpoint scope mismatch: --balanced-minibatches: recorded <present>, requested <absent>"
+    );
+    assert_eq!(checkpoint_digests(&directory), before);
+    options.execution.balanced_minibatches = true;
+    assert_eq!(
+        run(options, &directory, true)
+            .expect("balanced resume")
+            .completed_updates,
+        2
+    );
+    std::fs::remove_dir_all(directory).expect("remove own checkpoint");
+}
+
 fn folding_execution() -> TrainingExecutionOptions {
     TrainingExecutionOptions {
         host_math_workers: 4,
+        ..Default::default()
     }
 }
 
@@ -55,6 +215,7 @@ fn concurrency_cli_rejects_retired_flags_and_bounds_scope_workers() {
     for workers in [0, 33] {
         let error = TrainingExecutionOptions {
             host_math_workers: workers,
+            ..Default::default()
         }
         .validate()
         .expect_err("worker bound");
@@ -207,6 +368,25 @@ fn parse_probe_balanced(value: Option<&std::ffi::OsStr>) -> Result<bool, &'stati
     }
 }
 
+fn parse_probe_reuse(value: Option<&std::ffi::OsStr>) -> Result<bool, &'static str> {
+    parse_probe_balanced(value).map_err(|_| "DRYSUA_PROBE_REUSE_ACTOR_VALUES must be 0 or 1")
+}
+
+#[test]
+fn probe_actor_value_reuse_is_default_off_and_rejects_non_boolean_values() {
+    use std::ffi::OsStr;
+    assert_eq!(parse_probe_reuse(None), Ok(false));
+    for (value, expected) in [("0", false), ("1", true)] {
+        assert_eq!(parse_probe_reuse(Some(OsStr::new(value))), Ok(expected));
+    }
+    for value in ["", "true", "2", "-1"] {
+        assert_eq!(
+            parse_probe_reuse(Some(OsStr::new(value))),
+            Err("DRYSUA_PROBE_REUSE_ACTOR_VALUES must be 0 or 1")
+        );
+    }
+}
+
 #[test]
 fn probe_controls_reject_out_of_bounds_work_without_changing_defaults() {
     use std::ffi::OsStr;
@@ -257,11 +437,15 @@ fn concurrency_probe(device: PolicyDevice) {
         "base" => TrainingExecutionOptions::default(),
         "c" => TrainingExecutionOptions {
             host_math_workers: count("DRYSUA_PROBE_WORKERS", 4, 32),
+            ..Default::default()
         },
         _ => panic!("DRYSUA_PROBE_MODE must be base/c"),
     };
     let balanced = parse_probe_balanced(std::env::var_os("DRYSUA_PROBE_BALANCED").as_deref())
         .expect("balanced flag");
+    let reuse_actor_values =
+        parse_probe_reuse(std::env::var_os("DRYSUA_PROBE_REUSE_ACTOR_VALUES").as_deref())
+            .expect("reuse actor values flag");
     // The caller pins U376 read-only weights here; every fresh trial uses the same path.
     let initial = std::env::var_os("DRYSUA_PROBE_WEIGHTS").map(PathBuf::from);
     let mut options = settings(9001, 1);
@@ -278,7 +462,7 @@ fn concurrency_probe(device: PolicyDevice) {
         &[false, true]
     };
     eprintln!(
-        "concurrency-workload mode={mode} device={device:?} worlds=40 rounds={rounds} epochs={} effective_minibatch={} microbatch=64 seed=9001 balanced={balanced}",
+        "concurrency-workload mode={mode} device={device:?} worlds=40 rounds={rounds} epochs={} effective_minibatch={} microbatch=64 seed=9001 balanced={balanced} reuse_actor_values={reuse_actor_values}",
         options.ppo.epochs, options.ppo.minibatch
     );
     let mut trials = Vec::with_capacity(order.len());
@@ -288,6 +472,7 @@ fn concurrency_probe(device: PolicyDevice) {
         } else {
             TrainingExecutionOptions::default()
         };
+        options.execution.reuse_actor_values = reuse_actor_values;
         let directory = test_directory("concurrency-probe");
         let measured = !balanced || index != 0;
         eprintln!(
