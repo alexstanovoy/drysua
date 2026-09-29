@@ -19,9 +19,18 @@ use candle_core::{DType, Device, Tensor, Var};
 pub(crate) mod cuda_graph_probe;
 mod host_folding;
 mod sampling;
+mod side_actors;
+#[cfg(feature = "side-actors")]
+pub(crate) use side_actors::expand_m24_side_actor_parameters;
+#[cfg(all(test, feature = "side-actors"))]
+pub(crate) use side_actors::take_encoder_forwards_for_test;
+use side_actors::{ActorHead, ActorRouting};
+#[cfg(all(test, feature = "side-actors"))]
+#[path = "tests/model_side_actors.rs"]
+mod side_actor_tests;
 #[cfg(test)]
 pub(crate) use sampling::{take_sampling_dispatches_for_test, with_eager_sampling_for_test};
-#[cfg(test)]
+#[cfg(all(test, not(feature = "side-actors")))]
 mod memory_probe;
 #[cfg(test)]
 mod self_imitation;
@@ -51,7 +60,12 @@ use crate::{
 };
 
 /// Version of the fixed policy-model layout and linked candidate execution contract.
-pub const MODEL_SCHEMA_VERSION: u32 = 24;
+pub const MODEL_SCHEMA_VERSION: u32 = if cfg!(feature = "side-actors") {
+    25
+} else {
+    LEGACY_MODEL_SCHEMA_VERSION
+};
+pub(crate) const LEGACY_MODEL_SCHEMA_VERSION: u32 = 24;
 /// Maximum frame count accepted by one public batch call.
 pub const MODEL_MAX_BATCH: usize = 8_192;
 /// Frame count evaluated by one bounded host inference tensor graph.
@@ -128,12 +142,12 @@ const SLOT_EMBEDDING: usize = 16;
 const DECODER_CONTEXT: usize = 336;
 const TARGET_MODE_HEAD: usize = 3;
 const PUT_MODE_HEAD: usize = 2;
-const MODEL_PARAMETER_TENSORS: usize = 62;
+const MODEL_PARAMETER_TENSORS: usize = 62 + if cfg!(feature = "side-actors") { 24 } else { 0 };
 static NEXT_MODEL_LINEAGE: AtomicU64 = AtomicU64::new(1);
 static NEXT_OPTIMIZER_LINEAGE: AtomicU64 = AtomicU64::new(1);
 
 /// Canonical model shapes, parameter order, and linked action/feature semantics.
-pub const MODEL_SCHEMA_DESCRIPTOR: &str = concat!(
+pub(crate) const LEGACY_MODEL_SCHEMA_DESCRIPTOR: &str = concat!(
     "bota-drysua-model/v24;",
     "linked_schemas=action,feature,map2_reward;linked_hash=fnv1a_descriptor_then_ordered_version_le32_hash_le64_then_map2_reward_descriptor_utf8;",
     "scope=map2_mid_only_cap27900_including900_pregame;candidate_execution=feature19_candidate_order_bookkeeping_action5_walkable_building_landing_move_only_mango_unchanged;layout=62_named_tensors_1700020_f32;transfer=explicit_pinned_m14_u4_or_initial_or_m16_initial_and_advantage_or_m17_initial05e78663_and_recovery004107e19e6_or_m19_u162_9d0b8812_new_owned_model_fresh_optimizer_progress_mastery_rng_league_not_resume_or_old_gameplay_compatibility,no_m18_or_m20_source_pin;model13_reserved_isolated_wide_experiment;",
@@ -165,6 +179,24 @@ pub const MODEL_SCHEMA_DESCRIPTOR: &str = concat!(
     "reward7=win.2_loss_neg.2_draw0_completed_taskcap_neg.2_win_only_victory_time_bonus_architecture_unchanged;mastery_configuration_and_window_never_model_inputs;m19_initialization_1698996_to1700020_f32_with1024_positive_zeros_all_old_parameter_bits_preserved_no_reward_or_gameplay_equivalence;"
 );
 
+#[cfg(not(feature = "side-actors"))]
+pub const MODEL_SCHEMA_DESCRIPTOR: &str = LEGACY_MODEL_SCHEMA_DESCRIPTOR;
+#[cfg(feature = "side-actors")]
+pub const MODEL_SCHEMA_DESCRIPTOR: &str = concat!(
+    "bota-drysua-model/v25;linked_schemas=model24,action,feature,map2_reward;",
+    "layout=86_named_tensors_1812983_f32;prefix=all62_model24_tensors_names_order_and_shapes_unchanged;",
+    "shared=model24_encoder_trunk_value_kind_unit_ability_item_embeddings;ppo_value_input_detach_unchanged;",
+    "actor=radiant_original12_linear_heads,dire12_independent_linear_heads_appended_in_original_actor_order;",
+    "dire_order=kind,controlled,ability_head,item_head,swap_head,learn_head,shop_head,loot_head,target_mode,put_mode,entity_query,point_query;",
+    "routing=observed_global4_Radiant_global5_Dire_exact_numeric_onehot_only,validate_before_tensors,negative_zero_is_zero;",
+    "geometry=existing_team_canonical_position_and_delta_unchanged;no_seat_stream_seed_outcome_or_modifier_routing;",
+    "math=both_actor_linears_full_original_batch_then_u8_where,select_queries_before_pointer_dot,no_row_compaction;",
+    "finite=both_raw_branches_all_rows_of_exercised_heads,all_training_heads_and_selected_pointer_scores_before_backward,unused_inference_families_skipped;",
+    "optimizer=one_shared_parameter_lock_global_Adam_norm_and_transaction_over86_tensors;",
+    "initialization=original_model24_seed_draw_prefix_unchanged_then_dire_heads;",
+    "migration=explicit_authenticated_m24_vector_copy_prefix_and_duplicate_actor_heads,new_optimizer_rng_progress_not_resume;"
+);
+
 pub(crate) const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
 
@@ -191,8 +223,8 @@ pub(crate) const fn linked_schema_hash(descriptor: &str, schemas: &[(u32, u64)])
 }
 
 /// FNV-1a of the descriptor, ordered linked versions/hashes, and reward descriptor.
-pub const MODEL_SCHEMA_HASH: u64 = linked_schema_hash(
-    MODEL_SCHEMA_DESCRIPTOR,
+pub(crate) const LEGACY_MODEL_SCHEMA_HASH: u64 = linked_schema_hash(
+    LEGACY_MODEL_SCHEMA_DESCRIPTOR,
     &[
         (crate::ACTION_SCHEMA_VERSION, crate::ACTION_SCHEMA_HASH),
         (FEATURE_SCHEMA_VERSION, FEATURE_SCHEMA_HASH),
@@ -207,8 +239,30 @@ const fn linear_parameters(input: usize, output: usize) -> usize {
     input * output + output
 }
 
-/// Exact number of F32 parameters in the M21 policy model.
-pub const MODEL_PARAMETER_COUNT: usize = 1_700_020;
+#[cfg(not(feature = "side-actors"))]
+pub const MODEL_SCHEMA_HASH: u64 = LEGACY_MODEL_SCHEMA_HASH;
+#[cfg(feature = "side-actors")]
+pub const MODEL_SCHEMA_HASH: u64 = linked_schema_hash(
+    MODEL_SCHEMA_DESCRIPTOR,
+    &[
+        (LEGACY_MODEL_SCHEMA_VERSION, LEGACY_MODEL_SCHEMA_HASH),
+        (crate::ACTION_SCHEMA_VERSION, crate::ACTION_SCHEMA_HASH),
+        (FEATURE_SCHEMA_VERSION, FEATURE_SCHEMA_HASH),
+        (
+            crate::MAP2_REWARD_SCHEMA_VERSION,
+            crate::MAP2_REWARD_SCHEMA_HASH,
+        ),
+    ],
+);
+
+/// Exact number of F32 parameters in the selected compile-time model layout.
+pub const MODEL_PARAMETER_COUNT: usize = LEGACY_MODEL_PARAMETER_COUNT
+    + if cfg!(feature = "side-actors") {
+        112_963
+    } else {
+        0
+    };
+pub(crate) const LEGACY_MODEL_PARAMETER_COUNT: usize = 1_700_020;
 
 const _: () = assert!(FEATURE_SCHEMA_VERSION == 22);
 const _: () = assert!(crate::ACTION_SCHEMA_VERSION == 5);
@@ -261,7 +315,14 @@ const fn decoder_parameter_count() -> usize {
         + linear_parameters(DECODER_CONTEXT, PUT_MODE_HEAD)
         + linear_parameters(DECODER_CONTEXT, UNIT_EMBEDDING)
         + linear_parameters(DECODER_CONTEXT, TOKEN_EMBEDDING);
-    embeddings + direct + conditional
+    embeddings
+        + direct
+        + conditional
+        + if cfg!(feature = "side-actors") {
+            linear_parameters(TRUNK_WIDTH, MODEL_KIND_HEAD) + conditional
+        } else {
+            0
+        }
 }
 
 fn allocate_lineage(counter: &AtomicU64, exhausted: ModelError) -> Result<NonZeroU64, ModelError> {
@@ -276,6 +337,12 @@ fn allocate_lineage(counter: &AtomicU64, exhausted: ModelError) -> Result<NonZer
 /// Model construction, evaluation, selection, or parameter-validation failure.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ModelError {
+    #[cfg(feature = "side-actors")]
+    InvalidSideOneHot {
+        index: usize,
+        radiant_bits: u32,
+        dire_bits: u32,
+    },
     EmptyBatch,
     BatchTooLarge {
         count: usize,
@@ -510,6 +577,17 @@ impl ModelError {
 
     fn fmt_runtime(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            #[cfg(feature = "side-actors")]
+            Self::InvalidSideOneHot {
+                index,
+                radiant_bits,
+                dire_bits,
+            } => write!(
+                formatter,
+                "model frame {index} has invalid side one-hot: radiant={}, dire={}; expected (1,0) or (0,1)",
+                f32::from_bits(*radiant_bits),
+                f32::from_bits(*dire_bits)
+            ),
             Self::EmptyMask => formatter.write_str("model selection mask is empty"),
             Self::SelectionShape { logits, mask } => write!(
                 formatter,
@@ -810,6 +888,8 @@ impl TrainingPrefix {
 }
 
 struct PolicyTensorTensors {
+    #[cfg(feature = "side-actors")]
+    side_raw: [[Tensor; 2]; 12],
     value: Tensor,
     kind: Tensor,
     controlled: Tensor,
@@ -959,19 +1039,26 @@ impl PolicyTensorOutput<'_> {
 
     /// Checks every tensor value while preserving the existing autograd graph.
     pub fn validate_finite(&self) -> Result<(), ModelError> {
-        validate_tensor_finite("value", self.value())?;
-        validate_tensor_finite("kind", self.kind())?;
-        validate_tensor_finite("controlled", self.controlled())?;
-        validate_tensor_finite("ability", self.ability())?;
-        validate_tensor_finite("item", self.item())?;
-        validate_tensor_finite("swap", self.swap())?;
-        validate_tensor_finite("learn", self.learn())?;
-        validate_tensor_finite("shop", self.shop())?;
-        validate_tensor_finite("loot", self.loot())?;
-        validate_tensor_finite("target mode", self.target_mode())?;
-        validate_tensor_finite("put mode", self.put_mode())?;
-        validate_tensor_finite("entity pointer", self.entity_pointer())?;
-        validate_tensor_finite("point pointer", self.point_pointer())
+        #[cfg(feature = "side-actors")]
+        {
+            side_actors::validate_training(&self.tensors)
+        }
+        #[cfg(not(feature = "side-actors"))]
+        {
+            validate_tensor_finite("value", self.value())?;
+            validate_tensor_finite("kind", self.kind())?;
+            validate_tensor_finite("controlled", self.controlled())?;
+            validate_tensor_finite("ability", self.ability())?;
+            validate_tensor_finite("item", self.item())?;
+            validate_tensor_finite("swap", self.swap())?;
+            validate_tensor_finite("learn", self.learn())?;
+            validate_tensor_finite("shop", self.shop())?;
+            validate_tensor_finite("loot", self.loot())?;
+            validate_tensor_finite("target mode", self.target_mode())?;
+            validate_tensor_finite("put mode", self.put_mode())?;
+            validate_tensor_finite("entity pointer", self.entity_pointer())?;
+            validate_tensor_finite("point pointer", self.point_pointer())
+        }
     }
 
     /// Sums all heads into one scalar graph-connected probe loss.
@@ -1241,6 +1328,8 @@ pub fn probe_nvfp4(ordinal: usize) -> Result<(), ModelError> {
 
 /// F32 DeepSets policy with an autoregressive masked decoder.
 pub struct PolicyModel {
+    #[cfg(feature = "side-actors")]
+    dire: side_actors::ActorHeads,
     #[cfg(all(
         test,
         feature = "cuda",
@@ -1413,6 +1502,8 @@ impl PolicyModel {
             put_mode: Linear::fresh(336, 2, &mut generator, &tensor_device)?,
             entity_query: Linear::fresh(336, 128, &mut generator, &tensor_device)?,
             point_query: Linear::fresh(336, 64, &mut generator, &tensor_device)?,
+            #[cfg(feature = "side-actors")]
+            dire: side_actors::ActorHeads::fresh(&mut generator, &tensor_device)?,
         })
     }
 
@@ -1543,13 +1634,30 @@ impl PolicyModel {
         frames: &[FeatureFrame],
         batch_offset: usize,
     ) -> Result<Vec<PolicyOutput>, ModelError> {
+        let routing = ActorRouting::new(frames, self.tensor_device(), false)?;
         let state = self.forward_frames(frames)?;
         let values = self
             .value
             .forward(&state.trunk)?
             .flatten_all()?
             .to_vec1::<f32>()?;
-        let kinds = self.kind.forward(&state.trunk)?.to_vec2::<f32>()?;
+        #[cfg(feature = "side-actors")]
+        validate_value_rows(&values, batch_offset)?;
+        let kinds = routing
+            .forward(self, ActorHead::Kind, &state.trunk)
+            .map_err(|error| match error {
+                ModelError::NonFiniteOutput {
+                    field,
+                    batch,
+                    index,
+                } => ModelError::NonFiniteOutput {
+                    field,
+                    batch: batch_offset + batch,
+                    index,
+                },
+                error => error,
+            })?
+            .to_vec2::<f32>()?;
         collect_outputs(values, kinds, batch_offset)
     }
 
@@ -1564,6 +1672,7 @@ impl PolicyModel {
         }
         validate_batch(std::slice::from_ref(frame))?;
         let _guard = self.read_parameter_lock()?;
+        let routing = ActorRouting::new(std::slice::from_ref(frame), self.tensor_device(), false)?;
         let state = self.forward_frames(std::slice::from_ref(frame))?;
         let values = self
             .value
@@ -1583,6 +1692,7 @@ impl PolicyModel {
         let mut source = ModelDecoder {
             model: self,
             state,
+            routing,
             rng: None,
             observed: None,
         };
@@ -1626,15 +1736,19 @@ impl PolicyModel {
         }
         validate_batch(std::slice::from_ref(frame))?;
         let _guard = self.read_parameter_lock()?;
+        let routing = ActorRouting::new(std::slice::from_ref(frame), self.tensor_device(), false)?;
         let state = self.forward_frames(std::slice::from_ref(frame))?;
         let value = self
             .value
             .forward(&state.trunk)?
             .flatten_all()?
             .to_vec1::<f32>()?[0];
+        #[cfg(feature = "side-actors")]
+        validate_value_rows(std::slice::from_ref(&value), 0)?;
         let mut source = ModelDecoder {
             model: self,
             state,
+            routing,
             rng: Some(rng),
             observed: Some(SampledPathLogits::default()),
         };
@@ -1705,23 +1819,27 @@ impl PolicyModel {
         action_spaces: &[ActionSpace],
         rngs: Option<&mut [PpoRng]>,
     ) -> Result<Vec<BatchSelection>, ModelError> {
+        #[cfg(feature = "side-actors")]
+        side_actors::validate_sides(frames)?;
         let state = self.forward_frames(frames)?;
-        self.selection_from_state_locked(state, action_spaces, rngs)
+        self.selection_from_state_locked(state, frames, action_spaces, rngs)
     }
 
     fn selection_from_state_locked(
         &self,
         state: ForwardState,
+        frames: &[FeatureFrame],
         action_spaces: &[ActionSpace],
         mut rngs: Option<&mut [PpoRng]>,
     ) -> Result<Vec<BatchSelection>, ModelError> {
-        let base = self.sampling_base_logits(&state)?;
+        let routing = ActorRouting::new(frames, self.tensor_device(), false)?;
+        let base = self.sampling_base_logits(&state, &routing)?;
         let mut rows = initialize_sampling_rows(&base, action_spaces, &mut rngs)?;
-        let kind = self.sampling_kind_logits(&state, &sampling_prefixes(&rows))?;
+        let kind = self.sampling_kind_logits(&state, &sampling_prefixes(&rows), &routing)?;
         select_sampling_units(&mut rows, &kind, action_spaces, &mut rngs)?;
-        let unit = self.sampling_unit_logits(&state, &sampling_prefixes(&rows))?;
+        let unit = self.sampling_unit_logits(&state, &sampling_prefixes(&rows), &routing)?;
         select_sampling_slots(&mut rows, &unit, action_spaces, &mut rngs)?;
-        let slot = self.sampling_slot_logits(&state, &sampling_prefixes(&rows))?;
+        let slot = self.sampling_slot_logits(&state, &sampling_prefixes(&rows), &routing)?;
         decode_batch_rows(
             action_spaces,
             &mut rngs,
@@ -1938,6 +2056,7 @@ impl PolicyModel {
         prefixes: &[TrainingPrefix],
         value_trunk_gradient: bool,
     ) -> Result<PolicyTensorTensors, ModelError> {
+        let routing = ActorRouting::new(frames, self.tensor_device(), true)?;
         let state = self.forward_frames(frames)?;
         // PPO deliberately isolates critic fitting to preserve transferred actor features.
         let value_input = if value_trunk_gradient {
@@ -1946,22 +2065,28 @@ impl PolicyModel {
             state.trunk.detach()
         };
         let contexts = self.training_contexts(&state.trunk, prefixes)?;
-        let entity_query = self.entity_query.forward(&contexts.slot)?.unsqueeze(1)?;
-        let point_query = self.point_query.forward(&contexts.slot)?.unsqueeze(1)?;
+        let entity_query = routing
+            .forward(self, ActorHead::EntityQuery, &contexts.slot)?
+            .unsqueeze(1)?;
+        let point_query = routing
+            .forward(self, ActorHead::PointQuery, &contexts.slot)?
+            .unsqueeze(1)?;
         Ok(PolicyTensorTensors {
             value: self.value.forward(&value_input)?,
-            kind: self.kind.forward(&state.trunk)?,
-            controlled: self.controlled.forward(&contexts.kind)?,
-            ability: self.ability_head.forward(&contexts.unit)?,
-            item: self.item_head.forward(&contexts.unit)?,
-            swap: self.swap_head.forward(&contexts.slot)?,
-            learn: self.learn_head.forward(&contexts.kind)?,
-            shop: self.shop_head.forward(&contexts.unit)?,
-            loot: self.loot_head.forward(&contexts.unit)?,
-            target_mode: self.target_mode.forward(&contexts.slot)?,
-            put_mode: self.put_mode.forward(&contexts.slot)?,
+            kind: routing.forward(self, ActorHead::Kind, &state.trunk)?,
+            controlled: routing.forward(self, ActorHead::Controlled, &contexts.kind)?,
+            ability: routing.forward(self, ActorHead::Ability, &contexts.unit)?,
+            item: routing.forward(self, ActorHead::Item, &contexts.unit)?,
+            swap: routing.forward(self, ActorHead::Swap, &contexts.slot)?,
+            learn: routing.forward(self, ActorHead::Learn, &contexts.kind)?,
+            shop: routing.forward(self, ActorHead::Shop, &contexts.unit)?,
+            loot: routing.forward(self, ActorHead::Loot, &contexts.unit)?,
+            target_mode: routing.forward(self, ActorHead::TargetMode, &contexts.slot)?,
+            put_mode: routing.forward(self, ActorHead::PutMode, &contexts.slot)?,
             entity_pointer: scaled_pointer_dot(&state.current_units, &entity_query)?,
             point_pointer: scaled_pointer_dot(&state.points, &point_query)?,
+            #[cfg(feature = "side-actors")]
+            side_raw: routing.into_raw()?,
         })
     }
 
@@ -2249,10 +2374,19 @@ impl PolicyModel {
         })
     }
 
-    fn sampling_base_logits(&self, state: &ForwardState) -> Result<SamplingBaseLogits, ModelError> {
+    fn sampling_base_logits(
+        &self,
+        state: &ForwardState,
+        routing: &ActorRouting,
+    ) -> Result<SamplingBaseLogits, ModelError> {
+        let value = self.value.forward(&state.trunk)?.flatten_all()?.to_vec1()?;
+        #[cfg(feature = "side-actors")]
+        validate_value_rows(&value, 0)?;
         Ok(SamplingBaseLogits {
-            value: self.value.forward(&state.trunk)?.flatten_all()?.to_vec1()?,
-            kind: self.kind.forward(&state.trunk)?.to_vec2()?,
+            value,
+            kind: routing
+                .forward(self, ActorHead::Kind, &state.trunk)?
+                .to_vec2()?,
         })
     }
 
@@ -2260,20 +2394,21 @@ impl PolicyModel {
         &self,
         state: &ForwardState,
         prefixes: &[TrainingPrefix],
+        routing: &ActorRouting,
     ) -> Result<SamplingKindLogits, ModelError> {
-        let [controlled, learn] = sampling::needed(prefixes, |kind| {
-            [
-                !matches!(kind, ActionKind::Continue | ActionKind::Learn),
-                kind == ActionKind::Learn,
-            ]
-        });
+        let [controlled, learn] = sampling::kind_needed(prefixes);
         if !controlled && !learn {
             return Ok(SamplingKindLogits::default());
         }
         let context = self.sampling_context(&state.trunk, prefixes, SamplingContext::Kind)?;
         Ok(SamplingKindLogits {
-            controlled: sampling::head(controlled, &self.controlled, &context)?,
-            learn: sampling::head(learn, &self.learn_head, &context)?,
+            controlled: self.sampling_actor_head(
+                controlled,
+                ActorHead::Controlled,
+                &context,
+                routing,
+            )?,
+            learn: self.sampling_actor_head(learn, ActorHead::Learn, &context, routing)?,
         })
     }
 
@@ -2281,6 +2416,7 @@ impl PolicyModel {
         &self,
         state: &ForwardState,
         prefixes: &[TrainingPrefix],
+        routing: &ActorRouting,
     ) -> Result<SamplingUnitLogits, ModelError> {
         let needed = sampling::needed(prefixes, |kind| {
             use ActionKind::*;
@@ -2299,21 +2435,23 @@ impl PolicyModel {
         let [ability, item, shop, loot, entity, point] = needed;
         let context = self.sampling_context(&state.trunk, prefixes, SamplingContext::Unit)?;
         Ok(SamplingUnitLogits {
-            ability: sampling::head(ability, &self.ability_head, &context)?,
-            item: sampling::head(item, &self.item_head, &context)?,
-            shop: sampling::head(shop, &self.shop_head, &context)?,
-            loot: sampling::head(loot, &self.loot_head, &context)?,
+            ability: self.sampling_actor_head(ability, ActorHead::Ability, &context, routing)?,
+            item: self.sampling_actor_head(item, ActorHead::Item, &context, routing)?,
+            shop: self.sampling_actor_head(shop, ActorHead::Shop, &context, routing)?,
+            loot: self.sampling_actor_head(loot, ActorHead::Loot, &context, routing)?,
             entity: self.sampling_pointer_logits(
                 entity,
                 &context,
                 &state.current_units,
-                &self.entity_query,
+                ActorHead::EntityQuery,
+                routing,
             )?,
             point: self.sampling_pointer_logits(
                 point,
                 &context,
                 &state.points,
-                &self.point_query,
+                ActorHead::PointQuery,
+                routing,
             )?,
         })
     }
@@ -2322,6 +2460,7 @@ impl PolicyModel {
         &self,
         state: &ForwardState,
         prefixes: &[TrainingPrefix],
+        routing: &ActorRouting,
     ) -> Result<SamplingSlotLogits, ModelError> {
         let needed = sampling::needed(prefixes, |kind| {
             use ActionKind::*;
@@ -2340,22 +2479,47 @@ impl PolicyModel {
         let [swap, target_mode, put_mode, entity, point] = needed;
         let context = self.sampling_context(&state.trunk, prefixes, SamplingContext::Slot)?;
         Ok(SamplingSlotLogits {
-            swap: sampling::head(swap, &self.swap_head, &context)?,
-            target_mode: sampling::head(target_mode, &self.target_mode, &context)?,
-            put_mode: sampling::head(put_mode, &self.put_mode, &context)?,
+            swap: self.sampling_actor_head(swap, ActorHead::Swap, &context, routing)?,
+            target_mode: self.sampling_actor_head(
+                target_mode,
+                ActorHead::TargetMode,
+                &context,
+                routing,
+            )?,
+            put_mode: self.sampling_actor_head(put_mode, ActorHead::PutMode, &context, routing)?,
             entity: self.sampling_pointer_logits(
                 entity,
                 &context,
                 &state.current_units,
-                &self.entity_query,
+                ActorHead::EntityQuery,
+                routing,
             )?,
             point: self.sampling_pointer_logits(
                 point,
                 &context,
                 &state.points,
-                &self.point_query,
+                ActorHead::PointQuery,
+                routing,
             )?,
         })
+    }
+
+    fn sampling_actor_head(
+        &self,
+        needed: bool,
+        head: ActorHead,
+        context: &Tensor,
+        routing: &ActorRouting,
+    ) -> Result<Option<Vec<Vec<f32>>>, ModelError> {
+        if !needed {
+            return Ok(None);
+        }
+        let (batch, width) = context.dims2()?;
+        assert!((1..=MODEL_TRAINING_BATCH).contains(&batch));
+        assert_eq!(width, DECODER_CONTEXT);
+        #[cfg(test)]
+        sampling::record_dispatch(batch);
+        Ok(Some(routing.forward(self, head, context)?.to_vec2()?))
     }
 
     fn sampling_pointer_logits(
@@ -2363,14 +2527,15 @@ impl PolicyModel {
         needed: bool,
         context: &Tensor,
         tokens: &Tensor,
-        head: &Linear,
+        head: ActorHead,
+        routing: &ActorRouting,
     ) -> Result<Option<Vec<Vec<f32>>>, ModelError> {
         if !needed {
             return Ok(None);
         }
         #[cfg(test)]
         sampling::record_dispatch(context.dim(0)?);
-        let query = head.forward(context)?.unsqueeze(1)?;
+        let query = routing.forward(self, head, context)?.unsqueeze(1)?;
         Ok(Some(scaled_pointer_dot(tokens, &query)?.to_vec2()?))
     }
 
@@ -2382,16 +2547,10 @@ impl PolicyModel {
     ) -> Result<Tensor, ModelError> {
         let batch = prefixes.len();
         let kind = self.training_kind_embeddings(prefixes)?;
-        let unit = match depth {
-            SamplingContext::Kind => Tensor::zeros(
-                (batch, UNIT_SELECTION_EMBEDDING),
-                DType::F32,
-                self.tensor_device(),
-            )?,
-            SamplingContext::Unit | SamplingContext::Slot => {
-                self.training_unit_embeddings(prefixes)?
-            }
-        };
+        if matches!(depth, SamplingContext::Kind) {
+            return self.kind_context_from_embedding(trunk, &kind);
+        }
+        let unit = self.training_unit_embeddings(prefixes)?;
         let slot = match depth {
             SamplingContext::Slot => self.training_slot_embeddings(prefixes)?,
             SamplingContext::Kind | SamplingContext::Unit => {
@@ -2399,6 +2558,23 @@ impl PolicyModel {
             }
         };
         Ok(Tensor::cat(&[trunk, &kind, &unit, &slot], 1)?)
+    }
+
+    fn kind_context_from_embedding(
+        &self,
+        trunk: &Tensor,
+        kind: &Tensor,
+    ) -> Result<Tensor, ModelError> {
+        let batch = trunk.dim(0)?;
+        assert_eq!(kind.dims(), &[batch, KIND_EMBEDDING]);
+        assert_eq!(trunk.dim(1)?, TRUNK_WIDTH);
+        let unit = Tensor::zeros(
+            (batch, UNIT_SELECTION_EMBEDDING),
+            DType::F32,
+            self.tensor_device(),
+        )?;
+        let slot = Tensor::zeros((batch, SLOT_EMBEDDING), DType::F32, self.tensor_device())?;
+        Ok(Tensor::cat(&[trunk, kind, &unit, &slot], 1)?)
     }
 
     fn training_contexts(
@@ -2424,11 +2600,17 @@ impl PolicyModel {
             .map(|prefix| prefix.kind.index() as u32)
             .collect::<Vec<_>>();
         let indices = Tensor::from_vec(indices, prefixes.len(), self.tensor_device())?;
+        self.kind_embedding_from_indices(&indices)
+    }
+
+    fn kind_embedding_from_indices(&self, indices: &Tensor) -> Result<Tensor, ModelError> {
+        assert_eq!(indices.rank(), 1);
+        assert_eq!(indices.dtype(), DType::U32);
         Ok(self
             .kind_embedding
             .value
             .as_tensor()
-            .index_select(&indices, 0)?)
+            .index_select(indices, 0)?)
     }
 
     fn training_unit_embeddings(&self, prefixes: &[TrainingPrefix]) -> Result<Tensor, ModelError> {
@@ -2550,6 +2732,8 @@ impl PolicyModel {
     }
 
     fn forward_encoder_inputs(&self, inputs: &EncoderInputs) -> Result<ForwardState, ModelError> {
+        #[cfg(all(test, feature = "side-actors"))]
+        side_actors::record_encoder_forward();
         let batch = inputs.batch;
         let units = encode_units(
             self,
@@ -2649,6 +2833,9 @@ impl PolicyModel {
             &mut output,
         );
         self.decoder_parameters(&mut output);
+        #[cfg(feature = "side-actors")]
+        self.dire.parameters(&mut output);
+        assert_eq!(output.len(), MODEL_PARAMETER_TENSORS);
         output
     }
 
@@ -3632,6 +3819,8 @@ fn validate_batch(frames: &[FeatureFrame]) -> Result<(), ModelError> {
     {
         return Err(ModelError::NonFiniteFrame { index });
     }
+    #[cfg(feature = "side-actors")]
+    side_actors::validate_sides(frames)?;
     Ok(())
 }
 
@@ -3667,6 +3856,8 @@ fn validate_policy_batch(
     {
         return Err(ModelError::BatchFrameActionSpaceMismatch { index });
     }
+    #[cfg(feature = "side-actors")]
+    side_actors::validate_sides(frames)?;
     Ok(())
 }
 
@@ -3734,6 +3925,8 @@ fn validate_training_batch_inputs(
     {
         return Err(ModelError::NonFiniteFrame { index });
     }
+    #[cfg(feature = "side-actors")]
+    side_actors::validate_sides(frames)?;
     Ok(())
 }
 
@@ -3997,6 +4190,20 @@ fn sample_sampling_head<const WIDTH: usize>(
     Ok(sampled)
 }
 
+#[cfg(feature = "side-actors")]
+fn validate_value_rows(values: &[f32], batch_offset: usize) -> Result<(), ModelError> {
+    assert!(!values.is_empty());
+    assert!(batch_offset + values.len() <= MODEL_MAX_BATCH);
+    if let Some(batch) = values.iter().position(|value| !value.is_finite()) {
+        return Err(ModelError::NonFiniteOutput {
+            field: "value",
+            batch: batch_offset + batch,
+            index: 0,
+        });
+    }
+    Ok(())
+}
+
 fn validate_tensor_finite(field: &'static str, tensor: &Tensor) -> Result<(), ModelError> {
     let width = tensor.dims().last().copied().unwrap_or(1);
     let values = tensor.flatten_all()?.to_vec1::<f32>()?;
@@ -4015,19 +4222,26 @@ fn validate_tensor_finite(field: &'static str, tensor: &Tensor) -> Result<(), Mo
 }
 
 fn validate_training_tensors_finite(output: &PolicyTensorTensors) -> Result<(), ModelError> {
-    validate_tensor_finite("value", &output.value)?;
-    validate_tensor_finite("kind", &output.kind)?;
-    validate_tensor_finite("controlled", &output.controlled)?;
-    validate_tensor_finite("ability", &output.ability)?;
-    validate_tensor_finite("item", &output.item)?;
-    validate_tensor_finite("swap", &output.swap)?;
-    validate_tensor_finite("learn", &output.learn)?;
-    validate_tensor_finite("shop", &output.shop)?;
-    validate_tensor_finite("loot", &output.loot)?;
-    validate_tensor_finite("target mode", &output.target_mode)?;
-    validate_tensor_finite("put mode", &output.put_mode)?;
-    validate_tensor_finite("entity pointer", &output.entity_pointer)?;
-    validate_tensor_finite("point pointer", &output.point_pointer)
+    #[cfg(feature = "side-actors")]
+    {
+        side_actors::validate_training(output)
+    }
+    #[cfg(not(feature = "side-actors"))]
+    {
+        validate_tensor_finite("value", &output.value)?;
+        validate_tensor_finite("kind", &output.kind)?;
+        validate_tensor_finite("controlled", &output.controlled)?;
+        validate_tensor_finite("ability", &output.ability)?;
+        validate_tensor_finite("item", &output.item)?;
+        validate_tensor_finite("swap", &output.swap)?;
+        validate_tensor_finite("learn", &output.learn)?;
+        validate_tensor_finite("shop", &output.shop)?;
+        validate_tensor_finite("loot", &output.loot)?;
+        validate_tensor_finite("target mode", &output.target_mode)?;
+        validate_tensor_finite("put mode", &output.put_mode)?;
+        validate_tensor_finite("entity pointer", &output.entity_pointer)?;
+        validate_tensor_finite("point pointer", &output.point_pointer)
+    }
 }
 
 fn sum_training_tensors(output: &PolicyTensorTensors) -> Result<Tensor, ModelError> {
@@ -5294,6 +5508,7 @@ impl DecoderSource for SamplingDecoder<'_, '_> {
 struct ModelDecoder<'model, 'rng> {
     model: &'model PolicyModel,
     state: ForwardState,
+    routing: ActorRouting,
     rng: Option<&'rng mut PpoRng>,
     observed: Option<SampledPathLogits>,
 }
@@ -5368,13 +5583,14 @@ impl ModelDecoder<'_, '_> {
     fn head<const SIZE: usize>(
         &self,
         field: &'static str,
-        head: &Linear,
+        head: ActorHead,
         kind: ActionKind,
         unit: Option<ControlledUnit>,
         slot: Option<SlotSelection>,
     ) -> Result<[f32; SIZE], ModelError> {
-        let values = head
-            .forward(&self.context(kind, unit, slot)?)?
+        let values = self
+            .routing
+            .forward(self.model, head, &self.context(kind, unit, slot)?)?
             .flatten_all()?
             .to_vec1::<f32>()?;
         finite_array(field, values)
@@ -5383,14 +5599,15 @@ impl ModelDecoder<'_, '_> {
     fn pointer<const SIZE: usize>(
         &self,
         field: &'static str,
-        head: &Linear,
+        head: ActorHead,
         tokens: &Tensor,
         kind: ActionKind,
         unit: ControlledUnit,
         slot: Option<SlotSelection>,
     ) -> Result<[f32; SIZE], ModelError> {
-        let query = head
-            .forward(&self.context(kind, Some(unit), slot)?)?
+        let query = self
+            .routing
+            .forward(self.model, head, &self.context(kind, Some(unit), slot)?)?
             .unsqueeze(1)?;
         let scores = scaled_pointer_dot(tokens, &query)?
             .flatten_all()?
@@ -5402,9 +5619,8 @@ impl ModelDecoder<'_, '_> {
 impl DecoderSource for ModelDecoder<'_, '_> {
     fn kind(&mut self) -> Result<[f32; 16], ModelError> {
         let values = self
-            .model
-            .kind
-            .forward(&self.state.trunk)?
+            .routing
+            .forward(self.model, ActorHead::Kind, &self.state.trunk)?
             .flatten_all()?
             .to_vec1::<f32>()?;
         let logits = finite_array("kind", values)?;
@@ -5414,7 +5630,7 @@ impl DecoderSource for ModelDecoder<'_, '_> {
         self.perturb(logits)
     }
     fn controlled(&mut self, kind: ActionKind) -> Result<[f32; 2], ModelError> {
-        let logits = self.head("controlled", &self.model.controlled, kind, None, None)?;
+        let logits = self.head("controlled", ActorHead::Controlled, kind, None, None)?;
         if let Some(observed) = &mut self.observed {
             observed.controlled = Some(logits);
         }
@@ -5425,14 +5641,14 @@ impl DecoderSource for ModelDecoder<'_, '_> {
         kind: ActionKind,
         unit: Option<ControlledUnit>,
     ) -> Result<[f32; 8], ModelError> {
-        let logits = self.head("ability", &self.model.ability_head, kind, unit, None)?;
+        let logits = self.head("ability", ActorHead::Ability, kind, unit, None)?;
         if let Some(observed) = &mut self.observed {
             observed.ability = Some(logits);
         }
         self.perturb(logits)
     }
     fn item(&mut self, kind: ActionKind, unit: ControlledUnit) -> Result<[f32; 15], ModelError> {
-        let logits = self.head("item", &self.model.item_head, kind, Some(unit), None)?;
+        let logits = self.head("item", ActorHead::Item, kind, Some(unit), None)?;
         if let Some(observed) = &mut self.observed {
             observed.item = Some(logits);
         }
@@ -5446,7 +5662,7 @@ impl DecoderSource for ModelDecoder<'_, '_> {
     ) -> Result<[f32; 15], ModelError> {
         let logits = self.head(
             "swap",
-            &self.model.swap_head,
+            ActorHead::Swap,
             kind,
             Some(unit),
             Some(SlotSelection::Item(slot)),
@@ -5457,21 +5673,21 @@ impl DecoderSource for ModelDecoder<'_, '_> {
         self.perturb(logits)
     }
     fn learn(&mut self, kind: ActionKind) -> Result<[f32; 6], ModelError> {
-        let logits = self.head("learn", &self.model.learn_head, kind, None, None)?;
+        let logits = self.head("learn", ActorHead::Learn, kind, None, None)?;
         if let Some(observed) = &mut self.observed {
             observed.learn = Some(logits);
         }
         self.perturb(logits)
     }
     fn shop(&mut self, kind: ActionKind, unit: ControlledUnit) -> Result<[f32; 64], ModelError> {
-        let logits = self.head("shop", &self.model.shop_head, kind, Some(unit), None)?;
+        let logits = self.head("shop", ActorHead::Shop, kind, Some(unit), None)?;
         if let Some(observed) = &mut self.observed {
             observed.shop = Some(logits);
         }
         self.perturb(logits)
     }
     fn loot(&mut self, kind: ActionKind, unit: ControlledUnit) -> Result<[f32; 16], ModelError> {
-        let logits = self.head("loot", &self.model.loot_head, kind, Some(unit), None)?;
+        let logits = self.head("loot", ActorHead::Loot, kind, Some(unit), None)?;
         if let Some(observed) = &mut self.observed {
             observed.loot = Some(logits);
         }
@@ -5485,7 +5701,7 @@ impl DecoderSource for ModelDecoder<'_, '_> {
     ) -> Result<[f32; 3], ModelError> {
         let logits = self.head(
             "target mode",
-            &self.model.target_mode,
+            ActorHead::TargetMode,
             kind,
             Some(unit),
             Some(slot),
@@ -5503,7 +5719,7 @@ impl DecoderSource for ModelDecoder<'_, '_> {
     ) -> Result<[f32; 2], ModelError> {
         let logits = self.head(
             "put mode",
-            &self.model.put_mode,
+            ActorHead::PutMode,
             kind,
             Some(unit),
             Some(SlotSelection::Item(slot)),
@@ -5521,7 +5737,7 @@ impl DecoderSource for ModelDecoder<'_, '_> {
     ) -> Result<[f32; 96], ModelError> {
         let logits = self.pointer(
             "entity pointer",
-            &self.model.entity_query,
+            ActorHead::EntityQuery,
             &self.state.current_units,
             kind,
             unit,
@@ -5540,7 +5756,7 @@ impl DecoderSource for ModelDecoder<'_, '_> {
     ) -> Result<[f32; 48], ModelError> {
         let logits = self.pointer(
             "point pointer",
-            &self.model.point_query,
+            ActorHead::PointQuery,
             &self.state.points,
             kind,
             unit,

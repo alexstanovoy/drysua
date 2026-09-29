@@ -103,6 +103,25 @@ controller forces a fresh clean environment even when extension credit remains.
 The clean tail therefore cannot be delayed by poor results. The final update does
 not create an unused next environment. These controls never change reward shaping.
 
+## Run seed
+
+`train-annealed` has no fixed seed default:
+
+- `--seed <n>` is an explicit override and is recorded in the run scope and the
+  checkpoint as `run_seed`.
+- A **fresh** run without `--seed` draws an unpredictable `u64` when settings are
+  built, prints the resolved value, and records it in the run scope. On Unix this
+  reads eight bytes from `/dev/urandom`; the non-Unix fallback mixes the wall
+  clock with the process id through splitmix64 and is best effort. No dependency
+  is added either way.
+- A **resume** without `--seed` adopts the recorded scope seed, so an interrupted
+  run replays identical streams. An unreadable run scope is a clear error, never a
+  silent fallback.
+- A resume with an explicit `--seed` that differs from the recorded one still
+  fails the run-scope check with the `--seed: recorded X, requested Y` message.
+
+`train-full` is unchanged and keeps its fixed default seed.
+
 ## Legacy fixed resume
 
 Retain all of the checkpoint's original arguments and add the fixed selector.

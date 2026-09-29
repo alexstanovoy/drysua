@@ -3,6 +3,15 @@
 
 use super::*;
 
+pub(super) fn kind_needed(prefixes: &[TrainingPrefix]) -> [bool; 2] {
+    needed(prefixes, |kind| {
+        [
+            !matches!(kind, ActionKind::Continue | ActionKind::Learn),
+            kind == ActionKind::Learn,
+        ]
+    })
+}
+
 pub(super) fn needed<const HEADS: usize>(
     prefixes: &[TrainingPrefix],
     demand: impl Fn(ActionKind) -> [bool; HEADS],
@@ -20,22 +29,6 @@ pub(super) fn needed<const HEADS: usize>(
         }
     }
     needed
-}
-
-pub(super) fn head(
-    needed: bool,
-    head: &Linear,
-    context: &Tensor,
-) -> Result<Option<Vec<Vec<f32>>>, ModelError> {
-    if !needed {
-        return Ok(None);
-    }
-    let (batch, width) = context.dims2()?;
-    assert!((1..=MODEL_TRAINING_BATCH).contains(&batch));
-    assert_eq!(width, DECODER_CONTEXT);
-    #[cfg(test)]
-    record_dispatch(batch);
-    Ok(Some(head.forward(context)?.to_vec2()?))
 }
 
 #[cfg(test)]

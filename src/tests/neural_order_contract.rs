@@ -293,6 +293,7 @@ pub(super) fn install_policy(model: &PolicyModel, policy: DiagnosticPolicy) {
     for (name, shape) in model.parameter_schema().expect("schema") {
         let count = shape.iter().product::<usize>();
         let values = &mut parameters[offset..offset + count];
+        let name = name.strip_prefix("dire.").unwrap_or(name);
         match (policy, name) {
             (DiagnosticPolicy::Constant(kind), "kind.bias") => values[kind.index()] = 10.0,
             (DiagnosticPolicy::ActiveOrderReadout, "trunk.0.weight") => {

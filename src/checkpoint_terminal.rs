@@ -1,23 +1,31 @@
+#[cfg(not(feature = "side-actors"))]
 use std::collections::HashMap;
 use std::path::Path;
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "side-actors")))]
 use safetensors::SafeTensors;
 
+#[cfg(not(feature = "side-actors"))]
 use super::{
     CheckpointError, MAX_RUNTIME_TENSOR_BYTES, RUNTIME_TENSOR_FILE, TrainingArtifact,
     decode_runtime_tensor_with_metadata, read_bounded, sha256, validate_directory,
 };
+#[cfg(feature = "side-actors")]
+use super::{CheckpointError, TrainingArtifact};
 use crate::{PolicyDevice, PolicyModel};
 
 #[path = "checkpoint_reward_v5.rs"]
+#[cfg(not(feature = "side-actors"))]
 mod reward_v5;
 
+#[cfg(not(feature = "side-actors"))]
 const SOURCE: [u8; 32] = [
     0xb2, 0x97, 0x52, 0xac, 0xf5, 0xc0, 0x26, 0x87, 0xa5, 0x4a, 0x63, 0xdc, 0xe9, 0xd7, 0x64, 0x80,
     0xf8, 0xe9, 0x7f, 0xc4, 0x16, 0xad, 0x9d, 0x41, 0x59, 0xc2, 0x1a, 0x59, 0xe9, 0x10, 0x97, 0x80,
 ];
+#[cfg(not(feature = "side-actors"))]
 const SOURCE_PARAMETERS: usize = 1_700_020;
+#[cfg(not(feature = "side-actors"))]
 const _: () = assert!(SOURCE_PARAMETERS == crate::MODEL_PARAMETER_COUNT);
 
 impl TrainingArtifact {
@@ -25,6 +33,7 @@ impl TrainingArtifact {
     /// Verifies frozen reward5 metadata, SHA, F32 shape and finiteness. Preserves every
     /// parameter bit, including actor and critic; imports no optimizer, RNG or mastery.
     /// The returned provenance must accompany the new artifact, not relabel the source.
+    #[cfg(not(feature = "side-actors"))]
     pub fn initialize_selected_m21_for_terminal_reward(
         directory: &Path,
         seed: u64,
@@ -55,8 +64,21 @@ impl TrainingArtifact {
             ),
         ))
     }
+
+    /// M21 initialization is unavailable for the side-actor architecture.
+    #[cfg(feature = "side-actors")]
+    pub fn initialize_selected_m21_for_terminal_reward(
+        _directory: &Path,
+        _seed: u64,
+        _device: PolicyDevice,
+    ) -> Result<(PolicyModel, String), CheckpointError> {
+        Err(CheckpointError::TensorContract(
+            "M21 initialization unsupported with side-actors; use pinned M24/u428",
+        ))
+    }
 }
 
+#[cfg(not(feature = "side-actors"))]
 fn initialize_parameters(
     parameters: &[f32],
     seed: u64,
@@ -72,6 +94,7 @@ fn initialize_parameters(
     Ok(model)
 }
 
+#[cfg(not(feature = "side-actors"))]
 fn source_metadata() -> HashMap<String, String> {
     [
         ("action_schema_hash", "10658390830565586343"),
@@ -89,6 +112,6 @@ fn source_metadata() -> HashMap<String, String> {
     .collect()
 }
 
-#[cfg(test)]
+#[cfg(all(test, not(feature = "side-actors")))]
 #[path = "tests/terminal_initialization.rs"]
 mod tests;

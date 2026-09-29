@@ -80,8 +80,22 @@ const PIPELINED_GROUPS: [usize; 2] = [2, 4];
 // Compile-time guards pin the benchmark's interpretation of the library
 // constants; drift fails the bench build instead of a timed run.
 const _: () = assert!(FEATURE_SCHEMA_VERSION == 22);
-const _: () = assert!(MODEL_SCHEMA_VERSION == 24);
-const _: () = assert!(MODEL_PARAMETER_COUNT == 1_700_020);
+const _: () = assert!(
+    MODEL_SCHEMA_VERSION
+        == if cfg!(feature = "side-actors") {
+            25
+        } else {
+            24
+        }
+);
+const _: () = assert!(
+    MODEL_PARAMETER_COUNT
+        == if cfg!(feature = "side-actors") {
+            1_812_983
+        } else {
+            1_700_020
+        }
+);
 const _: () = assert!(MAP2_ACTOR_DECISIONS == 9_300);
 const _: () = assert!(MAP2_RETENTION_STRIDE == 8);
 const _: () = assert!(MAX_TRAINING_ENVIRONMENTS == 26);

@@ -468,7 +468,50 @@ fn probe_controls_reject_out_of_bounds_work_without_changing_defaults() {
     }
 }
 
+#[test]
+fn frozen_neural_probe_cases_validate_without_loading_and_reject_scalar_g2() {
+    use std::ffi::OsStr;
+    let weights = Path::new("unused-frozen-parent");
+    for (case, games, batch, groups, batched) in [
+        ("m8-scalar", 8, 8, 1, false),
+        ("m8-batched", 8, 8, 1, true),
+        ("m40-scalar", 40, 20, 1, false),
+        ("m40-batched", 40, 20, 1, true),
+        ("m40-g2-batched", 40, 20, 2, true),
+    ] {
+        let options = frozen_neural_settings(OsStr::new(case), weights).expect("probe case");
+        assert_eq!(options.games_per_update, games);
+        assert_eq!(options.parallel_worlds, batch);
+        assert_eq!(options.execution.actor_pipeline_groups, groups);
+        assert_eq!(options.execution.neural_opponent_batching, batched);
+        assert_eq!(validate_annealed(&options, harness()), Ok(options.ppo));
+        assert_eq!((options.ppo.epochs, options.ppo.minibatch), (4, 2048));
+        assert_eq!(options.execution.training_microbatch, 256);
+        assert!(options.execution.reuse_actor_values);
+        assert_eq!(options.ppo.gae_lambda, 0.98);
+    }
+    for case in ["", "m40-g2-scalar", "m8", "M8-scalar"] {
+        assert_eq!(
+            frozen_neural_settings(OsStr::new(case), weights).unwrap_err(),
+            "DRYSUA_PROBE_NN must be m8-scalar/m8-batched/m40-scalar/m40-batched/m40-g2-batched"
+        );
+    }
+    let mut invalid =
+        frozen_neural_settings(OsStr::new("m40-g2-batched"), weights).expect("batched G2");
+    invalid.execution.neural_opponent_batching = false;
+    assert_eq!(
+        validate_annealed(&invalid, harness()),
+        Err(PpoError::InvalidConfig(
+            "annealed actor pipeline weights opponent requires batched inference"
+        ))
+    );
+}
+
 fn concurrency_probe(device: PolicyDevice) {
+    if let Some(case) = std::env::var_os("DRYSUA_PROBE_NN") {
+        frozen_neural_probe(device, &case);
+        return;
+    }
     let count = |name, default, maximum| {
         probe_count(std::env::var_os(name).as_deref(), default, maximum).expect(name)
     };
@@ -569,6 +612,212 @@ fn concurrency_probe(device: PolicyDevice) {
     }
     for (directory, _, _) in trials {
         std::fs::remove_dir_all(directory).expect("remove own probe trial");
+    }
+}
+
+fn frozen_neural_settings(
+    case: &std::ffi::OsStr,
+    weights: &Path,
+) -> Result<AnnealedJobConfig, &'static str> {
+    let (games, batch, groups, batched) = match case.to_str() {
+        Some("m8-scalar") => (8, 8, 1, false),
+        Some("m8-batched") => (8, 8, 1, true),
+        Some("m40-scalar") => (40, 20, 1, false),
+        Some("m40-batched") => (40, 20, 1, true),
+        Some("m40-g2-batched") => (40, 20, 2, true),
+        _ => {
+            return Err(
+                "DRYSUA_PROBE_NN must be m8-scalar/m8-batched/m40-scalar/m40-batched/m40-g2-batched",
+            );
+        }
+    };
+    let mut options = settings(9001, 1);
+    options.opponent = AnnealedOpponent::Weights(weights.to_path_buf());
+    options.games_per_update = games;
+    options.parallel_worlds = batch;
+    options.games_per_generation = games as u64;
+    options.ppo.environments = games;
+    options.ppo.sample_budget = crate::PpoSampleBudget::for_annealed_games(games);
+    options.ppo.epochs = 4;
+    options.ppo.minibatch = 2048;
+    options.ppo.gae_lambda = 0.98;
+    options.execution.actor_pipeline_groups = groups;
+    options.execution.neural_opponent_batching = batched;
+    options.execution.reuse_actor_values = true;
+    options.execution.training_microbatch = 256;
+    Ok(options)
+}
+
+fn frozen_neural_probe(device: PolicyDevice, case: &std::ffi::OsStr) {
+    let parent =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("temp/side-actors-teacher-100-20260929-0738");
+    let weights = std::env::var_os("DRYSUA_PROBE_WEIGHTS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| parent.join("checkpoint"));
+    assert!(
+        weights == parent.join("checkpoint") || weights == parent.join("history/u0100"),
+        "NN probe requires the pinned completed U100 checkpoint or history/u0100"
+    );
+    let options = frozen_neural_settings(case, &weights).expect("frozen NN case");
+    validate_annealed(&options, harness()).expect("NN probe admission before loading");
+    eprintln!(
+        "frozen-nn case={case:?} device={device:?} weights={} expected_runtime_sha256=9f8bc4acaea9a2dcbb315f7d26227b2db3d33cc41a0b0b1d662e5411ac2a6280 sha_verified=false rounds=1024 seed=9001 epochs=4 minibatch=2048 microbatch=256 reuse=true lambda=0.98 collection_only=true execution={:?}",
+        weights.display(),
+        options.execution
+    );
+    let mut previous = None;
+    for index in 0..3 {
+        let work = frozen_neural_trial(&options, device, &weights, index);
+        if let Some(previous) = previous {
+            assert_eq!(work, previous, "fresh same-mode trials changed actual work");
+        }
+        previous = Some(work);
+    }
+}
+
+fn frozen_neural_groups(
+    options: &AnnealedJobConfig,
+    opponent: &AnnealedOpponentRuntime,
+    local: usize,
+    random: &mut PpoRng,
+) -> Vec<episode::ActorGroup> {
+    let seats = balanced_policy_seats(options.seed, 0, options.games_per_update).expect("seats");
+    let draw = draw_generation(
+        options.seed,
+        0,
+        options.games_per_generation,
+        options.games_per_update as u64,
+        anneal_schedule(options),
+    )
+    .expect("native generation");
+    (0..options.execution.actor_pipeline_groups)
+        .map(|group| {
+            let base = local + group * options.parallel_worlds;
+            let end = base + options.parallel_worlds;
+            assert!(end <= seats.len());
+            let environments =
+                batch_environments(options, base as u64, &seats[base..end], opponent, &draw)
+                    .expect("native annealed worlds");
+            episode::ActorGroup {
+                stream_base: base,
+                environments,
+                streams: (base..end)
+                    .map(|game| {
+                        episode::game_stream(options.seed, game as u64).expect("native stream")
+                    })
+                    .collect(),
+                random: actor_stream_rngs(random, options.parallel_worlds)
+                    .expect("native actor RNGs"),
+            }
+        })
+        .collect()
+}
+
+fn frozen_neural_trial(
+    options: &AnnealedJobConfig,
+    device: PolicyDevice,
+    weights: &Path,
+    index: usize,
+) -> (u64, u64, usize, u64) {
+    let model = TrainingArtifact::initialize_from_weights(weights, options.seed, device)
+        .expect("native frozen learner initializer");
+    let opponent = load_opponent(&options.opponent, device).expect("frozen opponent");
+    let fingerprint = PolicySnapshot::capture(&model, 0)
+        .expect("learner fingerprint")
+        .fingerprint();
+    assert_eq!(
+        Some(fingerprint),
+        opponent.fingerprint,
+        "both policies must use the same tensors"
+    );
+    let mut random = PpoRng::new(options.seed ^ 0xa17e);
+    let mut rollout = PpoRollout::for_config(options.ppo, model.policy_identity().expect("policy"))
+        .expect("bounded rollout");
+    let mut report = PpoSmokeReport::default();
+    let mut decisions = 0_u64;
+    let mut elapsed = 0_u128;
+    let wave = options.parallel_worlds * options.execution.actor_pipeline_groups;
+    for local in (0..options.games_per_update).step_by(wave) {
+        let mut groups = frozen_neural_groups(options, &opponent.runtime, local, &mut random);
+        let starts: Vec<_> = groups
+            .iter()
+            .flat_map(|group| group.environments.iter().map(|world| world.arena.tick()))
+            .collect();
+        // Exclude loading/world construction; include native collector setup and flushing.
+        let started = Instant::now();
+        frozen_neural_collect(&model, options, &mut groups, &mut rollout, &mut report);
+        elapsed += started.elapsed().as_nanos();
+        // Only the last, terminal decision can advance fewer than three ticks.
+        decisions += groups
+            .iter()
+            .flat_map(|group| &group.environments)
+            .zip(starts)
+            .map(|(world, start)| {
+                u64::from((world.arena.tick() - start).div_ceil(MAP2_DECISION_INTERVAL_TICKS))
+            })
+            .sum::<u64>();
+    }
+    let expected_decisions = options.games_per_update as u64 * 1024;
+    let expected_ticks = expected_decisions * u64::from(MAP2_DECISION_INTERVAL_TICKS);
+    let fixed_work = report.elapsed_ticks == expected_ticks
+        && decisions == expected_decisions
+        && report.terminal_wins + report.terminal_losses + report.terminal_draws == 0;
+    eprintln!(
+        "frozen-nn-end index={index} measured={} collection_ns={elapsed} fingerprint={fingerprint:016x} ticks={} decisions={decisions} retained_samples={} wins={} losses={} draws={} timeouts={} fixed_work={fixed_work} cross_mode_equality=unverified",
+        index != 0,
+        report.elapsed_ticks,
+        rollout.len(),
+        report.terminal_wins,
+        report.terminal_losses,
+        report.terminal_draws,
+        report.episode_timeouts
+    );
+    assert!(
+        fixed_work,
+        "terminal/round divergence: reject fixed-work timing comparison"
+    );
+    assert!(!rollout.is_empty());
+    (report.elapsed_ticks, decisions, rollout.len(), fingerprint)
+}
+
+fn frozen_neural_collect(
+    model: &PolicyModel,
+    options: &AnnealedJobConfig,
+    groups: &mut [episode::ActorGroup],
+    rollout: &mut PpoRollout,
+    report: &mut PpoSmokeReport,
+) {
+    assert_eq!(groups.len(), options.execution.actor_pipeline_groups);
+    assert!(matches!(groups.len(), 1 | 2));
+    if groups.len() == 1 {
+        let group = &mut groups[0];
+        episode::collect_batch_with_opponent_batching(
+            model,
+            options.ppo,
+            group.stream_base,
+            "frozen-nn",
+            &mut group.environments,
+            &mut group.streams,
+            &mut group.random,
+            1024,
+            rollout,
+            report,
+            true,
+            options.execution.neural_opponent_batching,
+        )
+        .expect("native G1 collector");
+    } else {
+        episode::collect_actor_pipeline_with_opponent_batching(
+            model,
+            options.ppo,
+            groups,
+            1024,
+            rollout,
+            report,
+            true,
+            true,
+        )
+        .expect("native G2 collector");
     }
 }
 

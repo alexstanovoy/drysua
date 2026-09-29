@@ -15,6 +15,7 @@ mod adaptive;
 #[cfg(all(
     test,
     feature = "cuda",
+    not(feature = "side-actors"),
     any(target_os = "linux", target_os = "windows")
 ))]
 #[path = "../tests/autonomous_learning.rs"]
@@ -368,8 +369,9 @@ impl AnnealedSession {
         state
             .trainer
             .set_execution(crate::TrainingExecutionOptions {
-                // Actor pipelining and bootstrap reuse belong to collection, not optimization.
+                // Actor and opponent inference modes belong to collection, not optimization.
                 actor_pipeline_groups: 1,
+                neural_opponent_batching: false,
                 reuse_actor_values: false,
                 ..settings.execution
             })?;
@@ -556,7 +558,7 @@ impl AnnealedSession {
                 seats,
             )?);
         }
-        episode::collect_actor_pipeline(
+        episode::collect_actor_pipeline_with_opponent_batching(
             &self.state.model,
             config,
             &mut groups,
@@ -564,6 +566,7 @@ impl AnnealedSession {
             rollout,
             report,
             settings.execution.reuse_actor_values,
+            settings.execution.neural_opponent_batching,
         )?;
         for group in &groups {
             for environment in &group.environments {
@@ -652,7 +655,7 @@ impl AnnealedSession {
             .map(|offset| episode::game_stream(settings.seed, global_game + offset as u64))
             .collect::<Result<Vec<_>, _>>()?;
         let mut random = actor_stream_rngs(&mut self.state.sampling, batch_len)?;
-        episode::collect_batch_with_actor_values(
+        episode::collect_batch_with_opponent_batching(
             &self.state.model,
             config,
             local,
@@ -664,6 +667,7 @@ impl AnnealedSession {
             rollout,
             report,
             settings.execution.reuse_actor_values,
+            settings.execution.neural_opponent_batching,
         )?;
         for environment in &environments {
             reject_production_rejection(environment, "annealed collection")?;
@@ -952,6 +956,7 @@ fn annealed_run(
     opponent_fingerprint: Option<u64>,
 ) -> Result<CheckpointRun, PpoError> {
     settings.execution.validate()?;
+    validate_opponent_inference(settings)?;
     let device_name = device_name(device);
     let mut command_line = format!(
         "train-annealed --updates {} --games {} --parallel {} --generation-games {} --zero-updates {} --epochs {} --minibatch {} --seed {} --map 2 --device {device_name}",
@@ -1056,6 +1061,13 @@ pub(crate) fn validate_annealed(
         return Err(PpoError::InvalidConfig("annealed opponent weights"));
     }
     let config = validate_annealed_ppo(settings)?;
+    validate_opponent_inference(settings)?;
+    if settings.execution.neural_opponent_batching {
+        episode::validate_neural_opponent_memory(
+            config,
+            settings.parallel_worlds * settings.execution.actor_pipeline_groups,
+        )?;
+    }
     validate_actor_pipeline(settings, config)?;
     validate_annealed_counters(settings, config)?;
     Ok(config)
@@ -1108,6 +1120,24 @@ fn validate_annealed_batches(settings: &AnnealedJobConfig) -> Result<(), PpoErro
     Ok(())
 }
 
+fn validate_opponent_inference(settings: &AnnealedJobConfig) -> Result<(), PpoError> {
+    let weights = matches!(settings.opponent, AnnealedOpponent::Weights(_));
+    if settings.execution.neural_opponent_batching && !weights {
+        return Err(PpoError::InvalidConfig(
+            "neural opponent batching requires a weights opponent",
+        ));
+    }
+    if weights
+        && settings.execution.actor_pipeline_groups > 1
+        && !settings.execution.neural_opponent_batching
+    {
+        return Err(PpoError::InvalidConfig(
+            "annealed actor pipeline weights opponent requires batched inference",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_actor_pipeline(
     settings: &AnnealedJobConfig,
     config: PpoConfig,
@@ -1117,11 +1147,6 @@ fn validate_actor_pipeline(
     }
     assert!(matches!(settings.execution.actor_pipeline_groups, 2 | 4));
     assert_eq!(settings.ppo, config);
-    if !matches!(settings.opponent, AnnealedOpponent::Teacher) {
-        return Err(PpoError::InvalidConfig(
-            "annealed actor pipeline requires a teacher opponent",
-        ));
-    }
     episode::validate_pipeline_memory(
         config,
         settings.parallel_worlds,

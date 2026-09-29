@@ -29,6 +29,7 @@ const DESCRIPTORS: [&str; 3] = [
 ];
 
 #[test]
+#[cfg(not(feature = "side-actors"))]
 fn fixed_descriptors_and_linked_identities_match_pre_adaptive_golden() {
     assert_eq!(
         [
@@ -53,6 +54,67 @@ fn fixed_descriptors_and_linked_identities_match_pre_adaptive_golden() {
     ] {
         assert_eq!(checkpoint_schema_identity(budget), identity);
     }
+}
+
+#[test]
+#[cfg(feature = "side-actors")]
+fn side_actor_checkpoint_identities_reject_all_three_legacy_m24_profiles() {
+    let mut schemas = LINKED_SCHEMAS;
+    schemas[2] = (24, crate::model::LEGACY_MODEL_SCHEMA_HASH);
+    schemas[3] = (
+        37,
+        crate::model::linked_schema_hash(
+            crate::ppo::LEGACY_PPO_SCHEMA_DESCRIPTOR,
+            &[schemas[0], schemas[1], schemas[2], schemas[4]],
+        ),
+    );
+    let mut checkpoint = (
+        12,
+        crate::model::linked_schema_hash(DESCRIPTORS[0], &schemas),
+    );
+    for (index, budget) in [
+        PpoSampleBudget::Standard,
+        PpoSampleBudget::Annealed,
+        PpoSampleBudget::WideAnnealed,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if index > 0 {
+            let descriptor = if index == 1 {
+                crate::PPO_ANNEALED_SCHEMA_DESCRIPTOR
+            } else {
+                crate::PPO_WIDE_ANNEALED_SCHEMA_DESCRIPTOR
+            };
+            schemas[3] = (
+                37 + index as u32,
+                crate::model::linked_schema_hash(descriptor, &[schemas[3]]),
+            );
+            checkpoint = (
+                12 + index as u32,
+                crate::model::linked_schema_hash(
+                    DESCRIPTORS[index],
+                    &[
+                        schemas[0], schemas[1], schemas[2], schemas[3], schemas[4], checkpoint,
+                    ],
+                ),
+            );
+        }
+        assert_ne!(checkpoint_schema_identity(budget), checkpoint);
+        let mut encoded = Vec::new();
+        encoded.extend_from_slice(&checkpoint.0.to_le_bytes());
+        encoded.extend_from_slice(&checkpoint.1.to_le_bytes());
+        assert_eq!(
+            decode_checkpoint_identity(&mut ManifestReader::new(&encoded)),
+            Err(CheckpointError::SchemaMismatch)
+        );
+    }
+    assert!(CHECKPOINT_SCHEMA_DESCRIPTOR.contains("model25=parameters1812983_tensors86"));
+    assert!(
+        compiled_features()
+            .split(',')
+            .any(|feature| feature == "side-actors")
+    );
 }
 
 #[test]

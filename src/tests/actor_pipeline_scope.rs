@@ -246,7 +246,7 @@ fn actor_pipeline_rejects_weights_before_opening_the_opponent_or_checkpoint() {
             false
         ),
         Err(PpoError::InvalidConfig(
-            "annealed actor pipeline requires a teacher opponent"
+            "annealed actor pipeline weights opponent requires batched inference"
         ))
     );
     options.execution.actor_pipeline_groups = 1;

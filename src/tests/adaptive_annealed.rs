@@ -362,6 +362,75 @@ fn adaptive_settings() -> AnnealedJobConfig {
     config
 }
 
+#[cfg(all(
+    feature = "side-actors",
+    feature = "cuda",
+    any(target_os = "linux", target_os = "windows")
+))]
+#[test]
+#[ignore = "exclusive CUDA pinned initialization and two-update M4/G2 native replay"]
+fn cuda_pinned_side_actors_update_both_heads_and_resume_exactly() {
+    let baseline = test_directory("side-actor-native-baseline");
+    let resumed = test_directory("side-actor-native-resumed");
+    let source = Path::new(
+        "/home/alexstanovoy/Workspace/bots/drysua/artifacts/temp/annealed-teacher-20260920/attempt-008/history/update-0428",
+    );
+    let mut config = adaptive_settings();
+    config.updates = 2;
+    config.zero_updates = 0;
+    config.games_per_update = 4;
+    config.parallel_worlds = 2;
+    config.games_per_generation = 16;
+    config.ppo.environments = 4;
+    config.ppo.minibatch = 2048;
+    config.execution.actor_pipeline_groups = 2;
+    config.execution.training_microbatch = 256;
+    config.execution.reuse_actor_values = true;
+    let device = PolicyDevice::Cuda { ordinal: 0 };
+    let (initial, _) =
+        TrainingArtifact::initialize_selected_m24_u428_for_side_actors(source, config.seed, device)
+            .unwrap();
+    let before = initial.export_parameters().unwrap();
+    drop(initial);
+    let execute = |config, directory: &Path, resume| {
+        run_annealed_job_harnessed(
+            config,
+            AnnealedHarness::default(),
+            device,
+            directory,
+            resume,
+            (!resume).then_some(source),
+            |_| {},
+        )
+        .unwrap()
+    };
+    execute(config.clone(), &baseline, false);
+    let mut first = config.clone();
+    first.invocation_updates = NonZeroU64::new(1);
+    assert_eq!(execute(first, &resumed, false).completed_updates, 1);
+    assert_eq!(execute(config, &resumed, true).completed_updates, 2);
+    assert_same_training(&baseline, &resumed, device);
+    let trained = PolicyModel::fresh(0).unwrap();
+    TrainingArtifact::load_runtime_weights(&trained, &baseline).unwrap();
+    let after = trained.export_parameters().unwrap();
+    let changed = |range: std::ops::Range<usize>| {
+        range
+            .into_iter()
+            .any(|index| before[index].to_bits() != after[index].to_bits())
+    };
+    assert!(
+        changed(1_586_113..1_590_225) || changed(1_591_169..1_700_020),
+        "Radiant actor must train"
+    );
+    assert!(changed(1_700_020..1_812_983), "Dire actor must train");
+    eprintln!(
+        "side-actor-native parameters=1812983 tensors=86 balanced_games_per_update=4 groups=2 microbatch=256 reuse=true both_actor_heads_changed=true exact_model_adam_rng_controller_snapshots_resume=true"
+    );
+    for directory in [baseline, resumed] {
+        std::fs::remove_dir_all(directory).unwrap();
+    }
+}
+
 fn outcome_harness(wins: &'static [u64]) -> AnnealedHarness {
     assert!(!wins.is_empty());
     assert!(wins.len() <= 8);

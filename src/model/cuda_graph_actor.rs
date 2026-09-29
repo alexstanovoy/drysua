@@ -29,6 +29,14 @@ struct Owner {
     shapes: [usize; 2],
     warmups: [AtomicU8; 2],
     captured: AtomicU8,
+    purpose: CapturePurpose,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CapturePurpose {
+    Encoder,
+    #[cfg(feature = "side-actors")]
+    KindPrefixB20,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -92,6 +100,19 @@ pub(super) fn admit(model: &PolicyModel) -> Result<(), ModelError> {
 }
 
 fn admit_shapes(model: &PolicyModel, shapes: [usize; 2]) -> Result<(), ModelError> {
+    admit_purpose(model, shapes, CapturePurpose::Encoder)
+}
+
+#[cfg(feature = "side-actors")]
+pub(super) fn admit_kind_prefix(model: &PolicyModel) -> Result<(), ModelError> {
+    admit_purpose(model, [20, 0], CapturePurpose::KindPrefixB20)
+}
+
+fn admit_purpose(
+    model: &PolicyModel,
+    shapes: [usize; 2],
+    purpose: CapturePurpose,
+) -> Result<(), ModelError> {
     assert!(matches!(shapes[0], 20 | 40));
     assert!(shapes[1] <= 1);
     if USED.load(Ordering::Acquire) {
@@ -133,6 +154,7 @@ fn admit_shapes(model: &PolicyModel, shapes: [usize; 2]) -> Result<(), ModelErro
             shapes,
             warmups: std::array::from_fn(|_| AtomicU8::new(0)),
             captured: AtomicU8::new(0),
+            purpose,
         })
         .map_err(|_| ModelError::InvalidModelState("actor graph owner already bound"))?;
     Ok(())
@@ -143,9 +165,28 @@ pub(super) fn authorize_shape(
     batch: usize,
     capture: bool,
 ) -> Result<(), ModelError> {
+    authorize_purpose(model, batch, capture, CapturePurpose::Encoder)
+}
+
+#[cfg(feature = "side-actors")]
+pub(super) fn authorize_kind_prefix(model: &PolicyModel, capture: bool) -> Result<(), ModelError> {
+    authorize_purpose(model, 20, capture, CapturePurpose::KindPrefixB20)
+}
+
+fn authorize_purpose(
+    model: &PolicyModel,
+    batch: usize,
+    capture: bool,
+    purpose: CapturePurpose,
+) -> Result<(), ModelError> {
     let owner = OWNER.get().ok_or(ModelError::InvalidModelState(
         "actor graph has no admission",
     ))?;
+    if owner.purpose != purpose {
+        return Err(ModelError::InvalidModelState(
+            "actor graph capture purpose mismatch",
+        ));
+    }
     if owner.thread != std::thread::current().id()
         || owner.lineage != model.lineage
         || !owner.device.same_device(model.tensor_device())
@@ -344,7 +385,7 @@ impl ActorWorkspace {
             let state = slot.forward(frames, &self.device);
             self.replays += 1;
             self.stats.hits_by_batch[frames.len()] += 1;
-            model.selection_from_state_locked(state, spaces, Some(random))
+            model.selection_from_state_locked(state, frames, spaces, Some(random))
         } else {
             model.selection_batch_locked(frames, spaces, Some(random))
         };

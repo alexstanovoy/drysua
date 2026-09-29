@@ -144,11 +144,12 @@ fn assert_candidate_errors(device: PolicyDevice) {
         .set(&nonfinite)
         .expect("inject unused head");
     assert!(!samples[0].transition.target.item.active);
-    assert_candidate_error(
-        &model,
-        &samples,
-        "model item output at batch 0 index 0 is non-finite",
-    );
+    let message = if cfg!(feature = "side-actors") {
+        "model radiant.item output at batch 0 index 0 is non-finite"
+    } else {
+        "model item output at batch 0 index 0 is non-finite"
+    };
+    assert_candidate_error(&model, &samples, message);
 }
 
 fn assert_candidate_error(model: &PolicyModel, samples: &[PpoPreparedSample], message: &str) {

@@ -48,7 +48,10 @@ fn annealed_cli_resolves_hardware_independent_m40_b20_profile_without_changing_p
     assert_eq!(settings.games_per_update, 40);
     assert_eq!(settings.parallel_worlds, 20);
     assert_eq!(settings.zero_updates, 40);
-    assert_eq!(settings.seed, 9001);
+    // A fresh run no longer pins a constant seed: the CLI field stays optional
+    // and the resolved value is random and recorded in the run scope.
+    // Seed resolution itself is covered by tests::annealed::seed_tests.
+    assert_eq!(arguments(&[]).seed, None);
     assert_eq!(
         settings.environment_schedule,
         crate::EnvironmentSchedule::default()
@@ -157,7 +160,7 @@ fn annealed_cli_rejects_small_games_with_default_parallel_before_directory_acces
 
 #[cfg(feature = "builtin")]
 #[test]
-fn annealed_cli_requires_explicit_group_one_for_weights_and_micro64_for_wide_budget() {
+fn annealed_cli_requires_group_one_or_batched_inference_for_weights_and_micro64_for_wide_budget() {
     let settings = |extra: &[&str]| {
         arguments(extra)
             .annealed_settings("drysua".into(), "bota".into())
@@ -168,13 +171,23 @@ fn annealed_cli_requires_explicit_group_one_for_weights_and_micro64_for_wide_bud
         "weights",
         "--opponent-weights",
         "unused-opponent",
+        "--opponent-inference",
+        "scalar",
     ]);
     assert_eq!(
         crate::ppo_arena::validate_annealed(&weights, Default::default())
             .unwrap_err()
             .to_string(),
-        "invalid PPO config field: annealed actor pipeline requires a teacher opponent"
+        "invalid PPO config field: annealed actor pipeline weights opponent requires batched inference"
     );
+    // Batched inference, the weights default, admits the grouped pipeline.
+    let weights = settings(&[
+        "--opponent",
+        "weights",
+        "--opponent-weights",
+        "unused-opponent",
+    ]);
+    crate::ppo_arena::validate_annealed(&weights, Default::default()).unwrap();
     let weights = settings(&[
         "--opponent",
         "weights",

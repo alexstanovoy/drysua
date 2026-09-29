@@ -7,12 +7,19 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use super::*;
 
+#[cfg(test)]
+#[path = "../tests/neural_opponent_collection.rs"]
+mod neural_opponent_tests;
+
 #[path = "actor_pipeline.rs"]
 mod actor_pipeline;
 #[path = "actor_values.rs"]
 mod actor_values;
 
-pub(super) use actor_pipeline::{ActorGroup, collect_actor_pipeline, validate_pipeline_memory};
+pub(super) use actor_pipeline::{
+    ActorGroup, collect_actor_pipeline_with_opponent_batching, validate_neural_opponent_memory,
+    validate_pipeline_memory,
+};
 
 #[cfg(test)]
 #[path = "../tests/actor_value_reuse.rs"]
@@ -393,17 +400,24 @@ impl CollectionPhases {
 enum StreamJob {
     /// Build the policy frame and action space for the next decision.
     Prepare,
+    /// Prepare both neural seats; inference remains on the collection owner.
+    PrepareNeural,
     /// Apply one chosen action and advance the owned world three ticks.
     Advance {
         state: EpisodeStream,
         choice: PpoPolicyChoice,
         space: ActionSpace,
+        opponent: Option<Box<neural_opponent::OpponentChoice>>,
     },
 }
 
 /// One ordered reply from a stream worker.
 enum StreamReply {
     Prepared(Box<(FeatureFrame, ActionSpace)>),
+    PreparedNeural(
+        Box<(FeatureFrame, ActionSpace)>,
+        Box<neural_opponent::PreparedOpponent>,
+    ),
     Advanced(Box<AdvancedReply>),
 }
 
@@ -419,6 +433,7 @@ struct AdvancedReply {
     /// world step so the next sampling round never waits for a separate
     /// prepare barrier.
     prepared: Option<Box<(FeatureFrame, ActionSpace)>>,
+    opponent_prepared: Option<Box<neural_opponent::PreparedOpponent>>,
 }
 
 /// One queued retained-interval flush request: the next frame plus the slot
@@ -945,6 +960,7 @@ fn collect_with_workers(
                         state,
                         choice,
                         space,
+                        opponent: None,
                     },
                 )?;
             }
@@ -1013,10 +1029,19 @@ fn run_stream_job(
     evaluator: Option<&FlushEvaluator>,
     phases: Option<&CollectionPhases>,
 ) -> Result<StreamReply, PpoError> {
+    if matches!(&job, StreamJob::PrepareNeural) {
+        let sample = prepare_policy_sample(environment)?;
+        let opponent = neural_opponent::prepare(environment)?;
+        return Ok(StreamReply::PreparedNeural(
+            Box::new(sample),
+            Box::new(opponent),
+        ));
+    }
     let StreamJob::Advance {
         mut state,
         choice,
         space,
+        opponent,
     } = job
     else {
         let started = phases.map(|_| Instant::now());
@@ -1024,10 +1049,42 @@ fn run_stream_job(
         CollectionPhases::record(started, phases.map(|phases| &phases.prepare_ns));
         return sample.map(|sample| StreamReply::Prepared(Box::new(sample)));
     };
+    let batched_opponent = opponent.is_some();
     let started = phases.map(|_| Instant::now());
-    let advanced = advance_cpu(environment, &mut state, choice, space, config);
+    let advanced = advance_cpu_with_opponent(
+        environment,
+        &mut state,
+        choice,
+        space,
+        config,
+        opponent.map(|value| *value),
+    );
     CollectionPhases::record(started, phases.map(|phases| &phases.advance_ns));
     let completed = advanced?;
+    let (value, prepared) = prepare_after_advance(environment, &state, evaluator, phases)?;
+    let opponent_prepared = if batched_opponent && !state.done {
+        Some(Box::new(neural_opponent::prepare(environment)?))
+    } else {
+        None
+    };
+    Ok(StreamReply::Advanced(Box::new(AdvancedReply {
+        state,
+        completed,
+        value,
+        opponent: opponent_name(&environment.opponent),
+        prepared,
+        opponent_prepared,
+    })))
+}
+
+type PreparedNext = (Option<FlushValue>, Option<Box<(FeatureFrame, ActionSpace)>>);
+
+fn prepare_after_advance(
+    environment: &mut TrainingEnvironment,
+    state: &EpisodeStream,
+    evaluator: Option<&FlushEvaluator>,
+    phases: Option<&CollectionPhases>,
+) -> Result<PreparedNext, PpoError> {
     let mut value = None;
     let prepared = if state.done {
         None
@@ -1047,13 +1104,7 @@ fn run_stream_job(
     };
     assert_eq!(prepared.is_none(), state.done);
     assert!(value.is_none() || state.should_flush());
-    Ok(StreamReply::Advanced(Box::new(AdvancedReply {
-        state,
-        completed,
-        value,
-        opponent: opponent_name(&environment.opponent),
-        prepared,
-    })))
+    Ok((value, prepared))
 }
 
 /// Applies the shared completion contract to one finished group.
@@ -1294,6 +1345,52 @@ pub(super) fn collect_batch_with_actor_values(
         .map_err(text_error)?;
     }
     collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn collect_batch_with_opponent_batching(
+    model: &PolicyModel,
+    config: PpoConfig,
+    stream_base: usize,
+    thread_prefix: &str,
+    environments: &mut [TrainingEnvironment],
+    streams: &mut [EpisodeStream],
+    random: &mut [PpoRng],
+    rounds: usize,
+    rollout: &mut PpoRollout,
+    report: &mut PpoSmokeReport,
+    reuse_actor_values: bool,
+    neural_opponent_batching: bool,
+) -> Result<(), PpoError> {
+    if !neural_opponent_batching {
+        return collect_batch_with_actor_values(
+            model,
+            config,
+            stream_base,
+            thread_prefix,
+            environments,
+            streams,
+            random,
+            rounds,
+            rollout,
+            report,
+            reuse_actor_values,
+        );
+    }
+    actor_pipeline::collect_single_neural(
+        model,
+        config,
+        stream_base,
+        environments,
+        streams,
+        random,
+        rounds,
+        rollout,
+        report,
+        reuse_actor_values,
+    )?;
+    finish_annealed_batch(streams, rounds);
+    Ok(())
 }
 
 fn finish_annealed_batch(streams: &[EpisodeStream], rounds: usize) {
@@ -1567,6 +1664,17 @@ fn advance_cpu(
     space: ActionSpace,
     config: PpoConfig,
 ) -> Result<CompletedAdvance, PpoError> {
+    advance_cpu_with_opponent(environment, state, choice, space, config, None)
+}
+
+fn advance_cpu_with_opponent(
+    environment: &mut TrainingEnvironment,
+    state: &mut EpisodeStream,
+    choice: PpoPolicyChoice,
+    space: ActionSpace,
+    config: PpoConfig,
+    opponent: Option<neural_opponent::OpponentChoice>,
+) -> Result<CompletedAdvance, PpoError> {
     assert!(!state.done);
     assert!(state.decisions < ACTOR_DECISIONS);
     #[cfg(test)]
@@ -1589,7 +1697,10 @@ fn advance_cpu(
         .ok_or(PpoError::InvalidTransition("episode snapshot"))?
         .tick;
     assert!(tick < TICK_CAP);
-    let requests = requests_for_decision_in_space(environment, &choice, &space)?;
+    let requests = match opponent {
+        Some(opponent) => requests_for_prepared_opponent(environment, &choice, &space, opponent)?,
+        None => requests_for_decision_in_space(environment, &choice, &space)?,
+    };
     #[cfg(test)]
     {
         use std::hash::Hash;
@@ -1615,9 +1726,25 @@ fn advance_cpu(
     state.actions[choice.action().kind().index()] += 1;
     state.append_retained_reward(reward, advanced.ticks, config.gamma_tick)?;
     #[cfg(test)]
-    if let Some(mut row) = learning_signal {
+    record_learning_signal(state, learning_signal, reward, advanced.ticks);
+    state.decisions += 1;
+    Ok(CompletedAdvance {
+        end_tick: tick + advanced.ticks,
+        ticks: advanced.ticks,
+        outcome,
+    })
+}
+
+#[cfg(test)]
+fn record_learning_signal(
+    state: &mut EpisodeStream,
+    signal: Option<super::annealed::learning_signal::Decision>,
+    reward: f64,
+    ticks: u32,
+) {
+    if let Some(mut row) = signal {
         row.reward = reward;
-        row.ticks = advanced.ticks;
+        row.ticks = ticks;
         row.terminal = state.done;
         let tape = state
             .learning_signal
@@ -1627,12 +1754,6 @@ fn advance_cpu(
         assert!(tape.len() < ACTOR_DECISIONS);
         tape.push(row);
     }
-    state.decisions += 1;
-    Ok(CompletedAdvance {
-        end_tick: tick + advanced.ticks,
-        ticks: advanced.ticks,
-        outcome,
-    })
 }
 
 /// Serial completion of one advanced decision: retained-interval flush with an

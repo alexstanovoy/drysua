@@ -11,6 +11,34 @@ const MAX_PIPELINE_GROUPS: usize = 4;
 const _: () = assert!(MAX_ACTOR_ENVIRONMENTS <= 64);
 const MEMORY_LIMIT: u64 = 12 * 1024 * 1024 * 1024;
 const NON_ROLLOUT_RESERVE: u64 = 2 * 1024 * 1024 * 1024;
+// Charge the new owned inputs, output choices and temporary dense frame copies
+// separately; ActionSpace backing allocations still share the guarded non-rollout reserve.
+const NEURAL_HOST_ROW_BYTES: usize = std::mem::size_of::<neural_opponent::PreparedOpponent>()
+    + std::mem::size_of::<neural_opponent::OpponentChoice>()
+    + 2 * std::mem::size_of::<FeatureFrame>();
+const _: () = assert!(NEURAL_HOST_ROW_BYTES * 64 < 64 * 1024 * 1024);
+
+pub(in crate::ppo_arena) fn validate_neural_opponent_memory(
+    config: PpoConfig,
+    live_worlds: usize,
+) -> Result<(), PpoError> {
+    config.validate()?;
+    if !(1..=MAX_ACTOR_ENVIRONMENTS).contains(&live_worlds) || live_worlds > config.environments {
+        return Err(PpoError::InvalidConfig(
+            "neural opponent active worlds must be within 1..=64",
+        ));
+    }
+    let base = match config.sample_budget {
+        crate::PpoSampleBudget::WideAnnealed => crate::PPO_WIDE_ANNEALED_PAYLOAD_BOUND_BYTES,
+        _ => crate::PPO_ANNEALED_STORAGE_PEAK_BYTES + NON_ROLLOUT_RESERVE,
+    };
+    if base + live_worlds as u64 * NEURAL_HOST_ROW_BYTES as u64 > MEMORY_LIMIT {
+        return Err(PpoError::InvalidConfig(
+            "neural opponent batching exceeds 12 GiB admission budget",
+        ));
+    }
+    Ok(())
+}
 
 pub(in crate::ppo_arena) struct ActorGroup {
     pub(in crate::ppo_arena) stream_base: usize,
@@ -125,6 +153,103 @@ pub(in crate::ppo_arena) fn collect_actor_pipeline(
     collect()
 }
 
+#[allow(clippy::too_many_arguments)]
+pub(in crate::ppo_arena) fn collect_actor_pipeline_with_opponent_batching(
+    model: &PolicyModel,
+    config: PpoConfig,
+    groups: &mut [ActorGroup],
+    rounds: usize,
+    rollout: &mut PpoRollout,
+    report: &mut PpoSmokeReport,
+    reuse_actor_values: bool,
+    neural_opponent_batching: bool,
+) -> Result<(), PpoError> {
+    if !neural_opponent_batching {
+        return collect_actor_pipeline(
+            model,
+            config,
+            groups,
+            rounds,
+            rollout,
+            report,
+            reuse_actor_values,
+        );
+    }
+    #[cfg(all(
+        test,
+        feature = "cuda",
+        any(target_os = "linux", target_os = "windows")
+    ))]
+    let _ = graph_pipeline_mode(config, groups, rounds, reuse_actor_values)?;
+    collect_with_operation_mode(
+        model,
+        config,
+        groups,
+        rounds,
+        rollout,
+        report,
+        reuse_actor_values,
+        true,
+        move |_, world, job| run_stream_job(world, job, config, None, None),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn collect_single_neural(
+    model: &PolicyModel,
+    config: PpoConfig,
+    stream_base: usize,
+    environments: &mut [TrainingEnvironment],
+    streams: &mut [EpisodeStream],
+    random: &mut [PpoRng],
+    rounds: usize,
+    rollout: &mut PpoRollout,
+    report: &mut PpoSmokeReport,
+    reuse: bool,
+) -> Result<(), PpoError> {
+    validate_neural_opponent_memory(config, environments.len())?;
+    if rounds == 0
+        || rounds > ACTOR_DECISIONS
+        || environments.len() != streams.len()
+        || environments.len() != random.len()
+        || stream_base
+            .checked_add(environments.len())
+            .is_none_or(|end| end > config.environments)
+    {
+        return Err(PpoError::InvalidConfig(
+            "neural opponent collection dimensions",
+        ));
+    }
+    #[cfg(all(
+        test,
+        feature = "cuda",
+        any(target_os = "linux", target_os = "windows")
+    ))]
+    let _ = actor_graph_collection_mode(config, stream_base, environments, reuse)?;
+    let opponent = neural_opponent::OpponentBatch::new(model, environments)?;
+    std::thread::scope(|scope| {
+        let mut state = GroupState::spawn_parts(
+            scope,
+            stream_base,
+            environments,
+            streams,
+            random,
+            Some(opponent),
+            move |_, world, job| run_stream_job(world, job, config, None, None),
+        )?;
+        let collected = (|| {
+            for round in 0..=rounds {
+                if !state.turn(model, round < rounds, reuse, rollout)? {
+                    break;
+                }
+            }
+            state.merge_report(report)
+        })();
+        state.workers.finish()?;
+        collected
+    })
+}
+
 #[cfg(all(
     test,
     feature = "cuda",
@@ -176,13 +301,51 @@ fn collect_with_operation(
     + Sync
     + Copy,
 ) -> Result<(), PpoError> {
-    validate_groups(config, groups, rounds)?;
+    collect_with_operation_mode(
+        model,
+        config,
+        groups,
+        rounds,
+        rollout,
+        report,
+        reuse_actor_values,
+        false,
+        operation,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn collect_with_operation_mode(
+    model: &PolicyModel,
+    config: PpoConfig,
+    groups: &mut [ActorGroup],
+    rounds: usize,
+    rollout: &mut PpoRollout,
+    report: &mut PpoSmokeReport,
+    reuse_actor_values: bool,
+    neural_opponent_batching: bool,
+    operation: impl Fn(usize, &mut TrainingEnvironment, StreamJob) -> Result<StreamReply, PpoError>
+    + Send
+    + Sync
+    + Copy,
+) -> Result<(), PpoError> {
+    validate_groups_for_inference(config, groups, rounds, neural_opponent_batching)?;
     let width = groups[0].environments.len();
     let group_count = groups.len();
+    let opponents = groups
+        .iter()
+        .map(|group| {
+            if neural_opponent_batching {
+                neural_opponent::OpponentBatch::new(model, &group.environments).map(Some)
+            } else {
+                Ok(None)
+            }
+        })
+        .collect::<Result<Vec<_>, PpoError>>()?;
     std::thread::scope(|scope| -> Result<(), PpoError> {
         let mut states = bounded_vec(group_count)?;
-        for group in groups {
-            states.push(GroupState::spawn(scope, group, operation)?);
+        for (group, opponent) in groups.iter_mut().zip(opponents) {
+            states.push(GroupState::spawn(scope, group, opponent, operation)?);
         }
         let collected = visit_groups(rounds, group_count, |index, sample| {
             states[index].turn(model, sample, reuse_actor_values, rollout)
@@ -206,16 +369,30 @@ fn collect_with_operation(
     rollout.canonicalize_actor_order(config, width)
 }
 
+#[cfg(test)]
 fn validate_groups(
     config: PpoConfig,
     groups: &[ActorGroup],
     rounds: usize,
+) -> Result<(), PpoError> {
+    validate_groups_for_inference(config, groups, rounds, false)
+}
+
+fn validate_groups_for_inference(
+    config: PpoConfig,
+    groups: &[ActorGroup],
+    rounds: usize,
+    neural: bool,
 ) -> Result<(), PpoError> {
     if !matches!(groups.len(), 2 | MAX_PIPELINE_GROUPS) || rounds == 0 || rounds > ACTOR_DECISIONS {
         return Err(PpoError::InvalidConfig("actor pipeline groups or rounds"));
     }
     let width = groups[0].environments.len();
     validate_pipeline_memory(config, width, groups.len())?;
+    if neural {
+        validate_neural_opponent_memory(config, width * groups.len())?;
+    }
+    let mut opponent_model = None;
     for (index, group) in groups.iter().enumerate() {
         if group.environments.len() != width
             || group.streams.len() != width
@@ -229,14 +406,28 @@ fn validate_groups(
         {
             return Err(PpoError::InvalidConfig("actor pipeline group streams"));
         }
-        if group
-            .environments
-            .iter()
-            .any(|world| matches!(world.opponent, OpponentRuntime::Policy { .. }))
-        {
-            return Err(PpoError::InvalidConfig(
-                "actor pipeline requires CPU opponents",
-            ));
+        for world in &group.environments {
+            match (&world.opponent, neural) {
+                (OpponentRuntime::Policy { model, .. }, true) => {
+                    if opponent_model.is_some_and(|expected| !Arc::ptr_eq(expected, model)) {
+                        return Err(PpoError::InvalidConfig(
+                            "actor pipeline opponent model mismatch",
+                        ));
+                    }
+                    opponent_model = Some(model);
+                }
+                (OpponentRuntime::Policy { .. }, false) => {
+                    return Err(PpoError::InvalidConfig(
+                        "actor pipeline requires CPU opponents",
+                    ));
+                }
+                (_, true) => {
+                    return Err(PpoError::InvalidConfig(
+                        "batched opponent requires neural worlds",
+                    ));
+                }
+                _ => {}
+            }
         }
     }
     Ok(())
@@ -278,6 +469,8 @@ struct GroupState<'scope> {
     random: &'scope mut [PpoRng],
     staged_random: Vec<PpoRng>,
     prepared: Vec<Option<(FeatureFrame, ActionSpace)>>,
+    opponent_prepared: Vec<Option<Box<neural_opponent::PreparedOpponent>>>,
+    opponent_batch: Option<neural_opponent::OpponentBatch>,
     active: Vec<usize>,
     pending: actor_values::PendingRound,
     terminals: Vec<(usize, CompletedAdvance)>,
@@ -291,36 +484,70 @@ impl<'scope> GroupState<'scope> {
     fn spawn(
         scope: &'scope std::thread::Scope<'scope, '_>,
         group: &'scope mut ActorGroup,
+        opponent: Option<neural_opponent::OpponentBatch>,
         operation: impl Fn(usize, &mut TrainingEnvironment, StreamJob) -> Result<StreamReply, PpoError>
         + Send
         + Sync
         + Copy
         + 'scope,
     ) -> Result<Self, PpoError> {
-        let width = group.environments.len();
-        assert_eq!(width, group.streams.len());
-        assert_eq!(width, group.random.len());
-        let stream_base = group.stream_base;
-        let name = format!("actor-pipe-{stream_base}");
-        let workers = StreamWorkers::spawn(
+        Self::spawn_parts(
             scope,
+            group.stream_base,
             &mut group.environments,
-            &name,
-            move |stream, world, job| operation(stream_base + stream, world, job),
-        )?;
+            &mut group.streams,
+            &mut group.random,
+            opponent,
+            operation,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_parts(
+        scope: &'scope std::thread::Scope<'scope, '_>,
+        stream_base: usize,
+        environments: &'scope mut [TrainingEnvironment],
+        streams: &'scope mut [EpisodeStream],
+        random: &'scope mut [PpoRng],
+        opponent: Option<neural_opponent::OpponentBatch>,
+        operation: impl Fn(usize, &mut TrainingEnvironment, StreamJob) -> Result<StreamReply, PpoError>
+        + Send
+        + Sync
+        + Copy
+        + 'scope,
+    ) -> Result<Self, PpoError> {
+        let width = environments.len();
+        assert_eq!(width, streams.len());
+        assert_eq!(width, random.len());
+        let name = format!("actor-pipe-{stream_base}");
+        let workers =
+            StreamWorkers::spawn(scope, environments, &name, move |stream, world, job| {
+                operation(stream_base + stream, world, job)
+            })?;
         let mut prepared = bounded_vec(width)?;
         prepared.resize_with(width, || None);
         let mut active = bounded_vec(width)?;
+        let mut opponent_prepared = bounded_vec(width)?;
+        opponent_prepared.resize_with(width, || None);
         active.extend(0..width);
         for &stream in &active {
-            workers.submit(stream, StreamJob::Prepare)?;
+            workers.submit(
+                stream,
+                if opponent.is_some() {
+                    StreamJob::PrepareNeural
+                } else {
+                    StreamJob::Prepare
+                },
+            )?;
         }
         Ok(Self {
             workers,
-            streams: &mut group.streams,
-            staged_random: group.random.clone(),
-            random: &mut group.random,
+            streams,
+            staged_random: random.to_vec(),
+            random,
             prepared,
+            opponent_prepared,
+            opponent_batch: opponent,
             active,
             pending: actor_values::PendingRound::new(width),
             terminals: bounded_vec(width)?,
@@ -342,15 +569,28 @@ impl<'scope> GroupState<'scope> {
             .zip(self.workers.receive(&self.active)?)
         {
             match reply {
-                StreamReply::Prepared(sample) if self.bootstrap => {
+                StreamReply::Prepared(sample)
+                    if self.bootstrap && self.opponent_batch.is_none() =>
+                {
                     self.prepared[stream] = Some(*sample)
+                }
+                StreamReply::PreparedNeural(sample, opponent)
+                    if self.bootstrap && self.opponent_batch.is_some() =>
+                {
+                    self.prepared[stream] = Some(*sample);
+                    self.opponent_prepared[stream] = Some(opponent);
                 }
                 StreamReply::Advanced(reply) if !self.bootstrap => {
                     let reply = *reply;
                     assert!(reply.value.is_none(), "single owner has no flush evaluator");
                     self.streams[stream] = reply.state;
                     self.prepared[stream] = reply.prepared.map(|sample| *sample);
+                    self.opponent_prepared[stream] = reply.opponent_prepared;
                     assert_eq!(self.prepared[stream].is_none(), self.streams[stream].done);
+                    assert_eq!(
+                        self.opponent_prepared[stream].is_some(),
+                        self.opponent_batch.is_some() && !self.streams[stream].done
+                    );
                     if self.streams[stream].done {
                         assert!(self.terminals.len() < self.streams.len());
                         self.terminals.push((stream, reply.completed));
@@ -403,6 +643,7 @@ impl<'scope> GroupState<'scope> {
         self.staged_random.clone_from_slice(self.random);
         let (choices, spaces) =
             sample_choices(model, &mut self.staged_random, &self.active, frames, spaces)?;
+        let mut opponents = self.sample_opponents()?.into_iter().flatten();
         self.pending.finish_sampled(
             self.streams,
             self.stream_base,
@@ -412,17 +653,38 @@ impl<'scope> GroupState<'scope> {
         )?;
         self.random.clone_from_slice(&self.staged_random);
         for ((&stream, choice), space) in self.active.iter().zip(choices).zip(spaces) {
+            let opponent = opponents.next().map(Box::new);
+            assert_eq!(opponent.is_some(), self.opponent_batch.is_some());
             self.workers.submit(
                 stream,
                 StreamJob::Advance {
                     state: std::mem::take(&mut self.streams[stream]),
                     choice,
                     space,
+                    opponent,
                 },
             )?;
         }
+        assert!(opponents.next().is_none());
         self.in_flight = true;
         Ok(true)
+    }
+
+    fn sample_opponents(
+        &mut self,
+    ) -> Result<Option<Vec<neural_opponent::OpponentChoice>>, PpoError> {
+        let Some(batch) = &self.opponent_batch else {
+            return Ok(None);
+        };
+        let mut inputs = bounded_vec(self.active.len())?;
+        for &stream in &self.active {
+            inputs.push(*self.opponent_prepared[stream].take().ok_or(
+                PpoError::InvalidTransition("missing prepared neural opponent"),
+            )?);
+        }
+        let choices = batch.sample(inputs)?;
+        assert_eq!(choices.len(), self.active.len());
+        Ok(Some(choices))
     }
 
     fn merge_report(&self, target: &mut PpoSmokeReport) -> Result<(), PpoError> {

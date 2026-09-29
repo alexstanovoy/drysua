@@ -1,5 +1,33 @@
 use crate::{MasteryConfig, MasteryProgress, MasteryStage, TrainingGameOutcome as Outcome};
 
+#[cfg(feature = "side-actors")]
+#[test]
+fn side_actor_model_and_linked_training_identities_have_distinct_m25_goldens() {
+    assert_eq!(
+        (crate::MODEL_SCHEMA_VERSION, crate::MODEL_SCHEMA_HASH),
+        (25, 17_285_410_362_008_731_380)
+    );
+    assert_eq!(
+        (crate::PPO_SCHEMA_VERSION, crate::PPO_SCHEMA_HASH),
+        (37, 16_589_653_264_490_481_953)
+    );
+    assert_eq!(
+        (
+            crate::CHECKPOINT_SCHEMA_VERSION,
+            crate::CHECKPOINT_SCHEMA_HASH
+        ),
+        (12, 12_982_760_569_971_282_030)
+    );
+    assert_eq!(
+        (crate::LEAGUE_SCHEMA_VERSION, crate::LEAGUE_SCHEMA_HASH),
+        (37, 3_968_032_957_249_661_993)
+    );
+    assert_eq!(crate::MODEL_PARAMETER_COUNT, 1_812_983);
+    assert_eq!(crate::FEATURE_SCHEMA_HASH, 10_552_563_335_950_731_440);
+    assert_eq!(crate::ACTION_SCHEMA_HASH, 10_658_390_830_565_586_343);
+    assert_eq!(crate::MAP2_REWARD_SCHEMA_HASH, 7_274_660_837_025_042_530);
+}
+
 #[test]
 fn mastery_counter_upper_boundary_rejects_next_game_without_mutation() {
     let config = MasteryConfig::new(1, 100, &[]).expect("config");
@@ -34,6 +62,7 @@ fn mastery_counter_upper_boundary_rejects_next_game_without_mutation() {
 }
 
 #[test]
+#[cfg(not(feature = "side-actors"))]
 fn mastery_codec_is_retained_with_exact_reward5_linked_identities_and_appended_inputs() {
     assert_eq!(
         (crate::ACTION_SCHEMA_VERSION, crate::ACTION_SCHEMA_HASH),

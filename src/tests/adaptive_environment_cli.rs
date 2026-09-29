@@ -61,6 +61,10 @@ fn missing_checkpoint_metrics_fixture() {
         checkpoint.to_str().unwrap(),
         "--metrics-directory",
         metrics.to_str().unwrap(),
+        // The resume scope cannot supply a seed for a bogus directory, so this
+        // metrics-ordering test names one explicitly.
+        "--seed",
+        "9001",
     ])
     .unwrap();
     let Some(Operation::TrainAnnealed(arguments)) = parsed.operation else {

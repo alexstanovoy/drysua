@@ -541,7 +541,7 @@ fn stop_model() -> PolicyModel {
     let mut parameters = vec![0.0; crate::MODEL_PARAMETER_COUNT];
     let mut offset = 0;
     for (name, shape) in model.parameter_schema().expect("schema") {
-        if name == "kind.bias" {
+        if matches!(name, "kind.bias" | "dire.kind.bias") {
             parameters[offset + ActionKind::Stop.index()] = 100.0;
         }
         offset += shape.iter().product::<usize>();

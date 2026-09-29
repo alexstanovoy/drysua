@@ -7,6 +7,7 @@ pub use annealed::{
     run_annealed_job_on_with_initial_weights,
 };
 pub(crate) mod episode;
+mod neural_opponent;
 mod parallel;
 mod reward;
 pub use reward::Map2TrainingReward;
@@ -15,6 +16,9 @@ pub use reward::Map2TrainingReward;
 mod test_support;
 #[cfg(test)]
 pub(crate) use test_support::*;
+#[cfg(all(test, feature = "side-actors"))]
+#[path = "tests/m25_evaluation.rs"]
+mod m25_evaluation_tests;
 #[cfg(test)]
 #[path = "tests/training_order_contract.rs"]
 pub(crate) mod training_order_contract;
@@ -979,11 +983,13 @@ impl TrainingSession {
         run: CheckpointRun,
         provenance: ResumeProvenance,
     ) -> Result<Self, PpoError> {
-        let model = PolicyModel::fresh_on(run.run_seed, device).map_err(text_error)?;
-        if !resume && let Some(initial_weights_directory) = initial_weights_directory {
-            TrainingArtifact::load_runtime_weights(&model, initial_weights_directory)
-                .map_err(text_error)?;
-        }
+        let model = match (resume, initial_weights_directory) {
+            (false, Some(directory)) => {
+                TrainingArtifact::initialize_from_weights(directory, run.run_seed, device)
+                    .map_err(text_error)?
+            }
+            _ => PolicyModel::fresh_on(run.run_seed, device).map_err(text_error)?,
+        };
         let restored = if resume {
             restore_training_session(&model, directory, &run, config, provenance)?
         } else {
@@ -2451,6 +2457,68 @@ fn encode_next_frame(environment: &mut TrainingEnvironment) -> Result<FeatureFra
         )
         .map_err(text_error)?;
     Ok(frame)
+}
+
+fn requests_for_prepared_opponent(
+    environment: &mut TrainingEnvironment,
+    choice: &PpoPolicyChoice,
+    space: &ActionSpace,
+    opponent: neural_opponent::OpponentChoice,
+) -> Result<Vec<Option<Request>>, PpoError> {
+    if environment.seats.len() != 2 || environment.policy_seat > 1 {
+        return Err(PpoError::InvalidTransition(
+            "prepared opponent requires two valid seats",
+        ));
+    }
+    let OpponentRuntime::Policy { model, rng } = &mut environment.opponent else {
+        return Err(PpoError::InvalidTransition(
+            "prepared opponent requires neural policy",
+        ));
+    };
+    if !Arc::ptr_eq(model, &opponent.model) {
+        return Err(PpoError::InvalidTransition(
+            "prepared opponent model allocation mismatch",
+        ));
+    }
+    if *rng != opponent.before {
+        return Err(PpoError::InvalidTransition("prepared opponent RNG changed"));
+    }
+    if !choice.frame.matches_action_space(space) {
+        return Err(PpoError::InvalidTransition("prepared actor action space"));
+    }
+    if !opponent.choice.frame.matches_action_space(&opponent.space) {
+        return Err(PpoError::InvalidTransition(
+            "prepared opponent action space mismatch",
+        ));
+    }
+    for (index, seat) in environment.seats.iter().enumerate() {
+        let prepared = if index == environment.policy_seat {
+            space
+        } else {
+            &opponent.space
+        };
+        if !prepared.matches_tracker(&seat.tracker) || !prepared.matches_readiness(&seat.readiness)
+        {
+            return Err(PpoError::InvalidTransition(
+                "prepared neural decision seat changed",
+            ));
+        }
+    }
+    let mut requests = Vec::with_capacity(2);
+    for index in 0..environment.seats.len() {
+        let (choice, space) = if index == environment.policy_seat {
+            (choice, space)
+        } else {
+            (&opponent.choice, &opponent.space)
+        };
+        requests.push(policy_request_in_space(
+            &mut environment.seats[index],
+            choice,
+            space,
+        )?);
+    }
+    *rng = opponent.after;
+    Ok(requests)
 }
 
 fn requests_for_decision_in_space(

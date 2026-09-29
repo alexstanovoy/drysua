@@ -97,7 +97,24 @@ fn assert_training_shapes_and_backward(source: &PolicyModel, frames: &[FeatureFr
     for (gradient, (name, shape)) in gradients.iter().zip(schema) {
         assert_eq!(gradient.name(), name);
         assert_eq!(gradient.parameter_shape(), shape);
-        assert_eq!(gradient.gradient_shape(), Some(shape.as_slice()));
+        match gradient.gradient_shape() {
+            Some(actual) => assert_eq!(actual, shape.as_slice()),
+            None => assert!(
+                cfg!(feature = "side-actors") && name.starts_with("dire."),
+                "Radiant fixture must differentiate {name}"
+            ),
+        }
+        if cfg!(feature = "side-actors")
+            && name.starts_with("dire.")
+            && let Some(tensor) = gradient.gradient()
+        {
+            let values = tensor
+                .flatten_all()
+                .expect("flat inactive gradient")
+                .to_vec1::<f32>()
+                .expect("inactive gradient");
+            assert!(values.iter().all(|value| *value == 0.0), "inactive {name}");
+        }
     }
 }
 
@@ -169,7 +186,7 @@ fn invalid_frames_and_extreme_parameters_fail_without_nonfinite_predictions() {
     );
     assert_eq!(
         model
-            .choose(&FeatureFrame::new(), &space)
+            .choose(&test_frame(), &space)
             .expect_err("unbound frame")
             .to_string(),
         "model feature frame does not belong to the supplied action space"
@@ -193,7 +210,7 @@ fn invalid_frames_and_extreme_parameters_fail_without_nonfinite_predictions() {
 #[test]
 fn absent_tokens_cannot_inject_garbage_into_predictions() {
     let model = PolicyModel::fresh(2).expect("model");
-    let clean = FeatureFrame::new();
+    let clean = test_frame();
     let mut garbage = clean.clone();
     garbage.units[7][1..].fill(900.0);
     garbage.abilities[5][1..].fill(-700.0);
@@ -209,7 +226,7 @@ fn absent_tokens_cannot_inject_garbage_into_predictions() {
 #[test]
 fn fresh_heads_are_unsaturated_and_pointer_scaling_has_the_expected_gradient() {
     let model = PolicyModel::fresh(503).expect("model");
-    let frames = [FeatureFrame::new()];
+    let frames = [test_frame()];
     let prefixes = [TrainingPrefix::new(ActionKind::Continue, None, None)];
     let output = model.training_forward(&frames, &prefixes).expect("forward");
     for head in [
@@ -542,4 +559,15 @@ fn sampled_examples(model: &PolicyModel, count: usize) -> Vec<PpoPreparedSample>
             super::ppo::prepared_choice(index, choice)
         })
         .collect()
+}
+
+fn test_frame() -> FeatureFrame {
+    let frame = FeatureFrame::new();
+    #[cfg(feature = "side-actors")]
+    let frame = {
+        let mut frame = frame;
+        frame.global[crate::global_feature::SIDE_RADIANT] = 1.0;
+        frame
+    };
+    frame
 }

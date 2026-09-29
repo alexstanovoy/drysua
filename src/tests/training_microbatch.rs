@@ -43,7 +43,7 @@ fn cuda_training_microbatch_modes_preserve_within_mode_state_and_uneven_tails() 
 #[test]
 fn internal_training_bound_is_256_but_public_forward_and_actor_stay_64() {
     let model = PolicyModel::fresh(9101).expect("model");
-    let frames = vec![FeatureFrame::new(); 257];
+    let frames = vec![test_frame(); 257];
     let prefixes = vec![TrainingPrefix::new(ActionKind::Continue, None, None); 257];
     assert_eq!(
         validate_ppo_training_batch(&frames, &prefixes)
@@ -94,11 +94,13 @@ fn internal_training_checks_finite_frames_and_all_unused_output_heads() {
     let examples = samples.iter().collect::<Vec<_>>();
     let error = model
         .ppo_candidate_kl_locked(&examples, transfer_ppo_config(), 128, false)
-        .expect_err("all 13 outputs checked");
-    assert_eq!(
-        error.to_string(),
+        .expect_err("all raw outputs checked");
+    let message = if cfg!(feature = "side-actors") {
+        "model radiant.item output at batch 0 index 0 is non-finite"
+    } else {
         "model item output at batch 0 index 0 is non-finite"
-    );
+    };
+    assert_eq!(error.to_string(), message);
 }
 
 fn samples(model: &PolicyModel, count: usize, microbatch: usize) -> Vec<PpoPreparedSample> {

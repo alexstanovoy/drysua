@@ -13,6 +13,9 @@ use std::time::Instant;
 mod actor;
 #[path = "../tests/cuda_graph_actor.rs"]
 mod actor_tests;
+#[cfg(feature = "side-actors")]
+#[path = "cuda_kind_stage.rs"]
+mod kind_stage;
 pub(super) use actor::sample_selection;
 pub(crate) use actor::{
     ActorGraphStats, actor_graph_stats_for_test, check_owner, parse_graph_mode,
@@ -126,6 +129,10 @@ fn shape_frames(batch: usize, shift: f32) -> Vec<FeatureFrame> {
     (0..batch)
         .map(|row| {
             let mut frame = FeatureFrame::new();
+            #[cfg(feature = "side-actors")]
+            {
+                frame.global[crate::global_feature::SIDE_RADIANT] = 1.0;
+            }
             frame.global[0] = row as f32 / batch as f32 + shift;
             frame.units[0][unit_feature::TOKEN_PRESENT] = 1.0;
             frame.units[0][unit_feature::KIND_TOKEN] = if shift == 0.0 { 1.0 } else { 2.0 };
@@ -188,21 +195,27 @@ fn capture_once(
     outputs: &[Var; 3],
     stream: &Arc<CudaStream>,
 ) -> CudaGraph {
-    let cuda = required(model.tensor_device().as_cuda_device(), "capture device");
-    let _lock = required(model.read_parameter_lock(), "capture parameter lock");
     required(
         actor::authorize_shape(model, inputs.batch, true),
         "shape capture admission",
     );
+    capture_tensor_body(model, stream, || eager_into(model, inputs, outputs))
+}
+
+fn capture_tensor_body(
+    model: &PolicyModel,
+    stream: &Arc<CudaStream>,
+    operation: impl FnOnce() -> Result<(), ModelError>,
+) -> CudaGraph {
+    let cuda = required(model.tensor_device().as_cuda_device(), "capture device");
+    let _lock = required(model.read_parameter_lock(), "capture parameter lock");
     let _cache = cuda.enable_cuda_graph_htod_cache();
     required(stream.synchronize(), "warmup completion");
     required(
         stream.begin_capture(sys::CUstreamCaptureMode::CU_STREAM_CAPTURE_MODE_THREAD_LOCAL),
         "begin capture",
     );
-    let body = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        eager_into(model, inputs, outputs)
-    }));
+    let body = std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation));
     // End capture even after a body error/panic; never retry an invalid or unknown stream.
     let ended = stream.end_capture(
         sys::CUgraphInstantiate_flags::CUDA_GRAPH_INSTANTIATE_FLAG_AUTO_FREE_ON_LAUNCH,
@@ -220,8 +233,8 @@ fn capture_once(
         fatal("stream remained in capture after end_capture");
     }
     match body {
-        Ok(result) => required(result, "capture encoder body"),
-        Err(_) => fatal("encoder body panicked during capture; no replay"),
+        Ok(result) => required(result, "capture tensor body"),
+        Err(_) => fatal("tensor body panicked during capture; no replay"),
     }
     required(graph.upload(), "graph upload");
     required(stream.synchronize(), "graph upload completion");

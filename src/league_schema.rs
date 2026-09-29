@@ -8,7 +8,8 @@ pub const LEAGUE_SCHEMA_VERSION: u32 = 37;
 /// Audited simulator and learner rules required by stage-ten league artifacts.
 pub const LEAGUE_RULES_AUDIT_VERSION: u32 = 32;
 /// Canonical stage-ten frozen-policy, scheduling, retention, and promotion contract.
-pub const LEAGUE_SCHEMA_DESCRIPTOR: &str = concat!(
+macro_rules! league_schema_descriptor {
+    ($contract:literal) => { concat!(
     "bota-drysua-league/v37;",
     "linked_schemas=action,feature,model,ppo,map2_reward;linked_hash=fnv1a_descriptor_then_ordered_version_le32_hash_le64_then_map2_reward_descriptor_utf8;rules_audit=32;",
     "scope=map2_mid_only_second_hero_death_or_first_tower_loss_simultaneous_draw_cap27900_including900_pregame;reward=linked_map2_reward_schema_version_hash_and_full_descriptor;observations=Guarded13_Inspired14_Shadowraze15_Healed_hp_mana_manual_reports_not_confirmed_tickregen;",
@@ -19,7 +20,16 @@ pub const LEAGUE_SCHEMA_DESCRIPTOR: &str = concat!(
     "evaluation=held_out_seed_disjoint,paired_radiant_and_dire,min20,max512,authoritative_map2_win_required,draw_and_task_timecap_nonwins,infrastructure_failures_invalidate,timeout_rejected,min_actions1000,rejections_below0.001,weak_loss_and_stall_rejected;",
     "exploit_audit=separate_seed_namespace,min2_pairs,min100_actions,timeout_rejected,nonnegative_each_side,rejections_below0.001;",
     "promotion=opaque_paired_evidence_and_exploit_audit,positive_combined_score,nonnegative_each_side,training_reward_excluded;",
+    $contract
+    ) };
+}
+#[cfg(not(feature = "side-actors"))]
+pub const LEAGUE_SCHEMA_DESCRIPTOR: &str = league_schema_descriptor!(
     "current_contract=feature22_model24_ppo37_reward7_win.2_loss_neg.2_draw0_completed_taskcap_neg.2_win_only_victory_time_bonus;mastery_training_gate_is_not_league_qualification;explicit_pinned_parameter_initialization_fresh_mastery_progress_no_equivalence;"
+);
+#[cfg(feature = "side-actors")]
+pub const LEAGUE_SCHEMA_DESCRIPTOR: &str = league_schema_descriptor!(
+    "current_contract=feature22_model25_side_actors_ppo37_reward7_win.2_loss_neg.2_draw0_completed_taskcap_neg.2_win_only_victory_time_bonus;mastery_training_gate_is_not_league_qualification;initialization=only_pinned_m24u428_fresh_state;older_initialization_paths_unsupported;no_equivalence;"
 );
 
 /// FNV-1a of the descriptor, ordered linked identities, and reward descriptor.
@@ -39,6 +49,13 @@ pub const LEAGUE_SCHEMA_HASH: u64 = crate::model::linked_schema_hash(
 
 const _: () = assert!(ACTION_SCHEMA_VERSION == 5);
 const _: () = assert!(FEATURE_SCHEMA_VERSION == 22);
-const _: () = assert!(MODEL_SCHEMA_VERSION == 24);
+const _: () = assert!(
+    MODEL_SCHEMA_VERSION
+        == if cfg!(feature = "side-actors") {
+            25
+        } else {
+            24
+        }
+);
 const _: () = assert!(PPO_SCHEMA_VERSION == 37);
 const _: () = assert!(LEAGUE_RULES_AUDIT_VERSION == crate::PPO_RULES_AUDIT_VERSION);

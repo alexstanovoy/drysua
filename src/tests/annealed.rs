@@ -19,6 +19,10 @@ mod concurrency_tests;
 mod graph_full_update;
 #[path = "annealed_invocation.rs"]
 mod invocation_tests;
+#[path = "neural_opponent_scope.rs"]
+mod neural_opponent_scope;
+#[path = "annealed_seed.rs"]
+mod seed_tests;
 #[path = "training_microbatch_scope.rs"]
 mod training_microbatch_scope;
 

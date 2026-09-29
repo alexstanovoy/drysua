@@ -1,0 +1,28 @@
+{
+  "schema": 1,
+  "trainer": "/absolute/path/to/new-side-actors-cuda/drysua",
+  "initial_weights": "/absolute/path/to/frozen-M25U100/drysua.weights.safetensors",
+  "opponent_weights": "/absolute/path/to/frozen-M25U100/drysua.weights.safetensors",
+  "workspace_root": "/home/alexstanovoy/Workspace/bots/drysua",
+  "total_updates": 200,
+  "invocation_updates": 1,
+  "invocation_seconds": 235,
+  "max_seconds": 86400,
+  "history_every": 20,
+  "mode": "gpu",
+  "docker_context": "rootless",
+  "image": "replace-with-image@sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "gpu_uuid": "GPU-00000000-0000-0000-0000-000000000000",
+  "lock_paths": ["/home/alexstanovoy/Workspace/bots/drysua/heavy.lock"],
+  "training_args": [
+    "--games", "40",
+    "--parallel", "20",
+    "--actor-pipeline-groups", "1",
+    "--training-microbatch", "256",
+    "--reuse-actor-values=true",
+    "--seed", "9001",
+    "--generation-games", "160",
+    "--zero-updates", "40",
+    "--environment-schedule", "adaptive"
+  ]
+}

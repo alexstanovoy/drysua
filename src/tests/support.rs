@@ -7,15 +7,19 @@ use std::collections::VecDeque;
 
 use bota_proto::{EntityId, Order, ServerMsg};
 
-use crate::{CheckpointRun, PolicyModel, Wire};
+#[cfg(not(feature = "side-actors"))]
+use crate::CheckpointRun;
+use crate::{PolicyModel, Wire};
 
 /// Git and simulator provenance variable names for one test family.
+#[cfg(not(feature = "side-actors"))]
 pub(crate) struct ProvenanceVariables {
     pub(crate) source: &'static str,
     pub(crate) simulator: &'static str,
 }
 
 /// The training-job utilities read the compiled command-line embedded revisions.
+#[cfg(not(feature = "side-actors"))]
 pub(crate) const TRAINING_PROVENANCE: ProvenanceVariables = ProvenanceVariables {
     source: "DRYSUA_GIT_COMMIT",
     simulator: "BOTA_GIT_COMMIT",
@@ -46,6 +50,7 @@ impl Wire for RecordingWire {
 }
 
 /// Builds the strict run identity shared by every pinned source utility.
+#[cfg(not(feature = "side-actors"))]
 pub(crate) fn initialization_run(
     seed: u64,
     batch_size: usize,
@@ -73,7 +78,14 @@ pub(crate) fn initialization_run(
 pub(crate) fn assert_frozen_schema_versions() {
     assert_eq!(crate::ACTION_SCHEMA_VERSION, 5);
     assert_eq!(crate::FEATURE_SCHEMA_VERSION, 22);
-    assert_eq!(crate::MODEL_SCHEMA_VERSION, 24);
+    assert_eq!(
+        crate::MODEL_SCHEMA_VERSION,
+        if cfg!(feature = "side-actors") {
+            25
+        } else {
+            24
+        }
+    );
     assert_eq!(crate::PPO_SCHEMA_VERSION, 37);
     assert_eq!(crate::PPO_RULES_AUDIT_VERSION, 32);
 }

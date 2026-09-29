@@ -80,7 +80,7 @@ fn assert_backward_readback(device: PolicyDevice) {
     let model = PolicyModel::fresh_on(9_102, device).expect("model");
     let output = model
         .training_forward(
-            &[FeatureFrame::new()],
+            &[test_frame()],
             &[TrainingPrefix::new(ActionKind::Continue, None, None)],
         )
         .expect("forward");
@@ -106,6 +106,17 @@ fn assert_backward_readback(device: PolicyDevice) {
         &expected,
     );
     assert_bits(&collect_host_gradients(named).expect("selected"), &expected);
+}
+
+fn test_frame() -> FeatureFrame {
+    let frame = FeatureFrame::new();
+    #[cfg(feature = "side-actors")]
+    let frame = {
+        let mut frame = frame;
+        frame.global[crate::global_feature::SIDE_RADIANT] = 1.0;
+        frame
+    };
+    frame
 }
 
 fn transfer_ppo_config() -> PpoConfig {

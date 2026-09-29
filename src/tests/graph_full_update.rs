@@ -382,6 +382,7 @@ fn gate_settings(main_batch: usize, actor_groups: usize) -> AnnealedJobConfig {
         training_microbatch: 256,
         host_math_workers: 1,
         balanced_minibatches: false,
+        ..Default::default()
     };
     options
 }

@@ -5,6 +5,9 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 mod test_support;
 #[cfg(test)]
 pub(crate) use test_support::*;
+#[cfg(test)]
+#[path = "tests/checkpoint_inspection_cli.rs"]
+mod checkpoint_inspection_tests;
 
 /// Drysua command line arguments.
 #[derive(Parser)]
@@ -21,6 +24,8 @@ struct Cli {
 /// Drysua operations.
 #[derive(Subcommand)]
 enum Operation {
+    /// Inspect a validated checkpoint or this build's contract as bounded read-only JSON.
+    CheckpointInspect(CheckpointInspectArgs),
     /// Serve persistent training metrics without starting a learner.
     MetricsServe(MetricsServeArgs),
     /// Passively score copied native participant frames from stdin; never sends orders or ACKs.
@@ -33,6 +38,20 @@ enum Operation {
     TrainFull(TrainFullArgs),
     /// Run the annealed domain-randomization loop with a frozen opponent.
     TrainAnnealed(TrainAnnealedArgs),
+}
+
+#[derive(Args)]
+struct CheckpointInspectArgs {
+    /// Existing checkpoint directory; never creates, repairs, locks, or changes files.
+    #[arg(
+        long,
+        required_unless_present = "contract",
+        conflicts_with = "contract"
+    )]
+    checkpoint_directory: Option<std::path::PathBuf>,
+    /// Describe this build's model and checkpoint identities without reading a checkpoint.
+    #[arg(long, conflicts_with = "checkpoint_directory")]
+    contract: bool,
 }
 
 #[derive(Args)]
@@ -192,6 +211,12 @@ enum AnnealedOpponentArg {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum OpponentInferenceArg {
+    Batched,
+    Scalar,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum EnvironmentScheduleArg {
     Adaptive,
     Fixed,
@@ -218,7 +243,7 @@ struct TrainAnnealedArgs {
     /// Reuse next-actor bootstrap values; may change PPO numerics, recorded in checkpoint scope.
     #[arg(long, default_value_t = true, action = clap::ArgAction::Set, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
     reuse_actor_values: bool,
-    /// Actor groups per wave (1/2/4); two or four require Teacher, at most 64 live worlds, and whole waves per update.
+    /// Actor groups per wave (1/2/4); multiple groups require Teacher or batched weights, at most 64 live worlds, and whole waves per update.
     #[arg(long, default_value_t = 2, value_parser = crate::training_execution::parse_actor_pipeline_groups)]
     actor_pipeline_groups: u8,
     /// Total PPO updates; each may perform multiple Adam minibatch steps.
@@ -264,9 +289,12 @@ struct TrainAnnealedArgs {
     /// Strict runtime weights directory for a frozen weights opponent.
     #[arg(long)]
     opponent_weights: Option<std::path::PathBuf>,
-    /// Deterministic run seed.
-    #[arg(long, default_value_t = 9_001)]
-    seed: u64,
+    /// Weights-opponent sampling mode; batched changes numerics and checkpoint scope. Ignored for Teacher.
+    #[arg(long, value_enum, default_value_t = OpponentInferenceArg::Batched)]
+    opponent_inference: OpponentInferenceArg,
+    /// Run seed; a fresh run without it draws a random seed, and resume adopts the recorded one.
+    #[arg(long)]
+    seed: Option<u64>,
     /// Learner tensor backend; actors and simulation remain on CPU.
     #[arg(long, value_enum, default_value_t = LearnerDevice::Cpu)]
     device: LearnerDevice,
@@ -319,6 +347,7 @@ pub fn run_from_env() -> std::io::Result<()> {
 
 fn run(arguments: Cli) -> std::io::Result<()> {
     let play = match arguments.operation {
+        Some(Operation::CheckpointInspect(inspect)) => return run_checkpoint_inspect(inspect),
         Some(Operation::MetricsServe(serve)) => {
             return crate::telemetry::prometheus::serve_directory(
                 serve.metrics_directory,
@@ -368,6 +397,25 @@ fn run(arguments: Cli) -> std::io::Result<()> {
         outcome.rejections
     );
     Ok(())
+}
+
+fn run_checkpoint_inspect(arguments: CheckpointInspectArgs) -> std::io::Result<()> {
+    use std::io::Write;
+    let bytes = if arguments.contract {
+        crate::checkpoint_inspection_contract()
+    } else {
+        let directory = arguments.checkpoint_directory.as_deref().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "checkpoint-inspect requires --checkpoint-directory or --contract",
+            )
+        })?;
+        crate::checkpoint_inspect(directory)
+    }
+    .map_err(std::io::Error::other)?;
+    let mut stdout = std::io::stdout().lock();
+    stdout.write_all(&bytes)?;
+    stdout.flush()
 }
 
 fn resolve_play_deployment(
@@ -499,6 +547,17 @@ fn run_train_annealed_with_settings(
         .map_err(std::io::Error::other)?;
     }
     let metrics = arguments.metrics.start()?;
+    if arguments.seed.is_none() {
+        eprintln!(
+            "annealed: seed {} resolved from {}; recorded in the run scope",
+            settings.seed,
+            if arguments.checkpoint.resume {
+                "the resumed run scope"
+            } else {
+                "the operating system random source"
+            },
+        );
+    }
     eprintln!(
         "annealed: updates={} games={} parallel={} generation_games={} zero_updates={} seed={} opponent={:?}",
         settings.updates,
@@ -780,6 +839,8 @@ impl TrainAnnealedArgs {
                 actor_pipeline_groups: usize::from(self.actor_pipeline_groups),
                 balanced_minibatches: self.balanced_minibatches,
                 host_math_workers: usize::from(self.host_math_workers),
+                neural_opponent_batching: self.opponent == AnnealedOpponentArg::Weights
+                    && self.opponent_inference == OpponentInferenceArg::Batched,
                 training_microbatch: self.training_microbatch,
                 reuse_actor_values: self.reuse_actor_values,
             },
@@ -789,13 +850,37 @@ impl TrainAnnealedArgs {
             parallel_worlds: self.parallel,
             games_per_generation: self.generation_games,
             zero_updates,
-            seed: self.seed,
+            seed: self.resolved_seed()?,
             opponent,
             ppo,
             checkpoint_cadence: self.checkpoint.cadence(),
             git_commit,
             simulator_commit,
         })
+    }
+
+    /// The resolved run seed: explicit, adopted from the recorded resume scope,
+    /// or freshly random. Adoption is what lets `resume` omit `--seed` without
+    /// silently changing every derived stream.
+    fn resolved_seed(&self) -> std::io::Result<u64> {
+        let Some(seed) = self.seed else {
+            if self.checkpoint.resume {
+                let run = crate::TrainingArtifact::load_run_scope(
+                    &self.checkpoint.checkpoint_directory,
+                )
+                .map_err(|error| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "train-annealed resume without --seed needs the recorded run scope: {error}"
+                        ),
+                    )
+                })?;
+                return Ok(run.run_seed);
+            }
+            return random_run_seed();
+        };
+        Ok(seed)
     }
 
     fn frozen_opponent(&self) -> std::io::Result<crate::AnnealedOpponent> {
@@ -816,13 +901,96 @@ impl TrainAnnealedArgs {
     }
 }
 
+/// Fresh runs without an explicit seed draw from the operating system instead
+/// of a shared constant, so two campaigns never replay identical trajectories.
+#[cfg(feature = "builtin")]
+fn random_run_seed() -> std::io::Result<u64> {
+    #[cfg(unix)]
+    {
+        use std::io::Read;
+        let mut bytes = [0_u8; 8];
+        std::fs::File::open("/dev/urandom")
+            .and_then(|mut source| source.read_exact(&mut bytes))
+            .map_err(|error| {
+                std::io::Error::new(
+                    error.kind(),
+                    format!("train-annealed random seed needs /dev/urandom: {error}"),
+                )
+            })?;
+        Ok(u64::from_le_bytes(bytes))
+    }
+    #[cfg(not(unix))]
+    {
+        // Best effort without a dependency: splitmix64 mixes the wall clock with
+        // the process id so two fresh runs on one host do not share a seed.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|error| {
+                std::io::Error::other(format!("train-annealed random seed clock: {error}"))
+            })?
+            .as_nanos() as u64;
+        let mut mixed = nanos ^ (u64::from(std::process::id()) << 32);
+        mixed = mixed.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        mixed = (mixed ^ (mixed >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        Ok(mixed ^ (mixed >> 31))
+    }
+}
+
 #[cfg(all(test, feature = "builtin"))]
 pub(crate) fn annealed_settings_for_test(
     overrides: &[&str],
 ) -> std::io::Result<crate::AnnealedJobConfig> {
-    let mut arguments = vec!["drysua", "train-annealed", "--checkpoint-directory", "."];
+    let mut arguments = vec!["--checkpoint-directory", "."];
+    if !requests_seed(overrides) {
+        // Unit tests keep the historical explicit seed; only a real run omits it.
+        arguments.extend(["--seed", TEST_ANNEALED_SEED]);
+    }
     arguments.extend_from_slice(overrides);
-    let cli = Cli::try_parse_from(arguments).map_err(std::io::Error::other)?;
+    annealed_settings_from_arguments(&arguments)
+}
+
+/// Parses fresh train-annealed settings exactly as production does, so a test
+/// can observe the random default seed.
+#[cfg(all(test, feature = "builtin"))]
+pub(crate) fn annealed_settings_for_test_without_seed(
+    overrides: &[&str],
+) -> std::io::Result<crate::AnnealedJobConfig> {
+    let mut arguments = vec!["--checkpoint-directory", "."];
+    arguments.extend_from_slice(overrides);
+    annealed_settings_from_arguments(&arguments)
+}
+
+/// Parses resume settings against one checkpoint directory; the adopted seed
+/// comes from the recorded scope unless an override names one.
+#[cfg(all(test, feature = "builtin"))]
+pub(crate) fn annealed_resume_settings_for_test(
+    directory: &std::path::Path,
+    overrides: &[&str],
+) -> std::io::Result<crate::AnnealedJobConfig> {
+    let checkpoint = directory.to_str().expect("utf8 test directory");
+    let mut arguments = vec!["--checkpoint-directory", checkpoint, "--resume"];
+    arguments.extend_from_slice(overrides);
+    annealed_settings_from_arguments(&arguments)
+}
+
+#[cfg(all(test, feature = "builtin"))]
+const TEST_ANNEALED_SEED: &str = "9001";
+
+#[cfg(all(test, feature = "builtin"))]
+fn requests_seed(overrides: &[&str]) -> bool {
+    overrides
+        .iter()
+        .any(|argument| *argument == "--seed" || argument.starts_with("--seed="))
+}
+
+#[cfg(all(test, feature = "builtin"))]
+fn annealed_settings_from_arguments(
+    arguments: &[&str],
+) -> std::io::Result<crate::AnnealedJobConfig> {
+    let mut full = vec!["drysua", "train-annealed"];
+    full.extend_from_slice(arguments);
+    let cli = Cli::try_parse_from(full).map_err(std::io::Error::other)?;
     let Some(Operation::TrainAnnealed(train)) = cli.operation else {
         unreachable!("train-annealed arguments");
     };

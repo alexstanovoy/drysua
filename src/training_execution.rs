@@ -9,6 +9,8 @@ pub struct TrainingExecutionOptions {
     pub balanced_minibatches: bool,
     /// Local folding-worker ceiling; one retains the historical serial path.
     pub host_math_workers: usize,
+    /// Batch frozen neural-opponent sampling in the annealed collector; changes inference numerics.
+    pub neural_opponent_batching: bool,
     /// Tensor rows per PPO forward/backward and candidate-KL pass, independent of actor batching.
     /// Values above 64 change GEMM and floating reduction grouping and require a new run scope.
     pub training_microbatch: usize,
@@ -23,6 +25,7 @@ impl Default for TrainingExecutionOptions {
             actor_pipeline_groups: 1,
             balanced_minibatches: false,
             host_math_workers: 1,
+            neural_opponent_batching: false,
             training_microbatch: 64,
             reuse_actor_values: false,
         }
@@ -98,6 +101,9 @@ impl TrainingExecutionOptions {
                 " --training-microbatch {}",
                 self.training_microbatch
             ));
+        }
+        if self.neural_opponent_batching {
+            command.push_str(" --opponent-inference batched");
         }
     }
 }

@@ -205,19 +205,28 @@ fn assert_dispatch_errors(device: PolicyDevice) {
     for eager in [false, true] {
         let operation = || {
             let mut random = [PpoRng::new(seed_for_kind(ActionKind::Continue))];
-            let choice = model
-                .sample_batch(&frames[..1], &spaces[..1], &mut random)
-                .expect("unused overflow");
-            assert_eq!(choice[0].action().kind(), ActionKind::Continue);
+            let before = random.clone();
+            let choice = model.sample_batch(&frames[..1], &spaces[..1], &mut random);
+            if cfg!(feature = "side-actors") && eager {
+                assert_eq!(
+                    choice
+                        .expect_err("forced eager family is checked")
+                        .to_string(),
+                    controlled_overflow()
+                );
+                assert_eq!(random, before);
+            } else {
+                assert_eq!(
+                    choice.expect("skipped overflow")[0].action().kind(),
+                    ActionKind::Continue
+                );
+            }
             let mut random = [PpoRng::new(seed_for_kind(ActionKind::Cast))];
             let before = random.clone();
             let error = model
                 .sample_batch(&frames[..1], &spaces[..1], &mut random)
                 .expect_err("masked courier logit");
-            assert_eq!(
-                error.to_string(),
-                "model controlled output at batch 0 index 1 is non-finite"
-            );
+            assert_eq!(error.to_string(), controlled_overflow());
             assert_eq!(random, before);
         };
         if eager {
@@ -230,10 +239,15 @@ fn assert_dispatch_errors(device: PolicyDevice) {
     let Err(error) = model.training_forward(&frames[..1], &prefixes) else {
         panic!("training must still validate unused conditional heads");
     };
-    assert_eq!(
-        error.to_string(),
+    assert_eq!(error.to_string(), controlled_overflow());
+}
+
+fn controlled_overflow() -> &'static str {
+    if cfg!(feature = "side-actors") {
+        "model radiant.controlled output at batch 0 index 1 is non-finite"
+    } else {
         "model controlled output at batch 0 index 1 is non-finite"
-    );
+    }
 }
 
 fn uniform_kind_model(device: PolicyDevice) -> PolicyModel {
