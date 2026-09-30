@@ -38,7 +38,7 @@ CAMPAIGN_DIRECTORIES = ("bin", "inputs", "frozen", "checkpoint", "history", "cud
 # An allowlist also blocks future output options unknown to this controller.
 ARGUMENTS = frozenset({
     "--samples-per-update", "--slots", "--lanes", "--simulation-threads", "--generation-updates",
-    "--seed", "--map", "--host-math-workers", "--training-microbatch",
+    "--seed", "--host-math-workers", "--training-microbatch",
     "--balanced-minibatches", "--environment-schedule",
     "--environment-success-updates", "--environment-success-rate",
     "--environment-poor-updates", "--environment-poor-rate", "--environment-extension",
