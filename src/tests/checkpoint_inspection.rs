@@ -102,9 +102,11 @@ mod files {
     fn malformed_runtime_is_an_error_not_a_lagging_export() {
         let mut artifact = fixture_artifact("other-command", 0);
         let fixture = Fixture::new(&mut artifact);
+        let mut schema = current_parameter_schema().unwrap();
+        schema[0].1.reverse();
         fs::write(
             fixture.0.join(RUNTIME_TENSOR_FILE),
-            serialize_runtime_tensor(&[0.0]).unwrap(),
+            runtime::serialize(&schema, &artifact.parameters).unwrap(),
         )
         .unwrap();
         assert_eq!(

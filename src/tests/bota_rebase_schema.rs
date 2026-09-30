@@ -58,13 +58,13 @@ fn historical_bindings_and_shapes_cannot_be_relabelled_as_current_runtime() {
             ));
         }
     }
-    for count in [1_695_924, 1_697_460] {
+    for count in [1_695_924, 1_697_460, 1_812_983] {
         cases.push((
-            format!("legacy shape {count}"),
+            format!("legacy flat layout {count}"),
             count,
             current.clone(),
-            CheckpointError::TensorContract("dtype or shape"),
-            "checkpoint tensor contract has invalid dtype or shape",
+            CheckpointError::TensorContract("names"),
+            "checkpoint tensor contract has invalid names",
         ));
     }
     for (name, count, metadata, kind, expected) in cases {

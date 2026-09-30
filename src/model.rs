@@ -48,7 +48,7 @@ use crate::{
 };
 
 /// Version of the fixed policy-model layout and linked candidate execution contract.
-pub const MODEL_SCHEMA_VERSION: u32 = 25;
+pub const MODEL_SCHEMA_VERSION: u32 = 26;
 /// Maximum frame count accepted by one public batch call.
 pub const MODEL_MAX_BATCH: usize = 8_192;
 /// Frame count evaluated by one bounded host inference tensor graph.
@@ -99,25 +99,27 @@ const TRUNK_INPUT: usize = GLOBAL_FEATURES
     + 5 * TOKEN_EMBEDDING * 2;
 const TRUNK_WIDE: usize = 512;
 const TRUNK_WIDTH: usize = 256;
+const VALUE_HIDDEN: usize = 256;
+const VALUE_OUTPUT_SCALE: f64 = 16.0;
 const KIND_EMBEDDING: usize = 32;
 const UNIT_SELECTION_EMBEDDING: usize = 32;
 const SLOT_EMBEDDING: usize = 16;
 const DECODER_CONTEXT: usize = 336;
 const TARGET_MODE_HEAD: usize = 3;
 const PUT_MODE_HEAD: usize = 2;
-pub(crate) const MODEL_PARAMETER_TENSORS: usize = 86;
+pub(crate) const MODEL_PARAMETER_TENSORS: usize = 88;
 static NEXT_MODEL_LINEAGE: AtomicU64 = AtomicU64::new(1);
 static NEXT_OPTIMIZER_LINEAGE: AtomicU64 = AtomicU64::new(1);
 
 /// Canonical model shapes, parameter order, side routing and linked action/feature semantics.
 pub const MODEL_SCHEMA_DESCRIPTOR: &str = concat!(
-    "bota-drysua-model/v25;",
+    "bota-drysua-model/v26;",
     "linked_schemas=action,feature,map2_reward;linked_hash=fnv1a_descriptor_then_ordered_version_le32_hash_le64_then_map2_reward_descriptor_utf8;",
-    "scope=map2_mid_only_cap27900_including900_pregame;candidate_execution=feature19_candidate_order_bookkeeping_action7_walkable_building_landing_move_only_mango_unchanged_point_pointer64_raze_only_points;layout=86_named_tensors_1812983_f32;",
+    "scope=map2_mid_only_cap27900_including900_pregame;candidate_execution=feature19_candidate_order_bookkeeping_action7_walkable_building_landing_move_only_mango_unchanged_point_pointer64_raze_only_points;layout=88_named_tensors_1878775_f32;",
     "map2_inputs=global92_unit84,wire_rebase_unit_bound_and_collision_and_attack_time;",
     "dtype=f32;device=cpu_actor,cpu_or_cuda_learner,one_learner_per_device;architecture=deepsets;activations=relu_after_every_encoder_and_trunk_linear;",
     "input_conditioning=host_before_tensor_after_presence_mask,feature_v9_unchanged;category_divisors=global10:5,12:3,32:16,55:12;policy_history3:16;unit5:12;ability1:2,2:8,11:5;item1:5,2:64,9:5,13:3;point10:8_sources9..13_exceed_one,12:8,16:12;semantic_ids=ability5_and_projectile6:ln1p(x)/ln(65548),item4_and_loot1:ln1p(x)/ln(65537);all_other_features_identity;",
-    "output_initialization=all_linear_outside_relu_mlps_including_value_and_pointer_queries:he_uniform_times0.01,bias_zero,no_extra_rng_draws;pointer_scaling=dot_div_sqrt_embedding_width_all_actor_batch_and_training_paths;",
+    "output_initialization=all_linear_outside_relu_mlps_and_pointer_queries:he_uniform_times0.01,value_readout_times0.01_over16,value_hidden_he_uniform,bias_zero,no_extra_rng_draws;pointer_scaling=dot_div_sqrt_embedding_width_all_actor_batch_and_training_paths;",
     "numeric_semantics=semantic_id_signed_ln1p_abs_extension_preserves_zero,bc_and_ppo_masked_cross_entropy_center_legal_logits_by_detached_row_max_before_logsumexp_and_selected_subtraction;",
     "unit_mlp=84x64,64x128,128x128;",
     "ability_mlp=24x64,64x64;item_mlp=28x64,64x64;",
@@ -127,26 +129,26 @@ pub const MODEL_SCHEMA_DESCRIPTOR: &str = concat!(
     "token_pools=ability,item,point,projectile,loot;own_units=hero,courier;",
     "trunk=2596x512,512x256,256x256;",
     "embeddings=kind:16x32,unit:2x32,ability:8x16,item:15x16;",
-    "heads=value:1,kind:16,unit:2,ability:8,item_source_from:15,swap_to:15,learn:6,shop:64,loot:16,target_mode:3,put_mode:2,entity_query:128,point_query:64;",
+    "heads=value:256x256_relu_256x1_times16,kind:16,unit:2,ability:8,item_source_from:15,swap_to:15,learn:6,shop:64,loot:16,target_mode:3,put_mode:2,entity_query:128,point_query:64;",
     "action_kind=0Continue,1Stop,2MovePoint,3FollowUnit,4Hold,5AttackMovePoint,6AttackUnit,7Cast,8Use,9PutPoint,10PutUnit,11Take,12Buy,13Sell,14Swap,15Learn;",
     "decoder=kind_then_optional_controlled_unit_then_family_slot_or_source_then_optional_target;branches=Continue:none,Stop:unit,MovePoint:unit_point,FollowUnit:unit_entity,Hold:unit,AttackMovePoint:unit_point,AttackUnit:unit_entity,Cast:unit_ability_target_mode_target,Use:unit_item_target_mode_target,PutPoint:unit_source_put_mode_optional_point,PutUnit:unit_source_entity,Take:unit_loot,Buy:unit_shop,Sell:unit_item,Swap:unit_from_to,Learn:ability;",
     "pointer=entity_query_dot_current_unit_embedding_in_frame_unit_order,point_query_dot_point_embedding_in_frame_point_order;target_mode=masked_argmax_None_Entity_Point_before_selected_pointer_argmax;put_mode=masked_argmax_Underfoot_Point_before_point_argmax;pointer_values_never_offset_mode_logits;",
     "head_context=controlled_and_learn_kind_prefix,ability_item_shop_loot_kind_unit_prefix,swap_target_put_and_pointer_kind_unit_slot_prefix;",
     "selection=choose_requires_private_exact_frame_action_space_lineage_revision_tick_readiness_provenance_before_tensor_work,provenance_excluded_from_tensor_and_frame_equality;mask_before_argmax,all_logits_finite_required,highest_legal_logit,lowest_stable_index_tie,no_legal_exact_error,final_action_allows_and_decode_required;",
     "nonfinite=finite_parameters_required_on_import,finite_frame_required,all_public_host_outputs_and_every_traversed_decoder_head_checked_with_batch_and_index,error_on_overflow_no_policy_choice,training_output_exposes_optional_graph_preserving_finite_validation;",
-    "initialization=splitmix64_state_plus_9e3779b97f4a7c15_then_mix_bf58476d1ce4e5b9_94d049bb133111eb_top24_to_symmetric_closed_interval;linear_weight_scale=sqrt(6/fan_in),linear_bias_zero,embedding_scale=sqrt(3/columns);draw_order=unit_ability_item_point_projectile_loot_trunk_value_kind_kind_embedding_unit_embedding_ability_embedding_item_embedding_controlled_ability_head_item_head_swap_head_learn_head_shop_head_loot_head_target_mode_put_mode_entity_query_point_query;seed_is_not_input_or_parameter;",
+    "initialization=splitmix64_state_plus_9e3779b97f4a7c15_then_mix_bf58476d1ce4e5b9_94d049bb133111eb_top24_to_symmetric_closed_interval;linear_weight_scale=sqrt(6/fan_in),linear_bias_zero,embedding_scale=sqrt(3/columns);draw_order=unit_ability_item_point_projectile_loot_trunk_value_hidden_value_readout_kind_kind_embedding_unit_embedding_ability_embedding_item_embedding_controlled_ability_head_item_head_swap_head_learn_head_shop_head_loot_head_target_mode_put_mode_entity_query_point_query;seed_is_not_input_or_parameter;",
     "batch=public_host_limit8192,evaluation_microbatch64_under_one_parameter_read_lock,training_tensor_limit64,larger_effective_training_batches_require_gradient_accumulation;",
     "runtime_identity=checked_process_local_nonzero_model_lineage_plus_monotonic_parameter_revision,one_internal_learner_optimizer_lineage_bound_to_exact_policy_identity,raw_import_advances_revision_and_unbinds_optimizer,evidence_never_enters_tensors;",
-    "updates=single_model_rwlock,all_inference_and_export_reads_hold_one_shared_lock,training_output_owns_shared_lock_for_full_forward_loss_backward_lifetime,named_backward_requires_same_model_guarded_output_and_returns86_stable_named_optional_gradient_tensors,no_unlocked_vars_exposed,parameter_import_deep_copies_originals_and_builds_and_replaces_all86_vars_under_one_exclusive_lock_with_exact_rollback_on_failure,readers_observe_complete_old_or_complete_new_parameter_set;",
-    "parameter_order=unit_mlp,ability_mlp,item_mlp,point_mlp,projectile_mlp,loot_mlp,trunk,value,kind,kind_embedding,unit_embedding,ability_embedding,item_embedding,unit_head,ability_head,item_head,swap_head,learn_head,shop_head,loot_head,target_mode_head,put_mode_head,entity_query,point_query;",
+    "updates=single_model_rwlock,all_inference_and_export_reads_hold_one_shared_lock,training_output_owns_shared_lock_for_full_forward_loss_backward_lifetime,named_backward_requires_same_model_guarded_output_and_returns88_stable_named_optional_gradient_tensors,no_unlocked_vars_exposed,parameter_import_deep_copies_originals_and_builds_and_replaces_all88_vars_under_one_exclusive_lock_with_exact_rollback_on_failure,readers_observe_complete_old_or_complete_new_parameter_set;",
+    "parameter_order=unit_mlp,ability_mlp,item_mlp,point_mlp,projectile_mlp,loot_mlp,trunk,value.0,value.1,kind,kind_embedding,unit_embedding,ability_embedding,item_embedding,unit_head,ability_head,item_head,swap_head,learn_head,shop_head,loot_head,target_mode_head,put_mode_head,entity_query,point_query;",
     "reward7=win.2_loss_neg.2_draw0_completed_taskcap_neg.2_win_only_victory_time_bonus;",
-    "actor=radiant12_linear_heads_then_dire12_independent_linear_heads_in_the_same_order,shared_encoder_trunk_value_and_embeddings;ppo_value_input_detached;",
+    "actor=radiant12_linear_heads_then_dire12_independent_linear_heads_in_the_same_order,shared_encoder_trunk_value_and_embeddings;ppo_value_loss_trains_shared_trunk;",
     "dire_order=kind,controlled,ability_head,item_head,swap_head,learn_head,shop_head,loot_head,target_mode,put_mode,entity_query,point_query;",
     "routing=observed_global4_Radiant_global5_Dire_exact_numeric_onehot_only,validate_before_tensors,negative_zero_is_zero;",
     "geometry=existing_team_canonical_position_and_delta_unchanged;no_seat_stream_seed_outcome_or_modifier_routing;",
     "math=both_actor_linears_full_original_batch_then_u8_where,select_queries_before_pointer_dot,no_row_compaction;",
     "finite=both_raw_branches_all_rows_of_exercised_heads,all_training_heads_and_selected_pointer_scores_before_backward,unused_inference_families_skipped;",
-    "optimizer=one_shared_parameter_lock_global_Adam_norm_and_transaction_over86_tensors;",
+    "optimizer=one_shared_parameter_lock_global_Adam_norm_and_transaction_over88_tensors;",
     "initialization_suffix=dire_heads_drawn_after_the_radiant_parameter_order;"
 );
 
@@ -189,7 +191,7 @@ pub const MODEL_SCHEMA_HASH: u64 = linked_schema_hash(
 );
 
 /// Exact number of F32 parameters in the model layout.
-pub const MODEL_PARAMETER_COUNT: usize = 1_812_983;
+pub const MODEL_PARAMETER_COUNT: usize = 1_878_775;
 
 const _: () = assert!(FEATURE_SCHEMA_VERSION == 25);
 const _: () = assert!(crate::ACTION_SCHEMA_VERSION == 8);
@@ -229,8 +231,8 @@ const fn decoder_parameter_count() -> usize {
         + MODEL_UNIT_HEAD * UNIT_SELECTION_EMBEDDING
         + MODEL_ABILITY_HEAD * SLOT_EMBEDDING
         + MODEL_ITEM_HEAD * SLOT_EMBEDDING;
-    let direct =
-        linear_parameters(TRUNK_WIDTH, 1) + linear_parameters(TRUNK_WIDTH, MODEL_KIND_HEAD);
+    let value = linear_parameters(TRUNK_WIDTH, VALUE_HIDDEN) + linear_parameters(VALUE_HIDDEN, 1);
+    let direct = value + linear_parameters(TRUNK_WIDTH, MODEL_KIND_HEAD);
     let conditional = linear_parameters(DECODER_CONTEXT, MODEL_UNIT_HEAD)
         + linear_parameters(DECODER_CONTEXT, MODEL_ABILITY_HEAD)
         + linear_parameters(DECODER_CONTEXT, MODEL_ITEM_HEAD)
@@ -1101,6 +1103,47 @@ impl Mlp {
     }
 }
 
+/// The critic: one hidden ReLU layer over the shared trunk, then a linear
+/// read-out multiplied by [`VALUE_OUTPUT_SCALE`].
+///
+/// Adam moves every parameter by about the learning rate per step whatever the
+/// gradient scale, so a freshly initialized read-out needs thousands of steps to
+/// reach returns of order one at actor learning rates. The fixed output scale is
+/// a critic-only learning-rate multiplier that leaves the optimizer untouched.
+struct ValueHead {
+    hidden: Linear,
+    output: Linear,
+}
+
+impl ValueHead {
+    fn fresh(generator: &mut Initializer, device: &Device) -> Result<Self, ModelError> {
+        Ok(Self {
+            hidden: Linear::fresh_with_gain(TRUNK_WIDTH, VALUE_HIDDEN, generator, device, 1.0)?,
+            output: Linear::fresh_with_gain(
+                VALUE_HIDDEN,
+                1,
+                generator,
+                device,
+                0.01 / VALUE_OUTPUT_SCALE as f32,
+            )?,
+        })
+    }
+
+    fn forward(&self, trunk: &Tensor) -> Result<Tensor, ModelError> {
+        Ok(self
+            .output
+            .forward(&self.hidden.forward(trunk)?.relu()?)?
+            .affine(VALUE_OUTPUT_SCALE, 0.0)?)
+    }
+
+    fn parameters<'a>(&'a self, output: &mut Vec<NamedParameter<'a>>) {
+        self.hidden
+            .parameters(("value.0.weight", "value.0.bias"), output);
+        self.output
+            .parameters(("value.1.weight", "value.1.bias"), output);
+    }
+}
+
 struct Embedding {
     value: Var,
 }
@@ -1222,7 +1265,7 @@ pub struct PolicyModel {
     projectile: Mlp,
     loot: Mlp,
     trunk: Mlp,
-    value: Linear,
+    value: ValueHead,
     kind: Linear,
     kind_embedding: Embedding,
     unit_embedding: Embedding,
@@ -1338,7 +1381,7 @@ impl PolicyModel {
             projectile: encoders.projectile,
             loot: encoders.loot,
             trunk,
-            value: Linear::fresh(256, 1, &mut generator, &tensor_device)?,
+            value: ValueHead::fresh(&mut generator, &tensor_device)?,
             kind: Linear::fresh(256, 16, &mut generator, &tensor_device)?,
             kind_embedding: Embedding::fresh(16, 32, &mut generator, &tensor_device)?,
             unit_embedding: Embedding::fresh(2, 32, &mut generator, &tensor_device)?,
@@ -1886,35 +1929,26 @@ impl PolicyModel {
         })
     }
 
+    /// Every head over one shared trunk; the value loss trains the trunk too.
     fn training_forward_locked(
         &self,
         frames: &[FeatureFrame],
         prefixes: &[TrainingPrefix],
     ) -> Result<PolicyTensorTensors, ModelError> {
-        self.training_forward_value_gradient_locked(frames, prefixes, true)
-    }
-
-    fn training_forward_value_gradient_locked(
-        &self,
-        frames: &[FeatureFrame],
-        prefixes: &[TrainingPrefix],
-        value_trunk_gradient: bool,
-    ) -> Result<PolicyTensorTensors, ModelError> {
         let routing = ActorRouting::new(frames, self.tensor_device(), true)?;
         let state = self.forward_frames(frames)?;
         let prefixes = PrefixUpload::new(prefixes, self.tensor_device())?;
-        self.training_heads(state, routing, &prefixes, value_trunk_gradient)
+        self.training_heads(state, routing, &prefixes)
     }
 
     /// Training outputs of one staged microbatch.
     fn training_forward_inputs(
         &self,
         inputs: &device_learner::StagedInputs,
-        value_trunk_gradient: bool,
     ) -> Result<PolicyTensorTensors, ModelError> {
         let routing = ActorRouting::from_mask(inputs.sides.clone());
         let state = self.forward_encoder_inputs(&inputs.encoder)?;
-        self.training_heads(state, routing, &inputs.prefixes, value_trunk_gradient)
+        self.training_heads(state, routing, &inputs.prefixes)
     }
 
     fn training_heads(
@@ -1922,14 +1956,7 @@ impl PolicyModel {
         state: ForwardState,
         routing: ActorRouting,
         prefixes: &PrefixUpload,
-        value_trunk_gradient: bool,
     ) -> Result<PolicyTensorTensors, ModelError> {
-        // PPO deliberately isolates critic fitting to preserve transferred actor features.
-        let value_input = if value_trunk_gradient {
-            state.trunk.clone()
-        } else {
-            state.trunk.detach()
-        };
         let contexts = self.training_contexts(&state.trunk, prefixes)?;
         let entity_query = routing
             .forward(self, ActorHead::EntityQuery, &contexts.slot)?
@@ -1938,7 +1965,7 @@ impl PolicyModel {
             .forward(self, ActorHead::PointQuery, &contexts.slot)?
             .unsqueeze(1)?;
         Ok(PolicyTensorTensors {
-            value: self.value.forward(&value_input)?,
+            value: self.value.forward(&state.trunk)?,
             kind: routing.forward(self, ActorHead::Kind, &state.trunk)?,
             controlled: routing.forward(self, ActorHead::Controlled, &contexts.kind)?,
             ability: routing.forward(self, ActorHead::Ability, &contexts.unit)?,
@@ -2417,8 +2444,7 @@ impl PolicyModel {
     }
 
     fn decoder_parameters<'a>(&'a self, output: &mut Vec<NamedParameter<'a>>) {
-        self.value
-            .parameters(("value.weight", "value.bias"), output);
+        self.value.parameters(output);
         self.kind.parameters(("kind.weight", "kind.bias"), output);
         output.push(NamedParameter {
             name: "kind_embedding.weight",

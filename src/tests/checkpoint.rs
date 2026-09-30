@@ -110,36 +110,59 @@ fn runtime_requires_every_current_identity_field_without_mutation() {
 
 #[cfg(feature = "builtin")]
 #[test]
-fn warm_start_reuses_parameters_across_linked_schemas_and_refuses_other_layouts() {
+fn warm_start_reuses_named_tensors_reinitializes_the_rest_and_refuses_unrelated_files() {
     let directory = Directory::new();
-    let parameters = PolicyModel::fresh(18_111)
-        .expect("source")
-        .export_parameters()
-        .expect("parameters");
-    let path = directory.0.join("drysua.weights.safetensors");
+    let source = PolicyModel::fresh(18_111).expect("source");
+    let parameters = source.export_parameters().expect("parameters");
+    let schema = source.parameter_schema().expect("schema");
+    // An older model: another critic layout under older schema metadata.
+    let data: Vec<u8> = parameters.iter().flat_map(|value| value.to_le_bytes()).collect();
+    let legacy_value = vec![0; 257 * 4];
+    let mut tensors = vec![
+        ("value.weight".to_owned(), TensorView::new(Dtype::F32, vec![256, 1], &legacy_value[..1024])),
+        ("value.bias".to_owned(), TensorView::new(Dtype::F32, vec![1], &legacy_value[1024..])),
+    ];
+    let mut offset = 0;
+    for (name, shape) in &schema {
+        let size = shape.iter().product::<usize>() * 4;
+        if !name.starts_with("value.") {
+            let view = TensorView::new(Dtype::F32, shape.clone(), &data[offset..offset + size]);
+            tensors.push(((*name).to_owned(), view));
+        }
+        offset += size;
+    }
+    let tensors = tensors
+        .into_iter()
+        .map(|(name, view)| (name, view.expect("tensor")));
     let mut older = current_runtime_metadata();
-    older.insert("action_schema_hash".to_owned(), "1".to_owned());
-    older.insert("map2_reward_schema_version".to_owned(), "7".to_owned());
-    fs::write(&path, runtime_bytes(&parameters, older)).expect("older schema fixture");
+    older.insert("model_schema_hash".to_owned(), "1".to_owned());
+    let path = directory.0.join("drysua.weights.safetensors");
+    fs::write(&path, serialize(tensors, Some(older)).expect("older model")).expect("fixture");
 
     let model =
         TrainingArtifact::initialize_from_weights(&directory.0, 5, crate::PolicyDevice::Cpu)
             .expect("warm start across schemas");
 
-    assert_eq!(model.export_parameters().expect("imported"), parameters);
+    let imported = model.export_parameters().expect("imported");
+    let fresh = PolicyModel::fresh(5).expect("fresh").export_parameters().expect("fresh");
+    let mut offset = 0;
+    for (name, shape) in &schema {
+        let range = offset..offset + shape.iter().product::<usize>();
+        let expected = if name.starts_with("value.") { &fresh } else { &parameters };
+        assert_eq!(imported[range.clone()], expected[range.clone()], "{name}");
+        offset = range.end;
+    }
     assert_eq!(
         TrainingArtifact::load_runtime_weights(&model, &directory.0),
         Err(CheckpointError::SchemaMismatch),
         "play and eval stay strict"
     );
-    fs::write(
-        &path,
-        runtime_bytes(&parameters[1..], current_runtime_metadata()),
-    )
-    .expect("other layout fixture");
+    fs::write(&path, runtime_bytes(&parameters[1..], current_runtime_metadata()))
+        .expect("flat fixture");
     assert_eq!(
         TrainingArtifact::initialize_from_weights(&directory.0, 5, crate::PolicyDevice::Cpu).err(),
-        Some(CheckpointError::TensorContract("dtype or shape"))
+        Some(CheckpointError::TensorContract("names")),
+        "a file sharing no tensor is no warm start"
     );
 }
 

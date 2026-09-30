@@ -317,7 +317,7 @@ impl PolicyModel {
         for start in (0..total).step_by(microbatch) {
             let length = microbatch.min(total - start);
             let inputs = staged.gather(&rows.narrow(0, start, length)?)?;
-            let output = self.training_forward_inputs(&inputs, false)?;
+            let output = self.training_forward_inputs(&inputs)?;
             let probe = side_actors::training_finite_probe(&output)?;
             let terms = ppo_loss(&output, &inputs.targets, config, total)?;
             let store = terms.loss.backward()?;
@@ -356,7 +356,7 @@ impl PolicyModel {
         for start in (0..total).step_by(microbatch) {
             let length = microbatch.min(total - start);
             let inputs = staged.gather(&rows.narrow(0, start, length)?)?;
-            let output = self.training_forward_inputs(&inputs, true)?;
+            let output = self.training_forward_inputs(&inputs)?;
             let probe = side_actors::training_finite_probe(&output)?;
             let kl = candidate_kl_sum(&output, &inputs.targets)?.detach();
             let terms = Tensor::stack(&[kl, probe], 0)?;
@@ -392,7 +392,7 @@ impl PolicyModel {
                 .narrow(0, start, microbatch.min(total - start))
                 .map_err(ModelError::from)
                 .and_then(|rows| staged.gather(&rows))
-                .and_then(|inputs| self.training_forward_inputs(&inputs, true))
+                .and_then(|inputs| self.training_forward_inputs(&inputs))
                 .and_then(|output| validate_training_tensors_finite(&output));
             if let Err(error) = located {
                 return error;

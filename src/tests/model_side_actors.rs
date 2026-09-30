@@ -273,7 +273,7 @@ fn assert_gradients(device: PolicyDevice) {
                 .all(|value| *value == 0.0)
         );
         assert!(
-            gradient_values(&named, "value.weight")
+            gradient_values(&named, "value.1.weight")
                 .iter()
                 .all(|value| *value == 0.0)
         );
@@ -283,23 +283,29 @@ fn assert_gradients(device: PolicyDevice) {
                 .any(|value| *value > 0.0)
         );
     }
-    assert_critic_isolation(&model);
+    assert_critic_trains_the_shared_trunk_only(device);
 }
 
-fn assert_critic_isolation(model: &PolicyModel) {
+fn assert_critic_trains_the_shared_trunk_only(device: PolicyDevice) {
+    let model = PolicyModel::fresh_on(9002, device).expect("model");
     let _guard = model.read_parameter_lock().expect("critic read guard");
     let output = model
-        .training_forward_value_gradient_locked(
+        .training_forward_locked(
             &[side_frame(false), side_frame(true)],
             &[TrainingPrefix::new(ActionKind::Continue, None, None); 2],
-            false,
         )
-        .expect("isolated PPO critic");
+        .expect("PPO critic");
     let named = model
         .backward_named_locked(&output.value.sum_all().expect("value loss"))
         .expect("critic backward");
-    assert_eq!(gradient_values(&named, "value.bias"), vec![2.0]);
-    for name in ["trunk.2.bias", "kind.bias", "dire.kind.bias"] {
+    // Two rows through the fixed read-out scale of sixteen.
+    assert_eq!(gradient_values(&named, "value.1.bias"), vec![32.0]);
+    assert!(
+        gradient_values(&named, "trunk.2.weight")
+            .iter()
+            .any(|value| *value != 0.0)
+    );
+    for name in ["kind.bias", "dire.kind.bias"] {
         assert!(
             gradient_values(&named, name)
                 .iter()

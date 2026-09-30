@@ -67,12 +67,12 @@ pub const PPO_SHAPING_BUDGET: f32 = 100.0 / PPO_REWARD_SCALE;
 pub const PPO_TERMINAL_REWARD: f32 = 1.0;
 const _: () = assert!(PPO_TERMINAL_REWARD > PPO_SHAPING_BUDGET);
 /// Version of rollout, GAE, objective, optimizer, and reward semantics.
-pub const PPO_SCHEMA_VERSION: u32 = 41;
+pub const PPO_SCHEMA_VERSION: u32 = 42;
 /// Audited simulator and learner rules required by rollouts.
 pub const PPO_RULES_AUDIT_VERSION: u32 = 32;
 /// Canonical learner contract covered by [`PPO_SCHEMA_HASH`].
 pub const PPO_SCHEMA_DESCRIPTOR: &str = concat!(
-    "bota-drysua-ppo/v41;",
+    "bota-drysua-ppo/v42;",
     "linked_schemas=action,feature,model,map2_reward;linked_hash=fnv1a_descriptor_then_ordered_version_le32_hash_le64_then_map2_reward_descriptor_utf8;rules_audit=32;",
     "scope=map2_mid_only_dota_geometry_mid_waves_second_hero_death_or_first_tower_loss_simultaneous_draw_cap27900_including900_pregame_cap_tick_draw;",
     "collection=continuous_slots1to256_back_to_back_games,lanes_divide_slots_max64_slots_per_lane,update_due_after_whole_lane_rounds_reaching_samples_per_update_over_lanes,in_flight_intervals_continue_under_next_weights,actor_weights_lag_learner_by_pipeline_staleness_at_most2_with_boundary_intervals,per_game_opponent_mixture_teacher_frozen_weights_selfplay;",
@@ -84,7 +84,7 @@ pub const PPO_SCHEMA_DESCRIPTOR: &str = concat!(
     "actor=per_lane_weight_replica_recorded_behaviour_version,batch_max128_single_shared_trunk_forward_policy_and_selfplay_rows,side_selected_radiant_dire_actor_heads,per_game_rng_from_seed_slot_game,transactional_batch_rng,legal_masked_gumbel_max_open_f64_uniform,exact_autoregressive_log_probability_and_entropy_for_retained_rows;",
     "gae=map2_gamma_tick1_required,lambda0.98,terminal_reset,bootstrap_collector_truncation_not_task_terminal,normalized_advantages;",
     "objective=clipped_surrogate0.2,value_mse0.5,entropy0.01,target_kl0.02;",
-    "critic=ppo_only_detached_value_head_input,value_head_only_regression;",
+    "critic=value_mlp_on_shared_trunk,value_loss_trains_trunk;",
     "optimizer=adam_lr3e-6_beta1_0.9_beta2_0.999_epsilon1e-5_global_clip0.5,weighted_host_microbatch_accumulation,transactional_parameters_moments_shuffle;",
     "kl_guard=pre_step_rejection,post_step_sample_weighted_complete_effective_minibatch_rollout_policy_kl,candidate_exceeds_target_or_evaluation_error_restores_exact_parameters_adam_moments_step_policy_revision_under_exclusive_parameter_lock,applied_report_post_step_kl,rejected_report_candidate_kl;",
     "reward=linked_map2_reward_schema_version_hash_and_full_descriptor,seat_only_full_contiguous_snapshot_events_before_retention_or_tracker_journal;no_action_or_Teacher_override;",
@@ -92,7 +92,7 @@ pub const PPO_SCHEMA_DESCRIPTOR: &str = concat!(
     "navigation=existing_walkable_building_landing_points_allow_MovePoint_only,AttackMovePoint_source_veto_unchanged,no_goal_features_or_forced_retreat,seat_visible_channel_masks_cast_and_use,seat_visible_item_mute_masks_use,put_point_underfoot_only;",
     "deployment=raw_map2_mid_neural_policy_no_teacher_override_or_strategic_masks;",
     "teacher_economy=custom_bota_wraith_band_tango_boots_optional_stick_gloves_belt_once_only;",
-    "initialization=runtime_weights_with_equal_element_count_any_linked_schema_metadata_parameters_only_fresh_optimizer_progress_rng;"
+    "initialization=runtime_weights_named_tensors_equal_name_and_shape_reused_others_fresh_any_linked_schema_metadata_parameters_only_fresh_optimizer_progress_rng;"
 );
 
 /// FNV-1a of the descriptor, ordered linked identities, and reward version.
@@ -107,7 +107,7 @@ pub const PPO_SCHEMA_HASH: u64 = crate::model::linked_schema_hash(
 
 const _: () = assert!(ACTION_SCHEMA_VERSION == 8);
 const _: () = assert!(FEATURE_SCHEMA_VERSION == 25);
-const _: () = assert!(MODEL_SCHEMA_VERSION == 25);
+const _: () = assert!(MODEL_SCHEMA_VERSION == 26);
 const _: () = assert!(PPO_RULES_AUDIT_VERSION == 32);
 
 /// PPO hyperparameters and bounded rollout dimensions.

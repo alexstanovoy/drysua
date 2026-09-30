@@ -125,7 +125,7 @@ fn inspect_runtime(
         });
     };
     let hash = Some(hex(&sha256(&bytes)));
-    let parameters = match decode_runtime_tensor(&bytes) {
+    let parameters = match decode_runtime_parameters(&bytes) {
         Ok(parameters) => parameters,
         Err(CheckpointError::SchemaMismatch) => {
             return Ok(RuntimeInspection {
