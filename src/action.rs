@@ -588,6 +588,8 @@ struct BuyRequirement {
 struct StaticPassability {
     axis: usize,
     open: Vec<bool>,
+    /// Sorted static tree indices this seat saw felled (the key's list).
+    felled: Vec<u32>,
     /// Nearest landing cell of each allied structure position, computed once per grid.
     landings: Vec<(Vec2, Option<Vec2>)>,
 }
@@ -1405,6 +1407,7 @@ fn build_static_passability(
     let mut passability = StaticPassability {
         axis,
         open,
+        felled: key.felled.clone(),
         landings: Vec::new(),
     };
     for (index, position) in tracker.static_trees().iter().copied().enumerate() {
@@ -1899,9 +1902,7 @@ fn add_tree_points(
     let mut trees = Vec::with_capacity(tracker.static_trees().len() + current.planted_trees.len());
     for (index, position) in tracker.static_trees().iter().copied().enumerate() {
         let index = u32::try_from(index).map_err(|_| ActionError::Arithmetic("tree index"))?;
-        let locally_felled = current.felled_trees.contains(&index)
-            && tracker.position_locally_observable_to_own_seat(position);
-        if !locally_felled {
+        if passability.felled.binary_search(&index).is_err() {
             trees.push((center.distance_squared(position), position, false));
         }
     }
