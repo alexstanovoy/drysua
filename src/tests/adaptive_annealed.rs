@@ -465,7 +465,7 @@ fn controller(directory: &Path) -> AdaptiveEnvironmentCheckpoint {
 
 fn assert_same_training(source: &Path, target: &Path, device: PolicyDevice) {
     assert_trajectory_equal(source, target);
-    concurrency_tests::assert_artifact_bits(source, target, device);
+    assert_artifact_bits(source, target, device);
 }
 
 fn tree_snapshot(directory: &Path) -> Vec<(PathBuf, Option<[u8; 32]>)> {

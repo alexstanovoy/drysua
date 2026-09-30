@@ -3,22 +3,6 @@
 use super::*;
 use crate::PpoBatch;
 
-pub(super) fn emit_concurrency_probe_counts(streams: &[EpisodeStream], overlap: bool) {
-    if std::env::var_os("DRYSUA_PROBE_MODE").is_none() {
-        return;
-    }
-    assert!(streams.len() <= crate::PPO_ANNEALED_MAX_PARALLEL_WORLDS);
-    let decisions = streams.iter().map(|stream| stream.decisions).sum::<usize>();
-    let continues = streams
-        .iter()
-        .map(|stream| stream.actions[ActionKind::Continue.index()] as usize)
-        .sum::<usize>();
-    eprintln!(
-        "concurrency-actor overlap={overlap} worlds={} decisions={decisions} continues={continues}",
-        streams.len()
-    );
-}
-
 pub(super) fn sample_active(
     model: &PolicyModel,
     random: &mut [PpoRng],

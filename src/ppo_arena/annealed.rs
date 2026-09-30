@@ -12,14 +12,6 @@
 use std::path::{Path, PathBuf};
 #[path = "annealed_adaptive.rs"]
 mod adaptive;
-#[cfg(all(
-    test,
-    feature = "cuda",
-    not(feature = "side-actors"),
-    any(target_os = "linux", target_os = "windows")
-))]
-#[path = "../tests/autonomous_learning.rs"]
-mod autonomous_learning;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -1318,7 +1310,3 @@ mod metrics_integration_tests;
 #[cfg(test)]
 #[path = "../tests/annealed.rs"]
 mod tests;
-
-#[cfg(test)]
-#[path = "../tests/newlearning_signal.rs"]
-pub(super) mod learning_signal;

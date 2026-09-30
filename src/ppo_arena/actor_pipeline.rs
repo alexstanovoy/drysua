@@ -108,49 +108,16 @@ pub(in crate::ppo_arena) fn collect_actor_pipeline(
     report: &mut PpoSmokeReport,
     reuse_actor_values: bool,
 ) -> Result<(), PpoError> {
-    #[cfg(all(
-        test,
-        feature = "cuda",
-        any(target_os = "linux", target_os = "windows")
-    ))]
-    let graph = graph_pipeline_mode(config, groups, rounds, reuse_actor_values)?;
-    let mut collect = || {
-        collect_with_operation(
-            model,
-            config,
-            groups,
-            rounds,
-            rollout,
-            report,
-            reuse_actor_values,
-            move |_, world, job| run_stream_job(world, job, config, None, None),
-        )?;
-        #[cfg(all(
-            test,
-            feature = "cuda",
-            any(target_os = "linux", target_os = "windows")
-        ))]
-        if graph.is_some() {
-            record_graph_actor_trace(
-                groups
-                    .iter()
-                    .flat_map(|group| group.streams.iter().zip(group.random.iter())),
-            )?;
-        }
-        Ok(())
-    };
-    #[cfg(all(
-        test,
-        feature = "cuda",
-        any(target_os = "linux", target_os = "windows")
-    ))]
-    if let Some(graph) = graph {
-        return crate::model::cuda_graph_probe::with_actor_graph_for_test(
-            model, graph, 20, collect,
-        )
-        .map_err(text_error)?;
-    }
-    collect()
+    collect_with_operation(
+        model,
+        config,
+        groups,
+        rounds,
+        rollout,
+        report,
+        reuse_actor_values,
+        move |_, world, job| run_stream_job(world, job, config, None, None),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -175,12 +142,6 @@ pub(in crate::ppo_arena) fn collect_actor_pipeline_with_opponent_batching(
             reuse_actor_values,
         );
     }
-    #[cfg(all(
-        test,
-        feature = "cuda",
-        any(target_os = "linux", target_os = "windows")
-    ))]
-    let _ = graph_pipeline_mode(config, groups, rounds, reuse_actor_values)?;
     collect_with_operation_mode(
         model,
         config,
@@ -220,12 +181,6 @@ pub(super) fn collect_single_neural(
             "neural opponent collection dimensions",
         ));
     }
-    #[cfg(all(
-        test,
-        feature = "cuda",
-        any(target_os = "linux", target_os = "windows")
-    ))]
-    let _ = actor_graph_collection_mode(config, stream_base, environments, reuse)?;
     let opponent = neural_opponent::OpponentBatch::new(model, environments)?;
     std::thread::scope(|scope| {
         let mut state = GroupState::spawn_parts(
@@ -248,43 +203,6 @@ pub(super) fn collect_single_neural(
         state.workers.finish()?;
         collected
     })
-}
-
-#[cfg(all(
-    test,
-    feature = "cuda",
-    any(target_os = "linux", target_os = "windows")
-))]
-fn graph_pipeline_mode(
-    config: PpoConfig,
-    groups: &[ActorGroup],
-    rounds: usize,
-    reuse: bool,
-) -> Result<Option<bool>, PpoError> {
-    let mode = crate::model::cuda_graph_probe::parse_graph_mode(
-        std::env::var_os("DRYSUA_PROBE_ACTOR_GRAPH").as_deref(),
-    )
-    .map_err(text_error)?;
-    if mode.is_none() {
-        return Ok(None);
-    }
-    validate_groups(config, groups, rounds)?;
-    if groups.len() != 2
-        || config.environments != 40
-        || config.sample_budget != crate::PpoSampleBudget::Annealed
-        || groups[0].environments.len() != 20
-        || groups[0].stream_base != 0
-        || !reuse
-        || groups
-            .iter()
-            .flat_map(|group| &group.environments)
-            .any(|world| !matches!(world.opponent, OpponentRuntime::Teacher))
-    {
-        return Err(PpoError::InvalidConfig(
-            "actor graph probe requires one M40 B20 G2 Teacher wave with actor value reuse",
-        ));
-    }
-    Ok(mode)
 }
 
 #[allow(clippy::too_many_arguments)]

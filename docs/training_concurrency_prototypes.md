@@ -26,23 +26,3 @@ statistically established speedup. Earlier short contended comparisons were inco
 Preserved CSVs are under `artifacts/temp/concurrency-{idle,probes}-2026092*/`;
 final qualification is in `artifacts/deslop-20260922/REPORT.md` and `verification/`.
 The retired designs and original job ledger remain in Git at `2ddb68b`.
-
-## Probe inputs
-
-Run only through the [authorized bounded runner](experiment-safety.md), never beside
-a learner without its explicit resource authorization. CPU/CUDA probe names are
-`ppo_arena::annealed::tests::concurrency_tests::concurrency_probe_{cpu,cuda}`.
-Use the appropriate feature tuple, including `builtin,cuda` for CUDA, and payload:
-
-```text
-cargo test --release --lib --no-default-features --features builtin,cuda --quiet \
-  ppo_arena::annealed::tests::concurrency_tests::concurrency_probe_cuda \
-  -- --ignored --exact --nocapture
-```
-
-`DRYSUA_PROBE_MODE=base|c` defaults to `c`; `DRYSUA_PROBE_WORKERS` defaults to 4
-in this probe, not the production CLI. `DRYSUA_PROBE_WEIGHTS` is a read-only runtime directory.
-ROUNDS/EPOCHS/MINIBATCH variables with the same prefix default to 40/1/128;
-the full comparison sets 9300/4/2048. `DRYSUA_PROBE_BALANCED=1` selects an untimed
-warmup plus ABBA; absent/0 selects a pair. Each trial uses fresh owned output and
-new optimizer/RNG state. Keep work counters and identity checks with every timing.

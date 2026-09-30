@@ -11,12 +11,6 @@ use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use candle_core::{DType, Device, Tensor, Var};
 
-#[cfg(all(
-    test,
-    feature = "cuda",
-    any(target_os = "linux", target_os = "windows")
-))]
-pub(crate) mod cuda_graph_probe;
 mod host_folding;
 mod sampling;
 mod side_actors;
@@ -30,12 +24,6 @@ use side_actors::{ActorHead, ActorRouting};
 mod side_actor_tests;
 #[cfg(test)]
 pub(crate) use sampling::{take_sampling_dispatches_for_test, with_eager_sampling_for_test};
-#[cfg(all(test, not(feature = "side-actors")))]
-mod memory_probe;
-#[cfg(test)]
-mod self_imitation;
-#[cfg(all(test, feature = "builtin"))]
-pub(crate) use host_folding::resolved_host_math_workers;
 
 #[cfg(test)]
 #[path = "tests/model_test_support.rs"]
@@ -1330,18 +1318,6 @@ pub fn probe_nvfp4(ordinal: usize) -> Result<(), ModelError> {
 pub struct PolicyModel {
     #[cfg(feature = "side-actors")]
     dire: side_actors::ActorHeads,
-    #[cfg(all(
-        test,
-        feature = "cuda",
-        any(target_os = "linux", target_os = "windows")
-    ))]
-    creation_thread: std::thread::ThreadId,
-    #[cfg(all(
-        test,
-        feature = "cuda",
-        any(target_os = "linux", target_os = "windows")
-    ))]
-    foreign_thread_used: std::sync::atomic::AtomicBool,
     parameter_lock: RwLock<()>,
     lineage: NonZeroU64,
     parameter_revision: AtomicU64,
@@ -1459,18 +1435,6 @@ impl PolicyModel {
         )?;
         let lineage = allocate_lineage(&NEXT_MODEL_LINEAGE, ModelError::ModelLineageUnavailable)?;
         Ok(Self {
-            #[cfg(all(
-                test,
-                feature = "cuda",
-                any(target_os = "linux", target_os = "windows")
-            ))]
-            creation_thread: std::thread::current().id(),
-            #[cfg(all(
-                test,
-                feature = "cuda",
-                any(target_os = "linux", target_os = "windows")
-            ))]
-            foreign_thread_used: std::sync::atomic::AtomicBool::new(false),
             parameter_lock: RwLock::new(()),
             lineage,
             parameter_revision: AtomicU64::new(0),
@@ -1782,27 +1746,8 @@ impl PolicyModel {
         validate_sampling_rng_count(frames.len(), rngs.len())?;
         let mut staged_rngs = rngs.to_vec();
         let _guard = self.read_parameter_lock()?;
-        #[cfg(all(
-            test,
-            feature = "cuda",
-            any(target_os = "linux", target_os = "windows")
-        ))]
-        let graph_selected =
-            cuda_graph_probe::sample_selection(self, frames, action_spaces, &mut staged_rngs)?;
-        #[cfg(not(all(
-            test,
-            feature = "cuda",
-            any(target_os = "linux", target_os = "windows")
-        )))]
-        let graph_selected: Option<Vec<BatchSelection>> = None;
-        let selected = match graph_selected {
-            Some(selected) => selected,
-            None => self.selection_batch_locked(
-                frames,
-                action_spaces,
-                Some(staged_rngs.as_mut_slice()),
-            )?,
-        };
+        let selected =
+            self.selection_batch_locked(frames, action_spaces, Some(staged_rngs.as_mut_slice()))?;
         let choices = finish_sampled_choices(
             frames,
             action_spaces,
@@ -2655,42 +2600,18 @@ impl PolicyModel {
     }
 
     fn read_parameter_lock(&self) -> Result<RwLockReadGuard<'_, ()>, ModelError> {
-        #[cfg(all(
-            test,
-            feature = "cuda",
-            any(target_os = "linux", target_os = "windows")
-        ))]
-        cuda_graph_probe::check_owner(self)?;
         let guard = self
             .parameter_lock
             .read()
             .map_err(|_| ModelError::ParameterLockPoisoned)?;
-        #[cfg(all(
-            test,
-            feature = "cuda",
-            any(target_os = "linux", target_os = "windows")
-        ))]
-        cuda_graph_probe::check_owner(self)?;
         Ok(guard)
     }
 
     fn write_parameter_lock(&self) -> Result<RwLockWriteGuard<'_, ()>, ModelError> {
-        #[cfg(all(
-            test,
-            feature = "cuda",
-            any(target_os = "linux", target_os = "windows")
-        ))]
-        cuda_graph_probe::check_owner(self)?;
         let guard = self
             .parameter_lock
             .write()
             .map_err(|_| ModelError::ParameterLockPoisoned)?;
-        #[cfg(all(
-            test,
-            feature = "cuda",
-            any(target_os = "linux", target_os = "windows")
-        ))]
-        cuda_graph_probe::check_owner(self)?;
         Ok(guard)
     }
 

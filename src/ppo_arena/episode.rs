@@ -1242,36 +1242,6 @@ pub(super) fn game_stream(seed: u64, game: u64) -> Result<EpisodeStream, PpoErro
     })
 }
 
-/// Runs the historical annealed collector for test/reference callers.
-#[cfg(test)]
-#[allow(clippy::too_many_arguments)]
-pub(super) fn collect_batch(
-    model: &PolicyModel,
-    config: PpoConfig,
-    stream_base: usize,
-    thread_prefix: &str,
-    environments: &mut [TrainingEnvironment],
-    streams: &mut [EpisodeStream],
-    random: &mut [PpoRng],
-    rounds: usize,
-    rollout: &mut PpoRollout,
-    report: &mut PpoSmokeReport,
-) -> Result<(), PpoError> {
-    collect_batch_with_actor_values(
-        model,
-        config,
-        stream_base,
-        thread_prefix,
-        environments,
-        streams,
-        random,
-        rounds,
-        rollout,
-        report,
-        false,
-    )
-}
-
 /// Runs one annealed batch of episodes over already built environments.
 /// Reuse keeps actor batches unchanged but permits different bootstrap bits from
 /// their larger GEMMs; the caller must bind this choice to the checkpoint scope.
@@ -1299,52 +1269,24 @@ pub(super) fn collect_batch_with_actor_values(
     if rounds == 0 || rounds > ACTOR_DECISIONS {
         return Err(PpoError::InvalidConfig("annealed collection rounds"));
     }
-    #[cfg(all(
-        test,
-        feature = "cuda",
-        any(target_os = "linux", target_os = "windows")
-    ))]
-    let graph = actor_graph_collection_mode(config, stream_base, environments, reuse_actor_values)?;
-    let mut collect = || {
-        let completed = collect_with_workers(
-            model,
-            config,
-            stream_base,
-            thread_prefix,
-            environments,
-            streams,
-            random,
-            rounds,
-            None,
-            None,
-            rollout,
-            report,
-            reuse_actor_values,
-        )?;
-        assert!(completed, "an annealed batch cannot cancel");
-        finish_annealed_batch(streams, rounds);
-        #[cfg(all(
-            test,
-            feature = "cuda",
-            any(target_os = "linux", target_os = "windows")
-        ))]
-        if graph.is_some() {
-            record_graph_actor_trace(streams.iter().zip(random.iter()))?;
-        }
-        Ok(())
-    };
-    #[cfg(all(
-        test,
-        feature = "cuda",
-        any(target_os = "linux", target_os = "windows")
-    ))]
-    if let Some(graph) = graph {
-        return crate::model::cuda_graph_probe::with_actor_graph_for_test(
-            model, graph, 40, collect,
-        )
-        .map_err(text_error)?;
-    }
-    collect()
+    let completed = collect_with_workers(
+        model,
+        config,
+        stream_base,
+        thread_prefix,
+        environments,
+        streams,
+        random,
+        rounds,
+        None,
+        None,
+        rollout,
+        report,
+        reuse_actor_values,
+    )?;
+    assert!(completed, "an annealed batch cannot cancel");
+    finish_annealed_batch(streams, rounds);
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1396,69 +1338,12 @@ pub(super) fn collect_batch_with_opponent_batching(
 fn finish_annealed_batch(streams: &[EpisodeStream], rounds: usize) {
     assert!(!streams.is_empty());
     assert!(streams.len() <= MAX_ACTOR_ENVIRONMENTS);
-    #[cfg(test)]
-    test_support::emit_concurrency_probe_counts(streams, false);
     if rounds == ACTOR_DECISIONS {
         assert!(
             streams.iter().all(|stream| stream.done),
             "a full annealed batch finishes every episode"
         );
     }
-}
-
-#[cfg(all(
-    test,
-    feature = "cuda",
-    any(target_os = "linux", target_os = "windows")
-))]
-fn actor_graph_collection_mode(
-    config: PpoConfig,
-    stream_base: usize,
-    environments: &[TrainingEnvironment],
-    reuse: bool,
-) -> Result<Option<bool>, PpoError> {
-    let mode = crate::model::cuda_graph_probe::parse_graph_mode(
-        std::env::var_os("DRYSUA_PROBE_ACTOR_GRAPH").as_deref(),
-    )
-    .map_err(text_error)?;
-    if mode.is_some()
-        && (config.environments != 40
-            || environments.len() != 40
-            || stream_base != 0
-            || !reuse
-            || config.sample_budget != crate::PpoSampleBudget::Annealed
-            || environments
-                .iter()
-                .any(|world| !matches!(world.opponent, OpponentRuntime::Teacher)))
-    {
-        return Err(PpoError::InvalidConfig(
-            "actor graph probe requires one M40 B40 Teacher batch with actor value reuse",
-        ));
-    }
-    Ok(mode)
-}
-
-#[cfg(all(
-    test,
-    feature = "cuda",
-    any(target_os = "linux", target_os = "windows")
-))]
-fn record_graph_actor_trace<'a>(
-    rows: impl IntoIterator<Item = (&'a EpisodeStream, &'a PpoRng)>,
-) -> Result<(), PpoError> {
-    use std::hash::Hasher;
-    let mut iterator = rows.into_iter();
-    let rows: [(&EpisodeStream, &PpoRng); 40] =
-        std::array::from_fn(|_| iterator.next().expect("40 graph actor streams"));
-    assert!(iterator.next().is_none());
-    let trace = crate::model::cuda_graph_probe::ActorTrace {
-        hashes: std::array::from_fn(|index| rows[index].0.trace.finish()),
-        random: std::array::from_fn(|index| rows[index].1.checkpoint()),
-        decisions: std::array::from_fn(|index| rows[index].0.decisions),
-        retained: std::array::from_fn(|index| rows[index].0.retained),
-    };
-    eprintln!("graph-actor-trace {trace:?}");
-    crate::model::cuda_graph_probe::record_actor_trace(trace).map_err(text_error)
 }
 
 /// Bootstrap barrier: every stream prepares its first decision frame.
@@ -1535,8 +1420,6 @@ fn select_choices(
 
 #[derive(Default)]
 pub(super) struct EpisodeStream {
-    #[cfg(test)]
-    pub(super) learning_signal: Option<Vec<super::annealed::learning_signal::Decision>>,
     #[cfg(test)]
     pub(super) trace: std::collections::hash_map::DefaultHasher,
     #[cfg(test)]
@@ -1677,15 +1560,6 @@ fn advance_cpu_with_opponent(
 ) -> Result<CompletedAdvance, PpoError> {
     assert!(!state.done);
     assert!(state.decisions < ACTOR_DECISIONS);
-    #[cfg(test)]
-    let learning_signal = state.learning_signal.as_ref().map(|_| {
-        super::annealed::learning_signal::Decision::capture(
-            environment,
-            &choice,
-            state.decisions,
-            state.begins_interval(),
-        )
-    });
     if state.begins_interval() {
         assert!(state.choice.is_none());
         assert_eq!(state.interval.steps, 0);
@@ -1725,35 +1599,12 @@ fn advance_cpu_with_opponent(
     )?;
     state.actions[choice.action().kind().index()] += 1;
     state.append_retained_reward(reward, advanced.ticks, config.gamma_tick)?;
-    #[cfg(test)]
-    record_learning_signal(state, learning_signal, reward, advanced.ticks);
     state.decisions += 1;
     Ok(CompletedAdvance {
         end_tick: tick + advanced.ticks,
         ticks: advanced.ticks,
         outcome,
     })
-}
-
-#[cfg(test)]
-fn record_learning_signal(
-    state: &mut EpisodeStream,
-    signal: Option<super::annealed::learning_signal::Decision>,
-    reward: f64,
-    ticks: u32,
-) {
-    if let Some(mut row) = signal {
-        row.reward = reward;
-        row.ticks = ticks;
-        row.terminal = state.done;
-        let tape = state
-            .learning_signal
-            .as_mut()
-            .expect("enabled learning tape");
-        assert_eq!(tape.len(), state.decisions);
-        assert!(tape.len() < ACTOR_DECISIONS);
-        tape.push(row);
-    }
 }
 
 /// Serial completion of one advanced decision: retained-interval flush with an

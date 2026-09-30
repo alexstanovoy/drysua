@@ -14,9 +14,6 @@ mod adaptive_annealed;
 mod capacity_tests;
 #[path = "training_concurrency.rs"]
 mod concurrency_tests;
-#[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
-#[path = "graph_full_update.rs"]
-mod graph_full_update;
 #[path = "annealed_invocation.rs"]
 mod invocation_tests;
 #[path = "neural_opponent_scope.rs"]
@@ -310,4 +307,46 @@ fn resume_rejects_a_changed_environment_scale_without_committing() {
         2
     );
     std::fs::remove_dir_all(directory).expect("remove own checkpoint");
+}
+
+fn assert_artifact_bits(source: &std::path::Path, target: &std::path::Path, device: PolicyDevice) {
+    let source = TrainingArtifact::load(source).expect("source artifact");
+    let target = TrainingArtifact::load(target).expect("target artifact");
+    assert_eq!(source.progress(), target.progress());
+    let (source, source_rng, source_updates) = restored_state(&source, device);
+    let (target, target_rng, target_updates) = restored_state(&target, device);
+    let (source_first, source_second) = source.adam.moments();
+    let (target_first, target_second) = target.adam.moments();
+    for (source, target) in [
+        (source.parameters.as_slice(), target.parameters.as_slice()),
+        (source_first, target_first),
+        (source_second, target_second),
+    ] {
+        assert_eq!(source.len(), target.len());
+        assert!(
+            source
+                .iter()
+                .zip(target)
+                .all(|(a, b)| a.to_bits() == b.to_bits())
+        );
+    }
+    assert_eq!(source.adam.step(), target.adam.step());
+    assert_eq!(source_rng, target_rng);
+    assert_eq!(source_updates, target_updates);
+}
+
+fn restored_state(
+    artifact: &TrainingArtifact,
+    device: PolicyDevice,
+) -> (crate::model::ModelAdamSnapshot, (u64, u64), u64) {
+    let model = PolicyModel::fresh_on(9001, device).expect("restore device");
+    let restored = artifact.restore(&model, artifact.run()).expect("restore");
+    (
+        restored
+            .trainer()
+            .checkpoint_snapshot(&model)
+            .expect("snapshot"),
+        restored.trainer().rng_checkpoint(),
+        restored.trainer().updates(),
+    )
 }

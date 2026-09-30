@@ -5,13 +5,7 @@
 
 #[cfg(feature = "builtin")]
 mod actor_order;
-#[cfg(test)]
-mod learning_fork;
 mod minibatch;
-#[cfg(all(test, not(feature = "side-actors")))]
-mod rnd;
-#[cfg(all(test, not(feature = "side-actors")))]
-pub(crate) use rnd::{Rnd, RndReport};
 
 use std::error::Error;
 use std::fmt;
@@ -988,31 +982,13 @@ impl PpoTrainer {
         Ok(())
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "builtin"))]
     pub(crate) const fn execution_for_test(&self) -> crate::TrainingExecutionOptions {
         self.execution
     }
 
     pub const fn optimizer_step(&self) -> u64 {
         self.adam.step()
-    }
-
-    /// Research-only, off-policy SIL-inspired actor loss, not a PPO update.
-    /// Callers supply complete-episode gamma-one Monte Carlo returns in `return_value`.
-    /// Accepted steps advance shared Adam, but freeze value-head weights and moments.
-    /// Reported KL is pre-auxiliary versus candidate on replay actions, not on-policy KL.
-    /// Replay is not checkpointed; this does not define a resumable production profile.
-    /// `applied = false` means zero weight/coefficient or KL rejection, not PPO early stop.
-    #[cfg(test)]
-    pub(crate) fn self_imitation_update(
-        &mut self,
-        model: &PolicyModel,
-        samples: &[PpoPreparedSample],
-        coefficient: f32,
-    ) -> Result<PpoMinibatchReport, PpoError> {
-        model
-            .self_imitation_update(samples, &mut self.adam, self.config, coefficient)
-            .map_err(|error| PpoError::Model(error.to_string()))
     }
 
     pub const fn updates(&self) -> u64 {

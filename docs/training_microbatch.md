@@ -136,13 +136,3 @@ cargo test --all-targets --all-features --quiet
 cargo fmt
 cargo machete
 ```
-
-The existing ignored `concurrency_probe_cuda` accepts
-`DRYSUA_PROBE_TRAINING_MICROBATCH=64|128|256` (default 64). Every fresh trial within
-one invocation uses the same numerical mode, so existing within-invocation bit
-checks remain meaningful. Cross-mode final weights/reports may differ. For the
-planned full40 CREDIT-u10 comparison keep the identical pinned initial weights,
-seed, collector settings, epochs=4 and effective minibatch=2048. Require the same
-pre-update actor trace/retained rows and **40 applied Adam steps** on both sides;
-a different KL stop or fewer steps is not a same-work speedup. The theoretical
-2048-row tensor-pass count is 32/16/8 for 64/128/256, not a measured 2x speedup.
