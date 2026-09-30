@@ -1533,11 +1533,21 @@ fn build_entity_candidates(
     current: &WorldView,
     center: Option<Vec2>,
 ) -> Vec<EntityCandidate> {
-    let mut selected: Vec<&UnitView> = current.units.iter().filter(|unit| unit.hp > 0).collect();
-    selected.sort_by_key(|unit| entity_priority(tracker, unit, center));
-    selected.truncate(UNIT_TOKENS);
+    // Priorities end in the unique unit id, so they are distinct and any
+    // selection or sort yields the same order; each is computed once.
+    let mut selected: Vec<EntityPriority<'_>> = current
+        .units
+        .iter()
+        .filter(|unit| unit.hp > 0)
+        .map(|unit| entity_priority(tracker, unit, center))
+        .collect();
+    if selected.len() > UNIT_TOKENS {
+        selected.select_nth_unstable(UNIT_TOKENS);
+        selected.truncate(UNIT_TOKENS);
+    }
+    selected.sort_unstable();
     let mut output = Vec::with_capacity(UNIT_TOKENS);
-    for unit in selected {
+    for EntityPriority { unit, .. } in selected {
         output.push(EntityCandidate {
             id: unit.id,
             unit: unit.clone(),

@@ -1091,26 +1091,19 @@ impl StateTracker {
         for entity in &mut self.entities {
             entity.visible = false;
         }
-        for unit in &view.units {
-            if let Ok(index) = self
-                .entities
-                .binary_search_by_key(&unit.id, |entity| entity.id)
-            {
-                update_entity(&mut self.entities[index], view.tick, unit);
+        let mut untracked = Vec::new();
+        for (unit, tracked) in pair_tracked(&mut self.entities, &view.units) {
+            match tracked {
+                Some(entity) => update_entity(entity, view.tick, unit),
+                None => untracked.push(unit),
             }
         }
-        for unit in &view.units {
-            if self
+        for unit in untracked {
+            let index = self
                 .entities
                 .binary_search_by_key(&unit.id, |entity| entity.id)
-                .is_err()
-            {
-                let index = self
-                    .entities
-                    .binary_search_by_key(&unit.id, |entity| entity.id)
-                    .expect_err("new entity cannot already exist");
-                self.entities.insert(index, new_entity(view.tick, unit));
-            }
+                .expect_err("new entity cannot already exist");
+            self.entities.insert(index, new_entity(view.tick, unit));
         }
         assert!(self.entities.len() <= MAX_TRACKED_ENTITIES);
     }
@@ -1144,14 +1137,8 @@ impl StateTracker {
     }
 
     fn make_entity_room(&mut self, view: &WorldView) {
-        let new_count = view
-            .units
-            .iter()
-            .filter(|unit| {
-                self.entities
-                    .binary_search_by_key(&unit.id, |entity| entity.id)
-                    .is_err()
-            })
+        let new_count = pair_tracked(&self.entities, &view.units)
+            .filter(|(_, tracked)| tracked.is_none())
             .count();
         let mut required = self
             .entities
@@ -1699,9 +1686,9 @@ fn validate_position_deltas(
     entities: &[EntityTrack],
     view: &WorldView,
 ) -> Result<(), TrackerError> {
-    for unit in &view.units {
-        if let Ok(index) = entities.binary_search_by_key(&unit.id, |entity| entity.id) {
-            let previous = entities[index].unit.pos;
+    for (unit, tracked) in pair_tracked(entities, &view.units) {
+        if let Some(entity) = tracked {
+            let previous = entity.unit.pos;
             if unit.pos.x.checked_sub(previous.x).is_none()
                 || unit.pos.y.checked_sub(previous.y).is_none()
             {
@@ -1710,6 +1697,19 @@ fn validate_position_deltas(
         }
     }
     Ok(())
+}
+
+/// Each snapshot unit with its tracked entity, if any, in one merge pass:
+/// both lists are sorted by id (units strictly, as validated).
+fn pair_tracked<T: std::ops::Deref<Target = EntityTrack>>(
+    entities: impl IntoIterator<Item = T>,
+    units: &[UnitView],
+) -> impl Iterator<Item = (&UnitView, Option<T>)> {
+    let mut entities = entities.into_iter().peekable();
+    units.iter().map(move |unit| {
+        while entities.next_if(|entity| entity.id < unit.id).is_some() {}
+        (unit, entities.next_if(|entity| entity.id == unit.id))
+    })
 }
 
 fn new_entity(tick: u32, unit: &UnitView) -> EntityTrack {
