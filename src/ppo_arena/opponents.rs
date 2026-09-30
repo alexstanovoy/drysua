@@ -4,7 +4,7 @@
 //! Every published update gets its own per-game mixture. Its entries are the
 //! configured opponents plus, with a league, the `size` latest runtime-history
 //! milestones of this run. Under PFSP each entry's configured weight is scaled
-//! by `(1 - p)^2`, where `p` is the Laplace-smoothed score (win 1, draw 1/2)
+//! by `(1 - p)^2`, at least 1/10, where `p` is the Laplace-smoothed score (win 1, draw 1/2)
 //! of the learner's last [`PFSP_WINDOW`] games against it. Weights are exact
 //! integers computed from logged outcomes of updates every lane has finished,
 //! so the schedule is a pure function of the run and resumes identically.
@@ -20,6 +20,10 @@ use crate::{PpoError, PpoTerminalOutcome};
 
 /// Games per opponent that form its PFSP win rate.
 pub(crate) const PFSP_WINDOW: usize = 100;
+/// Every opponent keeps at least this fraction (one over it) of its configured
+/// weight: an update still plays the styles the learner already beats, so it
+/// cannot overfit to the hardest one and forget the rest.
+const PFSP_FLOOR_DIVISOR: u64 = 10;
 /// Most league milestones playing at once.
 pub(crate) const MAX_LEAGUE_SIZE: usize = 16;
 /// Most entries of one update's mixture: configured opponents plus the league.
@@ -147,7 +151,7 @@ pub(crate) fn schedule_mixture(
     OpponentMixture::new(weighted)
 }
 
-/// `weight * (1 - p)^2` with `p = (score / 2 + 1) / (games + 2)`, floored at one unit.
+/// `weight * max((1 - p)^2, 1/10)` with `p = (score / 2 + 1) / (games + 2)`, at least one unit.
 fn pfsp_weight(weight: u64, (games, score): (u64, u64)) -> u64 {
     assert!(score <= 2 * games);
     let numerator = u128::from(2 * games + 2 - score);
@@ -155,6 +159,7 @@ fn pfsp_weight(weight: u64, (games, score): (u64, u64)) -> u64 {
     let scaled = u128::from(weight) * numerator * numerator / (denominator * denominator);
     u64::try_from(scaled)
         .expect("never above the configured weight")
+        .max(weight / PFSP_FLOOR_DIVISOR)
         .max(1)
 }
 
