@@ -2,7 +2,7 @@
 
 ## Observations
 
-`FeatureEncoder` (`src/feature.rs`, schema 23) turns one `StateTracker` view into a
+`FeatureEncoder` (`src/feature.rs`, schema 24) turns one `StateTracker` view into a
 fixed-size `FeatureFrame`. Coordinates are team-canonical; every value is finite,
 bounded and has an explicit presence flag where it can be unknown.
 
@@ -12,18 +12,18 @@ bounded and has an explicit presence flag where it can be unknown.
 | History | 7 global samples × 24 at ages 480, 240, 120, 60, 30, 15, 0 ticks; 16 policy-history samples × 4 |
 | Map | 96 |
 | Units | 96 current + 32 remembered + 2 own tokens × 84 |
-| Tokens | abilities 24, items 28, point candidates 32 (48 tokens), projectiles 20 (32), loot 16 (16) |
+| Tokens | abilities 24, items 28, point candidates 32 (64 tokens), projectiles 20 (32), loot 16 (16) |
 
 Enemy ability cooldowns are not encoded, and there is no recurrent state beyond this
 history.
 
 ## Actions
 
-The action is an autoregressive tuple (`src/action.rs`, schema 6):
+The action is an autoregressive tuple (`src/action.rs`, schema 7):
 
 ```text
 kind (16) -> controlled unit (hero, courier) -> ability/item/source slot
-          -> target mode (None, Entity, Point) -> entity pointer (96) or point pointer (48)
+          -> target mode (None, Entity, Point) -> entity pointer (96) or point pointer (64)
 ```
 
 Kinds, append-only: Continue, Stop, MovePoint, FollowUnit, Hold, AttackMovePoint,
@@ -32,20 +32,42 @@ sends nothing and keeps the current order. `ActionSpace` builds legality masks b
 sampling (ownership, visibility, range, mana, cooldown, charges, inventory, shop
 range, gold, skill points, channel, courier errand); only legal choices are sampled.
 
-Point candidates: 8 directions at 200/600/1,200, fountains, towers, predicted hero
-and creep positions, static and planted trees, and building landing points.
+Point candidates (at most 64): first up to 48 general ones — 8 directions at
+200/600/1,200, building landing points, the 8 nearest trees, fountains and towers,
+predicted hero and creep positions — then up to 16 raze-only ones (`src/action/raze_points.rs`)
+while the own hero lives: straight ahead along its facing, per raze reach the landing
+that strikes the most visible hostile units (then heroes; the middle of the widest
+run of 128 scanned headings), the last-seen and extrapolated positions of up to two
+enemy heroes out of sight for at most 150 ticks, and 8 blind headings halfway between
+the tactical directions. Raze-only points are legal only as raze targets, so movement,
+items and Teacher see exactly the general candidates. Every point token carries, per
+raze reach, the visible hostile non-hero units and enemy heroes the landing along the
+heading toward it would strike, and fog guesses carry their sighting age.
 
 ### Aimed razes
 
 A Shadowraze has no target on the wire: it lands 200/450/700 units along the
-caster's facing with radius 250, and bota has no order that only turns. A raze is
-therefore legal only as `Cast` with an entity target: a visible enemy or neutral
-whose distance is within the raze's reach ± 250 while the ability is ready.
-`RazeAim` (`src/raze_aim.rs`) expands that one decision into a macro: it walks
-48 units toward the target's predicted position to turn, then casts once the landing
-predicted for the next tick covers it. Continue advances the macro; any other
-decision replaces it; it aborts after 15 ticks or when the target is lost, out of
-the reach window or the raze is not ready. Teacher uses the same macro.
+caster's facing with radius 250, strikes only hostile units its side sees at that
+tick, and bota has no order that only turns. The policy picks the target mode of a
+ready raze:
+
+- **None** fires along the current facing at once.
+- **Entity** tracks a visible enemy or neutral within the raze's reach ± 250:
+  `RazeAim` (`src/raze_aim.rs`) walks 48 units toward its predicted position and casts
+  once the landing predicted for the next tick covers it.
+- **Point** takes any candidate but the caster's own position as a heading (the reach
+  stays fixed): the macro fixes the heading toward the point at the decision, walks
+  32 units along it (one walk node; longer walks route through node centres and
+  leave the facing off the heading) and casts once the landing is within 25 units
+  of the landing along the heading. This expresses area razes at cluster landings and
+  blind razes at fog guesses; a blind raze strikes only if the hero is back in sight
+  when it lands.
+
+Continue advances the macro; any other decision replaces it; it aborts after 15 ticks
+or when the raze is not ready (and for Entity when the target is lost or leaves the
+reach window). Teacher razes only as Entity. Episode logs count each seat's raze
+decisions per mode (`raze_mode_*`) and razes that struck any hostile unit
+(`raze_hits`) besides enemy heroes (`raze_hero_hits`).
 
 ## Network
 

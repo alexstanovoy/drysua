@@ -21,24 +21,29 @@ use crate::{
 #[cfg(test)]
 #[path = "tests/action_test_support.rs"]
 mod test_support;
+
+mod raze_points;
+pub use raze_points::RazeCoverage;
+pub(crate) use raze_points::{FOG_GUESS_MAX_AGE_TICKS, RAZE_RING_RADIUS};
 #[cfg(test)]
 pub(crate) use test_support::*;
 
 /// Distance at which drysua permits stash swaps around the own fountain.
 pub const STASH_ACCESS_RANGE: i32 = 1_000;
 /// Version of the append-only structured-action schema.
-pub const ACTION_SCHEMA_VERSION: u32 = 6;
+pub const ACTION_SCHEMA_VERSION: u32 = 7;
 /// Canonical action families, head widths, and autoregressive branch order.
 pub const ACTION_SCHEMA_DESCRIPTOR: &str = concat!(
-    "bota-drysua-action/v6;kinds=Continue,Stop,MovePoint,FollowUnit,Hold,AttackMovePoint,AttackUnit,Cast,Use,PutPoint,PutUnit,Take,Buy,Sell,Swap,Learn;",
-    "heads=kind16,controlled2,ability8,item15,swap15,learn6,shop64,loot16,target_mode3,put_mode2,entity96,point48;",
+    "bota-drysua-action/v7;kinds=Continue,Stop,MovePoint,FollowUnit,Hold,AttackMovePoint,AttackUnit,Cast,Use,PutPoint,PutUnit,Take,Buy,Sell,Swap,Learn;",
+    "heads=kind16,controlled2,ability8,item15,swap15,learn6,shop64,loot16,target_mode3,put_mode2,entity96,point64;",
     "target_modes=None,Entity,Point;put_modes=Underfoot,Point;put_point_legality=underfoot_only;",
     "buy_legality=positive_missing_leaves_and_total_missing_cost_and_leaf_capacity;buy_decode=root_or_first_missing_leaf;",
     "buy_mango=item42_one_charge_repeatable_home_bag_then_stash_remote_stash_empty_or_visible_compatible_stack_below3;",
     "use_mango=hero_active_slots0..5_unmuted_charges1..3_target_none_provable_positive_own_mana_deficit;",
     "mana_legality=all_casts_and_uses_conservative_own_wire_mana_affordability;",
-    "raze_legality=ready_entity_target_only_live_enemy_or_neutral_candidate_within_reach_pm_radius250_plus1_no_none_or_point;",
-    "raze_execution=entity_intent_decodes_to_unit_cast_resolved_by_aim_macro_walk48_toward_one_tick_prediction_until_next_tick_landing_covers_it_then_untargeted_cast_limit15_ticks_continue_advances_other_decisions_replace;",
+    "raze_legality=ready_none,ready_point_any_candidate_but_the_caster_position,ready_entity_live_enemy_or_neutral_candidate_within_reach_pm_radius250_plus1;",
+    "raze_execution=none_casts_along_current_facing_at_once,entity_and_point_intents_decode_to_unit_and_pos_casts_resolved_by_aim_macro,entity_walk48_toward_one_tick_prediction_until_next_tick_landing_covers_it,point_heading_fixed_toward_point_at_decision_walk48_along_it_until_next_tick_landing_within25_of_heading_landing,then_untargeted_cast_limit15_ticks_continue_advances_other_decisions_replace;",
+    "point_candidates=general48_then_raze_only16:facing450,best_landing_per_reach_most_hostile_then_heroes_128_headings_widest_run_middle,fogged_enemy_heroes2_age_le150_last_seen_then_extrapolated,blind_ring8_between_tactical_directions450;raze_only_points_are_raze_targets_only;",
     "move_point_legality=live_body_unstunned_unrooted_and_walkable_including_existing_building_landing;attack_move_point_legality=unchanged_building_landing_source_excluded;building_landing_provenance=unchanged_tp_walkability_allied_anchor_and_target_kind_checks,no_new_points_or_goal_features;",
     "entity_order=active_effect15_max_lexicographic_stacks_remaining_then_guarded13_inspired14_timers_then_prior_received_manual_hp_mana_report_semantics_before_opaque_id;",
 );
@@ -52,6 +57,8 @@ const ACTION_KIND_COUNT: usize = 16;
 const ACTIVE_ITEM_SLOTS: usize = 6;
 const STASH_SLOT_START: usize = HERO_BAG_SLOTS;
 const WIRE_ITEM_SLOTS: usize = HERO_BAG_SLOTS + STASH_SLOTS;
+/// Movement, item and raze candidates; raze-only candidates follow up to the full cap.
+const GENERAL_POINT_CANDIDATES: usize = 48;
 const NEARBY_TREE_POINTS: usize = 8;
 const PREDICTED_HERO_POINTS: usize = 4;
 const STATIC_TREE_CLEARANCE: i32 = 48 + 24 + 8;
@@ -65,6 +72,8 @@ const TACTICAL_RADII: [i32; 3] = [200, 600, 1_200];
 const LANDING_SEARCH_CELLS: usize = 10;
 
 const _: () = assert!(ACTIVE_ITEM_SLOTS <= HERO_BAG_SLOTS);
+const _: () =
+    assert!(GENERAL_POINT_CANDIDATES + raze_points::RAZE_POINT_CANDIDATES == MAX_POINT_CANDIDATES);
 const _: () = assert!(STASH_SLOTS <= HERO_BAG_SLOTS);
 const _: () = assert!(MANGO_STACK_MAX > 1);
 
@@ -355,6 +364,36 @@ pub enum PointSource {
     Tower(LandmarkRelation),
     PredictedHero(EntityRelation),
     PredictedCreep(EntityRelation),
+    /// Straight ahead along the own hero's facing: a point raze here casts at once.
+    RazeFacing,
+    /// Landing of this reach that strikes the most visible hostile units.
+    RazeCluster {
+        reach: i32,
+    },
+    /// Where a fogged enemy hero was last seen, `age` ticks ago.
+    LastSeenHero {
+        age: u32,
+    },
+    /// A fogged enemy hero's last sighting carried forward `age` ticks at its last velocity.
+    ExtrapolatedHero {
+        age: u32,
+    },
+    /// One of eight blind headings halfway between the tactical directions.
+    RazeRing,
+}
+
+impl PointSource {
+    /// Whether the candidate exists only as a raze heading.
+    pub const fn raze_only(self) -> bool {
+        matches!(
+            self,
+            Self::RazeFacing
+                | Self::RazeCluster { .. }
+                | Self::LastSeenHero { .. }
+                | Self::ExtrapolatedHero { .. }
+                | Self::RazeRing
+        )
+    }
 }
 
 /// Deterministic model-visible point candidate.
@@ -370,6 +409,8 @@ pub struct PointCandidate {
     pub standing_tree: bool,
     /// Whether this point is a landing candidate near a visible allied structure.
     pub allied_building: bool,
+    /// Per Shadowraze reach, what its landing along the heading toward this point strikes.
+    pub raze_coverage: [RazeCoverage; 3],
 }
 
 /// Model-safe visible ground-item candidate; its opaque handle remains private.
@@ -1581,6 +1622,13 @@ fn build_point_candidates(
         add_landmark_points(tracker, current, passability, center, &mut points);
         add_predicted_points(tracker, current, passability, center, &mut points)?;
     }
+    assert!(points.len() <= GENERAL_POINT_CANDIDATES);
+    if let Some(hero) = raze_points::raze_caster(tracker) {
+        let targets = raze_points::raze_targets(tracker, current, hero.pos);
+        raze_points::add_raze_points(tracker, current, passability, hero, &targets, &mut points)?;
+        raze_points::fill_raze_coverage(hero.pos, &targets, &mut points);
+    }
+    assert!(points.len() <= MAX_POINT_CANDIDATES);
     Ok(points)
 }
 
@@ -1602,7 +1650,9 @@ fn add_tactical_points(
                     walkable: passability.walkable(position),
                     standing_tree: false,
                     allied_building: false,
+                    raze_coverage: [RazeCoverage::NONE; 3],
                 },
+                GENERAL_POINT_CANDIDATES,
             );
         }
     }
@@ -1647,9 +1697,11 @@ fn add_building_landing_points(
                 walkable: true,
                 standing_tree: false,
                 allied_building: true,
+                raze_coverage: [RazeCoverage::NONE; 3],
             },
+            GENERAL_POINT_CANDIDATES,
         );
-        if points.len() == MAX_POINT_CANDIDATES {
+        if points.len() == GENERAL_POINT_CANDIDATES {
             break;
         }
     }
@@ -1738,7 +1790,7 @@ fn add_tree_points(
     center: Vec2,
     points: &mut Vec<PointCandidate>,
 ) -> Result<(), ActionError> {
-    assert!(points.len() <= MAX_POINT_CANDIDATES);
+    assert!(points.len() <= GENERAL_POINT_CANDIDATES);
     let mut trees = Vec::with_capacity(tracker.static_trees().len() + current.planted_trees.len());
     for (index, position) in tracker.static_trees().iter().copied().enumerate() {
         let index = u32::try_from(index).map_err(|_| ActionError::Arithmetic("tree index"))?;
@@ -1777,9 +1829,11 @@ fn add_tree_points(
                 walkable: passability.walkable(position),
                 standing_tree: true,
                 allied_building: false,
+                raze_coverage: [RazeCoverage::NONE; 3],
             },
+            GENERAL_POINT_CANDIDATES,
         );
-        if points.len() == MAX_POINT_CANDIDATES {
+        if points.len() == GENERAL_POINT_CANDIDATES {
             break;
         }
     }
@@ -1819,7 +1873,9 @@ fn add_landmark_points(
                     walkable: passability.walkable(position),
                     standing_tree: false,
                     allied_building: false,
+                    raze_coverage: [RazeCoverage::NONE; 3],
                 },
+                GENERAL_POINT_CANDIDATES,
             );
         }
     }
@@ -1884,9 +1940,11 @@ fn add_predicted_points(
                 walkable: passability.walkable(position),
                 standing_tree: false,
                 allied_building: false,
+                raze_coverage: [RazeCoverage::NONE; 3],
             },
+            GENERAL_POINT_CANDIDATES,
         );
-        if points.len() == MAX_POINT_CANDIDATES {
+        if points.len() == GENERAL_POINT_CANDIDATES {
             break;
         }
     }
@@ -2002,7 +2060,7 @@ fn canonical_facing(tracker: &StateTracker, unit: &UnitView) -> u16 {
     }
 }
 
-fn push_point(points: &mut Vec<PointCandidate>, candidate: PointCandidate) {
+fn push_point(points: &mut Vec<PointCandidate>, candidate: PointCandidate, cap: usize) {
     if let Some(existing) = points
         .iter_mut()
         .find(|point| point.position == candidate.position)
@@ -2012,7 +2070,8 @@ fn push_point(points: &mut Vec<PointCandidate>, candidate: PointCandidate) {
         existing.allied_building |= candidate.allied_building;
         return;
     }
-    if points.len() == MAX_POINT_CANDIDATES {
+    assert!(cap <= MAX_POINT_CANDIDATES);
+    if points.len() >= cap {
         return;
     }
     points.push(candidate);
@@ -2214,9 +2273,10 @@ fn fill_body_masks(
     masks: &mut ControlledMasks,
 ) {
     for (index, point) in space.points.iter().enumerate() {
+        let walkable = point.walkable && !point.source.raze_only();
         let body_navigation_target =
-            point.walkable && !matches!(point.source, PointSource::BuildingLanding(_));
-        masks.move_points[index] = movement_enabled && point.walkable;
+            walkable && !matches!(point.source, PointSource::BuildingLanding(_));
+        masks.move_points[index] = movement_enabled && walkable;
         masks.attack_move_points[index] = attack_enabled && body_navigation_target;
     }
     for (index, target) in space.entities.iter().enumerate() {
@@ -2251,7 +2311,9 @@ pub(crate) fn ability_ready(unit: &UnitView, ability: &AbilityView) -> bool {
         && can_afford_mana(unit.mana, ability.mana_cost)
 }
 
-/// A raze is only ever aimed at a live hostile unit it can still cover.
+/// A ready raze fires along the current facing (None), turns toward any point
+/// candidate that gives it a heading (Point), or tracks a live hostile unit it
+/// can still cover (Entity).
 fn raze_target_mask(
     space: &ActionSpace,
     state: &ControlledState,
@@ -2261,6 +2323,10 @@ fn raze_target_mask(
     let mut mask = empty_target_mask(space);
     if !ready {
         return mask;
+    }
+    mask.none = true;
+    for (allowed, point) in mask.points.iter_mut().zip(&space.points) {
+        *allowed = point.position != state.unit.pos;
     }
     for (allowed, target) in mask.entities.iter_mut().zip(&space.entities) {
         *allowed = matches!(
@@ -2384,7 +2450,8 @@ fn fill_point_targets(
     mask: &mut [bool],
 ) {
     for (index, target) in space.points.iter().enumerate() {
-        mask[index] = (!require_walkable || target.walkable)
+        mask[index] = !target.source.raze_only()
+            && (!require_walkable || target.walkable)
             && in_range(state.unit.pos, target.position, range);
     }
 }

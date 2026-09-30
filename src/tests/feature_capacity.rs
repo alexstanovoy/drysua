@@ -138,7 +138,7 @@ fn bounded_feature_reservation_reports_allocation_failure_without_allocating() {
 
 #[test]
 fn feature_peak_counts_all_row_capacities_and_one_largest_reallocation() {
-    let counts = [96u64, 32, 48, 14, 85, 32, 16];
+    let counts = [96u64, 32, 64, 14, 85, 32, 16];
     let sizes = [340u64, 340, 132, 100, 116, 84, 68];
     let mut total = 0;
     let mut largest = 0;
@@ -150,10 +150,10 @@ fn feature_peak_counts_all_row_capacities_and_one_largest_reallocation() {
         largest = largest.max(bytes);
     }
 
-    assert_eq!(total, 3_018_775_840);
+    assert_eq!(total, 3_117_026_080);
     assert_eq!(largest, 1_518_412_800);
     assert_eq!(FEATURE_ARENA_PEAK_BYTES, total + largest);
-    assert_eq!(FEATURE_ARENA_PEAK_BYTES, 4_537_188_640);
+    assert_eq!(FEATURE_ARENA_PEAK_BYTES, 4_635_438_880);
 }
 
 fn arena_capacities(arena: &RaggedFeatureArena) -> [usize; 7] {

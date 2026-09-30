@@ -789,6 +789,7 @@ fn issue_request(
     action_kind: ActionKind,
     synchronize_teacher: bool,
 ) -> Result<Option<Request>, PpoError> {
+    seat.combat.note_decision(&seat.tracker, issued);
     let active_body = seat
         .order_bookkeeping
         .effective(&seat.persistence)

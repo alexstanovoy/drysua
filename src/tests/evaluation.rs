@@ -96,7 +96,14 @@ fn episode_summary_log_carries_every_evaluation_field() {
         assert_eq!(fields["ticks"], json["ticks"].to_string());
         for hero in ["own", "enemy"] {
             let expected = &json[hero];
-            for key in ["kills", "deaths", "level", "xp", "raze_hero_hits"] {
+            for key in [
+                "kills",
+                "deaths",
+                "level",
+                "xp",
+                "raze_hero_hits",
+                "raze_hits",
+            ] {
                 let field = format!("{hero}_{key}");
                 assert_eq!(fields[field.as_str()], expected[key].to_string(), "{field}");
             }
@@ -108,8 +115,12 @@ fn episode_summary_log_carries_every_evaluation_field() {
                 let field = format!("{hero}_casts_{cast}");
                 assert_eq!(fields[field.as_str()], count.to_string(), "{field}");
             }
+            for (mode, count) in expected["raze_modes"].as_object().expect("raze modes") {
+                let field = format!("{hero}_raze_mode_{mode}");
+                assert_eq!(fields[field.as_str()], count.to_string(), "{field}");
+            }
         }
-        assert_eq!(fields.len(), 4 + 2 * 10);
+        assert_eq!(fields.len(), 4 + 2 * 14);
     }
 }
 
