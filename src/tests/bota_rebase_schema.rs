@@ -1,4 +1,4 @@
-use super::map2_checkpoint::{Directory, runtime_bytes};
+use super::map2_checkpoint::runtime_bytes;
 use crate::{CheckpointError, PolicyModel, TrainingArtifact};
 
 #[test]
@@ -8,9 +8,9 @@ fn historical_bindings_and_shapes_cannot_be_relabelled_as_current_runtime() {
         crate::PpoTrainer::new(&model, super::map2_checkpoint::config(), 38).expect("trainer");
     let prior = model.export_parameters().expect("parameters");
     let identity = model.policy_identity().expect("identity");
-    let directory = Directory::new();
-    let path = directory.0.join("drysua.weights.safetensors");
-    TrainingArtifact::save_runtime_weights(&model, &directory.0).expect("current runtime");
+    let directory = crate::ppo::test_directory("map2-checkpoint");
+    let path = directory.join("drysua.weights.safetensors");
+    TrainingArtifact::save_runtime_weights(&model, &directory).expect("current runtime");
     let current = std::fs::read(&path).expect("current bytes");
     let (_, header) = safetensors::SafeTensors::read_metadata(&current).expect("metadata");
     let current = header.metadata().clone().expect("current metadata");
@@ -70,8 +70,7 @@ fn historical_bindings_and_shapes_cannot_be_relabelled_as_current_runtime() {
     for (name, count, metadata, kind, expected) in cases {
         let bytes = runtime_bytes(&vec![0.0; count], metadata);
         std::fs::write(&path, &bytes).expect("incompatible runtime");
-        let error =
-            TrainingArtifact::load_runtime_weights(&model, &directory.0).expect_err("reject");
+        let error = TrainingArtifact::load_runtime_weights(&model, &directory).expect_err("reject");
         assert_eq!(error, kind, "{name}");
         assert_eq!(error.to_string(), expected, "{name}");
         super::support::assert_bits(&model.export_parameters().expect("after"), &prior);
@@ -95,22 +94,19 @@ fn legacy_effect_and_progress_manifests_reject_before_tensor_access() {
         (3u32, 6_904_067_705_245_923_052u64),
         (6, 16_772_919_360_388_607_733),
     ] {
-        let directory = Directory::new();
-        let path = directory.0.join("checkpoint.meta");
+        let directory = crate::ppo::test_directory("map2-checkpoint");
+        let path = directory.join("checkpoint.meta");
         let mut bytes = b"DRYCKP21".to_vec();
         bytes.extend(version.to_le_bytes());
         bytes.extend(hash.to_le_bytes());
         std::fs::write(&path, &bytes).expect("old manifest header");
-        let error = TrainingArtifact::load(&directory.0).expect_err("old resume");
+        let error = TrainingArtifact::load(&directory).expect_err("old resume");
         assert_eq!(error, CheckpointError::SchemaMismatch, "{version}");
         assert_eq!(
             error.to_string(),
             "checkpoint schema does not match this build"
         );
         assert_eq!(std::fs::read(path).expect("unchanged header"), bytes);
-        assert_eq!(
-            std::fs::read_dir(&directory.0).expect("directory").count(),
-            1
-        );
+        assert_eq!(std::fs::read_dir(&directory).expect("directory").count(), 1);
     }
 }

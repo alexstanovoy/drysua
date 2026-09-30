@@ -570,7 +570,7 @@ mod files {
         }
     }
 
-    struct Fixture(PathBuf);
+    struct Fixture(crate::ppo::TestDirectory);
 
     struct RootSwap<'a> {
         original: &'a Path,
@@ -612,12 +612,6 @@ mod files {
         fn manifest(&self, artifact: &TrainingArtifact) {
             let bytes = encode_manifest(artifact, artifact.tensor_hash).expect("native manifest");
             fs::write(self.0.join(CHECKPOINT_META_FILE), bytes).expect("own manifest");
-        }
-    }
-
-    impl Drop for Fixture {
-        fn drop(&mut self) {
-            fs::remove_dir_all(&self.0).expect("remove own inspection fixture");
         }
     }
 

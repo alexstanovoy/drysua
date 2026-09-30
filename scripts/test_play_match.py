@@ -1,4 +1,4 @@
-"""Local launcher regression tests; fixtures stay below artifacts/temp."""
+"""Local launcher regression tests; fixtures live in temporary directories removed on cleanup."""
 
 import ctypes
 import contextlib
@@ -24,8 +24,10 @@ import unittest
 from unittest.mock import Mock, patch
 
 
-ROOT = Path(__file__).resolve().parents[2]
-TEMPORARY = ROOT / "drysua/artifacts/temp"
+# This checkout and its sibling simulator, never another checkout of the same repository.
+SCRIPTS = Path(__file__).resolve().parent
+REPOSITORY = SCRIPTS.parent
+BOTA = REPOSITORY.parent / "bota"
 # Bounded native client-output assertions moved here from the archived historical
 # release evaluator when that harness left the tracked tree.
 SUMMARY = re.compile(r"played (\d+) ticks as Some\((Radiant|Dire)\); winner "
@@ -365,7 +367,6 @@ with socket.create_connection((host, int(port)), 5) as connection:
 class LauncherTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        TEMPORARY.mkdir(parents=True, exist_ok=True)
         # Adopt killed grandchildren so tests never leave zombies with PID 1.
         cls.libc = ctypes.CDLL(None, use_errno=True)
         cls.previous_subreaper = ctypes.c_int()
@@ -377,7 +378,7 @@ class LauncherTests(unittest.TestCase):
         assert cls.libc.prctl(36, cls.previous_subreaper.value, 0, 0, 0) == 0
 
     def setUp(self):
-        self.temporary = tempfile.TemporaryDirectory(prefix="play-test-", dir=TEMPORARY)
+        self.temporary = tempfile.TemporaryDirectory(prefix="play-test-")
         self.addCleanup(self.temporary.cleanup)
         self.root = Path(self.temporary.name) / "workspace with spaces"
         self.root.mkdir()
@@ -388,7 +389,7 @@ class LauncherTests(unittest.TestCase):
         (self.root / "drysua/scripts").mkdir()
         for name in ("play.sh", "play_match.py", "play_admission.py",
                      "play_reward.py", "play_pacing.py"):
-            source = ROOT / "drysua/scripts" / name
+            source = SCRIPTS / name
             if source.exists():
                 shutil.copy(source, self.root / "drysua/scripts")
         self.tools = self.root / "tools"
@@ -644,7 +645,9 @@ class LauncherTests(unittest.TestCase):
                 self.send(name, b"7")
                 output = self.finish(1)
                 if name == "bota-server":
-                    self.assertRegex(output, "exited|server disconnected before verified MatchOver")
+                    # A dying server resets rather than closes a relay socket that still holds
+                    # unread relayed bytes; which one the relay sees first depends on timing.
+                    self.assertRegex(output, "exited|(server disconnected|connection reset) before verified MatchOver")
                 else:
                     self.assertIn("exited", output)
                 self.assert_children_stopped()
@@ -754,12 +757,17 @@ class LauncherTests(unittest.TestCase):
     def test_either_wrong_welcome_slot_fails_and_cleans_clients_and_relays(self):
         for slot in (0, 1):
             with self.subTest(slot=slot):
+                # A wrong first Welcome aborts the launch at once, so the human hello waits
+                # until the bot process has reported; otherwise a slow bot start is killed unseen.
                 self.launch("--no-build", "--port", "0", PLAY_TEST_WRONG_SLOT="0" if slot else "1",
-                            PLAY_TEST_WRONG_SECOND_SLOT="0")
+                            PLAY_TEST_WRONG_SECOND_SLOT="0", PLAY_TEST_HOLD_HELLO="" if slot else "bota-client")
                 self.send("bota-server", b"R")
                 self.record("bota-server")
                 for name in ("bota-client", "drysua"):
                     self.child(name)
+                if not slot:
+                    self.assertEqual(self.record("bota-client"), {"connected": True})
+                    self.send("bota-client", b"h")
                 output = self.finish(1)
                 self.assertIn(f"expected slot {slot}, got {1 - slot}", output)
                 if slot:
@@ -1173,7 +1181,7 @@ class TerminalLifecycleTests(unittest.TestCase):
         relay, human, server = self.socket_relay()
         human.sendall(self.ORDER)
         waits = []
-        with tempfile.TemporaryDirectory(prefix="play-poll-", dir=TEMPORARY) as temporary:
+        with tempfile.TemporaryDirectory(prefix="play-poll-") as temporary:
             supervisor = self.launcher.Supervisor(Path(temporary))
             self.addCleanup(supervisor.close)
             supervisor.admission = SimpleNamespace(pacer=None, pump=relay.pump, close=relay.close)
@@ -1191,7 +1199,7 @@ class TerminalLifecycleTests(unittest.TestCase):
             self.assertEqual(sum(waits), 0, f"already-ready frame paid log-only waits: {waits}")
 
     def test_idle_relay_keeps_log_selector_timeout_instead_of_busy_polling(self):
-        with tempfile.TemporaryDirectory(prefix="play-poll-", dir=TEMPORARY) as temporary:
+        with tempfile.TemporaryDirectory(prefix="play-poll-") as temporary:
             supervisor = self.launcher.Supervisor(Path(temporary))
             self.addCleanup(supervisor.close)
             supervisor.admission = SimpleNamespace(pacer=None, pump=Mock(return_value=False), close=Mock())
@@ -1202,11 +1210,10 @@ class TerminalLifecycleTests(unittest.TestCase):
 
 class SupervisorTests(unittest.TestCase):
     def setUp(self):
-        TEMPORARY.mkdir(parents=True, exist_ok=True)
         self.module = importlib.import_module("play_match")
 
     def supervisor(self):
-        temporary = tempfile.TemporaryDirectory(prefix="play-unit-", dir=TEMPORARY)
+        temporary = tempfile.TemporaryDirectory(prefix="play-unit-")
         self.addCleanup(temporary.cleanup)
         supervisor = self.module.Supervisor(Path(temporary.name))
         self.addCleanup(supervisor.close)
@@ -1256,7 +1263,7 @@ class SupervisorTests(unittest.TestCase):
 
         with patch.object(self.module.subprocess, "Popen", side_effect=interrupted_spawn):
             child = supervisor.spawn("build-bota", [sys.executable, "-c",
-                                     "import signal; signal.pause()"], ROOT)
+                                     "import signal; signal.pause()"], REPOSITORY)
         self.assertEqual(supervisor.stop_status, 130)
         self.assertEqual(len(supervisor.children), 1)
         self.doCleanups()
@@ -1264,7 +1271,7 @@ class SupervisorTests(unittest.TestCase):
 
     def test_readiness_deadline_uses_monotonic_time_without_sleep(self):
         supervisor = self.supervisor()
-        child = supervisor.spawn("server", [sys.executable, "-c", "import signal; signal.pause()"], ROOT)
+        child = supervisor.spawn("server", [sys.executable, "-c", "import signal; signal.pause()"], REPOSITORY)
         with patch.object(self.module.time, "monotonic", side_effect=[100, 111]):
             with self.assertRaisesRegex(RuntimeError, "readiness.*10"):
                 supervisor.wait_ready(child, 0)
@@ -1276,7 +1283,7 @@ class SupervisorTests(unittest.TestCase):
         for final, chunks, limit, message in cases:
             with self.subTest(final=final, message=message):
                 supervisor = self.supervisor()
-                child = supervisor.spawn("client", [sys.executable, "-c", "import signal; signal.pause()"], ROOT)
+                child = supervisor.spawn("client", [sys.executable, "-c", "import signal; signal.pause()"], REPOSITORY)
                 key = SimpleNamespace(fileobj=child.process.stderr, data=(child, False))
                 with patch.object(supervisor.selector, "select", return_value=[(key, 1)]), \
                         patch.object(self.module.os, "read", side_effect=chunks), \
@@ -1298,7 +1305,7 @@ class SupervisorTests(unittest.TestCase):
         previous = signal.signal(signal.SIGCHLD, signal.SIG_IGN)
         mask = os.umask(0o077)
         try:
-            with tempfile.TemporaryDirectory(prefix="play-unit-", dir=TEMPORARY) as temporary, \
+            with tempfile.TemporaryDirectory(prefix="play-unit-") as temporary, \
                     patch.dict(os.environ, DISPLAY=":fixture"), \
                     patch.object(self.module, "current_paths", return_value=(Path("unused"), Path("unused"))), \
                     patch.object(self.module, "release_executables"), \
@@ -1314,15 +1321,15 @@ class SupervisorTests(unittest.TestCase):
             os.umask(mask)
             signal.signal(signal.SIGCHLD, previous)
 
-    @unittest.skipUnless((ROOT / "bota/target/release/bota-server").is_file(),
+    @unittest.skipUnless((BOTA / "target/release/bota-server").is_file(),
                          "optional smoke requires an existing release server; never builds it")
     def test_existing_release_server_readiness_works_without_connecting_a_probe(self):
-        with tempfile.TemporaryDirectory(prefix="play-native-", dir=TEMPORARY) as temporary:
+        with tempfile.TemporaryDirectory(prefix="play-native-") as temporary:
             supervisor = self.module.Supervisor(Path(temporary))
             try:
-                server = supervisor.spawn("server", [str(ROOT / "bota/target/release/bota-server"),
+                server = supervisor.spawn("server", [str(BOTA / "target/release/bota-server"),
                                            "--port", "0", "--mode", "realtime", "--players", "2",
-                                           "--map", "2", "--seed", "9000001"], ROOT)
+                                           "--map", "2", "--seed", "9000001"], REPOSITORY)
                 port = supervisor.wait_ready(server, 0)
                 self.assertGreater(port, 0)
                 self.assertLessEqual(port, 65535)
@@ -1335,8 +1342,8 @@ class SupervisorTests(unittest.TestCase):
 
     def test_current_native_map2_teacher_protocol_with_explicit_build_attestation(self):
         # An existing target path alone does not establish that the concurrent rebase build finished.
-        bot = ROOT / "drysua/target/release/drysua"
-        server = ROOT / "bota/target/release/bota-server"
+        bot = REPOSITORY / "target/release/drysua"
+        server = BOTA / "target/release/bota-server"
         for role, binary in (("BOT", bot), ("SERVER", server)):
             expected = os.environ.get(f"PLAY_TEST_CURRENT_{role}_SHA256", "")
             if not expected:
@@ -1351,7 +1358,7 @@ class SupervisorTests(unittest.TestCase):
                     self.native_match(mode, limit, human_slot, server, bot, "teacher", 2)
 
     def native_match(self, mode, limit, human_slot, server_binary, bot_binary, policy, map_id):
-        with tempfile.TemporaryDirectory(prefix="play-native-map2-", dir=TEMPORARY) as temporary:
+        with tempfile.TemporaryDirectory(prefix="play-native-map2-") as temporary:
             supervisor = self.module.Supervisor(Path(temporary))
             children, statuses, failure = [], None, None
             previous = {}
@@ -1362,17 +1369,17 @@ class SupervisorTests(unittest.TestCase):
                 server = supervisor.spawn("server", [str(server_binary),
                                            "--port", "0", "--mode", ("realtime", "lockstep")[mode], "--players", "2",
                                            "--map", str(map_id), "--seed", "9000001",
-                                           "--ack-timeout-ticks", "900"], ROOT)
+                                           "--ack-timeout-ticks", "900"], REPOSITORY)
                 children.append(server)
                 port = supervisor.wait_ready(server, 0)
                 admission = self.module.Admission(port, ("radiant", "dire")[human_slot], mode)
                 supervisor.admission = admission
                 command = [str(bot_binary), "--addr", admission.addresses["bot"],
                            "--name", "drysua", "--policy", policy, "--limit", str(limit)]
-                children.append(supervisor.spawn("bot", command, ROOT))
+                children.append(supervisor.spawn("bot", command, REPOSITORY))
                 children.append(supervisor.spawn("client", [sys.executable, "-B", "-c", NATIVE_CLIENT,
                                                 admission.addresses["human"], str(human_slot), str(mode), str(limit),
-                                                str(ROOT / "drysua/scripts")], ROOT))
+                                                str(SCRIPTS)], REPOSITORY))
                 statuses = self.wait_native_peers(supervisor, children)
             except Exception as error:
                 failure = error

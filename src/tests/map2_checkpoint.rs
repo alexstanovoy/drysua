@@ -1,32 +1,8 @@
 //! Shared filesystem and runtime fixtures; behavior lives in the public checkpoint tests.
 
 use std::collections::HashMap;
-use std::fs;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use safetensors::tensor::{Dtype, TensorView, serialize};
-
-pub(super) struct Directory(pub PathBuf);
-
-impl Directory {
-    pub(super) fn new() -> Self {
-        static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "drysua-map2-checkpoint-{}-{}",
-            std::process::id(),
-            NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir(&path).expect("unique fixture directory");
-        Self(path)
-    }
-}
-
-impl Drop for Directory {
-    fn drop(&mut self) {
-        fs::remove_dir_all(&self.0).expect("fixture cleanup");
-    }
-}
 
 /// Runtime weights of `values`: named tensors in the current layout when the
 /// count matches it, otherwise one flat `model.parameters` tensor.

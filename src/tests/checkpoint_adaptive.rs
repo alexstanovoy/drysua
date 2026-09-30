@@ -280,7 +280,6 @@ fn adaptive_state_and_snapshot_invariants_reject_before_tensor_io() {
             format!("checkpoint manifest has invalid {field}")
         );
     }
-    fs::remove_dir_all(directory).expect("cleanup");
 }
 
 #[test]
@@ -370,7 +369,6 @@ fn adaptive_capture_save_restore_carries_model_adam_rng_and_rejects_without_muta
     assert_eq!(snapshot.parameters, artifact.parameters);
     assert_eq!(snapshot.adam.moments().0, artifact.optimizer.first_moment);
     assert_eq!(snapshot.adam.moments().1, artifact.optimizer.second_moment);
-    fs::remove_dir_all(directory).expect("cleanup");
 }
 
 #[test]

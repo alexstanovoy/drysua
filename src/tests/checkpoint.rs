@@ -5,7 +5,7 @@ use bota_proto::{MapId, Team};
 use safetensors::tensor::{Dtype, TensorView, serialize};
 
 use super::feature::{encode, tracker_with_view, world_view};
-use super::map2_checkpoint::{Directory, runtime_bytes};
+use super::map2_checkpoint::runtime_bytes;
 use crate::{
     ActionSpace, CheckpointDevice, CheckpointError, CheckpointProgress, CheckpointRun,
     LocalPolicyState, PolicyModel, PpoConfig, PpoOutcome, PpoRng, PpoRollout, PpoTrainer,
@@ -63,14 +63,14 @@ fn capture_requires_map2_scope_rules_and_reward_discount() {
 
 #[test]
 fn runtime_requires_every_current_identity_field_without_mutation() {
-    let directory = Directory::new();
+    let directory = test_directory("map2-checkpoint");
     let model = PolicyModel::fresh(18_102).expect("model");
     let trainer = PpoTrainer::new(&model, checkpoint_config(), 1).expect("owner");
     let identity = model.policy_identity().expect("identity");
     let parameters = model.export_parameters().expect("parameters");
     let current = current_runtime_metadata();
-    TrainingArtifact::save_runtime_weights(&model, &directory.0).expect("save");
-    let bytes = fs::read(directory.0.join("drysua.weights.safetensors")).expect("runtime");
+    TrainingArtifact::save_runtime_weights(&model, &directory).expect("save");
+    let bytes = fs::read(directory.join("drysua.weights.safetensors")).expect("runtime");
     let (_, metadata) = safetensors::SafeTensors::read_metadata(&bytes).expect("metadata");
     assert_eq!(metadata.metadata().as_ref(), Some(&current));
     for key in current.keys().map(String::as_str).chain(["unexpected"]) {
@@ -84,9 +84,9 @@ fn runtime_requires_every_current_identity_field_without_mutation() {
                 metadata.insert(key.to_owned(), value.to_owned());
             }
             let bytes = runtime_bytes(&parameters, metadata);
-            let path = directory.0.join("drysua.weights.safetensors");
+            let path = directory.join("drysua.weights.safetensors");
             fs::write(&path, &bytes).expect("fixture");
-            let error = TrainingArtifact::load_runtime_weights(&model, &directory.0)
+            let error = TrainingArtifact::load_runtime_weights(&model, &directory)
                 .expect_err("exact schema required");
             assert_eq!(error, CheckpointError::SchemaMismatch, "{key}");
             assert_eq!(
@@ -111,7 +111,7 @@ fn runtime_requires_every_current_identity_field_without_mutation() {
 #[cfg(feature = "builtin")]
 #[test]
 fn warm_start_reuses_named_tensors_reinitializes_the_rest_and_refuses_unrelated_files() {
-    let directory = Directory::new();
+    let directory = test_directory("map2-checkpoint");
     let source = PolicyModel::fresh(18_111).expect("source");
     let parameters = source.export_parameters().expect("parameters");
     let schema = source.parameter_schema().expect("schema");
@@ -145,12 +145,11 @@ fn warm_start_reuses_named_tensors_reinitializes_the_rest_and_refuses_unrelated_
         .map(|(name, view)| (name, view.expect("tensor")));
     let mut older = current_runtime_metadata();
     older.insert("model_schema_hash".to_owned(), "1".to_owned());
-    let path = directory.0.join("drysua.weights.safetensors");
+    let path = directory.join("drysua.weights.safetensors");
     fs::write(&path, serialize(tensors, Some(older)).expect("older model")).expect("fixture");
 
-    let model =
-        TrainingArtifact::initialize_from_weights(&directory.0, 5, crate::PolicyDevice::Cpu)
-            .expect("warm start across schemas");
+    let model = TrainingArtifact::initialize_from_weights(&directory, 5, crate::PolicyDevice::Cpu)
+        .expect("warm start across schemas");
 
     let imported = model.export_parameters().expect("imported");
     let fresh = PolicyModel::fresh(5)
@@ -169,7 +168,7 @@ fn warm_start_reuses_named_tensors_reinitializes_the_rest_and_refuses_unrelated_
         offset = range.end;
     }
     assert_eq!(
-        TrainingArtifact::load_runtime_weights(&model, &directory.0),
+        TrainingArtifact::load_runtime_weights(&model, &directory),
         Err(CheckpointError::SchemaMismatch),
         "play and eval stay strict"
     );
@@ -179,7 +178,7 @@ fn warm_start_reuses_named_tensors_reinitializes_the_rest_and_refuses_unrelated_
     )
     .expect("flat fixture");
     assert_eq!(
-        TrainingArtifact::initialize_from_weights(&directory.0, 5, crate::PolicyDevice::Cpu).err(),
+        TrainingArtifact::initialize_from_weights(&directory, 5, crate::PolicyDevice::Cpu).err(),
         Some(CheckpointError::TensorContract("names")),
         "a file sharing no tensor is no warm start"
     );
@@ -187,12 +186,12 @@ fn warm_start_reuses_named_tensors_reinitializes_the_rest_and_refuses_unrelated_
 
 #[test]
 fn resume_rejects_each_linked_schema_version_and_hash_before_tensor_io() {
-    let directory = Directory::new();
+    let directory = test_directory("map2-checkpoint");
     let artifact = fresh_artifact();
-    artifact.save(&directory.0).expect("save");
-    let path = directory.0.join("checkpoint.meta");
+    artifact.save(&directory).expect("save");
+    let path = directory.join("checkpoint.meta");
     let original = fs::read(&path).expect("manifest");
-    for entry in fs::read_dir(&directory.0).expect("directory") {
+    for entry in fs::read_dir(&directory).expect("directory") {
         let path = entry.expect("entry").path();
         if path
             .extension()
@@ -206,8 +205,8 @@ fn resume_rejects_each_linked_schema_version_and_hash_before_tensor_io() {
         bytes[offset] ^= 1;
         fs::write(&path, &bytes).expect("alter schema");
         for result in [
-            TrainingArtifact::load(&directory.0),
-            TrainingArtifact::load_compatible(&directory.0, artifact.run()),
+            TrainingArtifact::load(&directory),
+            TrainingArtifact::load_compatible(&directory, artifact.run()),
         ] {
             let error = result.expect_err("schema before missing tensors");
             assert_eq!(error, CheckpointError::SchemaMismatch);
@@ -222,7 +221,7 @@ fn resume_rejects_each_linked_schema_version_and_hash_before_tensor_io() {
 
 #[test]
 fn strict_checkpoint_restores_adam_rng_and_identical_next_update() {
-    let directory = Directory::new();
+    let directory = test_directory("map2-checkpoint");
     let source = PolicyModel::fresh(18_001).expect("source");
     let mut trainer = PpoTrainer::new(&source, checkpoint_config(), 18_002).expect("trainer");
     advance_trainer(&source, &mut trainer);
@@ -234,9 +233,9 @@ fn strict_checkpoint_restores_adam_rng_and_identical_next_update() {
         crate::checkpoint::collection_fixture(&source),
     )
     .expect("capture")
-    .save(&directory.0)
+    .save(&directory)
     .expect("save");
-    let loaded = TrainingArtifact::load_compatible(&directory.0, &run_metadata()).expect("load");
+    let loaded = TrainingArtifact::load_compatible(&directory, &run_metadata()).expect("load");
     let target = PolicyModel::fresh(18_003).expect("target");
     let mut state = loaded.restore(&target, &run_metadata()).expect("restore");
     assert_eq!(loaded.run(), &run_metadata());
@@ -255,7 +254,7 @@ fn strict_checkpoint_restores_adam_rng_and_identical_next_update() {
         .expect("next restored update");
     assert_eq!(source_actions, target_actions);
     assert_snapshot_equal(&source, &trainer, &target, state.trainer());
-    assert!(fs::read_dir(&directory.0).expect("directory").all(|entry| {
+    assert!(fs::read_dir(&directory).expect("directory").all(|entry| {
         !entry
             .expect("entry")
             .file_name()
@@ -288,10 +287,10 @@ fn assert_snapshot_equal(
 
 #[test]
 fn checkpoint_storage_rejects_corrupt_payload_and_truncated_manifest() {
-    let directory = Directory::new();
-    fresh_artifact().save(&directory.0).expect("save");
-    let manifest = directory.0.join("checkpoint.meta");
-    let files = fs::read_dir(&directory.0)
+    let directory = test_directory("map2-checkpoint");
+    fresh_artifact().save(&directory).expect("save");
+    let manifest = directory.join("checkpoint.meta");
+    let files = fs::read_dir(&directory)
         .expect("directory")
         .map(|entry| {
             entry
@@ -316,19 +315,19 @@ fn checkpoint_storage_rejects_corrupt_payload_and_truncated_manifest() {
         .into(),
         "one commit leaves exactly its three files"
     );
-    let generation = directory.0.join(generation);
+    let generation = directory.join(generation);
     let mut bytes = fs::read(&generation).expect("tensor bytes");
     let last = bytes.len() - 1;
     bytes[last] ^= 1;
     fs::write(&generation, bytes).expect("corrupt generation");
-    let error = TrainingArtifact::load(&directory.0).expect_err("hash mismatch");
+    let error = TrainingArtifact::load(&directory).expect_err("hash mismatch");
     assert_eq!(error, CheckpointError::TensorHashMismatch);
     assert_eq!(
         error.to_string(),
         "checkpoint tensor SHA-256 does not match manifest"
     );
     fs::write(manifest, b"DRYSUA").expect("truncate manifest");
-    let error = TrainingArtifact::load(&directory.0).expect_err("truncated manifest");
+    let error = TrainingArtifact::load(&directory).expect_err("truncated manifest");
     assert_eq!(error, CheckpointError::ManifestTruncated);
     assert_eq!(error.to_string(), "checkpoint manifest is truncated");
 }
@@ -365,14 +364,14 @@ fn restore_rejects_optimizer_ownership_actor_and_scope_without_mutation() {
 #[cfg(unix)]
 #[test]
 fn runtime_loader_rejects_symlink_artifact() {
-    let directory = Directory::new();
+    let directory = test_directory("map2-checkpoint");
     let model = PolicyModel::fresh(18_090).expect("model");
-    let target = directory.0.join("outside.safetensors");
+    let target = directory.join("outside.safetensors");
     fs::write(&target, b"outside").expect("outside file");
-    std::os::unix::fs::symlink(&target, directory.0.join("drysua.weights.safetensors"))
+    std::os::unix::fs::symlink(&target, directory.join("drysua.weights.safetensors"))
         .expect("symlink");
     assert_eq!(
-        TrainingArtifact::load_runtime_weights(&model, &directory.0).expect_err("symlink"),
+        TrainingArtifact::load_runtime_weights(&model, &directory).expect_err("symlink"),
         CheckpointError::InvalidManifest("artifact file type")
     );
     assert_eq!(fs::read(target).expect("unchanged target"), b"outside");

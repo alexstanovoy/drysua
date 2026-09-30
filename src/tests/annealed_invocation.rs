@@ -62,7 +62,7 @@ fn relative_resumes_match_uninterrupted_boundaries_clamp_at_target_and_then_do_n
     config.invocation_updates = None;
     config.checkpoint_cadence = crate::TrainingCheckpointCadence::Updates(1);
     let (sent, received) = sync_channel(3);
-    let snapshots = baseline.clone();
+    let snapshots = baseline.to_path_buf();
     run_annealed_job_harnessed(
         config,
         harness(),
@@ -118,8 +118,6 @@ fn relative_resumes_match_uninterrupted_boundaries_clamp_at_target_and_then_do_n
     }
     assert_completed_resume_is_unchanged(&resumed);
     assert_trajectory_equal(&baseline, &resumed);
-    std::fs::remove_dir_all(baseline).expect("cleanup baseline");
-    std::fs::remove_dir_all(resumed).expect("cleanup resumed");
 }
 
 fn run_limited_invocation(directory: &Path, update: u64, limit: u64) -> AnnealedJobReport {

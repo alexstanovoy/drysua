@@ -8,15 +8,6 @@ use crate::tests::support::RecordingWire as MockWire;
 use crate::{ActionKind, PolicyModel};
 use crate::{Seated, play_idle_on};
 
-pub(super) fn tactical_directory(name: &str) -> std::path::PathBuf {
-    let directory = std::env::temp_dir().join(format!(
-        "drysua-tactical-live-{}-{name}",
-        std::process::id()
-    ));
-    std::fs::create_dir(&directory).expect("unique test directory");
-    directory
-}
-
 #[cfg(feature = "builtin")]
 fn tactical_combat_fixture(map: MapId) -> (MatchInfo, WorldView) {
     let (_, messages) = super::neural_order_contract::combat_start(map, 70_007, 0, None);
@@ -390,13 +381,12 @@ fn neural_sends_network_stop_instead_of_teacher_on_both_maps_at_low_health_and_d
 #[cfg(feature = "builtin")]
 #[test]
 fn neural_tcp_cli_loads_current_seed_weights_on_both_maps_without_training() {
-    let directory = tactical_directory("neural-tcp");
+    let directory = crate::ppo::test_directory("tactical-neural-tcp");
     let model = PolicyModel::fresh(70_010).expect("untrained seed model");
     crate::TrainingArtifact::save_runtime_weights(&model, &directory).expect("current metadata");
     for map in [MapId(0), MapId(1)] {
         tcp_cli_match(map, 70_010, "neural", 32, Some(&directory));
     }
-    std::fs::remove_dir_all(directory).expect("remove seed artifact");
 }
 
 #[cfg(feature = "builtin")]
@@ -509,7 +499,7 @@ fn neural_deduplicates_body_orders_but_resends_after_rejection_or_respawn() {
 
 #[test]
 fn neural_rejects_missing_weights_before_attempting_connection() {
-    let directory = tactical_directory("neural-missing");
+    let directory = crate::ppo::test_directory("tactical-neural-missing");
     let model = crate::PolicyModel::fresh(0).expect("model");
     let expected = crate::TrainingArtifact::load_runtime_weights(&model, &directory)
         .expect_err("missing weights")
@@ -518,5 +508,4 @@ fn neural_rejects_missing_weights_before_attempting_connection() {
         .expect_err("no fallback or connection");
     assert_eq!(error.to_string(), expected);
     assert_eq!(error.kind(), std::io::ErrorKind::Other);
-    std::fs::remove_dir_all(directory).expect("remove fixture");
 }

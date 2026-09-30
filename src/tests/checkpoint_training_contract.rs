@@ -55,7 +55,6 @@ fn training_contract_current_runtime_validates_tensor_names_shapes_and_dtype() {
         );
         assert_eq!(fs::read(path).expect("unchanged source"), bytes);
     }
-    fs::remove_dir_all(directory).expect("cleanup");
 }
 
 #[test]
@@ -103,5 +102,4 @@ fn training_contract_current_runtime_rejects_nonfinite_tensor_boundaries() {
         }
         data[index * 4..index * 4 + 4].fill(0);
     }
-    fs::remove_dir_all(directory).expect("cleanup");
 }

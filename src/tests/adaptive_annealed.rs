@@ -59,9 +59,6 @@ fn fractional_extension_survives_resume_and_retains_the_environment_until_update
     assert_eq!(fifth.snapshot_hash, first.snapshot_hash);
     run_with(config, fixture, &resumed, true).expect("finish from fractional extension boundary");
     assert_same_training(&baseline, &resumed, PolicyDevice::Cpu);
-    for directory in [baseline, resumed] {
-        std::fs::remove_dir_all(directory).expect("own cleanup");
-    }
 }
 
 #[test]
@@ -99,9 +96,6 @@ fn early_success_at_update_two_resumes_with_the_actual_generation_start() {
     );
     assert!(generations[1].1.contains("\"start_update\":2"));
     assert_same_training(&baseline, &resumed, PolicyDevice::Cpu);
-    for directory in [baseline, resumed] {
-        std::fs::remove_dir_all(directory).expect("own cleanup");
-    }
 }
 
 #[test]
@@ -139,7 +133,6 @@ fn clean_boundary_at_update_six_discards_a_long_extension_before_nominal_collect
     assert!(generations[1].1.contains("\"start_update\":6"));
     assert!(generations[1].1.contains("\"scale_bp\":0,"));
     assert_ne!(final_state.snapshot_hash, extended.snapshot_hash);
-    std::fs::remove_dir_all(directory).expect("own cleanup");
 }
 
 #[test]
@@ -184,7 +177,6 @@ fn every_adaptive_parameter_mismatch_rejects_before_mutating_the_training_tree()
             .command_line
             .ends_with(&AdaptiveEnvironmentConfig::default().scope_suffix())
     );
-    std::fs::remove_dir_all(directory).expect("own cleanup");
 }
 
 #[test]
@@ -210,7 +202,6 @@ fn fixed_and_adaptive_cross_resume_rejects_without_mutating_either_training_tree
             "{error}"
         );
         assert_eq!(tree_snapshot(&directory), before);
-        std::fs::remove_dir_all(directory).expect("own cleanup");
     }
 }
 
@@ -238,7 +229,6 @@ fn outcome_fixture_scope_binds_future_results_not_only_the_committed_prefix() {
         "{error}"
     );
     assert_eq!(tree_snapshot(&directory), before);
-    std::fs::remove_dir_all(directory).expect("own cleanup");
 }
 
 #[test]
@@ -261,7 +251,6 @@ fn corrupt_adaptive_snapshot_resume_is_rejected_without_repairing_or_mutating_fi
     assert!(message.contains("snapshot"), "{message}");
     assert_eq!(checkpoint_digests(&directory), checkpoint);
     assert_eq!(tree_snapshot(&directory), damaged);
-    std::fs::remove_dir_all(directory).expect("own cleanup");
 }
 
 #[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
@@ -294,9 +283,6 @@ fn cuda_full_native_adaptive_resume_preserves_exact_training_state() {
     assert_eq!(execute(first, &resumed, false).completed_updates, 1);
     assert_eq!(execute(config, &resumed, true).completed_updates, 2);
     assert_same_training(&baseline, &resumed, device);
-    for directory in [baseline, resumed] {
-        std::fs::remove_dir_all(directory).expect("own cleanup");
-    }
 }
 
 fn adaptive_settings() -> AnnealedJobConfig {
@@ -315,7 +301,7 @@ fn cuda_side_actors_update_both_heads_and_resume_exactly() {
     let baseline = test_directory("side-actor-native-baseline");
     let resumed = test_directory("side-actor-native-resumed");
     let weights = test_directory("side-actor-native-weights");
-    let source = weights.as_path();
+    let source = &*weights;
     let mut config = adaptive_settings();
     config.updates = 2;
     config.zero_updates = 0;
@@ -362,9 +348,6 @@ fn cuda_side_actors_update_both_heads_and_resume_exactly() {
     eprintln!(
         "side-actor-native parameters=1878775 tensors=88 slots=4 lanes=2 microbatch=256 both_actor_heads_changed=true exact_model_adam_rng_controller_snapshots_resume=true"
     );
-    for directory in [baseline, resumed, weights] {
-        std::fs::remove_dir_all(directory).unwrap();
-    }
 }
 
 fn outcome_harness(wins: &'static [u64]) -> AnnealedHarness {

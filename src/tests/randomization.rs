@@ -1,23 +1,7 @@
 //! Annealing schedule, bounded draws, golden vectors and snapshot round-trips.
 
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-
 use super::*;
-
-fn test_directory(name: &str) -> PathBuf {
-    static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(1);
-    let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
-    let directory = std::env::temp_dir().join(format!(
-        "drysua-randomization-{name}-{}-{sequence}",
-        std::process::id()
-    ));
-    if directory.exists() {
-        std::fs::remove_dir_all(&directory).expect("remove stale directory");
-    }
-    std::fs::create_dir(&directory).expect("create directory");
-    directory
-}
+use crate::ppo::test_directory;
 
 fn schedule(updates: u64, zero_updates: u64) -> AnnealSchedule {
     AnnealSchedule {
@@ -254,7 +238,6 @@ fn a_written_snapshot_is_verified_and_a_changed_file_is_rejected() {
         error.to_string(),
         "invalid PPO config field: domain randomization snapshot mismatch"
     );
-    std::fs::remove_dir_all(directory).expect("remove directory");
 }
 
 #[test]
@@ -271,7 +254,6 @@ fn an_oversized_snapshot_is_rejected() {
         error.to_string(),
         "invalid PPO config field: domain randomization snapshot is oversized"
     );
-    std::fs::remove_dir_all(directory).expect("remove directory");
 }
 
 #[test]
@@ -298,7 +280,6 @@ fn resume_verification_covers_every_started_generation() {
         error.to_string(),
         "invalid PPO config field: domain randomization snapshot mismatch"
     );
-    std::fs::remove_dir_all(directory).expect("remove directory");
 }
 
 /// Independent integer square root: brute force, deliberately not the kernel's.
@@ -516,5 +497,4 @@ fn a_snapshot_chain_is_verified_only_under_its_own_scale() {
         error.to_string(),
         "invalid PPO config field: domain randomization snapshot mismatch"
     );
-    std::fs::remove_dir_all(directory).expect("remove directory");
 }

@@ -1,11 +1,41 @@
 use super::*;
 
-pub(crate) fn test_directory(name: &str) -> std::path::PathBuf {
+/// A private test directory that is removed with its contents when dropped,
+/// so a panicking test cannot leak it.
+pub(crate) struct TestDirectory(std::path::PathBuf);
+
+impl std::ops::Deref for TestDirectory {
+    type Target = std::path::Path;
+
+    fn deref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl AsRef<std::path::Path> for TestDirectory {
+    fn as_ref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for TestDirectory {
+    fn drop(&mut self) {
+        let result = std::fs::remove_dir_all(&self.0);
+        if let Err(error) = result
+            && error.kind() != std::io::ErrorKind::NotFound
+            && !std::thread::panicking()
+        {
+            panic!("remove test directory {}: {error}", self.0.display());
+        }
+    }
+}
+
+pub(crate) fn test_directory(name: &str) -> TestDirectory {
     use std::sync::atomic::{AtomicU64, Ordering};
     static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(1);
     let sequence = NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed);
     let directory = std::env::temp_dir().join(format!(
-        "drysua-learning-{name}-{}-{sequence}",
+        "drysua-test-{name}-{}-{sequence}",
         std::process::id()
     ));
     let mut builder = std::fs::DirBuilder::new();
@@ -17,7 +47,7 @@ pub(crate) fn test_directory(name: &str) -> std::path::PathBuf {
     builder
         .create(&directory)
         .expect("unique private test directory");
-    directory
+    TestDirectory(directory)
 }
 
 #[cfg(test)]

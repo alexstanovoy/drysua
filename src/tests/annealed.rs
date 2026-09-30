@@ -43,7 +43,6 @@ fn resume_requires_intact_generation_history_without_mutating_checkpoint() {
         let error = run(config, &directory, true).expect_err("damaged history");
         assert!(error.to_string().contains(message), "{error}");
         assert_eq!(checkpoint_digests(&directory), before);
-        std::fs::remove_dir_all(directory).expect("cleanup");
     }
 }
 
@@ -58,12 +57,11 @@ fn cached_generation_rules_turn_off_at_the_zero_window_boundary() {
     assert!(draw.scale_bp > 0);
     assert_eq!(draw.applied_games, 1);
     let directory = test_directory("zero-window-rules");
-    let mut cache = GenerationCache::new(directory.clone(), 3, 2, 1, schedule, 0);
+    let mut cache = GenerationCache::new(directory.to_path_buf(), 3, 2, 1, schedule, 0);
     for (update, applied) in [(2, true), (3, false)] {
         let spec = cache.spec_for_update(update).expect("spec");
         assert_eq!(!spawn_modifiers_for(spec).is_empty(), applied);
     }
-    std::fs::remove_dir_all(directory).expect("cleanup");
 }
 
 #[test]
@@ -73,7 +71,7 @@ fn resume_rejects_swapped_opponent_weights() {
     let first = PolicyModel::fresh(0x1111).expect("first opponent");
     TrainingArtifact::save_runtime_weights(&first, &weights).expect("first weights");
     let mut config = settings(0x1a2c, 1);
-    config.opponents = vec![(AnnealedOpponent::Weights(weights.clone()), one())];
+    config.opponents = vec![(AnnealedOpponent::Weights(weights.to_path_buf()), one())];
     run(config.clone(), &directory, false).expect("frozen opponent update");
     let before = checkpoint_digests(&directory);
     let second = PolicyModel::fresh(0x2222).expect("second opponent");
@@ -84,8 +82,6 @@ fn resume_rejects_swapped_opponent_weights() {
         "{error}"
     );
     assert_eq!(checkpoint_digests(&directory), before);
-    std::fs::remove_dir_all(directory).expect("cleanup run");
-    std::fs::remove_dir_all(weights).expect("cleanup weights");
 }
 
 #[test]
@@ -153,9 +149,6 @@ fn initial_weights_then_resume_matches_uninterrupted_parameters_optimizer_and_rn
         exported.export_parameters().expect("exported parameters"),
         checkpoint.parameters
     );
-    for directory in [weights, uninterrupted, resumed] {
-        std::fs::remove_dir_all(directory).expect("cleanup");
-    }
 }
 
 /// Logged decisions of the games in flight at the committed boundary.
@@ -183,9 +176,6 @@ fn simulation_thread_count_never_changes_training_bits() {
         })
         .collect();
     assert_trajectory_equal(&directories[0], &directories[1]);
-    for directory in directories {
-        std::fs::remove_dir_all(directory).expect("cleanup");
-    }
 }
 
 #[test]
@@ -202,7 +192,7 @@ fn pfsp_league_mixtures_resume_in_flight_neural_games_exactly() {
         (AnnealedOpponent::Teacher, one()),
         (AnnealedOpponent::HarassPush, one()),
         (AnnealedOpponent::SelfPlay, one()),
-        (AnnealedOpponent::Weights(weights.clone()), one()),
+        (AnnealedOpponent::Weights(weights.to_path_buf()), one()),
         (AnnealedOpponent::League, one()),
     ];
     let uninterrupted = test_directory("mixed-uninterrupted");
@@ -262,9 +252,6 @@ fn pfsp_league_mixtures_resume_in_flight_neural_games_exactly() {
         kept, expected,
         "only the snapshots the final checkpoint records"
     );
-    for directory in [weights, uninterrupted, resumed] {
-        std::fs::remove_dir_all(directory).expect("cleanup");
-    }
 }
 
 /// Two lanes of one slot each; with 16-decision games an update of four
@@ -464,7 +451,6 @@ fn resume_rejects_a_changed_environment_scale_without_committing() {
             .completed_updates,
         2
     );
-    std::fs::remove_dir_all(directory).expect("remove own checkpoint");
 }
 
 fn assert_artifact_bits(source: &std::path::Path, target: &std::path::Path, device: PolicyDevice) {

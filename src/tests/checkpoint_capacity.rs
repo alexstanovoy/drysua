@@ -82,7 +82,6 @@ fn invalid_config_rejects_before_tensor_io() {
             format!("checkpoint manifest has invalid {field}")
         );
     }
-    fs::remove_dir_all(directory).expect("cleanup");
 }
 
 #[test]
@@ -155,7 +154,6 @@ fn public_checkpoint_preserves_state_and_rejects_invalid_capture_restore() {
     assert_eq!(snapshot.parameters, artifact.parameters);
     drop(state);
     assert_invalid_capture_restore(&source, &trainer, &target, &loaded);
-    fs::remove_dir_all(directory).expect("cleanup");
 }
 
 fn assert_invalid_capture_restore(
@@ -245,7 +243,6 @@ fn runtime_weights_roundtrip_and_reject_foreign_schema_without_mutation() {
         }
         assert_eq!(model.export_parameters().expect("parameters"), parameters);
     }
-    fs::remove_dir_all(directory).expect("cleanup");
 }
 
 #[test]
@@ -282,7 +279,6 @@ fn public_loaders_reject_empty_and_oversized_files_before_decoding() {
             );
         }
     }
-    fs::remove_dir_all(directory).expect("cleanup");
 }
 
 pub(super) fn manifest_artifact(updates: u64, samples: u64) -> TrainingArtifact {
