@@ -1,3 +1,8 @@
+#![allow(
+    clippy::float_arithmetic,
+    reason = "Reward returns are compared as f64 sums"
+)]
+
 use bota_proto::{MapId, ServerMsg, SlotId, Team, Vec2};
 
 use crate::{
@@ -516,4 +521,129 @@ fn observe_messages(seat: &mut SeatPolicy, messages: &[ServerMsg], counts: &mut 
             | ServerMsg::MatchOver { .. } => {}
         }
     }
+}
+
+/// Two Teachers play a full native Map2 game; each seat is scored only from its own stream.
+/// Shaping telescopes to zero from the neutral start, so each return is exactly the outcome,
+/// and the fully public potentials (towers, deaths, XP) are exact opposites at every tick.
+#[test]
+fn teacher_map2_rewards_telescope_to_the_outcome_and_agree_on_public_potentials() {
+    let (mut arena, start) = Arena::new(ArenaConfig {
+        seats: 2,
+        map: MapId(2),
+        seed: 8_273,
+    })
+    .expect("teacher arena starts");
+    let initial_events: Vec<_> = start
+        .messages
+        .iter()
+        .map(|messages| {
+            messages.iter().find_map(|message| match message {
+                ServerMsg::Events { tick, events } => Some((*tick, events.clone())),
+                _ => None,
+            })
+        })
+        .collect();
+    let mut seats = setup_seats(start);
+    for (seat, events) in seats.iter_mut().zip(initial_events) {
+        let (tick, events) = events.expect("initial events");
+        seat.tracker.observe_events(tick, &events).expect("events");
+        let baseline = seat.tracker.take_map2_reward_interval().expect("baseline");
+        assert_eq!(baseline.total, 0.0);
+    }
+    let mut counts = GateCounts::default();
+    let mut returns = [crate::Map2RewardBreakdown::default(); 2];
+    for _ in 0..crate::MAP2_TICK_CAP {
+        let tick = arena.tick();
+        let requests: Vec<_> = seats
+            .iter_mut()
+            .map(|seat| {
+                (tick - 1)
+                    .is_multiple_of(3)
+                    .then(|| decide_request(seat, &mut counts))
+                    .flatten()
+            })
+            .collect();
+        let step = arena.step(&requests).expect("teacher arena advances");
+        let winner = step.messages[0].iter().find_map(|message| match message {
+            ServerMsg::MatchOver { winner, .. } => Some(*winner),
+            _ => None,
+        });
+        for (seat, messages) in seats.iter_mut().zip(step.messages) {
+            observe_messages(seat, &messages, &mut counts);
+        }
+        if let Some(winner) = winner {
+            assert_ne!(winner, Team::Neutral, "Teachers must decide the game");
+            return assert_teacher_map2_returns(&mut seats, returns, winner, arena.tick());
+        }
+        let intervals = seats
+            .iter_mut()
+            .map(|seat| seat.tracker.take_map2_reward_interval().expect("interval"));
+        let intervals: Vec<_> = intervals.collect();
+        assert_eq!(intervals[0].towers, -intervals[1].towers);
+        assert_eq!(intervals[0].deaths, -intervals[1].deaths);
+        assert_eq!(intervals[0].xp, -intervals[1].xp);
+        for (total, interval) in returns.iter_mut().zip(intervals) {
+            accumulate(total, interval);
+        }
+    }
+    panic!("Map2 must end by the native cap");
+}
+
+fn assert_teacher_map2_returns(
+    seats: &mut [SeatPolicy],
+    mut returns: [crate::Map2RewardBreakdown; 2],
+    winner: Team,
+    tick: u32,
+) {
+    for (seat, total) in seats.iter_mut().zip(&mut returns) {
+        let potential = f64::from(
+            seat.tracker
+                .map2_reward_state()
+                .expect("Map2 reward")
+                .potential,
+        );
+        let won = seat.tracker.team() == winner;
+        let end = if won {
+            crate::Map2RewardEnd::Win
+        } else {
+            crate::Map2RewardEnd::Loss
+        };
+        accumulate(total, seat.tracker.finish_map2_reward(end).expect("finish"));
+        let shaping = total.towers + total.deaths + total.health + total.xp;
+        assert!(
+            (shaping - potential).abs() < 1.0e-6,
+            "{shaping} {potential}"
+        );
+        assert!((total.closure + shaping).abs() < 1.0e-9);
+        let lead = total.observations.enemy_deaths as f64 - total.observations.own_deaths as f64;
+        assert!((total.deaths - crate::MAP2_REWARD_DEATH_WEIGHT * lead).abs() < 1.0e-9);
+        assert_eq!(total.terminal, if won { 1.0 } else { -1.0 });
+        let fast = if won {
+            0.5 * f64::from(crate::MAP2_TICK_CAP - tick) / 27_000.0
+        } else {
+            0.0
+        };
+        assert!((total.fast_win - fast).abs() < 1.0e-12);
+        assert!((total.total - total.terminal - fast).abs() < 1.0e-9);
+    }
+    assert_eq!(
+        returns[0].observations.own_deaths,
+        returns[1].observations.enemy_deaths
+    );
+}
+
+fn accumulate(total: &mut crate::Map2RewardBreakdown, interval: crate::Map2RewardBreakdown) {
+    total.towers += interval.towers;
+    total.deaths += interval.deaths;
+    total.health += interval.health;
+    total.xp += interval.xp;
+    total.closure += interval.closure;
+    total.terminal += interval.terminal;
+    total.fast_win += interval.fast_win;
+    total.total += interval.total;
+    total.observations = total
+        .observations
+        .checked_add(&interval.observations)
+        .expect("bounded counters");
 }

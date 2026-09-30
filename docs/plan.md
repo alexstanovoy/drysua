@@ -801,48 +801,16 @@ post-step rejection reports contain candidate KL. This is not full-distribution 
 anchor-wide multi-update drift guarantee. Permanent critic isolation, LR `3e-6`, and reward
 normalization are conservative design/tuning decisions, not evidence that standard shared
 actor/critic gradients are incorrect or that learned strength improved. GAE is unchanged;
-the v15 reward contract is below. See PPO v15 migration (archived 2026-09-18, git history `41bc295`).
+the reward is described in §15.
 
 ## 15. Reward
 
-Terminal reward:
-
-```text
-win  = +1
-loss = -1
-draw = 0
-truncation without terminal adjudication = bootstrap, not a terminal draw
-```
-
-Episode shaping budget ограничен `100/101` для суммы абсолютных emitted components;
-смена знака и взаимная компенсация компонентов не восполняют budget. Expenditure хранится
-в f64, emitted rewards — f32 (tolerance `1e-6` для rounding). Все shaping components
-масштабируются пропорционально оставшемуся budget. Terminal dominance относится к
-undiscounted episode budget, не к произвольно далёким discounted outcomes. Clipped
-potential shaping не даёт общей гарантии policy invariance.
-
-Текущие компоненты v15:
-
-- XP advantage: `.02/101`;
-- kills/deaths combat advantage: `2/101`;
-- structure destruction advantage: `5/101`;
-- cash wealth, last hits и denies: zero reward; покупки не штрафуются за расход cash.
-
-Остальные перечислявшиеся ранее сигналы не являются текущими reward components.
-Потенциал рассчитывается как:
-
-```text
-gamma * Phi(next_state) - Phi(current_state)
-```
-
-При любом terminal outcome `Phi(next_state) = 0`; финальный snapshot не влияет на
-terminal shaping до применения budget. Truncation сохраняет discounted next potential.
-
-Reward считается только из `MatchInfo`, seat-specific `WorldView`, visible `Events` и
-`MatchOver`. Reward code не читает полный `World`.
-
-Каждый компонент логируется отдельно. Общего числа без breakdown недостаточно для
-поиска reward hacking.
+The current Map2 reward (version 8) is defined in [reward.md](reward.md): terminal
+±1 with a win-only fast-win bonus, plus potential-based shaping over the decisive
+public quantities (weakest tower, hero deaths, hero HP, XP lead) that is returned at
+the terminal (`Φ(terminal) = 0`, γ = 1). Reward is computed only from `MatchInfo`,
+the seat-specific `WorldView`, visible `Events` and `MatchOver`; reward code never reads
+the full `World`. Every component is logged separately.
 
 ## 16. Этап 10: self-play league
 

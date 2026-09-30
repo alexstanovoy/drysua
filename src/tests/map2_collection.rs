@@ -8,7 +8,7 @@ use bota_proto::{DamageKind, Vec2};
 fn reward_rejection_preserves_accumulated_credit_and_allows_recovery() {
     let interval = crate::Map2RewardBreakdown {
         ticks: 3,
-        gold: 0.02,
+        health: 0.02,
         total: 0.02,
         ..crate::Map2RewardBreakdown::default()
     };
@@ -24,79 +24,13 @@ fn reward_rejection_preserves_accumulated_credit_and_allows_recovery() {
     }
     aggregate.record(interval).expect("recovery");
     assert_eq!(aggregate.ticks, 6);
-    assert_eq!(aggregate.gold, 0.04);
-    aggregate.observations.stagnation_repaid_ticks = u64::MAX;
+    assert_eq!(aggregate.components[2], 0.04);
+    aggregate.observations.hero_damage_dealt = u64::MAX;
     let before = aggregate;
     let mut overflow = interval;
-    overflow.observations.stagnation_repaid_ticks = 1;
+    overflow.observations.hero_damage_dealt = 1;
     assert_eq!(aggregate.record(overflow), Err(PpoError::CounterOverflow));
     assert_eq!(aggregate, before);
-}
-
-#[test]
-fn progress_debt_and_purchase_refund_survive_reward_drains() {
-    let environment = configured_environment(1, 0, OpponentSpec::Idle, |_| {});
-    let mut tracker = environment.seats[0].tracker.clone();
-    let mut view = tracker.current().expect("snapshot").clone();
-    let own = tracker.own_hero().expect("hero").id;
-    let hero = view
-        .units
-        .iter_mut()
-        .find(|unit| unit.id == own)
-        .expect("hero");
-    hero.hp = hero.max_hp;
-    hero.mana = hero.max_mana;
-    hero.effects
-        .retain(|effect| effect.id != bota_proto::EffectId(3));
-    let position = hero.pos;
-    view.units
-        .iter_mut()
-        .find(|unit| unit.kind == bota_proto::UnitKind::Fountain && unit.team == tracker.team())
-        .expect("fountain")
-        .pos = position;
-    let mut aggregate = Map2TrainingReward::default();
-    for tick in 2..=2705 {
-        view.tick = tick;
-        if tick == 2704 {
-            view.players[0].xp += 1;
-        }
-        let events = if tick == 2703 {
-            vec![EventKind::ItemBought {
-                slot: tracker.slot(),
-                item: bota_proto::ItemId(0),
-            }]
-        } else {
-            vec![]
-        };
-        tracker.observe_snapshot(&view).expect("snapshot");
-        tracker.observe_events(tick, &events).expect("events");
-        if tick % 17 == 0 {
-            aggregate
-                .record(tracker.take_map2_reward_interval().expect("drain"))
-                .expect("aggregate");
-        }
-    }
-    aggregate
-        .record(
-            tracker
-                .finish_map2_reward(Map2RewardEnd::Draw)
-                .expect("split end"),
-        )
-        .expect("final");
-    assert_eq!(aggregate.ticks, 2704);
-    let components = aggregate.components();
-    assert!(
-        (components[..components.len() - 1].iter().sum::<f64>() - aggregate.total).abs() < 1e-12
-    );
-    assert_eq!(
-        aggregate.observations.progress_reasons,
-        crate::MAP2_PROGRESS_PURCHASE | crate::MAP2_PROGRESS_XP
-    );
-    assert_eq!(aggregate.observations.stagnation_base_charges, 1);
-    assert_eq!(aggregate.stagnation_base, -0.02);
-    assert_eq!(aggregate.stagnation_ticks_cost, -0.000002);
-    assert!(aggregate.fountain_wait_refund > 0.0);
-    assert_eq!(aggregate.observations.fountain_wait_refunds, 1);
 }
 
 #[test]
@@ -191,9 +125,9 @@ fn final_native_damage_is_rewarded_before_draw_finalization() {
     assert_eq!(completed.ticks, 1);
     assert_eq!(completed.outcome, Some(PpoTerminalOutcome::Draw));
     assert!(state.done);
-    assert_eq!(state.map2_reward.terminal, 0.0);
-    assert!(state.map2_reward.hero_damage > 0.0);
-    assert!(state.raw_return > 0.0);
+    assert_eq!(state.map2_reward.components[5], 0.0);
+    assert!(state.map2_reward.components[2] > 0.0);
+    assert_eq!(state.map2_reward.observations.hero_damage_dealt, 100);
     assert_eq!(
         environment.seats[0]
             .tracker
@@ -244,7 +178,7 @@ fn learner_deadline_zero_bootstraps_without_inventing_match_over() {
     .expect("terminal deadline");
     assert_eq!(report.episode_timeouts, 1);
     assert_eq!(report.terminal_draws, 0);
-    assert_eq!(state.map2_reward.terminal, -0.2);
+    assert_eq!(state.map2_reward.components[5], 0.0);
     assert_eq!(rollout.len(), 1);
     let config = PpoConfig {
         environments: 1,
@@ -306,17 +240,15 @@ fn native_mango_then_cast_is_legal_for_both_neural_seats() {
         );
         reject_production_rejection(&environment, "Map2 Mango and raze contract")
             .expect("no NotReady");
-        let reward = take_map2_reward(&mut environment, None, 3).expect("event streams");
-        if action.kind() == ActionKind::Use {
-            assert_eq!(reward.observations.mana_spent, 0);
-            for seat in &environment.seats {
-                let hero = seat.tracker.own_hero().expect("restored hero");
+        take_map2_reward(&mut environment, None, 3).expect("event streams");
+        for seat in &environment.seats {
+            let hero = seat.tracker.own_hero().expect("hero");
+            if action.kind() == ActionKind::Use {
                 assert!(hero.mana >= 100);
                 assert!(hero.items[0].is_none());
+            } else {
+                assert!(hero.mana < hero.max_mana);
             }
-        } else {
-            assert!(reward.observations.mana_spent > 0);
-            assert!(reward.mana_spent < 0.0);
         }
     }
     assert_eq!(

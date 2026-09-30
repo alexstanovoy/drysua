@@ -24,21 +24,20 @@ mod adaptive_tests;
 mod capacity_tests;
 use crate::{
     ACTION_SCHEMA_HASH, ACTION_SCHEMA_VERSION, FEATURE_SCHEMA_HASH, FEATURE_SCHEMA_VERSION,
-    MAP2_REWARD_SCHEMA_DESCRIPTOR, MAP2_REWARD_SCHEMA_HASH, MAP2_REWARD_SCHEMA_VERSION,
-    MAX_TRAINING_COUNTER, MODEL_MAX_OPTIMIZER_STEP, MODEL_PARAMETER_COUNT, MODEL_SCHEMA_HASH,
-    MODEL_SCHEMA_VERSION, PPO_RULES_AUDIT_VERSION, PPO_SCHEMA_HASH, PPO_SCHEMA_VERSION,
-    PolicyDevice, PolicyModel, PpoConfig, PpoTrainer, SHADOW_FIEND,
+    MAP2_REWARD_VERSION, MAX_TRAINING_COUNTER, MODEL_MAX_OPTIMIZER_STEP, MODEL_PARAMETER_COUNT,
+    MODEL_SCHEMA_HASH, MODEL_SCHEMA_VERSION, PPO_RULES_AUDIT_VERSION, PPO_SCHEMA_HASH,
+    PPO_SCHEMA_VERSION, PolicyDevice, PolicyModel, PpoConfig, PpoTrainer, SHADOW_FIEND,
 };
 
 pub use adaptive::AdaptiveEnvironmentCheckpoint;
 
-const CHECKPOINT_MAGIC: &[u8; 8] = b"DRYCKP18";
+const CHECKPOINT_MAGIC: &[u8; 8] = b"DRYCKP19";
 /// Version of the strict on-disk tensor and manifest contract.
-pub const CHECKPOINT_SCHEMA_VERSION: u32 = 18;
+pub const CHECKPOINT_SCHEMA_VERSION: u32 = 19;
 /// Canonical strict checkpoint contract descriptor.
 pub const CHECKPOINT_SCHEMA_DESCRIPTOR: &str = concat!(
-    "bota-drysua-checkpoint/v18;linked_schemas=action,feature,model,ppo,map2_reward;linked_hash=fnv1a_descriptor_then_ordered_version_le32_hash_le64_then_map2_reward_descriptor_utf8;files=checkpoint.safetensors,checkpoint.meta,drysua.weights.safetensors,immutable_sha256_tensor_generation;",
-    "tensors=model.parameters,adam.first_moment,adam.second_moment;dtype=f32;runtime_metadata=action_feature_model_ppo_schema_hashes,ppo_schema_version,ppo_rules_audit_version,map2_reward_schema_version,map2_reward_schema_hash,map2_reward_schema_descriptor;load=exact_names_shapes_dtype_finite_schema_sha256,canonical_tensor_fallback;",
+    "bota-drysua-checkpoint/v19;linked_schemas=action,feature,model,ppo;linked_hash=fnv1a_descriptor_then_ordered_version_le32_hash_le64_then_map2_reward_version_le32;files=checkpoint.safetensors,checkpoint.meta,drysua.weights.safetensors,immutable_sha256_tensor_generation;",
+    "tensors=model.parameters,adam.first_moment,adam.second_moment;dtype=f32;runtime_metadata=action_feature_model_ppo_schema_hashes,ppo_schema_version,ppo_rules_audit_version,map2_reward_version;load=exact_names_shapes_dtype_finite_schema_sha256,canonical_tensor_fallback;",
     "initialization=current_runtime_weights_parameters_only,optimizer_progress_rng=fresh;",
     "manifest=magic_version_hash_linked_schemas_then_git_simulator_features_command_seed_map_hero_device_batch_rules32_then_progress_rng_curriculum_league_then_ppo_config_trainer_updates_optimizer_step_shuffle_rng_tensor_sha256_then_adaptive_presence_u8_and_optional152_byte_block,no_trailing_bytes,max65536;",
     "progress=committed_rollout_samples_le_updates_times_games_times_retained_decisions;",
@@ -46,15 +45,14 @@ pub const CHECKPOINT_SCHEMA_DESCRIPTOR: &str = concat!(
     "save=immutable_generation,canonical_copy,recoverable_manifest_commit_last,file_and_directory_fsync;"
 );
 /// Ordered linked schema identities captured in every checkpoint manifest.
-const LINKED_SCHEMAS: [(u32, u64); 5] = [
+const LINKED_SCHEMAS: [(u32, u64); 4] = [
     (ACTION_SCHEMA_VERSION, ACTION_SCHEMA_HASH),
     (FEATURE_SCHEMA_VERSION, FEATURE_SCHEMA_HASH),
     (MODEL_SCHEMA_VERSION, MODEL_SCHEMA_HASH),
     (PPO_SCHEMA_VERSION, PPO_SCHEMA_HASH),
-    (MAP2_REWARD_SCHEMA_VERSION, MAP2_REWARD_SCHEMA_HASH),
 ];
 
-/// FNV-1a of the descriptor, ordered linked identities, and reward descriptor.
+/// FNV-1a of the descriptor, ordered linked identities, and reward version.
 pub const CHECKPOINT_SCHEMA_HASH: u64 =
     crate::model::linked_schema_hash(CHECKPOINT_SCHEMA_DESCRIPTOR, &LINKED_SCHEMAS);
 const CHECKPOINT_TENSOR_FILE: &str = "checkpoint.safetensors";
@@ -719,18 +717,7 @@ fn runtime_tensor_metadata() -> Vec<(&'static str, String)> {
     vec![
         ("action_schema_hash", ACTION_SCHEMA_HASH.to_string()),
         ("feature_schema_hash", FEATURE_SCHEMA_HASH.to_string()),
-        (
-            "map2_reward_schema_descriptor",
-            MAP2_REWARD_SCHEMA_DESCRIPTOR.to_owned(),
-        ),
-        (
-            "map2_reward_schema_hash",
-            MAP2_REWARD_SCHEMA_HASH.to_string(),
-        ),
-        (
-            "map2_reward_schema_version",
-            MAP2_REWARD_SCHEMA_VERSION.to_string(),
-        ),
+        ("map2_reward_version", MAP2_REWARD_VERSION.to_string()),
         ("model_schema_hash", MODEL_SCHEMA_HASH.to_string()),
         (
             "ppo_rules_audit_version",

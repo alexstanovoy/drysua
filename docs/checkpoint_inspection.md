@@ -29,7 +29,7 @@ Both modes return `schema: "drysua-checkpoint-inspection/v1"`.
 - `limits`: `max_json_bytes=4194304`, `max_snapshots=10000`, `max_files=10004`,
   native manifest/training/runtime byte limits, `snapshot_bytes=4096`,
   `max_samples` and `max_games`;
-- `schemas`: action, feature, reward and PPO version/hash pairs plus rules audit version;
+- `schemas`: action, feature and PPO version/hash pairs, the reward version, plus rules audit version;
 - `checkpoint`: the single native checkpoint version/hash;
 - `numeric_semantics`, documenting float, hash and adaptive-unit representations.
 

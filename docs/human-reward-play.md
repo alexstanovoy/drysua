@@ -1,8 +1,7 @@
 # Human vs Teacher with current RL reward
 
-Current scoring is reward7: Win+0.2 (plus a win-only victory-time bonus up to +0.2), Loss-0.2, Draw0, with all reward5 dense terms
-unchanged. Earlier human/native reports below used reward5 and remain historical;
-their saved numbers and profile identities are never rewritten as reward6 or reward7.
+Current scoring is Map2 reward version 8, defined in [reward.md](reward.md). Earlier
+human/native reports referenced below used older reward versions and remain historical.
 
 **Verified with the current native server in headless fixtures on both sides.**
 The graphical client was not launched by the agent; launch from your desktop.
@@ -52,36 +51,27 @@ The human and opponent observations never enter the same scorer.
 
 Tick 1 is required as the initial complete baseline. Subsequent ticks must be
 contiguous; empty Events are required and consumed too. Completed-tick reward
-intervals are drained without resetting budgets, potential baselines, refundable
-fountain charges, or opening/progress state. Diagnostics sum those production f64
-components; alternative accumulation groupings can differ at floating-point roundoff.
+intervals are drained without resetting the potential. Diagnostics sum those
+production f64 components; alternative groupings can differ at floating-point roundoff.
 
-All 17 production components appear in the report, including net earned gold and
-net public XP, hero dealt/taken, creep/tower/other taken, mana, tower/lane potential,
-pregame hint, opening positioning, fountain wait/refund, stagnation base/rate and
-terminal. Raw production observation counts are included, with progress reason
-flags combined by bitwise OR rather than summed.
+All seven production components appear in the report (`towers`, `deaths`, `health`,
+`xp`, `closure`, `terminal`, `fast_win`), plus the raw seat-visible counters
+(deaths, XP gained, hero/tower/other damage, structure damage dealt). These are
+seat-visible measurements, not omniscient totals.
 
-The public raw paid-gold net is
-`raw_counts.own_gold_earned - raw_counts.enemy_gold_earned`; public raw XP net is
-`raw_counts.own_xp_gained - raw_counts.enemy_xp_gained`. These are seat-visible
-measurements, not omniscient totals. Gold comes from observed paid bounties, not
-current wallet, passive income, purchases, sales or end-stat net worth. The signed
-`components.gold` and `components.experience` rewards subtract independently
-diminishing own/enemy channels; they are not a constant times either raw net.
-
-Only an authoritative MatchOver after the complete final pair closes the lane
-potential through `Map2Reward::finish`. Its result is relative to that scorer's
-actual assigned team: Win +0.2, Loss -0.2, native Draw 0. TaskTimeCap would be -0.2 in
-production, but this passive observer **never invents a task deadline** and never
-calls `finish(TimeCap)` on timeout, EOF or manual close.
+Only an authoritative MatchOver after the complete final pair calls
+`Map2Reward::finish`, which returns the whole potential (`closure`) and pays the
+outcome relative to that scorer's actual team: Win +1 plus the fast-win bonus,
+Loss -1, native Draw 0. This passive observer **never invents a task deadline** and
+never calls `finish(TimeCap)` on timeout, EOF or manual close; a cut report therefore
+keeps its accumulated potential steps without closure.
 
 ## Files and console
 
 The launcher announces its existing private `drysua/artifacts/temp/play-*` directory:
 
 * `reward-human.json` / `reward-bot.json`: final JSON for each original seat, with
-  profile version/hash, slot/team, completed tick, pending-pair status, outcome,
+  profile version, slot/team, completed tick, pending-pair status, outcome,
   completeness/validity, all components, raw counts, total and total without terminal.
 * `reward-human.jsonl` / `reward-bot.jsonl`: bounded periodic cumulative component
   values and interval deltas, readable while playing.

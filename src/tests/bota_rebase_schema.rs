@@ -39,12 +39,7 @@ fn historical_bindings_and_shapes_cannot_be_relabelled_as_current_runtime() {
             "15379677344330093698",
         ),
         ("ppo_rules_audit_version", "23", "26"),
-        ("map2_reward_schema_version", "1", "2"),
-        (
-            "map2_reward_schema_hash",
-            "798798703797057220",
-            "699687995158557285",
-        ),
+        ("map2_reward_version", "1", "7"),
     ] {
         for old in [m15, m18] {
             let mut metadata = current.clone();
@@ -102,7 +97,7 @@ fn legacy_effect_and_progress_manifests_reject_before_tensor_access() {
     ] {
         let directory = Directory::new();
         let path = directory.0.join("checkpoint.meta");
-        let mut bytes = b"DRYCKP18".to_vec();
+        let mut bytes = b"DRYCKP19".to_vec();
         bytes.extend(version.to_le_bytes());
         bytes.extend(hash.to_le_bytes());
         std::fs::write(&path, &bytes).expect("old manifest header");

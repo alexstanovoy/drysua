@@ -30,7 +30,7 @@ mod capacity_tests;
 mod test_support;
 
 /// Version of the policy feature layout and candidate input-state semantics.
-pub const FEATURE_SCHEMA_VERSION: u32 = 22;
+pub const FEATURE_SCHEMA_VERSION: u32 = 23;
 /// Number of scalar global features.
 pub const GLOBAL_FEATURES: usize = 92;
 /// Number of scalar features in one global-history sample.
@@ -181,25 +181,21 @@ pub mod global_feature {
     pub const ENEMY_ANCIENT_RELATIVE_Y: usize = 70;
     pub const ENEMY_ANCIENT_DISTANCE: usize = 71;
     pub const MAP_TWO: usize = 72;
-    /// Nine remaining fractions in MAP2_REWARD_SCHEMA_DESCRIPTOR channel order.
-    pub const MAP2_REWARD_REMAINING_START: usize = 73;
-    pub const MAP2_TOWER_POTENTIAL: usize = 82;
-    pub const MAP2_LANE_POTENTIAL: usize = 83;
-    pub const MAP2_LANE_OBSERVED: usize = 84;
-    /// Open fountain-wait intervals divided by the native Map2 tick cap.
-    pub const MAP2_FOUNTAIN_WAIT_TICKS: usize = 85;
-    /// Open period refundable cost divided by the reward's lifetime wait-charge bound.
-    pub const MAP2_FOUNTAIN_WAIT_REFUNDABLE_COST: usize = 86;
-    /// Generic progress debt divided by its 2700-tick threshold.
-    pub const MAP2_STAGNATION_TICKS: usize = 87;
-    /// Remaining activity lease divided by 30, after consuming the current tick.
-    pub const MAP2_ACTIVITY_TICKS_LEFT: usize = 88;
-    /// Base-charge latch, cleared only when generic progress debt reaches zero.
-    pub const MAP2_STAGNATION_BASE_CHARGED: usize = 89;
-    /// Remaining fraction of the appended independent incoming-Tower budget.
-    pub const MAP2_TOWER_DAMAGE_REMAINING: usize = 90;
-    /// First-wave opening-position assessment is still pending.
-    pub const MAP2_OPENING_POSITION_PENDING: usize = 91;
+    /// Own and enemy weakest-tower HP fractions from the Map2 reward potential.
+    pub const MAP2_OWN_TOWER_HEALTH: usize = 73;
+    pub const MAP2_ENEMY_TOWER_HEALTH: usize = 74;
+    /// Own and enemy hero deaths over the Map2 death limit.
+    pub const MAP2_OWN_DEATHS: usize = 75;
+    pub const MAP2_ENEMY_DEATHS: usize = 76;
+    /// Own and enemy hero HP fractions as last seen; one while dead.
+    pub const MAP2_OWN_HERO_HEALTH: usize = 77;
+    pub const MAP2_ENEMY_HERO_HEALTH: usize = 78;
+    /// Clamped experience lead over the reward's saturation scale.
+    pub const MAP2_XP_LEAD: usize = 79;
+    /// Current Map2 reward potential, in reward units.
+    pub const MAP2_REWARD_POTENTIAL: usize = 80;
+    /// First of the always-zero reserved global slots.
+    pub const RESERVED_START: usize = 81;
 }
 
 /// Stable indices in each unit token.
@@ -488,47 +484,29 @@ pub const FEATURE_SCHEMA_DESCRIPTOR: &str = concat!(
     "map_scalars=normalizers:elevation63_landmark_squared_extent_ray_step20,categories:direction_fixed_E_NE_N_NW_W_SW_S_SE_hit_kind_walkable_water_opaque_tree,reserved:14..15;",
     "unit_append_indices=69:invulnerable,70:channelling,71:facing_cos,72:facing_sin;unit_append_semantics=wire_status_bits9_10,last_observed_only_with_visible_remembered_age_provenance,canonical_facing_brads_times_TAU_div65536_f32_sin_cos,absent_token_zero;",
     "global_append_indices=64:own_ancient_present,65:own_ancient_relative_x,66:own_ancient_relative_y,67:own_ancient_distance,68:enemy_ancient_present,69:enemy_ancient_relative_x,70:enemy_ancient_relative_y,71:enemy_ancient_distance;ancient_geometry=seat_observed_current_or_remembered_Ancient_kind_exact_team,only_unique_known_position_per_team,requires_live_own_hero_origin,canonical_delta_extent_chebyshev_distance_extent,missing_or_ambiguous_all_zero,no_hidden_map_lookup_no_goal_priority;",
-    "map2_global_append=72:map2_present,73-81:original_nine_reward_remaining_in_unchanged_channel_order,82:tower_potential_raw_f32_range[-.3,.3],83:lane_potential_raw_f32_range[-.1,.1],84:lane_observed;legacy_map0_map1_append_zero;",
-    "map2_reward=only_map2_tracker_owned_complete_contiguous_seat_snapshot_events_before_event_journal_trim,full_lifetime_clone,no_hidden_world_inputs,complete_pair_required_before_observe_and_encode,remaining_and_potentials_and_completed_tick_in_provenance,drain_does_not_invalidate_features,finish_advances_revision;reward_schema=linked_version_hash_and_complete_descriptor;",
-    "map2_audit=reward_state_includes_public_enemy_bounty_and_xp_budget_remaining_even_when_raw_enemy_scoreboard_disabled;no_hidden_enemy_economy;",
+    "map2_global_append=72:map2_present,73:own_weakest_tower_hp,74:enemy_weakest_tower_hp,75:own_deaths_div_limit,76:enemy_deaths_div_limit,77:own_hero_hp_last_seen_dead1,78:enemy_hero_hp_last_seen_dead1,79:xp_lead_clamped,80:reward_potential,81-91:reserved;legacy_map0_map1_append_zero;",
+    "map2_reward=only_map2_tracker_owned_complete_contiguous_seat_snapshot_events,public_scoreboard_buildings_and_visible_heroes_only,complete_pair_required_before_observe_and_encode,drain_does_not_invalidate_features,finish_advances_revision;reward_schema=linked_version;",
     "raze_append=73:anonymous_effect15_present,74:stacks_div255,75:ticks_left_div240;pair=max_lexicographic_valid_active_row_stacks_then_remaining_ticks,never_sum_or_source_attribution;valid_stacks1..255_ticks1..240;memory_timer=observed_ticks_minus_age_expired_zero,no_fog_refresh,known_death_clears;rows_order_independent;entity_sort_pair_before_opaque_id;absent_incomplete_out_of_range_rows_zero;",
     "rebase_effects=Guarded13_Inspired14_Shadowraze15;auras=unit76:guarded_remaining_div15,77:inspired_remaining_div15,positive_means_presence,anonymous_max_timer_valid1..15_no_stacks,age_subtracted_no_hidden_refresh_or_source,expired_absent_dead_zero;",
     "manual_restoration=Healed_amount_health_and_mana_independent_reports_0..1000000_reject_invalid_before_tracker_mutation,positive_updates_only_other_channel_retained,instant_or_interruptible_overtime_promise_not_confirmed_tickregen,no_passive_or_fountain_report,no_pool_mutation_no_reward_credit_or_refund;unit78:health_report_present,79:amount_div100000_clamped,80:age_div480,81:mana_report_present,82:amount_div20000_clamped,83:age_div480;received_only_latest_positive_per_channel_from_existing64_prior_snapshot_event_journal,strict_tick_before_snapshot_age1..480,full_generation_bookkeeping_no_source_id;sorting=raze_pair_then_aura_timers_then_received_report_semantics_before_opaque_id;",
     "map2_scope=cap27900_including900_pregame_15minute_gameplay;",
-    "wait_accounting_append=global85:open_fountain_wait_ticks_div27900,86:open_refundable_cost_div.093,range0to1,legacy_maps_zero;reward2=prewave_center_hint_only_before_first_wave_no_new_postspawn_hero_constraint,any_movement_or_resource_break_resets_wait,any_own_purchase_refunds_open_period_including_drained_cost,only_two_new_accounting_facts_no_intent_price_or_antiabuse_conditions;",
-    "progress_accounting_append=global87:stagnation_ticks_div2700,88:activity_ticks_left_div30,89:stagnation_base_charged_0or1;invariants=debt0..2700_lease0..29_latch_implies_positive_debt,off_map2_zero,complete_snapshot_events_only,drains_clone_provenance_include_all_three_facts;reward3=independent_progress_debt_baseline_free_inactive_add1_including_death_active_repay3_refresh30_consumes_current_base.02_once_at2700_then_inactive_cap_rate.000002_rearm_only_debt0_no_refund;effect3_positive_ticks_direct_even_full_or_lingering,purchase_only_partial_activity_lease_plus_unchanged_v2_full_open_wait_refund,no_strategy_or_antiabuse_additions;",
     "mango=item42_category43_existing_item_and_loot_token_fields,no_new_item_rows;map2_geometry=map0_public_geometry_no_metadata_relabel;",
     "wire_rebase=bota78427bb_damaged_then_missed_then_healed_died_cast_level_bought_structure_event_order_shift,missed_is_not_damage_or_healing_and_never_scores,cheat_orders_decoded_structurally_and_never_issued_by_any_seat,NoCheats_rejection_has_no_reward_effect,unit_attack_time_and_attack_point_milliseconds_after_speed_converted_to_historical_whole_ticks_at_30,attack_interval_feature_unchanged_in_ticks,unit_collision_and_bound_split_from_the_old_radius,bound_feeds_every_combat_range_and_area_and_the_radius_feature,collision_feeds_movement_clearance_and_walkability_no_hidden_radius;",
-    "reward7=unchanged_reward5_dense_channels_and_potentials_terminal_win.2_loss_neg.2_draw0_taskcap_neg.2_win_only_victory_time_bonus;global90:tower_damage_channel9_remaining_fraction,91:opening_position_pending_bool;all_global0to91_indices_preserved_nine_remaining73to81_not_overwritten_by_tenth_channel;opening_pending_lifetime_clone_complete_pair_provenance_and_finish_expiry_no_ids_or_forced_actions;mastery_stage_thresholds_and_rolling_window_excluded_from_features;"
+    "mastery_stage_thresholds_and_rolling_window_excluded_from_features;"
 );
 
-/// FNV-1a of the descriptor, action/reward version-le32/hash-le64 pairs, and reward descriptor.
+/// FNV-1a of the descriptor, action version-le32/hash-le64 pair, and reward version.
 pub const FEATURE_SCHEMA_HASH: u64 = crate::model::linked_schema_hash(
     FEATURE_SCHEMA_DESCRIPTOR,
-    &[
-        (crate::ACTION_SCHEMA_VERSION, crate::ACTION_SCHEMA_HASH),
-        (
-            crate::MAP2_REWARD_SCHEMA_VERSION,
-            crate::MAP2_REWARD_SCHEMA_HASH,
-        ),
-    ],
+    &[(crate::ACTION_SCHEMA_VERSION, crate::ACTION_SCHEMA_HASH)],
 );
 
 const _: () = assert!(crate::ACTION_SCHEMA_VERSION == 5);
 const _: () = assert!(StatusFlags::INVULNERABLE == 1 << 9);
 const _: () = assert!(StatusFlags::CHANNELLING == 1 << 10);
-const _: () = assert!(
-    global_feature::MAP2_REWARD_REMAINING_START + crate::MAP2_REWARD_LEGACY_CHANNELS
-        == global_feature::MAP2_TOWER_POTENTIAL
-);
-const _: () = assert!(
-    global_feature::MAP2_STAGNATION_BASE_CHARGED + 1 == global_feature::MAP2_TOWER_DAMAGE_REMAINING
-);
-const _: () = assert!(global_feature::MAP2_OPENING_POSITION_PENDING + 1 == GLOBAL_FEATURES);
-const _: () = assert!(crate::MAP2_REWARD_STAGNATION_THRESHOLD_TICKS == 2700);
-const _: () = assert!(crate::MAP2_REWARD_ACTIVITY_LEASE_TICKS == 30);
+const _: () = assert!(global_feature::MAP2_REWARD_POTENTIAL + 1 == global_feature::RESERVED_START);
+const _: () = assert!(global_feature::RESERVED_START < GLOBAL_FEATURES);
 const _: () = assert!(crate::MAP2_TICK_CAP == 27_900);
-const _: () = assert!(crate::MAP2_REWARD_FOUNTAIN_WAIT_BOUND > 0.0);
 const _: () = assert!(unit_feature::MANA_RESTORE_REPORT_AGE + 1 == UNIT_FEATURES);
 const _: () =
     assert!(unit_feature::INSPIRED_TICKS_LEFT + 1 == unit_feature::HEALTH_RESTORE_REPORT_PRESENT);
@@ -2601,40 +2579,19 @@ fn encode_map2_reward(tracker: &StateTracker, global: &mut [f32; GLOBAL_FEATURES
         tracker.current().map(|view| view.tick)
     );
     global[global_feature::MAP_TWO] = 1.0;
-    let start = global_feature::MAP2_REWARD_REMAINING_START;
-    global[start..start + crate::MAP2_REWARD_LEGACY_CHANNELS]
-        .copy_from_slice(&state.remaining[..crate::MAP2_REWARD_LEGACY_CHANNELS]);
-    global[global_feature::MAP2_TOWER_DAMAGE_REMAINING] =
-        state.remaining[crate::MAP2_REWARD_TOWER_CHANNEL];
-    global[global_feature::MAP2_OPENING_POSITION_PENDING] =
-        bool_feature(state.opening_position_pending);
-    global[global_feature::MAP2_TOWER_POTENTIAL] = state.tower_potential;
-    global[global_feature::MAP2_LANE_POTENTIAL] = state.lane_potential;
-    global[global_feature::MAP2_LANE_OBSERVED] = bool_feature(state.lane_observed);
-    global[global_feature::MAP2_FOUNTAIN_WAIT_TICKS] =
-        unit_ratio(state.fountain_wait_ticks, crate::MAP2_TICK_CAP);
-    global[global_feature::MAP2_FOUNTAIN_WAIT_REFUNDABLE_COST] =
-        (state.fountain_wait_refundable_cost / crate::MAP2_REWARD_FOUNTAIN_WAIT_BOUND as f32)
-            .clamp(0.0, 1.0);
-    encode_progress_debt(state, global);
-}
-
-fn encode_progress_debt(state: crate::Map2RewardState, global: &mut [f32; GLOBAL_FEATURES]) {
-    assert!(state.stagnation_ticks <= crate::MAP2_REWARD_STAGNATION_THRESHOLD_TICKS);
-    assert!(state.activity_ticks_left < crate::MAP2_REWARD_ACTIVITY_LEASE_TICKS);
-    if state.stagnation_base_charged {
-        assert!(state.stagnation_ticks > 0);
-    }
-    global[global_feature::MAP2_STAGNATION_TICKS] = unit_ratio(
-        state.stagnation_ticks,
-        crate::MAP2_REWARD_STAGNATION_THRESHOLD_TICKS,
+    global[global_feature::MAP2_OWN_TOWER_HEALTH] = state.tower_health[0];
+    global[global_feature::MAP2_ENEMY_TOWER_HEALTH] = state.tower_health[1];
+    global[global_feature::MAP2_OWN_DEATHS] = state.deaths[0];
+    global[global_feature::MAP2_ENEMY_DEATHS] = state.deaths[1];
+    global[global_feature::MAP2_OWN_HERO_HEALTH] = state.hero_health[0];
+    global[global_feature::MAP2_ENEMY_HERO_HEALTH] = state.hero_health[1];
+    global[global_feature::MAP2_XP_LEAD] = state.xp_lead;
+    global[global_feature::MAP2_REWARD_POTENTIAL] = state.potential;
+    assert!(
+        global[global_feature::RESERVED_START..]
+            .iter()
+            .all(|value| *value == 0.0)
     );
-    global[global_feature::MAP2_ACTIVITY_TICKS_LEFT] = unit_ratio(
-        state.activity_ticks_left,
-        crate::MAP2_REWARD_ACTIVITY_LEASE_TICKS,
-    );
-    global[global_feature::MAP2_STAGNATION_BASE_CHARGED] =
-        bool_feature(state.stagnation_base_charged);
 }
 
 fn encode_unit_effects(token: &mut [f32; UNIT_FEATURES], track: &crate::EntityTrack, tick: u32) {

@@ -12,6 +12,8 @@ pub const MAP2_PREGAME_TICKS: u32 = 30 * MAP2_TICK_RATE;
 pub const MAP2_GAME_TICKS: u32 = 15 * 60 * MAP2_TICK_RATE;
 /// Inclusive native terminal tick, including pregame.
 pub const MAP2_TICK_CAP: u32 = MAP2_PREGAME_TICKS + MAP2_GAME_TICKS;
+/// Hero deaths at which a side loses; losing any tower loses as well.
+pub const MAP2_DEATH_LIMIT: u16 = 2;
 /// Simulation ticks between actor decisions.
 pub const MAP2_DECISION_INTERVAL_TICKS: u32 = 3;
 /// Maximum decisions from the initial tick-one snapshot through the cap.
@@ -35,4 +37,5 @@ const _: () = {
     assert!(MAP2_PREGAME_TICKS == bota_server::game::rules::PREGAME_TICKS);
     assert!(MAP2_GAME_TICKS == bota_server::game::MAP2_GAME_TICKS);
     assert!(MAP2_TICK_CAP == bota_server::game::MAP2_TICK_CAP);
+    assert!(MAP2_DEATH_LIMIT == bota_server::game::MAP2_DEATH_LIMIT);
 };

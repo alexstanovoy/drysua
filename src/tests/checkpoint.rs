@@ -112,7 +112,7 @@ fn resume_rejects_each_linked_schema_version_and_hash_before_tensor_io() {
             fs::remove_file(path).expect("remove tensors to prove validation ordering");
         }
     }
-    for offset in [8, 12, 20, 24, 32, 36, 44, 48, 56, 60, 68, 72] {
+    for offset in [8, 12, 20, 24, 32, 36, 44, 48, 56, 60] {
         let mut bytes = original.clone();
         bytes[offset] ^= 1;
         fs::write(&path, &bytes).expect("alter schema");
@@ -292,16 +292,8 @@ fn current_runtime_metadata() -> std::collections::HashMap<String, String> {
             crate::PPO_RULES_AUDIT_VERSION.to_string(),
         ),
         (
-            "map2_reward_schema_version",
-            crate::MAP2_REWARD_SCHEMA_VERSION.to_string(),
-        ),
-        (
-            "map2_reward_schema_hash",
-            crate::MAP2_REWARD_SCHEMA_HASH.to_string(),
-        ),
-        (
-            "map2_reward_schema_descriptor",
-            crate::MAP2_REWARD_SCHEMA_DESCRIPTOR.to_owned(),
+            "map2_reward_version",
+            crate::MAP2_REWARD_VERSION.to_string(),
         ),
     ]
     .into_iter()
