@@ -12,15 +12,13 @@ Reward-report mode uses native **Lockstep paced at at most 30 Hz**, not coalesci
 Realtime. The two passive observers reuse production Map2Reward and save per-seat
 JSON plus bounded interval deltas under the announced play-run directory. A slower
 renderer slows simulation. See [human-reward-play.md](human-reward-play.md) for
-components, completeness flags, public raw paid-gold nets and verified native examples.
+components, completeness flags, raw seat-visible counters and verified native examples.
 The GUI is for the human to launch from a desktop; agent verification was headless.
 
 ## Default Neural mode still fails closed without explicit weights
 
-The current reward7 terminal and victory-time change is documented in
-[reward-rebalance.md](reward-rebalance.md). Win has terminal reward+0.2, Draw0,
-Loss and completed-task TimeCap-0.2. Dense terms are unchanged. Historical
-M19/M20/M21 models are not current-compatible without explicit initialization.
+The current Map2 reward (version 8) is documented in [reward.md](reward.md).
+Historical models are not current-compatible without explicit initialization.
 
 Integration checks against the earlier bota rebase are recorded in
 [`artifacts/temp/bota-rebase-integration-20260910/RESULTS.md`](../artifacts/temp/bota-rebase-integration-20260910/RESULTS.md).

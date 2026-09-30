@@ -100,10 +100,10 @@ fn incomplete_pairs_reject_atomically_and_feature_observation_can_retry() {
 #[test]
 fn reward_drain_preserves_frames_but_each_terminal_invalidates_pairings_exactly_once() {
     for (end, terminal) in [
-        (Map2RewardEnd::Win, 0.2),
-        (Map2RewardEnd::Loss, -0.2),
+        (Map2RewardEnd::Win, 1.0),
+        (Map2RewardEnd::Loss, -1.0),
         (Map2RewardEnd::Draw, 0.0),
-        (Map2RewardEnd::TimeCap, -0.2),
+        (Map2RewardEnd::TimeCap, 0.0),
     ] {
         let (mut view, mut tracker) = initial(Team::Radiant);
         let visible = frame(&tracker);

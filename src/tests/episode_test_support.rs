@@ -253,7 +253,7 @@ fn assert_unsampled_terminal(choice: &PpoPolicyChoice) {
         .expect("unretained reward");
     short.map2_reward = Map2TrainingReward {
         ticks: 3,
-        terminal: 1.0,
+        components: [0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
         total: 1.0,
         ..Map2TrainingReward::default()
     };

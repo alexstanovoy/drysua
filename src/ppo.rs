@@ -90,22 +90,18 @@ pub const PPO_SCHEMA_DESCRIPTOR: &str = concat!(
     "initialization=current_runtime_weights_parameters_only_fresh_optimizer_progress_rng;"
 );
 
-/// FNV-1a of the descriptor, ordered linked identities, and reward descriptor.
+/// FNV-1a of the descriptor, ordered linked identities, and reward version.
 pub const PPO_SCHEMA_HASH: u64 = crate::model::linked_schema_hash(
     PPO_SCHEMA_DESCRIPTOR,
     &[
         (ACTION_SCHEMA_VERSION, ACTION_SCHEMA_HASH),
         (FEATURE_SCHEMA_VERSION, FEATURE_SCHEMA_HASH),
         (MODEL_SCHEMA_VERSION, MODEL_SCHEMA_HASH),
-        (
-            crate::MAP2_REWARD_SCHEMA_VERSION,
-            crate::MAP2_REWARD_SCHEMA_HASH,
-        ),
     ],
 );
 
 const _: () = assert!(ACTION_SCHEMA_VERSION == 5);
-const _: () = assert!(FEATURE_SCHEMA_VERSION == 22);
+const _: () = assert!(FEATURE_SCHEMA_VERSION == 23);
 const _: () = assert!(MODEL_SCHEMA_VERSION == 25);
 const _: () = assert!(PPO_RULES_AUDIT_VERSION == 32);
 

@@ -10,7 +10,7 @@ pub(super) fn contract() -> Value {
             "max_samples": crate::PPO_MAX_SAMPLES, "max_games": crate::PPO_MAX_GAMES},
         "schemas": {"action": schema(ACTION_SCHEMA_VERSION, ACTION_SCHEMA_HASH),
             "feature": schema(FEATURE_SCHEMA_VERSION, FEATURE_SCHEMA_HASH),
-            "reward": schema(crate::MAP2_REWARD_SCHEMA_VERSION, crate::MAP2_REWARD_SCHEMA_HASH),
+            "reward": {"version": crate::MAP2_REWARD_VERSION},
             "ppo": schema(PPO_SCHEMA_VERSION, PPO_SCHEMA_HASH),
             "rules_audit_version": PPO_RULES_AUDIT_VERSION},
         "checkpoint": checkpoint(), "numeric_semantics": {"ppo_floats": "IEEE-754 binary32, JSON numbers widened exactly to binary64",

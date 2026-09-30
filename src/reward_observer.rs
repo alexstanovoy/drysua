@@ -8,11 +8,20 @@ use std::path::Path;
 
 use bota_proto::{ServerMsg, SlotId, Team, TickMode};
 
-use crate::{Map2Reward, Map2RewardBreakdown, Map2RewardEnd};
+use crate::{
+    MAP2_REWARD_COMPONENTS, MAP2_REWARD_COUNTERS, Map2Reward, Map2RewardBreakdown, Map2RewardEnd,
+    Map2RewardObservations,
+};
 
 const MAX_MESSAGES: usize = 1_000_000;
 const MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const REPORT_LIMIT: usize = 1024 * 1024;
+const COMPONENTS: usize = MAP2_REWARD_COMPONENTS.len();
+const TERMINAL: usize = 5;
+const _: () = assert!(matches!(
+    MAP2_REWARD_COMPONENTS[TERMINAL].as_bytes(),
+    b"terminal"
+));
 
 /// Observes one copied participant stream and writes bounded reward diagnostics.
 pub(crate) fn run(output: &Path, interval: u32) -> io::Result<()> {
@@ -78,7 +87,7 @@ pub(crate) fn consume(
 ) -> io::Result<()> {
     let mut next = interval;
     let mut written = 0;
-    let mut previous = [0.0; 18];
+    let mut previous = [0.0; COMPONENTS];
     for _ in 0..MAX_MESSAGES {
         let Some(message) = read_message(input)? else {
             return if observer.ended {
@@ -141,8 +150,8 @@ pub(crate) struct Observer {
     pending: bool,
     ended: bool,
     outcome: Option<Map2RewardEnd>,
-    totals: [f64; 18],
-    counts: [u64; 32],
+    totals: [f64; COMPONENTS],
+    counts: Map2RewardObservations,
     pub(crate) last_interval: Map2RewardBreakdown,
 }
 
@@ -157,8 +166,8 @@ impl Observer {
             pending: false,
             ended: false,
             outcome: None,
-            totals: [0.0; 18],
-            counts: [0; 32],
+            totals: [0.0; COMPONENTS],
+            counts: Map2RewardObservations::default(),
             last_interval: Map2RewardBreakdown::default(),
         }
     }
@@ -185,7 +194,7 @@ impl Observer {
                 self.pending = false;
                 self.tick = tick;
                 let interval = self.reward()?.take_interval().map_err(io::Error::other)?;
-                self.add(interval);
+                self.add(interval)?;
             }
             ServerMsg::MatchOver { winner, stats } => {
                 if stats.slots.len() != 2
@@ -294,7 +303,7 @@ impl Observer {
             Map2RewardEnd::Loss
         };
         let final_interval = self.reward()?.finish(end).map_err(io::Error::other)?;
-        self.add(final_interval);
+        self.add(final_interval)?;
         self.outcome = Some(end);
         self.ended = true;
         assert!(!self.pending);
@@ -302,20 +311,18 @@ impl Observer {
         Ok(())
     }
 
-    fn add(&mut self, interval: Map2RewardBreakdown) {
-        for (total, value) in self.totals.iter_mut().zip(components(&interval)) {
+    fn add(&mut self, interval: Map2RewardBreakdown) -> io::Result<()> {
+        for (total, value) in self.totals.iter_mut().zip(interval.components()) {
             *total += value;
         }
-        for (index, (total, value)) in self.counts.iter_mut().zip(counts(&interval)).enumerate() {
-            if index == 30 {
-                *total |= value;
-            } else {
-                *total += value;
-            }
-        }
+        self.counts = self
+            .counts
+            .checked_add(&interval.observations)
+            .ok_or_else(|| invalid("reward counter overflow"))?;
         self.last_interval = interval;
         assert!(self.totals.iter().all(|value| value.is_finite()));
         assert!(self.tick <= crate::MAP2_TICK_CAP);
+        Ok(())
     }
 
     pub(crate) fn report(&self, error: Option<&str>) -> String {
@@ -323,14 +330,13 @@ impl Observer {
         let total: f64 = self.totals.iter().sum();
         format!(
             concat!(
-                "{{\"kind\":\"final\",\"profile_version\":{},\"profile_hash\":\"{}\",",
+                "{{\"kind\":\"final\",\"profile_version\":{},",
                 "\"slot\":{},\"team\":{},\"ticks\":{},\"complete\":{},\"valid\":{},",
                 "\"pending_events\":{},\"reward_ticks\":{},",
                 "\"outcome\":{},\"error\":{},\"components\":{},\"raw_counts\":{},",
                 "\"total\":{},\"total_without_terminal\":{}}}"
             ),
-            crate::MAP2_REWARD_SCHEMA_VERSION,
-            crate::MAP2_REWARD_SCHEMA_HASH,
+            crate::MAP2_REWARD_VERSION,
             self.slot
                 .map_or("null".to_owned(), |slot| slot.0.to_string()),
             quoted(self.team.map(|team| format!("{team:?}")).as_deref()),
@@ -341,146 +347,29 @@ impl Observer {
             self.tick.saturating_sub(1),
             quoted(self.outcome.map(|end| format!("{end:?}")).as_deref()),
             quoted(error),
-            fields(&COMPONENTS, &self.totals),
-            fields(&COUNTS, &self.counts),
+            fields(&MAP2_REWARD_COMPONENTS, &self.totals),
+            fields(&MAP2_REWARD_COUNTERS, &self.counts.counters()),
             total,
-            total - self.totals[16]
+            total - self.totals[TERMINAL]
         )
     }
 
-    fn timeline(&self, previous: &[f64; 18]) -> String {
-        let delta: [f64; 18] = std::array::from_fn(|index| self.totals[index] - previous[index]);
+    fn timeline(&self, previous: &[f64; COMPONENTS]) -> String {
+        let delta: [f64; COMPONENTS] =
+            std::array::from_fn(|index| self.totals[index] - previous[index]);
         format!(
             concat!(
                 "{{\"kind\":\"interval\",\"status\":\"partial\",\"profile_version\":{},",
-                "\"profile_hash\":\"{}\",\"team\":{},\"ticks\":{},\"components\":{},\"delta\":{},\"total\":{}}}"
+                "\"team\":{},\"ticks\":{},\"components\":{},\"delta\":{},\"total\":{}}}"
             ),
-            crate::MAP2_REWARD_SCHEMA_VERSION,
-            crate::MAP2_REWARD_SCHEMA_HASH,
+            crate::MAP2_REWARD_VERSION,
             quoted(self.team.map(|team| format!("{team:?}")).as_deref()),
             self.tick,
-            fields(&COMPONENTS, &self.totals),
-            fields(&COMPONENTS, &delta),
+            fields(&MAP2_REWARD_COMPONENTS, &self.totals),
+            fields(&MAP2_REWARD_COMPONENTS, &delta),
             self.totals.iter().sum::<f64>()
         )
     }
-}
-
-const COMPONENTS: [&str; 18] = [
-    "gold",
-    "experience",
-    "hero_damage",
-    "hero_damage_taken",
-    "creep_damage_taken",
-    "tower_damage_taken",
-    "other_damage_taken",
-    "mana_spent",
-    "tower_health",
-    "lane_pressure",
-    "pregame_movement",
-    "opening_position",
-    "fountain_wait",
-    "fountain_wait_refund",
-    "stagnation_base",
-    "stagnation_ticks_cost",
-    "terminal",
-    "victory_time",
-];
-
-fn components(value: &Map2RewardBreakdown) -> [f64; 18] {
-    [
-        value.gold,
-        value.experience,
-        value.hero_damage,
-        value.hero_damage_taken,
-        value.creep_damage_taken,
-        value.tower_damage_taken,
-        value.other_damage_taken,
-        value.mana_spent,
-        value.tower_health,
-        value.lane_pressure,
-        value.pregame_movement,
-        value.opening_position,
-        value.fountain_wait,
-        value.fountain_wait_refund,
-        value.stagnation_base,
-        value.stagnation_ticks_cost,
-        value.terminal,
-        value.victory_time,
-    ]
-}
-
-const COUNTS: [&str; 32] = [
-    "tower_damage_taken",
-    "opening_position_checks",
-    "victory_time_ticks",
-    "own_gold_earned",
-    "enemy_gold_earned",
-    "own_xp_gained",
-    "enemy_xp_gained",
-    "hero_damage_dealt",
-    "structure_damage_dealt",
-    "creep_kills",
-    "creep_denies",
-    "hero_damage_taken",
-    "creep_damage_taken",
-    "other_damage_taken",
-    "unattributed_damage_taken",
-    "mana_spent",
-    "mana_unobserved_ticks",
-    "lane_last_hits",
-    "neutral_last_hits",
-    "unattributed_damage_events",
-    "unattributed_deaths",
-    "duplicate_deaths",
-    "lane_observed_ticks",
-    "fountain_wait_ticks",
-    "fountain_wait_charged_ticks",
-    "fountain_wait_refunds",
-    "stagnation_active_ticks",
-    "stagnation_idle_ticks",
-    "stagnation_charged_ticks",
-    "stagnation_base_charges",
-    "stagnation_repaid_ticks",
-    "progress_reasons",
-];
-
-fn counts(value: &Map2RewardBreakdown) -> [u64; 32] {
-    let value = value.observations;
-    [
-        value.tower_damage_taken,
-        value.opening_position_checks,
-        value.victory_time_ticks,
-        value.own_gold_earned,
-        value.enemy_gold_earned,
-        value.own_xp_gained,
-        value.enemy_xp_gained,
-        value.hero_damage_dealt,
-        value.structure_damage_dealt,
-        value.creep_kills,
-        value.creep_denies,
-        value.hero_damage_taken,
-        value.creep_damage_taken,
-        value.other_damage_taken,
-        value.unattributed_damage_taken,
-        value.mana_spent,
-        value.mana_unobserved_ticks,
-        value.lane_last_hits,
-        value.neutral_last_hits,
-        value.unattributed_damage_events,
-        value.unattributed_deaths,
-        value.duplicate_deaths,
-        value.lane_observed_ticks,
-        value.fountain_wait_ticks,
-        value.fountain_wait_charged_ticks,
-        value.fountain_wait_refunds,
-        value.stagnation_active_ticks,
-        value.stagnation_idle_ticks,
-        value.stagnation_charged_ticks,
-        value.stagnation_base_charges,
-        value.stagnation_repaid_ticks,
-        u64::from(value.progress_reasons),
-    ]
 }
 
 fn fields<T: std::fmt::Display, const N: usize>(names: &[&str; N], values: &[T; N]) -> String {

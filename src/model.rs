@@ -181,7 +181,7 @@ pub(crate) const fn fnv1a_extend(mut hash: u64, bytes: &[u8]) -> u64 {
     hash
 }
 
-/// Folds ordered imported identities rather than duplicating concurrently versioned hashes.
+/// Folds ordered imported identities and the Map2 reward version.
 pub(crate) const fn linked_schema_hash(descriptor: &str, schemas: &[(u32, u64)]) -> u64 {
     let mut hash = fnv1a_extend(FNV_OFFSET, descriptor.as_bytes());
     let mut index = 0;
@@ -190,30 +190,26 @@ pub(crate) const fn linked_schema_hash(descriptor: &str, schemas: &[(u32, u64)])
         hash = fnv1a_extend(hash, &schemas[index].1.to_le_bytes());
         index += 1;
     }
-    fnv1a_extend(hash, crate::MAP2_REWARD_SCHEMA_DESCRIPTOR.as_bytes())
+    fnv1a_extend(hash, &crate::MAP2_REWARD_VERSION.to_le_bytes())
 }
 
 const fn linear_parameters(input: usize, output: usize) -> usize {
     input * output + output
 }
 
-/// FNV-1a of the descriptor, ordered linked versions/hashes, and reward descriptor.
+/// FNV-1a of the descriptor, ordered linked versions/hashes, and reward version.
 pub const MODEL_SCHEMA_HASH: u64 = linked_schema_hash(
     MODEL_SCHEMA_DESCRIPTOR,
     &[
         (crate::ACTION_SCHEMA_VERSION, crate::ACTION_SCHEMA_HASH),
         (FEATURE_SCHEMA_VERSION, FEATURE_SCHEMA_HASH),
-        (
-            crate::MAP2_REWARD_SCHEMA_VERSION,
-            crate::MAP2_REWARD_SCHEMA_HASH,
-        ),
     ],
 );
 
 /// Exact number of F32 parameters in the model layout.
 pub const MODEL_PARAMETER_COUNT: usize = 1_812_983;
 
-const _: () = assert!(FEATURE_SCHEMA_VERSION == 22);
+const _: () = assert!(FEATURE_SCHEMA_VERSION == 23);
 const _: () = assert!(crate::ACTION_SCHEMA_VERSION == 5);
 const _: () = assert!(GLOBAL_FEATURES == 92);
 const _: () = assert!(UNIT_FEATURES == 84);
