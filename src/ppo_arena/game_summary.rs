@@ -5,17 +5,19 @@
 
 use std::fmt;
 
-use bota_proto::{AbilityId, DamageKind, EventKind, Team, UnitKind};
+use bota_proto::{AbilityId, DamageKind, EventKind, Order, Target, Team, UnitKind};
 use serde_json::{Value, json};
 
 use super::TrainingEnvironment;
-use crate::{PpoTerminalOutcome, StateTracker};
+use crate::{IssuedOrder, PpoTerminalOutcome, StateTracker};
 
 /// Shadowraze near, medium, far, then Requiem of Souls.
 const TRACKED_ABILITIES: [AbilityId; 4] =
     [AbilityId(13), AbilityId(14), AbilityId(15), AbilityId(16)];
 const CAST_LABELS: [&str; 4] = ["raze_near", "raze_mid", "raze_far", "requiem"];
 const RAZE_COUNT: usize = 3;
+/// Raze decisions by target mode, in the action schema's mode order.
+const RAZE_MODE_LABELS: [&str; 3] = ["none", "entity", "point"];
 
 /// Casts and structure losses one seat observed over its whole game.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -23,16 +25,44 @@ pub(crate) struct SeatCombat {
     casts: [u32; TRACKED_ABILITIES.len()],
     /// Razes whose effect tick carried own magical damage to an enemy hero.
     raze_hero_hits: u32,
+    /// Razes whose effect tick carried own magical damage to any hostile unit.
+    raze_hits: u32,
+    /// Raze decisions by target mode; an aim abandoned before its cast still counts.
+    raze_modes: [u32; 3],
     tower_lost: bool,
 }
 
 impl SeatCombat {
+    /// Counts a decided own-hero raze by its target mode before the aim macro resolves it.
+    pub(super) fn note_decision(&mut self, tracker: &StateTracker, issued: Option<IssuedOrder>) {
+        let Some(IssuedOrder {
+            unit: None,
+            order: Order::Cast { slot, target },
+        }) = issued
+        else {
+            return;
+        };
+        let raze = tracker
+            .own_hero()
+            .and_then(|hero| hero.abilities.get(usize::from(slot.0)))
+            .is_some_and(|ability| TRACKED_ABILITIES[..RAZE_COUNT].contains(&ability.id));
+        if raze {
+            let mode = match target {
+                Target::None => 0,
+                Target::Unit(_) => 1,
+                Target::Pos(_) => 2,
+            };
+            self.raze_modes[mode] = self.raze_modes[mode].saturating_add(1);
+        }
+    }
+
     /// Folds one tick of this seat's events; the tick's snapshot is already observed.
     pub(super) fn observe(&mut self, tracker: &StateTracker, events: &[EventKind]) {
         let own_team = tracker.team();
         let own_hero = tracker.own_hero().map(|hero| hero.id);
         let mut razes = 0u32;
         let mut hero_hit = false;
+        let mut hit = false;
         for event in events {
             match event {
                 EventKind::AbilityCast { caster, ability } if Some(*caster) == own_hero => {
@@ -47,9 +77,10 @@ impl SeatCombat {
                     kind: DamageKind::Magical,
                     ..
                 } if Some(*source) == own_hero => {
-                    hero_hit |= tracker.entity(*target).is_some_and(|track| {
-                        track.unit.kind == UnitKind::Hero && track.unit.team != own_team
-                    });
+                    let hostile = tracker.entity(*target).map(|track| &track.unit);
+                    let hostile = hostile.filter(|unit| unit.team != own_team);
+                    hit |= hostile.is_some();
+                    hero_hit |= hostile.is_some_and(|unit| unit.kind == UnitKind::Hero);
                 }
                 EventKind::StructureDestroyed { team, .. } if *team == own_team => {
                     self.tower_lost = true;
@@ -61,7 +92,11 @@ impl SeatCombat {
         if hero_hit {
             self.raze_hero_hits = self.raze_hero_hits.saturating_add(razes.min(1));
         }
-        assert!(self.raze_hero_hits <= self.casts[..RAZE_COUNT].iter().sum::<u32>());
+        if hit {
+            self.raze_hits = self.raze_hits.saturating_add(razes.min(1));
+        }
+        assert!(self.raze_hero_hits <= self.raze_hits);
+        assert!(self.raze_hits <= self.casts[..RAZE_COUNT].iter().sum::<u32>());
     }
 }
 
@@ -184,14 +219,18 @@ impl fmt::Display for GameSummary {
         for (prefix, hero) in [("own", &self.own), ("enemy", &self.enemy)] {
             write!(
                 formatter,
-                " {prefix}_kills={} {prefix}_deaths={} {prefix}_level={} {prefix}_xp={} {prefix}_tower_hp={:.4} {prefix}_raze_hero_hits={}",
+                " {prefix}_kills={} {prefix}_deaths={} {prefix}_level={} {prefix}_xp={} {prefix}_tower_hp={:.4} {prefix}_raze_hero_hits={} {prefix}_raze_hits={}",
                 hero.kills,
                 hero.deaths,
                 hero.level,
                 hero.xp,
                 hero.tower_hp,
-                hero.combat.raze_hero_hits
+                hero.combat.raze_hero_hits,
+                hero.combat.raze_hits
             )?;
+            for (label, count) in RAZE_MODE_LABELS.iter().zip(hero.combat.raze_modes) {
+                write!(formatter, " {prefix}_raze_mode_{label}={count}")?;
+            }
             for (label, casts) in CAST_LABELS.iter().zip(hero.combat.casts) {
                 write!(formatter, " {prefix}_casts_{label}={casts}")?;
             }
@@ -246,5 +285,11 @@ fn hero_json(hero: &HeroSummary) -> Value {
         "tower_hp": hero.tower_hp,
         "casts": casts,
         "raze_hero_hits": hero.combat.raze_hero_hits,
+        "raze_hits": hero.combat.raze_hits,
+        "raze_modes": RAZE_MODE_LABELS
+            .iter()
+            .zip(hero.combat.raze_modes)
+            .map(|(label, count)| ((*label).to_owned(), json!(count)))
+            .collect::<serde_json::Map<String, Value>>(),
     })
 }
