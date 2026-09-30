@@ -18,6 +18,35 @@ const CAST_LABELS: [&str; 4] = ["raze_near", "raze_mid", "raze_far", "requiem"];
 const RAZE_COUNT: usize = 3;
 /// Raze decisions by target mode, in the action schema's mode order.
 const RAZE_MODE_LABELS: [&str; 3] = ["none", "entity", "point"];
+/// Game-clock minutes (after the pregame) at which both seats record their standing;
+/// early leads decide most games.
+const MILESTONE_MINUTES: [u32; 3] = [2, 3, 5];
+
+const fn milestone_tick(minutes: u32) -> u32 {
+    crate::MAP2_PREGAME_TICKS + minutes * 60 * crate::MAP2_TICK_RATE
+}
+
+/// One seat's own standing at a milestone, from its own tracker only.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Standing {
+    xp: i32,
+    /// Gold paid to this seat for last hits and kills; passive income is equal for both.
+    bounty: i32,
+    deaths: u16,
+    /// Weakest own tower's HP in basis points.
+    tower_bp: u16,
+}
+
+/// Own minus enemy standing at one milestone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Lead {
+    pub xp: i32,
+    pub gold: i32,
+    /// Enemy deaths minus own deaths.
+    pub deaths: i32,
+    /// Own minus enemy weakest-tower HP in basis points.
+    pub tower_bp: i32,
+}
 
 /// Casts and structure losses one seat observed over its whole game.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -30,6 +59,8 @@ pub(crate) struct SeatCombat {
     /// Raze decisions by target mode; an aim abandoned before its cast still counts.
     raze_modes: [u32; 3],
     tower_lost: bool,
+    bounty: i32,
+    standings: [Option<Standing>; MILESTONE_MINUTES.len()],
 }
 
 impl SeatCombat {
@@ -85,9 +116,17 @@ impl SeatCombat {
                 EventKind::StructureDestroyed { team, .. } if *team == own_team => {
                     self.tower_lost = true;
                 }
+                EventKind::Died {
+                    killer: Some(killer),
+                    gold,
+                    ..
+                } if Some(*killer) == own_hero => {
+                    self.bounty = self.bounty.saturating_add(*gold);
+                }
                 _ => {}
             }
         }
+        self.record_standings(tracker);
         // Razes land on their effect tick, so a same-tick magical hero hit belongs to them.
         if hero_hit {
             self.raze_hero_hits = self.raze_hero_hits.saturating_add(razes.min(1));
@@ -97,6 +136,32 @@ impl SeatCombat {
         }
         assert!(self.raze_hero_hits <= self.raze_hits);
         assert!(self.raze_hits <= self.casts[..RAZE_COUNT].iter().sum::<u32>());
+    }
+}
+
+impl SeatCombat {
+    /// Records the standing at every milestone this tick has reached; both seats
+    /// observe every tick, so their standings share the tick.
+    fn record_standings(&mut self, tracker: &StateTracker) {
+        let Some(tick) = tracker.current().map(|view| view.tick) else {
+            return;
+        };
+        for (standing, minutes) in self.standings.iter_mut().zip(MILESTONE_MINUTES) {
+            if standing.is_none() && tick >= milestone_tick(minutes) {
+                let player = tracker.own_player();
+                let tower = if self.tower_lost {
+                    0.0
+                } else {
+                    weakest_tower_fraction(tracker, tracker.team())
+                };
+                *standing = Some(Standing {
+                    xp: player.map_or(0, |player| player.xp),
+                    bounty: self.bounty,
+                    deaths: player.map_or(0, |player| player.deaths),
+                    tower_bp: basis_points(tower),
+                });
+            }
+        }
     }
 }
 
@@ -184,6 +249,20 @@ impl GameSummary {
         side_label(self.side)
     }
 
+    /// Own minus enemy standing at each milestone the game reached.
+    pub(crate) fn leads(&self) -> [Option<Lead>; MILESTONE_MINUTES.len()] {
+        let (own, enemy) = (&self.own.combat.standings, &self.enemy.combat.standings);
+        std::array::from_fn(|index| {
+            let (own, enemy) = (own[index]?, enemy[index]?);
+            Some(Lead {
+                xp: own.xp - enemy.xp,
+                gold: own.bounty - enemy.bounty,
+                deaths: i32::from(enemy.deaths) - i32::from(own.deaths),
+                tower_bp: i32::from(own.tower_bp) - i32::from(enemy.tower_bp),
+            })
+        })
+    }
+
     /// The per-game fields of an evaluation JSON line.
     pub(crate) fn json(&self) -> Value {
         json!({
@@ -193,6 +272,17 @@ impl GameSummary {
             "ticks": self.ticks,
             "own": hero_json(&self.own),
             "enemy": hero_json(&self.enemy),
+            "leads": MILESTONE_MINUTES
+                .iter()
+                .zip(self.leads())
+                .map(|(minutes, lead)| {
+                    let lead = lead.map(|lead| {
+                        json!({"xp": lead.xp, "gold": lead.gold, "deaths": lead.deaths,
+                               "tower_bp": lead.tower_bp})
+                    });
+                    (format!("{minutes}m"), lead.unwrap_or(Value::Null))
+                })
+                .collect::<serde_json::Map<String, Value>>(),
         })
     }
 }
@@ -235,6 +325,15 @@ impl fmt::Display for GameSummary {
                 write!(formatter, " {prefix}_casts_{label}={casts}")?;
             }
         }
+        for (minutes, lead) in MILESTONE_MINUTES.iter().zip(self.leads()) {
+            if let Some(lead) = lead {
+                write!(
+                    formatter,
+                    " lead_{minutes}m_xp={} lead_{minutes}m_gold={} lead_{minutes}m_deaths={} lead_{minutes}m_tower_bp={}",
+                    lead.xp, lead.gold, lead.deaths, lead.tower_bp
+                )?;
+            }
+        }
         Ok(())
     }
 }
@@ -269,6 +368,17 @@ fn weakest_tower_fraction(tracker: &StateTracker, team: Team) -> f64 {
         .map(|unit| f64::from(unit.hp.max(0)) / f64::from(unit.max_hp))
         .fold(1.0, f64::min);
     (weakest * 10_000.0).round() / 10_000.0
+}
+
+#[allow(
+    clippy::float_arithmetic,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "a reported HP fraction in [0, 1]; never feeds back into play"
+)]
+fn basis_points(fraction: f64) -> u16 {
+    assert!((0.0..=1.0).contains(&fraction));
+    (fraction * 10_000.0).round() as u16
 }
 
 fn hero_json(hero: &HeroSummary) -> Value {

@@ -120,7 +120,15 @@ fn episode_summary_log_carries_every_evaluation_field() {
                 assert_eq!(fields[field.as_str()], count.to_string(), "{field}");
             }
         }
-        assert_eq!(fields.len(), 4 + 2 * 14);
+        let mut leads = 0;
+        for (minute, lead) in json["leads"].as_object().expect("leads") {
+            for (key, value) in lead.as_object().into_iter().flatten() {
+                let field = format!("lead_{minute}_{key}");
+                assert_eq!(fields[field.as_str()], value.to_string(), "{field}");
+                leads += 1;
+            }
+        }
+        assert_eq!(fields.len(), 4 + 2 * 14 + leads);
     }
 }
 
