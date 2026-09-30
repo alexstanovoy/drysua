@@ -6,14 +6,31 @@ import json
 from pathlib import Path
 import socket
 import signal
+import struct
 import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
 import play_match
-from play_admission import Endpoint, SeatRelay
+from play_admission import Endpoint, SeatRelay, varint
 from play_reward import RewardPipe, print_overview
-from test_release_wire import frame
+
+
+def integer(value):
+    """Encode one canonical postcard unsigned integer fixture."""
+    assert 0 <= value < 2**64
+    data = bytearray()
+    for _ in range(10):
+        data.append((value & 127) | (128 if value >= 128 else 0))
+        value >>= 7
+        if not value:
+            return bytes(data)
+    raise AssertionError("fixture integer exceeds u64")
+
+
+def frame(payload):
+    assert 0 < len(payload) <= 4 * 1024 * 1024
+    return struct.pack("<I", len(payload)) + payload
 
 
 def relay_fixture(test, slot=0, role="human", mode=0, pacer=None):
@@ -27,6 +44,16 @@ def relay_fixture(test, slot=0, role="human", mode=0, pacer=None):
             test.addCleanup(connection.close)
     relay.endpoints = [Endpoint(pair[0]) for pair in pairs]
     return relay, pairs
+
+
+class VarintTests(unittest.TestCase):
+    def test_varint_u64_maximum_is_valid_but_overflow_and_negative_offset_fail(self):
+        self.assertEqual(varint(integer(2**64 - 1), 0), (2**64 - 1, 10))
+        for payload, offset, message in ((b"\xff" * 9 + b"\x02", 0, "exceeds u64"),
+                                         (b"\x00", -1, "invalid postcard offset"),
+                                         (b"\x80\x00", 0, "noncanonical postcard integer")):
+            with self.assertRaisesRegex(ValueError, message):
+                varint(payload, offset)
 
 
 class OpponentTests(unittest.TestCase):

@@ -65,7 +65,7 @@ struct RewardObserverArgs {
 /// Options for one server match.
 #[derive(Args)]
 struct PlayArgs {
-    /// Override the repository-selected default with Neural, Hybrid, or Teacher.
+    /// Override the repository-selected default with Neural or Teacher.
     #[arg(long, value_enum)]
     policy: Option<PlayPolicy>,
     /// Server socket address.
@@ -77,14 +77,13 @@ struct PlayArgs {
     /// Leave after receiving this snapshot tick.
     #[arg(long, value_name = "TICKS")]
     limit: Option<u32>,
-    /// Explicit experiment weights; without --policy this selects Hybrid. Defaults need no path.
+    /// Explicit runtime weights; without --policy this selects Neural. Defaults need no path.
     #[arg(long, required_if_eq("policy", "neural"))]
     weights_directory: Option<std::path::PathBuf>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub(crate) enum PlayPolicy {
-    Hybrid,
     Neural,
     Teacher,
 }
@@ -256,14 +255,6 @@ fn run(arguments: Cli) -> std::io::Result<()> {
         eprintln!("deployment: repository-selected {policy:?}");
     }
     let outcome = match policy {
-        PlayPolicy::Hybrid => crate::play(
-            &play.addr,
-            &play.name,
-            play.limit,
-            weights_directory
-                .as_deref()
-                .unwrap_or(std::path::Path::new(".")),
-        )?,
         PlayPolicy::Neural => {
             let directory = weights_directory.as_deref().ok_or_else(|| {
                 std::io::Error::new(
@@ -319,7 +310,7 @@ fn resolve_play_deployment(
         return Ok((policy, play.weights_directory.clone()));
     }
     if play.weights_directory.is_some() {
-        return Ok((PlayPolicy::Hybrid, play.weights_directory.clone()));
+        return Ok((PlayPolicy::Neural, play.weights_directory.clone()));
     }
     crate::default_deployment::DEFAULT_DEPLOYMENT.resolve()
 }

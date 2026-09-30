@@ -20,7 +20,7 @@ Use `--human-side dire` for the other seat. `--bot-side` still selects the oppos
 human seat; specifying both requires opposite sides. Teacher is explicitly selected
 with `--policy teacher`, needs no model, and rejects `--weights-directory` rather
 than ignoring it. Without `--opponent`, the launcher still requires compatible
-explicit F22/M24 weights and runs **pure Neural**, never a Teacher fallback.
+explicit train-annealed runtime weights and runs **pure Neural**, never a Teacher fallback.
 
 **`--reward-report` uses native Lockstep, paced at a maximum of 30 ticks per second,
 not native Realtime.** Both ordinary clients still create their own ACKs. The shared

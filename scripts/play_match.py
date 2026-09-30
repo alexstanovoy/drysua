@@ -2,7 +2,6 @@
 
 import argparse
 from dataclasses import dataclass, field
-import hashlib
 import os
 from pathlib import Path
 import re
@@ -22,7 +21,6 @@ from play_reward import start_observers, pump_observers, finish_observers, print
 from play_pacing import ACK_TIMEOUT_TICKS
 
 
-ARTIFACT_LIMIT = 256 * 1024 * 1024
 BUILD_TIMEOUT = 1200
 LOG_LIMIT = 16 * 1024 * 1024
 MAX_CHILDREN = 7
@@ -187,24 +185,6 @@ def release_executables(root):
         if not executable_ready(executable):
             raise RuntimeError(f"release executable missing: {executable}; rerun without --no-build")
     return binaries
-
-
-def artifact_digest(path):
-    if not path.is_file() or path.is_symlink() or not 0 < path.stat().st_size <= ARTIFACT_LIMIT:
-        raise RuntimeError(f"review artifact missing, non-regular or outside 1..{ARTIFACT_LIMIT} bytes: {path}; "
-                           "populate the immutable review copy; no build or Teacher fallback")
-    digest, size = hashlib.sha256(), 0
-    with path.open("rb") as stream:
-        for _ in range(ARTIFACT_LIMIT // READ_CHUNK + 1):
-            data = stream.read(READ_CHUNK)
-            if not data:
-                assert 0 < size <= ARTIFACT_LIMIT
-                return digest.hexdigest()
-            size += len(data)
-            if size > ARTIFACT_LIMIT:
-                break
-            digest.update(data)
-    raise RuntimeError(f"review artifact grew beyond {ARTIFACT_LIMIT} bytes while hashing: {path}")
 
 
 def integer(value, maximum):

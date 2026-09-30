@@ -142,7 +142,7 @@ fn all_controllers_require_complete_ticks_with_or_without_a_live_hero() {
         (MapId(0), true),
         (MapId(1), true),
     ] {
-        for controller in 0..3 {
+        for controller in 0..2 {
             let mut wire = mock_wire();
             let ServerMsg::MatchStart { info } = &mut wire.messages[0] else {
                 panic!("match start");
@@ -159,7 +159,6 @@ fn all_controllers_require_complete_ticks_with_or_without_a_live_hero() {
             let seat = seated(TickMode::Lockstep);
             let error = match controller {
                 0 => crate::play_teacher_on(&mut wire, seat, None),
-                1 => crate::play_policy_on(&mut wire, seat, None, &model),
                 _ => crate::play_neural_on(&mut wire, seat, None, &model),
             }
             .expect_err("tick completion is mandatory");
@@ -182,12 +181,11 @@ fn teacher_tcp_cli_plays_map_one_without_weights() {
 #[cfg(feature = "builtin")]
 #[test]
 fn controllers_keep_cadence_and_teacher_learning_but_neural_continue_never_buys_or_learns() {
-    let stop = stop_policy();
     let continue_policy = biased_policy(ActionKind::Continue);
     for (map, limit) in [(MapId(0), 8), (MapId(1), 8), (MapId(1), 2)] {
         let messages = arena_messages(map, 70_009, limit);
         for mode in [TickMode::Lockstep, TickMode::Realtime] {
-            for controller in 0..3 {
+            for controller in 0..2 {
                 let mut wire = recording_wire(messages.clone());
                 let ServerMsg::MatchStart { info } = &mut wire.messages[0] else {
                     panic!("MatchStart first");
@@ -201,7 +199,6 @@ fn controllers_keep_cadence_and_teacher_learning_but_neural_continue_never_buys_
                 }
                 let outcome = match controller {
                     0 => crate::play_teacher_on(&mut wire, seated(mode), Some(limit)),
-                    1 => crate::play_policy_on(&mut wire, seated(mode), Some(limit), &stop),
                     _ => crate::play_neural_on(
                         &mut wire,
                         seated(mode),
@@ -211,19 +208,15 @@ fn controllers_keep_cadence_and_teacher_learning_but_neural_continue_never_buys_
                 }
                 .expect("pregame decisions");
                 assert_eq!(outcome.decisions, (limit - 2) / 3 + 1, "ticks 1, 4, 7");
-                assert_eq!(wire.orders.is_empty(), controller == 2);
-                assert_eq!(outcome.orders == 0, controller == 2);
+                assert_eq!(wire.orders.is_empty(), controller == 1);
+                assert_eq!(outcome.orders == 0, controller == 1);
                 assert_eq!(
                     wire.acknowledgements,
                     expected_acknowledgements(mode, limit)
                 );
-                if limit == 2 && controller != 2 {
+                if limit == 2 && controller == 0 {
                     assert_eq!(wire.orders.len(), 1);
-                    assert!(match wire.orders[0].1 {
-                        Order::Learn { .. } => controller == 0,
-                        Order::Move { .. } => controller == 1,
-                        _ => false,
-                    });
+                    assert!(matches!(wire.orders[0].1, Order::Learn { .. }));
                 }
             }
         }
@@ -462,25 +455,16 @@ fn tcp_cli_match(
 
 #[cfg(feature = "builtin")]
 #[test]
-fn deployment_and_neural_deduplicate_body_orders_but_resend_after_rejection_or_respawn() {
-    for (map, neural, reject, respawn_tick, limit) in [
-        (MapId(1), false, false, 4, 5),
-        (MapId(0), true, false, 7, 11),
-        (MapId(0), true, true, 7, 11),
-        (MapId(1), true, false, 7, 11),
-        (MapId(1), true, true, 7, 11),
+fn neural_deduplicates_body_orders_but_resends_after_rejection_or_respawn() {
+    for (map, reject, respawn_tick, limit) in [
+        (MapId(0), false, 7, 11),
+        (MapId(0), true, 7, 11),
+        (MapId(1), false, 7, 11),
+        (MapId(1), true, 7, 11),
     ] {
-        let (info, mut view) = if neural {
-            tactical_combat_fixture(map)
-        } else {
-            deployment_stop_fixture()
-        };
+        let (info, mut view) = tactical_combat_fixture(map);
         let mut messages = vec![ServerMsg::MatchStart { info }];
-        let ticks = if neural {
-            (1..=limit).collect::<Vec<_>>()
-        } else {
-            vec![1, 4, 5]
-        };
+        let ticks = (1..=limit).collect::<Vec<_>>();
         for tick in ticks.iter().copied() {
             view.tick = tick;
             if tick == respawn_tick {
@@ -501,12 +485,8 @@ fn deployment_and_neural_deduplicate_body_orders_but_resend_after_rejection_or_r
         let mut wire = recording_wire(messages);
         let model = stop_policy();
         let seat = seated(TickMode::Lockstep);
-        let outcome = if neural {
-            crate::play_neural_on(&mut wire, seat, Some(limit), &model)
-        } else {
-            crate::play_policy_on(&mut wire, seat, Some(limit), &model)
-        }
-        .expect("tracked deployment");
+        let outcome = crate::play_neural_on(&mut wire, seat, Some(limit), &model)
+            .expect("tracked deployment");
         assert_eq!(outcome.decisions, (limit - 2) / 3 + 1);
         assert_eq!(outcome.orders, if reject { 3 } else { 2 });
         assert_eq!(wire.orders.len(), outcome.orders as usize);
@@ -520,35 +500,6 @@ fn deployment_and_neural_deduplicate_body_orders_but_resend_after_rejection_or_r
                 }
             )));
     }
-}
-
-#[cfg(feature = "builtin")]
-fn deployment_stop_fixture() -> (MatchInfo, WorldView) {
-    // Map0 deployment delegates to Teacher; only Map1 uses the forced Stop model.
-    let (_, start) = crate::Arena::new(crate::ArenaConfig {
-        seats: 2,
-        map: MapId(1),
-        seed: 70_003,
-    })
-    .expect("deployment arena");
-    let mut info = start.messages[0]
-        .iter()
-        .find_map(|message| match message {
-            ServerMsg::MatchStart { info } => Some(info.clone()),
-            _ => None,
-        })
-        .expect("deployment match info");
-    info.pregame_ticks = 0;
-    let view = start.messages[0]
-        .iter()
-        .find_map(|message| match message {
-            ServerMsg::Snapshot { view } => Some(view.clone()),
-            _ => None,
-        })
-        .expect("deployment snapshot");
-    assert_eq!(info.map, MapId(1));
-    assert_eq!(view.tick, 1);
-    (info, view)
 }
 
 #[test]

@@ -17,7 +17,7 @@ The GUI is for the human to launch from a desktop; agent verification was headle
 
 ## Default Neural mode still fails closed without explicit weights
 
-The current reward7/F22/M24 terminal and victory-time change and explicit migration are documented in
+The current reward7 terminal and victory-time change is documented in
 [reward-rebalance.md](reward-rebalance.md). Win has terminal reward+0.2, Draw0,
 Loss and completed-task TimeCap-0.2. Dense terms are unchanged. Historical
 M19/M20/M21 models are not current-compatible without explicit initialization.
@@ -32,26 +32,26 @@ These are compatibility checks, not a trained-model release or win-rate result.
 From an authorized Linux X11/Xwayland desktop terminal:
 
 ```sh
-# Requires an externally supplied compatible model; none is selected by default.
+# Requires runtime weights exported by train-annealed; none is selected by default.
 /home/alexstanovoy/Workspace/bots/play.sh \
-  --weights-directory "/absolute/path/to/compatible M24 runtime weights"
+  --weights-directory "/absolute/path/to/train-annealed checkpoint directory"
 # Human Dire, pure Neural bot Radiant. Either side option derives the other.
 /home/alexstanovoy/Workspace/bots/play.sh \
-  --weights-directory "/absolute/path/to/compatible M24 runtime weights" \
+  --weights-directory "/absolute/path/to/train-annealed checkpoint directory" \
   --human-side dire --port 0 --seed 9000001 --no-build
 ```
 
-**No-argument play is not ready and fails closed.** No trained Map2 model has been
-supplied or promoted for this launcher. The old F12/M14 human-review checkpoint
-is incompatible with the current server/runtime. Supply `--weights-directory`
-containing compatible **A5/F22/M24/PPO37/rules32/reward7** `drysua.weights.safetensors`; do not relabel or
-copy old metadata to make a file pass. The launcher never creates, migrates,
-initializes, trains, promotes, or substitutes weights.
+**No-argument play fails closed.** No trained Map2 model is selected by default.
+Supply `--weights-directory` containing a `drysua.weights.safetensors` exported by
+this build's `train-annealed` (any checkpoint directory or history copy). Weights
+from older builds are rejected by the Rust loader; to play them, check out the
+commit that produced them. The launcher never creates, migrates, initializes,
+trains, promotes, or substitutes weights.
 
 With explicit weights, the default sides remain human Radiant / pure Neural bot
 Dire. Both side options can be explicit; equal sides are rejected before startup.
 With the default `--opponent neural`, the bot receives **`--policy neural`**, never
-Hybrid or a Teacher fallback. Non-report play retains native Realtime.
+a Teacher fallback. Non-report play retains native Realtime.
 The core binary's repository-selected default remains **Teacher**, unchanged in
 `src/default_deployment.rs`; that is a separate CLI default, not launcher behavior.
 
@@ -63,101 +63,11 @@ the X11 client. A nonempty `DISPLAY` does not establish X authorization or prove
 OpenGL works. Python 3.10+ is required; Cargo/Rust is needed unless `--no-build`
 is used. No packages are downloaded or installed by the Python launcher.
 
-## Current weights compatibility preflight
+## Weights preflight
 
-`scripts/play_weights.py` performs standard-library, metadata-only preflight.
-It opens the weights file read-only with no final symlink following and nonblocking
-open (so a FIFO cannot hang startup), requires a regular file of at most **256 MiB**,
-and reads only the eight-byte Safetensors length prefix and at most **64 KiB** of
-header. Invalid/truncated JSON, duplicate keys, non-string metadata, missing or
-extra metadata keys, and incompatible identities fail before children or logs.
-
-Exactly nine metadata keys are required; numeric values are decimal strings:
-
-| Key | Required value |
-| --- | --- |
-| `action_schema_hash` | `10658390830565586343` (A5) |
-| `feature_schema_hash` | `10552563335950731440` (F22) |
-| `model_schema_hash` | `12076707506725412686` (M24) |
-| `ppo_schema_version` | `37` |
-| `ppo_schema_hash` | `12793043235719775693` |
-| `ppo_rules_audit_version` | `32` |
-| `map2_reward_schema_version` | `7` |
-| `map2_reward_schema_hash` | `7274660837025042530` |
-| `map2_reward_schema_descriptor` | Full current descriptor matching that FNV-1a hash |
-
-M24 retains A5 navigation/action legality, wait/refund and progress-debt rules.
-Reward7 retains reward5 event/potential coefficients and one first-wave positioning
-cost, not a perpetual location penalty. F22 preserves all92 global positions including
-Tower remaining90/opening pending91: global92, unit84,62 named tensors,
-1,700,020 F32 parameters. See the exact coefficient/bound table in reward-rebalance.md.
-
-Inactive ticks, including death, add one debt tick up to2700. Useful activity
-refreshes a30-tick lease including the current tick; active ticks repay3 debt.
-At2700, a0.02 base cost latches until debt reaches zero; subsequent inactive
-capped ticks cost0.000002. No stagnation refund is paid. A positive-timer own
-effect3 qualifies directly even with full pools or lingering outside a fountain.
-Any own purchase still fully refunds the open v2 fountain wait, but grants only
-a partial generic activity lease, not a generic debt reset. No strategy mask,
-Teacher override or extra anti-abuse condition is added.
-
-M17/M18/M19/M20/M21 runtime and old checkpoint resumes are incompatible; metadata is not
-silently relabelled. No M18 weights were generated or added to the source
-whitelist. No-argument play still fails with the missing-model prompt, and
-never substitutes root M17 weights or a Teacher.
-
-Explicit M17-to-current-M24 **initialization only** is available through
-`TrainingArtifact::initialize_selected_m17_for_map2_wait(directory, seed, device)`.
-The additional exact M19/u162 parameter-only initializer is documented in
-[reward-rebalance.md](reward-rebalance.md); it does not resume or relabel the old model.
-Only these full-file SHA256 sources and their exact original nine-key reward1
-metadata are accepted:
-
-- Initial: `05e78663dd45ac23ad6c0242a69d8b8e45c163f7861c59154e3f3fd81de9ab1f`
-- Recovery004: `107e19e61794c457ce8ec6adc2b3e66ccce08ee5b6544cb2005964f3e7dfedc8`
-
-Seven positive-zero rows are inserted at row85 of `trunk.0.weight` (2589x512 to
-2596x512); every source parameter bit is retained. This creates fresh model and
-optimizer/progress ancestry, not runtime/resume compatibility, equivalent
-gameplay, or a qualified release. The launcher never calls this API.
-
-An explicitly selected M16 source may be used only through
-`TrainingArtifact::initialize_selected_m16_for_map2_navigation(directory, seed, device)`.
-The exact permitted full-file SHA-256 values are:
-
-- Initial: `1739d280cb6c3fbd0df71ffe8c4a129ed3e25a0ed294b0b57931c4891c566bf4`
-- Advantage: `fdd4d3f2a85a64d9b4d162f1607a94a4aaba8a8e3136e51dab2152181cdf63b7`
-
-The API also checks the complete old nine-key tuple, tensor contract and finite
-values before constructing a model. Source reward1 metadata remains frozen;
-the same five wait/progress-input rows are now zero-padded. All old parameter bits are
-copied; no optimizer,
-progress, RNG history, samples, league history or qualification is imported.
-Retain its `INITIALIZATION_ONLY` provenance with `GAMEPLAY_EQUIVALENCE=false` and
-create fresh training state. Do not replace historical metadata. The existing
-explicit M14 padding initializer remains initialization-only into the current
-contract, not a way to reproduce old gameplay under new masks.
-
-The ignored, manual utility
-`tests::navigation_initialization_utility::initialize_pinned_m16_navigation_artifact_only`
-can write and reload a **new** runtime/checkpoint pair without training. It requires
-`DRYSUA_SELECTED_M16_SOURCE`, `DRYSUA_NAVIGATION_INITIALIZATION_OUTPUT` (nonexistent,
-outside the source directory), `DRYSUA_NAVIGATION_INITIALIZATION_SEED`,
-`DRYSUA_INITIALIZATION_GIT_COMMIT`, and `DRYSUA_INITIALIZATION_SIMULATOR_COMMIT`.
-Run it only under the [resource guard](experiment-safety.md), with all needed
-environment assignments **inside** the guarded command. CUDA-enabled checks here
-use `env NVCC_CCBIN=/usr/bin/g++-15 cargo ...`; no unsupported-compiler override.
-The utility is not run by ordinary tests and is not used by the play launcher.
-
-Tests recompute the schema hashes from the Rust descriptors and linked identities,
-and check versions and the Rust loader's nine-key set. FNV is a compatibility
-check, **not artifact authentication or qualification**. Preflight neither hashes
-the tensor body nor proves tensor validity. The current Rust loader remains
-authoritative for exact metadata/descriptor equality, tensor names, dimensions,
-layout, dtype, and finite values **before the bot connects or sends Hello**.
-A metadata-valid but invalid tensor file can therefore start build/server/client
-children, then fail in the bot; cleanup still runs. Use a trusted weights directory
-and do not replace files during launch.
+The launcher only checks that `drysua.weights.safetensors` is a regular,
+non-symlink file before building or starting children. The Rust loader validates
+the exact schema metadata, tensor name, shape, dtype and finiteness.
 
 ## Build and launch contract
 

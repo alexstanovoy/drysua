@@ -70,10 +70,8 @@
    запуском убедиться, что собственные процессы и сервисы завершились.
 
 Исторические watchdog/runner в `artifacts/` остаются свидетельствами старого
-backend, а не импортируемыми зависимостями нового. Docker-native guard находится
-в `docker/runtime_guard.py`; deployment-контракт и **ещё не выполненные** проверки
-описаны в [docker.md](docker.md). Его целевые тесты написаны, но не запускались
-при активном обучении; нельзя называть этот guard проверенным в runtime.
+backend, а не импортируемыми зависимостями нового. Кампании запускает
+`scripts/train_runner.py` (см. [training_controller.md](training_controller.md)).
 
 Сохраняются **оба существующих shared flock inode**: корневой `heavy.lock` и
 `artifacts/temp/map2-learning-20260911/credit-095-002-resume-001-journal/heavy.lock`.

@@ -184,6 +184,7 @@ impl Teacher {
 
     /// Selects channel, sustain, bounded finishing, navigation cancellation, or retreat work.
     /// Stages bookkeeping for `note_sent`, just like `decide`.
+    #[cfg(test)]
     pub fn safety_action(
         &mut self,
         tracker: &StateTracker,
@@ -195,16 +196,6 @@ impl Teacher {
             self.stage_choice(tracker, space, choice)
                 .expect("mandatory Teacher action is legal"),
         )
-    }
-
-    /// Selects a high-confidence seat-visible action that deployment must not miss.
-    pub fn deployment_action(
-        &mut self,
-        tracker: &StateTracker,
-        space: &ActionSpace,
-    ) -> Option<StructuredAction> {
-        self.safety_action(tracker, space)
-            .or_else(|| self.attack_structure(tracker, space))
     }
 
     fn prepare_decision(&mut self, tracker: &StateTracker) {

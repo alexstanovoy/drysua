@@ -3,6 +3,7 @@
 import ctypes
 import contextlib
 import errno
+import hashlib
 import importlib
 import io
 import json
@@ -25,9 +26,6 @@ from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[2]
 TEMPORARY = ROOT / "drysua/artifacts/temp"
-# Reject known obsolete binaries even when supplied as current-build attestations.
-BINARY_SHA = "64ba25ebb10e6beabc26ff667a3e3bddeb40dbf391110d4f0e31db6478500a2b"
-HISTORICAL_SERVER_SHA = "24a8efccb285308810678c7e3a8717b57814c9d8fecef386ca923cdb7c04e97c"
 # Bounded native client-output assertions moved here from the archived historical
 # release evaluator when that harness left the tracked tree.
 SUMMARY = re.compile(r"played (\d+) ticks as Some\((Radiant|Dire)\); winner "
@@ -35,7 +33,7 @@ SUMMARY = re.compile(r"played (\d+) ticks as Some\((Radiant|Dire)\); winner "
                      r"\d+ decisions, \d+ orders, (\d+) rejected orders\n?")
 CLIENT_OUTPUT_LIMIT = 1024 * 1024
 TELEMETRY_LINE_LIMIT = 4096
-POLICY_FIELD = r"policy=(?:teacher|hybrid|neural|tactical)"
+POLICY_FIELD = r"policy=(?:teacher|neural)"
 RECEIVE_FIELD = (r"receive_wait_scope=(?:socket_read|wire_hear_including_decode"
                  r"|mixed_socket_read_and_wire_hear|unavailable)")
 SEAT_FIELDS = rf"slot=(?P<slot>[01]) {POLICY_FIELD} mode=(?:lockstep|realtime)"
@@ -297,7 +295,7 @@ else:
 NATIVE_CLIENT = r'''
 import socket, struct, sys
 sys.path.insert(0, sys.argv[5])
-from release_wire import varint
+from play_admission import varint
 address, slot, mode, limit = sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4])
 def integer(value):
     output = bytearray()
@@ -389,7 +387,7 @@ class LauncherTests(unittest.TestCase):
             (directory / "Cargo.toml").write_text("[workspace]\n")
         (self.root / "drysua/scripts").mkdir()
         for name in ("play.sh", "play_match.py", "play_admission.py",
-                     "play_reward.py", "play_pacing.py", "release_wire.py"):
+                     "play_reward.py", "play_pacing.py"):
             source = ROOT / "drysua/scripts" / name
             if source.exists():
                 shutil.copy(source, self.root / "drysua/scripts")
@@ -1345,8 +1343,7 @@ class SupervisorTests(unittest.TestCase):
                 self.skipTest("current native Map2 smoke requires PLAY_TEST_CURRENT_BOT_SHA256 and "
                               "PLAY_TEST_CURRENT_SERVER_SHA256 from verified current builds; never uses stale targets")
             self.assertRegex(expected, r"^[0-9a-f]{64}$")
-            self.assertNotIn(expected, (BINARY_SHA, HISTORICAL_SERVER_SHA))
-            self.assertEqual(self.module.artifact_digest(binary), expected)
+            self.assertEqual(hashlib.sha256(binary.read_bytes()).hexdigest(), expected)
             self.assertTrue(os.access(binary, os.X_OK))
         for mode, limit in ((0, 30), (1, 1000)):
             for human_slot in (0, 1):

@@ -7,7 +7,6 @@ import socket
 import struct
 import time
 
-from release_wire import varint
 from play_pacing import PacedClock
 
 
@@ -18,6 +17,26 @@ FRAME_LIMIT = 4 * 1024 * 1024
 QUEUE_LIMIT = FRAME_LIMIT + 4
 READ_CHUNK = 65536
 FRAME_COUNT_LIMIT = 1_000_000
+
+
+def varint(payload, offset, bits=64):
+    """Read one canonical postcard unsigned integer (not a raw u8)."""
+    assert bits in (16, 32, 64)
+    if not 0 <= offset <= len(payload):
+        raise ValueError("invalid postcard offset")
+    value = 0
+    for index in range(10):
+        if offset + index >= len(payload):
+            raise ValueError("truncated postcard integer")
+        byte = payload[offset + index]
+        value |= (byte & 127) << (7 * index)
+        if byte < 128:
+            if value >= 1 << bits:
+                raise ValueError(f"postcard integer exceeds u{bits}")
+            if index and byte == 0:
+                raise ValueError("noncanonical postcard integer")
+            return value, offset + index + 1
+    raise ValueError("oversized postcard integer")
 SERVER_BYTE_LIMIT = 2 * 1024**3
 CLIENT_BYTE_LIMIT = 64 * 1024**2
 assert READ_CHUNK < FRAME_LIMIT < SERVER_BYTE_LIMIT

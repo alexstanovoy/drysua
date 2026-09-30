@@ -1,14 +1,14 @@
 #[test]
 fn public_cli_accepts_play_training_and_initialization_contracts() {
-    use crate::cli::PlayPolicy::{Hybrid, Neural, Teacher};
+    use crate::cli::PlayPolicy::{Neural, Teacher};
     for (arguments, expected) in [
         ("drysua", Teacher),
         ("drysua play", Teacher),
         ("drysua --policy teacher", Teacher),
-        ("drysua --weights-directory explicit-experiment", Hybrid),
+        ("drysua --weights-directory explicit-experiment", Neural),
         (
             "drysua play --weights-directory explicit-experiment",
-            Hybrid,
+            Neural,
         ),
         (
             "drysua play --policy neural --weights-directory artifacts/test",
@@ -60,30 +60,23 @@ fn public_cli_rejects_invalid_policies_and_conflicting_training_sources() {
 
 #[test]
 fn selected_neural_weights_resolve_from_the_repository_not_the_working_directory() {
-    use crate::cli::PlayPolicy::{Hybrid, Neural};
-    for policy in [Hybrid, Neural] {
-        let selection = crate::default_deployment::DefaultDeployment {
-            policy,
-            weights_directory: Some("artifacts/v9.9.9"),
-        };
-        assert_eq!(
-            selection.resolve().unwrap(),
-            (
-                policy,
-                Some(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("artifacts/v9.9.9"))
-            )
-        );
-    }
+    let selection = crate::default_deployment::DefaultDeployment {
+        policy: crate::cli::PlayPolicy::Neural,
+        weights_directory: Some("artifacts/v9.9.9"),
+    };
+    assert_eq!(
+        selection.resolve().unwrap(),
+        (
+            crate::cli::PlayPolicy::Neural,
+            Some(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("artifacts/v9.9.9"))
+        )
+    );
 }
 
 #[test]
 fn selected_deployment_rejects_policy_and_weight_mismatches() {
-    use crate::cli::PlayPolicy::{Hybrid, Neural, Teacher};
-    for (policy, weights_directory) in [
-        (Teacher, Some("artifacts/v9.9.9")),
-        (Neural, None),
-        (Hybrid, None),
-    ] {
+    use crate::cli::PlayPolicy::{Neural, Teacher};
+    for (policy, weights_directory) in [(Teacher, Some("artifacts/v9.9.9")), (Neural, None)] {
         let error = crate::default_deployment::DefaultDeployment {
             policy,
             weights_directory,

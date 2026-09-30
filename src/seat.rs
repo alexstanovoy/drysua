@@ -53,7 +53,6 @@ struct LivePolicy {
 
 #[derive(Clone, Copy)]
 enum LiveController<'model> {
-    Hybrid(&'model PolicyModel),
     Neural(&'model PolicyModel),
     Teacher,
 }
@@ -61,7 +60,6 @@ enum LiveController<'model> {
 impl LiveController<'_> {
     fn label(self) -> &'static str {
         match self {
-            Self::Hybrid(_) => "hybrid",
             Self::Neural(_) => "neural",
             Self::Teacher => "teacher",
         }
@@ -81,30 +79,6 @@ pub fn play_teacher_on(
     limit: Option<u32>,
 ) -> std::io::Result<Outcome> {
     play_controller_on(wire, seated, limit, LiveController::Teacher)
-}
-
-/// Loads deployment weights, connects, and runs greedy policy inference for one match.
-pub fn play(
-    address: &str,
-    name: &str,
-    limit: Option<u32>,
-    weights_directory: &Path,
-) -> std::io::Result<Outcome> {
-    let model = PolicyModel::fresh(0).map_err(std::io::Error::other)?;
-    TrainingArtifact::load_runtime_weights(&model, weights_directory)
-        .map_err(std::io::Error::other)?;
-    let (mut link, seated) = Link::join(address, name)?;
-    play_policy_on(&mut link, seated, limit, &model)
-}
-
-/// Runs greedy model inference on an assigned match connection.
-pub fn play_policy_on(
-    wire: &mut impl Wire,
-    seated: Seated,
-    limit: Option<u32>,
-    model: &PolicyModel,
-) -> std::io::Result<Outcome> {
-    play_controller_on(wire, seated, limit, LiveController::Hybrid(model))
 }
 
 /// Loads required runtime weights before connecting; never constructs or invokes Teacher.
@@ -658,12 +632,7 @@ impl LivePolicy {
                 assert!(self.teacher.is_none());
                 model
             }
-            LiveController::Hybrid(model)
-                if self.tracker.metadata().map != bota_proto::MapId(0) =>
-            {
-                model
-            }
-            LiveController::Hybrid(_) | LiveController::Teacher => {
+            LiveController::Teacher => {
                 return self
                     .teacher
                     .as_mut()
@@ -684,15 +653,10 @@ impl LivePolicy {
                 &mut frame,
             )
             .map_err(std::io::Error::other)?;
-        let proposed = model
+        let action = model
             .choose(&frame, &space)
             .map_err(std::io::Error::other)?
             .action;
-        let action = self
-            .teacher
-            .as_mut()
-            .and_then(|teacher| teacher.deployment_action(&self.tracker, &space))
-            .unwrap_or(proposed);
         Ok((action, space))
     }
 

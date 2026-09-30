@@ -7,8 +7,7 @@ import unittest
 from play_admission import Admission
 from play_match import parse_arguments, transport_arguments
 from play_pacing import PacedClock, PERIOD, STALL_TIMEOUT, ack_tick
-from test_play_reward import relay_fixture
-from test_release_wire import frame, integer
+from test_play_reward import frame, integer, relay_fixture
 
 
 class FakeClock:
