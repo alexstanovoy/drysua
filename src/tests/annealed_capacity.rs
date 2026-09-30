@@ -1,143 +1,30 @@
-//! Capacity is proved by real M40 updates plus bounded failure oracles.
+//! Counter budgets and run-scope dimensions, proved before and after a real update.
 
 use super::*;
-use crate::{CompletedTrainingEpisodes, TrainingGameOutcome};
-
-#[test]
-fn partitions_admit_forty_games_and_reject_overflow() {
-    for parallel in [40, 8, 20] {
-        let mut config = expanded_settings(2);
-        config.parallel_worlds = parallel;
-        let validated = validate_annealed(&config, harness()).expect("candidate");
-        assert_eq!(
-            validated.environments * validated.rollout_decisions,
-            40 * 1163
-        );
-    }
-    let mut invalid = expanded_settings(2);
-    invalid.parallel_worlds = 65;
-    assert_eq!(
-        validate_annealed(&invalid, harness()),
-        Err(PpoError::InvalidConfig("annealed parallel worlds"))
-    );
-    invalid.parallel_worlds = 40;
-    invalid.games_per_update = 42;
-    assert_eq!(
-        validate_annealed(&invalid, harness()),
-        Err(PpoError::InvalidConfig(
-            "annealed games per update must be even and within 2..=40"
-        ))
-    );
-}
-
-#[test]
-fn m40_sequential_and_b40_updates_resume_model_optimizer_rng_and_generation_bytes() {
-    for (parallel, updates, stop, interrupt) in [(8, 6, 5, Some(24)), (40, 2, 1, None)] {
-        let baseline = test_directory("capacity-baseline");
-        let resumed = test_directory("capacity-resumed");
-        let mut config = expanded_settings(updates);
-        config.parallel_worlds = parallel;
-        let expected = run(config.clone(), &baseline, false).expect("complete M40 updates");
-        assert_eq!(expected.games, updates * 40);
-        assert_eq!(expected.completed_updates, updates);
-        assert_eq!(expected.generations, (updates * 40).div_ceil(200));
-        assert!((updates * 40..=updates * 80).contains(&expected.rollout_samples));
-        assert!((1..=updates).contains(&expected.optimizer_step));
-        let stopped = AnnealedHarness {
-            stop_after: Some(stop),
-            ..harness()
-        };
-        let first = run_with(config.clone(), stopped, &resumed, false).expect("M40 boundary");
-        assert_eq!(first.games, stop * 40);
-        assert_eq!(first.completed_updates, stop);
-        if parallel == 8 {
-            assert_expanded_resume_rejects_changed_dimensions(&config, &resumed);
-        }
-        if let Some(games) = interrupt {
-            let before = checkpoint_digests(&resumed);
-            let interrupted = AnnealedHarness {
-                stop_after_games: Some(games),
-                ..harness()
-            };
-            let error = run_with(config.clone(), interrupted, &resumed, true)
-                .expect_err("uncommitted generation");
-            assert_eq!(
-                error.to_string(),
-                "invalid PPO transition: annealed invocation stopped mid-update"
-            );
-            assert_eq!(checkpoint_digests(&resumed), before);
-            assert_eq!(generation_files(&resumed).len(), 2);
-        }
-        let actual = run(config, &resumed, true).expect("replay and resume");
-        assert_eq!(actual.completed_updates, updates);
-        assert_eq!(actual.games, expected.games);
-        assert_eq!(actual.rollout_samples, expected.rollout_samples);
-        assert_eq!(actual.optimizer_step, expected.optimizer_step);
-        assert_trajectory_equal(&baseline, &resumed);
-        let files = generation_files(&resumed);
-        if updates == 6 {
-            assert!(files[0].1.contains("\"applied_games\":200"));
-            assert!(files[1].1.contains("\"applied_games\":40"));
-        }
-        std::fs::remove_dir_all(baseline).expect("cleanup baseline");
-        std::fs::remove_dir_all(resumed).expect("cleanup resumed");
-    }
-}
-
-#[test]
-fn expanded_jobs_enforce_capacity_and_partition_boundaries() {
-    let mut maximum = expanded_settings(2);
-    maximum.parallel_worlds = 40;
-    let validated = validate_annealed(&maximum, AnnealedHarness::default()).expect("M40 B40");
-    assert_eq!(validated.environments * validated.rollout_decisions, 46_520);
-    let directory = test_directory("invalid-capacity");
-    for (games, parallel, generation, message) in [
-        (
-            42,
-            40,
-            200,
-            "annealed games per update must be even and within 2..=40",
-        ),
-        (40, 65, 200, "annealed parallel worlds"),
-        (
-            40,
-            6,
-            200,
-            "annealed parallel worlds must divide games per update",
-        ),
-        (
-            40,
-            8,
-            202,
-            "annealed games per generation must be positive and divisible by parallel worlds",
-        ),
-    ] {
-        let mut invalid = maximum.clone();
-        invalid.games_per_update = games;
-        invalid.ppo.environments = games;
-        invalid.parallel_worlds = parallel;
-        invalid.games_per_generation = generation;
-        assert_eq!(
-            run(invalid, &directory, false).expect_err("invalid job"),
-            PpoError::InvalidConfig(message)
-        );
-        assert_eq!(std::fs::read_dir(&directory).expect("directory").count(), 0);
-    }
-    std::fs::remove_dir_all(directory).expect("cleanup");
-}
 
 #[test]
 fn shuffle_sample_and_optimizer_preflight_accept_max_updates_and_reject_max_plus_one() {
-    for (games, epochs, minibatch, per_update, field) in [
-        (40, 4, 80, 4 * (46_520 - 1), "annealed shuffle RNG counter"),
-        (40, 1, 80, 46_520, "annealed sample counter"),
-        (40, 2, 1, 2 * 46_520, "annealed optimizer counter"),
+    let capacity = |config: &AnnealedJobConfig| config.ppo.rollout_capacity(config.slots) as u64;
+    for (epochs, minibatch, field) in [
+        (4, 2, "annealed shuffle RNG counter"),
+        (1, 2, "annealed sample counter"),
+        (2, 1, "annealed optimizer counter"),
     ] {
-        let mut config = expanded_settings(MAX_TRAINING_COUNTER / per_update);
-        config.games_per_update = games;
-        config.ppo.environments = games;
+        let mut config = settings(9001, 1);
         config.ppo.epochs = epochs;
         config.ppo.minibatch = minibatch;
+        let per_update = match field {
+            "annealed shuffle RNG counter" => (capacity(&config) - 1) * epochs as u64,
+            "annealed sample counter" => capacity(&config),
+            _ => capacity(&config) * epochs as u64,
+        };
+        let limit = if field == "annealed optimizer counter" {
+            MODEL_MAX_OPTIMIZER_STEP
+        } else {
+            MAX_TRAINING_COUNTER
+        };
+        config.updates = limit / per_update;
+        config.zero_updates = 0;
         assert_eq!(
             validate_annealed(&config, harness()).expect("maximum updates"),
             config.ppo
@@ -147,89 +34,50 @@ fn shuffle_sample_and_optimizer_preflight_accept_max_updates_and_reject_max_plus
             validate_annealed(&config, harness()),
             Err(PpoError::InvalidConfig(field))
         );
-        assert_eq!(
-            validate_counter_budget(u64::MAX, 2, MAX_TRAINING_COUNTER, field),
-            Err(PpoError::InvalidConfig(field))
-        );
     }
+    assert_eq!(
+        validate_counter_budget(u64::MAX, 2, MAX_TRAINING_COUNTER, "annealed sample counter"),
+        Err(PpoError::InvalidConfig("annealed sample counter"))
+    );
 }
 
 #[test]
-fn completed_episode_capacity_rejects_overflow_atomically() {
-    let mut completed = CompletedTrainingEpisodes::default();
-    completed
-        .record(crate::MAP2_TICK_CAP, 39, TrainingGameOutcome::TimeCap)
-        .expect("last valid tick and stream");
-    let before = completed;
-    assert_eq!(completed.ordered_outcomes(), [TrainingGameOutcome::TimeCap]);
-    assert_eq!(
-        completed.record(1, 40, TrainingGameOutcome::Win),
-        Err(PpoError::InvalidTransition(
-            "completed episode tick or stream"
-        ))
-    );
-    assert_eq!(completed, before);
-}
-
-fn expanded_settings(updates: u64) -> AnnealedJobConfig {
-    let mut config = crate::cli::legacy_fixed_annealed_settings_for_test(&[
-        "--updates",
-        "6",
-        "--games",
-        "40",
-        "--parallel",
-        "8",
-        "--actor-pipeline-groups",
-        "1",
-        "--training-microbatch",
-        "64",
-        "--reuse-actor-values=false",
-        "--generation-games",
-        "200",
-        "--epochs",
-        "1",
-        "--minibatch",
-        "80",
-        "--zero-updates",
-        "0",
-        "--seed",
-        "9001",
-    ])
-    .expect("M40 CLI settings");
-    config.updates = updates;
-    config.checkpoint_cadence = crate::TrainingCheckpointCadence::Updates(1);
-    config
-}
-
-fn assert_expanded_resume_rejects_changed_dimensions(config: &AnnealedJobConfig, directory: &Path) {
-    let before = checkpoint_digests(directory);
-    for (games, parallel, generation, message) in [
-        (32, 8, 200, "--games: recorded 40, requested 32"),
-        (40, 4, 200, "--parallel: recorded 8, requested 4"),
-        (
-            40,
-            8,
-            400,
-            "--generation-games: recorded 200, requested 400",
-        ),
-    ] {
-        let mut changed = config.clone();
-        changed.games_per_update = games;
-        changed.ppo.environments = games;
-        changed.parallel_worlds = parallel;
-        changed.games_per_generation = generation;
-        let error = run(changed, directory, true).expect_err("changed M/B/K");
-        assert_eq!(
-            error.to_string(),
-            format!("checkpoint scope mismatch: {message}")
-        );
-        assert_eq!(checkpoint_digests(directory), before);
-    }
+fn resume_rejects_changed_collection_dimensions_without_committing() {
+    let directory = test_directory("capacity-dimensions");
+    let config = settings(9002, 2);
+    let first = run_with(
+        config.clone(),
+        AnnealedHarness {
+            stop_after: Some(1),
+            ..harness()
+        },
+        &directory,
+        false,
+    )
+    .expect("first update");
+    assert_eq!(first.completed_updates, 1);
+    let before = checkpoint_digests(&directory);
     type ConfigChange = fn(&mut AnnealedJobConfig);
-    let changes: [(ConfigChange, &str); 3] = [
+    let changes: [(ConfigChange, &str); 7] = [
+        (
+            |config| config.slots = 4,
+            "--slots: recorded 2, requested 4",
+        ),
+        (
+            |config| config.lanes = 1,
+            "--lanes: recorded 2, requested 1",
+        ),
+        (
+            |config| config.ppo.samples_per_update = 8,
+            "--samples-per-update: recorded 6, requested 8",
+        ),
+        (
+            |config| config.generation_updates = 2,
+            "--generation-updates: recorded 1, requested 2",
+        ),
         (
             |config| config.updates += 1,
-            "--updates: recorded 6, requested 7",
+            "--updates: recorded 2, requested 3",
         ),
         (|config| config.seed += 1, "compatibility scope"),
         (
@@ -240,8 +88,18 @@ fn assert_expanded_resume_rejects_changed_dimensions(config: &AnnealedJobConfig,
     for (change, message) in changes {
         let mut changed = config.clone();
         change(&mut changed);
-        let error = run(changed, directory, true).expect_err("changed training identity");
+        let error = run(changed, &directory, true).expect_err("changed training identity");
         assert!(error.to_string().contains(message), "{error}");
-        assert_eq!(checkpoint_digests(directory), before);
+        assert_eq!(checkpoint_digests(&directory), before);
     }
+    // Simulation threads never change results, so they are not part of the scope.
+    let mut threads = config;
+    threads.simulation_threads = 1;
+    assert_eq!(
+        run(threads, &directory, true)
+            .expect("any thread count resumes")
+            .completed_updates,
+        2
+    );
+    std::fs::remove_dir_all(directory).expect("cleanup");
 }

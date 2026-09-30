@@ -12,11 +12,13 @@ use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use candle_core::{DType, Device, Tensor, Var};
 
 mod host_folding;
+mod rows;
 mod sampling;
 mod side_actors;
+pub use rows::{ENCODER_ROW_ELEMENTS, EncoderRow};
 #[cfg(test)]
 pub(crate) use side_actors::take_encoder_forwards_for_test;
-use side_actors::{ActorHead, ActorRouting};
+use side_actors::{ActorHead, ActorRouting, QueuedPair, StageRequest, StageValues};
 #[cfg(test)]
 #[path = "tests/model_side_actors.rs"]
 mod side_actor_tests;
@@ -53,6 +55,9 @@ pub const MODEL_MAX_BATCH: usize = 8_192;
 pub const MODEL_EVALUATION_MICROBATCH: usize = 64;
 /// Maximum frame count in one autograd-preserving tensor forward pass.
 pub const MODEL_TRAINING_BATCH: usize = 64;
+/// Maximum rows in one sampling or greedy selection call.
+pub const MODEL_SAMPLING_BATCH: usize = 128;
+const _: () = assert!(MODEL_SAMPLING_BATCH <= MODEL_PPO_MAX_MICROBATCH);
 /// Private PPO tensor ceiling; public training forward and actor APIs remain bounded at 64.
 pub const MODEL_PPO_MAX_MICROBATCH: usize = 256;
 /// Conservative per-row admission reserve for autograd activations and backward temporaries.
@@ -1484,28 +1489,8 @@ impl PolicyModel {
     ) -> Result<Vec<PolicyOutput>, ModelError> {
         let routing = ActorRouting::new(frames, self.tensor_device(), false)?;
         let state = self.forward_frames(frames)?;
-        let values = self
-            .value
-            .forward(&state.trunk)?
-            .flatten_all()?
-            .to_vec1::<f32>()?;
-        validate_value_rows(&values, batch_offset)?;
-        let kinds = routing
-            .forward(self, ActorHead::Kind, &state.trunk)
-            .map_err(|error| match error {
-                ModelError::NonFiniteOutput {
-                    field,
-                    batch,
-                    index,
-                } => ModelError::NonFiniteOutput {
-                    field,
-                    batch: batch_offset + batch,
-                    index,
-                },
-                error => error,
-            })?
-            .to_vec2::<f32>()?;
-        collect_outputs(values, kinds, batch_offset)
+        let base = self.base_logits(&state, &routing, batch_offset)?;
+        collect_outputs(base.value, base.kind, batch_offset)
     }
 
     /// Selects one greedy legal structured action and returns its state value.
@@ -1553,16 +1538,19 @@ impl PolicyModel {
         Ok(PolicyChoice { action, value })
     }
 
-    /// Selects at most [`MODEL_TRAINING_BATCH`] greedy legal actions in input order.
+    /// Selects at most [`MODEL_SAMPLING_BATCH`] greedy legal actions in input order.
     pub fn choose_batch(
         &self,
         frames: &[FeatureFrame],
         action_spaces: &[ActionSpace],
     ) -> Result<Vec<PolicyChoice>, ModelError> {
         validate_policy_batch(frames, action_spaces)?;
+        let rows = packed_rows(frames)?;
+        let rows = rows.iter().collect::<Vec<_>>();
+        let spaces = action_spaces.iter().collect::<Vec<_>>();
         let _guard = self.read_parameter_lock()?;
         Ok(self
-            .selection_batch_locked(frames, action_spaces, None)?
+            .selection_rows_locked(&rows, &spaces, None)?
             .into_iter()
             .map(|choice| PolicyChoice {
                 action: choice.action,
@@ -1617,7 +1605,7 @@ impl PolicyModel {
         })
     }
 
-    /// Samples at most [`MODEL_TRAINING_BATCH`] rows with one transactional RNG per row.
+    /// Samples at most [`MODEL_SAMPLING_BATCH`] rows with one transactional RNG per row.
     pub fn sample_batch(
         &self,
         frames: &[FeatureFrame],
@@ -1626,40 +1614,83 @@ impl PolicyModel {
     ) -> Result<Vec<PpoPolicyChoice>, ModelError> {
         validate_policy_batch(frames, action_spaces)?;
         validate_sampling_rng_count(frames.len(), rngs.len())?;
-        let mut staged_rngs = rngs.to_vec();
+        let rows = packed_rows(frames)?;
+        let rows = rows.iter().collect::<Vec<_>>();
+        let spaces = action_spaces.iter().collect::<Vec<_>>();
+        let statistics = vec![true; frames.len()];
         let _guard = self.read_parameter_lock()?;
+        let policy = self.policy_identity_locked();
+        let sampled = self.sample_rows_locked(&rows, &spaces, rngs, &statistics)?;
+        sampled
+            .into_iter()
+            .zip(frames)
+            .map(|(row, frame)| {
+                let statistics = row
+                    .statistics
+                    .ok_or(ModelError::InvalidModelState("sampled row statistics"))?;
+                Ok(PpoPolicyChoice {
+                    frame: frame.clone(),
+                    target: statistics.target,
+                    action: row.action,
+                    policy,
+                    log_probability: statistics.log_probability,
+                    entropy: statistics.entropy,
+                    value: row.value,
+                })
+            })
+            .collect()
+    }
+
+    /// Samples packed rows with one transactional RNG per row; behaviour statistics
+    /// are computed only for rows that request them.
+    #[cfg(feature = "builtin")]
+    pub(crate) fn sample_rows(
+        &self,
+        rows: &[&EncoderRow],
+        spaces: &[&ActionSpace],
+        rngs: &mut [PpoRng],
+        statistics: &[bool],
+    ) -> Result<Vec<SampledRow>, ModelError> {
+        let _guard = self.read_parameter_lock()?;
+        self.sample_rows_locked(rows, spaces, rngs, statistics)
+    }
+
+    fn sample_rows_locked(
+        &self,
+        rows: &[&EncoderRow],
+        spaces: &[&ActionSpace],
+        rngs: &mut [PpoRng],
+        statistics: &[bool],
+    ) -> Result<Vec<SampledRow>, ModelError> {
+        validate_row_batch(rows.len(), spaces.len())?;
+        validate_sampling_rng_count(rows.len(), rngs.len())?;
+        if statistics.len() != rows.len() {
+            return Err(ModelError::InvalidModelState(
+                "sampled row statistics count",
+            ));
+        }
+        let mut staged_rngs = rngs.to_vec();
         let selected =
-            self.selection_batch_locked(frames, action_spaces, Some(staged_rngs.as_mut_slice()))?;
-        let choices = finish_sampled_choices(
-            frames,
-            action_spaces,
-            selected,
-            self.policy_identity_locked(),
-        )?;
+            self.selection_rows_locked(rows, spaces, Some(staged_rngs.as_mut_slice()))?;
+        let sampled = selected
+            .into_iter()
+            .zip(spaces)
+            .zip(statistics)
+            .map(|((selection, space), &wanted)| finish_sampled_row(space, selection, wanted))
+            .collect::<Result<Vec<_>, _>>()?;
         rngs.clone_from_slice(&staged_rngs);
-        Ok(choices)
+        Ok(sampled)
     }
 
-    fn selection_batch_locked(
+    fn selection_rows_locked(
         &self,
-        frames: &[FeatureFrame],
-        action_spaces: &[ActionSpace],
-        rngs: Option<&mut [PpoRng]>,
-    ) -> Result<Vec<BatchSelection>, ModelError> {
-        side_actors::validate_sides(frames)?;
-        let state = self.forward_frames(frames)?;
-        self.selection_from_state_locked(state, frames, action_spaces, rngs)
-    }
-
-    fn selection_from_state_locked(
-        &self,
-        state: ForwardState,
-        frames: &[FeatureFrame],
-        action_spaces: &[ActionSpace],
+        rows: &[&EncoderRow],
+        action_spaces: &[&ActionSpace],
         mut rngs: Option<&mut [PpoRng]>,
     ) -> Result<Vec<BatchSelection>, ModelError> {
-        let routing = ActorRouting::new(frames, self.tensor_device(), false)?;
-        let base = self.sampling_base_logits(&state, &routing)?;
+        let state = self.forward_rows(rows)?;
+        let routing = ActorRouting::from_rows(rows, self.tensor_device())?;
+        let base = self.base_logits(&state, &routing, 0)?;
         let mut rows = initialize_sampling_rows(&base, action_spaces, &mut rngs)?;
         let kind = self.sampling_kind_logits(&state, &sampling_prefixes(&rows), &routing)?;
         select_sampling_units(&mut rows, &kind, action_spaces, &mut rngs)?;
@@ -2209,19 +2240,32 @@ impl PolicyModel {
         })
     }
 
-    fn sampling_base_logits(
+    /// Value and side-selected kind logits; errors report rows offset by `batch_offset`.
+    fn base_logits(
         &self,
         state: &ForwardState,
         routing: &ActorRouting,
+        batch_offset: usize,
     ) -> Result<SamplingBaseLogits, ModelError> {
-        let value = self.value.forward(&state.trunk)?.flatten_all()?.to_vec1()?;
-        validate_value_rows(&value, 0)?;
-        Ok(SamplingBaseLogits {
-            value,
-            kind: routing
-                .forward(self, ActorHead::Kind, &state.trunk)?
-                .to_vec2()?,
-        })
+        let mut request = StageRequest::new(state.trunk.dim(0)?);
+        let value = request.push(self.value.forward(&state.trunk)?)?;
+        let kind = routing.queue_pair(self, ActorHead::Kind, &state.trunk, &mut request)?;
+        let values = request.read()?;
+        let value = values.column(value);
+        validate_value_rows(&value, batch_offset)?;
+        let kind = routing.select(&values, kind).map_err(|error| match error {
+            ModelError::NonFiniteOutput {
+                field,
+                batch,
+                index,
+            } => ModelError::NonFiniteOutput {
+                field,
+                batch: batch_offset + batch,
+                index,
+            },
+            error => error,
+        })?;
+        Ok(SamplingBaseLogits { value, kind })
     }
 
     fn sampling_kind_logits(
@@ -2235,14 +2279,15 @@ impl PolicyModel {
             return Ok(SamplingKindLogits::default());
         }
         let context = self.sampling_context(&state.trunk, prefixes, SamplingContext::Kind)?;
+        let mut request = StageRequest::new(prefixes.len());
+        let mut queue =
+            |needed, head| self.queue_actor_head(needed, head, &context, routing, &mut request);
+        let controlled = queue(controlled, ActorHead::Controlled)?;
+        let learn = queue(learn, ActorHead::Learn)?;
+        let values = request.read()?;
         Ok(SamplingKindLogits {
-            controlled: self.sampling_actor_head(
-                controlled,
-                ActorHead::Controlled,
-                &context,
-                routing,
-            )?,
-            learn: self.sampling_actor_head(learn, ActorHead::Learn, &context, routing)?,
+            controlled: select_queued(routing, &values, controlled)?,
+            learn: select_queued(routing, &values, learn)?,
         })
     }
 
@@ -2268,25 +2313,26 @@ impl PolicyModel {
         }
         let [ability, item, shop, loot, entity, point] = needed;
         let context = self.sampling_context(&state.trunk, prefixes, SamplingContext::Unit)?;
+        let mut request = StageRequest::new(prefixes.len());
+        let mut queue =
+            |needed, head| self.queue_actor_head(needed, head, &context, routing, &mut request);
+        let ability = queue(ability, ActorHead::Ability)?;
+        let item = queue(item, ActorHead::Item)?;
+        let shop = queue(shop, ActorHead::Shop)?;
+        let loot = queue(loot, ActorHead::Loot)?;
+        let mut pointer = |needed, tokens, head| {
+            self.queue_pointer_head(needed, &context, tokens, head, routing, &mut request)
+        };
+        let entity = pointer(entity, &state.current_units, ActorHead::EntityQuery)?;
+        let point = pointer(point, &state.points, ActorHead::PointQuery)?;
+        let values = request.read()?;
         Ok(SamplingUnitLogits {
-            ability: self.sampling_actor_head(ability, ActorHead::Ability, &context, routing)?,
-            item: self.sampling_actor_head(item, ActorHead::Item, &context, routing)?,
-            shop: self.sampling_actor_head(shop, ActorHead::Shop, &context, routing)?,
-            loot: self.sampling_actor_head(loot, ActorHead::Loot, &context, routing)?,
-            entity: self.sampling_pointer_logits(
-                entity,
-                &context,
-                &state.current_units,
-                ActorHead::EntityQuery,
-                routing,
-            )?,
-            point: self.sampling_pointer_logits(
-                point,
-                &context,
-                &state.points,
-                ActorHead::PointQuery,
-                routing,
-            )?,
+            ability: select_queued(routing, &values, ability)?,
+            item: select_queued(routing, &values, item)?,
+            shop: select_queued(routing, &values, shop)?,
+            loot: select_queued(routing, &values, loot)?,
+            entity: pointer_queued(routing, &values, entity)?,
+            point: pointer_queued(routing, &values, point)?,
         })
     }
 
@@ -2312,65 +2358,63 @@ impl PolicyModel {
         }
         let [swap, target_mode, put_mode, entity, point] = needed;
         let context = self.sampling_context(&state.trunk, prefixes, SamplingContext::Slot)?;
+        let mut request = StageRequest::new(prefixes.len());
+        let mut queue =
+            |needed, head| self.queue_actor_head(needed, head, &context, routing, &mut request);
+        let swap = queue(swap, ActorHead::Swap)?;
+        let target_mode = queue(target_mode, ActorHead::TargetMode)?;
+        let put_mode = queue(put_mode, ActorHead::PutMode)?;
+        let mut pointer = |needed, tokens, head| {
+            self.queue_pointer_head(needed, &context, tokens, head, routing, &mut request)
+        };
+        let entity = pointer(entity, &state.current_units, ActorHead::EntityQuery)?;
+        let point = pointer(point, &state.points, ActorHead::PointQuery)?;
+        let values = request.read()?;
         Ok(SamplingSlotLogits {
-            swap: self.sampling_actor_head(swap, ActorHead::Swap, &context, routing)?,
-            target_mode: self.sampling_actor_head(
-                target_mode,
-                ActorHead::TargetMode,
-                &context,
-                routing,
-            )?,
-            put_mode: self.sampling_actor_head(put_mode, ActorHead::PutMode, &context, routing)?,
-            entity: self.sampling_pointer_logits(
-                entity,
-                &context,
-                &state.current_units,
-                ActorHead::EntityQuery,
-                routing,
-            )?,
-            point: self.sampling_pointer_logits(
-                point,
-                &context,
-                &state.points,
-                ActorHead::PointQuery,
-                routing,
-            )?,
+            swap: select_queued(routing, &values, swap)?,
+            target_mode: select_queued(routing, &values, target_mode)?,
+            put_mode: select_queued(routing, &values, put_mode)?,
+            entity: pointer_queued(routing, &values, entity)?,
+            point: pointer_queued(routing, &values, point)?,
         })
     }
 
-    fn sampling_actor_head(
+    fn queue_actor_head(
         &self,
         needed: bool,
         head: ActorHead,
         context: &Tensor,
         routing: &ActorRouting,
-    ) -> Result<Option<Vec<Vec<f32>>>, ModelError> {
+        request: &mut StageRequest,
+    ) -> Result<Option<QueuedPair>, ModelError> {
         if !needed {
             return Ok(None);
         }
         let (batch, width) = context.dims2()?;
-        assert!((1..=MODEL_TRAINING_BATCH).contains(&batch));
+        assert!((1..=MODEL_SAMPLING_BATCH).contains(&batch));
         assert_eq!(width, DECODER_CONTEXT);
         #[cfg(test)]
         sampling::record_dispatch(batch);
-        Ok(Some(routing.forward(self, head, context)?.to_vec2()?))
+        routing.queue_pair(self, head, context, request).map(Some)
     }
 
-    fn sampling_pointer_logits(
+    fn queue_pointer_head(
         &self,
         needed: bool,
         context: &Tensor,
         tokens: &Tensor,
         head: ActorHead,
         routing: &ActorRouting,
-    ) -> Result<Option<Vec<Vec<f32>>>, ModelError> {
+        request: &mut StageRequest,
+    ) -> Result<Option<(QueuedPair, usize)>, ModelError> {
         if !needed {
             return Ok(None);
         }
         #[cfg(test)]
         sampling::record_dispatch(context.dim(0)?);
-        let query = routing.forward(self, head, context)?.unsqueeze(1)?;
-        Ok(Some(scaled_pointer_dot(tokens, &query)?.to_vec2()?))
+        routing
+            .queue_pointer(self, head, context, tokens, request)
+            .map(Some)
     }
 
     fn sampling_context(
@@ -2380,13 +2424,14 @@ impl PolicyModel {
         depth: SamplingContext,
     ) -> Result<Tensor, ModelError> {
         let batch = prefixes.len();
-        let kind = self.training_kind_embeddings(prefixes)?;
+        let upload = PrefixUpload::new(prefixes, self.tensor_device())?;
+        let kind = self.kind_embeddings(&upload)?;
         if matches!(depth, SamplingContext::Kind) {
             return self.kind_context_from_embedding(trunk, &kind);
         }
-        let unit = self.training_unit_embeddings(prefixes)?;
+        let unit = self.unit_embeddings(&upload)?;
         let slot = match depth {
-            SamplingContext::Slot => self.training_slot_embeddings(prefixes)?,
+            SamplingContext::Slot => self.slot_embeddings(&upload)?,
             SamplingContext::Kind | SamplingContext::Unit => {
                 Tensor::zeros((batch, SLOT_EMBEDDING), DType::F32, self.tensor_device())?
             }
@@ -2416,9 +2461,10 @@ impl PolicyModel {
         trunk: &Tensor,
         prefixes: &[TrainingPrefix],
     ) -> Result<TrainingContexts, ModelError> {
-        let kind = self.training_kind_embeddings(prefixes)?;
-        let unit = self.training_unit_embeddings(prefixes)?;
-        let slot = self.training_slot_embeddings(prefixes)?;
+        let upload = PrefixUpload::new(prefixes, self.tensor_device())?;
+        let kind = self.kind_embeddings(&upload)?;
+        let unit = self.unit_embeddings(&upload)?;
+        let slot = self.slot_embeddings(&upload)?;
         let zero_unit = Tensor::zeros(unit.shape(), DType::F32, self.tensor_device())?;
         let zero_slot = Tensor::zeros(slot.shape(), DType::F32, self.tensor_device())?;
         Ok(TrainingContexts {
@@ -2428,63 +2474,36 @@ impl PolicyModel {
         })
     }
 
-    fn training_kind_embeddings(&self, prefixes: &[TrainingPrefix]) -> Result<Tensor, ModelError> {
-        let indices = prefixes
-            .iter()
-            .map(|prefix| prefix.kind.index() as u32)
-            .collect::<Vec<_>>();
-        let indices = Tensor::from_vec(indices, prefixes.len(), self.tensor_device())?;
-        self.kind_embedding_from_indices(&indices)
-    }
-
-    fn kind_embedding_from_indices(&self, indices: &Tensor) -> Result<Tensor, ModelError> {
-        assert_eq!(indices.rank(), 1);
-        assert_eq!(indices.dtype(), DType::U32);
+    fn kind_embeddings(&self, upload: &PrefixUpload) -> Result<Tensor, ModelError> {
         Ok(self
             .kind_embedding
             .value
             .as_tensor()
-            .index_select(indices, 0)?)
+            .index_select(&upload.indices(PrefixIndex::Kind)?, 0)?)
     }
 
-    fn training_unit_embeddings(&self, prefixes: &[TrainingPrefix]) -> Result<Tensor, ModelError> {
-        let indices = prefixes
-            .iter()
-            .map(|prefix| prefix.unit.map_or(0, ControlledUnit::index) as u32)
-            .collect::<Vec<_>>();
-        let presence = prefixes
-            .iter()
-            .map(|prefix| prefix.unit.is_some() as u8 as f32)
-            .collect::<Vec<_>>();
-        let indices = Tensor::from_vec(indices, prefixes.len(), self.tensor_device())?;
-        let presence = Tensor::from_vec(presence, (prefixes.len(), 1), self.tensor_device())?;
+    fn unit_embeddings(&self, upload: &PrefixUpload) -> Result<Tensor, ModelError> {
         Ok(self
             .unit_embedding
             .value
             .as_tensor()
-            .index_select(&indices, 0)?
-            .broadcast_mul(&presence)?)
+            .index_select(&upload.indices(PrefixIndex::Unit)?, 0)?
+            .broadcast_mul(&upload.mask(PrefixMask::Unit)?)?)
     }
 
-    fn training_slot_embeddings(&self, prefixes: &[TrainingPrefix]) -> Result<Tensor, ModelError> {
-        let ability = training_slot_indices(prefixes, true);
-        let item = training_slot_indices(prefixes, false);
-        let ability_indices = Tensor::from_vec(ability.0, prefixes.len(), self.tensor_device())?;
-        let item_indices = Tensor::from_vec(item.0, prefixes.len(), self.tensor_device())?;
-        let ability_mask = Tensor::from_vec(ability.1, (prefixes.len(), 1), self.tensor_device())?;
-        let item_mask = Tensor::from_vec(item.1, (prefixes.len(), 1), self.tensor_device())?;
+    fn slot_embeddings(&self, upload: &PrefixUpload) -> Result<Tensor, ModelError> {
         let ability = self
             .ability_embedding
             .value
             .as_tensor()
-            .index_select(&ability_indices, 0)?
-            .broadcast_mul(&ability_mask)?;
+            .index_select(&upload.indices(PrefixIndex::Ability)?, 0)?
+            .broadcast_mul(&upload.mask(PrefixMask::Ability)?)?;
         let item = self
             .item_embedding
             .value
             .as_tensor()
-            .index_select(&item_indices, 0)?
-            .broadcast_mul(&item_mask)?;
+            .index_select(&upload.indices(PrefixIndex::Item)?, 0)?
+            .broadcast_mul(&upload.mask(PrefixMask::Item)?)?;
         Ok((ability + item)?)
     }
 
@@ -2536,8 +2555,18 @@ impl PolicyModel {
     }
 
     fn forward_frames(&self, frames: &[FeatureFrame]) -> Result<ForwardState, ModelError> {
-        let (flat, lengths) = stage_frame_buffer(frames, self.tensor_device())?;
-        let inputs = EncoderInputs::from_buffer(&flat, &lengths, frames.len())?;
+        let rows = frames
+            .iter()
+            .map(EncoderRow::from_frame)
+            .collect::<Result<Vec<_>, _>>()?;
+        self.forward_rows(&rows.iter().collect::<Vec<_>>())
+    }
+
+    fn forward_rows(&self, rows: &[&EncoderRow]) -> Result<ForwardState, ModelError> {
+        let (host, lengths) = rows::assemble(rows);
+        let total = host.len();
+        let flat = Tensor::from_vec(host, total, self.tensor_device())?;
+        let inputs = EncoderInputs::from_buffer(&flat, &lengths, rows.len())?;
         self.forward_encoder_inputs(&inputs)
     }
 
@@ -3637,10 +3666,10 @@ fn validate_policy_batch(
     action_spaces: &[ActionSpace],
 ) -> Result<(), ModelError> {
     validate_batch_count(frames.len())?;
-    if frames.len() > MODEL_TRAINING_BATCH {
+    if frames.len() > MODEL_SAMPLING_BATCH {
         return Err(ModelError::BatchTooLarge {
             count: frames.len(),
-            maximum: MODEL_TRAINING_BATCH,
+            maximum: MODEL_SAMPLING_BATCH,
         });
     }
     if action_spaces.len() != frames.len() {
@@ -3665,6 +3694,23 @@ fn validate_policy_batch(
         return Err(ModelError::BatchFrameActionSpaceMismatch { index });
     }
     side_actors::validate_sides(frames)?;
+    Ok(())
+}
+
+fn validate_row_batch(rows: usize, spaces: usize) -> Result<(), ModelError> {
+    validate_batch_count(rows)?;
+    if rows > MODEL_SAMPLING_BATCH {
+        return Err(ModelError::BatchTooLarge {
+            count: rows,
+            maximum: MODEL_SAMPLING_BATCH,
+        });
+    }
+    if spaces != rows {
+        return Err(ModelError::BatchActionSpaceCount {
+            action_spaces: spaces,
+            frames: rows,
+        });
+    }
     Ok(())
 }
 
@@ -3777,7 +3823,7 @@ fn batch_row_rng<'a>(rngs: &'a mut Option<&mut [PpoRng]>, index: usize) -> Optio
 
 fn initialize_sampling_rows(
     logits: &SamplingBaseLogits,
-    action_spaces: &[ActionSpace],
+    action_spaces: &[&ActionSpace],
     rngs: &mut Option<&mut [PpoRng]>,
 ) -> Result<Vec<SamplingRow>, ModelError> {
     if logits.value.len() != action_spaces.len() || logits.kind.len() != action_spaces.len() {
@@ -3815,7 +3861,7 @@ fn initialize_sampling_rows(
 fn select_sampling_units(
     rows: &mut [SamplingRow],
     logits: &SamplingKindLogits,
-    action_spaces: &[ActionSpace],
+    action_spaces: &[&ActionSpace],
     rngs: &mut Option<&mut [PpoRng]>,
 ) -> Result<(), ModelError> {
     for index in 0..rows.len() {
@@ -3845,7 +3891,7 @@ fn select_sampling_units(
 fn select_sampling_slots(
     rows: &mut [SamplingRow],
     logits: &SamplingUnitLogits,
-    action_spaces: &[ActionSpace],
+    action_spaces: &[&ActionSpace],
     rngs: &mut Option<&mut [PpoRng]>,
 ) -> Result<(), ModelError> {
     for index in 0..rows.len() {
@@ -3853,7 +3899,7 @@ fn select_sampling_slots(
             index,
             &mut rows[index],
             logits,
-            &action_spaces[index],
+            action_spaces[index],
             batch_row_rng(rngs, index),
         )?
         else {
@@ -4050,6 +4096,98 @@ fn sum_training_tensors(output: &PolicyTensorTensors) -> Result<Tensor, ModelErr
         loss = (loss + tensor.sum_all()?)?;
     }
     Ok(loss)
+}
+
+/// Validated side-selected rows of one optionally queued actor head.
+fn select_queued(
+    routing: &ActorRouting,
+    values: &StageValues,
+    pair: Option<QueuedPair>,
+) -> Result<Option<Vec<Vec<f32>>>, ModelError> {
+    pair.map(|pair| routing.select(values, pair)).transpose()
+}
+
+/// Pointer scores of one optionally queued pointer head after validating its raw query pair.
+fn pointer_queued(
+    routing: &ActorRouting,
+    values: &StageValues,
+    pointer: Option<(QueuedPair, usize)>,
+) -> Result<Option<Vec<Vec<f32>>>, ModelError> {
+    pointer
+        .map(|(pair, scores)| {
+            routing.validate(values, pair)?;
+            Ok(values.rows(scores))
+        })
+        .transpose()
+}
+
+#[derive(Clone, Copy)]
+enum PrefixIndex {
+    Kind,
+    Unit,
+    Ability,
+    Item,
+}
+
+#[derive(Clone, Copy)]
+enum PrefixMask {
+    Unit,
+    Ability,
+    Item,
+}
+
+/// Embedding indices and presence masks of one prefix batch, uploaded with two copies
+/// instead of one per field; views select the same values the per-field uploads held.
+struct PrefixUpload {
+    batch: usize,
+    indices: Tensor,
+    masks: Tensor,
+}
+
+impl PrefixUpload {
+    fn new(prefixes: &[TrainingPrefix], device: &Device) -> Result<Self, ModelError> {
+        let batch = prefixes.len();
+        assert!((1..=MODEL_PPO_MAX_MICROBATCH).contains(&batch));
+        let (ability, ability_mask) = training_slot_indices(prefixes, true);
+        let (item, item_mask) = training_slot_indices(prefixes, false);
+        let mut indices = Vec::with_capacity(4 * batch);
+        indices.extend(prefixes.iter().map(|prefix| prefix.kind.index() as u32));
+        indices.extend(
+            prefixes
+                .iter()
+                .map(|prefix| prefix.unit.map_or(0, ControlledUnit::index) as u32),
+        );
+        indices.extend(ability);
+        indices.extend(item);
+        let mut masks = Vec::with_capacity(3 * batch);
+        masks.extend(
+            prefixes
+                .iter()
+                .map(|prefix| prefix.unit.is_some() as u8 as f32),
+        );
+        masks.extend(ability_mask);
+        masks.extend(item_mask);
+        assert_eq!(indices.len(), 4 * batch);
+        assert_eq!(masks.len(), 3 * batch);
+        Ok(Self {
+            batch,
+            indices: Tensor::from_vec(indices, 4 * batch, device)?,
+            masks: Tensor::from_vec(masks, 3 * batch, device)?,
+        })
+    }
+
+    fn indices(&self, field: PrefixIndex) -> Result<Tensor, ModelError> {
+        Ok(self
+            .indices
+            .narrow(0, field as usize * self.batch, self.batch)?)
+    }
+
+    fn mask(&self, field: PrefixMask) -> Result<Tensor, ModelError> {
+        Ok(self
+            .masks
+            .narrow(0, field as usize * self.batch, self.batch)?
+            .reshape((self.batch, 1))?)
+    }
 }
 
 struct ForwardState {
@@ -4267,208 +4405,6 @@ const ENCODER_SCALARS: usize = GLOBAL_FEATURES
 /// Unit encoder input rows for one frame.
 const ENCODER_UNIT_TOKENS: usize = UNIT_FEATURE_TOKENS + REMEMBERED_UNIT_FEATURE_TOKENS;
 
-/// Host-side unit inputs for one batch before the single device upload.
-struct StagedUnits {
-    values: Vec<f32>,
-    presence: Vec<f32>,
-    groups: Vec<Vec<f32>>,
-}
-
-fn stage_units(frames: &[FeatureFrame]) -> StagedUnits {
-    let tokens = ENCODER_UNIT_TOKENS;
-    let mut values = Vec::with_capacity(frames.len() * tokens * UNIT_FEATURES);
-    let mut groups = (0..UNIT_GROUPS)
-        .map(|_| Vec::with_capacity(frames.len() * tokens))
-        .collect::<Vec<_>>();
-    for frame in frames {
-        append_unit_rows(&mut values, &mut groups, &frame.units);
-        append_unit_rows(&mut values, &mut groups, &frame.remembered_units);
-    }
-    condition_rows(
-        &mut values,
-        UNIT_FEATURES,
-        &[(unit_feature::KIND_TOKEN, 12.0)],
-        None,
-    );
-    let presence = (0..frames.len() * tokens)
-        .map(|index| groups.iter().any(|mask| mask[index] == 1.0) as u8 as f32)
-        .collect::<Vec<_>>();
-    assert_eq!(values.len(), frames.len() * tokens * UNIT_FEATURES);
-    assert_eq!(presence.len(), frames.len() * tokens);
-    StagedUnits {
-        values,
-        presence,
-        groups,
-    }
-}
-
-fn stage_own_units(frames: &[FeatureFrame]) -> (Vec<f32>, Vec<f32>) {
-    stage_present_rows(
-        frames,
-        |frame| &frame.own_units,
-        unit_feature::TOKEN_PRESENT,
-        &[(unit_feature::KIND_TOKEN, 12.0)],
-        None,
-    )
-}
-
-fn stage_tokens(frames: &[FeatureFrame], field: TokenField) -> (Vec<f32>, Vec<f32>) {
-    match field {
-        TokenField::Ability => stage_present_rows(
-            frames,
-            |frame| &frame.abilities,
-            ability_feature::TOKEN_PRESENT,
-            &[
-                (ability_feature::BODY_TOKEN, 2.0),
-                (ability_feature::SEMANTIC_SLOT_TOKEN, 8.0),
-                (ability_feature::AIM_TOKEN, 5.0),
-            ],
-            Some((ability_feature::ID_TOKEN, 65_547.0)),
-        ),
-        TokenField::Item => stage_present_rows(
-            frames,
-            |frame| &frame.items,
-            item_feature::TOKEN_PRESENT,
-            &[
-                (item_feature::LOCATION_TOKEN, 5.0),
-                (item_feature::SLOT_TOKEN, 64.0),
-                (item_feature::AIM_TOKEN, 5.0),
-                (item_feature::ATTRIBUTE_TOKEN, 3.0),
-            ],
-            Some((item_feature::ITEM_TOKEN, 65_536.0)),
-        ),
-        TokenField::Point => stage_present_rows(
-            frames,
-            |frame| &frame.points,
-            point_feature::TOKEN_PRESENT,
-            &[
-                (point_feature::SOURCE_TOKEN, 8.0),
-                (point_feature::SOURCE_DIRECTION_TOKEN, 8.0),
-                (point_feature::SOURCE_KIND_TOKEN, 12.0),
-            ],
-            None,
-        ),
-        TokenField::Projectile => stage_present_rows(
-            frames,
-            |frame| &frame.projectiles,
-            projectile_feature::TOKEN_PRESENT,
-            &[],
-            Some((projectile_feature::ABILITY_TOKEN, 65_547.0)),
-        ),
-        TokenField::Loot => stage_present_rows(
-            frames,
-            |frame| &frame.loot,
-            loot_feature::TOKEN_PRESENT,
-            &[],
-            Some((loot_feature::ITEM_TOKEN, 65_536.0)),
-        ),
-    }
-}
-
-fn stage_present_rows<const TOKENS: usize, const FEATURES: usize>(
-    frames: &[FeatureFrame],
-    rows: impl Fn(&FeatureFrame) -> &[[f32; FEATURES]; TOKENS],
-    presence: usize,
-    categories: &[(usize, f32)],
-    semantic_id: Option<(usize, f32)>,
-) -> (Vec<f32>, Vec<f32>) {
-    let mut values = Vec::with_capacity(frames.len() * TOKENS * FEATURES);
-    let mut mask = Vec::with_capacity(frames.len() * TOKENS);
-    for frame in frames {
-        append_present_rows(&mut values, &mut mask, rows(frame), presence);
-    }
-    condition_rows(&mut values, FEATURES, categories, semantic_id);
-    assert_eq!(values.len(), frames.len() * TOKENS * FEATURES);
-    assert_eq!(mask.len(), frames.len() * TOKENS);
-    (values, mask)
-}
-
-fn stage_scalars(frames: &[FeatureFrame]) -> Vec<f32> {
-    let mut values = Vec::with_capacity(frames.len() * ENCODER_SCALARS);
-    for frame in frames {
-        let mut global = frame.global;
-        condition_rows(
-            &mut global,
-            GLOBAL_FEATURES,
-            &[
-                (crate::global_feature::ROLE_TOKEN, 5.0),
-                (crate::global_feature::LANE_TOKEN, 3.0),
-                (crate::global_feature::ACTIVE_ORDER_KIND, 16.0),
-                (crate::global_feature::ACTIVE_TARGET_KIND_TOKEN, 12.0),
-            ],
-            None,
-        );
-        values.extend(global);
-        values.extend(frame.history.iter().flatten().copied());
-        for mut row in frame.policy_history {
-            condition_rows(&mut row, POLICY_HISTORY_FEATURES, &[(3, 16.0)], None);
-            values.extend(row);
-        }
-        values.extend(frame.map);
-    }
-    assert_eq!(values.len(), frames.len() * ENCODER_SCALARS);
-    values
-}
-
-fn stage_frame_buffer(
-    frames: &[FeatureFrame],
-    device: &Device,
-) -> Result<(Tensor, Vec<usize>), ModelError> {
-    let units = stage_units(frames);
-    let (own_values, own_mask) = stage_own_units(frames);
-    let (ability_values, ability_mask) = stage_tokens(frames, TokenField::Ability);
-    let (item_values, item_mask) = stage_tokens(frames, TokenField::Item);
-    let (point_values, point_mask) = stage_tokens(frames, TokenField::Point);
-    let (projectile_values, projectile_mask) = stage_tokens(frames, TokenField::Projectile);
-    let (loot_values, loot_mask) = stage_tokens(frames, TokenField::Loot);
-    let scalars = stage_scalars(frames);
-    let mut parts: Vec<&[f32]> = Vec::with_capacity(3 + UNIT_GROUPS + 12);
-    parts.push(&units.values);
-    parts.push(&units.presence);
-    for group in &units.groups {
-        parts.push(group);
-    }
-    parts.push(&own_values);
-    parts.push(&own_mask);
-    for values in [
-        &ability_values,
-        &ability_mask,
-        &item_values,
-        &item_mask,
-        &point_values,
-        &point_mask,
-        &projectile_values,
-        &projectile_mask,
-        &loot_values,
-        &loot_mask,
-        &scalars,
-    ] {
-        parts.push(values);
-    }
-    upload_parts(&parts, device)
-}
-
-/// Uploads every encoder input part with one device allocation and copy.
-///
-/// Part lengths let the tensor-only encoder recreate the original contiguous
-/// views and offsets without uploading changing data inside CUDA graph capture.
-fn upload_parts(parts: &[&[f32]], device: &Device) -> Result<(Tensor, Vec<usize>), ModelError> {
-    let total = parts.iter().try_fold(0usize, |total, part| {
-        total
-            .checked_add(part.len())
-            .ok_or(ModelError::InvalidModelState("staged input overflow"))
-    })?;
-    if parts.is_empty() || total == 0 {
-        return Err(ModelError::InvalidModelState("staged input empty"));
-    }
-    let mut host = Vec::with_capacity(total);
-    for part in parts {
-        host.extend_from_slice(part);
-    }
-    let flat = Tensor::from_vec(host, total, device)?;
-    Ok((flat, parts.iter().map(|part| part.len()).collect()))
-}
-
 fn encode_units(
     model: &PolicyModel,
     rows: &Tensor,
@@ -4487,25 +4423,6 @@ fn encode_units(
     let pooled = pool_groups(&encoded, groups, batch, tokens, UNIT_EMBEDDING)?;
     let current = encoded.narrow(1, 0, UNIT_FEATURE_TOKENS)?;
     Ok(UnitEncoding { pooled, current })
-}
-
-fn append_unit_rows<const TOKENS: usize>(
-    values: &mut Vec<f32>,
-    masks: &mut [Vec<f32>],
-    rows: &[[f32; UNIT_FEATURES]; TOKENS],
-) {
-    for row in rows {
-        let present = row[unit_feature::TOKEN_PRESENT] == 1.0;
-        if present {
-            values.extend(row);
-        } else {
-            values.resize(values.len() + UNIT_FEATURES, 0.0);
-        }
-        let group = unit_group(row[unit_feature::KIND_TOKEN]);
-        for (index, mask) in masks.iter_mut().enumerate() {
-            mask.push((present && group == Some(index)) as u8 as f32);
-        }
-    }
 }
 
 pub(crate) fn unit_group(kind: f32) -> Option<usize> {
@@ -4539,14 +4456,6 @@ fn encode_own_units(
     Ok(OwnUnitEncoding { fixed })
 }
 
-enum TokenField {
-    Ability,
-    Item,
-    Point,
-    Projectile,
-    Loot,
-}
-
 fn encode_tokens(
     encoder: &Mlp,
     rows: &Tensor,
@@ -4566,23 +4475,6 @@ fn encode_tokens(
         TOKEN_EMBEDDING,
     )?;
     Ok(TokenEncoding { pooled, encoded })
-}
-
-fn append_present_rows<const TOKENS: usize, const FEATURES: usize>(
-    values: &mut Vec<f32>,
-    mask: &mut Vec<f32>,
-    rows: &[[f32; FEATURES]; TOKENS],
-    presence: usize,
-) {
-    for row in rows {
-        let present = row[presence] == 1.0;
-        if present {
-            values.extend(row);
-        } else {
-            values.resize(values.len() + FEATURES, 0.0);
-        }
-        mask.push(present as u8 as f32);
-    }
 }
 
 fn pool_groups(
@@ -5106,7 +4998,7 @@ fn sampled_head_statistics<const WIDTH: usize>(
 }
 
 fn decode_batch_rows(
-    action_spaces: &[ActionSpace],
+    action_spaces: &[&ActionSpace],
     rngs: &mut Option<&mut [PpoRng]>,
     rows: Vec<SamplingRow>,
     logits: SamplingLogits,
@@ -5120,7 +5012,7 @@ fn decode_batch_rows(
             observed: row.observed,
             perturbed: row.perturbed,
         };
-        let action = decode_from_source(&action_spaces[index], &mut source)?;
+        let action = decode_from_source(action_spaces[index], &mut source)?;
         if !action_spaces[index].allows(action) {
             return Err(ModelError::InvalidModelState("illegal decoded action"));
         }
@@ -5136,29 +5028,47 @@ fn decode_batch_rows(
     Ok(selections)
 }
 
-fn finish_sampled_choices(
-    frames: &[FeatureFrame],
-    action_spaces: &[ActionSpace],
-    selections: Vec<BatchSelection>,
-    policy: PolicyIdentity,
-) -> Result<Vec<PpoPolicyChoice>, ModelError> {
-    let mut choices = Vec::with_capacity(selections.len());
-    for (index, selection) in selections.into_iter().enumerate() {
-        let action = selection.action;
-        let target = BehavioralTarget::from_action(&frames[index], &action_spaces[index], action)
+fn finish_sampled_row(
+    space: &ActionSpace,
+    selection: BatchSelection,
+    statistics: bool,
+) -> Result<SampledRow, ModelError> {
+    let statistics = if statistics {
+        let target = BehavioralTarget::from_sampled_action(space, selection.action)
             .map_err(|error| ModelError::Backend(error.to_string()))?;
         let (log_probability, entropy) = selection.observed.statistics(&target)?;
-        choices.push(PpoPolicyChoice {
-            frame: frames[index].clone(),
+        Some(SampledStatistics {
             target,
-            action,
-            policy,
             log_probability,
             entropy,
-            value: selection.value,
-        });
-    }
-    Ok(choices)
+        })
+    } else {
+        None
+    };
+    Ok(SampledRow {
+        action: selection.action,
+        value: selection.value,
+        statistics,
+    })
+}
+
+/// Packs a validated frame batch into encoder rows.
+fn packed_rows(frames: &[FeatureFrame]) -> Result<Vec<EncoderRow>, ModelError> {
+    frames.iter().map(EncoderRow::from_frame).collect()
+}
+
+/// One sampled row: action, state value and, when requested, exact behaviour statistics.
+pub(crate) struct SampledRow {
+    pub(crate) action: StructuredAction,
+    pub(crate) value: f32,
+    pub(crate) statistics: Option<SampledStatistics>,
+}
+
+/// Behavioural target and old-policy statistics of one sampled row.
+pub(crate) struct SampledStatistics {
+    pub(crate) target: BehavioralTarget,
+    pub(crate) log_probability: f32,
+    pub(crate) entropy: f32,
 }
 
 struct SamplingDecoder<'logits, 'rng> {

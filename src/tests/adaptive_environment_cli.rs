@@ -217,14 +217,14 @@ fn adaptive_environment_cli_extension_enforces_full_exact_global_bound() {
 }
 
 #[test]
-fn adaptive_environment_cli_requires_generation_games_and_rejects_unknown_schedule() {
+fn adaptive_environment_cli_requires_generation_updates_and_rejects_unknown_schedule() {
     let error = parse_annealed(&["--updates", "20"])
         .err()
-        .expect("required generation games");
+        .expect("required generation updates");
     assert!(
         error
             .to_string()
-            .contains("--generation-games <GENERATION_GAMES>"),
+            .contains("--generation-updates <GENERATION_UPDATES>"),
         "{error}"
     );
     let error =
@@ -244,32 +244,9 @@ fn adaptive_environment_cli_requires_generation_games_and_rejects_unknown_schedu
 }
 
 #[test]
-fn adaptive_environment_cli_requires_positive_whole_update_generations() {
-    for (games, generation) in [("0", "8"), ("8", "0"), ("8", "6"), ("8", "12")] {
-        let train = parse_annealed(&[
-            "--updates",
-            "20",
-            "--games",
-            games,
-            "--generation-games",
-            generation,
-        ])
-        .unwrap_or_else(|error| panic!("parse dimensions: {error}"));
-        let error = train
-            .environment_schedule()
-            .expect_err("nonwhole generation");
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
-        assert_eq!(
-            error.to_string(),
-            "adaptive environment generation games must be a positive whole multiple of games per update"
-        );
-    }
-}
-
-#[test]
 fn adaptive_environment_cli_validates_base_total_and_zero_update_limits() {
     let overflow = (crate::MAX_TRAINING_COUNTER + 1).to_string();
-    let base_overflow = ((crate::MAX_TRAINING_COUNTER + 1) * 2).to_string();
+    let base_overflow = (crate::MAX_TRAINING_COUNTER + 1).to_string();
     for (total, generation, zero, field) in [
         (
             "0",
@@ -299,9 +276,7 @@ fn adaptive_environment_cli_validates_base_total_and_zero_update_limits() {
         let train = parse_annealed(&[
             "--updates",
             total,
-            "--games",
-            "2",
-            "--generation-games",
+            "--generation-updates",
             generation,
             "--zero-updates",
             zero,
@@ -322,10 +297,8 @@ fn adaptive_environment_cli_accepts_base_above_total_and_zero_phase_endpoints() 
         parse_annealed(&[
             "--updates",
             "20",
-            "--games",
-            "2",
-            "--generation-games",
-            "42",
+            "--generation-updates",
+            "21",
             "--zero-updates",
             zero,
         ])
@@ -337,73 +310,23 @@ fn adaptive_environment_cli_accepts_base_above_total_and_zero_phase_endpoints() 
 
 #[cfg(feature = "builtin")]
 #[test]
-fn adaptive_environment_cli_settings_preserve_whole_adaptive_and_fractional_fixed_generations() {
-    for generation in ["8", "32"] {
+fn adaptive_environment_cli_settings_count_generations_in_updates() {
+    for schedule in ["adaptive", "fixed"] {
         let settings = annealed_settings_for_test(&[
             "--updates",
             "20",
-            "--games",
-            "8",
-            "--parallel",
-            "2",
-            "--actor-pipeline-groups",
-            "1",
-            "--training-microbatch",
-            "64",
-            "--reuse-actor-values=false",
-            "--generation-games",
-            generation,
+            "--generation-updates",
+            "3",
+            "--environment-schedule",
+            schedule,
         ])
-        .expect("whole adaptive generation");
-        assert_eq!(
-            settings.environment_schedule,
-            EnvironmentSchedule::Adaptive(AdaptiveEnvironmentConfig::default())
-        );
-        assert_eq!(settings.games_per_generation.to_string(), generation);
+        .expect("generation in updates");
+        assert_eq!(settings.generation_updates, 3);
     }
-    for generation in ["6", "12"] {
-        let flags = [
-            "--updates",
-            "20",
-            "--games",
-            "8",
-            "--parallel",
-            "2",
-            "--actor-pipeline-groups",
-            "1",
-            "--training-microbatch",
-            "64",
-            "--reuse-actor-values=false",
-            "--generation-games",
-            generation,
-        ];
-        let error = annealed_settings_for_test(&flags).expect_err("fractional adaptive generation");
-        assert_eq!(
-            error.to_string(),
-            "adaptive environment generation games must be a positive whole multiple of games per update"
-        );
-        let fixed =
-            legacy_fixed_annealed_settings_for_test(&flags).expect("legacy fixed generation");
-        assert_eq!(fixed.environment_schedule, EnvironmentSchedule::Fixed);
-        assert_eq!(fixed.games_per_generation.to_string(), generation);
-        assert_eq!(fixed.parallel_worlds, 2);
-    }
-}
-
-#[cfg(feature = "builtin")]
-#[test]
-fn adaptive_environment_cli_default_m40_rejects_generation_games_32_as_partial_update() {
-    let error = annealed_settings_for_test(&["--updates", "200", "--generation-games", "32"])
-        .expect_err("default M40 must not silently resize a generation");
-    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
-    assert_eq!(
-        error.to_string(),
-        "adaptive environment generation games must be a positive whole multiple of games per update"
-    );
 }
 
 fn schedule_for_test(flags: &[&str]) -> std::io::Result<EnvironmentSchedule> {
-    let mut arguments = vec!["--updates", "20", "--generation-games", "160"];
+    let mut arguments = vec!["--updates", "20", "--generation-updates", "4"];
     arguments.extend_from_slice(flags);
     parse_annealed(&arguments)?.environment_schedule()
 }
@@ -421,7 +344,7 @@ fn parse_annealed(flags: &[&str]) -> std::io::Result<TrainAnnealedArgs> {
 #[cfg(feature = "builtin")]
 #[test]
 fn annealed_cli_resolves_environment_scale_endpoints() {
-    let base = ["--updates", "20", "--generation-games", "160"];
+    let base = ["--updates", "20", "--generation-updates", "4"];
     let settings = |extra: &[&str]| {
         let mut arguments = base.to_vec();
         arguments.extend_from_slice(extra);

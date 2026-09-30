@@ -97,7 +97,7 @@ fn legacy_effect_and_progress_manifests_reject_before_tensor_access() {
     ] {
         let directory = Directory::new();
         let path = directory.0.join("checkpoint.meta");
-        let mut bytes = b"DRYCKP19".to_vec();
+        let mut bytes = b"DRYCKP20".to_vec();
         bytes.extend(version.to_le_bytes());
         bytes.extend(hash.to_le_bytes());
         std::fs::write(&path, &bytes).expect("old manifest header");

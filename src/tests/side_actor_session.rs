@@ -44,7 +44,7 @@ fn fresh_session_imports_only_initial_parameters_and_resets_all_training_state()
     assert_eq!(session.trainer.updates(), 0);
     assert_eq!(session.completed_updates, 0);
     assert_eq!(session.rollout_samples, 0);
-    assert_eq!(session.sampling.checkpoint(), (9001 ^ 0xa17e, 0));
+    assert!(session.collection.is_none());
     assert_eq!(session.trainer.rng_checkpoint(), (9001 ^ 0x51a9, 0));
     assert!(session.adaptive_environment.is_none());
     let snapshot = session.trainer.checkpoint_snapshot(&session.model).unwrap();

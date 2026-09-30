@@ -4,7 +4,7 @@ use super::{
 };
 use crate::{
     AdaptiveEnvironmentConfig, AdaptiveEnvironmentLimits, AdaptiveEnvironmentState,
-    EnvironmentDecimal, MAX_TRAINING_COUNTER, PpoConfig, PpoError,
+    EnvironmentDecimal, MAX_TRAINING_COUNTER, PpoError,
 };
 
 const BLOCK_BYTES: usize = 152;
@@ -25,7 +25,6 @@ pub struct AdaptiveEnvironmentCheckpoint {
 pub(super) fn validate_scope(
     run: &CheckpointRun,
     progress: &CheckpointProgress,
-    ppo: PpoConfig,
 ) -> Result<(), CheckpointError> {
     super::validate_text("command line", &run.command_line)?;
     // A non-default scale ramp is recorded after the adaptive suffix. Only the
@@ -63,7 +62,7 @@ pub(super) fn validate_scope(
             "adaptive environment scope suffix",
         ));
     }
-    validate_limits_scope(prefix, checkpoint.limits, ppo.environments)?;
+    validate_limits_scope(prefix, checkpoint.limits)?;
     checkpoint
         .state
         .validate(checkpoint.config, checkpoint.limits, progress.global_update)
@@ -152,10 +151,8 @@ pub(super) fn decode(
 fn validate_limits_scope(
     prefix: &str,
     limits: AdaptiveEnvironmentLimits,
-    environments: usize,
 ) -> Result<(), CheckpointError> {
     debug_assert!(prefix.len() <= MAX_TEXT_BYTES);
-    debug_assert!(environments > 0);
     if !prefix.starts_with("train-annealed ") {
         return Err(CheckpointError::InvalidManifest(
             "adaptive environment command",
@@ -169,9 +166,6 @@ fn validate_limits_scope(
             "adaptive environment league",
         ));
     }
-    let generation_games = limits.base_updates.checked_mul(environments as u64).ok_or(
-        CheckpointError::InvalidManifest("adaptive environment generation-games scope"),
-    )?;
     for (flag, expected, field) in [
         (
             "--updates",
@@ -184,14 +178,9 @@ fn validate_limits_scope(
             "adaptive environment zero-updates scope",
         ),
         (
-            "--generation-games",
-            generation_games,
-            "adaptive environment generation-games scope",
-        ),
-        (
-            "--games",
-            environments as u64,
-            "adaptive environment games scope",
+            "--generation-updates",
+            limits.base_updates,
+            "adaptive environment generation-updates scope",
         ),
     ] {
         if scope_counter(prefix, flag, field)? != expected {

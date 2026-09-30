@@ -17,7 +17,7 @@ pub(super) fn needed<const HEADS: usize>(
     demand: impl Fn(ActionKind) -> [bool; HEADS],
 ) -> [bool; HEADS] {
     assert!(!prefixes.is_empty());
-    assert!(prefixes.len() <= MODEL_TRAINING_BATCH);
+    assert!(prefixes.len() <= MODEL_SAMPLING_BATCH);
     #[cfg(test)]
     if EAGER.get() {
         return [true; HEADS];
@@ -40,7 +40,7 @@ thread_local! {
 #[cfg(test)]
 pub(super) fn record_dispatch(batch: usize) {
     assert!(batch > 0);
-    assert!(batch <= MODEL_TRAINING_BATCH);
+    assert!(batch <= MODEL_SAMPLING_BATCH);
     let (heads, rows) = DISPATCHES.get();
     DISPATCHES.set((
         heads.checked_add(1).expect("bounded test dispatches"),

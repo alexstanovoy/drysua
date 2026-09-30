@@ -89,7 +89,7 @@ fn decisions_until_hit(slot: u8, reach: i32, facing: u16, motion: Motion) -> usi
 
 /// Shadow Fiend at `ORIGIN` looking `facing` away from the enemy hero east of it at `reach`.
 fn aim_environment(reach: i32, facing: u16, motion: Motion) -> TrainingEnvironment {
-    configured_environment(30, 0, OpponentSpec::Idle, |world| {
+    configured_environment(30, 0, OpponentRuntime::Idle, |world| {
         let own = world.seats[0].unit.expect("own hero");
         let enemy = world.seats[1].unit.expect("enemy hero");
         let enemy_position = Vec2::from_ints(ORIGIN.x.to_int() + reach, ORIGIN.y.to_int());
@@ -170,15 +170,9 @@ fn teacher_hero_raze_accuracy_native_aim_versus_aim_macro() {
 
 /// Per seat: raze hero hits, hero-aimed raze casts, all raze casts, wins.
 fn teacher_game(seed: u64, macro_seat: usize) -> [[u64; 4]; 2] {
-    let mut environment = build_environment(
-        seed,
-        seed ^ 0x5eed,
-        MapId(2),
-        0,
-        OpponentSpec::Teacher,
-        Vec::new(),
-    )
-    .expect("teacher arena");
+    let mut environment =
+        build_environment(seed, MapId(2), 0, OpponentRuntime::Teacher, Vec::new())
+            .expect("teacher arena");
     environment.seats[macro_seat].teacher = Teacher::with_macro_hero_aim();
     let mut hero_aimed = [false; 2];
     let mut hero_casts = [0u64; 2];

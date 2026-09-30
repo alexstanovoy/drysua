@@ -6,25 +6,17 @@ use std::path::PathBuf;
 use super::*;
 use crate::randomization::{AnnealSchedule, RANDOMIZATION_DIRECTORY, draw_generation};
 
-#[path = "actor_pipeline_scope.rs"]
-mod actor_pipeline_scope;
 #[path = "adaptive_annealed.rs"]
 mod adaptive_annealed;
 #[path = "annealed_capacity.rs"]
 mod capacity_tests;
-#[path = "training_concurrency.rs"]
-mod concurrency_tests;
 #[path = "annealed_invocation.rs"]
 mod invocation_tests;
-#[path = "neural_opponent_scope.rs"]
-mod neural_opponent_scope;
 #[path = "annealed_seed.rs"]
 mod seed_tests;
 #[cfg(unix)]
 #[path = "annealed_session.rs"]
 mod session_tests;
-#[path = "training_microbatch_scope.rs"]
-mod training_microbatch_scope;
 
 #[test]
 fn resume_requires_intact_generation_history_without_mutating_checkpoint() {
@@ -34,9 +26,10 @@ fn resume_requires_intact_generation_history_without_mutating_checkpoint() {
         (2, "domain randomization snapshots are missing on resume"),
     ] {
         let directory = test_directory("generation-history");
-        let mut config = settings(0x66bc, 1);
-        config.games_per_update = 6;
-        config.ppo.environments = 6;
+        // Committing update one has drawn the generations of every collected
+        // update: one, and the pipelined two.
+        let mut config = settings(0x66bc, 3);
+        config.invocation_updates = std::num::NonZeroU64::new(1);
         run(config.clone(), &directory, false).expect("three generations");
         assert_eq!(generation_files(&directory).len(), 3);
         let before = checkpoint_digests(&directory);
@@ -61,12 +54,16 @@ fn cached_generation_rules_turn_off_at_the_zero_window_boundary() {
         zero_updates: 1,
         scale: crate::randomization::AnnealScale::FULL,
     };
-    let draw = draw_generation(3, 1, 4, 2, schedule).expect("truncated draw");
+    let draw = draw_generation(3, 1, 2, 1, schedule).expect("truncated draw");
     assert!(draw.scale_bp > 0);
-    assert_eq!(draw.applied_games, 2);
-    for (game, applied) in [(4, true), (5, true), (6, false), (7, false)] {
-        assert_eq!(!generation_rules(&draw, game).is_empty(), applied);
+    assert_eq!(draw.applied_games, 1);
+    let directory = test_directory("zero-window-rules");
+    let mut cache = GenerationCache::new(directory.clone(), 3, 2, 1, schedule, 0);
+    for (update, applied) in [(2, true), (3, false)] {
+        let spec = cache.spec_for_update(update).expect("spec");
+        assert_eq!(!spawn_modifiers_for(spec).is_empty(), applied);
     }
+    std::fs::remove_dir_all(directory).expect("cleanup");
 }
 
 #[test]
@@ -76,7 +73,7 @@ fn resume_rejects_swapped_opponent_weights() {
     let first = PolicyModel::fresh(0x1111).expect("first opponent");
     TrainingArtifact::save_runtime_weights(&first, &weights).expect("first weights");
     let mut config = settings(0x1a2c, 1);
-    config.opponent = AnnealedOpponent::Weights(weights.clone());
+    config.opponents = vec![(AnnealedOpponent::Weights(weights.clone()), one())];
     run(config.clone(), &directory, false).expect("frozen opponent update");
     let before = checkpoint_digests(&directory);
     let second = PolicyModel::fresh(0x2222).expect("second opponent");
@@ -121,6 +118,10 @@ fn initial_weights_then_resume_matches_uninterrupted_parameters_optimizer_and_rn
     let first = start(&resumed, Some(1));
     assert_eq!(first.starting_policy_fingerprint, fingerprint);
     assert_eq!(first.completed_updates, 1);
+    assert!(
+        in_flight_decisions(&resumed) > 0,
+        "the boundary splits a game"
+    );
     let before = checkpoint_digests(&resumed);
     let error = run_annealed_job_harnessed(
         config.clone(),
@@ -157,6 +158,74 @@ fn initial_weights_then_resume_matches_uninterrupted_parameters_optimizer_and_rn
     }
 }
 
+/// Logged decisions of the games in flight at the committed boundary.
+fn in_flight_decisions(directory: &std::path::Path) -> usize {
+    let artifact = TrainingArtifact::load(directory).expect("checkpoint");
+    crate::ppo_arena::collector_state::CollectorState::decode(&artifact.collection().state)
+        .expect("collection state")
+        .slots
+        .iter()
+        .map(|slot| slot.log.policy.len())
+        .sum()
+}
+
+#[test]
+fn simulation_thread_count_never_changes_training_bits() {
+    let config = settings(23_072, 2);
+    let directories: Vec<_> = [1, 4]
+        .into_iter()
+        .map(|threads| {
+            let directory = test_directory("simulation-threads");
+            let mut config = config.clone();
+            config.simulation_threads = threads;
+            run(config, &directory, false).expect("two updates");
+            directory
+        })
+        .collect();
+    assert_trajectory_equal(&directories[0], &directories[1]);
+    for directory in directories {
+        std::fs::remove_dir_all(directory).expect("cleanup");
+    }
+}
+
+#[test]
+fn mixed_opponents_resume_in_flight_neural_games_exactly() {
+    let weights = test_directory("mixed-opponent-weights");
+    let frozen = PolicyModel::fresh(0x0dd).expect("frozen opponent");
+    TrainingArtifact::save_runtime_weights(&frozen, &weights).expect("frozen weights");
+    let mut config = settings(23_073, 2);
+    config.slots = 4;
+    config.ppo.samples_per_update = 10;
+    config.opponents = vec![
+        (AnnealedOpponent::Teacher, one()),
+        (AnnealedOpponent::SelfPlay, one()),
+        (AnnealedOpponent::Weights(weights.clone()), one()),
+    ];
+    let uninterrupted = test_directory("mixed-uninterrupted");
+    let resumed = test_directory("mixed-resumed");
+    run(config.clone(), &uninterrupted, false).expect("uninterrupted mixture");
+    let stopped = AnnealedHarness {
+        stop_after: Some(1),
+        ..harness()
+    };
+    run_with(config.clone(), stopped, &resumed, false).expect("first update");
+    let artifact = TrainingArtifact::load(&resumed).expect("checkpoint");
+    let state =
+        crate::ppo_arena::collector_state::CollectorState::decode(&artifact.collection().state)
+            .expect("collection state");
+    assert!(
+        state.slots.iter().any(|slot| !slot.log.opponent.is_empty()),
+        "a neural opponent game is in flight at the boundary"
+    );
+    run(config, &resumed, true).expect("resume");
+    assert_trajectory_equal(&uninterrupted, &resumed);
+    for directory in [weights, uninterrupted, resumed] {
+        std::fs::remove_dir_all(directory).expect("cleanup");
+    }
+}
+
+/// Two lanes of one slot each; with 16-decision games an update of four
+/// intervals per lane ends mid-game, so every resume replays in-flight games.
 fn settings(seed: u64, updates: u64) -> AnnealedJobConfig {
     AnnealedJobConfig {
         environment_schedule: crate::EnvironmentSchedule::Fixed,
@@ -164,19 +233,19 @@ fn settings(seed: u64, updates: u64) -> AnnealedJobConfig {
         updates,
         invocation_updates: None,
         history: None,
-        games_per_update: 2,
-        parallel_worlds: 2,
-        games_per_generation: 2,
+        slots: 2,
+        lanes: 2,
+        simulation_threads: 2,
+        generation_updates: 1,
         zero_updates: 0,
         scale: crate::randomization::AnnealScale::FULL,
         seed,
-        opponent: AnnealedOpponent::Teacher,
+        opponents: vec![(AnnealedOpponent::Teacher, one())],
         ppo: PpoConfig {
             decision_interval_ticks: MAP2_DECISION_INTERVAL_TICKS,
-            environments: 2,
-            rollout_decisions: MAP2_RETAINED_DECISIONS,
+            samples_per_update: 6,
             epochs: 1,
-            minibatch: 2,
+            minibatch: 3,
             gamma_tick: MAP2_REWARD_GAMMA_TICK,
             ..PpoConfig::default()
         },
@@ -184,6 +253,10 @@ fn settings(seed: u64, updates: u64) -> AnnealedJobConfig {
         git_commit: "test-drysua-annealed".to_owned(),
         simulator_commit: "test-bota-annealed".to_owned(),
     }
+}
+
+fn one() -> crate::EnvironmentDecimal {
+    crate::EnvironmentDecimal::from_units(crate::EnvironmentDecimal::SCALE)
 }
 
 fn harness() -> AnnealedHarness {
@@ -271,7 +344,8 @@ fn assert_trajectory_equal(source: &std::path::Path, target: &std::path::Path) {
 fn the_scope_records_a_non_default_environment_scale_in_a_fixed_order() {
     let options = settings(9001, 2);
     let scope = |options: &AnnealedJobConfig| {
-        annealed_run(options, PolicyDevice::Cpu, options.ppo, harness(), None)
+        let pool = load_opponents(options).expect("opponents");
+        annealed_run(options, PolicyDevice::Cpu, options.ppo, harness(), &pool)
             .expect("scope")
             .command_line
     };

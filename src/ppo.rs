@@ -3,8 +3,6 @@
     reason = "PPO optimization and metrics use floating-point arithmetic"
 )]
 
-#[cfg(feature = "builtin")]
-mod actor_order;
 mod minibatch;
 
 use std::error::Error;
@@ -29,8 +27,13 @@ pub const PPO_MAX_STREAMS: usize = 1_280;
 pub const PPO_MAX_GAMES: usize = 40;
 /// Maximum transitions retained for one policy update.
 pub const PPO_MAX_SAMPLES: usize = PPO_MAX_GAMES * crate::MAP2_RETAINED_DECISIONS;
-/// Maximum simultaneously active worlds, independent of games per update.
+/// Maximum simultaneously active worlds of one evaluation batch.
 pub const PPO_MAX_PARALLEL_WORLDS: usize = 64;
+/// Maximum concurrent training world slots.
+pub const PPO_MAX_SLOTS: usize = 256;
+/// Largest retained-interval target of one update.
+pub const PPO_MAX_UPDATE_SAMPLES: usize = 32_768;
+const _: () = assert!(PPO_MAX_UPDATE_SAMPLES + 2 * PPO_MAX_SLOTS <= PPO_MAX_SAMPLES);
 const _: () = assert!(
     std::mem::size_of::<CompactPpoTransition>()
         + std::mem::size_of::<CompactPreparedSample>()
@@ -52,7 +55,9 @@ pub const PPO_STORAGE_PEAK_BYTES: u64 = crate::feature::FEATURE_ARENA_PEAK_BYTES
 const _: () = assert!(PPO_MAX_SAMPLES == 46_520);
 const _: () = assert!(PPO_STORAGE_PEAK_BYTES < 6 * 1024 * 1024 * 1024);
 /// Maximum decisions retained from each environment in one policy update.
-pub const PPO_MAX_ROLLOUT_DECISIONS: usize = 16_384;
+/// Maximum updates between a sample's behaviour weights and the learner: one
+/// pipelined update plus an interval that straddles an update boundary.
+pub const PPO_MAX_STALENESS: u64 = 2;
 /// Maximum random draws made by one autoregressive policy sample.
 pub const PPO_MAX_POLICY_SAMPLE_DRAWS: u64 = 132;
 const PPO_REWARD_SCALE: f32 = 101.0;
@@ -62,21 +67,21 @@ pub const PPO_SHAPING_BUDGET: f32 = 100.0 / PPO_REWARD_SCALE;
 pub const PPO_TERMINAL_REWARD: f32 = 1.0;
 const _: () = assert!(PPO_TERMINAL_REWARD > PPO_SHAPING_BUDGET);
 /// Version of rollout, GAE, objective, optimizer, and reward semantics.
-pub const PPO_SCHEMA_VERSION: u32 = 40;
+pub const PPO_SCHEMA_VERSION: u32 = 41;
 /// Audited simulator and learner rules required by rollouts.
 pub const PPO_RULES_AUDIT_VERSION: u32 = 32;
 /// Canonical learner contract covered by [`PPO_SCHEMA_HASH`].
 pub const PPO_SCHEMA_DESCRIPTOR: &str = concat!(
-    "bota-drysua-ppo/v40;",
+    "bota-drysua-ppo/v41;",
     "linked_schemas=action,feature,model,map2_reward;linked_hash=fnv1a_descriptor_then_ordered_version_le32_hash_le64_then_map2_reward_descriptor_utf8;rules_audit=32;",
     "scope=map2_mid_only_dota_geometry_mid_waves_second_hero_death_or_first_tower_loss_simultaneous_draw_cap27900_including900_pregame_cap_tick_draw;",
-    "collection=annealed_complete_episodes,games_even2to40,retained1163_per_game,samples46520_max,parallel_worlds1to64,one_frozen_policy_one_PPO_update_all_retained_samples;",
-    "candidate_order=live_neural_ppo_learner_and_frozen_sharedpolicy_opponents,effective_directive_ledger_follows_all_actual_sends;teacher=original_strategy_no_learner_override;",
-    "bounds=streams1280,environments128,decisions16384,epochs16,minibatch8192,microbatch64_128_256;",
+    "collection=continuous_slots1to256_back_to_back_games,lanes_divide_slots_max64_slots_per_lane,update_due_after_whole_lane_rounds_reaching_samples_per_update_over_lanes,in_flight_intervals_continue_under_next_weights,actor_weights_lag_learner_by_pipeline_staleness_at_most2_with_boundary_intervals,per_game_opponent_mixture_teacher_frozen_weights_selfplay;",
+    "candidate_order=live_neural_ppo_learner_and_neural_opponents_by_prepared_action,effective_directive_ledger_follows_all_actual_sends;teacher=original_strategy_no_learner_override;",
+    "bounds=streams1280,samples_per_update32768,slots256,epochs16,minibatch8192,microbatch64_128_256;",
     "complete_episodes=map2_balanced_sides,retain_original_action_logprob_exact_elapsed_ticks_and_all_intervening_reward,terminal_zero_bootstrap_partial_flush,no_synthetic_zero_tick_samples,empty_optimizer_batch_rejected;lambda1=full_monte_carlo_f64_return_recurrence;",
     "terminal=win.2_loss-.2_draw0_timecap-.2,victory_time=win_only_native_ticks_full.2_to9000_linear_to0_at21600,draw_and_timecap_are_nonwins_distinct_labels,infrastructure_failure_invalidates_not_fabricated_outcome;",
     "wire_rebase=bota78427bb_missed_event_ignored_without_damage_or_healing_cheat_order_never_issued_or_honoured_NoCheats_rejected_without_reward,attack_time_ms_converted_to_ticks,bound_combat_and_collision_clearance_no_terminal_or_shaping_change;",
-    "actor=frozen_exact_policy_identity,batch_max64_single_shared_trunk_forward,side_selected_radiant_dire_actor_heads,independent_per_environment_rng_seeded_from_checkpointed_master,transactional_batch_rng,legal_masked_gumbel_max_open_f64_uniform,exact_autoregressive_log_probability_and_entropy;",
+    "actor=per_lane_weight_replica_recorded_behaviour_version,batch_max128_single_shared_trunk_forward_policy_and_selfplay_rows,side_selected_radiant_dire_actor_heads,per_game_rng_from_seed_slot_game,transactional_batch_rng,legal_masked_gumbel_max_open_f64_uniform,exact_autoregressive_log_probability_and_entropy_for_retained_rows;",
     "gae=map2_gamma_tick1_required,lambda0.98,terminal_reset,bootstrap_collector_truncation_not_task_terminal,normalized_advantages;",
     "objective=clipped_surrogate0.2,value_mse0.5,entropy0.01,target_kl0.02;",
     "critic=ppo_only_detached_value_head_input,value_head_only_regression;",
@@ -109,8 +114,8 @@ const _: () = assert!(PPO_RULES_AUDIT_VERSION == 32);
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PpoConfig {
     pub decision_interval_ticks: u32,
-    pub rollout_decisions: usize,
-    pub environments: usize,
+    /// Retained intervals that make one update due.
+    pub samples_per_update: usize,
     pub epochs: usize,
     pub minibatch: usize,
     pub clip_epsilon: f32,
@@ -130,8 +135,7 @@ impl Default for PpoConfig {
     fn default() -> Self {
         Self {
             decision_interval_ticks: 3,
-            rollout_decisions: 256,
-            environments: 32,
+            samples_per_update: 8_000,
             epochs: 4,
             minibatch: 2_048,
             clip_epsilon: 0.2,
@@ -155,20 +159,13 @@ impl PpoConfig {
         if self.decision_interval_ticks == 0 {
             return Err(PpoError::InvalidConfig("decision interval"));
         }
-        if !(1..=PPO_MAX_ROLLOUT_DECISIONS).contains(&self.rollout_decisions) {
-            return Err(PpoError::InvalidConfig("rollout decisions"));
-        }
-        if !(1..=128).contains(&self.environments) {
-            return Err(PpoError::InvalidConfig("environments"));
-        }
-        let samples = self
-            .rollout_decisions
-            .checked_mul(self.environments)
-            .ok_or(PpoError::InvalidConfig("samples per update"))?;
-        if samples > PPO_MAX_SAMPLES {
+        if !(1..=PPO_MAX_UPDATE_SAMPLES).contains(&self.samples_per_update) {
             return Err(PpoError::InvalidConfig("samples per update"));
         }
-        if self.minibatch == 0 || self.minibatch > samples || self.minibatch > MODEL_MAX_BATCH {
+        if self.minibatch == 0
+            || self.minibatch > self.samples_per_update
+            || self.minibatch > MODEL_MAX_BATCH
+        {
             return Err(PpoError::InvalidConfig("minibatch"));
         }
         if !(1..=16).contains(&self.epochs) {
@@ -176,6 +173,13 @@ impl PpoConfig {
         }
         validate_probabilities(self)?;
         Ok(self)
+    }
+
+    /// Retained intervals one update can hold: every lane closes whole rounds,
+    /// and one round closes at most two intervals per slot.
+    pub const fn rollout_capacity(self, slots: usize) -> usize {
+        assert!(slots <= PPO_MAX_SLOTS);
+        self.samples_per_update + 2 * slots
     }
 
     pub(crate) fn adam(self) -> AdamConfig {
@@ -391,7 +395,8 @@ pub struct PpoTransition {
     pub(crate) frame: FeatureFrame,
     pub(crate) target: BehavioralTarget,
     pub(crate) action: StructuredAction,
-    pub(crate) policy: PolicyIdentity,
+    /// Completed updates of the actor weights that sampled `action`.
+    pub(crate) behaviour: u64,
     pub(crate) stream: usize,
     pub(crate) decision: u32,
     pub(crate) ticks: u32,
@@ -447,12 +452,12 @@ impl PpoPolicyChoice {
     }
 
     /// Adds only bounded observable outcome data to this policy sample.
-    pub fn finish(self, outcome: PpoOutcome) -> Result<PpoTransition, PpoError> {
+    pub fn finish(self, behaviour: u64, outcome: PpoOutcome) -> Result<PpoTransition, PpoError> {
         let transition = PpoTransition {
             frame: self.frame,
             target: self.target,
             action: self.action,
-            policy: self.policy,
+            behaviour,
             stream: outcome.stream,
             decision: outcome.decision,
             ticks: outcome.ticks,
@@ -467,7 +472,7 @@ impl PpoPolicyChoice {
     }
 }
 
-fn validate_transition(transition: &PpoTransition) -> Result<(), PpoError> {
+pub(crate) fn validate_transition(transition: &PpoTransition) -> Result<(), PpoError> {
     if transition.stream >= PPO_MAX_STREAMS {
         return Err(PpoError::StreamOutOfRange {
             stream: transition.stream,
@@ -498,9 +503,8 @@ fn validate_transition(transition: &PpoTransition) -> Result<(), PpoError> {
         .map_err(|error| PpoError::Model(error.to_string()))
 }
 
-/// Fixed-capacity rollout tied to one immutable actor policy version.
+/// Fixed-capacity rollout of one update; samples carry their behaviour versions.
 pub struct PpoRollout {
-    policy: PolicyIdentity,
     capacity: usize,
     transitions: Vec<CompactPpoTransition>,
     frames: RaggedFeatureArena,
@@ -511,7 +515,7 @@ struct CompactPpoTransition {
     frame: RaggedFeatureHeader,
     target: PackedBehavioralTarget,
     action: StructuredAction,
-    policy: PolicyIdentity,
+    behaviour: u64,
     stream: usize,
     decision: u32,
     ticks: u32,
@@ -524,12 +528,11 @@ struct CompactPpoTransition {
 
 impl PpoRollout {
     /// A smaller test/collector buffer may retain fewer than a full update.
-    pub fn new(capacity: usize, policy: PolicyIdentity) -> Result<Self, PpoError> {
+    pub fn new(capacity: usize) -> Result<Self, PpoError> {
         if !(1..=PPO_MAX_SAMPLES).contains(&capacity) {
             return Err(PpoError::Capacity { capacity });
         }
         Ok(Self {
-            policy,
             capacity,
             transitions: rollout_storage(capacity)?,
             frames: RaggedFeatureArena::new(capacity).map_err(PpoError::InvalidTransition)?,
@@ -537,17 +540,8 @@ impl PpoRollout {
         })
     }
 
-    /// Reserves the complete validated update without coupling games to worlds.
-    pub fn for_config(config: PpoConfig, policy: PolicyIdentity) -> Result<Self, PpoError> {
-        let config = config.validate()?;
-        Self::new(config.environments * config.rollout_decisions, policy)
-    }
-
     pub fn push(&mut self, transition: PpoTransition) -> Result<(), PpoError> {
         validate_transition(&transition)?;
-        if transition.policy != self.policy {
-            return Err(PpoError::PolicyMismatch);
-        }
         if self.transitions.len() >= self.capacity {
             return Err(PpoError::RolloutFull {
                 capacity: self.capacity,
@@ -574,7 +568,7 @@ impl PpoRollout {
             frame,
             target: transition.target.pack(),
             action: transition.action,
-            policy: transition.policy,
+            behaviour: transition.behaviour,
             stream: transition.stream,
             decision: transition.decision,
             ticks: transition.ticks,
@@ -591,10 +585,6 @@ impl PpoRollout {
         self.transitions.len()
     }
 
-    pub const fn policy(&self) -> PolicyIdentity {
-        self.policy
-    }
-
     pub fn is_empty(&self) -> bool {
         self.transitions.is_empty()
     }
@@ -604,14 +594,7 @@ impl PpoRollout {
             return Err(PpoError::EmptyRollout);
         }
         let config = config.validate()?;
-        if self.len() > config.environments * config.rollout_decisions
-            || self.next_decision[config.environments..]
-                .iter()
-                .any(Option::is_some)
-        {
-            return Err(PpoError::InvalidConfig("rollout dimensions"));
-        }
-        prepare_batch(self.policy, self.transitions, self.frames, config)
+        prepare_batch(self.transitions, self.frames, config)
     }
 }
 
@@ -635,10 +618,8 @@ impl PpoPreparedSample {
     }
 }
 
-/// Immutable normalized update batch from one actor policy revision.
+/// Immutable normalized update batch.
 pub struct PpoBatch {
-    policy: PolicyIdentity,
-    environments: usize,
     samples: Vec<CompactPreparedSample>,
     frames: RaggedFeatureArena,
 }
@@ -716,28 +697,8 @@ impl PpoTrainer {
         &mut self,
         execution: crate::TrainingExecutionOptions,
     ) -> Result<(), PpoError> {
-        if execution.actor_pipeline_groups != 1 {
-            return Err(PpoError::InvalidConfig(
-                "actor pipeline groups requires the annealed collector",
-            ));
-        }
-        if execution.reuse_actor_values {
-            return Err(PpoError::InvalidConfig(
-                "reuse actor values requires the annealed collector",
-            ));
-        }
-        if execution.neural_opponent_batching {
-            return Err(PpoError::InvalidConfig(
-                "neural opponent batching requires the annealed collector",
-            ));
-        }
         self.execution = execution.validate()?;
         Ok(())
-    }
-
-    #[cfg(all(test, feature = "builtin"))]
-    pub(crate) const fn execution_for_test(&self) -> crate::TrainingExecutionOptions {
-        self.execution
     }
 
     pub const fn optimizer_step(&self) -> u64 {
@@ -783,6 +744,8 @@ impl PpoTrainer {
         })
     }
 
+    /// Trains one update; every sample's behaviour weights must be at most
+    /// [`PPO_MAX_STALENESS`] updates older than the learner.
     pub fn train_update(
         &mut self,
         model: &PolicyModel,
@@ -791,7 +754,12 @@ impl PpoTrainer {
         let current = model
             .policy_identity()
             .map_err(|error| PpoError::Model(error.to_string()))?;
-        if current != batch.policy || self.adam.policy_identity() != current {
+        if self.adam.policy_identity() != current
+            || batch.samples.iter().any(|sample| {
+                let behaviour = sample.transition.behaviour;
+                behaviour > self.updates || self.updates - behaviour > PPO_MAX_STALENESS
+            })
+        {
             return Err(PpoError::PolicyMismatch);
         }
         self.train_accepted_update(model, batch)
@@ -828,9 +796,7 @@ impl PpoTrainer {
     }
 
     fn validate_batch_dimensions(&self, batch: &PpoBatch) -> Result<(), PpoError> {
-        if batch.environments != self.config.environments
-            || batch.len() > self.config.environments * self.config.rollout_decisions
-        {
+        if batch.len() > self.config.rollout_capacity(PPO_MAX_SLOTS) {
             return Err(PpoError::InvalidConfig("batch dimensions"));
         }
         Ok(())
@@ -934,9 +900,6 @@ fn finish_update_report(report: &mut PpoUpdateReport, optimizer_step: u64) -> Re
 }
 
 impl PpoBatch {
-    pub const fn policy(&self) -> PolicyIdentity {
-        self.policy
-    }
     pub fn len(&self) -> usize {
         self.samples.len()
     }
@@ -1001,7 +964,6 @@ fn rollout_storage<T>(capacity: usize) -> Result<Vec<T>, PpoError> {
 }
 
 fn prepare_batch(
-    policy: PolicyIdentity,
     transitions: Vec<CompactPpoTransition>,
     frames: RaggedFeatureArena,
     config: PpoConfig,
@@ -1035,8 +997,6 @@ fn prepare_batch(
     prepared.reverse();
     normalize_advantages(&mut prepared)?;
     Ok(PpoBatch {
-        environments: config.environments,
-        policy,
         samples: prepared,
         frames,
     })
@@ -1099,7 +1059,7 @@ fn expand_transition(
             .map_err(PpoError::InvalidTransition)?,
         target: compact.target.unpack(),
         action: compact.action,
-        policy: compact.policy,
+        behaviour: compact.behaviour,
         stream: compact.stream,
         decision: compact.decision,
         ticks: compact.ticks,

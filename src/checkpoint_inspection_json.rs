@@ -7,7 +7,7 @@ pub(super) fn contract() -> Value {
         "limits": {"max_json_bytes": MAX_JSON_BYTES, "max_snapshots": MAX_SNAPSHOTS, "max_files": MAX_FILES,
             "manifest_bytes": MAX_META_BYTES, "training_tensor_bytes": MAX_TRAINING_TENSOR_BYTES,
             "runtime_tensor_bytes": MAX_RUNTIME_TENSOR_BYTES, "snapshot_bytes": 4096,
-            "max_samples": crate::PPO_MAX_SAMPLES, "max_games": crate::PPO_MAX_GAMES},
+            "max_samples": crate::PPO_MAX_SAMPLES, "max_slots": crate::PPO_MAX_SLOTS},
         "schemas": {"action": schema(ACTION_SCHEMA_VERSION, ACTION_SCHEMA_HASH),
             "feature": schema(FEATURE_SCHEMA_VERSION, FEATURE_SCHEMA_HASH),
             "reward": {"version": crate::MAP2_REWARD_VERSION},
@@ -59,8 +59,8 @@ pub(super) fn progress(artifact: &TrainingArtifact, games: Option<u64>) -> Value
 
 pub(super) fn ppo(config: PpoConfig) -> Value {
     json!({"schema_version": PPO_SCHEMA_VERSION, "schema_hash": format!("{PPO_SCHEMA_HASH:016x}"),
-        "decision_interval_ticks": config.decision_interval_ticks, "rollout_decisions": config.rollout_decisions,
-        "environments": config.environments, "epochs": config.epochs, "minibatch": config.minibatch,
+        "decision_interval_ticks": config.decision_interval_ticks,
+        "samples_per_update": config.samples_per_update, "epochs": config.epochs, "minibatch": config.minibatch,
         "clip_epsilon": f64::from(config.clip_epsilon), "value_coefficient": f64::from(config.value_coefficient),
         "entropy_coefficient": f64::from(config.entropy_coefficient), "learning_rate": f64::from(config.learning_rate),
         "adam_beta1": f64::from(config.adam_beta1), "adam_beta2": f64::from(config.adam_beta2),

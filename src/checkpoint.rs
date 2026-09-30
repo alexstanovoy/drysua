@@ -31,16 +31,16 @@ use crate::{
 
 pub use adaptive::AdaptiveEnvironmentCheckpoint;
 
-const CHECKPOINT_MAGIC: &[u8; 8] = b"DRYCKP19";
+const CHECKPOINT_MAGIC: &[u8; 8] = b"DRYCKP20";
 /// Version of the strict on-disk tensor and manifest contract.
-pub const CHECKPOINT_SCHEMA_VERSION: u32 = 19;
+pub const CHECKPOINT_SCHEMA_VERSION: u32 = 20;
 /// Canonical strict checkpoint contract descriptor.
 pub const CHECKPOINT_SCHEMA_DESCRIPTOR: &str = concat!(
-    "bota-drysua-checkpoint/v19;linked_schemas=action,feature,model,ppo;linked_hash=fnv1a_descriptor_then_ordered_version_le32_hash_le64_then_map2_reward_version_le32;files=checkpoint.safetensors,checkpoint.meta,drysua.weights.safetensors,immutable_sha256_tensor_generation;",
-    "tensors=model.parameters,adam.first_moment,adam.second_moment;dtype=f32;runtime_metadata=action_feature_model_ppo_schema_hashes,ppo_schema_version,ppo_rules_audit_version,map2_reward_version;load=exact_names_shapes_dtype_finite_schema_sha256,canonical_tensor_fallback;",
+    "bota-drysua-checkpoint/v20;linked_schemas=action,feature,model,ppo;linked_hash=fnv1a_descriptor_then_ordered_version_le32_hash_le64_then_map2_reward_version_le32;files=checkpoint.safetensors,checkpoint.meta,drysua.weights.safetensors,immutable_sha256_tensor_generation;",
+    "tensors=model.parameters,adam.first_moment,adam.second_moment,actor.parameters_f32,collection.state_u8_bounded;dtype=f32_except_collection_state;runtime_metadata=action_feature_model_ppo_schema_hashes,ppo_schema_version,ppo_rules_audit_version,map2_reward_version;load=exact_names_shapes_dtype_finite_schema_sha256,canonical_tensor_fallback;",
     "initialization=current_runtime_weights_parameters_only,optimizer_progress_rng=fresh;",
     "manifest=magic_version_hash_linked_schemas_then_git_simulator_features_command_seed_map_hero_device_batch_rules32_then_progress_rng_curriculum_league_then_ppo_config_trainer_updates_optimizer_step_shuffle_rng_tensor_sha256_then_adaptive_presence_u8_and_optional152_byte_block,no_trailing_bytes,max65536;",
-    "progress=committed_rollout_samples_le_updates_times_games_times_retained_decisions;",
+    "progress=committed_rollout_samples_le_updates_times_samples_per_update_plus_two_per_max_slot;collection=next_update_actor_version_spec_and_replayable_in_flight_slot_games;",
     "adaptive_block=le64_success_updates_success_rate_millionths_poor_updates_poor_rate_millionths_extension_millionths_base_updates_total_updates_zero_updates_generation_start_update_updates_in_generation_success_streak_poor_streak_extension_awards_snapshot_count_then_snapshot_sha256_raw32;adaptive_scope=train-annealed_only_no_league_exact_config_scope_suffix_last_once;",
     "save=immutable_generation,canonical_copy,recoverable_manifest_commit_last,file_and_directory_fsync;"
 );
@@ -59,7 +59,11 @@ const CHECKPOINT_TENSOR_FILE: &str = "checkpoint.safetensors";
 const CHECKPOINT_META_FILE: &str = "checkpoint.meta";
 const RUNTIME_TENSOR_FILE: &str = "drysua.weights.safetensors";
 const MAX_META_BYTES: u64 = 64 * 1024;
-const MAX_TRAINING_TENSOR_BYTES: u64 = MODEL_PARAMETER_COUNT as u64 * 12 + 64 * 1024;
+/// Largest encoded collection state: every slot with two full action logs.
+pub(crate) const MAX_COLLECTION_STATE_BYTES: usize =
+    64 + crate::PPO_MAX_SLOTS * (160 + 2 * 4 * crate::MAP2_ACTOR_DECISIONS);
+pub(crate) const MAX_TRAINING_TENSOR_BYTES: u64 =
+    MODEL_PARAMETER_COUNT as u64 * 16 + MAX_COLLECTION_STATE_BYTES as u64 + 64 * 1024;
 const MAX_RUNTIME_TENSOR_BYTES: u64 = MODEL_PARAMETER_COUNT as u64 * 4 + 16 * 1024;
 const MAX_TEXT_BYTES: usize = 4_096;
 const MAX_RNG_STATES: usize = 32;
@@ -231,6 +235,24 @@ struct DecodedTensors {
     parameters: Vec<f32>,
     first_moment: Vec<f32>,
     second_moment: Vec<f32>,
+    collection: CollectionCheckpoint,
+}
+
+/// A minimal collection state for checkpoint tests: the model's weights and one byte.
+#[cfg(test)]
+pub(crate) fn collection_fixture(model: &PolicyModel) -> CollectionCheckpoint {
+    CollectionCheckpoint {
+        actor: model.export_parameters().expect("fixture parameters"),
+        state: vec![1],
+    }
+}
+
+/// Collection state a resumed run starts from: the weights collecting the next
+/// update and the opaque, bounded collector encoding.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CollectionCheckpoint {
+    pub(crate) actor: Vec<f32>,
+    pub(crate) state: Vec<u8>,
 }
 
 /// Complete model, Adam, PPO, provenance, and control-plane checkpoint.
@@ -243,6 +265,7 @@ pub struct TrainingArtifact {
     shuffle: (u64, u64),
     parameters: Vec<f32>,
     optimizer: CheckpointOptimizer,
+    collection: CollectionCheckpoint,
     tensor_hash: [u8; 32],
 }
 
@@ -281,10 +304,11 @@ impl TrainingArtifact {
         trainer: &PpoTrainer,
         run: CheckpointRun,
         progress: CheckpointProgress,
+        collection: CollectionCheckpoint,
     ) -> Result<Self, CheckpointError> {
         validate_run(&run, model, trainer.config())?;
         validate_progress(&progress, trainer.updates(), trainer.config())?;
-        adaptive::validate_scope(&run, &progress, trainer.config())?;
+        adaptive::validate_scope(&run, &progress)?;
         let snapshot = trainer
             .checkpoint_snapshot(model)
             .map_err(|error| CheckpointError::Model(error.to_string()))?;
@@ -301,10 +325,16 @@ impl TrainingArtifact {
                 second_moment: second_moment.to_vec(),
                 step: snapshot.adam.step(),
             },
+            collection,
             tensor_hash: [0; 32],
         };
         artifact.validate()?;
         Ok(artifact)
+    }
+
+    /// The collection state the next update starts from.
+    pub fn collection(&self) -> &CollectionCheckpoint {
+        &self.collection
     }
 
     pub fn run(&self) -> &CheckpointRun {
@@ -403,6 +433,7 @@ impl TrainingArtifact {
         artifact.parameters = decoded.parameters;
         artifact.optimizer.first_moment = decoded.first_moment;
         artifact.optimizer.second_moment = decoded.second_moment;
+        artifact.collection = decoded.collection;
         artifact.validate()?;
         Ok(artifact)
     }
@@ -509,10 +540,17 @@ impl TrainingArtifact {
     fn validate(&self) -> Result<(), CheckpointError> {
         validate_run_without_model(&self.run, self.config)?;
         validate_progress(&self.progress, self.trainer_updates, self.config)?;
-        adaptive::validate_scope(&self.run, &self.progress, self.config)?;
+        adaptive::validate_scope(&self.run, &self.progress)?;
         validate_tensor_values("model.parameters", &self.parameters)?;
         validate_tensor_values("adam.first_moment", &self.optimizer.first_moment)?;
         validate_tensor_values("adam.second_moment", &self.optimizer.second_moment)?;
+        validate_tensor_values("actor.parameters", &self.collection.actor)?;
+        if self.collection.actor.len() != MODEL_PARAMETER_COUNT
+            || self.collection.state.is_empty()
+            || self.collection.state.len() > MAX_COLLECTION_STATE_BYTES
+        {
+            return Err(CheckpointError::TensorContract("collection state"));
+        }
         if self.parameters.len() != MODEL_PARAMETER_COUNT
             || self.optimizer.first_moment.len() != MODEL_PARAMETER_COUNT
             || self.optimizer.second_moment.len() != MODEL_PARAMETER_COUNT
@@ -647,8 +685,7 @@ fn validate_progress(
 
 fn maximum_rollout_samples(config: PpoConfig, updates: u64) -> Result<u64, CheckpointError> {
     updates
-        .checked_mul(config.environments as u64)
-        .and_then(|count| count.checked_mul(config.rollout_decisions as u64))
+        .checked_mul(config.rollout_capacity(crate::PPO_MAX_SLOTS) as u64)
         .ok_or(CheckpointError::InvalidManifest("rollout sample counter"))
 }
 
@@ -671,11 +708,15 @@ fn validate_tensor_values(name: &'static str, values: &[f32]) -> Result<(), Chec
 }
 
 fn serialize_training_tensors(artifact: &TrainingArtifact) -> Result<Vec<u8>, CheckpointError> {
-    serialize_named_tensors(&[
-        ("adam.first_moment", &artifact.optimizer.first_moment),
-        ("adam.second_moment", &artifact.optimizer.second_moment),
-        ("model.parameters", &artifact.parameters),
-    ])
+    serialize_named_tensors(
+        &[
+            ("actor.parameters", &artifact.collection.actor),
+            ("adam.first_moment", &artifact.optimizer.first_moment),
+            ("adam.second_moment", &artifact.optimizer.second_moment),
+            ("model.parameters", &artifact.parameters),
+        ],
+        Some(("collection.state", &artifact.collection.state)),
+    )
 }
 
 /// Serializes the runtime weights with metadata in canonical key order.
@@ -759,12 +800,15 @@ fn runtime_tensor_metadata_map() -> HashMap<String, String> {
         .collect()
 }
 
-fn serialize_named_tensors(tensors: &[(&str, &[f32])]) -> Result<Vec<u8>, CheckpointError> {
+fn serialize_named_tensors(
+    tensors: &[(&str, &[f32])],
+    raw: Option<(&str, &[u8])>,
+) -> Result<Vec<u8>, CheckpointError> {
     let bytes = tensors
         .iter()
         .map(|(_, values)| encode_f32(values))
         .collect::<Vec<_>>();
-    let views = tensors
+    let mut views = tensors
         .iter()
         .zip(&bytes)
         .map(|((name, values), bytes)| {
@@ -773,6 +817,13 @@ fn serialize_named_tensors(tensors: &[(&str, &[f32])]) -> Result<Vec<u8>, Checkp
         })
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| CheckpointError::Backend(error.to_string()))?;
+    if let Some((name, bytes)) = raw {
+        views.push((
+            name.to_owned(),
+            TensorView::new(Dtype::U8, vec![bytes.len()], bytes)
+                .map_err(|error| CheckpointError::Backend(error.to_string()))?,
+        ));
+    }
     serialize(views, None).map_err(|error| CheckpointError::Backend(error.to_string()))
 }
 
@@ -782,15 +833,31 @@ fn decode_training_tensors(bytes: &[u8]) -> Result<DecodedTensors, CheckpointErr
     validate_names(
         &tensors,
         &[
+            "actor.parameters",
             "adam.first_moment",
             "adam.second_moment",
+            "collection.state",
             "model.parameters",
         ],
     )?;
+    let state = tensors
+        .tensor("collection.state")
+        .map_err(|error| CheckpointError::Backend(error.to_string()))?;
+    if state.dtype() != Dtype::U8
+        || state.shape().len() != 1
+        || state.data().is_empty()
+        || state.data().len() > MAX_COLLECTION_STATE_BYTES
+    {
+        return Err(CheckpointError::TensorContract("collection state"));
+    }
     Ok(DecodedTensors {
         parameters: decode_tensor(&tensors, "model.parameters")?,
         first_moment: decode_tensor(&tensors, "adam.first_moment")?,
         second_moment: decode_tensor(&tensors, "adam.second_moment")?,
+        collection: CollectionCheckpoint {
+            actor: decode_tensor(&tensors, "actor.parameters")?,
+            state: state.data().to_vec(),
+        },
     })
 }
 
@@ -934,7 +1001,7 @@ fn decode_manifest(bytes: &[u8]) -> Result<TrainingArtifact, CheckpointError> {
         progress.adaptive_environment = Some(adaptive::decode(&mut reader)?);
     }
     reader.finish()?;
-    adaptive::validate_scope(&run, &progress, config)?;
+    adaptive::validate_scope(&run, &progress)?;
     Ok(TrainingArtifact {
         run,
         progress,
@@ -946,6 +1013,10 @@ fn decode_manifest(bytes: &[u8]) -> Result<TrainingArtifact, CheckpointError> {
             first_moment: Vec::new(),
             second_moment: Vec::new(),
             step,
+        },
+        collection: CollectionCheckpoint {
+            actor: Vec::new(),
+            state: Vec::new(),
         },
         tensor_hash,
     })
@@ -1077,12 +1148,7 @@ fn decode_progress(reader: &mut ManifestReader<'_>) -> Result<CheckpointProgress
 
 fn encode_config(writer: &mut ManifestWriter, config: PpoConfig) -> Result<(), CheckpointError> {
     writer.u32(config.decision_interval_ticks);
-    for value in [
-        config.rollout_decisions,
-        config.environments,
-        config.epochs,
-        config.minibatch,
-    ] {
+    for value in [config.samples_per_update, config.epochs, config.minibatch] {
         writer.u32(
             u32::try_from(value).map_err(|_| CheckpointError::InvalidManifest("PPO dimension"))?,
         );
@@ -1095,14 +1161,12 @@ fn encode_config(writer: &mut ManifestWriter, config: PpoConfig) -> Result<(), C
 
 fn decode_config(reader: &mut ManifestReader<'_>) -> Result<PpoConfig, CheckpointError> {
     let decision_interval_ticks = reader.u32()?;
-    let rollout_decisions = reader.u32()? as usize;
-    let environments = reader.u32()? as usize;
+    let samples_per_update = reader.u32()? as usize;
     let epochs = reader.u32()? as usize;
     let minibatch = reader.u32()? as usize;
     PpoConfig {
         decision_interval_ticks,
-        rollout_decisions,
-        environments,
+        samples_per_update,
         epochs,
         minibatch,
         clip_epsilon: reader.f32()?,

@@ -3,10 +3,10 @@ use crate::ppo::test_directory;
 
 /// Offset of the 64-byte PPO config from the end of a fixed-schedule manifest:
 /// config, four u64 counters, the tensor SHA-256 and the adaptive presence byte.
-const CONFIG_FROM_END: usize = 64 + 4 * 8 + 32 + 1;
+const CONFIG_FROM_END: usize = 60 + 4 * 8 + 32 + 1;
 
 #[test]
-fn manifest_records_current_identity_and_64_byte_config() {
+fn manifest_records_current_identity_and_60_byte_config() {
     let artifact = manifest_artifact(0, 0);
     let bytes = encode_manifest(&artifact, artifact.tensor_hash).expect("manifest");
     assert_eq!(&bytes[..8], CHECKPOINT_MAGIC);
@@ -15,9 +15,9 @@ fn manifest_records_current_identity_and_64_byte_config() {
     assert_eq!(&bytes[56..60], &crate::PPO_SCHEMA_VERSION.to_le_bytes());
     let mut writer = ManifestWriter::default();
     encode_config(&mut writer, artifact.config).expect("config");
-    assert_eq!(writer.bytes.len(), 64);
+    assert_eq!(writer.bytes.len(), 60);
     let start = bytes.len() - CONFIG_FROM_END;
-    assert_eq!(&bytes[start..start + 64], writer.bytes.as_slice());
+    assert_eq!(&bytes[start..start + 60], writer.bytes.as_slice());
     assert_eq!(bytes.last(), Some(&0));
     assert_eq!(
         decode_manifest(&bytes).expect("roundtrip").config(),
@@ -64,12 +64,12 @@ fn invalid_config_rejects_before_tensor_io() {
     let original = encoded_manifest(0, 0);
     for (offset, value, field) in [
         (0, 0u32, "PPO config"),
-        (8, 0, "PPO config"),
-        (8, crate::PPO_MAX_GAMES as u32 + 1, "PPO config"),
-        (12, 17, "PPO config"),
-        (16, 8_193, "PPO config"),
-        (32, f32::NAN.to_bits(), "PPO config"),
-        (52, 0.5f32.to_bits(), "Map2 reward discount"),
+        (4, 0, "PPO config"),
+        (4, crate::PPO_MAX_UPDATE_SAMPLES as u32 + 1, "PPO config"),
+        (8, 17, "PPO config"),
+        (12, 8_193, "PPO config"),
+        (28, f32::NAN.to_bits(), "PPO config"),
+        (48, 0.5f32.to_bits(), "Map2 reward discount"),
     ] {
         let mut encoded = original.clone();
         let start = encoded.len() - CONFIG_FROM_END + offset;
@@ -87,10 +87,15 @@ fn invalid_config_rejects_before_tensor_io() {
 
 #[test]
 fn sample_counters_accept_configured_boundary_and_reject_one_more() {
-    for (games, updates, maximum) in [(40, 0, 0), (40, 1, 46_520), (40, 3, 139_560), (2, 3, 6_978)]
-    {
+    // Each update holds its target plus at most two closed intervals per slot.
+    for (samples, updates, maximum) in [
+        (32_768, 0, 0),
+        (32_768, 1, 33_280),
+        (32_768, 3, 99_840),
+        (512, 3, 3_072),
+    ] {
         let mut artifact = manifest_artifact(updates, maximum);
-        artifact.config.environments = games;
+        artifact.config.samples_per_update = samples;
         let bytes = encode_manifest(&artifact, artifact.tensor_hash).expect("boundary");
         assert_eq!(
             decode_manifest(&bytes)
@@ -119,8 +124,14 @@ fn public_checkpoint_preserves_state_and_rejects_invalid_capture_restore() {
     let fixture = manifest_artifact(0, 0);
     let source = PolicyModel::fresh(40_008).expect("source");
     let trainer = PpoTrainer::new(&source, fixture.config, 91).expect("trainer");
-    let artifact = TrainingArtifact::capture(&source, &trainer, fixture.run, fixture.progress)
-        .expect("capture");
+    let artifact = TrainingArtifact::capture(
+        &source,
+        &trainer,
+        fixture.run,
+        fixture.progress,
+        crate::checkpoint::collection_fixture(&source),
+    )
+    .expect("capture");
     artifact.save(&directory).expect("save");
     let loaded = TrainingArtifact::load_compatible(&directory, artifact.run()).expect("load");
     let target = PolicyModel::fresh(40_009).expect("target");
@@ -161,6 +172,7 @@ fn assert_invalid_capture_restore(
         trainer,
         invalid.run.clone(),
         invalid.progress.clone(),
+        crate::checkpoint::collection_fixture(source),
     )
     .expect_err("invalid capture");
     assert_eq!(error, CheckpointError::InvalidManifest(field));
@@ -286,12 +298,11 @@ pub(super) fn manifest_artifact(updates: u64, samples: u64) -> TrainingArtifact 
             curriculum_stage: 0,
             rollout_samples: samples,
             best_evaluation: None,
-            rng_states: vec![RngCheckpoint::new("ppo_actor_sampling", 8, 40).expect("RNG")],
+            rng_states: vec![RngCheckpoint::new("league_sampling", 8, 40).expect("RNG")],
             league_references: Vec::new(),
         },
         config: PpoConfig {
-            environments: 40,
-            rollout_decisions: 1_163,
+            samples_per_update: 32_768,
             decision_interval_ticks: 3,
             epochs: 1,
             minibatch: 512,
@@ -305,6 +316,10 @@ pub(super) fn manifest_artifact(updates: u64, samples: u64) -> TrainingArtifact 
             first_moment: Vec::new(),
             second_moment: Vec::new(),
             step: 0,
+        },
+        collection: crate::CollectionCheckpoint {
+            actor: Vec::new(),
+            state: Vec::new(),
         },
         tensor_hash: [42; 32],
     }

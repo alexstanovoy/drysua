@@ -35,25 +35,9 @@ impl PpoOrderContractProbe {
             .choose(&frame, &space)
             .expect("PPO probe choice")
             .action;
-        let request = if candidate {
-            // Only the learner's request transport is tested; these placeholder
-            // statistics never enter a rollout, reward calculation or optimizer.
-            let choice = PpoPolicyChoice {
-                frame: frame.clone(),
-                action,
-                target: crate::BehavioralTarget::from_action(&frame, &space, action)
-                    .expect("probe target"),
-                policy: model.policy_identity().expect("probe policy"),
-                log_probability: 0.0,
-                entropy: 0.0,
-                value: 0.0,
-            };
-            policy_request_in_space(&mut self.0, &choice, &space).expect("PPO learner transport")
-        } else {
-            neural_policy_request_in_space(&mut self.0, action, &space)
-                .expect("legacy probe request")
-                .1
-        };
+        let request = neural_policy_request_in_space(&mut self.0, action, &space)
+            .expect("probe request")
+            .1;
         (frame, request, self.0.local.active_order())
     }
 

@@ -41,7 +41,13 @@ fn capture_requires_map2_scope_rules_and_reward_discount() {
             rules_audit_version: rules,
             ..run_metadata()
         };
-        let result = TrainingArtifact::capture(&model, &trainer, run, progress_metadata(0));
+        let result = TrainingArtifact::capture(
+            &model,
+            &trainer,
+            run,
+            progress_metadata(0),
+            crate::checkpoint::collection_fixture(&model),
+        );
         if let Some(field) = expected {
             let error = result.expect_err("invalid scope");
             assert_eq!(error, CheckpointError::InvalidManifest(field));
@@ -90,8 +96,14 @@ fn runtime_requires_every_current_identity_field_without_mutation() {
             assert_eq!(model.policy_identity().expect("identity"), identity);
             assert_eq!(model.export_parameters().expect("parameters"), parameters);
             assert_eq!(fs::read(path).expect("unchanged file"), bytes);
-            TrainingArtifact::capture(&model, &trainer, run_metadata(), progress_metadata(0))
-                .expect("optimizer binding preserved");
+            TrainingArtifact::capture(
+                &model,
+                &trainer,
+                run_metadata(),
+                progress_metadata(0),
+                crate::checkpoint::collection_fixture(&model),
+            )
+            .expect("optimizer binding preserved");
         }
     }
 }
@@ -172,10 +184,16 @@ fn strict_checkpoint_restores_adam_rng_and_identical_next_update() {
     let source = PolicyModel::fresh(18_001).expect("source");
     let mut trainer = PpoTrainer::new(&source, checkpoint_config(), 18_002).expect("trainer");
     advance_trainer(&source, &mut trainer);
-    TrainingArtifact::capture(&source, &trainer, run_metadata(), progress_metadata(1))
-        .expect("capture")
-        .save(&directory.0)
-        .expect("save");
+    TrainingArtifact::capture(
+        &source,
+        &trainer,
+        run_metadata(),
+        progress_metadata(1),
+        crate::checkpoint::collection_fixture(&source),
+    )
+    .expect("capture")
+    .save(&directory.0)
+    .expect("save");
     let loaded = TrainingArtifact::load_compatible(&directory.0, &run_metadata()).expect("load");
     let target = PolicyModel::fresh(18_003).expect("target");
     let mut state = loaded.restore(&target, &run_metadata()).expect("restore");
@@ -308,8 +326,14 @@ fn runtime_loader_rejects_symlink_artifact() {
 fn fresh_artifact() -> TrainingArtifact {
     let model = PolicyModel::fresh(18_000).expect("model");
     let trainer = PpoTrainer::new(&model, checkpoint_config(), 1).expect("trainer");
-    TrainingArtifact::capture(&model, &trainer, run_metadata(), progress_metadata(0))
-        .expect("capture")
+    TrainingArtifact::capture(
+        &model,
+        &trainer,
+        run_metadata(),
+        progress_metadata(0),
+        crate::checkpoint::collection_fixture(&model),
+    )
+    .expect("capture")
 }
 
 fn current_runtime_metadata() -> std::collections::HashMap<String, String> {
@@ -339,8 +363,7 @@ fn current_runtime_metadata() -> std::collections::HashMap<String, String> {
 fn checkpoint_config() -> PpoConfig {
     PpoConfig {
         gamma_tick: crate::MAP2_REWARD_GAMMA_TICK,
-        rollout_decisions: 1,
-        environments: 4,
+        samples_per_update: 4,
         epochs: 1,
         minibatch: 4,
         ..PpoConfig::default()
@@ -392,8 +415,7 @@ fn checkpoint_batch(
     let space = ActionSpace::from_tracker(&tracker).expect("space");
     let frame = encode(&tracker, &LocalPolicyState::new(0));
     let mut rng = PpoRng::new(seed);
-    let mut rollout =
-        PpoRollout::new(4, model.policy_identity().expect("policy")).expect("rollout");
+    let mut rollout = PpoRollout::new(4).expect("rollout");
     let mut actions = Vec::with_capacity(4);
     for stream in 0..4 {
         let choice = model.sample(&frame, &space, &mut rng).expect("choice");
@@ -401,14 +423,17 @@ fn checkpoint_batch(
         rollout
             .push(
                 choice
-                    .finish(PpoOutcome {
-                        stream,
-                        decision: 0,
-                        ticks: 3,
-                        next_value: 0.0,
-                        reward: stream as f32,
-                        terminal: true,
-                    })
+                    .finish(
+                        0,
+                        PpoOutcome {
+                            stream,
+                            decision: 0,
+                            ticks: 3,
+                            next_value: 0.0,
+                            reward: stream as f32,
+                            terminal: true,
+                        },
+                    )
                     .expect("transition"),
             )
             .expect("push");

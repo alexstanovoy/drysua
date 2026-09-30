@@ -14,9 +14,10 @@ use serde_json::{Value, json};
 
 use super::game_summary::{EndReason, GameSummary};
 use super::{
-    OpponentSpec, TrainingEnvironment, advance_interval, build_environment, derive_training_seed,
-    neural_policy_request_in_space, prepare_neural_seat_policy_sample, prepare_policy_sample,
-    reject_production_rejection, teacher_request, terminal_outcome, text_error,
+    OpponentRuntime, TrainingEnvironment, advance_interval, build_environment,
+    derive_training_seed, neural_policy_request_in_space, prepare_neural_seat_policy_sample,
+    prepare_policy_sample, reject_production_rejection, teacher_request, terminal_outcome,
+    text_error,
 };
 use crate::randomization::{ARENA_DOMAIN, OPPONENT_DOMAIN};
 use crate::{
@@ -279,17 +280,16 @@ fn start_game(
     game: PlannedGame,
     opponent: Option<&Arc<PolicyModel>>,
 ) -> Result<LiveWorld, PpoError> {
-    let spec = match opponent {
-        Some(model) => OpponentSpec::SharedPolicy(Arc::clone(model)),
-        None => OpponentSpec::Teacher,
+    let runtime = match opponent {
+        Some(_) => OpponentRuntime::Neural,
+        None => OpponentRuntime::Teacher,
     };
     let opponent_seed = derive_training_seed(game.seed, game.seat as u64, OPPONENT_DOMAIN);
     let mut environment = build_environment(
         derive_training_seed(game.seed, 0, ARENA_DOMAIN),
-        opponent_seed,
         crate::MAP2_ID,
         game.seat,
-        spec,
+        runtime,
         Vec::new(),
     )?;
     let prepared = prepare(&mut environment, opponent.is_some())?;

@@ -179,8 +179,8 @@ fn assert_sample_parity(
 
 fn assert_dispatch_errors(device: PolicyDevice) {
     let model = uniform_kind_model(device);
-    let (frames, spaces) = inputs(65);
-    let mut random = vec![PpoRng::new(7); 65];
+    let (frames, spaces) = inputs(crate::MODEL_SAMPLING_BATCH + 1);
+    let mut random = vec![PpoRng::new(7); crate::MODEL_SAMPLING_BATCH + 1];
     let before = random.clone();
     take_sampling_dispatches_for_test();
     assert_eq!(
@@ -188,7 +188,7 @@ fn assert_dispatch_errors(device: PolicyDevice) {
             .sample_batch(&frames, &spaces, &mut random)
             .expect_err("batch bound")
             .to_string(),
-        "model batch count 65 exceeds maximum 64"
+        "model batch count 129 exceeds maximum 128"
     );
     assert_eq!(random, before);
     assert_eq!(take_sampling_dispatches_for_test(), (0, 0));
@@ -293,7 +293,7 @@ fn seed_for_kind(kind: ActionKind) -> u64 {
 }
 
 fn inputs(count: usize) -> (Vec<FeatureFrame>, Vec<ActionSpace>) {
-    assert!((1..=65).contains(&count));
+    assert!((1..=crate::MODEL_SAMPLING_BATCH + 1).contains(&count));
     (0..count)
         .map(|index| {
             let mut view = action::world_view(100 + index as u32);

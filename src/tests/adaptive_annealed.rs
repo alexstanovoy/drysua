@@ -84,7 +84,8 @@ fn early_success_at_update_two_resumes_with_the_actual_generation_start() {
         }
     );
     assert_eq!(boundary.snapshot_count, 1);
-    assert_eq!(generation_files(&resumed).len(), 1);
+    // The pipelined update three was already published under generation one.
+    assert_eq!(generation_files(&resumed).len(), 2);
     run_with(config, fixture, &resumed, true).expect("resume early transition");
     let final_state = controller(&resumed);
     assert_eq!(final_state.state.start_update, 2);
@@ -138,62 +139,6 @@ fn clean_boundary_at_update_six_discards_a_long_extension_before_nominal_collect
     assert!(generations[1].1.contains("\"start_update\":6"));
     assert!(generations[1].1.contains("\"scale_bp\":0,"));
     assert_ne!(final_state.snapshot_hash, extended.snapshot_hash);
-    std::fs::remove_dir_all(directory).expect("own cleanup");
-}
-
-#[test]
-fn interrupted_adaptive_update_restores_exact_model_adam_rng_controller_and_snapshots() {
-    let baseline = test_directory("adaptive-interrupted-baseline");
-    let resumed = test_directory("adaptive-interrupted-resumed");
-    let mut config = adaptive_settings();
-    config.updates = 3;
-    config.zero_updates = 0;
-    config.games_per_generation = 2;
-    let fixture = outcome_harness(&[1, 1, 1]);
-    run_with(config.clone(), fixture, &baseline, false).expect("baseline native PPO");
-    run_to(&config, fixture, &resumed, 1, false);
-    let before = TrainingArtifact::load(&resumed).expect("saved update one");
-    let digests = checkpoint_digests(&resumed);
-    assert_eq!(before.progress().global_update, 1);
-    assert_eq!(controller(&resumed).state.start_update, 1);
-    let error = run_with(
-        config.clone(),
-        AnnealedHarness {
-            stop_after_games: Some(2),
-            ..fixture
-        },
-        &resumed,
-        true,
-    )
-    .expect_err("stop collected games before PPO commit");
-    assert_eq!(
-        error.to_string(),
-        "invalid PPO transition: annealed invocation stopped mid-update"
-    );
-    assert_eq!(checkpoint_digests(&resumed), digests);
-    assert_eq!(
-        TrainingArtifact::load(&resumed)
-            .expect("unchanged artifact")
-            .progress(),
-        before.progress()
-    );
-    run_with(config, fixture, &resumed, true).expect("replay uncommitted adaptive generation");
-    assert_same_training(&baseline, &resumed, PolicyDevice::Cpu);
-    for directory in [baseline, resumed] {
-        std::fs::remove_dir_all(directory).expect("own cleanup");
-    }
-}
-
-#[test]
-fn shortened_native_collection_without_outcome_fixture_rejects_incomplete_results() {
-    let directory = test_directory("adaptive-incomplete-outcomes");
-    let error = run(adaptive_settings(), &directory, false)
-        .expect_err("short native collector has no complete match outcomes");
-    let message = error.to_string();
-    assert!(message.contains("adaptive"), "{message}");
-    assert!(message.contains("outcomes"), "{message}");
-    assert!(!directory.join("checkpoint.meta").exists());
-    assert!(!directory.join("checkpoint.safetensors").exists());
     std::fs::remove_dir_all(directory).expect("own cleanup");
 }
 
@@ -328,7 +273,8 @@ fn cuda_full_native_adaptive_resume_preserves_exact_training_state() {
     let mut config = adaptive_settings();
     config.updates = 2;
     config.zero_updates = 0;
-    config.ppo.minibatch = 2048;
+    config.ppo.samples_per_update = 256;
+    config.ppo.minibatch = 128;
     let device = PolicyDevice::Cuda { ordinal: 0 };
     let execute = |config: AnnealedJobConfig, directory: &Path, resume| {
         run_annealed_job_harnessed(
@@ -357,7 +303,7 @@ fn adaptive_settings() -> AnnealedJobConfig {
     let mut config = settings(0xa6a9, 8);
     config.environment_schedule =
         EnvironmentSchedule::Adaptive(AdaptiveEnvironmentConfig::default());
-    config.games_per_generation = 8;
+    config.generation_updates = 4;
     config.zero_updates = 2;
     config
 }
@@ -373,14 +319,10 @@ fn cuda_side_actors_update_both_heads_and_resume_exactly() {
     let mut config = adaptive_settings();
     config.updates = 2;
     config.zero_updates = 0;
-    config.games_per_update = 4;
-    config.parallel_worlds = 2;
-    config.games_per_generation = 16;
-    config.ppo.environments = 4;
-    config.ppo.minibatch = 2048;
-    config.execution.actor_pipeline_groups = 2;
+    config.slots = 4;
+    config.ppo.samples_per_update = 256;
+    config.ppo.minibatch = 128;
     config.execution.training_microbatch = 256;
-    config.execution.reuse_actor_values = true;
     let device = PolicyDevice::Cuda { ordinal: 0 };
     let initial = PolicyModel::fresh(0x5a1d).unwrap();
     TrainingArtifact::save_runtime_weights(&initial, source).unwrap();
@@ -418,7 +360,7 @@ fn cuda_side_actors_update_both_heads_and_resume_exactly() {
     );
     assert!(changed(1_700_020..1_812_983), "Dire actor must train");
     eprintln!(
-        "side-actor-native parameters=1812983 tensors=86 balanced_games_per_update=4 groups=2 microbatch=256 reuse=true both_actor_heads_changed=true exact_model_adam_rng_controller_snapshots_resume=true"
+        "side-actor-native parameters=1812983 tensors=86 slots=4 lanes=2 microbatch=256 both_actor_heads_changed=true exact_model_adam_rng_controller_snapshots_resume=true"
     );
     for directory in [baseline, resumed, weights] {
         std::fs::remove_dir_all(directory).unwrap();

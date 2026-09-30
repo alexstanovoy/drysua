@@ -21,8 +21,8 @@ fn public_cli_accepts_play_training_and_initialization_contracts() {
         );
     }
     for arguments in [
-        "drysua train-annealed --updates 10000 --generation-games 40 --history-directory training/history --history-every 20 --checkpoint-directory training/run --resume --device cuda --device-ordinal 1",
-        "drysua train-annealed --updates 8 --games 2 --parallel 2 --generation-games 2 --checkpoint-directory training/run --initial-weights training/pretrain",
+        "drysua train-annealed --updates 10000 --generation-updates 4 --history-directory training/history --history-every 20 --checkpoint-directory training/run --resume --device cuda --device-ordinal 1",
+        "drysua train-annealed --updates 8 --slots 2 --lanes 1 --samples-per-update 64 --opponent teacher:0.5 --opponent self:0.5 --generation-updates 1 --checkpoint-directory training/run --initial-weights training/pretrain",
     ] {
         crate::cli::parse_from(arguments.split_ascii_whitespace()).expect(arguments);
     }
@@ -38,7 +38,7 @@ fn public_cli_rejects_invalid_policies_and_conflicting_training_sources() {
         ("drysua --hero 2", "unexpected argument '--hero'"),
         ("drysua --policy neural", "--weights-directory"),
         (
-            "drysua train-annealed --updates 1 --generation-games 40 --checkpoint-directory . --initial-weights training/pretrain --resume",
+            "drysua train-annealed --updates 1 --generation-updates 4 --checkpoint-directory . --initial-weights training/pretrain --resume",
             "cannot be used with '--resume'",
         ),
     ] {
@@ -120,13 +120,9 @@ fn train_annealed_configuration_rejects_invalid_hyperparameters_before_execution
     let base = [
         "--updates",
         "1",
-        "--games",
+        "--slots",
         "2",
-        "--parallel",
-        "2",
-        "--generation-games",
-        "2",
-        "--actor-pipeline-groups",
+        "--generation-updates",
         "1",
     ];
     for (flags, field) in [

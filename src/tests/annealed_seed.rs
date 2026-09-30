@@ -5,18 +5,20 @@ use super::*;
 const PROFILE: &[&str] = &[
     "--updates",
     "2",
-    "--games",
-    "2",
-    "--parallel",
-    "2",
-    "--actor-pipeline-groups",
+    "--generation-updates",
     "1",
-    "--training-microbatch",
-    "64",
-    "--generation-games",
-    "2",
     "--environment-schedule",
     "fixed",
+    "--slots",
+    "2",
+    "--samples-per-update",
+    "6",
+    "--minibatch",
+    "3",
+    "--epochs",
+    "1",
+    "--simulation-threads",
+    "2",
 ];
 
 #[test]
@@ -31,7 +33,8 @@ fn explicit_annealed_seed_is_honored() {
 fn fresh_annealed_run_without_a_seed_records_the_resolved_seed_in_scope() {
     let options = crate::cli::annealed_settings_for_test_without_seed(PROFILE)
         .expect("fresh settings without an explicit seed");
-    let run = annealed_run(&options, PolicyDevice::Cpu, options.ppo, harness(), None)
+    let pool = load_opponents(&options).expect("opponents");
+    let run = annealed_run(&options, PolicyDevice::Cpu, options.ppo, harness(), &pool)
         .expect("fresh scope");
     assert_eq!(run.run_seed, options.seed);
     assert!(

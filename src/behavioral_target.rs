@@ -359,6 +359,24 @@ impl BehavioralTarget {
         Ok(target)
     }
 
+    /// Target of an action the model sampled from `space`; the frame was validated
+    /// against the same space when its encoder row was packed.
+    pub(crate) fn from_sampled_action(
+        space: &ActionSpace,
+        action: StructuredAction,
+    ) -> Result<Self, ImitationError> {
+        if !space.allows(action) || space.decode(action).is_err() {
+            return Err(ImitationError::ActionNotAllowed {
+                role: "teacher",
+                kind: action.kind(),
+            });
+        }
+        let mut target = Self::base(space, action);
+        target.map_action(space, action)?;
+        target.validate()?;
+        Ok(target)
+    }
+
     fn base(space: &ActionSpace, action: StructuredAction) -> Self {
         Self {
             kind: HeadTarget::active(*space.kind_mask().as_array(), action.kind().index()),

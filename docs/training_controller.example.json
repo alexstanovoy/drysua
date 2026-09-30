@@ -14,12 +14,11 @@
   "lock_paths": ["/home/alexstanovoy/Workspace/bots/drysua/heavy.lock"],
   "memory_gib": 12,
   "training_args": [
-    "--games", "16",
-    "--parallel", "8",
-    "--actor-pipeline-groups", "2",
+    "--samples-per-update", "8000",
+    "--slots", "64",
+    "--lanes", "2",
     "--training-microbatch", "256",
-    "--reuse-actor-values=true",
-    "--generation-games", "64",
+    "--generation-updates", "4",
     "--zero-updates", "40",
     "--environment-schedule", "adaptive"
   ]

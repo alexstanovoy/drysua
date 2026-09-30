@@ -125,7 +125,7 @@ fn adaptive_config_and_limits_are_bound_to_all_canonical_scope_values() {
         (2, 2, "adaptive environment scope suffix"),
         (3, 199_999, "adaptive environment scope suffix"),
         (4, 749_999, "adaptive environment scope suffix"),
-        (5, 4, "adaptive environment generation-games scope"),
+        (5, 4, "adaptive environment generation-updates scope"),
         (6, 9, "adaptive environment updates scope"),
         (7, 1, "adaptive environment zero-updates scope"),
     ] {
@@ -172,11 +172,10 @@ fn adaptive_scope_rejects_missing_duplicate_unbounded_or_noncanonical_tokens() {
             "adaptive environment zero-updates scope",
         ),
         (
-            "--generation-games 6",
-            "--generation-games 7",
-            "adaptive environment generation-games scope",
+            "--generation-updates 3",
+            "--generation-updates 4",
+            "adaptive environment generation-updates scope",
         ),
-        ("--games 2", "--games 4", "adaptive environment games scope"),
         (
             "--environment-success-rate 0.8",
             "--environment-success-rate .8",
@@ -308,8 +307,14 @@ fn adaptive_capture_save_restore_carries_model_adam_rng_and_rejects_without_muta
     let fixture = fixture();
     let source = PolicyModel::fresh(51_001).expect("source");
     let trainer = PpoTrainer::new(&source, fixture.config, 91).expect("trainer");
-    let artifact = TrainingArtifact::capture(&source, &trainer, fixture.run, fixture.progress)
-        .expect("capture");
+    let artifact = TrainingArtifact::capture(
+        &source,
+        &trainer,
+        fixture.run,
+        fixture.progress,
+        crate::checkpoint::collection_fixture(&source),
+    )
+    .expect("capture");
     artifact.save(&directory).expect("save");
     let loaded = TrainingArtifact::load_compatible(&directory, artifact.run()).expect("load");
     let target = PolicyModel::fresh(51_002).expect("target");
@@ -337,8 +342,14 @@ fn adaptive_capture_save_restore_carries_model_adam_rng_and_rejects_without_muta
         assert_eq!(target.export_parameters().expect("after"), before);
         assert_eq!(target.policy_identity().expect("identity after"), identity);
         assert_eq!(
-            TrainingArtifact::capture(&source, &trainer, invalid.run, invalid.progress)
-                .expect_err("capture rejects"),
+            TrainingArtifact::capture(
+                &source,
+                &trainer,
+                invalid.run,
+                invalid.progress,
+                crate::checkpoint::collection_fixture(&source)
+            )
+            .expect_err("capture rejects"),
             error
         );
     }
@@ -410,12 +421,9 @@ fn observe(artifact: &mut TrainingArtifact, update: u64, wins: u64) {
 
 fn fixture() -> TrainingArtifact {
     let mut artifact = capacity_tests::manifest_artifact(0, 0);
-    artifact.config.environments = 2;
     let config = AdaptiveEnvironmentConfig::default();
     artifact.run.command_line = format!(
-        "train-annealed --updates 8 --games {} --generation-games {} --zero-updates 2{}",
-        artifact.config.environments,
-        3 * artifact.config.environments,
+        "train-annealed --updates 8 --generation-updates 3 --zero-updates 2{}",
         config.scope_suffix()
     );
     artifact.progress.adaptive_environment = Some(AdaptiveEnvironmentCheckpoint {

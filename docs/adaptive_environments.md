@@ -13,40 +13,19 @@ training state or generation history is changed.
 For an already existing, empty checkpoint directory:
 
 ```sh
-drysua train-annealed --updates 200 --games 40 --parallel 20 \
-  --generation-games 160 --checkpoint-directory artifacts/my-new-run \
+drysua train-annealed --updates 200 --generation-updates 4 \
+  --checkpoint-directory artifacts/my-new-run --device cuda \
   --environment-schedule adaptive \
   --environment-success-updates 2 --environment-success-rate .8 \
   --environment-poor-updates 1 --environment-poor-rate .2 \
   --environment-extension .75
 ```
 
-This is M40/B20 with a base budget of four updates per environment. The schedule,
-all five environment tuning flags, `--games 40`, and `--parallel 20` may be omitted;
-these are their defaults. `--generation-games` remains required, with no new default.
-
-The five `train-annealed` execution defaults are:
-
-| Flag | CLI default | Meaning |
-| --- | --- | --- |
-| `--games` | `40` | Games per PPO update (M). |
-| `--parallel` | `20` | Worlds per actor group (B), independent of CPU count. |
-| `--actor-pipeline-groups` | `2` | Actor groups per wave (G); the default wave has 40 live worlds. |
-| `--training-microbatch` | `256` | Tensor rows per PPO gradient / candidate-KL pass, not the effective Adam minibatch. |
-| `--reuse-actor-values` | `true` | Reuse next-actor bootstrap values. Bare `--reuse-actor-values` and `--reuse-actor-values=true` enable it; `--reuse-actor-values=false` disables it. |
-
-These are CLI defaults, not changes to the library defaults. The learner backend
-still defaults to **CPU**; add **`--device cuda`** to select the measured CUDA
-profile. The execution defaults do not imply a backend switch or a measured CPU
-speedup. PPO rewards and optimizer defaults, host-math workers (`1`), balanced
-minibatches (`false`), and the adaptive schedule defaults below are unchanged.
-
-There is no automatic CPU-count or greatest-common-divisor choice for `--parallel`.
-When overriding dimensions, B must divide both game counts, and B times G must
-divide M and be at most 64. For example, M40/B10/G4 is valid; reducing M to 8 while
-leaving B20 is not. G2/G4 require a Teacher opponent; a weights opponent requires
-explicit `--actor-pipeline-groups 1`. See
-[training microbatches](training_microbatch.md) for numerical scope and library defaults.
+Generations are counted in updates: the base budget is four updates per
+environment. The schedule and all five environment tuning flags may be omitted;
+these are their defaults. `--generation-updates` is required. Collection flags
+(`--samples-per-update`, `--slots`, `--lanes`, `--opponent`) are described in
+[continuous collection](continuous_collection.md).
 
 The adaptive environment tuning defaults remain:
 
@@ -58,14 +37,12 @@ The adaptive environment tuning defaults remain:
 | `--environment-poor-rate Q` | `0.2` | Inclusive per-update poor win-rate threshold, `[0, 1]`. |
 | `--environment-extension X` | `0.75` | Exact extra-update credit per award, `0..=MAX_TRAINING_COUNTER`. |
 
-Adaptive generations start with `--generation-games / --games` updates. Both
-dimensions must be positive, and generation games must be a **whole multiple**
-of games per update. The base update budget may exceed the total run budget,
+Adaptive generations start with `--generation-updates` updates, which must be
+positive. The base update budget may exceed the total run budget,
 but must fit `MAX_TRAINING_COUNTER`. Total updates must be positive and fit the
 same bound; `--zero-updates` may cover none or all of the run, but not exceed
 total updates. Its existing default remains one fifth of total updates, rounded
-up. Existing global game, sample, optimizer, and parallel-world bounds still
-apply independently.
+up. Existing global sample, optimizer and slot bounds still apply independently.
 
 Rates and credit use exact millionths, never binary floating point. Accepted
 forms include `.8`, `0.8`, and `0.800000`; all have the canonical representation
@@ -77,9 +54,12 @@ is no local cap at one or at the base budget. The full exact value, including
 its fraction, must fit the global bound.
 
 After each successful PPO update, the scheduler uses that update's terminal wins
-divided by `--games`. Draws and task timeouts are non-wins. A partial collection
-or failed PPO update cannot advance the persisted controller. Production requires
-all games to have complete, unrejected native outcomes.
+divided by the games that finished while the update was collected. Draws and task
+timeouts are non-wins; an update in which no game finished carries no signal and
+breaks both streaks. A failed PPO update cannot advance the persisted controller.
+Collection runs ahead of the learner by the pipeline depth, so a transition decided
+after update `u` first applies to games that start while update `u + 2` is
+collected.
 
 Each of the last `N` updates in the **current environment** must independently
 meet `win_rate >= P`; their average is not used. With defaults, `.7, .9` does not
@@ -109,12 +89,12 @@ with two exact decimals:
 
 ```sh
 # Default: full variance at the first update, zero across the clean tail.
-drysua train-annealed --updates 200 --generation-games 32 ...
+drysua train-annealed --updates 200 --generation-updates 4 ...
 # Rise from a clean start to twice full variance.
-drysua train-annealed --updates 200 --generation-games 32 \
+drysua train-annealed --updates 200 --generation-updates 4 \
   --environment-scale-start 0 --environment-scale-end 2 ...
 # Hold one constant scale for the whole run (equal endpoints).
-drysua train-annealed --updates 200 --generation-games 32 \
+drysua train-annealed --updates 200 --generation-updates 4 \
   --environment-scale-start 0.5 --environment-scale-end 0.5 ...
 ```
 
@@ -160,40 +140,13 @@ drysua train-annealed --updates 200 --generation-games 32 \
 
 `train-full` is unchanged and keeps its fixed default seed.
 
-## Legacy fixed resume
+## Fixed schedule
 
-Retain all of the checkpoint's original arguments and add the fixed selector.
-For a CPU run originally using M8/B2, one actor group, microbatch 64, no actor-value
-reuse, one host-math worker, and unbalanced minibatches:
-
-```sh
-drysua train-annealed --updates 20 --games 8 --parallel 2 \
-  --generation-games 12 --checkpoint-directory artifacts/my-legacy-run \
-  --actor-pipeline-groups 1 --training-microbatch 64 \
-  --reuse-actor-values=false --host-math-workers 1 --device cpu \
-  --resume --environment-schedule fixed
-```
-
-Omit `--balanced-minibatches` only when it was originally disabled, as here. Keep
-the original device, seed, zero-update budget, PPO options, opponent, and any
-nondefault execution flags too. An old M8/B8 run needs explicit `--parallel 8`,
-not the B2 in this example. `--resume` does not restore old CLI defaults: selecting
-fixed alone does not restore M8/B8/G1/micro64/reuse=false. G1, micro64, and reuse=false
-still have their historical scope encoding (no execution suffix for those values).
-
-Fixed mode retains legacy generation boundaries on the global game counter.
-For example, 12 generation games and 8 games per update are allowed when the
-existing parallel divisor is valid (2 here). Fixed mode rejects **every
-explicit adaptive tuning flag**, even if its value equals the adaptive default;
-omit all five, rather than relying on them being ignored.
-
-The fixed selector preserves historical command-scope encoding; adaptive
-configuration is appended canonically by the runtime. Equivalent decimal
-spellings therefore do not create distinct adaptive scopes. An omitted schedule
-on a legacy resume still selects adaptive and must not silently continue that
-fixed checkpoint. An adaptive checkpoint also requires its original execution
-arguments on resume, with compatible build provenance; changing CLI defaults does
-not migrate either kind of run.
+`--environment-schedule fixed` draws one generation every `--generation-updates`
+updates on the update counter and rejects **every explicit adaptive tuning flag**,
+even if its value equals the adaptive default. A resume must repeat the original
+schedule, seed and collection arguments; the strict run-scope comparison rejects
+any change before training state or generation history is touched.
 
 ## Checkpoint and generation recovery
 

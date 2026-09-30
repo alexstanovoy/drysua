@@ -97,8 +97,7 @@ mod tests {
     #[test]
     fn short_default_and_balanced_updates_cover_every_row_with_different_boundaries() {
         let config = PpoConfig {
-            environments: 1,
-            rollout_decisions: 9,
+            samples_per_update: 9,
             minibatch: 4,
             epochs: 2,
             target_kl: 1000.0,
@@ -156,10 +155,9 @@ mod tests {
     }
 
     #[test]
-    fn balanced_trainer_restores_data_rejects_stale_batch_and_optimizes_fresh_rollout() {
+    fn balanced_trainer_rolls_back_a_failed_update_and_replays_the_restored_batch() {
         let config = PpoConfig {
-            environments: 1,
-            rollout_decisions: 9,
+            samples_per_update: 9,
             minibatch: 4,
             epochs: 2,
             target_kl: 1000.0,
@@ -193,24 +191,13 @@ mod tests {
         assert_eq!(restored.adam.moments(), before.adam.moments());
         assert_eq!(restored.adam.config(), before.adam.config());
         assert_eq!(restored.adam.step(), before.adam.step());
-        // Rollback advances identity even when parameters and optimizer data are restored.
-        assert!(restored.adam.policy_identity().revision() > batch.policy().revision());
         assert_eq!(trainer.rng_checkpoint(), PpoRng::new(19).checkpoint());
         assert_eq!(trainer.updates(), 0);
+        // A restored batch replays the rolled-back update from identical state.
         batch.samples[tail].transition.frame = frame;
-        let error = trainer
+        let report = trainer
             .train_update(&model, &batch)
-            .expect_err("stale rollout");
-        assert_eq!(error, PpoError::PolicyMismatch);
-        assert_eq!(error.to_string(), "PPO rollout policy identity is stale");
-        assert_eq!(
-            trainer.checkpoint_snapshot(&model).expect("stale"),
-            restored
-        );
-        assert_eq!(trainer.rng_checkpoint(), PpoRng::new(19).checkpoint());
-        let fresh = sampled_batch(&model, config);
-        assert_eq!(fresh.policy(), restored.adam.policy_identity());
-        let report = trainer.train_update(&model, &fresh).expect("fresh rollout");
+            .expect("restored rollout");
         assert_eq!(report.samples_optimized, 18);
         assert_eq!(report.minibatches, 6);
         assert_eq!((report.optimizer_step, trainer.optimizer_step()), (6, 6));
@@ -224,18 +211,21 @@ mod tests {
 
     fn sampled_batch(model: &PolicyModel, config: PpoConfig) -> PpoBatch {
         let choice = choice(model);
-        let mut rollout = PpoRollout::for_config(config, choice.policy()).expect("rollout");
+        let mut rollout = PpoRollout::new(config.samples_per_update).expect("rollout");
         for decision in 0..9 {
             let transition = choice
                 .clone()
-                .finish(PpoOutcome {
-                    stream: 0,
-                    decision,
-                    ticks: 3,
-                    next_value: 0.0,
-                    reward: decision as f32 + 1.0,
-                    terminal: true,
-                })
+                .finish(
+                    0,
+                    PpoOutcome {
+                        stream: 0,
+                        decision,
+                        ticks: 3,
+                        next_value: 0.0,
+                        reward: decision as f32 + 1.0,
+                        terminal: true,
+                    },
+                )
                 .expect("transition");
             rollout.push(transition).expect("push");
         }
