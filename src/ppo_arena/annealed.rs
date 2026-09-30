@@ -600,6 +600,9 @@ fn annealed_run(
             config.entropy_coefficient
         ));
     }
+    if config.target_kl != defaults.target_kl {
+        command_line.push_str(&format!(" --target-kl {}", config.target_kl));
+    }
     if config.value_coefficient != defaults.value_coefficient {
         command_line.push_str(&format!(
             " --value-coefficient {}",

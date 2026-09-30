@@ -295,6 +295,10 @@ struct OptimizerArgs {
     /// Value loss coefficient; must be finite and positive.
     #[arg(long, default_value_t = crate::PpoConfig::default().value_coefficient)]
     value_coefficient: f32,
+    /// Largest sampled KL to the behaviour policy an Adam step may start from or
+    /// end at; a strong imitation term needs more room than PPO alone.
+    #[arg(long, default_value_t = crate::PpoConfig::default().target_kl)]
+    target_kl: f32,
 }
 
 /// Persistence controls; a run cannot initialize and resume together.
@@ -931,6 +935,7 @@ impl OptimizerArgs {
             gae_lambda_tick: self.gae_lambda_tick,
             entropy_coefficient: self.entropy_coefficient,
             value_coefficient: self.value_coefficient,
+            target_kl: self.target_kl,
             ..config
         }
     }

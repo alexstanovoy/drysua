@@ -179,7 +179,10 @@ a resume recomputes them exactly.
   `ppo_update` line adds `imitation_coefficient`, `imitation_loss` (mean cross
   entropy per labeled row), `imitation_labeled` and the agreement of the policy's
   legal argmax with the label: `imitation_agree` for whole actions and
-  `imitation_agree_<head>` per head.
+  `imitation_agree_<head>` per head. The PPO KL guard (`--target-kl`, default
+  0.02) measures the KL to the 1-stale behaviour policy and ends an update once a
+  step starts from or reaches it; a strong imitation term moves the policy much
+  faster than that, so raise it while β is large.
 - `--critic-warmup-updates K`: updates `0..K` train only the value head (read from
   the detached trunk); every other parameter keeps its bits. Useful after a change
   that invalidates the critic, e.g. new rewards or inputs.
