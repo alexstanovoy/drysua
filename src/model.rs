@@ -191,7 +191,7 @@ pub const MODEL_SCHEMA_HASH: u64 = linked_schema_hash(
 /// Exact number of F32 parameters in the model layout.
 pub const MODEL_PARAMETER_COUNT: usize = 1_812_983;
 
-const _: () = assert!(FEATURE_SCHEMA_VERSION == 24);
+const _: () = assert!(FEATURE_SCHEMA_VERSION == 25);
 const _: () = assert!(crate::ACTION_SCHEMA_VERSION == 7);
 const _: () = assert!(GLOBAL_FEATURES == 92);
 const _: () = assert!(UNIT_FEATURES == 84);

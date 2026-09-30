@@ -935,11 +935,7 @@ impl StateTracker {
         let axis = self.metadata.terrain_cells as usize;
         view.units
             .iter()
-            .filter(|unit| {
-                unit.team == self.team
-                    && unit.hp > 0
-                    && unit.statuses.bits & bota_proto::StatusFlags::DEAD == 0
-            })
+            .filter(|unit| unit.team == self.team && unit.hp > 0)
             .any(|viewer| position_visible_from(&self.terrain, &self.opaque, axis, viewer, target))
     }
 
@@ -959,7 +955,6 @@ impl StateTracker {
         view.units.iter().any(|unit| {
             unit.team == self.team
                 && unit.hp > 0
-                && unit.statuses.bits & bota_proto::StatusFlags::DEAD == 0
                 && position_cell_xy(axis, unit.pos).is_some_and(|viewer_cell| {
                     viewer_cell.0.abs_diff(target_cell.0) <= 1
                         && viewer_cell.1.abs_diff(target_cell.1) <= 1

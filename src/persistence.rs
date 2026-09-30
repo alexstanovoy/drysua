@@ -5,7 +5,7 @@ use std::fmt;
 #[path = "training_order_bookkeeping.rs"]
 pub(crate) mod training;
 
-use bota_proto::{AbilityId, Aim, EntityId, Order, StatusFlags, Target, UnitView};
+use bota_proto::{AbilityId, Aim, EntityId, Order, Target, UnitView};
 
 use crate::{
     ActionKind, ActivePolicyOrder, ActivePolicyTarget, IssuedOrder, LocalPolicyError,
@@ -396,7 +396,7 @@ fn controlled_body_alive(tracker: &StateTracker, unit: Option<EntityId>) -> bool
 }
 
 fn unit_alive(unit: &UnitView) -> bool {
-    unit.hp > 0 && unit.statuses.bits & StatusFlags::DEAD == 0
+    unit.hp > 0
 }
 
 pub(crate) fn active_order_update_for_sent(

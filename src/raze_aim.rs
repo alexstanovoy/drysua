@@ -232,7 +232,7 @@ fn visible_unit(tracker: &StateTracker, id: EntityId) -> Option<&UnitView> {
 }
 
 fn alive(unit: &UnitView) -> bool {
-    unit.hp > 0 && unit.statuses.bits & bota_proto::StatusFlags::DEAD == 0
+    unit.hp > 0
 }
 
 pub(crate) fn predicted_position(tracker: &StateTracker, unit: &UnitView) -> Vec2 {

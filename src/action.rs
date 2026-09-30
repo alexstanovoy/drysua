@@ -1406,7 +1406,7 @@ impl StaticPassability {
 
 fn live_state(passability: &StaticPassability, unit: Option<&UnitView>) -> Option<ControlledState> {
     let unit = unit?;
-    if unit.hp <= 0 || has_status(unit, StatusFlags::DEAD) {
+    if unit.hp <= 0 {
         return None;
     }
     Some(ControlledState {
@@ -1421,11 +1421,7 @@ fn build_entity_candidates(
     current: &WorldView,
     center: Option<Vec2>,
 ) -> Vec<EntityCandidate> {
-    let mut selected: Vec<&UnitView> = current
-        .units
-        .iter()
-        .filter(|unit| unit.hp > 0 && !has_status(unit, StatusFlags::DEAD))
-        .collect();
+    let mut selected: Vec<&UnitView> = current.units.iter().filter(|unit| unit.hp > 0).collect();
     selected.sort_by_key(|unit| entity_priority(tracker, unit, center));
     selected.truncate(UNIT_TOKENS);
     let mut output = Vec::with_capacity(UNIT_TOKENS);
@@ -2252,12 +2248,9 @@ fn build_controlled_masks(space: &ActionSpace, unit: ControlledUnit) -> Controll
     let Some(state) = &space.controlled[unit.index()] else {
         return masks;
     };
-    let movement_enabled = !has_status(&state.unit, StatusFlags::STUNNED)
-        && !has_status(&state.unit, StatusFlags::ROOTED);
-    let attack_enabled = !has_status(&state.unit, StatusFlags::STUNNED)
-        && !has_status(&state.unit, StatusFlags::DISARMED);
+    let enabled = !has_status(&state.unit, StatusFlags::STUNNED);
     masks.stop = true;
-    fill_body_masks(space, state, movement_enabled, attack_enabled, &mut masks);
+    fill_body_masks(space, state, enabled, &mut masks);
     fill_cast_masks(space, state, &mut masks);
     fill_use_masks(space, state, unit, &mut masks);
     fill_put_masks(space, state, unit, &mut masks);
@@ -2268,23 +2261,22 @@ fn build_controlled_masks(space: &ActionSpace, unit: ControlledUnit) -> Controll
 fn fill_body_masks(
     space: &ActionSpace,
     state: &ControlledState,
-    movement_enabled: bool,
-    attack_enabled: bool,
+    enabled: bool,
     masks: &mut ControlledMasks,
 ) {
     for (index, point) in space.points.iter().enumerate() {
         let walkable = point.walkable && !point.source.raze_only();
         let body_navigation_target =
             walkable && !matches!(point.source, PointSource::BuildingLanding(_));
-        masks.move_points[index] = movement_enabled && walkable;
-        masks.attack_move_points[index] = attack_enabled && body_navigation_target;
+        masks.move_points[index] = enabled && walkable;
+        masks.attack_move_points[index] = enabled && body_navigation_target;
     }
     for (index, target) in space.entities.iter().enumerate() {
         let other = target.id != state.id;
-        masks.follow_entities[index] = movement_enabled && other;
-        masks.attack_entities[index] = attack_enabled && other;
+        masks.follow_entities[index] = enabled && other;
+        masks.attack_entities[index] = enabled && other;
     }
-    masks.hold = attack_enabled;
+    masks.hold = enabled;
 }
 
 fn fill_cast_masks(space: &ActionSpace, state: &ControlledState, masks: &mut ControlledMasks) {
@@ -2302,7 +2294,6 @@ fn fill_cast_masks(space: &ActionSpace, state: &ControlledState, masks: &mut Con
 pub(crate) fn ability_ready(unit: &UnitView, ability: &AbilityView) -> bool {
     let disabled = has_status(unit, StatusFlags::STUNNED)
         || has_status(unit, StatusFlags::FEARED)
-        || has_status(unit, StatusFlags::SILENCED)
         || has_status(unit, StatusFlags::CHANNELLING);
     !disabled
         && !ability.passive
@@ -2333,7 +2324,6 @@ fn raze_target_mask(
             target.relation,
             EntityRelation::Enemy | EntityRelation::Neutral
         ) && target.unit.hp > 0
-            && !has_status(&target.unit, StatusFlags::DEAD)
             && within_reach_window(state.unit.pos, target.position, reach);
     }
     mask

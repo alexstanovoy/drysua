@@ -148,9 +148,7 @@ impl GoalProgress {
         }
         let gain = Fixed::from_int(PROGRESS_UNITS).raw as u64;
         // Fighting on the way or being held in place is not a failed route.
-        let held = hero.statuses.bits
-            & (StatusFlags::STUNNED | StatusFlags::ROOTED | StatusFlags::CHANNELLING)
-            != 0;
+        let held = hero.statuses.bits & (StatusFlags::STUNNED | StatusFlags::CHANNELLING) != 0;
         let fought = tracker
             .entity(hero.id)
             .and_then(|track| track.last_damage_dealt)

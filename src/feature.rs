@@ -30,7 +30,7 @@ mod capacity_tests;
 mod test_support;
 
 /// Version of the policy feature layout and candidate input-state semantics.
-pub const FEATURE_SCHEMA_VERSION: u32 = 24;
+pub const FEATURE_SCHEMA_VERSION: u32 = 25;
 /// Number of scalar global features.
 pub const GLOBAL_FEATURES: usize = 92;
 /// Number of scalar features in one global-history sample.
@@ -247,7 +247,11 @@ pub mod unit_feature {
     pub const TIME_TO_REACH: usize = 49;
     pub const OWN_IN_ATTACK_RANGE: usize = 50;
     pub const UNIT_IN_ATTACK_RANGE: usize = 51;
-    pub const STATUS_START: usize = 52;
+    pub const STUNNED: usize = 52;
+    pub const SLOWED: usize = 56;
+    pub const DOT: usize = 57;
+    pub const INVISIBLE: usize = 58;
+    pub const MAGIC_IMMUNE: usize = 59;
     pub const RECENT_DAMAGE_TAKEN: usize = 61;
     pub const RECENT_DAMAGE_DEALT_PRESENT: usize = 62;
     pub const RECENT_DAMAGE_DEALT: usize = 63;
@@ -470,7 +474,7 @@ pub const FEATURE_SCHEMA_DESCRIPTOR: &str = concat!(
     "global_indices=0:tick,1:pregame,2:wave,3:jungle,4:radiant,5:dire,6:map0,7:map1,8:seats,9:role_present,10:role,11:lane_present,12:lane,13:kill_adv,14:death_adv,15:assist_adv,16:xp_adv,17:level_adv,18:lh_adv,19:deny_adv,20:gold,21:assets,22:respawn_present,23:respawn,24:alive,25:allied_alive,26:enemy_alive,27:allied_structure_hp,28:enemy_structure_hp,29:destroyed_present,30:destroyed,31:order_present,32:order,33:order_age,34:decision_present,35:decision_age,36:damage_dealt,37:damage_taken,38:level,39:xp,40:kills,41:deaths,42:assists,43:lh,44:denies,45:allied_visible,46:enemy_visible,47:enemy_scoreboard_enabled,48:active_target_present,49:active_target_point,50:active_target_unit,51:active_target_visible,52:active_target_relative_x,53:active_target_relative_y,54:active_target_distance,55:active_target_kind,56:active_target_allied,57:active_target_enemy,58:active_target_neutral,59-63:reserved;",
     "history_indices=0:present,1:age,2:hp_present,3:hp,4:mana_present,5:mana,6:level,7:gold,8:alive,9:respawn,10:allied_visible,11:enemy_visible,12:xp_adv,13:level_adv,14:kill_adv,15:death_adv,16:assist_adv,17:lh_adv,18:deny_adv,19:allied_structure_hp,20:enemy_structure_hp,21:destroyed_present,22:destroyed,23:enemy_scoreboard_enabled;",
     "policy_history_indices=0:present,1:age,2:kind_present,3:kind;",
-    "unit_indices=0:present,1-4:relation,5:kind,6-8:owner_relation,9:owner_present,10:observation,11:visible,12:remembered,13:origin_present,14:age,15-16:position,17-18:relative,19:distance,20-21:direction,22:facing,23:radius,24:velocity_present,25-26:velocity,27:hp_present,28:elevation,29:walkable,30:hp,31:mana_present,32:mana,33:hp_delta_present,34:hp_delta,35:mana_delta_present,36:mana_delta,37:attack_damage,38:attack_range,39:attack_interval,40:attack_speed,41:move_speed,42:armor,43:magic_resistance,44:vision,45:true_sight,46:attacks_present,47:attacks,48:reach_present,49:reach,50-51:mutual_range,52-60:statuses,61:damage_taken,62:damage_dealt_present,63:damage_dealt,64:attack_phase_present,65:attack_phase,66:item_slot_count,67:free_item_slots,68:item_capacity_available;",
+    "unit_indices=0:present,1-4:relation,5:kind,6-8:owner_relation,9:owner_present,10:observation,11:visible,12:remembered,13:origin_present,14:age,15-16:position,17-18:relative,19:distance,20-21:direction,22:facing,23:radius,24:velocity_present,25-26:velocity,27:hp_present,28:elevation,29:walkable,30:hp,31:mana_present,32:mana,33:hp_delta_present,34:hp_delta,35:mana_delta_present,36:mana_delta,37:attack_damage,38:attack_range,39:attack_interval,40:attack_speed,41:move_speed,42:armor,43:magic_resistance,44:vision,45:true_sight,46:attacks_present,47:attacks,48:reach_present,49:reach,50-51:mutual_range,52:stunned,53-55:reserved,56:slowed,57:dot,58:invisible,59:magic_immune,60:reserved,61:damage_taken,62:damage_dealt_present,63:damage_dealt,64:attack_phase_present,65:attack_phase,66:item_slot_count,67:free_item_slots,68:item_capacity_available;",
     "point_indices=0:present,1:pointer_valid,2-3:position,4:origin_present,5-6:relative,7:distance,8-9:direction,10:source,11:source_direction_present,12:source_direction,13:source_radius_present,14:source_radius,15:source_kind_present,16:source_kind,17:source_relation_present,18-21:source_relation,22:walkable,23:standing_tree,24:allied_building,25:sighting_age,26-28:raze_units_near_mid_far,29-31:raze_heroes_near_mid_far;",
     "ability_indices=0:present,1:body,2:slot,3:observation,4:id_present,5:id,6:level,7:max_level,8:cooldown,9:mana,10:range,11:aim,12:passive,13:toggle,14:can_level,15:legal,16:last_cast_present,17:last_cast_age,18:scoreboard_kit_source,19-23:reserved;",
     "item_indices=0:present,1:location,2:slot,3:item_present,4:item,5:charges_present,6:charges,7:cooldown,8:aim_present,9:aim,10:range,11:mana,12:attribute_present,13:attribute,14:for_sale,15:muted,16:value_present,17:value,18:recipe_component,19:composite,20:legal,21:shop,22:mute_present,23:mute_left,24:shared_wait_present,25:shared_wait_left,26:scoreboard_kit_source,27:reserved;",
@@ -480,7 +484,7 @@ pub const FEATURE_SCHEMA_DESCRIPTOR: &str = concat!(
     "global_scalars=normalizers:tick3600000_pregame_ticks_wave30s_jungle60s_seats10_score1000_xp100000_gold100000_age4800_damage10000_hp100000_structures64_visible256_level30_active_target_relative_extent_distance_extent,categories:role1..5_lane1..3_action1..16_map_onehot_side_onehot_active_target_kind1..12_relation_onehot3,reserved:59..63;",
     "history_scalars=normalizers:age480_hp_ratio_mana_ratio_level30_gold100000_visible256_score1000_xp100000_hp100000_structures64,categories:none,reserved:none;",
     "policy_history_scalars=normalizers:age4800,categories:action1..16,reserved:none;",
-    "unit_scalars=normalizers:age480_position_extent_delta_extent_distance_extent_facing65535_radius_extent_hp_ratio_mana_ratio_damage10000_attack_range_fixed_max_attack_interval600_attack_speed2000_move_speed2000_armor_raw6553600_magic_resistance_fixed_max_vision_fixed_max_attacks100_reach4800_item_slots9,categories:relation_onehot4_kind1..12_owner_relation_onehot3_status_bits9,reserved:none;",
+    "unit_scalars=normalizers:age480_position_extent_delta_extent_distance_extent_facing65535_radius_extent_hp_ratio_mana_ratio_damage10000_attack_range_fixed_max_attack_interval600_attack_speed2000_move_speed2000_armor_raw6553600_magic_resistance_fixed_max_vision_fixed_max_attacks100_reach4800_item_slots9,categories:relation_onehot4_kind1..12_owner_relation_onehot3_status_bits_stunned_slowed_dot_invisible_magic_immune,reserved:53..55_60;",
     "point_scalars=normalizers:position_extent_relative_extent_distance_extent_radius1200_sighting_age150_raze_units4_raze_heroes1_saturating,categories:source1..13_direction1..8_kind1..12_relation_onehot4,reserved:none;",
     "ability_scalars=normalizers:level30_cooldown36000_mana20000_range_fixed_max_age4800,categories:body1..2_slot1..8_ability1..65547_aim1..5,reserved:19..23;",
     "item_scalars=normalizers:charges255_cooldown36000_range_fixed_max_mana20000_value100000_mute36000_shared_wait36000,categories:location_hero2_stash3_courier4_shop5_with1_reserved_slot1..64_item1..65536_aim1..5_attribute1..3,reserved:27;",
@@ -2610,7 +2614,6 @@ fn encode_map2_reward(tracker: &StateTracker, global: &mut [f32; GLOBAL_FEATURES
 
 fn encode_unit_effects(token: &mut [f32; UNIT_FEATURES], track: &crate::EntityTrack, tick: u32) {
     if track.unit.hp <= 0
-        || track.unit.statuses.bits & StatusFlags::DEAD != 0
         || track
             .last_death
             .is_some_and(|death| death.tick >= track.last_seen_tick)
@@ -3138,21 +3141,14 @@ fn encode_statuses(token: &mut [f32; UNIT_FEATURES], statuses: StatusFlags) {
     token[unit_feature::INVULNERABLE] =
         bool_feature(statuses.bits & StatusFlags::INVULNERABLE != 0);
     token[unit_feature::CHANNELLING] = bool_feature(statuses.bits & StatusFlags::CHANNELLING != 0);
-    for (offset, flag) in [
-        StatusFlags::STUNNED,
-        StatusFlags::SILENCED,
-        StatusFlags::ROOTED,
-        StatusFlags::DISARMED,
-        StatusFlags::SLOWED,
-        StatusFlags::DOT,
-        StatusFlags::INVISIBLE,
-        StatusFlags::MAGIC_IMMUNE,
-        StatusFlags::DEAD,
-    ]
-    .into_iter()
-    .enumerate()
-    {
-        token[unit_feature::STATUS_START + offset] = bool_feature(statuses.bits & flag != 0);
+    for (index, flag) in [
+        (unit_feature::STUNNED, StatusFlags::STUNNED),
+        (unit_feature::SLOWED, StatusFlags::SLOWED),
+        (unit_feature::DOT, StatusFlags::DOT),
+        (unit_feature::INVISIBLE, StatusFlags::INVISIBLE),
+        (unit_feature::MAGIC_IMMUNE, StatusFlags::MAGIC_IMMUNE),
+    ] {
+        token[index] = bool_feature(statuses.bits & flag != 0);
     }
 }
 

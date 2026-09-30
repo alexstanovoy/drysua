@@ -1390,9 +1390,7 @@ fn tower_order_safe(tracker: &StateTracker, order: Order) -> bool {
 }
 
 fn tactical_burst(source: &UnitView, target: &UnitView, space: Option<&ActionSpace>) -> i32 {
-    let disabled = source.statuses.bits
-        & (bota_proto::StatusFlags::STUNNED | bota_proto::StatusFlags::SILENCED)
-        != 0;
+    let disabled = source.statuses.bits & bota_proto::StatusFlags::STUNNED != 0;
     let mut mana = source.mana;
     let raze = source
         .abilities
@@ -1588,7 +1586,6 @@ fn finish_risk_acceptable(
     }
     assert!(ticks <= FINISH_LIMIT_TICKS);
     let disabled = bota_proto::StatusFlags::STUNNED
-        | bota_proto::StatusFlags::DISARMED
         | bota_proto::StatusFlags::DOT
         | bota_proto::StatusFlags::CHANNELLING;
     let reach = hero.attack_range + hero.bound + enemy.bound - movement_guard(enemy);

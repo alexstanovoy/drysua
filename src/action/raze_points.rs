@@ -67,9 +67,7 @@ pub(super) struct RazeTarget {
 
 /// The own hero while it could ever cast a raze.
 pub(super) fn raze_caster(tracker: &StateTracker) -> Option<&UnitView> {
-    tracker
-        .own_hero()
-        .filter(|hero| hero.hp > 0 && !has_status(hero, StatusFlags::DEAD))
+    tracker.own_hero().filter(|hero| hero.hp > 0)
 }
 
 /// Visible hostile units any raze landing could strike from `origin`.
@@ -86,7 +84,6 @@ pub(super) fn raze_targets(
         .filter(|unit| {
             unit.team != tracker.team()
                 && unit.hp > 0
-                && !has_status(unit, StatusFlags::DEAD)
                 && !has_status(unit, StatusFlags::INVULNERABLE)
                 && origin.within(unit.pos, outermost)
         })
@@ -254,7 +251,6 @@ fn fog_heroes<'a>(tracker: &'a StateTracker, current: &WorldView) -> Vec<(u32, &
                 && track.unit.team != tracker.team()
                 && track.unit.team != Team::Neutral
                 && track.unit.hp > 0
-                && !has_status(&track.unit, StatusFlags::DEAD)
                 && track
                     .last_death
                     .is_none_or(|death| death.tick < track.last_seen_tick)
