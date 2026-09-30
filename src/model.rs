@@ -2027,6 +2027,37 @@ impl PolicyModel {
         self.training_heads(state, routing, &inputs.prefixes)
     }
 
+    /// Training outputs of one staged microbatch under `objective`, over one
+    /// shared trunk: plus the heads conditioned on the shadow labels' own
+    /// prefixes when it imitates, and with the value read from the detached
+    /// trunk when it trains the critic alone, so only the value head learns.
+    fn training_forward_objective(
+        &self,
+        inputs: &device_learner::StagedInputs,
+        objective: crate::UpdateObjective,
+    ) -> Result<(PolicyTensorTensors, Option<PolicyTensorTensors>), ModelError> {
+        let state = self.forward_encoder_inputs(&inputs.encoder)?;
+        let shadow = if crate::ppo::imitates(objective) {
+            let prefixes = inputs
+                .shadow_prefixes
+                .as_ref()
+                .ok_or(ModelError::InvalidModelState(
+                    "imitation without shadow prefixes",
+                ))?;
+            let routing = ActorRouting::from_mask(inputs.sides.clone());
+            Some(self.training_heads(state.clone(), routing, prefixes)?)
+        } else {
+            None
+        };
+        let trunk = state.trunk.clone();
+        let routing = ActorRouting::from_mask(inputs.sides.clone());
+        let mut output = self.training_heads(state, routing, &inputs.prefixes)?;
+        if objective.critic_only {
+            output.value = self.value.forward(&trunk.detach())?;
+        }
+        Ok((output, shadow))
+    }
+
     fn training_heads(
         &self,
         state: ForwardState,
@@ -3346,6 +3377,7 @@ impl PrefixUpload {
     }
 }
 
+#[derive(Clone)]
 struct ForwardState {
     trunk: Tensor,
     current_units: Tensor,

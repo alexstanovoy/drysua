@@ -246,11 +246,11 @@ fn strict_checkpoint_restores_adam_rng_and_identical_next_update() {
     let (source_batch, source_actions) = checkpoint_batch(&source, 18_005);
     let (target_batch, target_actions) = checkpoint_batch(&target, 18_005);
     trainer
-        .train_update(&source, &source_batch)
+        .train_update(&source, &source_batch, crate::UpdateObjective::default())
         .expect("next source update");
     state
         .trainer_mut()
-        .train_update(&target, &target_batch)
+        .train_update(&target, &target_batch, crate::UpdateObjective::default())
         .expect("next restored update");
     assert_eq!(source_actions, target_actions);
     assert_snapshot_equal(&source, &trainer, &target, state.trainer());
@@ -458,7 +458,9 @@ fn progress_metadata(global_update: u64) -> CheckpointProgress {
 
 fn advance_trainer(model: &PolicyModel, trainer: &mut PpoTrainer) {
     let (batch, _) = checkpoint_batch(model, 18_004);
-    trainer.train_update(model, &batch).expect("update");
+    trainer
+        .train_update(model, &batch, crate::UpdateObjective::default())
+        .expect("update");
 }
 
 fn checkpoint_batch(

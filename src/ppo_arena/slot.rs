@@ -184,6 +184,15 @@ pub(crate) struct GameSchedule {
     pub(crate) seed: u64,
     pub(crate) decision_cap: usize,
     pub(crate) config: PpoConfig,
+    pub(crate) shadow: Option<ShadowLabels>,
+}
+
+/// Which rule policy labels the policy seat's retained decisions, and for which games.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ShadowLabels {
+    pub(crate) kind: ScriptKind,
+    /// Games that start collecting at or after this update carry no labels.
+    pub(crate) until_update: u64,
 }
 
 /// The actions one game has taken so far; replayed on resume.
@@ -298,6 +307,11 @@ impl Slot {
             annealed::spawn_modifiers_for(plan.spec),
         )?;
         let policy_seat = plan.seat;
+        if let Some(labels) = schedule.shadow
+            && plan.start_update < labels.until_update
+        {
+            enable_shadow(&mut environment.seats[policy_seat], labels.kind);
+        }
         let policy = PreparedSeat::prepare(&mut environment.seats[policy_seat])?;
         let opponent = match runtime {
             OpponentRuntime::Neural => Some(PreparedSeat::prepare(
@@ -361,13 +375,24 @@ impl Slot {
     fn step(&mut self, decision: Decision, gamma: f32) -> Result<CompletedAdvance, PpoError> {
         assert!(!self.stream.done());
         assert!(!self.stream.closes_interval(decision.action.kind()));
+        let seat = &mut self.environment.seats[self.plan.seat];
+        let shadow = if seat.shadow {
+            Some(shadow_action(seat, &self.policy.space)?)
+        } else {
+            None
+        };
         if self.stream.retains(decision.action.kind()) {
             let (statistics, value, behaviour) = *decision
                 .retained
                 .ok_or(PpoError::InvalidTransition("retained decision statistics"))?;
+            let shadow = shadow
+                .map(|action| BehavioralTarget::from_sampled_action(&self.policy.space, action))
+                .transpose()
+                .map_err(text_error)?;
             self.stream.retain(RetainedChoice {
                 frame: self.policy.frame.clone(),
                 target: statistics.target,
+                shadow,
                 action: decision.action,
                 behaviour,
                 log_probability: statistics.log_probability,

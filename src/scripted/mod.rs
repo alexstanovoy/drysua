@@ -64,6 +64,30 @@ impl ScriptedPolicy {
         }
     }
 
+    /// A policy that labels another policy's seat: Teacher hands its hero razes to the
+    /// aim macro as single aimed casts, the form the learner's action space expresses.
+    #[cfg(feature = "builtin")]
+    pub(crate) fn shadow(kind: ScriptKind) -> Self {
+        match kind {
+            ScriptKind::Teacher => Self::Teacher(Box::new(Teacher::with_macro_hero_aim())),
+            ScriptKind::HarassPush => Self::HarassPush(HarassPush::new()),
+        }
+    }
+
+    /// Selects an action in `space`, the space the seat's tracker and readiness build.
+    #[cfg(feature = "builtin")]
+    pub(crate) fn decide_in(
+        &mut self,
+        tracker: &StateTracker,
+        persistence: &OrderPersistence,
+        space: &ActionSpace,
+    ) -> Result<StructuredAction, ActionError> {
+        match self {
+            Self::Teacher(teacher) => teacher.decide_in(tracker, persistence, space),
+            Self::HarassPush(script) => script.decide_in(tracker, persistence, space),
+        }
+    }
+
     /// Records a sent order and the snapshot tick of the space that decoded it.
     pub fn note_sent(&mut self, sequence: u32, issued: IssuedOrder, tick: u32) {
         match self {

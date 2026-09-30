@@ -117,7 +117,9 @@ mod tests {
             let before = model.export_parameters().unwrap();
             let frame = batch.sample(0).unwrap().transition.frame;
             let value_before = model.evaluate(&frame).unwrap().value;
-            let report = trainer.train_update(&model, &batch).unwrap();
+            let report = trainer
+                .train_update(&model, &batch, crate::UpdateObjective::default())
+                .unwrap();
             let after = model.export_parameters().unwrap();
             assert_eq!(report.samples_optimized, 18);
             assert_eq!(report.minibatches, 6);
@@ -180,7 +182,7 @@ mod tests {
         let frame = batch.samples[tail].transition.frame.clone();
         batch.corrupt_materialization_frame_for_test(tail);
         let error = trainer
-            .train_update(&model, &batch)
+            .train_update(&model, &batch, crate::UpdateObjective::default())
             .expect_err("tail error");
         assert_eq!(
             error.to_string(),
@@ -196,7 +198,7 @@ mod tests {
         // A restored batch replays the rolled-back update from identical state.
         batch.samples[tail].transition.frame = frame;
         let report = trainer
-            .train_update(&model, &batch)
+            .train_update(&model, &batch, crate::UpdateObjective::default())
             .expect("restored rollout");
         assert_eq!(report.samples_optimized, 18);
         assert_eq!(report.minibatches, 6);

@@ -160,6 +160,33 @@ each `0..=10` times full variance, set the modifier spread: `scale_bp = (start �
 zero_updates))`, truncated to basis points. The clean tail is always zero. Sampled
 deltas still clamp to each variable's range.
 
+## Imitation and critic warm-up
+
+Two optional aids speed up a start without narrowing what the policy may choose.
+Both are pure functions of the update index and are recorded in the run scope, so
+a resume recomputes them exactly.
+
+- `--imitation-coefficient START:END:N --imitation-shadow teacher|harass-push`
+  (DAgger with a fading anchor). The shadow rule policy runs on the learner's seat
+  at every decision, from that seat's own tracker, order ledger and item readiness
+  (seat-observable only), and is told every order the learner actually sends. Its
+  action at each retained decision becomes the sample's label (Teacher razes as
+  single aimed casts, as the learner does). The loss adds `β · CE` of the policy,
+  conditioned on the label's own kind, unit and slot, to the label on every head
+  the label defines; it never masks or overrides a choice. `β` moves linearly
+  from START at update 0 to END at update N and stays at END; with END 0 it is
+  exactly zero from update N on and games starting at N carry no labels. Each
+  `ppo_update` line adds `imitation_coefficient`, `imitation_loss` (mean cross
+  entropy per labeled row), `imitation_labeled` and the agreement of the policy's
+  legal argmax with the label: `imitation_agree` for whole actions and
+  `imitation_agree_<head>` per head. The PPO KL guard (`--target-kl`, default
+  0.02) measures the KL to the 1-stale behaviour policy and ends an update once a
+  step starts from or reaches it; a strong imitation term moves the policy much
+  faster than that, so raise it while β is large.
+- `--critic-warmup-updates K`: updates `0..K` train only the value head (read from
+  the detached trunk); every other parameter keeps its bits. Useful after a change
+  that invalidates the critic, e.g. new rewards or inputs.
+
 ## Run scope and resume
 
 The checkpoint records the run scope: seed, schedule, opponents, collection and

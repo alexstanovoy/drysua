@@ -73,8 +73,9 @@ impl PolicyModel {
         let log_probability = ppo_objective::log_probability(&output, &inputs.targets)?;
         let terms = ppo_objective::ppo_loss(
             &output,
+            None,
             &inputs.targets,
-            PpoConfig::default(),
+            (PpoConfig::default(), crate::UpdateObjective::default()),
             examples.len(),
         )?;
         let report = ppo_objective::report_from_sums(&terms.sums.to_vec1()?, examples.len())?;
@@ -102,7 +103,7 @@ pub(crate) fn masked_ppo_entropy_for_test(
         &device,
     )?;
     let variable = Var::from_tensor(&tensor)?;
-    let mut targets = ppo_objective::HostTargets::with_capacity(examples.len());
+    let mut targets = ppo_objective::HostTargets::with_capacity(examples.len(), false);
     for sample in examples {
         targets.push(sample)?;
     }

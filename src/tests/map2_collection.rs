@@ -111,6 +111,7 @@ fn step_policy(
         stream.retain(RetainedChoice {
             frame,
             target: choice.target.clone(),
+            shadow: None,
             action: choice.action(),
             behaviour: 0,
             log_probability: choice.log_probability(),

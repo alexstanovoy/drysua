@@ -89,6 +89,8 @@ pub struct AnnealedJobConfig {
     pub league_every: u64,
     /// PPO dimensions and hyperparameters.
     pub ppo: PpoConfig,
+    /// Fading imitation and critic warm-up.
+    pub guidance: super::TrainingGuidance,
     /// When to write a durable checkpoint.
     pub checkpoint_cadence: crate::TrainingCheckpointCadence,
     /// Additional committed updates in this invocation, capped by `updates`.
@@ -598,6 +600,9 @@ fn annealed_run(
             config.entropy_coefficient
         ));
     }
+    if config.target_kl != defaults.target_kl {
+        command_line.push_str(&format!(" --target-kl {}", config.target_kl));
+    }
     if config.value_coefficient != defaults.value_coefficient {
         command_line.push_str(&format!(
             " --value-coefficient {}",
@@ -605,6 +610,7 @@ fn annealed_run(
         ));
     }
     settings.execution.append_scope(&mut command_line);
+    settings.guidance.append_scope(&mut command_line);
     adaptive::append_scope(settings, harness, &mut command_line);
     Ok(CheckpointRun {
         git_commit: settings.git_commit.clone(),
@@ -669,6 +675,7 @@ pub(crate) fn validate_annealed(
 ) -> Result<PpoConfig, PpoError> {
     settings.execution.validate()?;
     settings.scale.validate()?;
+    settings.guidance.validate()?;
     if settings.updates == 0 || settings.updates > MAX_TRAINING_COUNTER {
         return Err(PpoError::InvalidConfig("annealed updates"));
     }
@@ -913,7 +920,7 @@ fn log_ppo_update(
     learning_rate: f32,
 ) {
     crate::telemetry::log_line!(
-        "level=INFO event=ppo_update update={} policy_loss={:.6} value_loss={:.6} entropy={:.6} approx_kl={:.8} clip_fraction={:.6} explained_variance={:.6} explained_variance_mc={:.6} kl_stop={} optimizer_steps={optimizer_steps} samples={samples} learning_rate={learning_rate:e}",
+        "level=INFO event=ppo_update update={} policy_loss={:.6} value_loss={:.6} entropy={:.6} approx_kl={:.8} clip_fraction={:.6} explained_variance={:.6} explained_variance_mc={:.6} kl_stop={} optimizer_steps={optimizer_steps} samples={samples} learning_rate={learning_rate:e} critic_only={}{}",
         report.update,
         report.policy_loss,
         report.value_loss,
@@ -923,5 +930,50 @@ fn log_ppo_update(
         explained_variance.lambda,
         explained_variance.monte_carlo,
         report.stopped_for_kl,
+        report.objective.critic_only,
+        imitation_fields(report),
     );
+}
+
+/// The imitation coefficient, mean cross entropy per labeled row and the
+/// agreement of the legal argmax with the labels: whole actions, then per head.
+#[allow(
+    clippy::float_arithmetic,
+    reason = "rates of summed imitation statistics"
+)]
+fn imitation_fields(report: &crate::PpoUpdateReport) -> String {
+    const HEADS: [&str; crate::MODEL_BEHAVIORAL_HEADS] = [
+        "kind",
+        "unit",
+        "ability",
+        "item",
+        "swap",
+        "learn",
+        "shop",
+        "loot",
+        "target_mode",
+        "put_mode",
+        "entity",
+        "point",
+    ];
+    let imitation = &report.imitation;
+    if report.objective.imitation == 0.0 || imitation.labeled == 0.0 {
+        return String::new();
+    }
+    let mut fields = format!(
+        " imitation_coefficient={} imitation_loss={:.6} imitation_labeled={} imitation_agree={:.6}",
+        report.objective.imitation,
+        imitation.cross_entropy / imitation.labeled,
+        imitation.labeled,
+        imitation.action_agreements / imitation.labeled,
+    );
+    for (head, name) in HEADS.iter().enumerate() {
+        if imitation.head_labels[head] > 0.0 {
+            fields.push_str(&format!(
+                " imitation_agree_{name}={:.6}",
+                imitation.head_agreements[head] / imitation.head_labels[head]
+            ));
+        }
+    }
+    fields
 }

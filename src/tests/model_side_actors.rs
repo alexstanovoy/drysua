@@ -760,6 +760,7 @@ fn ppo_samples() -> Vec<PpoPreparedSample> {
                 transition: crate::PpoTransition {
                     frame,
                     target,
+                    shadow: None,
                     action: StructuredAction::Continue,
                     behaviour: 0,
                     stream,

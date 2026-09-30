@@ -46,6 +46,7 @@ ARGUMENTS = frozenset({
     "--zero-updates", "--learning-rate", "--epochs", "--minibatch", "--gae-lambda-tick",
     "--entropy-coefficient", "--value-coefficient", "--environment-scale-start", "--environment-scale-end",
     "--opponent-schedule", "--league-size", "--league-every",
+    "--imitation-coefficient", "--imitation-shadow", "--critic-warmup-updates", "--target-kl",
 })
 MAX_OPPONENTS = 16
 CONFIG_FIELDS = {"schema", "trainer", "inspector", "initial_weights", "opponents", "total_updates",

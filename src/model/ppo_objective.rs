@@ -1,6 +1,6 @@
-//! The PPO objective: clipped policy surrogate, value regression, entropy bonus
-//! and the candidate KL guard. Every learner path computes its losses here, from
-//! targets that already live on the learner device.
+//! The PPO objective: clipped policy surrogate, value regression, entropy bonus,
+//! the fading imitation term and the candidate KL guard. Every learner path
+//! computes its losses here, from targets that already live on the learner device.
 
 use super::*;
 
@@ -32,31 +32,40 @@ pub(super) struct HeadTargets {
 /// Everything the objective needs besides the model outputs, row aligned.
 pub(super) struct ObjectiveTargets {
     heads: Vec<HeadTargets>,
+    /// Shadow labels, staged only for an update that imitates; unlabeled rows
+    /// have every head inactive.
+    shadow: Option<Vec<HeadTargets>>,
     old_log_probability: Tensor,
     advantages: Tensor,
     returns: Tensor,
     rows: usize,
 }
 
-/// Host columns of [`ObjectiveTargets`] before one upload per tensor.
+/// Host columns of one label per row over the twelve heads.
 #[derive(Default)]
-pub(super) struct HostTargets {
+struct HostHeads {
     masks: [Vec<u8>; 12],
     labels: [Vec<u32>; 12],
     active: [Vec<f32>; 12],
+}
+
+/// Host columns of [`ObjectiveTargets`] before one upload per tensor.
+#[derive(Default)]
+pub(super) struct HostTargets {
+    heads: HostHeads,
+    shadow: Option<HostHeads>,
     old_log_probability: Vec<f32>,
     advantages: Vec<f32>,
     returns: Vec<f32>,
 }
 
 impl HostTargets {
-    pub(super) fn with_capacity(rows: usize) -> Self {
-        let mut host = Self::default();
-        for (index, (_, width)) in HEADS.iter().enumerate() {
-            host.masks[index].reserve_exact(rows * width);
-            host.labels[index].reserve_exact(rows);
-            host.active[index].reserve_exact(rows);
-        }
+    pub(super) fn with_capacity(rows: usize, imitation: bool) -> Self {
+        let mut host = Self {
+            heads: HostHeads::with_capacity(rows),
+            shadow: imitation.then(|| HostHeads::with_capacity(rows)),
+            ..Self::default()
+        };
         host.old_log_probability.reserve_exact(rows);
         host.advantages.reserve_exact(rows);
         host.returns.reserve_exact(rows);
@@ -65,7 +74,49 @@ impl HostTargets {
 
     /// Appends one prepared sample, rejecting a label outside its legal mask.
     pub(super) fn push(&mut self, sample: &PpoPreparedSample) -> Result<(), ModelError> {
-        let target = &sample.transition.target;
+        self.heads.push(&sample.transition.target)?;
+        if let Some(shadow) = &mut self.shadow {
+            match &sample.transition.shadow {
+                Some(label) => shadow.push(label)?,
+                None => shadow.push_unlabeled(),
+            }
+        }
+        self.old_log_probability
+            .push(sample.transition.old_log_probability);
+        self.advantages.push(sample.advantage);
+        self.returns.push(sample.return_value);
+        Ok(())
+    }
+
+    pub(super) fn upload(self, device: &Device) -> Result<ObjectiveTargets, ModelError> {
+        let rows = self.returns.len();
+        assert!(rows > 0);
+        Ok(ObjectiveTargets {
+            heads: self.heads.upload(rows, device)?,
+            shadow: self
+                .shadow
+                .map(|shadow| shadow.upload(rows, device))
+                .transpose()?,
+            old_log_probability: Tensor::from_vec(self.old_log_probability, rows, device)?,
+            advantages: Tensor::from_vec(self.advantages, rows, device)?,
+            returns: Tensor::from_vec(self.returns, rows, device)?,
+            rows,
+        })
+    }
+}
+
+impl HostHeads {
+    fn with_capacity(rows: usize) -> Self {
+        let mut host = Self::default();
+        for (index, (_, width)) in HEADS.iter().enumerate() {
+            host.masks[index].reserve_exact(rows * width);
+            host.labels[index].reserve_exact(rows);
+            host.active[index].reserve_exact(rows);
+        }
+        host
+    }
+
+    fn push(&mut self, target: &BehavioralTarget) -> Result<(), ModelError> {
         self.head(0, &target.kind)?;
         self.head(1, &target.controlled)?;
         self.head(2, &target.ability)?;
@@ -78,11 +129,18 @@ impl HostTargets {
         self.head(9, &target.put_mode)?;
         self.head(10, &target.entity_pointer)?;
         self.head(11, &target.point_pointer)?;
-        self.old_log_probability
-            .push(sample.transition.old_log_probability);
-        self.advantages.push(sample.advantage);
-        self.returns.push(sample.return_value);
         Ok(())
+    }
+
+    /// A row without a label: every head inactive.
+    fn push_unlabeled(&mut self) {
+        for (index, (_, width)) in HEADS.iter().enumerate() {
+            let masks = &mut self.masks[index];
+            masks.push(1);
+            masks.resize(masks.len() + width - 1, 0);
+            self.labels[index].push(0);
+            self.active[index].push(0.0);
+        }
     }
 
     fn head<const WIDTH: usize>(
@@ -110,9 +168,7 @@ impl HostTargets {
         Ok(())
     }
 
-    pub(super) fn upload(self, device: &Device) -> Result<ObjectiveTargets, ModelError> {
-        let rows = self.returns.len();
-        assert!(rows > 0);
+    fn upload(self, rows: usize, device: &Device) -> Result<Vec<HeadTargets>, ModelError> {
         let mut heads = Vec::with_capacity(HEADS.len());
         for (((masks, labels), active), (_, width)) in self
             .masks
@@ -127,13 +183,7 @@ impl HostTargets {
                 active: Tensor::from_vec(active, rows, device)?,
             });
         }
-        Ok(ObjectiveTargets {
-            heads,
-            old_log_probability: Tensor::from_vec(self.old_log_probability, rows, device)?,
-            advantages: Tensor::from_vec(self.advantages, rows, device)?,
-            returns: Tensor::from_vec(self.returns, rows, device)?,
-            rows,
-        })
+        Ok(heads)
     }
 }
 
@@ -146,19 +196,21 @@ impl ObjectiveTargets {
 
     /// The rows at `indices`, gathered on the device.
     pub(super) fn gather(&self, indices: &Tensor) -> Result<Self, ModelError> {
-        let heads = self
-            .heads
-            .iter()
-            .map(|head| {
-                Ok(HeadTargets {
-                    masks: head.masks.index_select(indices, 0)?,
-                    labels: head.labels.index_select(indices, 0)?,
-                    active: head.active.index_select(indices, 0)?,
+        let gather = |heads: &[HeadTargets]| {
+            heads
+                .iter()
+                .map(|head| {
+                    Ok(HeadTargets {
+                        masks: head.masks.index_select(indices, 0)?,
+                        labels: head.labels.index_select(indices, 0)?,
+                        active: head.active.index_select(indices, 0)?,
+                    })
                 })
-            })
-            .collect::<Result<Vec<_>, ModelError>>()?;
+                .collect::<Result<Vec<_>, ModelError>>()
+        };
         Ok(Self {
-            heads,
+            heads: gather(&self.heads)?,
+            shadow: self.shadow.as_deref().map(gather).transpose()?,
             old_log_probability: self.old_log_probability.index_select(indices, 0)?,
             advantages: self.advantages.index_select(indices, 0)?,
             returns: self.returns.index_select(indices, 0)?,
@@ -198,11 +250,7 @@ pub(super) fn log_probability(
         if logits.dims() != [targets.rows, width] {
             return Err(ModelError::InvalidModelState("PPO head shape"));
         }
-        let negative_infinity = Tensor::full(f32::NEG_INFINITY, logits.shape(), logits.device())?;
-        let legal = head.masks.where_cond(logits, &negative_infinity)?;
-        let legal = legal.broadcast_sub(&legal.max_keepdim(1)?.detach())?;
-        let selected = legal.gather(&head.labels, 1)?.squeeze(1)?;
-        let loss = (legal.log_sum_exp(1)? - selected)?.mul(&head.active)?;
+        let (_, loss) = head_cross_entropy(logits, head)?;
         negative = Some(match negative {
             None => loss,
             Some(total) => (total + loss)?,
@@ -249,20 +297,31 @@ fn entropy(output: &PolicyTensorTensors, targets: &ObjectiveTargets) -> Result<T
 pub(super) struct ObjectiveTerms {
     /// Scalar training loss.
     pub(super) loss: Tensor,
-    /// `[policy loss, value loss, entropy, approximate KL, clipped rows]` summed over rows.
+    /// `[policy loss, value loss, entropy, approximate KL, clipped rows]` and the
+    /// [`IMITATION_SUMS`] imitation statistics, summed over rows.
     pub(super) sums: Tensor,
 }
 
-/// The clipped surrogate, critic regression and entropy bonus of one microbatch,
-/// each averaged over the `minibatch_rows` rows of its effective minibatch so
-/// that the gradients of the minibatch's microbatches simply add up.
+/// Imitation statistics per evaluation: cross entropy, labeled rows, rows agreeing
+/// on every labeled head, then per head the agreeing and the labeled rows.
+const IMITATION_SUMS: usize = 3 + 2 * HEADS.len();
+
+/// The clipped surrogate, critic regression, entropy bonus and imitation term of
+/// one microbatch, each averaged over the `minibatch_rows` rows of its effective
+/// minibatch so that the gradients of the minibatch's microbatches simply add up.
+///
+/// `shadow` holds the heads conditioned on the shadow labels' own prefixes and
+/// is present exactly when the update imitates. A critic-only update trains the
+/// value regression alone; its value output must not reach the trunk.
 pub(super) fn ppo_loss(
     output: &PolicyTensorTensors,
+    shadow: Option<&PolicyTensorTensors>,
     targets: &ObjectiveTargets,
-    config: PpoConfig,
+    (config, objective): (PpoConfig, crate::UpdateObjective),
     minibatch_rows: usize,
 ) -> Result<ObjectiveTerms, ModelError> {
     assert!(minibatch_rows >= targets.rows);
+    assert_eq!(shadow.is_some(), crate::ppo::imitates(objective));
     let log_ratio = (log_probability(output, targets)? - &targets.old_log_probability)?;
     let ratio = log_ratio.exp()?;
     let clipped_ratio = ratio.clamp(1.0 - config.clip_epsilon, 1.0 + config.clip_epsilon)?;
@@ -276,8 +335,28 @@ pub(super) fn ppo_loss(
     let policy_loss = surrogate.sum_all()?.affine(-1.0 / rows, 0.0)?;
     let value_loss = squared_error.sum_all()?.affine(1.0 / rows, 0.0)?;
     let mean_entropy = entropy.sum_all()?.affine(1.0 / rows, 0.0)?;
-    let loss = (&policy_loss + &value_loss.affine(f64::from(config.value_coefficient), 0.0)?)?;
-    let loss = (&loss - &mean_entropy.affine(f64::from(config.entropy_coefficient), 0.0)?)?;
+    let critic = value_loss.affine(f64::from(config.value_coefficient), 0.0)?;
+    let mut loss = if objective.critic_only {
+        critic
+    } else {
+        let loss = (&policy_loss + &critic)?;
+        (&loss - &mean_entropy.affine(f64::from(config.entropy_coefficient), 0.0)?)?
+    };
+    let imitation = match shadow {
+        Some(shadow) => {
+            let heads = targets
+                .shadow
+                .as_deref()
+                .ok_or(ModelError::InvalidModelState(
+                    "imitation without shadow labels",
+                ))?;
+            let (cross_entropy, sums) = imitation_terms(shadow, heads)?;
+            let mean = cross_entropy.sum_all()?.affine(1.0 / rows, 0.0)?;
+            loss = (&loss + &mean.affine(f64::from(objective.imitation), 0.0)?)?;
+            sums
+        }
+        None => Tensor::zeros(IMITATION_SUMS, DType::F32, output.value.device())?,
+    };
     let kl = (&ratio.affine(1.0, -1.0)? - &log_ratio)?.detach();
     let outside = (ratio
         .lt(1.0 - f64::from(config.clip_epsilon))?
@@ -295,7 +374,73 @@ pub(super) fn ppo_loss(
         ],
         0,
     )?;
+    let sums = Tensor::cat(&[sums, imitation], 0)?;
     Ok(ObjectiveTerms { loss, sums })
+}
+
+/// One head's legal logits (shifted by their detached row maximum; illegal
+/// classes are -inf) and the per-row cross entropy to its label, zero where the
+/// head is inactive.
+fn head_cross_entropy(logits: &Tensor, head: &HeadTargets) -> Result<(Tensor, Tensor), ModelError> {
+    let negative_infinity = Tensor::full(f32::NEG_INFINITY, logits.shape(), logits.device())?;
+    let legal = head.masks.where_cond(logits, &negative_infinity)?;
+    let legal = legal.broadcast_sub(&legal.max_keepdim(1)?.detach())?;
+    let selected = legal.gather(&head.labels, 1)?.squeeze(1)?;
+    let loss = (legal.log_sum_exp(1)? - selected)?.mul(&head.active)?;
+    Ok((legal, loss))
+}
+
+/// Per-row cross entropy to the shadow labels over every head a label defines,
+/// and the [`IMITATION_SUMS`] statistics of the legal argmax agreeing with them.
+fn imitation_terms(
+    shadow: &PolicyTensorTensors,
+    heads: &[HeadTargets],
+) -> Result<(Tensor, Tensor), ModelError> {
+    assert_eq!(heads.len(), HEADS.len());
+    let mut cross_entropy: Option<Tensor> = None;
+    let mut misses: Option<Tensor> = None;
+    let mut agreements = Vec::with_capacity(HEADS.len());
+    let mut labels = Vec::with_capacity(HEADS.len());
+    for ((logits, head), (_, width)) in head_logits(shadow).into_iter().zip(heads).zip(HEADS) {
+        if logits.dim(1)? != width {
+            return Err(ModelError::InvalidModelState("imitation head shape"));
+        }
+        let (legal, loss) = head_cross_entropy(logits, head)?;
+        let agree = legal
+            .detach()
+            .argmax(1)?
+            .eq(&head.labels.squeeze(1)?)?
+            .to_dtype(DType::F32)?
+            .mul(&head.active)?;
+        let miss = (&head.active - &agree)?;
+        agreements.push(agree.sum_all()?);
+        labels.push(head.active.sum_all()?);
+        cross_entropy = Some(match cross_entropy {
+            None => loss,
+            Some(total) => (total + loss)?,
+        });
+        misses = Some(match misses {
+            None => miss,
+            Some(total) => (total + miss)?,
+        });
+    }
+    let cross_entropy = cross_entropy.expect("twelve heads");
+    // Every label activates the kind head.
+    let labeled = &heads[0].active;
+    let whole = misses
+        .expect("twelve heads")
+        .eq(0.0)?
+        .to_dtype(DType::F32)?
+        .mul(labeled)?;
+    let mut sums = vec![
+        cross_entropy.detach().sum_all()?,
+        labeled.sum_all()?,
+        whole.sum_all()?,
+    ];
+    sums.extend(agreements);
+    sums.extend(labels);
+    assert_eq!(sums.len(), IMITATION_SUMS);
+    Ok((cross_entropy, Tensor::stack(&sums, 0)?))
 }
 
 /// Summed approximate KL of the current outputs against the behaviour policy.
@@ -308,17 +453,23 @@ pub(super) fn candidate_kl_sum(
     Ok((&ratio.affine(1.0, -1.0)? - &log_ratio)?.sum_all()?)
 }
 
-/// Turns summed terms of `rows` rows into the per-row minibatch report.
+/// Turns summed terms of `rows` rows into the per-row minibatch report; the
+/// imitation statistics stay sums.
 pub(super) fn report_from_sums(
     sums: &[f32],
     rows: usize,
 ) -> Result<PpoMinibatchReport, ModelError> {
-    let [policy, value, entropy, kl, clipped] = sums else {
+    if sums.len() != 5 + IMITATION_SUMS {
         return Err(ModelError::InvalidModelState("PPO objective sums"));
-    };
+    }
     if sums.iter().any(|value| !value.is_finite()) {
         return Err(ModelError::NonFiniteLoss);
     }
+    let (ppo, imitation) = sums.split_at(5);
+    let [policy, value, entropy, kl, clipped] = ppo else {
+        unreachable!("five PPO sums");
+    };
+    let heads = HEADS.len();
     let rows_f = rows as f64;
     Ok(PpoMinibatchReport {
         policy_loss: f64::from(*policy) / rows_f,
@@ -330,5 +481,12 @@ pub(super) fn report_from_sums(
         applied_scale: 0.0,
         samples: rows,
         applied: false,
+        imitation: crate::ImitationReport {
+            cross_entropy: f64::from(imitation[0]),
+            labeled: f64::from(imitation[1]),
+            action_agreements: f64::from(imitation[2]),
+            head_agreements: std::array::from_fn(|head| f64::from(imitation[3 + head])),
+            head_labels: std::array::from_fn(|head| f64::from(imitation[3 + heads + head])),
+        },
     })
 }

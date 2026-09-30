@@ -148,6 +148,12 @@ enum LearnerDevice {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum ShadowArg {
+    Teacher,
+    HarassPush,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum OpponentScheduleArg {
     Fixed,
     Pfsp,
@@ -260,6 +266,17 @@ struct TrainAnnealedArgs {
 /// Optimizer controls for resumable training.
 #[derive(Args)]
 struct OptimizerArgs {
+    /// Imitation loss weight `start:end:updates`: moves linearly from start to end
+    /// over the first updates, then stays at end; a cross entropy to the shadow's
+    /// labels on the learner's own states, never a mask or override.
+    #[arg(long, requires = "imitation_shadow", value_parser = parse_imitation_coefficient)]
+    imitation_coefficient: Option<(crate::EnvironmentDecimal, crate::EnvironmentDecimal, u64)>,
+    /// Rule policy that labels the learner's retained decisions for imitation.
+    #[arg(long, value_enum, requires = "imitation_coefficient")]
+    imitation_shadow: Option<ShadowArg>,
+    /// Updates at the start of the run that train only the critic (policy frozen).
+    #[arg(long, default_value_t = 0)]
+    critic_warmup_updates: u64,
     /// Adam learning rate; must be finite and positive.
     #[arg(long, default_value_t = crate::PpoConfig::default().learning_rate)]
     learning_rate: f32,
@@ -278,6 +295,10 @@ struct OptimizerArgs {
     /// Value loss coefficient; must be finite and positive.
     #[arg(long, default_value_t = crate::PpoConfig::default().value_coefficient)]
     value_coefficient: f32,
+    /// Largest sampled KL to the behaviour policy an Adam step may start from or
+    /// end at; a strong imitation term needs more room than PPO alone.
+    #[arg(long, default_value_t = crate::PpoConfig::default().target_kl)]
+    target_kl: f32,
 }
 
 /// Persistence controls; a run cannot initialize and resume together.
@@ -610,6 +631,7 @@ impl TrainAnnealedArgs {
             league_size: self.league_size,
             league_every: self.league_every,
             ppo,
+            guidance: self.optimizer.guidance(),
             checkpoint_cadence: crate::TrainingCheckpointCadence::WallTime(
                 std::time::Duration::from_secs(self.checkpoint.checkpoint_interval_seconds),
             ),
@@ -702,6 +724,26 @@ impl TrainAnnealedArgs {
                 std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
             })
     }
+}
+
+/// Parses `start:end:updates`, e.g. `1:0.3:30`.
+fn parse_imitation_coefficient(
+    text: &str,
+) -> Result<(crate::EnvironmentDecimal, crate::EnvironmentDecimal, u64), String> {
+    let mut parts = text.split(':');
+    let (Some(start), Some(end), Some(updates), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return Err("expected start:end:updates, e.g. 1:0.3:30".to_owned());
+    };
+    let decimal = |text: &str| {
+        text.parse::<crate::EnvironmentDecimal>()
+            .map_err(|error| error.to_string())
+    };
+    let updates = updates
+        .parse::<u64>()
+        .map_err(|error| format!("imitation updates: {error}"))?;
+    Ok((decimal(start)?, decimal(end)?, updates))
 }
 
 /// Parses one `--opponent` mixture entry; a weights path may itself contain colons.
@@ -867,6 +909,23 @@ fn annealed_settings_from_arguments(
 
 #[cfg(feature = "builtin")]
 impl OptimizerArgs {
+    fn guidance(&self) -> crate::TrainingGuidance {
+        crate::TrainingGuidance {
+            imitation: self.imitation_coefficient.zip(self.imitation_shadow).map(
+                |((start, end, updates), shadow)| crate::ImitationSchedule {
+                    shadow: match shadow {
+                        ShadowArg::Teacher => crate::ScriptKind::Teacher,
+                        ShadowArg::HarassPush => crate::ScriptKind::HarassPush,
+                    },
+                    start,
+                    end,
+                    updates,
+                },
+            ),
+            critic_warmup_updates: self.critic_warmup_updates,
+        }
+    }
+
     fn ppo(&self, config: crate::PpoConfig) -> crate::PpoConfig {
         crate::PpoConfig {
             decision_interval_ticks: crate::MAP2_DECISION_INTERVAL_TICKS,
@@ -876,6 +935,7 @@ impl OptimizerArgs {
             gae_lambda_tick: self.gae_lambda_tick,
             entropy_coefficient: self.entropy_coefficient,
             value_coefficient: self.value_coefficient,
+            target_kl: self.target_kl,
             ..config
         }
     }

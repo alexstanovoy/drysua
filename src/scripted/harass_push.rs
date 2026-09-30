@@ -108,22 +108,34 @@ impl HarassPush {
         readiness: &ItemReadiness,
     ) -> Result<(StructuredAction, ActionSpace), ActionError> {
         let space = ActionSpace::from_tracker_with_readiness(tracker, readiness)?;
+        let action = self.decide_in(tracker, persistence, &space)?;
+        Ok((action, space))
+    }
+
+    /// Selects an action in `space`, the space this seat's tracker and readiness build.
+    pub fn decide_in(
+        &mut self,
+        tracker: &StateTracker,
+        persistence: &OrderPersistence,
+        space: &ActionSpace,
+    ) -> Result<StructuredAction, ActionError> {
         self.observe(tracker, space.tick());
         let active = persistence
             .active_body_for(None)
             .map(|(_, issued)| issued.order);
-        let selected = self.select(tracker, &space, active);
+        let selected = self.select(tracker, space, active);
         if !space.allows(selected) {
             return Err(ActionError::InvalidSchema(
                 "HarassPush selected masked action",
             ));
         }
-        let action = if persistence.should_send(space.decode(selected)?).is_none() {
-            StructuredAction::Continue
-        } else {
-            selected
-        };
-        Ok((action, space))
+        Ok(
+            if persistence.should_send(space.decode(selected)?).is_none() {
+                StructuredAction::Continue
+            } else {
+                selected
+            },
+        )
     }
 
     /// HarassPush keeps no per-order memory; accepted orders need no bookkeeping.

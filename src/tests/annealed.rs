@@ -254,6 +254,84 @@ fn pfsp_league_mixtures_resume_in_flight_neural_games_exactly() {
     );
 }
 
+/// HarassPush labels the learner after one critic-only update: the warm-up keeps
+/// every policy parameter's bits, the labels reach the objective, and a resume
+/// replays the labeled in-flight games under the recorded schedule exactly.
+#[test]
+fn guided_updates_freeze_the_policy_in_warmup_and_resume_exactly() {
+    let weights = test_directory("guided-initial-weights");
+    let initial = PolicyModel::fresh(23_075).expect("initial model");
+    TrainingArtifact::save_runtime_weights(&initial, &weights).expect("initial weights");
+    let mut config = settings(23_076, 3);
+    config.guidance = crate::TrainingGuidance {
+        imitation: Some(crate::ImitationSchedule {
+            shadow: crate::ScriptKind::HarassPush,
+            start: one(),
+            end: crate::EnvironmentDecimal::from_units(500_000),
+            updates: 2,
+        }),
+        critic_warmup_updates: 1,
+    };
+    let start = |config: &AnnealedJobConfig, directory: &std::path::Path, stop_after| {
+        run_annealed_job_harnessed(
+            config.clone(),
+            AnnealedHarness {
+                stop_after,
+                ..harness()
+            },
+            PolicyDevice::Cpu,
+            directory,
+            false,
+            Some(&weights),
+            |_| {},
+        )
+        .expect("guided run")
+    };
+    let uninterrupted = test_directory("guided-uninterrupted");
+    let reference = start(&config, &uninterrupted, None);
+    assert_eq!(
+        reference.latest.objective,
+        crate::UpdateObjective {
+            imitation: 0.5,
+            critic_only: false
+        }
+    );
+    assert!(reference.latest.imitation.labeled > 0.0);
+    let resumed = test_directory("guided-resumed");
+    start(&config, &resumed, Some(1));
+    let (warm, _, _) = restored_state(
+        &TrainingArtifact::load(&resumed).expect("warm-up checkpoint"),
+        PolicyDevice::Cpu,
+    );
+    let before = initial.export_parameters().expect("initial parameters");
+    let mut offset = 0;
+    for (name, shape) in initial.parameter_schema().expect("schema") {
+        let range = offset..offset + shape.iter().product::<usize>();
+        let kept = before[range.clone()]
+            .iter()
+            .zip(&warm.parameters[range.clone()])
+            .all(|(a, b)| a.to_bits() == b.to_bits());
+        assert_eq!(kept, !name.starts_with("value."), "{name}");
+        offset = range.end;
+    }
+    assert!(
+        in_flight_decisions(&resumed) > 0,
+        "a labeled game is in flight"
+    );
+    let before = checkpoint_digests(&resumed);
+    let mut changed = config.clone();
+    changed.guidance.critic_warmup_updates = 2;
+    assert!(matches!(
+        run(changed, &resumed, true),
+        Err(PpoError::ScopeMismatch(_))
+    ));
+    assert_eq!(checkpoint_digests(&resumed), before);
+    let second = run(config, &resumed, true).expect("resume");
+    assert_eq!(second.latest, reference.latest);
+    assert_trajectory_equal(&uninterrupted, &resumed);
+    assert_artifact_bits(&uninterrupted, &resumed, PolicyDevice::Cpu);
+}
+
 /// Two lanes of one slot each; with 16-decision games an update of four
 /// intervals per lane ends mid-game, so every resume replays in-flight games.
 fn settings(seed: u64, updates: u64) -> AnnealedJobConfig {
@@ -284,6 +362,7 @@ fn settings(seed: u64, updates: u64) -> AnnealedJobConfig {
             gamma_tick: MAP2_REWARD_GAMMA_TICK,
             ..PpoConfig::default()
         },
+        guidance: crate::TrainingGuidance::default(),
         checkpoint_cadence: crate::TrainingCheckpointCadence::Updates(1),
         git_commit: "test-drysua-annealed".to_owned(),
         simulator_commit: "test-bota-annealed".to_owned(),
