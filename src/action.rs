@@ -588,7 +588,28 @@ struct BuyRequirement {
 struct StaticPassability {
     axis: usize,
     open: Vec<bool>,
+    /// Nearest landing cell of each allied structure position, computed once per grid.
+    landings: Vec<(Vec2, Option<Vec2>)>,
 }
+
+/// What a static passability grid depends on besides the fixed terrain and
+/// static tree layout of one tracker.
+#[derive(Debug, Default, PartialEq)]
+struct PassabilityKey {
+    /// Static trees seen felled by this seat.
+    felled: Vec<u32>,
+    /// Planted trees this seat can observe.
+    planted: Vec<Vec2>,
+    /// Every structure's position, clearance and whether it is allied.
+    structures: Vec<(Vec2, i32, bool)>,
+}
+
+/// One tracker's last passability grid; the grid changes only when a tree
+/// falls or grows in view or a structure dies, not with each decision.
+#[derive(Debug, Default)]
+pub(crate) struct PassabilityCache(
+    std::sync::Mutex<Option<(PassabilityKey, std::sync::Arc<StaticPassability>)>>,
+);
 
 #[derive(Clone, Debug)]
 struct PutPointMask {
@@ -1305,6 +1326,73 @@ fn validate_position(position: Vec2, maximum: i64, field: &'static str) -> Resul
 fn reconstruct_static_passability(
     tracker: &StateTracker,
     current: &WorldView,
+) -> Result<std::sync::Arc<StaticPassability>, ActionError> {
+    let key = passability_key(tracker, current)?;
+    let mut cache = tracker
+        .passability_cache()
+        .0
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if let Some((cached, passability)) = cache.as_ref()
+        && *cached == key
+    {
+        return Ok(std::sync::Arc::clone(passability));
+    }
+    let passability = std::sync::Arc::new(build_static_passability(tracker, &key)?);
+    *cache = Some((key, std::sync::Arc::clone(&passability)));
+    Ok(passability)
+}
+
+fn passability_key(
+    tracker: &StateTracker,
+    current: &WorldView,
+) -> Result<PassabilityKey, ActionError> {
+    let trees = tracker.static_trees();
+    let mut felled = Vec::with_capacity(current.felled_trees.len());
+    for &index in &current.felled_trees {
+        let position = usize::try_from(index)
+            .ok()
+            .and_then(|index| trees.get(index))
+            .copied();
+        if position
+            .is_some_and(|position| tracker.position_locally_observable_to_own_seat(position))
+        {
+            felled.push(index);
+        }
+    }
+    felled.sort_unstable();
+    felled.dedup();
+    if u32::try_from(trees.len()).is_err() {
+        return Err(ActionError::Arithmetic("tree index"));
+    }
+    let planted = current
+        .planted_trees
+        .iter()
+        .copied()
+        .filter(|&position| tracker.position_locally_observable_to_own_seat(position))
+        .collect();
+    let structures = current
+        .units
+        .iter()
+        .filter(|unit| is_structure(unit.kind))
+        .map(|structure| {
+            (
+                structure.pos,
+                structure.collision.raw + Fixed::from_int(STRUCTURE_CLEARANCE).raw,
+                structure.team == tracker.team(),
+            )
+        })
+        .collect();
+    Ok(PassabilityKey {
+        felled,
+        planted,
+        structures,
+    })
+}
+
+fn build_static_passability(
+    tracker: &StateTracker,
+    key: &PassabilityKey,
 ) -> Result<StaticPassability, ActionError> {
     let axis = usize::try_from(tracker.metadata().terrain_cells)
         .map_err(|_| ActionError::InvalidSchema("terrain axis"))?;
@@ -1314,28 +1402,49 @@ fn reconstruct_static_passability(
     }
     debug_assert_eq!(terrain.len(), axis * axis);
     let open = terrain.iter().map(|cell| cell & 0x80 != 0).collect();
-    let mut passability = StaticPassability { axis, open };
+    let mut passability = StaticPassability {
+        axis,
+        open,
+        landings: Vec::new(),
+    };
     for (index, position) in tracker.static_trees().iter().copied().enumerate() {
         let index = u32::try_from(index).map_err(|_| ActionError::Arithmetic("tree index"))?;
-        let locally_felled = current.felled_trees.contains(&index)
-            && tracker.position_locally_observable_to_own_seat(position);
-        if !locally_felled {
+        if key.felled.binary_search(&index).is_err() {
             passability.block_circle(position, Fixed::from_int(STATIC_TREE_CLEARANCE));
         }
     }
-    for position in current.planted_trees.iter().copied() {
-        if tracker.position_locally_observable_to_own_seat(position) {
-            passability.block_circle(position, Fixed::from_int(STATIC_TREE_CLEARANCE));
-        }
+    for &position in &key.planted {
+        passability.block_circle(position, Fixed::from_int(STATIC_TREE_CLEARANCE));
     }
-    for structure in current.units.iter().filter(|unit| is_structure(unit.kind)) {
-        let clearance_raw = structure.collision.raw + Fixed::from_int(STRUCTURE_CLEARANCE).raw;
-        passability.block_circle(structure.pos, Fixed { raw: clearance_raw });
+    for &(position, clearance, _) in &key.structures {
+        passability.block_circle(position, Fixed { raw: clearance });
     }
+    passability.landings = key
+        .structures
+        .iter()
+        .filter(|(_, _, allied)| *allied)
+        .map(|&(position, _, _)| {
+            (
+                position,
+                nearest_landing_cell(&passability, position, tracker.team()),
+            )
+        })
+        .collect();
     Ok(passability)
 }
 
 impl StaticPassability {
+    fn landing(&self, structure: Vec2, team: Team) -> Option<Vec2> {
+        match self
+            .landings
+            .iter()
+            .find(|(position, _)| *position == structure)
+        {
+            Some(&(_, landing)) => landing,
+            None => nearest_landing_cell(self, structure, team),
+        }
+    }
+
     fn walkable(&self, position: Vec2) -> bool {
         let Some((cell_x, cell_y)) = self.cell_of(position) else {
             return false;
@@ -1667,7 +1776,7 @@ fn add_building_landing_points(
         .iter()
         .filter(|unit| unit.team == tracker.team() && is_structure(unit.kind))
         .filter_map(|unit| {
-            let position = nearest_landing_cell(passability, unit.pos, tracker.team())?;
+            let position = passability.landing(unit.pos, tracker.team())?;
             Some((
                 center.distance_squared(position),
                 unit.kind,

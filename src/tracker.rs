@@ -116,121 +116,11 @@ pub(crate) struct StaticTrackerProvenance {
     roster: Vec<Pick>,
 }
 
-/// Frozen copy of the tracker's mutable state, captured for one provenance.
+/// Provenance used to pair action masks and observations with one tracker state.
 ///
-/// Buffers live in a bounded pool: a provenance that is dropped returns its
-/// buffer, and the next capture refills it in place (element slots and
-/// capacities are reused), so the steady state allocates nothing.
-#[derive(Debug, Default, PartialEq)]
-struct ProvenanceBuffer {
-    entities: Vec<EntityTrack>,
-    /// Slots that fell out of the visible set, kept for their allocations.
-    entity_spare: Vec<EntityTrack>,
-    summaries: VecDeque<GlobalSummary>,
-    recent_events: VecDeque<ObservedEvent>,
-    snapshot_events: VecDeque<ObservedEvent>,
-}
-
-impl ProvenanceBuffer {
-    fn copy_from(&mut self, tracker: &StateTracker) {
-        copy_entity_slots(
-            &mut self.entities,
-            &mut self.entity_spare,
-            &tracker.entities,
-        );
-        self.summaries.clear();
-        self.summaries.extend(tracker.summaries.iter().copied());
-        self.recent_events.clear();
-        self.recent_events
-            .extend(tracker.recent_events.iter().cloned());
-        self.snapshot_events.clear();
-        self.snapshot_events
-            .extend(tracker.snapshot_events.iter().cloned());
-    }
-}
-
-/// Bounded object pool of provenance buffers.
-#[derive(Debug)]
-struct ProvenancePool {
-    free: std::sync::Mutex<Vec<ProvenanceBuffer>>,
-}
-
-/// Most buffers any live setup can need: one per observation history entry
-/// plus the current capture and a test allowance.
-const PROVENANCE_POOL_LIMIT: usize = 32;
-
-impl ProvenancePool {
-    fn new() -> Self {
-        Self {
-            free: std::sync::Mutex::new(Vec::new()),
-        }
-    }
-
-    fn take(self: &Arc<Self>) -> PooledProvenance {
-        let buffer = self.free.lock().expect("provenance pool lock").pop();
-        PooledProvenance(Arc::new(PooledProvenanceInner {
-            buffer: Some(buffer.unwrap_or_default()),
-            pool: Arc::clone(self),
-        }))
-    }
-}
-
-struct PooledProvenanceInner {
-    buffer: Option<ProvenanceBuffer>,
-    pool: Arc<ProvenancePool>,
-}
-
-impl Drop for PooledProvenanceInner {
-    fn drop(&mut self) {
-        let Some(buffer) = self.buffer.take() else {
-            return;
-        };
-        let mut free = self.pool.free.lock().expect("provenance pool lock");
-        if free.len() < PROVENANCE_POOL_LIMIT {
-            free.push(buffer);
-        }
-    }
-}
-
-/// Shared handle to one pooled provenance buffer; clones are Arc bumps.
-#[derive(Clone)]
-pub(crate) struct PooledProvenance(Arc<PooledProvenanceInner>);
-
-impl PooledProvenance {
-    fn buffer(&self) -> &ProvenanceBuffer {
-        self.0
-            .buffer
-            .as_ref()
-            .expect("a provenance buffer is only read while alive")
-    }
-
-    fn buffer_mut(&mut self) -> &mut ProvenanceBuffer {
-        assert_eq!(
-            Arc::strong_count(&self.0),
-            1,
-            "a capture buffer is filled before it is shared"
-        );
-        Arc::get_mut(&mut self.0)
-            .expect("capture buffer was just checked to be unshared")
-            .buffer
-            .as_mut()
-            .expect("a provenance buffer is only read while alive")
-    }
-}
-
-impl std::fmt::Debug for PooledProvenance {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.buffer().fmt(formatter)
-    }
-}
-
-impl PartialEq for PooledProvenance {
-    fn eq(&self, other: &Self) -> bool {
-        self.buffer() == other.buffer()
-    }
-}
-
-/// Exact bounded provenance used to pair action masks and observations.
+/// Every tracker mutation advances its revision and clones take a fresh
+/// lineage, so equal lineage and revision identify the whole mutable state;
+/// it is not copied.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct TrackerProvenance {
     lineage: NonZeroU64,
@@ -240,8 +130,6 @@ pub(crate) struct TrackerProvenance {
     /// Shared immutable snapshots; the tracker owns one reference each.
     previous_snapshot: Option<Arc<WorldView>>,
     snapshot: Arc<WorldView>,
-    /// Frozen mutable state, pooled; clones are Arc bumps.
-    state: PooledProvenance,
     last_event_tick: Option<u32>,
     peak_allied_structures: Option<u32>,
     peak_enemy_structures: Option<u32>,
@@ -777,8 +665,6 @@ pub struct StateTracker {
     team: Team,
     metadata: MatchMetadata,
     static_provenance_cache: Arc<StaticTrackerProvenance>,
-    /// Bounded pool of frozen provenance buffers (allocated at warm-up).
-    provenance_pool: Arc<ProvenancePool>,
     static_trees: Vec<Vec2>,
     terrain_rle: Vec<(u16, u8)>,
     opaque_cells: Vec<(u16, u16)>,
@@ -796,6 +682,8 @@ pub struct StateTracker {
     peak_allied_structures: Option<u32>,
     peak_enemy_structures: Option<u32>,
     structure_baseline_complete: bool,
+    /// Last static passability built for an action space; see [`crate::action`].
+    passability: crate::action::PassabilityCache,
 }
 
 impl Clone for StateTracker {
@@ -813,7 +701,6 @@ impl Clone for StateTracker {
             team: self.team,
             metadata: self.metadata,
             static_provenance_cache: Arc::clone(&self.static_provenance_cache),
-            provenance_pool: Arc::clone(&self.provenance_pool),
             static_trees: self.static_trees.clone(),
             terrain_rle: self.terrain_rle.clone(),
             opaque_cells: self.opaque_cells.clone(),
@@ -831,6 +718,7 @@ impl Clone for StateTracker {
             peak_allied_structures: self.peak_allied_structures,
             peak_enemy_structures: self.peak_enemy_structures,
             structure_baseline_complete: self.structure_baseline_complete,
+            passability: crate::action::PassabilityCache::default(),
         }
     }
 }
@@ -872,7 +760,6 @@ impl StateTracker {
             team,
             metadata,
             static_provenance_cache,
-            provenance_pool: Arc::new(ProvenancePool::new()),
             static_trees: info.trees.clone(),
             terrain_rle: info.terrain_rle.clone(),
             opaque_cells: info.opaque_cells.clone(),
@@ -890,7 +777,12 @@ impl StateTracker {
             peak_allied_structures: None,
             peak_enemy_structures: None,
             structure_baseline_complete: false,
+            passability: crate::action::PassabilityCache::default(),
         })
+    }
+
+    pub(crate) const fn passability_cache(&self) -> &crate::action::PassabilityCache {
+        &self.passability
     }
 
     /// Own seat.
@@ -1069,8 +961,6 @@ impl StateTracker {
     }
 
     pub(crate) fn provenance(&self) -> TrackerProvenance {
-        let mut state = self.provenance_pool.take();
-        state.buffer_mut().copy_from(self);
         TrackerProvenance {
             map2_reward_state: self.map2_reward_state(),
             lineage: self.lineage,
@@ -1082,7 +972,6 @@ impl StateTracker {
                     .as_ref()
                     .expect("snapshot provenance requires a snapshot"),
             ),
-            state,
             last_event_tick: self.last_event_tick,
             peak_allied_structures: self.peak_allied_structures,
             peak_enemy_structures: self.peak_enemy_structures,
@@ -1942,70 +1831,6 @@ fn copy_unit_view(target: &mut UnitView, source: &UnitView) {
     target.effects.clone_from(effects);
 }
 
-/// Overwrites one track with another, reusing the unit's nested allocations.
-fn copy_entity_track(target: &mut EntityTrack, source: &EntityTrack) {
-    let EntityTrack {
-        id,
-        unit,
-        previous_pos,
-        previous_seen_tick,
-        last_seen_tick,
-        velocity,
-        hp_delta,
-        mana_delta,
-        visible,
-        last_damage_dealt,
-        last_damage_taken,
-        last_heal_dealt,
-        last_heal_received,
-        last_mana_restoration_dealt,
-        last_mana_restoration_received,
-        last_death,
-        last_ability_cast,
-        last_possible_attack_landed,
-    } = source;
-    target.id = *id;
-    copy_unit_view(&mut target.unit, unit);
-    target.previous_pos = *previous_pos;
-    target.previous_seen_tick = *previous_seen_tick;
-    target.last_seen_tick = *last_seen_tick;
-    target.velocity = *velocity;
-    target.hp_delta = *hp_delta;
-    target.mana_delta = *mana_delta;
-    target.visible = *visible;
-    target.last_damage_dealt = *last_damage_dealt;
-    target.last_damage_taken = *last_damage_taken;
-    target.last_heal_dealt = *last_heal_dealt;
-    target.last_heal_received = *last_heal_received;
-    target.last_mana_restoration_dealt = *last_mana_restoration_dealt;
-    target.last_mana_restoration_received = *last_mana_restoration_received;
-    target.last_death = *last_death;
-    target.last_ability_cast = *last_ability_cast;
-    target.last_possible_attack_landed = *last_possible_attack_landed;
-}
-
-/// Copies a tracker's tracks into reusable slots, parking leftovers in
-/// `spare` so their allocations survive visibility changes.
-fn copy_entity_slots(
-    target: &mut Vec<EntityTrack>,
-    spare: &mut Vec<EntityTrack>,
-    source: &[EntityTrack],
-) {
-    while target.len() < source.len() {
-        let slot = match spare.pop() {
-            Some(slot) => slot,
-            None => source[target.len()].clone(),
-        };
-        target.push(slot);
-    }
-    while target.len() > source.len() {
-        spare.push(target.pop().expect("target is longer than source"));
-    }
-    for (slot, source) in target.iter_mut().zip(source) {
-        copy_entity_track(slot, source);
-    }
-}
-
 fn snapshot_contains(view: &WorldView, id: EntityId) -> bool {
     view.units.binary_search_by_key(&id, |unit| unit.id).is_ok()
 }
@@ -2424,12 +2249,11 @@ impl TrackerProvenance {
         self.lineage == tracker.lineage
             && self.revision == tracker.revision
             && self.static_data.matches(tracker)
-            && self.previous_snapshot == tracker.previous_snapshot
-            && tracker.current.as_ref() == Some(&self.snapshot)
-            && self.state.buffer().entities == tracker.entities
-            && self.state.buffer().recent_events == tracker.recent_events
-            && self.state.buffer().snapshot_events == tracker.snapshot_events
-            && self.state.buffer().summaries == tracker.summaries
+            && same_snapshot(
+                self.previous_snapshot.as_ref(),
+                tracker.previous_snapshot.as_ref(),
+            )
+            && same_snapshot(Some(&self.snapshot), tracker.current.as_ref())
             && self.last_event_tick == tracker.last_event_tick
             && self.peak_allied_structures == tracker.peak_allied_structures
             && self.peak_enemy_structures == tracker.peak_enemy_structures
@@ -2440,7 +2264,17 @@ impl TrackerProvenance {
     pub(crate) fn snapshot_precedes(&self, tracker: &StateTracker) -> bool {
         self.lineage == tracker.lineage
             && self.static_data.matches(tracker)
-            && tracker.previous_snapshot.as_ref() == Some(&self.snapshot)
+            && same_snapshot(tracker.previous_snapshot.as_ref(), Some(&self.snapshot))
+    }
+}
+
+/// The tracker shares each snapshot by `Arc`, so identity is the cheap test;
+/// value equality still covers snapshots rebuilt from the same stream.
+fn same_snapshot(left: Option<&Arc<WorldView>>, right: Option<&Arc<WorldView>>) -> bool {
+    match (left, right) {
+        (Some(left), Some(right)) => Arc::ptr_eq(left, right) || left == right,
+        (None, None) => true,
+        _ => false,
     }
 }
 
