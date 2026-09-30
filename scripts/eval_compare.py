@@ -90,7 +90,7 @@ def describe(name, games, summary):
         won = sum(game["outcome"] == "win" for game in played)
         sides.append(f"{side} {percent(won, len(played)):.1f}% ({won}/{len(played)})")
     lines.append("  sides: " + ", ".join(sides))
-    for outcome in ("win", "loss"):
+    for outcome in ("win", "loss", "draw"):
         matching = [game for game in games.values() if game["outcome"] == outcome]
         reasons = ", ".join(
             f"{reason} {sum(game['end_reason'] == reason for game in matching)}"
