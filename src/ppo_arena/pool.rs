@@ -1,4 +1,4 @@
-//! Fixed simulation workers shared by every inference lane.
+//! Fixed simulation workers shared by the inference lanes of one group.
 //!
 //! Workers take slot jobs from one bounded queue in any order. A job owns its
 //! slot, so which worker runs it never changes the slot's result; replies go to
@@ -43,12 +43,13 @@ pub(super) struct SimPool {
 }
 
 impl SimPool {
-    /// Spawns `threads` workers inside `scope`.
+    /// Spawns `threads` workers inside `scope`, pinned to `cpus` when given.
     pub(super) fn spawn<'scope>(
         scope: &'scope std::thread::Scope<'scope, '_>,
-        threads: usize,
+        (group, threads): (usize, usize),
         capacity: usize,
         schedule: &'scope GameSchedule,
+        cpus: Option<&[usize]>,
     ) -> Result<Self, PpoError> {
         if !(1..=256).contains(&threads) || !(1..=super::slot::MAX_SLOTS).contains(&capacity) {
             return Err(PpoError::InvalidConfig(
@@ -59,9 +60,18 @@ impl SimPool {
         let receiver = Arc::new(Mutex::new(receiver));
         for index in 0..threads {
             let receiver = Arc::clone(&receiver);
+            let cpus = cpus.map(<[usize]>::to_vec);
             std::thread::Builder::new()
-                .name(format!("sim-{index}"))
-                .spawn_scoped(scope, move || work(&receiver, schedule))
+                .name(format!("sim-{group}-{index}"))
+                .spawn_scoped(scope, move || {
+                    // An unpinnable worker still simulates correctly, only placed by the OS.
+                    if let Some(cpus) = cpus
+                        && let Err(error) = super::topology::pin_current_thread(&cpus)
+                    {
+                        crate::telemetry::log_line!("level=WARN event=pin_failed {error}");
+                    }
+                    work(&receiver, schedule)
+                })
                 .map_err(|error| PpoError::Model(format!("simulation worker spawn: {error}")))?;
         }
         Ok(Self { jobs })

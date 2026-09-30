@@ -15,6 +15,7 @@ mod lane;
 mod pool;
 mod reward;
 mod slot;
+pub(crate) mod topology;
 pub use reward::Map2TrainingReward;
 #[cfg(test)]
 #[path = "tests/ppo_arena_test_support.rs"]
@@ -62,7 +63,7 @@ pub enum TrainingCheckpointCadence {
     WallTime(Duration),
 }
 
-/// Durable progress plus invocation-local gameplay telemetry emitted after a committed checkpoint.
+/// Progress plus invocation-local gameplay telemetry of one completed update.
 #[derive(Clone, Debug, PartialEq)]
 pub struct TrainingCheckpointReport {
     pub map2_reward: Map2TrainingReward,
@@ -81,6 +82,30 @@ pub struct TrainingCheckpointReport {
     pub rejected_orders: u64,
     pub elapsed_ticks: u64,
     pub cleanup_warning: Option<String>,
+}
+
+impl TrainingCheckpointReport {
+    /// The per-update statistics line; `checkpoint: update N` separately marks durability.
+    pub(crate) fn log_progress(&self) {
+        crate::telemetry::log_line!(
+            "progress: update {}, samples {}, optimizer step {}, policy loss {:.6}, value loss {:.6}, entropy {:.6}, KL {:.6}, KL stop {}, session terminal wins {}, session terminal losses {}, session terminal draws {}, session rejected {}, session ticks {}, session episode timeouts {}",
+            self.completed_updates,
+            self.rollout_samples,
+            self.optimizer_step,
+            self.policy_loss,
+            self.value_loss,
+            self.entropy,
+            self.approximate_kl,
+            self.stopped_for_kl,
+            self.terminal_wins,
+            self.terminal_losses,
+            self.terminal_draws,
+            self.rejected_orders,
+            self.elapsed_ticks,
+            self.episode_timeouts,
+        );
+        self.map2_reward.log("update", self.completed_updates);
+    }
 }
 
 struct ArenaSeatPolicy {
@@ -320,7 +345,6 @@ impl TrainingSession {
         )
         .map_err(text_error)?;
         let outcome = artifact.save(directory).map_err(text_error)?;
-        TrainingArtifact::save_runtime_weights(&self.model, directory).map_err(text_error)?;
         let cleanup_warning = match outcome {
             CheckpointSaveOutcome::Committed => None,
             CheckpointSaveOutcome::CommittedWithCleanupError(message) => Some(message),

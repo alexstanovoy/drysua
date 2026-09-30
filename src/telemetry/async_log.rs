@@ -9,7 +9,7 @@ use std::time::Duration;
 mod test_support;
 
 const LOG_LINE_CAPACITY: usize = 4096;
-const LOG_QUEUE_CAPACITY: usize = 8;
+const LOG_QUEUE_CAPACITY: usize = 64;
 const LOG_DRAIN_LIMIT: Duration = Duration::from_millis(50);
 static LOG_PUBLISHER: OnceLock<Option<LogPublisher>> = OnceLock::new();
 
@@ -69,7 +69,7 @@ pub(crate) struct AsyncLogWriter {
 impl Default for AsyncLogWriter {
     fn default() -> Self {
         let publisher = LOG_PUBLISHER.get_or_init(|| {
-            spawn_log_writer(io::stderr())
+            spawn_log_writer(super::LogSinkWriter)
                 .ok()
                 .map(|(publisher, _worker)| publisher)
         });

@@ -69,12 +69,8 @@ mod files {
         assert_eq!(report["runtime_status"], "matched");
         assert_eq!(report["runtime_matches_model"], true);
         assert_inventory(&fixture, &report);
-        assert_eq!(report["files"].as_array().unwrap().len(), 4);
-        for name in [
-            CHECKPOINT_META_FILE,
-            CHECKPOINT_TENSOR_FILE,
-            RUNTIME_TENSOR_FILE,
-        ] {
+        assert_eq!(report["files"].as_array().unwrap().len(), 3);
+        for name in [CHECKPOINT_META_FILE, RUNTIME_TENSOR_FILE] {
             assert!(listed(&report, name), "matched inventory contains {name}");
         }
     }
@@ -118,14 +114,10 @@ mod files {
     }
 
     #[test]
-    fn immutable_payload_is_authoritative_and_stale_alias_is_not_inventory() {
+    fn immutable_payload_is_listed_and_checksummed() {
         let mut artifact = fixture_artifact("other-command", 0);
         let fixture = Fixture::new(&mut artifact);
-        let mut stale = serialize_training_tensors(&artifact).unwrap();
-        *stale.last_mut().unwrap() ^= 1;
-        fs::write(fixture.0.join(CHECKPOINT_TENSOR_FILE), stale).unwrap();
-        let report = inspect(&fixture).expect("authoritative named tensor");
-        assert!(!listed(&report, CHECKPOINT_TENSOR_FILE));
+        let report = inspect(&fixture).expect("named tensor");
         let name = tensor_generation_path(&fixture.0, artifact.tensor_hash);
         assert!(listed(&report, name.file_name().unwrap().to_str().unwrap()));
         assert_inventory(&fixture, &report);
@@ -159,7 +151,7 @@ mod files {
         let fixture = Fixture::new(&mut artifact);
         let path = fixture.0.join(RUNTIME_TENSOR_FILE);
         fs::remove_file(&path).unwrap();
-        symlink(CHECKPOINT_TENSOR_FILE, &path).unwrap();
+        symlink(CHECKPOINT_META_FILE, &path).unwrap();
         assert_eq!(
             inspect(&fixture).expect_err("runtime symlink"),
             CheckpointError::InvalidManifest("inspection requires a non-symlink regular file")
@@ -261,42 +253,20 @@ mod files {
     }
 
     #[test]
-    fn previous_files_report_actual_sources_and_never_hide_an_unsafe_primary() {
+    fn symlinked_manifest_or_payload_is_rejected() {
         let mut artifact = fixture_artifact("other-command", 0);
         let fixture = Fixture::new(&mut artifact);
         let generation = tensor_generation_path(Path::new(""), artifact.tensor_hash);
-        fs::remove_file(fixture.0.join(&generation)).unwrap();
-        for name in [CHECKPOINT_META_FILE, CHECKPOINT_TENSOR_FILE] {
-            fs::rename(
-                fixture.0.join(name),
-                fixture.0.join(format!("{name}.previous")),
-            )
-            .unwrap();
-        }
-        let report = inspect(&fixture).expect("read-only previous-file recovery");
-        assert_eq!(report["sources"]["manifest"], "checkpoint.meta.previous");
-        assert_eq!(
-            report["sources"]["tensor"],
-            "checkpoint.safetensors.previous"
-        );
-        assert_eq!(report["sources"]["runtime"], RUNTIME_TENSOR_FILE);
-        assert_eq!(report["recovery_required"], true);
-        assert!(listed(&report, "checkpoint.meta.previous"));
-        assert!(listed(&report, "checkpoint.safetensors.previous"));
-        assert!(!listed(&report, CHECKPOINT_META_FILE));
-        assert!(!listed(&report, CHECKPOINT_TENSOR_FILE));
-        assert_inventory(&fixture, &report);
-        for name in [
-            Path::new(CHECKPOINT_META_FILE),
-            Path::new(CHECKPOINT_TENSOR_FILE),
-            generation.as_path(),
-        ] {
+        for name in [Path::new(CHECKPOINT_META_FILE), generation.as_path()] {
             let primary = fixture.0.join(name);
-            symlink("missing-owned-primary", &primary).unwrap();
+            let aside = fixture.0.join("aside");
+            fs::rename(&primary, &aside).unwrap();
+            symlink("aside", &primary).unwrap();
             let result = inspect(&fixture);
-            fs::remove_file(primary).unwrap();
+            fs::remove_file(&primary).unwrap();
+            fs::rename(&aside, &primary).unwrap();
             assert_eq!(
-                result.expect_err("unsafe primary is not missing"),
+                result.expect_err("unsafe primary"),
                 CheckpointError::InvalidManifest("inspection requires a non-symlink regular file")
             );
         }
@@ -410,7 +380,11 @@ mod files {
         for generation in 0..2 {
             let draw =
                 crate::randomization::draw_generation(9001, generation, 2, 1, schedule).unwrap();
-            crate::randomization::write_generation_snapshot(&directory, &draw).unwrap();
+            crate::randomization::write_generation_snapshots(
+                &directory,
+                std::slice::from_ref(&draw),
+            )
+            .unwrap();
         }
         fs::write(
             directory.join("generation-000000000002.json"),
@@ -628,7 +602,6 @@ mod files {
                 &tensors,
             )
             .unwrap();
-            fs::write(self.0.join(CHECKPOINT_TENSOR_FILE), &tensors).unwrap();
             let runtime = serialize_runtime_tensor(&artifact.parameters).unwrap();
             fs::write(self.0.join(RUNTIME_TENSOR_FILE), runtime).unwrap();
             self.manifest(artifact);
@@ -846,7 +819,11 @@ mod files {
                 scale: crate::randomization::AnnealScale::FULL,
             };
             let draw = crate::randomization::draw_generation(9001, 0, 2, 1, schedule).unwrap();
-            crate::randomization::write_generation_snapshot(&directory, &draw).unwrap();
+            crate::randomization::write_generation_snapshots(
+                &directory,
+                std::slice::from_ref(&draw),
+            )
+            .unwrap();
             (
                 "generation-000000000000.json",
                 "generation-000000000001.json",

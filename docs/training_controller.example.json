@@ -17,7 +17,7 @@
     "--samples-per-update", "8000",
     "--slots", "64",
     "--lanes", "2",
-    "--training-microbatch", "256",
+    "--training-microbatch", "512",
     "--generation-updates", "4",
     "--zero-updates", "40",
     "--environment-schedule", "adaptive"

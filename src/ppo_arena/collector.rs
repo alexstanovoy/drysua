@@ -24,14 +24,16 @@ pub(super) struct Collector {
 }
 
 impl Collector {
-    /// Spawns one thread per lane inside `scope`.
+    /// Spawns one thread per lane inside `scope`; consecutive lanes share one
+    /// group's pool and, when pinning, its CPUs.
     pub(super) fn spawn<'scope>(
         scope: &'scope std::thread::Scope<'scope, '_>,
         lanes: Vec<(LaneSettings, LaneStart)>,
-        pool: SimPool,
+        pools: Vec<(SimPool, Option<Vec<usize>>)>,
         schedule: &'scope GameSchedule,
     ) -> Result<Self, PpoError> {
-        assert!(!lanes.is_empty());
+        assert!(!lanes.is_empty() && lanes.len().is_multiple_of(pools.len()));
+        let lanes_per_group = lanes.len() / pools.len();
         let stop = Arc::new(AtomicBool::new(false));
         let (done_sender, done) = sync_channel(lanes.len() * LANE_QUEUE);
         let mut configs = Vec::with_capacity(lanes.len());
@@ -40,10 +42,15 @@ impl Collector {
             configs.push(sender);
             let links_done = done_sender.clone();
             let lane_stop = Arc::clone(&stop);
-            let pool = pool.clone();
+            let (pool, cpus) = pools[settings.index / lanes_per_group].clone();
             std::thread::Builder::new()
                 .name(format!("lane-{}", settings.index))
                 .spawn_scoped(scope, move || {
+                    if let Some(cpus) = cpus
+                        && let Err(error) = super::topology::pin_current_thread(&cpus)
+                    {
+                        crate::telemetry::log_line!("level=WARN event=pin_failed {error}");
+                    }
                     let links = LaneLinks {
                         configs: receiver,
                         done: links_done,

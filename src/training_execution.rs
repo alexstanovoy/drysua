@@ -1,23 +1,12 @@
 use crate::PpoError;
 
-// Rollout storage, the non-rollout reserve and the largest PPO tensor microbatch
-// fit the 12 GiB admission budget, so every accepted microbatch mode is admitted.
-const _: () = assert!(
-    crate::PPO_STORAGE_PEAK_BYTES
-        + 2 * 1024 * 1024 * 1024
-        + crate::MODEL_PPO_MAX_MICROBATCH as u64 * crate::MODEL_PPO_GRAPH_ROW_RESERVE_BYTES
-        <= 12 * 1024 * 1024 * 1024
-);
-
 /// Nondefault execution modes are bound by the canonical checkpoint run scope.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TrainingExecutionOptions {
     /// Spread each epoch's rows across nearly equal minibatches without dropping a tail.
     pub balanced_minibatches: bool,
-    /// Local folding-worker ceiling; one retains the historical serial path.
-    pub host_math_workers: usize,
-    /// Tensor rows per PPO forward/backward and candidate-KL pass, independent of actor batching.
-    /// Values above 64 change GEMM and floating reduction grouping and require a new run scope.
+    /// Rows per device forward/backward and candidate-KL pass; gradients of a minibatch's
+    /// microbatches are summed, so the choice only regroups floating-point reductions.
     pub training_microbatch: usize,
 }
 
@@ -25,23 +14,18 @@ impl Default for TrainingExecutionOptions {
     fn default() -> Self {
         Self {
             balanced_minibatches: false,
-            host_math_workers: 1,
-            training_microbatch: 64,
+            training_microbatch: DEFAULT_TRAINING_MICROBATCH,
         }
     }
 }
 
+pub(crate) const DEFAULT_TRAINING_MICROBATCH: usize = 512;
+const MICROBATCH_ERROR: &str = "training microbatch must be 256, 512, 1024 or 2048";
+
 impl TrainingExecutionOptions {
     pub fn validate(self) -> Result<Self, PpoError> {
-        if !matches!(self.training_microbatch, 64 | 128 | 256) {
-            return Err(PpoError::InvalidConfig(
-                "training microbatch must be 64, 128 or 256",
-            ));
-        }
-        if !(1..=32).contains(&self.host_math_workers) {
-            return Err(PpoError::InvalidConfig(
-                "host math workers must be within 1..=32",
-            ));
+        if !matches!(self.training_microbatch, 256 | 512 | 1024 | 2048) {
+            return Err(PpoError::InvalidConfig(MICROBATCH_ERROR));
         }
         Ok(self)
     }
@@ -51,10 +35,7 @@ impl TrainingExecutionOptions {
         if self.balanced_minibatches {
             command.push_str(" --balanced-minibatches");
         }
-        if self.host_math_workers != 1 {
-            command.push_str(&format!(" --host-math-workers {}", self.host_math_workers));
-        }
-        if self.training_microbatch != 64 {
+        if self.training_microbatch != DEFAULT_TRAINING_MICROBATCH {
             command.push_str(&format!(
                 " --training-microbatch {}",
                 self.training_microbatch
@@ -74,10 +55,11 @@ pub(crate) fn parse_actor_pipeline_groups(value: &str) -> Result<u8, &'static st
 
 pub(crate) fn parse_training_microbatch(value: &str) -> Result<usize, &'static str> {
     match value {
-        "64" => Ok(64),
-        "128" => Ok(128),
         "256" => Ok(256),
-        _ => Err("training microbatch must be 64, 128 or 256"),
+        "512" => Ok(512),
+        "1024" => Ok(1024),
+        "2048" => Ok(2048),
+        _ => Err(MICROBATCH_ERROR),
     }
 }
 

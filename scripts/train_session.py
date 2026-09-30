@@ -4,7 +4,7 @@ The trainer runs every remaining update in one process, so CUDA JIT and
 container start are paid once per session. The controller owns the container
 by full ID and labels, verifies its actual cgroup limits from the host, streams
 its output into a bounded log, samples host health, and stops it gracefully
-(SIGTERM, one committed update) or immediately (SIGKILL). The committed
+(SIGTERM, one update and a checkpoint) or immediately (SIGKILL). The committed
 checkpoint on disk stays valid under both.
 """
 import json
@@ -226,7 +226,7 @@ class Supervisor:
     """Streams one started container into a bounded log and applies stop requests.
 
     `control()` returns None, `("pause", reason)` for a graceful stop after the
-    in-flight update, or `("stop", reason)` for an immediate kill. A graceful
+    in-flight update and its checkpoint, or `("stop", reason)` for an immediate kill. A graceful
     stop escalates to a kill after `stop_seconds`.
     """
 

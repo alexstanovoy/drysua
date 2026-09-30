@@ -372,7 +372,7 @@ th:first-child, td:first-child { text-align: left; }
     var container = node('div', { class: 'charts' + (section.grid ? ' grid' : '') }, sections);
     section.charts.forEach(function (chart) { drawChart(chart, container, section.grid); });
   });
-  if (!data.sections.length) node('p', { class: 'empty' }, sections, 'No committed updates in the logs yet.');
+  if (!data.sections.length) node('p', { class: 'empty' }, sections, 'No updates in the logs yet.');
   table('blocks', ['Updates', 'Games', 'W', 'L', 'D', 'Win rate'], report.blocks.map(function (block) {
     return [block.first_update + '–' + block.last_update, block.games, block.wins, block.losses, block.draws, percent(block.win_rate)];
   }));

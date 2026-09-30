@@ -11,10 +11,13 @@ use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use candle_core::{DType, Device, Tensor, Var};
 
-mod host_folding;
+mod device_learner;
+mod ppo_objective;
 mod rows;
 mod sampling;
 mod side_actors;
+pub use device_learner::MODEL_PPO_MAX_MICROBATCH;
+pub(crate) use device_learner::StagedPpoBatch;
 pub use rows::{ENCODER_ROW_ELEMENTS, EncoderRow};
 #[cfg(test)]
 pub(crate) use side_actors::take_encoder_forwards_for_test;
@@ -28,9 +31,6 @@ pub(crate) use sampling::{take_sampling_dispatches_for_test, with_eager_sampling
 #[cfg(test)]
 #[path = "tests/model_test_support.rs"]
 mod test_support;
-#[cfg(test)]
-#[path = "tests/model_transfers.rs"]
-mod transfer_tests;
 #[cfg(test)]
 pub(crate) use test_support::*;
 
@@ -58,11 +58,6 @@ pub const MODEL_TRAINING_BATCH: usize = 64;
 /// Maximum rows in one sampling or greedy selection call.
 pub const MODEL_SAMPLING_BATCH: usize = 128;
 const _: () = assert!(MODEL_SAMPLING_BATCH <= MODEL_PPO_MAX_MICROBATCH);
-/// Private PPO tensor ceiling; public training forward and actor APIs remain bounded at 64.
-pub const MODEL_PPO_MAX_MICROBATCH: usize = 256;
-/// Conservative per-row admission reserve for autograd activations and backward temporaries.
-/// This is not measured allocator usage; runtime RAM/VRAM guards remain authoritative.
-pub const MODEL_PPO_GRAPH_ROW_RESERVE_BYTES: u64 = 16 * 1024 * 1024;
 const _: () = assert!(MODEL_TRAINING_BATCH <= MODEL_PPO_MAX_MICROBATCH);
 const _: () = assert!(MODEL_PPO_MAX_MICROBATCH <= MODEL_MAX_BATCH);
 /// Number of append-only action-kind logits.
@@ -95,24 +90,6 @@ const UNIT_EMBEDDING: usize = 128;
 const TOKEN_HIDDEN: usize = 64;
 const TOKEN_EMBEDDING: usize = 64;
 const UNIT_GROUPS: usize = 5;
-// Reserve four live copies for forward/backward work, including four full-width pool intermediates.
-const PPO_TOKEN_ROWS: usize = ABILITY_FEATURE_TOKENS
-    + ITEM_FEATURE_TOKENS
-    + POINT_FEATURE_TOKENS
-    + PROJECTILE_FEATURE_TOKENS
-    + LOOT_FEATURE_TOKENS;
-const PPO_ENCODER_ROW_ELEMENTS: usize = 2
-    * (ENCODER_UNIT_TOKENS + OWN_UNIT_FEATURE_TOKENS)
-    * (UNIT_HIDDEN + 2 * UNIT_EMBEDDING)
-    + 2 * PPO_TOKEN_ROWS * (TOKEN_HIDDEN + TOKEN_EMBEDDING)
-    + 4 * (UNIT_GROUPS * ENCODER_UNIT_TOKENS * UNIT_EMBEDDING + PPO_TOKEN_ROWS * TOKEN_EMBEDDING)
-    + 4 * TRUNK_INPUT
-    + 2 * (TRUNK_WIDE + 2 * TRUNK_WIDTH);
-const _: () = assert!(
-    4 * PPO_ENCODER_ROW_ELEMENTS as u64 * std::mem::size_of::<f32>() as u64
-        + 2 * (std::mem::size_of::<FeatureFrame>() as u64)
-        < MODEL_PPO_GRAPH_ROW_RESERVE_BYTES
-);
 const TRUNK_INPUT: usize = GLOBAL_FEATURES
     + HISTORY_SAMPLES * HISTORY_FEATURES
     + MAX_POLICY_HISTORY * POLICY_HISTORY_FEATURES
@@ -1925,6 +1902,28 @@ impl PolicyModel {
     ) -> Result<PolicyTensorTensors, ModelError> {
         let routing = ActorRouting::new(frames, self.tensor_device(), true)?;
         let state = self.forward_frames(frames)?;
+        let prefixes = PrefixUpload::new(prefixes, self.tensor_device())?;
+        self.training_heads(state, routing, &prefixes, value_trunk_gradient)
+    }
+
+    /// Training outputs of one staged microbatch.
+    fn training_forward_inputs(
+        &self,
+        inputs: &device_learner::StagedInputs,
+        value_trunk_gradient: bool,
+    ) -> Result<PolicyTensorTensors, ModelError> {
+        let routing = ActorRouting::from_mask(inputs.sides.clone());
+        let state = self.forward_encoder_inputs(&inputs.encoder)?;
+        self.training_heads(state, routing, &inputs.prefixes, value_trunk_gradient)
+    }
+
+    fn training_heads(
+        &self,
+        state: ForwardState,
+        routing: ActorRouting,
+        prefixes: &PrefixUpload,
+        value_trunk_gradient: bool,
+    ) -> Result<PolicyTensorTensors, ModelError> {
         // PPO deliberately isolates critic fitting to preserve transferred actor features.
         let value_input = if value_trunk_gradient {
             state.trunk.clone()
@@ -1979,265 +1978,6 @@ impl PolicyModel {
                 gradient: gradients.get(parameter.value.as_tensor()).cloned(),
             })
             .collect())
-    }
-
-    pub(crate) fn ppo_update(
-        &self,
-        examples: &[&PpoPreparedSample],
-        adam: &mut AdamState,
-        config: PpoConfig,
-    ) -> Result<PpoMinibatchReport, ModelError> {
-        self.ppo_update_with_microbatch(
-            examples,
-            adam,
-            config,
-            MODEL_TRAINING_BATCH,
-            #[cfg(test)]
-            PpoTestFaults::default(),
-        )
-    }
-
-    fn ppo_update_with_microbatch(
-        &self,
-        examples: &[&PpoPreparedSample],
-        adam: &mut AdamState,
-        config: PpoConfig,
-        microbatch_size: usize,
-        #[cfg(test)] faults: PpoTestFaults,
-    ) -> Result<PpoMinibatchReport, ModelError> {
-        self.ppo_update_with_microbatch_and_workers(
-            examples,
-            adam,
-            config,
-            microbatch_size,
-            1,
-            #[cfg(test)]
-            faults,
-        )
-    }
-
-    pub(crate) fn ppo_update_with_execution(
-        &self,
-        examples: &[&PpoPreparedSample],
-        adam: &mut AdamState,
-        config: PpoConfig,
-        execution: crate::TrainingExecutionOptions,
-    ) -> Result<PpoMinibatchReport, ModelError> {
-        execution
-            .validate()
-            .map_err(|error| ModelError::Backend(error.to_string()))?;
-        if execution.host_math_workers == 1 && execution.training_microbatch == MODEL_TRAINING_BATCH
-        {
-            return self.ppo_update(examples, adam, config);
-        }
-        self.ppo_update_with_microbatch_and_workers(
-            examples,
-            adam,
-            config,
-            execution.training_microbatch,
-            execution.host_math_workers,
-            #[cfg(test)]
-            PpoTestFaults::default(),
-        )
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn ppo_update_with_microbatch_and_workers(
-        &self,
-        examples: &[&PpoPreparedSample],
-        adam: &mut AdamState,
-        config: PpoConfig,
-        microbatch_size: usize,
-        requested_workers: usize,
-        #[cfg(test)] faults: PpoTestFaults,
-    ) -> Result<PpoMinibatchReport, ModelError> {
-        if examples.is_empty() || examples.len() > MODEL_MAX_BATCH {
-            return Err(ModelError::InvalidModelState("PPO minibatch count"));
-        }
-        if !(1..=MODEL_PPO_MAX_MICROBATCH).contains(&microbatch_size) {
-            return Err(ModelError::InvalidModelState("PPO microbatch size"));
-        }
-        if !(1..=32).contains(&requested_workers) {
-            return Err(ModelError::InvalidModelState("host math workers"));
-        }
-        let _guard = self.write_parameter_lock()?;
-        self.validate_optimizer_binding_locked(adam.binding)?;
-        let (mut gradients, mut report) =
-            host_folding::collect(self, examples, config, microbatch_size, requested_workers)?;
-        let divisor = examples.len() as f32;
-        for gradient in &mut gradients {
-            *gradient /= divisor;
-        }
-        average_ppo_report(&mut report, examples.len())?;
-        if report.approximate_kl > f64::from(config.target_kl) {
-            return Ok(report);
-        }
-        let original = self.export_parameters_locked()?;
-        let original_adam = adam.clone();
-        let diagnostics = self.apply_adam_locked(adam, &gradients, &original)?;
-        let candidate_kl = self.ppo_candidate_kl_locked(
-            examples,
-            config,
-            microbatch_size,
-            #[cfg(test)]
-            faults.candidate_evaluation,
-        );
-        if !candidate_kl
-            .as_ref()
-            .is_ok_and(|kl| *kl <= f64::from(config.target_kl))
-        {
-            self.rollback_ppo_candidate_locked(
-                &original,
-                original_adam,
-                adam,
-                &candidate_kl,
-                #[cfg(test)]
-                faults.rollback_import,
-            )?;
-            report.approximate_kl = candidate_kl?;
-            return Ok(report);
-        }
-        report.approximate_kl = candidate_kl?;
-        report.gradient_norm = diagnostics.unclipped_norm;
-        report.applied_scale = diagnostics.applied_scale;
-        report.applied = true;
-        Ok(report)
-    }
-
-    fn rollback_ppo_candidate_locked(
-        &self,
-        original: &[f32],
-        original_adam: AdamState,
-        adam: &mut AdamState,
-        candidate_kl: &Result<f64, ModelError>,
-        #[cfg(test)] inject_failure: bool,
-    ) -> Result<(), ModelError> {
-        assert_eq!(adam.binding.lineage, original_adam.binding.lineage);
-        assert_eq!(adam.step(), original_adam.step() + 1);
-        #[cfg(not(test))]
-        let fail_after = None;
-        #[cfg(test)]
-        let fail_after = inject_failure.then_some(0);
-        self.import_parameters_locked(original, fail_after)
-            .map_err(|rollback| {
-                let cause = match candidate_kl {
-                    Ok(kl) => format!("sampled KL {kl} exceeds target"),
-                    Err(error) => error.to_string(),
-                };
-                ModelError::Backend(format!(
-                    "PPO candidate rejected ({cause}); parameter rollback failed ({rollback})"
-                ))
-            })?;
-        self.parameter_revision
-            .store(original_adam.binding.policy.revision, Ordering::Relaxed);
-        *adam = original_adam;
-        Ok(())
-    }
-
-    fn ppo_candidate_kl_locked(
-        &self,
-        examples: &[&PpoPreparedSample],
-        _config: PpoConfig,
-        microbatch_size: usize,
-        #[cfg(test)] inject_failure: bool,
-    ) -> Result<f64, ModelError> {
-        assert!(!examples.is_empty());
-        assert!((1..=MODEL_PPO_MAX_MICROBATCH).contains(&microbatch_size));
-        let mut kl = 0.0;
-        for chunk in examples.chunks(microbatch_size) {
-            let frames = chunk
-                .iter()
-                .map(|sample| sample.transition.frame.clone())
-                .collect::<Vec<_>>();
-            let prefixes = chunk
-                .iter()
-                .map(|sample| sample.transition.target.prefix())
-                .collect::<Vec<_>>();
-            let output = self.training_forward_locked(&frames, &prefixes)?;
-            validate_training_tensors_finite(&output)?;
-            #[cfg(not(test))]
-            let approximate_kl = ppo_candidate_kl(&output, chunk)?;
-            #[cfg(test)]
-            let approximate_kl =
-                transfer_tests::candidate_kl_tests::evaluate(&output, chunk, _config)?;
-            kl += approximate_kl * chunk.len() as f64;
-            #[cfg(test)]
-            if inject_failure {
-                return Err(ModelError::Backend(format!(
-                    "injected PPO candidate evaluation failure after {} rows",
-                    chunk.len()
-                )));
-            }
-        }
-        Ok(kl / examples.len() as f64)
-    }
-
-    fn ppo_microbatch_locked(
-        &self,
-        examples: &[&PpoPreparedSample],
-        config: PpoConfig,
-    ) -> Result<PpoMicrobatch, ModelError> {
-        self.ppo_microbatch_readback_locked(examples, config, true)
-    }
-
-    fn ppo_microbatch_readback_locked(
-        &self,
-        examples: &[&PpoPreparedSample],
-        config: PpoConfig,
-        validate: bool,
-    ) -> Result<PpoMicrobatch, ModelError> {
-        let frames = examples
-            .iter()
-            .map(|sample| sample.transition.frame.clone())
-            .collect::<Vec<_>>();
-        let prefixes = examples
-            .iter()
-            .map(|sample| sample.transition.target.prefix())
-            .collect::<Vec<_>>();
-        validate_ppo_training_batch(&frames, &prefixes)?;
-        let output = self.training_forward_value_gradient_locked(&frames, &prefixes, false)?;
-        validate_training_tensors_finite(&output)?;
-        let (loss, report) = ppo_loss(&output, examples, config)?;
-        let named = self.backward_named_locked(&loss)?;
-        Ok(PpoMicrobatch {
-            gradients: if validate {
-                collect_host_gradients(named)?
-            } else {
-                collect_host_gradients_checked(named, false)?
-            },
-            report,
-        })
-    }
-
-    fn apply_adam_locked(
-        &self,
-        adam: &mut AdamState,
-        gradients: &[f32],
-        parameters: &[f32],
-    ) -> Result<AdamDiagnostics, ModelError> {
-        assert_eq!(parameters.len(), MODEL_PARAMETER_COUNT);
-        assert_eq!(adam.binding.policy, self.policy_identity_locked());
-        let next = self.next_policy_identity_locked()?;
-        // The exclusive candidate lock keeps the rollback snapshot current until import.
-        let replacement = compute_adam_step(
-            parameters,
-            gradients,
-            &adam.first_moment,
-            &adam.second_moment,
-            adam.step,
-            adam.config,
-        )?;
-        self.import_parameters_locked(&replacement.parameters, None)?;
-        adam.first_moment = replacement.first_moment;
-        adam.second_moment = replacement.second_moment;
-        adam.step = replacement.step;
-        adam.binding.policy = next;
-        self.parameter_revision
-            .store(next.revision, Ordering::Relaxed);
-        Ok(AdamDiagnostics {
-            unclipped_norm: replacement.unclipped_norm,
-            applied_scale: replacement.applied_scale,
-        })
     }
 
     /// Value and side-selected kind logits; errors report rows offset by `batch_offset`.
@@ -2459,12 +2199,11 @@ impl PolicyModel {
     fn training_contexts(
         &self,
         trunk: &Tensor,
-        prefixes: &[TrainingPrefix],
+        upload: &PrefixUpload,
     ) -> Result<TrainingContexts, ModelError> {
-        let upload = PrefixUpload::new(prefixes, self.tensor_device())?;
-        let kind = self.kind_embeddings(&upload)?;
-        let unit = self.unit_embeddings(&upload)?;
-        let slot = self.slot_embeddings(&upload)?;
+        let kind = self.kind_embeddings(upload)?;
+        let unit = self.unit_embeddings(upload)?;
+        let slot = self.slot_embeddings(upload)?;
         let zero_unit = Tensor::zeros(unit.shape(), DType::F32, self.tensor_device())?;
         let zero_slot = Tensor::zeros(slot.shape(), DType::F32, self.tensor_device())?;
         Ok(TrainingContexts {
@@ -2479,7 +2218,7 @@ impl PolicyModel {
             .kind_embedding
             .value
             .as_tensor()
-            .index_select(&upload.indices(PrefixIndex::Kind)?, 0)?)
+            .index_select(upload.indices(PrefixIndex::Kind), 0)?)
     }
 
     fn unit_embeddings(&self, upload: &PrefixUpload) -> Result<Tensor, ModelError> {
@@ -2487,8 +2226,8 @@ impl PolicyModel {
             .unit_embedding
             .value
             .as_tensor()
-            .index_select(&upload.indices(PrefixIndex::Unit)?, 0)?
-            .broadcast_mul(&upload.mask(PrefixMask::Unit)?)?)
+            .index_select(upload.indices(PrefixIndex::Unit), 0)?
+            .broadcast_mul(upload.mask(PrefixMask::Unit))?)
     }
 
     fn slot_embeddings(&self, upload: &PrefixUpload) -> Result<Tensor, ModelError> {
@@ -2496,14 +2235,14 @@ impl PolicyModel {
             .ability_embedding
             .value
             .as_tensor()
-            .index_select(&upload.indices(PrefixIndex::Ability)?, 0)?
-            .broadcast_mul(&upload.mask(PrefixMask::Ability)?)?;
+            .index_select(upload.indices(PrefixIndex::Ability), 0)?
+            .broadcast_mul(upload.mask(PrefixMask::Ability))?;
         let item = self
             .item_embedding
             .value
             .as_tensor()
-            .index_select(&upload.indices(PrefixIndex::Item)?, 0)?
-            .broadcast_mul(&upload.mask(PrefixMask::Item)?)?;
+            .index_select(upload.indices(PrefixIndex::Item), 0)?
+            .broadcast_mul(upload.mask(PrefixMask::Item))?;
         Ok((ability + item)?)
     }
 
@@ -2722,38 +2461,15 @@ impl PolicyModel {
     }
 }
 
-struct PpoMicrobatch {
-    gradients: Vec<f32>,
-    report: PpoMinibatchReport,
-}
-
 struct PolicyPathStatistics {
     log_probability: f32,
     entropy: f32,
     value: f32,
 }
 
-struct AdamReplacement {
-    parameters: Vec<f32>,
-    first_moment: Vec<f32>,
-    second_moment: Vec<f32>,
-    step: u64,
-    unclipped_norm: f64,
-    applied_scale: f64,
-}
-
 struct AdamDiagnostics {
     unclipped_norm: f64,
     applied_scale: f64,
-}
-
-struct AdamCalculation {
-    step: u64,
-    norm: f64,
-    scale: f64,
-    beta1_correction: f64,
-    beta2_correction: f64,
-    config: AdamConfig,
 }
 
 struct BehavioralHostLogits {
@@ -2866,539 +2582,6 @@ fn host_head_statistics<const WIDTH: usize>(
     Ok((log_probability, entropy))
 }
 
-fn ppo_candidate_kl(
-    output: &PolicyTensorTensors,
-    examples: &[&PpoPreparedSample],
-) -> Result<f64, ModelError> {
-    assert!(!examples.is_empty());
-    assert!(examples.len() <= MODEL_PPO_MAX_MICROBATCH);
-    let negative_log_probability = ppo_negative_log_probability(output, examples)?;
-    let new_log_probability = negative_log_probability.neg()?;
-    let mut old_values = [0.0f32; MODEL_PPO_MAX_MICROBATCH];
-    for (value, sample) in old_values.iter_mut().zip(examples) {
-        *value = sample.transition.old_log_probability;
-    }
-    let old_log_probability = Tensor::from_slice(
-        &old_values[..examples.len()],
-        examples.len(),
-        output.value.device(),
-    )?;
-    let log_ratio = (&new_log_probability - &old_log_probability)?;
-    let ratio = log_ratio.exp()?;
-    // Preserve ppo_loss_report's F32 operations and reduction, not an expm1 rewrite.
-    let approximate_kl = (&ratio.affine(1.0, -1.0)? - &log_ratio)?
-        .mean_all()?
-        .to_scalar::<f32>()?;
-    Ok(f64::from(approximate_kl))
-}
-
-fn ppo_loss(
-    output: &PolicyTensorTensors,
-    examples: &[&PpoPreparedSample],
-    config: PpoConfig,
-) -> Result<(Tensor, PpoMinibatchReport), ModelError> {
-    let device = output.value.device();
-    let negative_log_probability = ppo_negative_log_probability(output, examples)?;
-    let new_log_probability = negative_log_probability.neg()?;
-    let old_log_probability = Tensor::from_vec(
-        examples
-            .iter()
-            .map(|sample| sample.transition.old_log_probability)
-            .collect::<Vec<_>>(),
-        examples.len(),
-        device,
-    )?;
-    let advantages = Tensor::from_vec(
-        examples
-            .iter()
-            .map(|sample| sample.advantage)
-            .collect::<Vec<_>>(),
-        examples.len(),
-        device,
-    )?;
-    let log_ratio = (&new_log_probability - &old_log_probability)?;
-    let ratio = log_ratio.exp()?;
-    let clipped_ratio = ratio.clamp(1.0 - config.clip_epsilon, 1.0 + config.clip_epsilon)?;
-    let unclipped = ratio.mul(&advantages)?;
-    let clipped = clipped_ratio.mul(&advantages)?;
-    let policy_loss = unclipped.minimum(&clipped)?.mean_all()?.neg()?;
-    let returns = Tensor::from_vec(
-        examples
-            .iter()
-            .map(|sample| sample.return_value)
-            .collect::<Vec<_>>(),
-        examples.len(),
-        device,
-    )?;
-    let values = output.value.squeeze(1)?;
-    let value_loss = (&values - &returns)?.sqr()?.mean_all()?;
-    let entropy = ppo_entropy(output, examples)?.mean_all()?;
-    let loss = (&policy_loss + &value_loss.affine(f64::from(config.value_coefficient), 0.0)?)?;
-    let loss = (&loss - &entropy.affine(f64::from(config.entropy_coefficient), 0.0)?)?;
-    let report = ppo_loss_report(
-        &policy_loss,
-        &value_loss,
-        &entropy,
-        &log_ratio,
-        &ratio,
-        config,
-        examples.len(),
-    )?;
-    Ok((loss, report))
-}
-
-fn ppo_loss_report(
-    policy_loss: &Tensor,
-    value_loss: &Tensor,
-    entropy: &Tensor,
-    log_ratio: &Tensor,
-    ratio: &Tensor,
-    config: PpoConfig,
-    samples: usize,
-) -> Result<PpoMinibatchReport, ModelError> {
-    let approximate_kl = (&ratio.affine(1.0, -1.0)? - log_ratio)?
-        .mean_all()?
-        .to_scalar::<f32>()?;
-    let ratios = ratio.to_vec1::<f32>()?;
-    let clipped = ratios
-        .iter()
-        .filter(|ratio| **ratio < 1.0 - config.clip_epsilon || **ratio > 1.0 + config.clip_epsilon)
-        .count();
-    Ok(PpoMinibatchReport {
-        policy_loss: f64::from(policy_loss.to_scalar::<f32>()?),
-        value_loss: f64::from(value_loss.to_scalar::<f32>()?),
-        entropy: f64::from(entropy.to_scalar::<f32>()?),
-        approximate_kl: f64::from(approximate_kl),
-        clip_fraction: clipped as f64 / samples as f64,
-        gradient_norm: 0.0,
-        applied_scale: 0.0,
-        samples,
-        applied: false,
-    })
-}
-
-fn ppo_negative_log_probability(
-    output: &PolicyTensorTensors,
-    examples: &[&PpoPreparedSample],
-) -> Result<Tensor, ModelError> {
-    macro_rules! add_head {
-        ($loss:ident, $tensor:expr, $name:literal, $field:ident) => {
-            $loss =
-                ($loss + masked_ppo_head_loss($tensor, examples, $name, |target| &target.$field)?)?;
-        };
-    }
-    let mut loss = masked_ppo_head_loss(&output.kind, examples, "kind", |target| &target.kind)?;
-    add_head!(loss, &output.controlled, "controlled", controlled);
-    add_head!(loss, &output.ability, "ability", ability);
-    add_head!(loss, &output.item, "item", item);
-    add_head!(loss, &output.swap, "swap", swap);
-    add_head!(loss, &output.learn, "learn", learn);
-    add_head!(loss, &output.shop, "shop", shop);
-    add_head!(loss, &output.loot, "loot", loot);
-    add_head!(loss, &output.target_mode, "target mode", target_mode);
-    add_head!(loss, &output.put_mode, "put mode", put_mode);
-    add_head!(
-        loss,
-        &output.entity_pointer,
-        "entity pointer",
-        entity_pointer
-    );
-    add_head!(loss, &output.point_pointer, "point pointer", point_pointer);
-    Ok(loss)
-}
-
-fn masked_ppo_head_loss<const WIDTH: usize>(
-    logits: &Tensor,
-    examples: &[&PpoPreparedSample],
-    name: &'static str,
-    target: fn(&BehavioralTarget) -> &HeadTarget<WIDTH>,
-) -> Result<Tensor, ModelError> {
-    let mut masks = Vec::with_capacity(examples.len() * WIDTH);
-    let mut labels = Vec::with_capacity(examples.len());
-    let mut active = Vec::with_capacity(examples.len());
-    for sample in examples {
-        append_tensor_target(
-            target(&sample.transition.target),
-            name,
-            &mut masks,
-            &mut labels,
-            &mut active,
-        )?;
-    }
-    masked_loss_from_parts(logits, examples.len(), WIDTH, masks, labels, active)
-}
-
-fn masked_loss_from_parts(
-    logits: &Tensor,
-    batch: usize,
-    width: usize,
-    masks: Vec<u8>,
-    labels: Vec<u32>,
-    active: Vec<f32>,
-) -> Result<Tensor, ModelError> {
-    if logits.dims() != [batch, width] {
-        return Err(ModelError::InvalidModelState("PPO head shape"));
-    }
-    let device = logits.device();
-    let masks = Tensor::from_vec(masks, (batch, width), device)?;
-    let labels = Tensor::from_vec(labels, (batch, 1), device)?;
-    let active = Tensor::from_vec(active, batch, device)?;
-    let negative = Tensor::full(f32::NEG_INFINITY, logits.shape(), device)?;
-    let legal_logits = masks.where_cond(logits, &negative)?;
-    let legal_logits = legal_logits.broadcast_sub(&legal_logits.max_keepdim(1)?.detach())?;
-    let selected = legal_logits.gather(&labels, 1)?.squeeze(1)?;
-    Ok((legal_logits.log_sum_exp(1)? - selected)?.mul(&active)?)
-}
-
-fn ppo_entropy(
-    output: &PolicyTensorTensors,
-    examples: &[&PpoPreparedSample],
-) -> Result<Tensor, ModelError> {
-    macro_rules! add_head {
-        ($entropy:ident, $tensor:expr, $field:ident) => {
-            $entropy =
-                ($entropy + masked_ppo_head_entropy($tensor, examples, |target| &target.$field)?)?;
-        };
-    }
-    let mut entropy = masked_ppo_head_entropy(&output.kind, examples, |target| &target.kind)?;
-    add_head!(entropy, &output.controlled, controlled);
-    add_head!(entropy, &output.ability, ability);
-    add_head!(entropy, &output.item, item);
-    add_head!(entropy, &output.swap, swap);
-    add_head!(entropy, &output.learn, learn);
-    add_head!(entropy, &output.shop, shop);
-    add_head!(entropy, &output.loot, loot);
-    add_head!(entropy, &output.target_mode, target_mode);
-    add_head!(entropy, &output.put_mode, put_mode);
-    add_head!(entropy, &output.entity_pointer, entity_pointer);
-    add_head!(entropy, &output.point_pointer, point_pointer);
-    Ok(entropy)
-}
-
-fn masked_ppo_head_entropy<const WIDTH: usize>(
-    logits: &Tensor,
-    examples: &[&PpoPreparedSample],
-    target: fn(&BehavioralTarget) -> &HeadTarget<WIDTH>,
-) -> Result<Tensor, ModelError> {
-    Ok(masked_ppo_head_entropy_tensors(logits, examples, target)?.entropy)
-}
-
-struct MaskedPpoEntropy {
-    entropy: Tensor,
-    #[cfg(test)]
-    log_normalizer: Tensor,
-}
-
-fn masked_ppo_head_entropy_tensors<const WIDTH: usize>(
-    logits: &Tensor,
-    examples: &[&PpoPreparedSample],
-    target: fn(&BehavioralTarget) -> &HeadTarget<WIDTH>,
-) -> Result<MaskedPpoEntropy, ModelError> {
-    if logits.dims() != [examples.len(), WIDTH] {
-        return Err(ModelError::InvalidModelState("PPO entropy head shape"));
-    }
-    let mut masks = Vec::with_capacity(examples.len() * WIDTH);
-    let mut active = Vec::with_capacity(examples.len());
-    for sample in examples {
-        let head = target(&sample.transition.target);
-        // An inactive head needs a singleton distribution, not an all-infinite normalizer.
-        let mask = if head.active {
-            head.mask
-        } else {
-            std::array::from_fn(|index| index == 0)
-        };
-        masks.extend(mask.map(u8::from));
-        active.push(f32::from(head.active));
-    }
-    let device = logits.device();
-    let masks = Tensor::from_vec(masks, (examples.len(), WIDTH), device)?;
-    let active = Tensor::from_vec(active, examples.len(), device)?;
-    let negative = Tensor::full(f32::NEG_INFINITY, logits.shape(), device)?;
-    let legal = masks.where_cond(logits, &negative)?;
-    let log_normalizer = legal.log_sum_exp(1)?.unsqueeze(1)?;
-    let log_probability = legal.broadcast_sub(&log_normalizer)?;
-    let zeros = Tensor::zeros(logits.shape(), DType::F32, device)?;
-    let safe_log_probability = masks.where_cond(&log_probability, &zeros)?;
-    let probability = masks.where_cond(&safe_log_probability.exp()?, &zeros)?;
-    let entropy = probability
-        .mul(&safe_log_probability)?
-        .sum(1)?
-        .neg()?
-        .mul(&active)?;
-    Ok(MaskedPpoEntropy {
-        entropy,
-        #[cfg(test)]
-        log_normalizer,
-    })
-}
-
-fn append_tensor_target<const WIDTH: usize>(
-    target: &HeadTarget<WIDTH>,
-    name: &'static str,
-    masks: &mut Vec<u8>,
-    labels: &mut Vec<u32>,
-    active: &mut Vec<f32>,
-) -> Result<(), ModelError> {
-    if target.active && !target.mask.get(target.selected).copied().unwrap_or(false) {
-        return Err(ModelError::BehavioralTarget {
-            head: name,
-            label: target.selected,
-        });
-    }
-    if target.active {
-        masks.extend(target.mask.map(u8::from));
-        labels.push(target.selected as u32);
-        active.push(1.0);
-    } else {
-        masks.push(1);
-        masks.resize(masks.len() + WIDTH - 1, 0);
-        labels.push(0);
-        active.push(0.0);
-    }
-    Ok(())
-}
-
-fn collect_host_gradients(named: Vec<NamedPolicyGradient>) -> Result<Vec<f32>, ModelError> {
-    collect_host_gradients_checked(named, true)
-}
-
-fn collect_host_gradients_checked(
-    named: Vec<NamedPolicyGradient>,
-    validate: bool,
-) -> Result<Vec<f32>, ModelError> {
-    validate_gradient_descriptors(&named)?;
-    let first = named.iter().find_map(|gradient| gradient.gradient.as_ref());
-    if first.is_some_and(|first| {
-        !first.device().is_cpu()
-            && named
-                .iter()
-                .filter_map(|gradient| gradient.gradient.as_ref())
-                .all(|tensor| {
-                    tensor.dtype() == DType::F32 && tensor.device().same_device(first.device())
-                })
-    }) {
-        return if validate {
-            collect_packed_gradients(&named)
-        } else {
-            collect_packed_gradients_checked(&named, false)
-        };
-    }
-    let mut output = Vec::with_capacity(MODEL_PARAMETER_COUNT);
-    let mut total = Some(0usize);
-    for gradient in named {
-        let count = gradient_element_count(&gradient.parameter_shape)?;
-        let end = total.and_then(|offset| gradient_buffer_end(offset, count));
-        if let Some(tensor) = gradient.gradient {
-            // Match Candle's extraction error before compacting invalid or empty inputs.
-            if tensor.dtype() != DType::F32 {
-                return Err(candle_core::Error::UnexpectedDType {
-                    expected: DType::F32,
-                    got: tensor.dtype(),
-                    msg: "unexpected dtype",
-                }
-                .bt()
-                .into());
-            }
-            if tensor.elem_count() != count {
-                return Err(ModelError::InvalidModelState("gradient shape"));
-            }
-            if count == 0 || count > MODEL_PARAMETER_COUNT {
-                total = end;
-                continue;
-            }
-            let tensor = if tensor.device().is_cpu() {
-                tensor
-            } else {
-                tensor.detach().force_contiguous()?
-            };
-            let values = tensor.flatten_all()?.to_vec1::<f32>()?;
-            if values.len() != count {
-                return Err(ModelError::InvalidModelState("gradient shape"));
-            }
-            if end.is_some() {
-                output.extend(values);
-            }
-        } else if let Some(end) = end {
-            output.resize(end, 0.0);
-        }
-        total = end;
-    }
-    // Shape/dtype errors retain priority even after a bounded total overflows.
-    total.ok_or(ModelError::InvalidModelState("gradient parameter count"))?;
-    finish_host_gradients(output, validate)
-}
-
-fn collect_packed_gradients(named: &[NamedPolicyGradient]) -> Result<Vec<f32>, ModelError> {
-    collect_packed_gradients_checked(named, true)
-}
-
-fn collect_packed_gradients_checked(
-    named: &[NamedPolicyGradient],
-    validate: bool,
-) -> Result<Vec<f32>, ModelError> {
-    validate_gradient_descriptors(named)?;
-    let mut tensors = Vec::with_capacity(named.len());
-    let mut ranges = Vec::with_capacity(named.len());
-    let mut total = Some(0usize);
-    let mut present = 0usize;
-    for gradient in named {
-        let count = gradient_element_count(&gradient.parameter_shape)?;
-        let end = total.and_then(|offset| gradient_buffer_end(offset, count));
-        if let Some(tensor) = &gradient.gradient {
-            if tensor.elem_count() != count {
-                return Err(ModelError::InvalidModelState("gradient shape"));
-            }
-            if let Some(end) = end
-                && count > 0
-            {
-                present = gradient_buffer_end(present, count)
-                    .ok_or(ModelError::InvalidModelState("gradient parameter count"))?;
-                tensors.push(tensor.detach().flatten_all()?);
-                ranges.push(end - count..end);
-            }
-        }
-        total = end;
-    }
-    let total = total.ok_or(ModelError::InvalidModelState("gradient parameter count"))?;
-    let mut output = vec![0.0f32; total];
-    if !tensors.is_empty() {
-        // Singleton cat aliases backing storage; compact it before the only host read.
-        let packed = if tensors.len() == 1 {
-            tensors[0].force_contiguous()?
-        } else {
-            Tensor::cat(&tensors, 0)?
-        };
-        assert_eq!(packed.elem_count(), present);
-        assert_eq!(packed.layout().start_offset(), 0);
-        let values = packed.to_vec1::<f32>()?;
-        if values.len() != present {
-            return Err(ModelError::InvalidModelState("gradient shape"));
-        }
-        let mut offset = 0usize;
-        for range in ranges {
-            let end = gradient_buffer_end(offset, range.len())
-                .ok_or(ModelError::InvalidModelState("gradient parameter count"))?;
-            let source = values
-                .get(offset..end)
-                .ok_or(ModelError::InvalidModelState("gradient shape"))?;
-            let target = output
-                .get_mut(range)
-                .ok_or(ModelError::InvalidModelState("gradient parameter count"))?;
-            target.copy_from_slice(source);
-            offset = end;
-        }
-        assert_eq!(offset, present);
-    }
-    finish_host_gradients(output, validate)
-}
-
-fn validate_gradient_descriptors(named: &[NamedPolicyGradient]) -> Result<(), ModelError> {
-    if named.len() > MODEL_PARAMETER_TENSORS {
-        return Err(ModelError::InvalidModelState("gradient parameter count"));
-    }
-    Ok(())
-}
-
-fn gradient_element_count(shape: &[usize]) -> Result<usize, ModelError> {
-    if shape.len() > 2 {
-        return Err(ModelError::InvalidModelState("gradient shape"));
-    }
-    shape.iter().try_fold(1usize, |count, dimension| {
-        count
-            .checked_mul(*dimension)
-            .ok_or(ModelError::InvalidModelState("gradient shape"))
-    })
-}
-
-fn gradient_buffer_end(offset: usize, count: usize) -> Option<usize> {
-    offset
-        .checked_add(count)
-        .filter(|end| *end <= MODEL_PARAMETER_COUNT)
-}
-
-fn finish_host_gradients(output: Vec<f32>, validate: bool) -> Result<Vec<f32>, ModelError> {
-    if output.len() != MODEL_PARAMETER_COUNT {
-        return Err(ModelError::InvalidModelState("gradient parameter count"));
-    }
-    if validate {
-        validate_gradients(&output)?;
-    }
-    Ok(output)
-}
-
-fn accumulate_gradients(total: &mut [f32], addition: &[f32]) -> Result<(), ModelError> {
-    if total.len() != addition.len() {
-        return Err(ModelError::OptimizerVectorLength {
-            field: "gradient",
-            actual: addition.len(),
-            expected: total.len(),
-        });
-    }
-    for (index, (total, addition)) in total.iter_mut().zip(addition).enumerate() {
-        *total += addition;
-        if !total.is_finite() {
-            return Err(ModelError::NonFiniteGradient { index });
-        }
-    }
-    Ok(())
-}
-
-fn scale_gradients(gradients: &mut [f32], scale: f32) -> Result<(), ModelError> {
-    if !scale.is_finite() || scale <= 0.0 {
-        return Err(ModelError::InvalidModelState("gradient accumulation scale"));
-    }
-    for (index, gradient) in gradients.iter_mut().enumerate() {
-        *gradient *= scale;
-        if !gradient.is_finite() {
-            return Err(ModelError::NonFiniteGradient { index });
-        }
-    }
-    Ok(())
-}
-
-fn accumulate_ppo_report(
-    total: &mut PpoMinibatchReport,
-    addition: PpoMinibatchReport,
-) -> Result<(), ModelError> {
-    total.policy_loss += addition.policy_loss * addition.samples as f64;
-    total.value_loss += addition.value_loss * addition.samples as f64;
-    total.entropy += addition.entropy * addition.samples as f64;
-    total.approximate_kl += addition.approximate_kl * addition.samples as f64;
-    total.clip_fraction += addition.clip_fraction * addition.samples as f64;
-    total.samples = total
-        .samples
-        .checked_add(addition.samples)
-        .ok_or(ModelError::InvalidModelState("PPO sample count"))?;
-    Ok(())
-}
-
-fn average_ppo_report(
-    report: &mut PpoMinibatchReport,
-    expected_samples: usize,
-) -> Result<(), ModelError> {
-    if report.samples != expected_samples || report.samples == 0 {
-        return Err(ModelError::InvalidModelState("PPO report sample count"));
-    }
-    let divisor = report.samples as f64;
-    report.policy_loss /= divisor;
-    report.value_loss /= divisor;
-    report.entropy /= divisor;
-    report.approximate_kl /= divisor;
-    report.clip_fraction /= divisor;
-    for value in [
-        report.policy_loss,
-        report.value_loss,
-        report.entropy,
-        report.approximate_kl,
-        report.clip_fraction,
-    ] {
-        if !value.is_finite() {
-            return Err(ModelError::InvalidModelState("PPO report finite"));
-        }
-    }
-    Ok(())
-}
-
 fn validate_adam_config(config: AdamConfig) -> Result<(), ModelError> {
     if !config.learning_rate.is_finite() || config.learning_rate <= 0.0 {
         return Err(ModelError::InvalidAdamConfig("learning rate"));
@@ -3463,136 +2646,6 @@ fn validate_moments(
         return Err(ModelError::NonFiniteMoment { field, index });
     }
     Ok(())
-}
-
-fn validate_gradients(gradients: &[f32]) -> Result<(), ModelError> {
-    if let Some((index, _)) = gradients
-        .iter()
-        .enumerate()
-        .find(|(_, value)| !value.is_finite())
-    {
-        return Err(ModelError::NonFiniteGradient { index });
-    }
-    Ok(())
-}
-
-fn compute_adam_step(
-    parameters: &[f32],
-    gradients: &[f32],
-    first_moment: &[f32],
-    second_moment: &[f32],
-    step: u64,
-    config: AdamConfig,
-) -> Result<AdamReplacement, ModelError> {
-    validate_adam_parts(config, first_moment, second_moment, step, parameters.len())?;
-    validate_optimizer_length("gradient", gradients.len(), parameters.len())?;
-    validate_gradients(gradients)?;
-    if let Some((index, _)) = parameters
-        .iter()
-        .enumerate()
-        .find(|(_, value)| !value.is_finite())
-    {
-        return Err(ModelError::NonFiniteParameter { index });
-    }
-    let next_step = step
-        .checked_add(1)
-        .filter(|value| *value <= MODEL_MAX_OPTIMIZER_STEP)
-        .ok_or(ModelError::OptimizerStepOverflow)?;
-    let norm = gradient_norm(gradients)?;
-    let scale = if norm > f64::from(config.gradient_clip) {
-        f64::from(config.gradient_clip) / norm
-    } else {
-        1.0
-    };
-    let calculation = AdamCalculation {
-        step: next_step,
-        norm,
-        scale,
-        beta1_correction: 1.0 - f64::from(config.beta1).powi(next_step as i32),
-        beta2_correction: 1.0 - f64::from(config.beta2).powi(next_step as i32),
-        config,
-    };
-    build_adam_replacement(
-        parameters,
-        gradients,
-        first_moment,
-        second_moment,
-        &calculation,
-    )
-}
-
-fn gradient_norm(gradients: &[f32]) -> Result<f64, ModelError> {
-    let mut squared = 0.0f64;
-    for gradient in gradients {
-        squared += f64::from(*gradient) * f64::from(*gradient);
-        if !squared.is_finite() {
-            return Err(ModelError::NonFiniteOptimizerNorm);
-        }
-    }
-    let norm = squared.sqrt();
-    if !norm.is_finite() {
-        return Err(ModelError::NonFiniteOptimizerNorm);
-    }
-    Ok(norm)
-}
-
-fn build_adam_replacement(
-    parameters: &[f32],
-    gradients: &[f32],
-    first_moment: &[f32],
-    second_moment: &[f32],
-    calculation: &AdamCalculation,
-) -> Result<AdamReplacement, ModelError> {
-    let mut next_parameters = Vec::with_capacity(parameters.len());
-    let mut next_first = Vec::with_capacity(parameters.len());
-    let mut next_second = Vec::with_capacity(parameters.len());
-    for index in 0..parameters.len() {
-        let values = adam_scalar(
-            parameters[index],
-            gradients[index],
-            first_moment[index],
-            second_moment[index],
-            calculation,
-        )?;
-        if !values.0.is_finite() || !values.1.is_finite() || !values.2.is_finite() {
-            return Err(ModelError::NonFiniteOptimizerUpdate { index });
-        }
-        next_parameters.push(values.0);
-        next_first.push(values.1);
-        next_second.push(values.2);
-    }
-    Ok(AdamReplacement {
-        parameters: next_parameters,
-        first_moment: next_first,
-        second_moment: next_second,
-        step: calculation.step,
-        unclipped_norm: calculation.norm,
-        applied_scale: calculation.scale,
-    })
-}
-
-fn adam_scalar(
-    parameter: f32,
-    gradient: f32,
-    first: f32,
-    second: f32,
-    calculation: &AdamCalculation,
-) -> Result<(f32, f32, f32), ModelError> {
-    let config = calculation.config;
-    let gradient = (f64::from(gradient) * calculation.scale) as f32;
-    let first = config.beta1 * first + (1.0 - config.beta1) * gradient;
-    let second_value = f64::from(config.beta2) * f64::from(second)
-        + f64::from(1.0 - config.beta2) * f64::from(gradient) * f64::from(gradient);
-    let second = second_value as f32;
-    let first_hat = f64::from(first) / calculation.beta1_correction;
-    let second_hat = f64::from(second) / calculation.beta2_correction;
-    let delta = f64::from(config.learning_rate) * first_hat
-        / (second_hat.sqrt() + f64::from(config.epsilon));
-    let parameter = (f64::from(parameter) - delta) as f32;
-    if second < 0.0 {
-        return Err(ModelError::NonFiniteOptimizerUpdate { index: 0 });
-    }
-    Ok((parameter, first, second))
 }
 
 fn collect_outputs(
@@ -3742,22 +2795,6 @@ fn validate_training_batch(
     prefixes: &[TrainingPrefix],
 ) -> Result<(), ModelError> {
     validate_training_batch_count(frames.len())?;
-    validate_training_batch_inputs(frames, prefixes)
-}
-
-fn validate_ppo_training_batch(
-    frames: &[FeatureFrame],
-    prefixes: &[TrainingPrefix],
-) -> Result<(), ModelError> {
-    if frames.is_empty() {
-        return Err(ModelError::EmptyTrainingBatch);
-    }
-    if frames.len() > MODEL_PPO_MAX_MICROBATCH {
-        return Err(ModelError::TrainingBatchTooLarge {
-            count: frames.len(),
-            maximum: MODEL_PPO_MAX_MICROBATCH,
-        });
-    }
     validate_training_batch_inputs(frames, prefixes)
 }
 
@@ -4136,18 +3173,19 @@ enum PrefixMask {
     Item,
 }
 
-/// Embedding indices and presence masks of one prefix batch, uploaded with two copies
-/// instead of one per field; views select the same values the per-field uploads held.
+/// Embedding indices and presence masks of one prefix batch.
+///
+/// Host prefixes upload with two copies instead of one per field; each field is
+/// a view of those copies holding the same values the per-field uploads held.
 struct PrefixUpload {
-    batch: usize,
-    indices: Tensor,
-    masks: Tensor,
+    indices: [Tensor; 4],
+    masks: [Tensor; 3],
 }
 
 impl PrefixUpload {
     fn new(prefixes: &[TrainingPrefix], device: &Device) -> Result<Self, ModelError> {
         let batch = prefixes.len();
-        assert!((1..=MODEL_PPO_MAX_MICROBATCH).contains(&batch));
+        assert!((1..=device_learner::MODEL_MAX_STAGED_ROWS).contains(&batch));
         let (ability, ability_mask) = training_slot_indices(prefixes, true);
         let (item, item_mask) = training_slot_indices(prefixes, false);
         let mut indices = Vec::with_capacity(4 * batch);
@@ -4169,24 +3207,40 @@ impl PrefixUpload {
         masks.extend(item_mask);
         assert_eq!(indices.len(), 4 * batch);
         assert_eq!(masks.len(), 3 * batch);
+        let indices = Tensor::from_vec(indices, 4 * batch, device)?;
+        let masks = Tensor::from_vec(masks, 3 * batch, device)?;
+        let index = |field: usize| indices.narrow(0, field * batch, batch);
+        let mask = |field: usize| masks.narrow(0, field * batch, batch)?.reshape((batch, 1));
         Ok(Self {
-            batch,
-            indices: Tensor::from_vec(indices, 4 * batch, device)?,
-            masks: Tensor::from_vec(masks, 3 * batch, device)?,
+            indices: [index(0)?, index(1)?, index(2)?, index(3)?],
+            masks: [mask(0)?, mask(1)?, mask(2)?],
         })
     }
 
-    fn indices(&self, field: PrefixIndex) -> Result<Tensor, ModelError> {
-        Ok(self
-            .indices
-            .narrow(0, field as usize * self.batch, self.batch)?)
+    /// The rows at `rows`, gathered on the device.
+    fn gather(&self, rows: &Tensor) -> Result<Self, ModelError> {
+        let index = |tensor: &Tensor| tensor.index_select(rows, 0);
+        Ok(Self {
+            indices: [
+                index(&self.indices[0])?,
+                index(&self.indices[1])?,
+                index(&self.indices[2])?,
+                index(&self.indices[3])?,
+            ],
+            masks: [
+                index(&self.masks[0])?,
+                index(&self.masks[1])?,
+                index(&self.masks[2])?,
+            ],
+        })
     }
 
-    fn mask(&self, field: PrefixMask) -> Result<Tensor, ModelError> {
-        Ok(self
-            .masks
-            .narrow(0, field as usize * self.batch, self.batch)?
-            .reshape((self.batch, 1))?)
+    fn indices(&self, field: PrefixIndex) -> &Tensor {
+        &self.indices[field as usize]
+    }
+
+    fn mask(&self, field: PrefixMask) -> &Tensor {
+        &self.masks[field as usize]
     }
 }
 
@@ -4212,7 +3266,6 @@ struct EncoderInputs {
 impl EncoderInputs {
     fn from_buffer(flat: &Tensor, lengths: &[usize], batch: usize) -> Result<Self, ModelError> {
         assert_eq!(lengths.len(), 3 + UNIT_GROUPS + 12);
-        assert!((1..=MODEL_PPO_MAX_MICROBATCH).contains(&batch));
         let mut offset = 0usize;
         let mut views = Vec::with_capacity(lengths.len());
         for &length in lengths {
@@ -4222,7 +3275,13 @@ impl EncoderInputs {
                 .ok_or(ModelError::InvalidModelState("staged input overflow"))?;
         }
         assert_eq!(offset, flat.elem_count());
-        let mut views = views.into_iter();
+        Self::from_parts(views, batch)
+    }
+
+    /// Encoder inputs from the 20 per-part tensors, each holding `batch` rows.
+    fn from_parts(parts: Vec<Tensor>, batch: usize) -> Result<Self, ModelError> {
+        assert_eq!(parts.len(), 3 + UNIT_GROUPS + 12);
+        let mut views = parts.into_iter();
         let units = encoder_input_pair(&mut views, batch, ENCODER_UNIT_TOKENS, UNIT_FEATURES)?;
         let mut unit_groups = Vec::with_capacity(UNIT_GROUPS);
         for _ in 0..UNIT_GROUPS {

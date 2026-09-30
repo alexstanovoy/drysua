@@ -12,7 +12,7 @@ use crate::{
     ACTION_SCHEMA_HASH, ACTION_SCHEMA_VERSION, AdamConfig, AdamState, BehavioralTarget,
     FEATURE_SCHEMA_HASH, FEATURE_SCHEMA_VERSION, FeatureFrame, GlobalSummary, MODEL_MAX_BATCH,
     MODEL_SCHEMA_HASH, MODEL_SCHEMA_VERSION, PackedBehavioralTarget, PolicyIdentity, PolicyModel,
-    RaggedFeatureArena, RaggedFeatureHeader, StructuredAction,
+    RaggedFeatureArena, RaggedFeatureHeader, StagedPpoBatch, StructuredAction,
 };
 
 #[cfg(test)]
@@ -808,6 +808,7 @@ impl PpoTrainer {
         batch: &PpoBatch,
     ) -> Result<PpoUpdateReport, PpoError> {
         let mut aggregate = PpoUpdateReport::default();
+        let staged = batch.stage(model)?;
         let mut order = (0..batch.samples.len()).collect::<Vec<_>>();
         'epochs: for epoch in 0..self.config.epochs {
             self.shuffle.shuffle(&mut order)?;
@@ -816,14 +817,13 @@ impl PpoTrainer {
                 self.config.minibatch,
                 self.execution.balanced_minibatches,
             ) {
-                let samples = batch.materialize(indices)?;
-                let references = samples.iter().collect::<Vec<_>>();
                 let report = model
-                    .ppo_update_with_execution(
-                        &references,
+                    .ppo_update_staged(
+                        &staged,
+                        indices,
                         &mut self.adam,
                         self.config,
-                        self.execution,
+                        self.execution.training_microbatch,
                     )
                     .map_err(|error| PpoError::Model(error.to_string()))?;
                 if !report.applied {
@@ -931,25 +931,25 @@ impl PpoBatch {
     }
 
     pub fn sample(&self, index: usize) -> Result<PpoPreparedSample, PpoError> {
-        self.materialize(std::slice::from_ref(&index))?
-            .pop()
-            .ok_or(PpoError::InvalidTransition("PPO sample index"))
+        let sample = self
+            .samples
+            .get(index)
+            .ok_or(PpoError::InvalidTransition("PPO sample index"))?;
+        Ok(PpoPreparedSample {
+            transition: expand_transition(&self.frames, &sample.transition)?,
+            advantage: sample.advantage,
+            return_value: sample.return_value,
+        })
     }
 
-    fn materialize(&self, indices: &[usize]) -> Result<Vec<PpoPreparedSample>, PpoError> {
-        let mut output = Vec::with_capacity(indices.len());
-        for index in indices {
-            let sample = self
-                .samples
-                .get(*index)
-                .ok_or(PpoError::InvalidTransition("PPO sample index"))?;
-            output.push(PpoPreparedSample {
-                transition: expand_transition(&self.frames, &sample.transition)?,
-                advantage: sample.advantage,
-                return_value: sample.return_value,
-            });
+    /// Uploads every sample once, in batch order, to the learner device.
+    fn stage(&self, model: &PolicyModel) -> Result<StagedPpoBatch, PpoError> {
+        let error = |error: crate::ModelError| PpoError::Model(error.to_string());
+        let mut staging = model.ppo_staging(self.samples.len()).map_err(error)?;
+        for index in 0..self.samples.len() {
+            staging.push(&self.sample(index)?).map_err(error)?;
         }
-        Ok(output)
+        model.stage_ppo_batch(staging).map_err(error)
     }
 }
 

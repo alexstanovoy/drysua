@@ -31,18 +31,18 @@ use crate::{
 
 pub use adaptive::AdaptiveEnvironmentCheckpoint;
 
-const CHECKPOINT_MAGIC: &[u8; 8] = b"DRYCKP20";
+const CHECKPOINT_MAGIC: &[u8; 8] = b"DRYCKP21";
 /// Version of the strict on-disk tensor and manifest contract.
-pub const CHECKPOINT_SCHEMA_VERSION: u32 = 20;
+pub const CHECKPOINT_SCHEMA_VERSION: u32 = 21;
 /// Canonical strict checkpoint contract descriptor.
 pub const CHECKPOINT_SCHEMA_DESCRIPTOR: &str = concat!(
-    "bota-drysua-checkpoint/v20;linked_schemas=action,feature,model,ppo;linked_hash=fnv1a_descriptor_then_ordered_version_le32_hash_le64_then_map2_reward_version_le32;files=checkpoint.safetensors,checkpoint.meta,drysua.weights.safetensors,immutable_sha256_tensor_generation;",
-    "tensors=model.parameters,adam.first_moment,adam.second_moment,actor.parameters_f32,collection.state_u8_bounded;dtype=f32_except_collection_state;runtime_metadata=action_feature_model_ppo_schema_hashes,ppo_schema_version,ppo_rules_audit_version,map2_reward_version;load=exact_names_shapes_dtype_finite_schema_sha256,canonical_tensor_fallback;",
+    "bota-drysua-checkpoint/v21;linked_schemas=action,feature,model,ppo;linked_hash=fnv1a_descriptor_then_ordered_version_le32_hash_le64_then_map2_reward_version_le32;files=checkpoint.meta,drysua.weights.safetensors,immutable_sha256_tensor_generation;",
+    "tensors=model.parameters,adam.first_moment,adam.second_moment,actor.parameters_f32,collection.state_u8_bounded;dtype=f32_except_collection_state;runtime_metadata=action_feature_model_ppo_schema_hashes,ppo_schema_version,ppo_rules_audit_version,map2_reward_version;load=exact_names_shapes_dtype_finite_schema_sha256;",
     "initialization=current_runtime_weights_parameters_only,optimizer_progress_rng=fresh;",
     "manifest=magic_version_hash_linked_schemas_then_git_simulator_features_command_seed_map_hero_device_batch_rules32_then_progress_rng_curriculum_league_then_ppo_config_trainer_updates_optimizer_step_shuffle_rng_tensor_sha256_then_adaptive_presence_u8_and_optional152_byte_block,no_trailing_bytes,max65536;",
     "progress=committed_rollout_samples_le_updates_times_samples_per_update_plus_two_per_max_slot;collection=next_update_actor_version_spec_and_replayable_in_flight_slot_games;",
     "adaptive_block=le64_success_updates_success_rate_millionths_poor_updates_poor_rate_millionths_extension_millionths_base_updates_total_updates_zero_updates_generation_start_update_updates_in_generation_success_streak_poor_streak_extension_awards_snapshot_count_then_snapshot_sha256_raw32;adaptive_scope=train-annealed_only_no_league_exact_config_scope_suffix_last_once;",
-    "save=immutable_generation,canonical_copy,recoverable_manifest_commit_last,file_and_directory_fsync;"
+    "save=immutable_generation_then_runtime_then_manifest_rename,one_fsync_per_file_then_one_directory_fsync;"
 );
 /// Ordered linked schema identities captured in every checkpoint manifest.
 const LINKED_SCHEMAS: [(u32, u64); 4] = [
@@ -55,7 +55,6 @@ const LINKED_SCHEMAS: [(u32, u64); 4] = [
 /// FNV-1a of the descriptor, ordered linked identities, and reward version.
 pub const CHECKPOINT_SCHEMA_HASH: u64 =
     crate::model::linked_schema_hash(CHECKPOINT_SCHEMA_DESCRIPTOR, &LINKED_SCHEMAS);
-const CHECKPOINT_TENSOR_FILE: &str = "checkpoint.safetensors";
 const CHECKPOINT_META_FILE: &str = "checkpoint.meta";
 const RUNTIME_TENSOR_FILE: &str = "drysua.weights.safetensors";
 const MAX_META_BYTES: u64 = 64 * 1024;
@@ -350,7 +349,8 @@ impl TrainingArtifact {
         self.config
     }
 
-    /// Writes tensors and manifest via sibling temporary files, fsync, and rename.
+    /// Commits one checkpoint generation: the immutable tensor file, the runtime
+    /// weights and last the manifest, each synced once, then the directory once.
     pub fn save(&self, directory: &Path) -> Result<CheckpointSaveOutcome, CheckpointError> {
         self.validate()?;
         validate_directory(directory)?;
@@ -358,10 +358,11 @@ impl TrainingArtifact {
         let tensor_bytes = serialize_training_tensors(self)?;
         let tensor_hash = sha256(&tensor_bytes);
         let manifest_bytes = encode_manifest(self, tensor_hash)?;
+        let runtime_bytes = serialize_runtime_tensor(&self.parameters)?;
         let generation = tensor_generation_path(directory, tensor_hash);
         write_immutable(&generation, &tensor_bytes)?;
-        atomic_replace(&directory.join(CHECKPOINT_TENSOR_FILE), &tensor_bytes)?;
-        atomic_replace(&directory.join(CHECKPOINT_META_FILE), &manifest_bytes)?;
+        replace_file(&directory.join(RUNTIME_TENSOR_FILE), &runtime_bytes)?;
+        replace_file(&directory.join(CHECKPOINT_META_FILE), &manifest_bytes)?;
         sync_directory(directory)?;
         match prune_tensor_generations(directory, tensor_hash) {
             Ok(()) => Ok(CheckpointSaveOutcome::Committed),
@@ -391,7 +392,7 @@ impl TrainingArtifact {
     #[cfg(feature = "builtin")]
     pub(crate) fn load_run_scope(directory: &Path) -> Result<CheckpointRun, CheckpointError> {
         validate_directory(directory)?;
-        let manifest = read_recoverable(&directory.join(CHECKPOINT_META_FILE), MAX_META_BYTES)?;
+        let manifest = read_bounded(&directory.join(CHECKPOINT_META_FILE), MAX_META_BYTES)?;
         let artifact = decode_manifest(&manifest)?;
         Ok(artifact.run)
     }
@@ -402,7 +403,7 @@ impl TrainingArtifact {
         directory: &Path,
     ) -> Result<(CheckpointRun, CheckpointProgress), CheckpointError> {
         validate_directory(directory)?;
-        let manifest = read_recoverable(&directory.join(CHECKPOINT_META_FILE), MAX_META_BYTES)?;
+        let manifest = read_bounded(&directory.join(CHECKPOINT_META_FILE), MAX_META_BYTES)?;
         let artifact = decode_manifest(&manifest)?;
         Ok((artifact.run, artifact.progress))
     }
@@ -412,20 +413,13 @@ impl TrainingArtifact {
         expected: Option<&CheckpointRun>,
     ) -> Result<Self, CheckpointError> {
         validate_directory(directory)?;
-        let manifest = read_recoverable(&directory.join(CHECKPOINT_META_FILE), MAX_META_BYTES)?;
+        let manifest = read_bounded(&directory.join(CHECKPOINT_META_FILE), MAX_META_BYTES)?;
         let mut artifact = decode_manifest(&manifest)?;
         if expected.is_some_and(|expected| expected != &artifact.run) {
             return Err(CheckpointError::InvalidManifest("compatibility scope"));
         }
         let generation = tensor_generation_path(directory, artifact.tensor_hash);
-        let tensors = if generation.exists() {
-            read_bounded(&generation, MAX_TRAINING_TENSOR_BYTES)?
-        } else {
-            read_recoverable(
-                &directory.join(CHECKPOINT_TENSOR_FILE),
-                MAX_TRAINING_TENSOR_BYTES,
-            )?
-        };
+        let tensors = read_bounded(&generation, MAX_TRAINING_TENSOR_BYTES)?;
         if sha256(&tensors) != artifact.tensor_hash {
             return Err(CheckpointError::TensorHashMismatch);
         }
@@ -481,7 +475,7 @@ impl TrainingArtifact {
             .map_err(|error| CheckpointError::Model(error.to_string()))?;
         validate_tensor_values("model.parameters", &parameters)?;
         let bytes = serialize_runtime_tensor(&parameters)?;
-        atomic_replace(&directory.join(RUNTIME_TENSOR_FILE), &bytes)?;
+        replace_file(&directory.join(RUNTIME_TENSOR_FILE), &bytes)?;
         sync_directory(directory)
     }
 
@@ -499,7 +493,7 @@ impl TrainingArtifact {
         let model = PolicyModel::fresh_on(seed, device)
             .map_err(|error| CheckpointError::Model(error.to_string()))?;
         validate_directory(directory)?;
-        let bytes = read_recoverable(
+        let bytes = read_bounded(
             &directory.join(RUNTIME_TENSOR_FILE),
             MAX_RUNTIME_TENSOR_BYTES,
         )?;
@@ -507,7 +501,7 @@ impl TrainingArtifact {
         model
             .import_parameters(&parameters)
             .map_err(|error| CheckpointError::Model(error.to_string()))?;
-        eprintln!(
+        crate::telemetry::log_line!(
             "level=INFO event=initial_weights_loaded path={} reused_tensors={} reused_parameters={} reinitialized_tensors=0 differing_metadata={}",
             directory.display(),
             crate::model::MODEL_PARAMETER_TENSORS,
@@ -527,7 +521,7 @@ impl TrainingArtifact {
         directory: &Path,
     ) -> Result<(), CheckpointError> {
         validate_directory(directory)?;
-        let bytes = read_recoverable(
+        let bytes = read_bounded(
             &directory.join(RUNTIME_TENSOR_FILE),
             MAX_RUNTIME_TENSOR_BYTES,
         )?;
@@ -1348,13 +1342,6 @@ fn read_bounded(path: &Path, maximum: u64) -> Result<Vec<u8>, CheckpointError> {
     Ok(bytes)
 }
 
-fn read_recoverable(path: &Path, maximum: u64) -> Result<Vec<u8>, CheckpointError> {
-    if path.exists() {
-        return read_bounded(path, maximum);
-    }
-    read_bounded(&backup_path(path)?, maximum)
-}
-
 fn write_immutable(path: &Path, bytes: &[u8]) -> Result<(), CheckpointError> {
     if path.exists() {
         let existing = read_bounded(path, bytes.len() as u64)?;
@@ -1369,31 +1356,27 @@ fn write_immutable(path: &Path, bytes: &[u8]) -> Result<(), CheckpointError> {
     Ok(())
 }
 
-fn atomic_replace(path: &Path, bytes: &[u8]) -> Result<(), CheckpointError> {
+/// Writes a synced sibling temporary file and renames it over `path`; the
+/// caller syncs the directory once for every file of one commit.
+fn replace_file(path: &Path, bytes: &[u8]) -> Result<(), CheckpointError> {
     let temporary = temporary_path(path)?;
-    #[cfg(not(windows))]
-    let backup = backup_path(path)?;
-    let result = (|| -> Result<(), CheckpointError> {
-        write_immutable(&temporary, bytes)?;
-        #[cfg(not(windows))]
-        if path.exists() {
-            if backup.exists() {
-                fs::remove_file(&backup)?;
-            }
-            fs::rename(path, &backup)?;
-            sync_parent(path)?;
-        }
-        durable_rename(&temporary, path)?;
-        #[cfg(not(windows))]
-        if backup.exists() {
-            fs::remove_file(&backup)?;
-        }
-        Ok(())
-    })();
+    let result = write_immutable(&temporary, bytes).and_then(|()| commit_rename(&temporary, path));
     if result.is_err() {
         let _ = fs::remove_file(&temporary);
     }
     result
+}
+
+/// Renames a synced file into place; durable after the directory is synced.
+#[cfg(not(windows))]
+pub(crate) fn commit_rename(source: &Path, target: &Path) -> Result<(), CheckpointError> {
+    Ok(fs::rename(source, target)?)
+}
+
+/// Renames a synced file into place with write-through.
+#[cfg(windows)]
+pub(crate) fn commit_rename(source: &Path, target: &Path) -> Result<(), CheckpointError> {
+    windows_replace(source, target)
 }
 
 #[cfg(windows)]
@@ -1419,19 +1402,6 @@ fn windows_replace(source: &Path, target: &Path) -> Result<(), CheckpointError> 
         return Err(std::io::Error::last_os_error().into());
     }
     Ok(())
-}
-
-/// Commits one synced temporary file with platform-appropriate durability.
-#[cfg(not(windows))]
-pub(crate) fn durable_rename(source: &Path, target: &Path) -> Result<(), CheckpointError> {
-    fs::rename(source, target)?;
-    sync_parent(target)
-}
-
-/// Commits one synced temporary file with platform-appropriate durability.
-#[cfg(windows)]
-pub(crate) fn durable_rename(source: &Path, target: &Path) -> Result<(), CheckpointError> {
-    windows_replace(source, target)
 }
 
 fn tensor_generation_path(directory: &Path, hash: [u8; 32]) -> PathBuf {
@@ -1484,11 +1454,6 @@ fn is_tensor_generation(path: &Path) -> bool {
         .is_some_and(|hash| hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
 }
 
-fn backup_path(path: &Path) -> Result<PathBuf, CheckpointError> {
-    let name = artifact_name(path)?;
-    Ok(path.with_file_name(format!("{name}.previous")))
-}
-
 fn temporary_path(path: &Path) -> Result<PathBuf, CheckpointError> {
     let name = artifact_name(path)?;
     let sequence = NEXT_TEMPORARY_FILE.fetch_add(1, Ordering::Relaxed);
@@ -1502,21 +1467,13 @@ fn artifact_name(path: &Path) -> Result<&str, CheckpointError> {
 }
 
 #[cfg(not(windows))]
-fn sync_parent(path: &Path) -> Result<(), CheckpointError> {
-    let parent = path
-        .parent()
-        .ok_or(CheckpointError::InvalidManifest("artifact parent"))?;
-    sync_directory(parent)
-}
-
-#[cfg(not(windows))]
-fn sync_directory(directory: &Path) -> Result<(), CheckpointError> {
+pub(crate) fn sync_directory(directory: &Path) -> Result<(), CheckpointError> {
     File::open(directory)?.sync_all()?;
     Ok(())
 }
 
 #[cfg(windows)]
-fn sync_directory(_: &Path) -> Result<(), CheckpointError> {
+pub(crate) fn sync_directory(_: &Path) -> Result<(), CheckpointError> {
     // Every Windows replacement uses MOVEFILE_WRITE_THROUGH; directories cannot be opened.
     Ok(())
 }

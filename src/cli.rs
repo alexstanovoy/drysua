@@ -177,11 +177,8 @@ struct TrainAnnealedArgs {
     optimizer: OptimizerArgs,
     #[command(flatten)]
     checkpoint: CheckpointArgs,
-    /// Local gradient-fold worker ceiling (1 is the historical serial path).
-    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=32))]
-    host_math_workers: u8,
-    /// PPO tensor microbatch (64/128/256); larger modes change reductions and checkpoint scope.
-    #[arg(long, default_value_t = 256, value_parser = crate::training_execution::parse_training_microbatch)]
+    /// Rows per device PPO pass (256/512/1024/2048); regroups reductions, recorded in scope.
+    #[arg(long, default_value_t = crate::training_execution::DEFAULT_TRAINING_MICROBATCH, value_parser = crate::training_execution::parse_training_microbatch)]
     training_microbatch: usize,
     /// Spread all rollout rows across nearly equal minibatches; recorded in checkpoint scope.
     #[arg(long)]
@@ -195,15 +192,25 @@ struct TrainAnnealedArgs {
     /// Retained intervals that make one update due; a multiple of --lanes.
     #[arg(long, default_value_t = crate::PpoConfig::default().samples_per_update)]
     samples_per_update: usize,
-    /// Concurrent world slots (1..=256); each always holds a live game.
-    #[arg(long, default_value_t = 64)]
-    slots: usize,
+    /// Concurrent world slots (1..=256); each always holds a live game. Defaults to
+    /// the recorded value on resume, else 16 per available core.
+    #[arg(long)]
+    slots: Option<usize>,
     /// Inference lanes; each owns a thread, a weight replica and at most 64 slots.
-    #[arg(long, default_value_t = 2)]
-    lanes: usize,
+    /// Defaults to the recorded value on resume, else two per simulation group
+    /// (more when the slots need them).
+    #[arg(long)]
+    lanes: Option<usize>,
     /// Simulation worker threads; defaults to the available cores and never changes results.
     #[arg(long)]
     simulation_threads: Option<usize>,
+    /// Lane groups with their own simulation workers; defaults to the host's
+    /// last-level cache domains (CCDs) and never changes results.
+    #[arg(long, value_parser = clap::value_parser!(u8).range(1..=16))]
+    simulation_groups: Option<u8>,
+    /// Pin each simulation group's threads to one cache domain (Linux).
+    #[arg(long)]
+    pin_threads: bool,
     /// Updates per environment generation.
     #[arg(long)]
     generation_updates: u64,
@@ -284,9 +291,14 @@ struct CheckpointArgs {
     /// Existing directory receiving runtime weights `u<update>/` at milestones.
     #[arg(long, requires = "history_every")]
     history_directory: Option<std::path::PathBuf>,
-    /// Milestone spacing in updates; the final update is always exported.
+    /// Milestone spacing in updates, exported at the first checkpoint past each
+    /// milestone; the final update is always exported.
     #[arg(long, requires = "history_directory", value_parser = clap::builder::RangedU64ValueParser::<std::num::NonZeroU64>::new().range(1..=crate::MAX_TRAINING_COUNTER))]
     history_every: Option<std::num::NonZeroU64>,
+    /// Wall seconds between checkpoints; a graceful stop and the last update
+    /// always checkpoint. A crash loses at most one interval.
+    #[arg(long, default_value_t = 600, value_parser = clap::value_parser!(u64).range(60..=86_400))]
+    checkpoint_interval_seconds: u64,
 }
 
 /// Parses command line arguments and plays one match.
@@ -384,6 +396,7 @@ fn resolve_play_deployment(
 
 #[cfg(feature = "builtin")]
 fn run_train_annealed(arguments: TrainAnnealedArgs) -> std::io::Result<()> {
+    let _flush = crate::telemetry::FlushLogOnDrop;
     let settings = arguments.annealed_settings(
         embedded_commit("DRYSUA_GIT_COMMIT", option_env!("DRYSUA_GIT_COMMIT"))?,
         embedded_commit("BOTA_GIT_COMMIT", option_env!("BOTA_GIT_COMMIT"))?,
@@ -413,7 +426,7 @@ fn run_train_annealed_with_settings(
         .map_err(std::io::Error::other)?;
     }
     if arguments.seed.is_none() {
-        eprintln!(
+        crate::telemetry::log_line!(
             "annealed: seed {} resolved from {}; recorded in the run scope",
             settings.seed,
             if arguments.checkpoint.resume {
@@ -423,13 +436,15 @@ fn run_train_annealed_with_settings(
             },
         );
     }
-    eprintln!(
-        "annealed: updates={} samples_per_update={} slots={} lanes={} simulation_threads={} generation_updates={} zero_updates={} seed={} opponents={:?}",
+    crate::telemetry::log_line!(
+        "annealed: updates={} samples_per_update={} slots={} lanes={} simulation_threads={} simulation_groups={} pin_threads={} generation_updates={} zero_updates={} seed={} opponents={:?}",
         settings.updates,
         settings.ppo.samples_per_update,
         settings.slots,
         settings.lanes,
         settings.simulation_threads,
+        settings.simulation_groups,
+        settings.pin_threads,
         settings.generation_updates,
         settings.zero_updates,
         settings.seed,
@@ -444,7 +459,7 @@ fn run_train_annealed_with_settings(
         report_training_checkpoint,
     )
     .map_err(std::io::Error::other)?;
-    println!(
+    crate::telemetry::log_line!(
         "annealed training complete: starting fingerprint {:016x}, {} updates, {} samples, {} games, {} generations, optimizer step {}, terminal wins {}, terminal losses {}, terminal draws {}, ticks {}, episode timeouts {}",
         report.starting_policy_fingerprint,
         report.completed_updates,
@@ -462,7 +477,7 @@ fn run_train_annealed_with_settings(
         .map2_reward
         .log("invocation", report.completed_updates);
     if crate::training_signals::stop_requested() {
-        println!(
+        crate::telemetry::log_line!(
             "level=INFO event=training_stopped reason=signal completed_updates={}",
             report.completed_updates
         );
@@ -472,28 +487,9 @@ fn run_train_annealed_with_settings(
 
 #[cfg(feature = "builtin")]
 fn report_training_checkpoint(checkpoint: crate::TrainingCheckpointReport) {
-    println!(
-        "checkpoint: update {}, samples {}, optimizer step {}, policy loss {:.6}, value loss {:.6}, entropy {:.6}, KL {:.6}, KL stop {}, session terminal wins {}, session terminal losses {}, session terminal draws {}, session rejected {}, session ticks {}, session episode timeouts {}",
-        checkpoint.completed_updates,
-        checkpoint.rollout_samples,
-        checkpoint.optimizer_step,
-        checkpoint.policy_loss,
-        checkpoint.value_loss,
-        checkpoint.entropy,
-        checkpoint.approximate_kl,
-        checkpoint.stopped_for_kl,
-        checkpoint.terminal_wins,
-        checkpoint.terminal_losses,
-        checkpoint.terminal_draws,
-        checkpoint.rejected_orders,
-        checkpoint.elapsed_ticks,
-        checkpoint.episode_timeouts,
-    );
-    checkpoint
-        .map2_reward
-        .log("checkpoint", checkpoint.completed_updates);
+    crate::telemetry::log_line!("checkpoint: update {}", checkpoint.completed_updates);
     if let Some(warning) = checkpoint.cleanup_warning {
-        eprintln!("checkpoint cleanup warning: {warning}");
+        crate::telemetry::log_line!("checkpoint cleanup warning: {warning}");
     }
 }
 
@@ -577,34 +573,76 @@ impl TrainAnnealedArgs {
             gamma_tick: crate::MAP2_REWARD_GAMMA_TICK,
             ..crate::PpoConfig::default()
         });
-        let simulation_threads = match self.simulation_threads {
-            Some(threads) => threads,
-            None => std::thread::available_parallelism()?.get(),
+        let cores = std::thread::available_parallelism()?.get();
+        let simulation_threads = self.simulation_threads.unwrap_or(cores);
+        let simulation_groups = match self.simulation_groups {
+            Some(groups) => usize::from(groups),
+            None => crate::ppo_arena::topology::cache_domains().len(),
         };
+        let seed = self.resolved_seed()?;
+        let (slots, lanes) = self.collection_shape(cores, simulation_groups)?;
         Ok(crate::AnnealedJobConfig {
             environment_schedule,
             execution: crate::TrainingExecutionOptions {
                 balanced_minibatches: self.balanced_minibatches,
-                host_math_workers: usize::from(self.host_math_workers),
                 training_microbatch: self.training_microbatch,
             },
             updates: self.updates,
             invocation_updates: self.invocation_updates,
             history: self.checkpoint.history()?,
-            slots: self.slots,
-            lanes: self.lanes,
+            slots,
+            lanes,
             simulation_threads,
+            simulation_groups,
+            pin_threads: self.pin_threads,
             generation_updates: self.generation_updates,
             zero_updates,
-            seed: self.resolved_seed()?,
+            seed,
             scale,
             opponents: self.opponents.clone(),
             ppo,
-            // Every update commits: a stop or crash loses at most the in-flight update.
-            checkpoint_cadence: crate::TrainingCheckpointCadence::Updates(1),
+            checkpoint_cadence: crate::TrainingCheckpointCadence::WallTime(
+                std::time::Duration::from_secs(self.checkpoint.checkpoint_interval_seconds),
+            ),
             git_commit,
             simulator_commit,
         })
+    }
+
+    /// Slots and lanes: explicit, adopted from the recorded resume scope, or
+    /// sized to the host (16 slots per core, two lanes per group, 64 slots per lane).
+    fn collection_shape(&self, cores: usize, groups: usize) -> std::io::Result<(usize, usize)> {
+        let recorded = |name| -> std::io::Result<Option<usize>> {
+            if !self.checkpoint.resume {
+                return Ok(None);
+            }
+            let run =
+                crate::TrainingArtifact::load_run_scope(&self.checkpoint.checkpoint_directory)
+                    .map_err(|error| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            format!("train-annealed resume needs the recorded run scope: {error}"),
+                        )
+                    })?;
+            Ok(recorded_option(&run.command_line, name))
+        };
+        let slots = match self.slots {
+            Some(slots) => Some(slots),
+            None => recorded("--slots")?,
+        };
+        let lanes = match self.lanes {
+            Some(lanes) => Some(lanes),
+            None => recorded("--lanes")?,
+        };
+        let slots = slots.unwrap_or((16 * cores).clamp(1, crate::PPO_MAX_SLOTS));
+        let lanes = lanes.unwrap_or_else(|| {
+            let needed = slots.div_ceil(64).max(2 * groups);
+            // The smallest multiple of the groups that divides the slots.
+            (needed..=slots)
+                .find(|lanes| lanes.is_multiple_of(groups) && slots.is_multiple_of(*lanes))
+                .unwrap_or(1)
+        });
+        Ok((slots, lanes))
     }
 
     /// The resolved run seed: explicit, adopted from the recorded resume scope,
@@ -940,4 +978,12 @@ fn run_train_annealed(_: TrainAnnealedArgs) -> std::io::Result<()> {
     Err(std::io::Error::other(
         "annealed training requires cargo feature `builtin`",
     ))
+}
+
+/// The numeric value of `name` in a recorded command line.
+#[cfg(feature = "builtin")]
+fn recorded_option(command_line: &str, name: &str) -> Option<usize> {
+    let mut tokens = command_line.split_whitespace();
+    tokens.find(|token| *token == name)?;
+    tokens.next()?.parse().ok()
 }

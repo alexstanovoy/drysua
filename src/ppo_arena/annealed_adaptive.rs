@@ -190,7 +190,7 @@ impl GenerationCache {
                 update
             );
             if previous.state.generation != next.state.generation {
-                eprintln!(
+                crate::telemetry::log_line!(
                     "level=INFO event=adaptive_environment_transition update={update} previous_generation={} generation={} start_update={} previous_awards={} clean={}",
                     previous.state.generation,
                     next.state.generation,

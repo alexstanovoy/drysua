@@ -473,6 +473,38 @@ fn rollback_failure_retains_the_original_candidate_error() {
     );
 }
 
+#[test]
+fn staged_update_rejects_invalid_rows_and_any_nonfinite_output_without_mutation() {
+    let (model, mut adam, samples, config) = rollback_fixture(65);
+    let before = model.coherent_snapshot(&adam).expect("before");
+    let update = |samples: &[PpoPreparedSample], adam: &mut crate::AdamState| {
+        let references = samples.iter().collect::<Vec<_>>();
+        model
+            .ppo_update(&references, adam, config)
+            .expect_err("invalid update")
+            .to_string()
+    };
+    let mut invalid = samples.clone();
+    invalid[64].transition.frame.global[0] = f32::NAN;
+    assert_eq!(
+        update(&invalid, &mut adam),
+        "model frame 64 contains a non-finite value"
+    );
+    let mut invalid = samples.clone();
+    invalid[64].transition.target.kind.selected = MODEL_KIND_HEAD;
+    assert_eq!(
+        update(&invalid, &mut adam),
+        "model behavioral target label 16 is illegal for head kind"
+    );
+    assert_eq!(model.coherent_snapshot(&adam).expect("unchanged"), before);
+    model.poison_item_head_for_test().expect("poison");
+    assert_eq!(
+        update(&samples, &mut adam),
+        "model radiant.item output at batch 0 index 0 is non-finite"
+    );
+    assert_eq!(adam.step(), before.adam.step());
+}
+
 fn rollback_fixture(
     count: usize,
 ) -> (

@@ -590,18 +590,28 @@ fn read_snapshot(path: &Path) -> Result<String, PpoError> {
         .map_err(|error| PpoError::Model(format!("randomization snapshot read: {error}")))
 }
 
-/// Writes one generation snapshot, verifying an existing file byte for byte.
+/// Writes generation snapshots, verifying existing files byte for byte.
 ///
 /// A mismatch means the recomputed generation disagrees with what a previous
 /// run recorded; the run is stopped rather than continued under different
-/// world modifiers. File contents are synced before a durable rename: Unix
-/// syncs the parent directory and Windows uses `MOVEFILE_WRITE_THROUGH`,
-/// matching the checkpoint path.
-pub fn write_generation_snapshot(directory: &Path, draw: &GenerationDraw) -> Result<(), PpoError> {
-    use std::io::Write;
-
+/// world modifiers. Each new file is synced once before its rename and the
+/// directory once at the end, so a batch costs one directory sync.
+pub fn write_generation_snapshots(
+    directory: &Path,
+    draws: &[GenerationDraw],
+) -> Result<(), PpoError> {
     std::fs::create_dir_all(directory)
         .map_err(|error| PpoError::Model(format!("randomization directory: {error}")))?;
+    for draw in draws {
+        write_generation_file(directory, draw)?;
+    }
+    crate::checkpoint::sync_directory(directory)
+        .map_err(|error| PpoError::Model(format!("randomization snapshot commit: {error}")))
+}
+
+fn write_generation_file(directory: &Path, draw: &GenerationDraw) -> Result<(), PpoError> {
+    use std::io::Write;
+
     let path = generation_path(directory, draw.generation);
     let text = generation_json(draw);
     if path.exists() {
@@ -621,7 +631,7 @@ pub fn write_generation_snapshot(directory: &Path, draw: &GenerationDraw) -> Res
     file.sync_all()
         .map_err(|error| PpoError::Model(format!("randomization snapshot sync: {error}")))?;
     drop(file);
-    crate::checkpoint::durable_rename(&temporary, &path)
+    crate::checkpoint::commit_rename(&temporary, &path)
         .map_err(|error| PpoError::Model(format!("randomization snapshot commit: {error}")))
 }
 

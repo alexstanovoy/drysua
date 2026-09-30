@@ -83,13 +83,13 @@ Fields:
   `unsupported`; unsupported history always has `verified=false`.
 - `runtime_status`: `matched`, `missing`, or `mismatch`;
   `runtime_matches_model` is true only for `matched`.
-- `recovery_required`: true for a previous-manifest/tensor fallback or an unmatched
-  runtime export. This is a diagnostic, not permission to recover automatically.
-- `sources`: actual relative `manifest` and `tensor` paths, nullable observed
-  `runtime` path, and `canonical_tensor_matches`.
-- `files`: ordered `{path,size,sha256}` entries for the selected manifest,
-  authoritative tensor, matching canonical tensor alias when separate, matching
-  runtime export, and committed generation snapshots. Paths are restricted relative
+- `recovery_required`: true for an unmatched runtime export (a kill between its
+  rename and the manifest's). This is a diagnostic, not permission to recover
+  automatically.
+- `sources`: relative `manifest` and `tensor` paths and the nullable observed
+  `runtime` path.
+- `files`: ordered `{path,size,sha256}` entries for the manifest, the immutable
+  tensor file, a matching runtime export, and committed generation snapshots. Paths are restricted relative
   filenames or `domain-randomization/<filename>`; never absolute or traversing.
 
 `scope_sha256` hashes the domain `drysua-checkpoint-inspection-scope/v1\0`, then the
@@ -105,10 +105,11 @@ finite parameters and moments, optimizer/RNG bounds, and control-plane consisten
 It intentionally does not call the pathname-reopening loader or restore a model:
 inspection reads are anchored to owned Linux directory descriptors.
 
-The immutable `checkpoint.<tensor-sha>.safetensors` file named by the manifest is preferred. A canonical
-tensor alias is listed only when its bytes hash to that same commitment. Native
-`.previous` fallbacks are reported under their actual names when the primary is
-absent; an unsafe existing primary is an error, not absence.
+A commit (checkpoint v21) writes the immutable `checkpoint.<tensor-sha>.safetensors`,
+the runtime export and last the manifest, each through a synced temporary file and
+a rename, then syncs the directory once. The manifest names the only authoritative
+tensor file; there is no alias copy or `.previous` fallback, and an unsafe manifest
+or tensor file is an error.
 
 Runtime export is not authoritative checkpoint state. A missing export or a valid
 older export returns false with `missing`/`mismatch`; its observed SHA is retained

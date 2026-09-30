@@ -315,7 +315,7 @@ impl EpisodeRecord {
 
     /// Writes the game's `episode:`, reward and summary lines.
     pub(super) fn log(&self) {
-        eprintln!("{}", self.lines[0]);
+        crate::telemetry::log_line!("{}", self.lines[0]);
         let mut output =
             crate::telemetry::PerformanceOutput::new(crate::telemetry::AsyncLogWriter::default());
         output.emit(&format_args!("{}", self.lines[1]));

@@ -264,6 +264,16 @@ impl ActorRouting {
         )
     }
 
+    /// Training routing of a gathered device side mask; training never selects on the host.
+    pub(super) fn from_mask(mask: Tensor) -> Self {
+        Self {
+            mask,
+            sides: Vec::new(),
+            training: true,
+            raw: RefCell::new(std::array::from_fn(|_| None)),
+        }
+    }
+
     fn with_sides(sides: Vec<u8>, device: &Device, training: bool) -> Result<Self, ModelError> {
         Ok(Self {
             mask: Tensor::from_slice(&sides, (sides.len(), 1), device)?,
@@ -414,6 +424,23 @@ pub(super) fn side_row(frame: &FeatureFrame, index: usize) -> Result<u8, ModelEr
 }
 
 pub(super) fn validate_training(output: &PolicyTensorTensors) -> Result<(), ModelError> {
+    validate_named(&training_outputs(output))
+}
+
+/// A device scalar that is finite exactly when every training output is, so the
+/// learner checks finiteness with the readback it already performs.
+pub(super) fn training_finite_probe(output: &PolicyTensorTensors) -> Result<Tensor, ModelError> {
+    let probes = training_outputs(output)
+        .into_iter()
+        .map(|(_, tensor)| {
+            let tensor = tensor.detach();
+            tensor.sub(&tensor)?.sum_all()
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(Tensor::stack(&probes, 0)?.sum_all()?)
+}
+
+fn training_outputs(output: &PolicyTensorTensors) -> Vec<(&'static str, &Tensor)> {
     let mut named = Vec::with_capacity(27);
     named.push(("value", &output.value));
     for (head, pair) in ActorHead::ALL.into_iter().zip(&output.side_raw) {
@@ -424,7 +451,7 @@ pub(super) fn validate_training(output: &PolicyTensorTensors) -> Result<(), Mode
     named.push(("entity pointer", &output.entity_pointer));
     named.push(("point pointer", &output.point_pointer));
     assert_eq!(named.len(), 27);
-    validate_named(&named)
+    named
 }
 
 fn validate_named(named: &[(&'static str, &Tensor)]) -> Result<(), ModelError> {

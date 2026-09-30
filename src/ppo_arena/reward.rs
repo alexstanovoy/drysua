@@ -21,7 +21,7 @@ pub struct Map2TrainingReward {
 
 impl Map2TrainingReward {
     pub(crate) fn log(&self, scope: &'static str, updates: u64) {
-        assert!(matches!(scope, "checkpoint" | "invocation"));
+        assert!(matches!(scope, "update" | "invocation"));
         assert!(updates <= crate::MAX_TRAINING_COUNTER);
         crate::telemetry::PerformanceOutput::new(crate::telemetry::AsyncLogWriter::default()).emit(
             &format_args!(

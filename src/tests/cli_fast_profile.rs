@@ -27,7 +27,12 @@ fn annealed_cli_resolves_the_continuous_profile_and_validates() {
     let settings = arguments(&["--simulation-threads", "3"])
         .annealed_settings("drysua".into(), "bota".into())
         .unwrap();
-    assert_eq!((settings.slots, settings.lanes), (64, 2));
+    // Host-sized defaults: 16 slots per core in lanes of at most 64 slots per group.
+    let cores = std::thread::available_parallelism().unwrap().get();
+    assert_eq!(settings.slots, (16 * cores).min(256));
+    assert!(settings.lanes >= 2 * settings.simulation_groups);
+    assert!(settings.slots.is_multiple_of(settings.lanes) && settings.slots / settings.lanes <= 64);
+    assert!(!settings.pin_threads);
     assert_eq!(settings.simulation_threads, 3);
     assert_eq!(settings.ppo.samples_per_update, 8_000);
     assert_eq!(settings.generation_updates, 4);
