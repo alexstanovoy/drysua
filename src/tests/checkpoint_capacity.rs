@@ -221,12 +221,15 @@ fn runtime_weights_roundtrip_and_reject_foreign_schema_without_mutation() {
             foreign.insert(key.to_owned(), value);
         }
         let data = encode_f32(&parameters);
-        let tensor = TensorView::new(Dtype::F32, vec![parameters.len()], &data).expect("tensor");
-        fs::write(
-            &path,
-            serialize([("model.parameters", tensor)], Some(foreign)).expect("fixture"),
-        )
-        .expect("write");
+        let mut offset = 0;
+        let mut tensors = Vec::new();
+        for (name, shape) in model.parameter_schema().expect("schema") {
+            let size = shape.iter().product::<usize>() * 4;
+            let view = TensorView::new(Dtype::F32, shape, &data[offset..offset + size]);
+            tensors.push((name, view.expect("tensor")));
+            offset += size;
+        }
+        fs::write(&path, serialize(tensors, Some(foreign)).expect("fixture")).expect("write");
         let identity = model.policy_identity().expect("identity");
         let result = TrainingArtifact::load_runtime_weights(&model, &directory);
         if !invalid {

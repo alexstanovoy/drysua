@@ -224,10 +224,18 @@ fn pfsp_league_mixtures_resume_in_flight_neural_games_exactly() {
     let league = |kind: &OpponentKind| matches!(kind, OpponentKind::League(_));
     assert!(state.mixture.entries().iter().any(|(kind, _)| league(kind)));
     assert!(state.outcomes.entries.iter().any(|(kind, _)| league(kind)));
-    let reweighted = state.mixture.entries().windows(2).any(|pair| pair[0].1 != pair[1].1);
+    let reweighted = state
+        .mixture
+        .entries()
+        .windows(2)
+        .any(|pair| pair[0].1 != pair[1].1);
     assert!(reweighted, "PFSP reweighted the configured equal weights");
     let written: Vec<u64> = state.league.iter().map(|(update, _)| *update).collect();
-    assert_eq!(written, [0, 2], "the checkpoint's own update 4 is its model");
+    assert_eq!(
+        written,
+        [0, 2],
+        "the checkpoint's own update 4 is its model"
+    );
     run(config, &resumed, true).expect("resume");
     assert_trajectory_equal(&uninterrupted, &resumed);
     let artifact = TrainingArtifact::load(&resumed).expect("final checkpoint");
@@ -237,11 +245,23 @@ fn pfsp_league_mixtures_resume_in_flight_neural_games_exactly() {
             .league;
     let mut kept: Vec<String> = std::fs::read_dir(resumed.join("league"))
         .expect("league")
-        .map(|entry| entry.expect("entry").file_name().into_string().expect("name"))
+        .map(|entry| {
+            entry
+                .expect("entry")
+                .file_name()
+                .into_string()
+                .expect("name")
+        })
         .collect();
     kept.sort();
-    let expected: Vec<String> = recorded.iter().map(|(update, _)| format!("u{update:04}")).collect();
-    assert_eq!(kept, expected, "only the snapshots the final checkpoint records");
+    let expected: Vec<String> = recorded
+        .iter()
+        .map(|(update, _)| format!("u{update:04}"))
+        .collect();
+    assert_eq!(
+        kept, expected,
+        "only the snapshots the final checkpoint records"
+    );
     for directory in [weights, uninterrupted, resumed] {
         std::fs::remove_dir_all(directory).expect("cleanup");
     }

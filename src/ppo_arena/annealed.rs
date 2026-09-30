@@ -539,7 +539,9 @@ fn load_opponents(settings: &AnnealedJobConfig) -> Result<OpponentPool, PpoError
         entries.push((kind, weight.units()));
     }
     if entries.is_empty() && league.is_none() {
-        return Err(PpoError::InvalidConfig("annealed opponent mixture is empty"));
+        return Err(PpoError::InvalidConfig(
+            "annealed opponent mixture is empty",
+        ));
     }
     Ok(OpponentPool {
         entries,
@@ -656,10 +658,7 @@ fn append_opponent_scope(
             }
         }
     }
-    command_line.push_str(&format!(
-        " --opponent-schedule {}",
-        pool.schedule.name()
-    ));
+    command_line.push_str(&format!(" --opponent-schedule {}", pool.schedule.name()));
     Ok(())
 }
 

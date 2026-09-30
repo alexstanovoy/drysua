@@ -116,11 +116,20 @@ fn warm_start_reuses_named_tensors_reinitializes_the_rest_and_refuses_unrelated_
     let parameters = source.export_parameters().expect("parameters");
     let schema = source.parameter_schema().expect("schema");
     // An older model: another critic layout under older schema metadata.
-    let data: Vec<u8> = parameters.iter().flat_map(|value| value.to_le_bytes()).collect();
+    let data: Vec<u8> = parameters
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect();
     let legacy_value = vec![0; 257 * 4];
     let mut tensors = vec![
-        ("value.weight".to_owned(), TensorView::new(Dtype::F32, vec![256, 1], &legacy_value[..1024])),
-        ("value.bias".to_owned(), TensorView::new(Dtype::F32, vec![1], &legacy_value[1024..])),
+        (
+            "value.weight".to_owned(),
+            TensorView::new(Dtype::F32, vec![256, 1], &legacy_value[..1024]),
+        ),
+        (
+            "value.bias".to_owned(),
+            TensorView::new(Dtype::F32, vec![1], &legacy_value[1024..]),
+        ),
     ];
     let mut offset = 0;
     for (name, shape) in &schema {
@@ -144,11 +153,18 @@ fn warm_start_reuses_named_tensors_reinitializes_the_rest_and_refuses_unrelated_
             .expect("warm start across schemas");
 
     let imported = model.export_parameters().expect("imported");
-    let fresh = PolicyModel::fresh(5).expect("fresh").export_parameters().expect("fresh");
+    let fresh = PolicyModel::fresh(5)
+        .expect("fresh")
+        .export_parameters()
+        .expect("fresh");
     let mut offset = 0;
     for (name, shape) in &schema {
         let range = offset..offset + shape.iter().product::<usize>();
-        let expected = if name.starts_with("value.") { &fresh } else { &parameters };
+        let expected = if name.starts_with("value.") {
+            &fresh
+        } else {
+            &parameters
+        };
         assert_eq!(imported[range.clone()], expected[range.clone()], "{name}");
         offset = range.end;
     }
@@ -157,8 +173,11 @@ fn warm_start_reuses_named_tensors_reinitializes_the_rest_and_refuses_unrelated_
         Err(CheckpointError::SchemaMismatch),
         "play and eval stay strict"
     );
-    fs::write(&path, runtime_bytes(&parameters[1..], current_runtime_metadata()))
-        .expect("flat fixture");
+    fs::write(
+        &path,
+        runtime_bytes(&parameters[1..], current_runtime_metadata()),
+    )
+    .expect("flat fixture");
     assert_eq!(
         TrainingArtifact::initialize_from_weights(&directory.0, 5, crate::PolicyDevice::Cpu).err(),
         Some(CheckpointError::TensorContract("names")),

@@ -143,17 +143,17 @@ fn feature_peak_counts_all_row_capacities_and_one_largest_reallocation() {
     let mut total = 0;
     let mut largest = 0;
     for (tokens, size) in counts.into_iter().zip(sizes) {
-        let rows = 46_520 * tokens;
+        let rows = 33_280 * tokens;
         assert!(rows <= u64::from(u32::MAX));
         let bytes = rows * size;
         total += bytes;
         largest = largest.max(bytes);
     }
 
-    assert_eq!(total, 3_117_026_080);
-    assert_eq!(largest, 1_518_412_800);
+    assert_eq!(total, 2_229_893_120);
+    assert_eq!(largest, 1_086_259_200);
     assert_eq!(FEATURE_ARENA_PEAK_BYTES, total + largest);
-    assert_eq!(FEATURE_ARENA_PEAK_BYTES, 4_635_438_880);
+    assert_eq!(FEATURE_ARENA_PEAK_BYTES, 3_316_152_320);
 }
 
 fn arena_capacities(arena: &RaggedFeatureArena) -> [usize; 7] {

@@ -274,10 +274,12 @@ impl AnnealedSession {
             Some(mixture) => mixture,
             None => schedule_mixture(&entries, &self.outcomes, pool.schedule)?,
         };
-        let league = self.league.weights(entries.iter().filter_map(|(kind, _)| match kind {
-            OpponentKind::League(milestone) => Some(*milestone),
-            _ => None,
-        }))?;
+        let league = self
+            .league
+            .weights(entries.iter().filter_map(|(kind, _)| match kind {
+                OpponentKind::League(milestone) => Some(*milestone),
+                _ => None,
+            }))?;
         Ok(PartConfig {
             update,
             version,
@@ -330,7 +332,11 @@ impl AnnealedSession {
                 let state = CollectorState::decode(&checkpoint.state)?;
                 self.part_config(
                     pool,
-                    (completed, state.actor_version, Arc::new(checkpoint.actor.clone())),
+                    (
+                        completed,
+                        state.actor_version,
+                        Arc::new(checkpoint.actor.clone()),
+                    ),
                     (state.spec, Some(state.mixture)),
                 )?
             }

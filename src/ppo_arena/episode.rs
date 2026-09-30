@@ -76,7 +76,9 @@ impl EpisodeStream {
     pub(super) fn retains(&self, kind: ActionKind) -> bool {
         assert!(!self.done);
         assert!(self.interval.steps <= CONTINUE_STRIDE);
-        self.choice.is_none() || kind != ActionKind::Continue || self.interval.steps == CONTINUE_STRIDE
+        self.choice.is_none()
+            || kind != ActionKind::Continue
+            || self.interval.steps == CONTINUE_STRIDE
     }
 
     /// Whether a next decision of `kind` closes the open interval; its value

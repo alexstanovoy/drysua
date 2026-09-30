@@ -74,7 +74,11 @@ impl LeagueStore {
     }
 
     /// Writes every manifest snapshot the checkpoint directory lacks.
-    pub(super) fn persist(&self, checkpoint: &Path, manifest: &[(u64, u64)]) -> Result<(), PpoError> {
+    pub(super) fn persist(
+        &self,
+        checkpoint: &Path,
+        manifest: &[(u64, u64)],
+    ) -> Result<(), PpoError> {
         let root = checkpoint.join(LEAGUE_DIRECTORY);
         if !manifest.is_empty() {
             std::fs::create_dir_all(&root).map_err(|error| league_error(&root, &error))?;
@@ -86,7 +90,8 @@ impl LeagueStore {
             }
             let staging = root.join(format!(".u{update:04}.partial"));
             if staging.exists() {
-                std::fs::remove_dir_all(&staging).map_err(|error| league_error(&staging, &error))?;
+                std::fs::remove_dir_all(&staging)
+                    .map_err(|error| league_error(&staging, &error))?;
             }
             std::fs::create_dir(&staging).map_err(|error| league_error(&staging, &error))?;
             let snapshot = &self.snapshots[update];

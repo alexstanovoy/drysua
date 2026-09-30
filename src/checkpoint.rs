@@ -540,7 +540,12 @@ impl TrainingArtifact {
             warm.reused_tensors,
             warm.reused_parameters,
             warm.reinitialized.len(),
-            listed(warm.reinitialized.iter().map(|name| (*name).to_owned()).collect()),
+            listed(
+                warm.reinitialized
+                    .iter()
+                    .map(|name| (*name).to_owned())
+                    .collect()
+            ),
             warm.dropped_tensors,
             listed(warm.differing_metadata),
         );
@@ -750,7 +755,9 @@ fn serialize_runtime_tensor(parameters: &[f32]) -> Result<Vec<u8>, CheckpointErr
     runtime::serialize(&current_parameter_schema()?, parameters)
 }
 
-fn parameter_schema(model: &PolicyModel) -> Result<Vec<(&'static str, Vec<usize>)>, CheckpointError> {
+fn parameter_schema(
+    model: &PolicyModel,
+) -> Result<Vec<(&'static str, Vec<usize>)>, CheckpointError> {
     model
         .parameter_schema()
         .map_err(|error| CheckpointError::Model(error.to_string()))

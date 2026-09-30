@@ -79,7 +79,7 @@ fn annealed_cli_parses_an_ordered_opponent_mixture_with_colon_paths() {
     );
     for invalid in [
         "weights:/runs/u100",
-        "league:1",
+        "league:x",
         "teacher:-1",
         "self:0.1234567",
     ] {

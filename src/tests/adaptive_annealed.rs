@@ -355,12 +355,12 @@ fn cuda_side_actors_update_both_heads_and_resume_exactly() {
             .any(|index| before[index].to_bits() != after[index].to_bits())
     };
     assert!(
-        changed(1_586_113..1_590_225) || changed(1_591_169..1_700_020),
+        changed(1_651_905..1_656_017) || changed(1_656_961..1_765_812),
         "Radiant actor must train"
     );
-    assert!(changed(1_700_020..1_812_983), "Dire actor must train");
+    assert!(changed(1_765_812..1_878_775), "Dire actor must train");
     eprintln!(
-        "side-actor-native parameters=1812983 tensors=86 slots=4 lanes=2 microbatch=256 both_actor_heads_changed=true exact_model_adam_rng_controller_snapshots_resume=true"
+        "side-actor-native parameters=1878775 tensors=88 slots=4 lanes=2 microbatch=256 both_actor_heads_changed=true exact_model_adam_rng_controller_snapshots_resume=true"
     );
     for directory in [baseline, resumed, weights] {
         std::fs::remove_dir_all(directory).unwrap();

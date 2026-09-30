@@ -186,7 +186,13 @@ fn learner_deadline_zero_bootstraps_without_inventing_match_over() {
     assert_eq!(transition.ticks, 3);
     assert_eq!(stream.map2_reward().components[5], 0.0);
     let summary = crate::ppo_arena::game_summary::GameSummary::capture(&environment, None, 4);
-    let record = stream.record(0, 0, &completed, crate::ppo_arena::slot::OpponentKind::Teacher, &summary);
+    let record = stream.record(
+        0,
+        0,
+        &completed,
+        crate::ppo_arena::slot::OpponentKind::Teacher,
+        &summary,
+    );
     let mut report = CollectionReport::default();
     record.accumulate(&mut report).expect("report");
     assert_eq!(report.episode_timeouts, 1);

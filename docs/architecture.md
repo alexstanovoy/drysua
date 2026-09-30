@@ -60,16 +60,19 @@ These rules keep the policy from winning through simulator leaks rather than pla
 [continuous collection](continuous_collection.md)):
 
 - `--slots` worlds (default 64) each always hold a live game against an opponent
-  drawn per game from `--opponent` (`teacher`, `harass-push`, `self`, frozen `weights:`).
+  drawn per game from `--opponent` (`teacher`, `harass-push`, `self`, frozen `weights:`,
+  `league` snapshots of the learner), weighted by PFSP per update.
 - `--lanes` inference threads (default 2) batch their slots through a weight replica;
   a shared pool steps the simulations.
-- One decision in `MAP2_RETENTION_STRIDE = 8` is retained as a PPO sample (about one
-  every 24 ticks); an update is due at `--samples-per-update` samples (default 8,000).
+- The first decision, every non-Continue decision and each Continue that finds the
+  open interval `MAP2_CONTINUE_STRIDE = 8` decisions long begin a PPO sample (about
+  0.4 per decision); an update is due at `--samples-per-update` samples (default
+  24,000, about sixteen games).
 - The learner trains update `u` while lanes collect `u + 1` with the weights of
   `u - 1` (1-stale PPO; the ratio uses stored behaviour log-probabilities).
-- PPO defaults: Adam lr 3e-6, 4 epochs, minibatch 2,048, clip 0.2, value coefficient
-  0.5, entropy 0.01, gradient clip 0.5, λ 0.98 per retained sample, γ = 1, target
-  KL 0.02 (early stop).
+- PPO defaults: Adam lr 1e-5, 4 epochs, minibatch 2,048, clip 0.2, value coefficient
+  0.5, entropy 0.004, gradient clip 0.5, λ 0.99979 per tick (0.995 per 24 ticks, a
+  160 s horizon), γ = 1, target KL 0.02 (step rollback and early stop).
 - Domain randomization draws spawn modifiers per environment generation; the
   adaptive schedule extends or ends generations by win rate, and the last
   `--zero-updates` are unmodified.
@@ -81,10 +84,11 @@ Reward: [reward.md](reward.md) (version 8, outcome plus potential-based shaping)
 ## Versions
 
 Every contract carries a version and hash: action schema 7, feature schema 24, model
-schema 25 (1,812,983 parameters), checkpoint format 20, reward 8. Backward
+schema 26 (1,878,775 parameters), checkpoint format 20 (collection state v2), reward 8. Backward
 compatibility is not kept: a change bumps the version and old artifacts are
 rejected; old bots are played from their git commit. `--initial-weights` is the one
-exception: it warm-starts from any runtime weights with the current parameter layout.
+exception: it warm-starts from any runtime weights, reusing every tensor whose name and
+shape match and initializing the rest.
 
 ## Source map
 
@@ -115,9 +119,12 @@ exception: it warm-starts from any runtime weights with the current parameter la
   M25 lineage (u100, u200v1, u200v2) at about 31–34% against Teacher with no
   forgetting between checkpoints. Training barely moves the policy: KL per update
   is about 1e-4 against a 0.02 target.
-- **Credit assignment.** The critic is one `Linear(256, 1)` on a detached trunk, and
-  λ = 0.98 per retained sample reaches back only about 40 s. Reward 8 makes every
-  return equal the outcome and moves credit earlier through shaping.
+- **Credit assignment.** The critic is a 256×256 MLP trained with the trunk and λ is
+  per tick (160 s horizon), yet explained variance plateaus near 0.08 after 60
+  updates (the old linear critic: 0.05–0.11), and GAE still truncates at update
+  boundaries (about 375 samples per slot per update). With lr 1e-5 the policy moves
+  about 0.009 KL per update (30× the old setting) without a significant win-rate
+  change against Teacher (+3 points, p = 0.38, 400 paired games).
 - **Aiming.** Razes fire along the hero's facing and bota has no face order. Action
   schema 7 makes a raze one decision (`Cast` untargeted, at an entity, or toward a
   point candidate such as a cluster landing or a fog guess) expanded by `RazeAim`,
@@ -131,7 +138,5 @@ exception: it warm-starts from any runtime weights with the current parameter la
   froze in most of those games and HarassPush won 195; E0 and every other number
   measured against Teacher before that fix are against the freezing Teacher.
 
-In flight: reward 8 and aimed razes in campaigns; critic capacity and trunk
-gradient, λ, retention of non-Continue decisions and a PFSP opponent mixture;
-HarassPush as an opponent and imitation target to seed the push strategy;
+In flight: reward 8 and aimed razes in campaigns; HarassPush as an opponent and imitation target to seed the push strategy;
 collection and learner performance (the learner is host-bound).

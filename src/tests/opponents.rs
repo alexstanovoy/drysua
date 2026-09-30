@@ -30,7 +30,11 @@ fn pfsp_prefers_opponents_the_learner_loses_to_and_never_drops_one() {
     window
         .record(OpponentKind::Snapshot(0), Some(PpoTerminalOutcome::Draw))
         .expect("record");
-    assert_eq!(window.tally(OpponentKind::Teacher), (100, 0), "window of 100");
+    assert_eq!(
+        window.tally(OpponentKind::Teacher),
+        (100, 0),
+        "window of 100"
+    );
     let entries = [
         (OpponentKind::Teacher, 1_000_000),
         (OpponentKind::SelfPlay, 1_000_000),
@@ -38,7 +42,11 @@ fn pfsp_prefers_opponents_the_learner_loses_to_and_never_drops_one() {
         (OpponentKind::League(0), 1_000_000),
     ];
     let mixture = schedule_mixture(&entries, &window, OpponentSchedule::Pfsp).expect("mixture");
-    let weights: Vec<u64> = mixture.entries().iter().map(|(_, weight)| *weight).collect();
+    let weights: Vec<u64> = mixture
+        .entries()
+        .iter()
+        .map(|(_, weight)| *weight)
+        .collect();
     // (101/102)^2 after 100 losses, (1/102)^2 after 100 wins, (1/2)^2 after one draw or none.
     assert_eq!(weights, [980_488, 96, 250_000, 250_000]);
     let fixed = schedule_mixture(&entries, &window, OpponentSchedule::Fixed).expect("fixed");

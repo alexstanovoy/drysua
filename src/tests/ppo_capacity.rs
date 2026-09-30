@@ -14,7 +14,7 @@ fn rollout_capacity_bounds_include_peak_memory_and_reject_overflow() {
                 .err()
                 .expect("capacity")
                 .to_string(),
-            format!("PPO rollout capacity {capacity} is outside 1..=46520")
+            format!("PPO rollout capacity {capacity} is outside 1..=33280")
         );
     }
     let config = annealed_config();

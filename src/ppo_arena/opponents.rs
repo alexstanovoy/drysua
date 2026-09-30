@@ -153,7 +153,9 @@ fn pfsp_weight(weight: u64, (games, score): (u64, u64)) -> u64 {
     let numerator = u128::from(2 * games + 2 - score);
     let denominator = u128::from(2 * games + 4);
     let scaled = u128::from(weight) * numerator * numerator / (denominator * denominator);
-    u64::try_from(scaled).expect("never above the configured weight").max(1)
+    u64::try_from(scaled)
+        .expect("never above the configured weight")
+        .max(1)
 }
 
 /// Logs each entry's recent record and its share of the next mixture.
