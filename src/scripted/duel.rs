@@ -7,7 +7,7 @@ use bota_proto::{DamageKind, EventKind, Fixed, MapId, ServerMsg, SlotId, Team, U
 
 use crate::raze_aim::{SHADOWRAZE_RADIUS, SHADOWRAZES, isqrt, raze_reach};
 use crate::scripted::tactics::{DECISION_TICKS, own_fountain};
-use crate::scripted::{ScriptKind, ScriptedPolicy};
+use crate::scripted::{ScriptedPolicy, StyleSpec, StyleValues, seat_seed};
 use crate::{
     Arena, ArenaConfig, ItemReadiness, OrderPersistence, RazeAim, Request, StateTracker,
     tracker::map_maximum_raw,
@@ -25,10 +25,10 @@ const MATCH_TICK_LIMIT: u32 = 30 * 60 * 16;
 /// Which seeds and policies a duel plays.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DuelConfig {
-    /// The evaluated policy.
-    pub policy: ScriptKind,
-    /// The policy it plays against.
-    pub opponent: ScriptKind,
+    /// The evaluated policy and the styles it draws from.
+    pub policy: StyleSpec,
+    /// The policy it plays against and the styles that one draws from.
+    pub opponent: StyleSpec,
     /// First arena seed.
     pub first_seed: u64,
     /// Consecutive seeds, each played once per side.
@@ -64,6 +64,9 @@ pub struct DuelGame {
     pub seed: u64,
     /// Team of the evaluated policy.
     pub side: Team,
+    /// Styles drawn for this game.
+    pub policy_style: StyleValues,
+    pub opponent_style: StyleValues,
     pub result: DuelResult,
     pub end: DuelEnd,
     pub ticks: u32,
@@ -126,7 +129,7 @@ pub fn run_duel(config: DuelConfig) -> Result<Vec<DuelGame>, String> {
                         break;
                     }
                     let seed = config.first_seed + (index / 2) as u64;
-                    let game = play_duel_game(config.policy, config.opponent, seed, index % 2);
+                    let game = play_duel_game(&config.policy, &config.opponent, seed, index % 2);
                     results.lock().expect("duel results lock")[index] = Some(game);
                 }
             });
@@ -140,10 +143,11 @@ pub fn run_duel(config: DuelConfig) -> Result<Vec<DuelGame>, String> {
         .collect()
 }
 
-/// Plays one deterministic Map2 game with the evaluated policy in `policy_seat`.
+/// Plays one deterministic Map2 game with the evaluated policy in `policy_seat`; each seat
+/// draws its style from the game seed and its own seat.
 pub fn play_duel_game(
-    policy: ScriptKind,
-    opponent: ScriptKind,
+    policy: &StyleSpec,
+    opponent: &StyleSpec,
     seed: u64,
     policy_seat: usize,
 ) -> Result<DuelGame, String> {
@@ -159,16 +163,24 @@ pub fn play_duel_game(
     })
     .map_err(|error| error.to_string())?;
     let mut seats = [None, None];
+    let mut styles = [StyleValues::canonical(policy.kind()); 2];
     for (index, messages) in start.messages.into_iter().enumerate() {
-        let kind = if index == policy_seat {
+        let spec = if index == policy_seat {
             policy
         } else {
             opponent
         };
-        seats[index] = Some(DuelSeat::new(kind, index, &messages)?);
+        let style_seed = seat_seed(seed, index);
+        styles[index] = spec.draw(style_seed);
+        let script = ScriptedPolicy::styled(spec.kind(), &styles[index], style_seed);
+        seats[index] = Some(DuelSeat::new(script, index, &messages)?);
     }
     let mut seats = seats.map(|seat| seat.expect("both duel seats start"));
-    let mut tally = Tally::new(seed, seats[policy_seat].tracker.team());
+    let mut tally = Tally::new(
+        seed,
+        seats[policy_seat].tracker.team(),
+        [styles[policy_seat], styles[1 - policy_seat]],
+    );
     loop {
         let tick = arena.tick();
         if tick > MATCH_TICK_LIMIT {
@@ -205,7 +217,7 @@ struct DuelSeat {
 }
 
 impl DuelSeat {
-    fn new(kind: ScriptKind, index: usize, messages: &[ServerMsg]) -> Result<Self, String> {
+    fn new(script: ScriptedPolicy, index: usize, messages: &[ServerMsg]) -> Result<Self, String> {
         let info = messages.iter().find_map(|message| match message {
             ServerMsg::MatchStart { info } => Some(info),
             _ => None,
@@ -214,7 +226,7 @@ impl DuelSeat {
         let tracker = StateTracker::new(slot, info.ok_or("duel seat has no MatchStart")?)
             .map_err(|error| error.to_string())?;
         let mut seat = Self {
-            script: ScriptedPolicy::new(kind),
+            script,
             tracker,
             persistence: OrderPersistence::default(),
             readiness: ItemReadiness::new(),
@@ -302,11 +314,14 @@ struct Tally {
 }
 
 impl Tally {
-    const fn new(seed: u64, side: Team) -> Self {
+    /// `styles` holds the evaluated policy's style first.
+    const fn new(seed: u64, side: Team, styles: [StyleValues; 2]) -> Self {
         Self {
             game: DuelGame {
                 seed,
                 side,
+                policy_style: styles[0],
+                opponent_style: styles[1],
                 result: DuelResult::Draw,
                 end: DuelEnd::Cap,
                 ticks: 0,

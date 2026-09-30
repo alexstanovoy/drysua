@@ -92,7 +92,10 @@ fn initial_weights_then_resume_matches_uninterrupted_parameters_optimizer_and_rn
     let initial = PolicyModel::fresh(23_074).expect("initial model");
     TrainingArtifact::save_runtime_weights(&initial, &weights).expect("initial weights");
     let fingerprint = initial.parameter_fingerprint().expect("fingerprint");
-    let config = settings(23_071, 2);
+    let mut config = settings(23_071, 2);
+    // A styled opponent draws its style and noise from the game seed, so the split game
+    // must replay it exactly too.
+    config.opponents = vec![(AnnealedOpponent::Styled(crate::ScriptKind::Teacher), one())];
     let start = |directory: &std::path::Path, stop_after| {
         run_annealed_job_harnessed(
             config.clone(),

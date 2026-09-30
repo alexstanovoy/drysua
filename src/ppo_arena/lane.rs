@@ -435,7 +435,7 @@ fn row_groups(slots: &[Box<Slot>]) -> Vec<(ModelKey, Vec<RowRef>)> {
             opponent: false,
         });
         let key = match slot.plan.opponent {
-            OpponentKind::Teacher | OpponentKind::HarassPush => continue,
+            OpponentKind::Teacher | OpponentKind::HarassPush | OpponentKind::Styled(_) => continue,
             OpponentKind::SelfPlay => ModelKey::Actor,
             OpponentKind::Snapshot(index) => ModelKey::Snapshot(index),
             OpponentKind::League(milestone) => ModelKey::League(milestone),

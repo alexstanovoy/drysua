@@ -17,8 +17,8 @@ The GUI is for the human to launch from a desktop; agent verification was headle
 
 ## Watch or play HarassPush
 
-HarassPush (`src/scripted/harass_push.rs`) is a weightless rule policy that razes
-Teacher off the lane and pushes its tower. `--opponent harass-push` plays it against
+HarassPush (`src/scripted/harass_push.rs`) is a weightless rule policy that holds
+the lane against Teacher with salves and clarities and pushes its tower. `--opponent harass-push` plays it against
 the human; `--watch harass-push` seats it where the human would sit and opens
 bota-client as a spectator, so it plays the `--opponent` rule policy:
 
@@ -31,6 +31,17 @@ Headless head-to-head numbers come from the builtin arena, every seed once per s
 ```sh
 cargo run --release --features builtin -- duel --policy harass-push --opponent teacher \
   --seed 1 --seeds 100
+```
+
+Both rule policies take style knobs (`retreat`, `hover`, `items`, `epsilon`, ...; an unknown
+knob name lists them). `--policy-style` and `--opponent-style` fix a knob (`knob=value`) or
+draw it per game (`knob=low..high`); a leading `styled` draws every knob from its styled
+range. The canonical style is the default. Training draws the styled preset per game with
+`--opponent teacher-styled:<weight>` or `harass-push-styled:<weight>`:
+
+```sh
+cargo run --release --features builtin -- duel --policy harass-push --opponent teacher \
+  --opponent-style styled,retreat=20..60 --seeds 100
 ```
 
 ## Default Neural mode still fails closed without explicit weights

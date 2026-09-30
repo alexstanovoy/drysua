@@ -298,20 +298,27 @@ const fn opponent_runtime(policy: &Policy) -> OpponentRuntime {
         Policy::Neural(_) => OpponentRuntime::Neural,
         Policy::Script(ScriptKind::Teacher) => OpponentRuntime::Teacher,
         Policy::Script(ScriptKind::HarassPush) => OpponentRuntime::HarassPush,
+        Policy::Styled(kind) => OpponentRuntime::Styled(*kind),
     }
 }
 
 fn start_game(game: PlannedGame, models: &Models) -> Result<LiveWorld, PpoError> {
     let opponent = &models.pool[game.opponent].policy;
+    let arena_seed = derive_training_seed(game.seed, 0, ARENA_DOMAIN);
     let mut environment = build_environment(
-        derive_training_seed(game.seed, 0, ARENA_DOMAIN),
+        arena_seed,
         crate::MAP2_ID,
         game.seat,
         opponent_runtime(opponent),
         Vec::new(),
     )?;
-    if let Policy::Script(kind) = models.candidate.policy {
-        environment.seats[game.seat].script = ScriptedPolicy::new(kind);
+    match models.candidate.policy {
+        Policy::Script(kind) => environment.seats[game.seat].script = ScriptedPolicy::new(kind),
+        Policy::Styled(kind) => {
+            environment.seats[game.seat].script =
+                ScriptedPolicy::styled_preset(kind, crate::seat_seed(arena_seed, game.seat));
+        }
+        Policy::Neural(_) => {}
     }
     let neural = (
         models.candidate.model().is_some(),

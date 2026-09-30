@@ -12,7 +12,7 @@ use super::opponents::{MAX_LEAGUE_SIZE, MAX_MIXTURE_ENTRIES, OutcomeWindow, PFSP
 use super::slot::{
     ActionLog, GamePlan, MAX_SLOTS, OpenInterval, OpponentKind, OpponentMixture, SlotSnapshot,
 };
-use crate::{MAP2_ACTOR_DECISIONS, MAX_COLLECTION_STATE_BYTES, PpoError};
+use crate::{MAP2_ACTOR_DECISIONS, MAX_COLLECTION_STATE_BYTES, PpoError, ScriptKind};
 
 const VERSION: u32 = 2;
 /// League snapshots one checkpoint can keep: two publications' leagues and
@@ -151,6 +151,8 @@ fn put_opponent(bytes: &mut Vec<u8>, opponent: OpponentKind) {
         OpponentKind::SelfPlay => (2, 0),
         OpponentKind::HarassPush => (3, 0),
         OpponentKind::League(milestone) => (4, milestone),
+        OpponentKind::Styled(ScriptKind::Teacher) => (5, 0),
+        OpponentKind::Styled(ScriptKind::HarassPush) => (5, 1),
     };
     put_u32(bytes, tag);
     put_u64(bytes, value);
@@ -257,6 +259,8 @@ impl Reader<'_> {
             (4, milestone) if milestone <= crate::MAX_TRAINING_COUNTER => {
                 OpponentKind::League(milestone)
             }
+            (5, 0) => OpponentKind::Styled(ScriptKind::Teacher),
+            (5, 1) => OpponentKind::Styled(ScriptKind::HarassPush),
             _ => return Err(invalid()),
         })
     }

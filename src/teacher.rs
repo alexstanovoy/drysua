@@ -8,7 +8,9 @@ use crate::raze_aim::{
     SHADOWRAZE_RADIUS, SHADOWRAZES, TURN_RATE_BRADS, facing_towards, isqrt, point_along,
     predicted_position, raze_center, raze_contains, raze_radius, raze_reach,
 };
+use crate::scripted::ScriptKind;
 use crate::scripted::progress::{GoalProgress, Pursuit};
+use crate::scripted::style::{Knob, StyleValues};
 use crate::scripted::tactics::{
     ATTACK_POINT_TICKS, ATTACK_PROJECTILE_UNITS_PER_TICK, DECISION_TICKS, allied_creep_near,
     attack_turn_ticks, best_attack_creep, cast_at, enemy_heroes, enemy_tower_danger, facing_gap,
@@ -38,20 +40,76 @@ const TELEPORT_CHANNEL_TICKS: u32 = 90;
 const COURIER_ERRAND_LIMIT_TICKS: u32 = 1_800;
 const ORDER_NOTE_LIMIT: usize = 4;
 const FOUNTAIN_RECOVERY_RADIUS: i32 = 1_200;
-const FOUNTAIN_RECOVERY_PERCENT: i32 = 95;
-const RETREAT_HEALTH_PERCENT: i32 = 40;
 const BACKOFF_DISTANCE: i32 = 200;
 const COMBAT_PLAN_TICKS: u32 = 90;
 const AIM_PLAN_TICKS: u32 = 18;
 const NAVIGATION_STALL_TICKS: u32 = 18;
 const WALK_ARRIVAL_UNITS: i32 = 100;
-const AGGRO_COOLDOWN_TICKS: u32 = 90;
 const AGGRO_HOLD_TICKS: u32 = 70;
 const AGGRO_RANGE: i32 = 500;
 const FINISH_LIMIT_TICKS: u32 = 60;
 const FINISH_ITEM_SLOTS: usize = 6;
 
-const _: () = assert!(AGGRO_HOLD_TICKS < AGGRO_COOLDOWN_TICKS);
+const _: () = assert!(AGGRO_HOLD_TICKS < AGGRO_KNOB.min as u32);
+
+/// Ticks between two aggro pulls of the enemy wave.
+const AGGRO_KNOB: Knob = Knob::new("aggro", 90, (90, 3_600), (90, 900));
+
+/// Style knobs after the shared noise knobs; defaults are the canonical Teacher.
+pub(crate) const STYLE_KNOBS: [Knob; 8] = [
+    // Health share at or below which it walks home.
+    Knob::new("retreat", 40, (10, 70), (25, 55)),
+    // Health share below which a started walk home continues; at or below `retreat` the
+    // canonical Teacher has no hysteresis.
+    Knob::new("return", 40, (10, 100), (40, 90)),
+    // Health and mana share it holds for at the fountain.
+    Knob::new("fountain", 95, (40, 100), (60, 100)),
+    AGGRO_KNOB,
+    // How near an enemy hero must be to be chased and razed.
+    Knob::new("victim", 1_200, (500, 1_800), (800, 1_500)),
+    // 1 right-clicks an enemy hero in reach when no last hit is due.
+    Knob::new("harass", 1, (0, 1), (0, 1)),
+    // Entries of the build plan it buys, in order.
+    Knob::new("items", 6, (0, 6), (0, 6)),
+    // 1 levels razes before Necromastery.
+    Knob::new("razes_first", 1, (0, 1), (0, 1)),
+];
+
+/// One game's Teacher knobs, typed; see [`STYLE_KNOBS`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TeacherStyle {
+    retreat_percent: i32,
+    return_percent: i32,
+    fountain_percent: i32,
+    aggro_cooldown: u32,
+    victim_distance: i32,
+    harass: bool,
+    items: usize,
+    razes_first: bool,
+}
+
+impl TeacherStyle {
+    /// Reads the Teacher knobs of one drawn style.
+    pub fn from_values(values: &StyleValues) -> Self {
+        let get = |name| values.get(ScriptKind::Teacher, name);
+        Self {
+            retreat_percent: get("retreat"),
+            return_percent: get("return"),
+            fountain_percent: get("fountain"),
+            aggro_cooldown: u32::try_from(get("aggro")).expect("knob bounds"),
+            victim_distance: get("victim"),
+            harass: get("harass") == 1,
+            items: usize::try_from(get("items")).expect("knob bounds"),
+            razes_first: get("razes_first") == 1,
+        }
+    }
+}
+
+impl Default for TeacherStyle {
+    fn default() -> Self {
+        Self::from_values(&StyleValues::canonical(ScriptKind::Teacher))
+    }
+}
 const _: () = assert!(AIM_PLAN_TICKS <= COMBAT_PLAN_TICKS);
 const _: () = assert!(FINISH_LIMIT_TICKS <= COMBAT_PLAN_TICKS);
 const _: () = assert!(FINISH_LIMIT_TICKS < 300);
@@ -128,6 +186,9 @@ pub struct Teacher {
     progress: GoalProgress,
     /// Hands hero razes straight to the aim macro instead of FollowUnit, Stop, Cast.
     macro_hero_aim: bool,
+    style: TeacherStyle,
+    /// Walking home until health reaches the style's return share.
+    retreating: bool,
 }
 
 impl Default for Teacher {
@@ -137,8 +198,13 @@ impl Default for Teacher {
 }
 
 impl Teacher {
-    /// Creates a teacher with empty per-match order and purchase memory.
-    pub const fn new() -> Self {
+    /// Creates a canonical teacher with empty per-match order and purchase memory.
+    pub fn new() -> Self {
+        Self::with_style(TeacherStyle::default())
+    }
+
+    /// Creates a teacher of one drawn style with empty per-match memory.
+    pub fn with_style(style: TeacherStyle) -> Self {
         Self {
             hero_notes: [None; ORDER_NOTE_LIMIT],
             hero_note_cursor: 0,
@@ -159,12 +225,14 @@ impl Teacher {
             combat_rollback: None,
             progress: GoalProgress::new(),
             macro_hero_aim: false,
+            style,
+            retreating: false,
         }
     }
 
     /// A teacher whose hero razes are single aimed decisions resolved by [`crate::RazeAim`].
     #[cfg(feature = "builtin")]
-    pub(crate) const fn with_macro_hero_aim() -> Self {
+    pub(crate) fn with_macro_hero_aim() -> Self {
         let mut teacher = Self::new();
         teacher.macro_hero_aim = true;
         teacher
@@ -454,7 +522,7 @@ impl Teacher {
 
     fn teacher_aim(&self, tracker: &StateTracker, space: &ActionSpace) -> Option<CombatChoice> {
         let hero = tracker.own_hero()?;
-        let (target, enemy) = combat_victim(tracker, space, hero)?;
+        let (target, enemy) = combat_victim(tracker, space, hero, self.style.victim_distance)?;
         if !tactical_chase_safe(tracker, hero, enemy.pos) {
             return None;
         }
@@ -468,11 +536,13 @@ impl Teacher {
             self.combat_rollback = None;
         }
         self.combat.hero = hero;
-        if tracker
-            .own_hero()
-            .is_some_and(|hero| !ratio_at_most(hero.hp, hero.max_hp, RETREAT_HEALTH_PERCENT))
-        {
-            self.combat.finish_attempted = false;
+        if let Some(hero) = tracker.own_hero() {
+            let style = self.style;
+            if !ratio_at_most(hero.hp, hero.max_hp, style.retreat_percent) {
+                self.combat.finish_attempted = false;
+            }
+            self.retreating = ratio_at_most(hero.hp, hero.max_hp, style.retreat_percent)
+                || self.retreating && ratio_below(hero.hp, hero.max_hp, style.return_percent);
         }
         self.combat.active_items = std::array::from_fn(|slot| {
             tracker
@@ -591,7 +661,7 @@ impl Teacher {
             };
             return space.allows(action).then_some(CombatChoice::plain(action));
         }
-        if !ratio_at_most(hero.hp, hero.max_hp, RETREAT_HEALTH_PERCENT)
+        if !ratio_at_most(hero.hp, hero.max_hp, self.style.retreat_percent)
             || self.combat.finish_attempted
             || own_fountain(tracker).is_some_and(|home| {
                 hero.pos
@@ -682,7 +752,10 @@ impl Teacher {
                 elapsed >= AIM_PLAN_TICKS
                     || space.entity_index(target).is_none_or(|index| {
                         let target = space.entity_candidates()[index.0].unit();
-                        target.hp <= 0 || !hero.pos.within(target.pos, Fixed::from_int(1_200))
+                        target.hp <= 0
+                            || !hero
+                                .pos
+                                .within(target.pos, Fixed::from_int(self.style.victim_distance))
                     })
             }
             CombatPurpose::AggroClick { .. } | CombatPurpose::AggroPull => self
@@ -789,7 +862,7 @@ impl Teacher {
         if self
             .combat
             .last_aggro
-            .is_some_and(|tick| space.tick().saturating_sub(tick) < AGGRO_COOLDOWN_TICKS)
+            .is_some_and(|tick| space.tick().saturating_sub(tick) < self.style.aggro_cooldown)
         {
             return self
                 .combat
@@ -797,7 +870,7 @@ impl Teacher {
                 .filter(|plan| matches!(plan.purpose, CombatPurpose::AggroPull))
                 .map(|_| CombatChoice::plain(StructuredAction::Continue));
         }
-        if ratio_at_most(hero.hp, hero.max_hp, RETREAT_HEALTH_PERCENT)
+        if ratio_at_most(hero.hp, hero.max_hp, self.style.retreat_percent)
             || self.attack_last_hit(tracker, space).is_some()
             || enemy_tower_danger(tracker, hero.pos, hero.bound)
         {
@@ -818,7 +891,7 @@ impl Teacher {
         if !eligible {
             return None;
         }
-        let (target, _) = combat_victim(tracker, space, hero)?;
+        let (target, _) = combat_victim(tracker, space, hero, self.style.victim_distance)?;
         let action = StructuredAction::AttackUnit {
             unit: ControlledUnit::Hero,
             target,
@@ -1006,7 +1079,12 @@ impl Teacher {
     fn learn(&self, tracker: &StateTracker, space: &ActionSpace) -> Option<StructuredAction> {
         let hero = tracker.own_hero()?;
         let mask = space.learn_slot_mask();
-        for wanted in [REQUIEM, SHADOWRAZES[0].0, NECROMASTERY, PRESENCE] {
+        let order = if self.style.razes_first {
+            [REQUIEM, SHADOWRAZES[0].0, NECROMASTERY, PRESENCE]
+        } else {
+            [REQUIEM, NECROMASTERY, SHADOWRAZES[0].0, PRESENCE]
+        };
+        for wanted in order {
             for (index, ability) in hero.abilities.iter().enumerate() {
                 let same_group = wanted == SHADOWRAZES[0].0
                     && SHADOWRAZES.iter().any(|(id, _)| *id == ability.id);
@@ -1026,6 +1104,7 @@ impl Teacher {
             space,
             &self.bought_once,
             &self.economy_observation,
+            self.style.items,
         )
     }
 
@@ -1085,7 +1164,7 @@ impl Teacher {
 
     fn sustain(&self, tracker: &StateTracker, space: &ActionSpace) -> Option<StructuredAction> {
         let hero = tracker.own_hero()?;
-        let emergency = ratio_at_most(hero.hp, hero.max_hp, RETREAT_HEALTH_PERCENT)
+        let emergency = ratio_at_most(hero.hp, hero.max_hp, self.style.retreat_percent)
             || visible_pressure(tracker, hero) >= hero.hp.max(0);
         teacher_economy::select_sustain(tracker, space, emergency, &self.progress)
     }
@@ -1097,16 +1176,15 @@ impl Teacher {
         if hero
             .pos
             .within(fountain, Fixed::from_int(FOUNTAIN_RECOVERY_RADIUS))
-            && (ratio_below(hero.hp, hero.max_hp, FOUNTAIN_RECOVERY_PERCENT)
-                || ratio_below(hero.mana, hero.max_mana, FOUNTAIN_RECOVERY_PERCENT))
+            && (ratio_below(hero.hp, hero.max_hp, self.style.fountain_percent)
+                || ratio_below(hero.mana, hero.max_mana, self.style.fountain_percent))
         {
             let action = StructuredAction::Hold {
                 unit: ControlledUnit::Hero,
             };
             return space.allows(action).then_some(action);
         }
-        let critical = ratio_at_most(hero.hp, hero.max_hp, RETREAT_HEALTH_PERCENT)
-            && !safe_kill_opportunity(tracker, space, hero);
+        let critical = self.retreating && !safe_kill_opportunity(tracker, space, hero);
         let lethal = visible_pressure(tracker, hero) >= hero.hp.max(0);
         let tower = unsafe_tower_without_wave(tracker, hero);
         if !critical && !lethal && !tower {
@@ -1155,7 +1233,7 @@ impl Teacher {
 
     fn raze_hero(&self, tracker: &StateTracker, space: &ActionSpace) -> Option<StructuredAction> {
         let hero = tracker.own_hero()?;
-        let (target, enemy) = combat_victim(tracker, space, hero)?;
+        let (target, enemy) = combat_victim(tracker, space, hero, self.style.victim_distance)?;
         best_hero_raze(tracker, space, hero, enemy, hero.facing.brads)?;
         self.aim_raze(tracker, space, hero, enemy, target)
             .map(|choice| choice.action)
@@ -1192,7 +1270,8 @@ impl Teacher {
 
     fn harass(&self, tracker: &StateTracker, space: &ActionSpace) -> Option<StructuredAction> {
         let hero = tracker.own_hero()?;
-        if best_attack_creep(tracker, space, EntityRelation::Enemy, false).is_some()
+        if !self.style.harass
+            || best_attack_creep(tracker, space, EntityRelation::Enemy, false).is_some()
             || enemy_tower_danger(tracker, hero.pos, hero.bound)
         {
             return None;
@@ -1394,6 +1473,7 @@ fn combat_victim<'a>(
     tracker: &StateTracker,
     space: &'a ActionSpace,
     hero: &UnitView,
+    reach: i32,
 ) -> Option<(EntityIndex, &'a UnitView)> {
     space
         .entity_candidates()
@@ -1403,7 +1483,7 @@ fn combat_victim<'a>(
             candidate.relation == EntityRelation::Enemy
                 && candidate.kind == UnitKind::Hero
                 && candidate.unit().hp > 0
-                && hero.pos.within(candidate.position, Fixed::from_int(1_200))
+                && hero.pos.within(candidate.position, Fixed::from_int(reach))
         })
         .min_by_key(|(_, candidate)| {
             let enemy = candidate.unit();

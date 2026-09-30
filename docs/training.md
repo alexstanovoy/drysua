@@ -96,7 +96,7 @@ controller owns the campaign.
 | `trainer` | required | `drysua` ELF built with `builtin` (and `cuda` for GPU) |
 | `inspector` | `trainer` | binary providing `checkpoint-inspect` |
 | `initial_weights` | none | runtime weights; tensors with the current name and shape are reused; fresh start only |
-| `opponents` | Teacher | 1..16 `{"kind", "weight"[, "path"]}`: `teacher`, `harass-push`, `self`, `league` or `weights` with a `path` (frozen into `inputs/opponent-<i>/`); weights are decimal strings |
+| `opponents` | Teacher | 1..16 `{"kind", "weight"[, "path"]}`: `teacher`, `harass-push`, `teacher-styled`, `harass-push-styled`, `self`, `league` or `weights` with a `path` (frozen into `inputs/opponent-<i>/`); weights are decimal strings |
 | `total_updates` | required | 1..10000 |
 | `history_every` | 20 | milestone spacing for `history/uNNNN/` runtime weights; exported only at checkpoints |
 | `checkpoint_seconds` | 600 | 60..86400, wall time between checkpoints (`--checkpoint-interval-seconds`) |
@@ -243,7 +243,8 @@ python3 scripts/eval_pool.py report --store temp/eval [--json]
 python3 scripts/eval_pool.py compare --store temp/eval NEW OLD
 ```
 
-**Players** are a rule policy (`teacher`, `harass-push`), `weights:<dir>` or
+**Players** are a rule policy (`teacher`, `harass-push`, or `teacher-styled` and
+`harass-push-styled`, which draw a style per game and seat), `weights:<dir>` or
 `average:<dir>,<dir>,...` (the parameter mean of runtime weights: an EMA-like
 average of the latest history snapshots, `train.py eval --average K`). The **pool**
 (`drysua-eval-pool/v1`, [example](eval_pool.example.json)) lists up to 16 opponents
