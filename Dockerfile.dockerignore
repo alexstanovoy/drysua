@@ -11,8 +11,6 @@
 !drysua/src/
 !drysua/src/**/
 !drysua/src/**/*.rs
-!drysua/benches/
-!drysua/benches/**/*.rs
 !drysua/crates/
 !drysua/crates/**/
 !drysua/crates/**/Cargo.toml

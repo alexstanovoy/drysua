@@ -7,7 +7,6 @@ edition = "2024"
 default = []
 builtin = ["dep:bota-server"]
 cuda = ["dep:candle-cuda-feature"]
-metal = ["dep:candle-metal-feature"]
 side-actors = []
 
 [dependencies]
@@ -33,27 +32,9 @@ libc = { version = "=0.2.189", default-features = false }
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", default-features = false, features = ["Win32_Storage_FileSystem"] }
 
-[target.'cfg(target_os = "macos")'.dependencies]
-candle-metal-feature = { path = "crates/candle-metal-feature", default-features = false, optional = true }
-
-[dev-dependencies]
-# Mirrors bota's workspace pin so the shared bench tooling version moves in lockstep.
-criterion = { version = "=0.8.2", default-features = false }
-
 [[bin]]
 name = "drysua"
 path = "src/main.rs"
-
-[[bin]]
-name = "drysua-profile"
-path = "src/bin/drysua_profile.rs"
-required-features = ["builtin"]
-
-[[bench]]
-name = "training"
-path = "benches/training.rs"
-harness = false
-required-features = ["builtin"]
 
 [lints.clippy]
 float_arithmetic = "deny"

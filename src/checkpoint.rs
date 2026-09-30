@@ -136,9 +136,6 @@ pub fn compiled_features() -> String {
     if cfg!(feature = "cuda") {
         features.push("cuda");
     }
-    if cfg!(feature = "metal") {
-        features.push("metal");
-    }
     if cfg!(feature = "side-actors") {
         features.push("side-actors");
     }
@@ -153,7 +150,6 @@ pub fn compiled_features() -> String {
 pub enum CheckpointDevice {
     Cpu,
     Cuda { ordinal: u32 },
-    Metal { ordinal: u32 },
 }
 
 /// Immutable run provenance required for strict artifact compatibility.
@@ -701,11 +697,6 @@ impl CheckpointDevice {
                 ordinal: u32::try_from(ordinal)
                     .map_err(|_| CheckpointError::InvalidManifest("device ordinal"))?,
             }),
-            #[cfg(all(feature = "metal", target_os = "macos"))]
-            PolicyDevice::Metal { ordinal } => Ok(Self::Metal {
-                ordinal: u32::try_from(ordinal)
-                    .map_err(|_| CheckpointError::InvalidManifest("device ordinal"))?,
-            }),
         }
     }
 
@@ -1245,7 +1236,6 @@ fn encode_device(writer: &mut ManifestWriter, device: CheckpointDevice) {
     let (kind, ordinal) = match device {
         CheckpointDevice::Cpu => (0, 0),
         CheckpointDevice::Cuda { ordinal } => (1, ordinal),
-        CheckpointDevice::Metal { ordinal } => (2, ordinal),
     };
     writer.u8(kind);
     writer.u32(ordinal);
@@ -1257,7 +1247,6 @@ fn decode_device(reader: &mut ManifestReader<'_>) -> Result<CheckpointDevice, Ch
     match (kind, ordinal) {
         (0, 0) => Ok(CheckpointDevice::Cpu),
         (1, ordinal) => Ok(CheckpointDevice::Cuda { ordinal }),
-        (2, ordinal) => Ok(CheckpointDevice::Metal { ordinal }),
         _ => Err(CheckpointError::InvalidManifest("device")),
     }
 }

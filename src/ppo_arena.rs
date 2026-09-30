@@ -891,8 +891,6 @@ pub(crate) fn device_name(device: PolicyDevice) -> &'static str {
         PolicyDevice::Cpu => "cpu",
         #[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
         PolicyDevice::Cuda { .. } => "cuda",
-        #[cfg(all(feature = "metal", target_os = "macos"))]
-        PolicyDevice::Metal { .. } => "metal",
     }
 }
 

@@ -45,7 +45,6 @@ pub(super) fn run(run: &CheckpointRun) -> Value {
     let device = match run.device {
         CheckpointDevice::Cpu => json!({"kind": "cpu", "ordinal": null}),
         CheckpointDevice::Cuda { ordinal } => json!({"kind": "cuda", "ordinal": ordinal}),
-        CheckpointDevice::Metal { ordinal } => json!({"kind": "metal", "ordinal": ordinal}),
     };
     json!({"git_commit": run.git_commit, "simulator_commit": run.simulator_commit,
         "enabled_features": run.enabled_features, "command_line": run.command_line, "run_seed": run.run_seed,

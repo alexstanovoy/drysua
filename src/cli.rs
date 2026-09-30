@@ -128,7 +128,7 @@ struct TrainArgs {
     /// Learner tensor backend; actors and simulation remain on CPU.
     #[arg(long, value_enum, default_value_t = LearnerDevice::Cpu)]
     device: LearnerDevice,
-    /// CUDA or Metal device ordinal.
+    /// CUDA device ordinal.
     #[arg(long, default_value_t = 0)]
     device_ordinal: usize,
 }
@@ -191,7 +191,7 @@ struct TrainFullArgs {
     /// Learner tensor backend; actors and simulation remain on CPU.
     #[arg(long, value_enum, default_value_t = LearnerDevice::Cpu)]
     device: LearnerDevice,
-    /// CUDA or Metal device ordinal.
+    /// CUDA device ordinal.
     #[arg(long, default_value_t = 0)]
     device_ordinal: usize,
 }
@@ -200,7 +200,6 @@ struct TrainFullArgs {
 enum LearnerDevice {
     Cpu,
     Cuda,
-    Metal,
 }
 
 /// Which frozen opponent the annealed run plays against.
@@ -304,7 +303,7 @@ struct TrainAnnealedArgs {
     /// Learner tensor backend; actors and simulation remain on CPU.
     #[arg(long, value_enum, default_value_t = LearnerDevice::Cpu)]
     device: LearnerDevice,
-    /// CUDA or Metal device ordinal.
+    /// CUDA device ordinal.
     #[arg(long, default_value_t = 0)]
     device_ordinal: usize,
 }
@@ -1115,7 +1114,6 @@ impl LearnerDevice {
         match self {
             Self::Cpu => Ok(crate::PolicyDevice::Cpu),
             Self::Cuda => cuda_policy_device(ordinal),
-            Self::Metal => metal_policy_device(ordinal),
         }
     }
 }
@@ -1136,18 +1134,6 @@ fn cuda_policy_device(ordinal: usize) -> std::io::Result<crate::PolicyDevice> {
 fn cuda_policy_device(_: usize) -> std::io::Result<crate::PolicyDevice> {
     Err(std::io::Error::other(
         "CUDA learner requires cargo feature `cuda` on Linux or Windows",
-    ))
-}
-
-#[cfg(all(feature = "builtin", feature = "metal", target_os = "macos"))]
-fn metal_policy_device(ordinal: usize) -> std::io::Result<crate::PolicyDevice> {
-    Ok(crate::PolicyDevice::Metal { ordinal })
-}
-
-#[cfg(all(feature = "builtin", not(all(feature = "metal", target_os = "macos"))))]
-fn metal_policy_device(_: usize) -> std::io::Result<crate::PolicyDevice> {
-    Err(std::io::Error::other(
-        "Metal learner requires cargo feature `metal` on macOS",
     ))
 }
 

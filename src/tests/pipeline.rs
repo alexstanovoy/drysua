@@ -354,17 +354,7 @@ fn cuda_pipeline_runs_complete_ppo_update_with_cpu_actor_snapshot() {
     accelerator_pipeline_update(PolicyDevice::Cuda { ordinal: 0 });
 }
 
-#[cfg(all(feature = "metal", target_os = "macos"))]
-#[test]
-#[ignore = "requires a Metal device"]
-fn metal_pipeline_runs_complete_ppo_update_with_cpu_actor_snapshot() {
-    accelerator_pipeline_update(PolicyDevice::Metal { ordinal: 0 });
-}
-
-#[cfg(any(
-    all(feature = "cuda", any(target_os = "linux", target_os = "windows")),
-    all(feature = "metal", target_os = "macos")
-))]
+#[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
 fn accelerator_pipeline_update(device: PolicyDevice) {
     let learner = PolicyModel::fresh_on(17_060, device).expect("accelerator learner");
     let mut pipeline = ActorLearnerPipeline::new(1, 1, &learner).expect("pipeline");
