@@ -98,7 +98,7 @@ consumes; they fail when no live controller owns the campaign.
 | `schema` | required | `2` |
 | `trainer` | required | native ELF `drysua` built with `builtin` (and `cuda` for GPU) |
 | `inspector` | `trainer` | binary providing `checkpoint-inspect` |
-| `initial_weights` | none | runtime weights file or directory; fresh start only |
+| `initial_weights` | none | runtime weights file or directory; fresh start only; any linked action, feature or reward schema with the same parameter layout (logged as `initial_weights_loaded`) |
 | `opponent_weights` | none | frozen runtime weights opponent (Teacher otherwise) |
 | `total_updates` | required | 1..10000 |
 | `history_every` | 20 | milestone spacing for `history/uNNNN/` runtime weights |

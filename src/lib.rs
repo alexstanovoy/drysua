@@ -20,6 +20,7 @@ mod ppo;
 mod ppo_arena;
 #[cfg(any(feature = "builtin", test))]
 mod randomization;
+mod raze_aim;
 mod readiness;
 mod reward_observer;
 mod seat;
@@ -52,6 +53,7 @@ pub use persistence::*;
 pub use ppo::*;
 #[cfg(feature = "builtin")]
 pub use ppo_arena::*;
+pub use raze_aim::RazeAim;
 pub use readiness::*;
 pub use seat::*;
 pub use teacher::*;

@@ -96,6 +96,41 @@ fn runtime_requires_every_current_identity_field_without_mutation() {
     }
 }
 
+#[cfg(feature = "builtin")]
+#[test]
+fn warm_start_reuses_parameters_across_linked_schemas_and_refuses_other_layouts() {
+    let directory = Directory::new();
+    let parameters = PolicyModel::fresh(18_111)
+        .expect("source")
+        .export_parameters()
+        .expect("parameters");
+    let path = directory.0.join("drysua.weights.safetensors");
+    let mut older = current_runtime_metadata();
+    older.insert("action_schema_hash".to_owned(), "1".to_owned());
+    older.insert("map2_reward_schema_version".to_owned(), "7".to_owned());
+    fs::write(&path, runtime_bytes(&parameters, older)).expect("older schema fixture");
+
+    let model =
+        TrainingArtifact::initialize_from_weights(&directory.0, 5, crate::PolicyDevice::Cpu)
+            .expect("warm start across schemas");
+
+    assert_eq!(model.export_parameters().expect("imported"), parameters);
+    assert_eq!(
+        TrainingArtifact::load_runtime_weights(&model, &directory.0),
+        Err(CheckpointError::SchemaMismatch),
+        "play and eval stay strict"
+    );
+    fs::write(
+        &path,
+        runtime_bytes(&parameters[1..], current_runtime_metadata()),
+    )
+    .expect("other layout fixture");
+    assert_eq!(
+        TrainingArtifact::initialize_from_weights(&directory.0, 5, crate::PolicyDevice::Cpu).err(),
+        Some(CheckpointError::TensorContract("dtype or shape"))
+    );
+}
+
 #[test]
 fn resume_rejects_each_linked_schema_version_and_hash_before_tensor_io() {
     let directory = Directory::new();

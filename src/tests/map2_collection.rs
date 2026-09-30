@@ -203,33 +203,42 @@ fn learner_deadline_zero_bootstraps_without_inventing_match_over() {
 }
 
 #[test]
-fn native_mango_then_cast_is_legal_for_both_neural_seats() {
+fn native_mango_then_aimed_raze_is_legal_for_both_neural_seats() {
     use crate::{ActionTarget, ControlledUnit, StructuredAction};
     use bota_proto::{AbilitySlot, Fixed, ItemId, ItemSlot};
     let mut environment = configured_environment(1, 0, OpponentSpec::Idle, |world| {
-        for seat in &world.seats {
+        for (index, seat) in world.seats.iter().enumerate() {
             let hero = seat.unit.expect("hero");
             world.inventory.get_mut(hero).expect("inventory").slots[0] =
                 bota_server::game::ItemStack::bought(ItemId(42), seat.slot, 1);
             world.mana.get_mut(hero).expect("mana").mana = Fixed::ZERO;
             world.abilities.get_mut(hero).expect("abilities").slots[0].level = 1;
+            // Each hero faces the other, so the aimed near raze goes off at once.
+            world.transform.get_mut(hero).expect("facing").facing.brads =
+                if index == 0 { 0 } else { 32_768 };
         }
     });
-    for action in [
-        StructuredAction::Use {
-            unit: ControlledUnit::Hero,
-            slot: ItemSlot(0),
-            target: ActionTarget::None,
-        },
-        StructuredAction::Cast {
-            unit: ControlledUnit::Hero,
-            slot: AbilitySlot(0),
-            target: ActionTarget::None,
-        },
-    ] {
+    for kind in [ActionKind::Use, ActionKind::Cast] {
         let mut requests = Vec::with_capacity(2);
         for seat in &mut environment.seats {
             let (_, space) = prepare_neural_seat_policy_sample(seat).expect("Neural space");
+            let action = if kind == ActionKind::Use {
+                StructuredAction::Use {
+                    unit: ControlledUnit::Hero,
+                    slot: ItemSlot(0),
+                    target: ActionTarget::None,
+                }
+            } else {
+                let enemy = seat.tracker.current().expect("view").players
+                    [usize::from(seat.tracker.team() == bota_proto::Team::Radiant)]
+                .unit
+                .expect("enemy hero");
+                StructuredAction::Cast {
+                    unit: ControlledUnit::Hero,
+                    slot: AbilitySlot(0),
+                    target: ActionTarget::Entity(space.entity_index(enemy).expect("enemy")),
+                }
+            };
             assert!(space.allows(action));
             requests.push(
                 neural_policy_request_in_space(seat, action, &space)
@@ -248,7 +257,7 @@ fn native_mango_then_cast_is_legal_for_both_neural_seats() {
         take_map2_reward(&mut environment, None, 3).expect("event streams");
         for seat in &environment.seats {
             let hero = seat.tracker.own_hero().expect("hero");
-            if action.kind() == ActionKind::Use {
+            if kind == ActionKind::Use {
                 assert!(hero.mana >= 100);
                 assert!(hero.items[0].is_none());
             } else {

@@ -6,7 +6,8 @@
 use bota_proto::{MapId, ServerMsg, SlotId, Team, Vec2};
 
 use crate::{
-    Arena, ArenaConfig, ArenaStart, ItemReadiness, OrderPersistence, Request, StateTracker, Teacher,
+    Arena, ArenaConfig, ArenaStart, ItemReadiness, OrderPersistence, RazeAim, Request,
+    StateTracker, Teacher,
 };
 
 const MATCH_TICKS: usize = 1_800;
@@ -14,6 +15,7 @@ struct SeatPolicy {
     teacher: Teacher,
     tracker: StateTracker,
     persistence: OrderPersistence,
+    aim: RazeAim,
     readiness: ItemReadiness,
     sequence: u32,
 }
@@ -175,6 +177,7 @@ fn setup_seats(start: ArenaStart) -> Vec<SeatPolicy> {
                 teacher: Teacher::new(),
                 tracker,
                 persistence: OrderPersistence::default(),
+                aim: RazeAim::default(),
                 readiness: ItemReadiness::new(),
                 sequence: 0,
             }
@@ -467,7 +470,11 @@ fn decide_request(seat: &mut SeatPolicy, counts: &mut GateCounts) -> Option<Requ
         space.allows(action),
         "teacher action must have mask coverage"
     );
-    let decoded = space.decode(action).expect("teacher action must decode")?;
+    let decoded = space.decode(action).expect("teacher action must decode");
+    let active_body = seat.persistence.active_body_order_for(None);
+    let (decoded, _) = seat
+        .aim
+        .resolve(&seat.tracker, decoded, action.kind(), active_body)?;
     let Some(issued) = seat.persistence.should_send(Some(decoded)) else {
         counts.suppressions = counts
             .suppressions

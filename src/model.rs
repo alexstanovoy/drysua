@@ -123,7 +123,7 @@ const SLOT_EMBEDDING: usize = 16;
 const DECODER_CONTEXT: usize = 336;
 const TARGET_MODE_HEAD: usize = 3;
 const PUT_MODE_HEAD: usize = 2;
-const MODEL_PARAMETER_TENSORS: usize = 86;
+pub(crate) const MODEL_PARAMETER_TENSORS: usize = 86;
 static NEXT_MODEL_LINEAGE: AtomicU64 = AtomicU64::new(1);
 static NEXT_OPTIMIZER_LINEAGE: AtomicU64 = AtomicU64::new(1);
 
@@ -131,7 +131,7 @@ static NEXT_OPTIMIZER_LINEAGE: AtomicU64 = AtomicU64::new(1);
 pub const MODEL_SCHEMA_DESCRIPTOR: &str = concat!(
     "bota-drysua-model/v25;",
     "linked_schemas=action,feature,map2_reward;linked_hash=fnv1a_descriptor_then_ordered_version_le32_hash_le64_then_map2_reward_descriptor_utf8;",
-    "scope=map2_mid_only_cap27900_including900_pregame;candidate_execution=feature19_candidate_order_bookkeeping_action5_walkable_building_landing_move_only_mango_unchanged;layout=86_named_tensors_1812983_f32;",
+    "scope=map2_mid_only_cap27900_including900_pregame;candidate_execution=feature19_candidate_order_bookkeeping_action6_walkable_building_landing_move_only_mango_unchanged;layout=86_named_tensors_1812983_f32;",
     "map2_inputs=global92_unit84,wire_rebase_unit_bound_and_collision_and_attack_time;",
     "dtype=f32;device=cpu_actor,cpu_or_cuda_learner,one_learner_per_device;architecture=deepsets;activations=relu_after_every_encoder_and_trunk_linear;",
     "input_conditioning=host_before_tensor_after_presence_mask,feature_v9_unchanged;category_divisors=global10:5,12:3,32:16,55:12;policy_history3:16;unit5:12;ability1:2,2:8,11:5;item1:5,2:64,9:5,13:3;point10:8,12:8,16:12;semantic_ids=ability5_and_projectile6:ln1p(x)/ln(65548),item4_and_loot1:ln1p(x)/ln(65537);all_other_features_identity;",
@@ -210,7 +210,7 @@ pub const MODEL_SCHEMA_HASH: u64 = linked_schema_hash(
 pub const MODEL_PARAMETER_COUNT: usize = 1_812_983;
 
 const _: () = assert!(FEATURE_SCHEMA_VERSION == 23);
-const _: () = assert!(crate::ACTION_SCHEMA_VERSION == 5);
+const _: () = assert!(crate::ACTION_SCHEMA_VERSION == 6);
 const _: () = assert!(GLOBAL_FEATURES == 92);
 const _: () = assert!(UNIT_FEATURES == 84);
 const _: () = assert!(TRUNK_INPUT == 2_596);

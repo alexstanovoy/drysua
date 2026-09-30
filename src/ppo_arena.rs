@@ -92,6 +92,7 @@ struct ArenaSeatPolicy {
     local: LocalPolicyState,
     persistence: OrderPersistence,
     order_bookkeeping: PolicyOrderBookkeeping,
+    aim: crate::RazeAim,
     readiness: ItemReadiness,
     teacher: Teacher,
     combat: game_summary::SeatCombat,
@@ -635,6 +636,7 @@ fn setup_seat(index: usize, messages: &[ServerMsg]) -> Result<ArenaSeatPolicy, P
         local: LocalPolicyState::new(1),
         persistence: OrderPersistence::default(),
         order_bookkeeping: PolicyOrderBookkeeping::Legacy,
+        aim: crate::RazeAim::default(),
         readiness: ItemReadiness::new(),
         teacher: Teacher::new(),
         combat: game_summary::SeatCombat::default(),
@@ -973,8 +975,18 @@ fn issue_request(
     action_kind: ActionKind,
     synchronize_teacher: bool,
 ) -> Result<Option<Request>, PpoError> {
+    let active_body = seat
+        .order_bookkeeping
+        .effective(&seat.persistence)
+        .active_body_order_for(None);
+    let Some((issued, action_kind)) =
+        seat.aim
+            .resolve(&seat.tracker, issued, action_kind, active_body)
+    else {
+        return Ok(None);
+    };
     let persistence = seat.order_bookkeeping.transport(&seat.persistence);
-    let Some(issued) = persistence.should_send(issued) else {
+    let Some(issued) = persistence.should_send(Some(issued)) else {
         return Ok(None);
     };
     let previous = seat.local.active_order();
