@@ -207,7 +207,7 @@ fn assert_dispatch_errors(device: PolicyDevice) {
             let mut random = [PpoRng::new(seed_for_kind(ActionKind::Continue))];
             let before = random.clone();
             let choice = model.sample_batch(&frames[..1], &spaces[..1], &mut random);
-            if cfg!(feature = "side-actors") && eager {
+            if eager {
                 assert_eq!(
                     choice
                         .expect_err("forced eager family is checked")
@@ -243,11 +243,7 @@ fn assert_dispatch_errors(device: PolicyDevice) {
 }
 
 fn controlled_overflow() -> &'static str {
-    if cfg!(feature = "side-actors") {
-        "model radiant.controlled output at batch 0 index 1 is non-finite"
-    } else {
-        "model controlled output at batch 0 index 1 is non-finite"
-    }
+    "model radiant.controlled output at batch 0 index 1 is non-finite"
 }
 
 fn uniform_kind_model(device: PolicyDevice) -> PolicyModel {

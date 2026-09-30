@@ -362,19 +362,14 @@ fn adaptive_settings() -> AnnealedJobConfig {
     config
 }
 
-#[cfg(all(
-    feature = "side-actors",
-    feature = "cuda",
-    any(target_os = "linux", target_os = "windows")
-))]
+#[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
 #[test]
-#[ignore = "exclusive CUDA pinned initialization and two-update M4/G2 native replay"]
-fn cuda_pinned_side_actors_update_both_heads_and_resume_exactly() {
+#[ignore = "exclusive CUDA initial weights and two-update M4/G2 native replay"]
+fn cuda_side_actors_update_both_heads_and_resume_exactly() {
     let baseline = test_directory("side-actor-native-baseline");
     let resumed = test_directory("side-actor-native-resumed");
-    let source = Path::new(
-        "/home/alexstanovoy/Workspace/bots/drysua/artifacts/temp/annealed-teacher-20260920/attempt-008/history/update-0428",
-    );
+    let weights = test_directory("side-actor-native-weights");
+    let source = weights.as_path();
     let mut config = adaptive_settings();
     config.updates = 2;
     config.zero_updates = 0;
@@ -387,9 +382,8 @@ fn cuda_pinned_side_actors_update_both_heads_and_resume_exactly() {
     config.execution.training_microbatch = 256;
     config.execution.reuse_actor_values = true;
     let device = PolicyDevice::Cuda { ordinal: 0 };
-    let (initial, _) =
-        TrainingArtifact::initialize_selected_m24_u428_for_side_actors(source, config.seed, device)
-            .unwrap();
+    let initial = PolicyModel::fresh(0x5a1d).unwrap();
+    TrainingArtifact::save_runtime_weights(&initial, source).unwrap();
     let before = initial.export_parameters().unwrap();
     drop(initial);
     let execute = |config, directory: &Path, resume| {
@@ -426,7 +420,7 @@ fn cuda_pinned_side_actors_update_both_heads_and_resume_exactly() {
     eprintln!(
         "side-actor-native parameters=1812983 tensors=86 balanced_games_per_update=4 groups=2 microbatch=256 reuse=true both_actor_heads_changed=true exact_model_adam_rng_controller_snapshots_resume=true"
     );
-    for directory in [baseline, resumed] {
+    for directory in [baseline, resumed, weights] {
         std::fs::remove_dir_all(directory).unwrap();
     }
 }

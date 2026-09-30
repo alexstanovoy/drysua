@@ -163,11 +163,7 @@ fn failing_a_head_after_sampling_restores_rng() {
             .sample_batch(&[frame], &[space], &mut random)
             .expect_err("head overflow")
             .to_string(),
-        if cfg!(feature = "side-actors") {
-            "model radiant.controlled output at batch 0 index 0 is non-finite"
-        } else {
-            "model controlled output at batch 0 index 0 is non-finite"
-        }
+        "model radiant.controlled output at batch 0 index 0 is non-finite"
     );
     assert_eq!(random, before);
 }

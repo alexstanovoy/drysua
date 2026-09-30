@@ -1,93 +1,8 @@
 use super::*;
 
-#[cfg(feature = "builtin")]
 #[test]
-#[ignore = "actual pinned U428 CPU/CUDA native-frame raw-head initialization parity"]
-fn pinned_u428_native_sides_match_original_radiant_raw_heads() {
-    let source = std::path::Path::new(
-        "/home/alexstanovoy/Workspace/bots/drysua/artifacts/temp/annealed-teacher-20260920/attempt-008/history/update-0428",
-    );
-    for device in [
-        PolicyDevice::Cpu,
-        #[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
-        PolicyDevice::Cuda { ordinal: 0 },
-    ] {
-        let (model, _) = crate::TrainingArtifact::initialize_selected_m24_u428_for_side_actors(
-            source, 9001, device,
-        )
-        .unwrap();
-        let (frames, spaces) = native_inputs();
-        let before = model.export_parameters().unwrap();
-        let greedy = model.choose_batch(&frames, &spaces).unwrap();
-        assert_eq!(greedy.len(), 2);
-        for prefix in [
-            TrainingPrefix::new(ActionKind::Continue, None, None),
-            TrainingPrefix::new(
-                ActionKind::Cast,
-                Some(ControlledUnit::Hero),
-                Some(TrainingSlot::Ability(TrainingAbilitySlot::new(0).unwrap())),
-            ),
-            TrainingPrefix::new(
-                ActionKind::Use,
-                Some(ControlledUnit::Courier),
-                Some(TrainingSlot::Item(TrainingItemSlot::new(2).unwrap())),
-            ),
-        ] {
-            let output = model.training_forward(&frames, &[prefix; 2]).unwrap();
-            for pair in &output.tensors.side_raw {
-                assert_bits(
-                    &pair[0].flatten_all().unwrap().to_vec1::<f32>().unwrap(),
-                    &pair[1].flatten_all().unwrap().to_vec1::<f32>().unwrap(),
-                );
-            }
-            assert_bits(
-                &output
-                    .kind()
-                    .flatten_all()
-                    .unwrap()
-                    .to_vec1::<f32>()
-                    .unwrap(),
-                &output.tensors.side_raw[0][0]
-                    .flatten_all()
-                    .unwrap()
-                    .to_vec1::<f32>()
-                    .unwrap(),
-            );
-        }
-        assert_bits(&before, &model.export_parameters().unwrap());
-        eprintln!(
-            "side-actor-initial-parity device={device:?} native_roles=2 prefixes=3 raw_head_pairs=12 legacy_radiant_reference_equal=true parameters_unchanged=true"
-        );
-    }
-}
-
-#[test]
-fn m25_appends_only_actor_heads_and_expansion_preserves_every_source_bit() {
-    assert_eq!(
-        (LEGACY_MODEL_SCHEMA_VERSION, MODEL_SCHEMA_VERSION),
-        (24, 25)
-    );
-    assert_eq!(
-        (LEGACY_MODEL_PARAMETER_COUNT, MODEL_PARAMETER_COUNT),
-        (1_700_020, 1_812_983)
-    );
-    assert!(LEGACY_MODEL_SCHEMA_DESCRIPTOR.starts_with("bota-drysua-model/v24;"));
-    assert_ne!(LEGACY_MODEL_SCHEMA_HASH, MODEL_SCHEMA_HASH);
-    let mut source = (0..LEGACY_MODEL_PARAMETER_COUNT)
-        .map(|index| f32::from_bits(0x3f00_0000 + (index as u32 % 65_536)))
-        .collect::<Vec<_>>();
-    source[0] = -0.0;
-    source[1] = f32::from_bits(1);
-    let expanded = expand_m24_side_actor_parameters(&source).expect("M24 expansion");
-    assert_bits(&expanded[..1_700_020], &source);
-    assert_bits(
-        &expanded[1_700_020..1_704_132],
-        &source[1_586_113..1_590_225],
-    );
-    assert_bits(&expanded[1_704_132..], &source[1_591_169..]);
+fn dire_actor_heads_mirror_radiant_heads_after_the_shared_parameters() {
     let model = PolicyModel::fresh(9001).expect("model");
-    model.import_parameters(&expanded).expect("expanded import");
-    assert_bits(&model.export_parameters().expect("export"), &expanded);
     let schema = model.parameter_schema().expect("schema");
     assert_eq!(schema.len(), 86);
     let heads = [
@@ -122,24 +37,6 @@ fn m25_appends_only_actor_heads_and_expansion_preserves_every_source_bit() {
     ]) {
         assert_eq!(entry.0, name);
     }
-}
-
-#[test]
-fn expansion_rejects_wrong_length_and_nonfinite_source_before_import() {
-    let mut source = vec![0.0; LEGACY_MODEL_PARAMETER_COUNT - 1];
-    assert_eq!(
-        expand_m24_side_actor_parameters(&source).expect_err("length"),
-        ModelError::ParameterLength {
-            actual: source.len(),
-            expected: LEGACY_MODEL_PARAMETER_COUNT
-        }
-    );
-    source.push(0.0);
-    source[7] = f32::INFINITY;
-    assert_eq!(
-        expand_m24_side_actor_parameters(&source).expect_err("finite"),
-        ModelError::NonFiniteParameter { index: 7 }
-    );
 }
 
 #[test]

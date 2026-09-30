@@ -33,7 +33,7 @@ class OpponentTests(unittest.TestCase):
     def test_teacher_needs_no_weights_and_exact_explicit_policy(self):
         for side in ("radiant", "dire"):
             arguments = play_match.parse_arguments(["--opponent", "teacher", "--human-side", side])
-            with patch("play_match.read_runtime_metadata", side_effect=AssertionError("weights touched")):
+            with patch("play_match.current_paths", side_effect=AssertionError("weights touched")):
                 binary, weights = play_match.opponent_paths(Path("/repo"), arguments)
             self.assertIsNone(weights)
             self.assertEqual(play_match.bot_command(binary, "127.0.0.1:1", arguments, weights),

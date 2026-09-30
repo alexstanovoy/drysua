@@ -111,16 +111,9 @@ macro_rules! ppo_schema_descriptor {
     ) };
 }
 
-pub(crate) const LEGACY_PPO_SCHEMA_DESCRIPTOR: &str = ppo_schema_descriptor!(
-    "current_contract=feature22_model24_reward7;prior_feature19_model21_reward5_and_older_not_runtime_or_resume_compatible;explicit_pinned_m21u300_parameter_only_or_m19u162_parameter_padding_initialization_fresh_optimizer_mastery_rng;",
-    "artifacts=no_old_runtime_or_training_resume,explicit_pinned_m14_m16_m17_or_m19u162_global_padding_initializers_with_new_provenance_fresh_optimizer_progress_mastery_rng_league_no_gameplay_or_reward_equivalence_or_qualification;"
-);
-#[cfg(not(feature = "side-actors"))]
-pub const PPO_SCHEMA_DESCRIPTOR: &str = LEGACY_PPO_SCHEMA_DESCRIPTOR;
-#[cfg(feature = "side-actors")]
 pub const PPO_SCHEMA_DESCRIPTOR: &str = ppo_schema_descriptor!(
-    "current_contract=feature22_model25_reward7;actors=side_selected_radiant_dire_shared_trunk_critic;initialization=only_pinned_m24u428_895e66a7_append_duplicate_actor_parameters_fresh_optimizer_progress_rng;legacy_runtime_resume=forbidden;",
-    "artifacts=strict_model25_runtime_and_resume;legacy_initialization=only_exact_pinned_m24u428_parameters_with_fresh_optimizer_progress_rng;older_m14_m16_m17_m19_m21_initialization=unsupported;"
+    "current_contract=feature22_model25_reward7;actors=side_selected_radiant_dire_shared_trunk_critic;initialization=current_runtime_weights_parameters_only_fresh_optimizer_progress_rng;",
+    "artifacts=strict_model25_runtime_and_resume;"
 );
 
 /// FNV-1a of the descriptor, ordered linked identities, and reward descriptor.
@@ -139,14 +132,7 @@ pub const PPO_SCHEMA_HASH: u64 = crate::model::linked_schema_hash(
 
 const _: () = assert!(ACTION_SCHEMA_VERSION == 5);
 const _: () = assert!(FEATURE_SCHEMA_VERSION == 22);
-const _: () = assert!(
-    MODEL_SCHEMA_VERSION
-        == if cfg!(feature = "side-actors") {
-            25
-        } else {
-            24
-        }
-);
+const _: () = assert!(MODEL_SCHEMA_VERSION == 25);
 const _: () = assert!(PPO_RULES_AUDIT_VERSION == 32);
 
 /// Explicit capacity extension; the standard PPO identity is never redefined.

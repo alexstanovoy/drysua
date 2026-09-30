@@ -109,13 +109,8 @@ fn assert_backward_readback(device: PolicyDevice) {
 }
 
 fn test_frame() -> FeatureFrame {
-    let frame = FeatureFrame::new();
-    #[cfg(feature = "side-actors")]
-    let frame = {
-        let mut frame = frame;
-        frame.global[crate::global_feature::SIDE_RADIANT] = 1.0;
-        frame
-    };
+    let mut frame = FeatureFrame::new();
+    frame.global[crate::global_feature::SIDE_RADIANT] = 1.0;
     frame
 }
 

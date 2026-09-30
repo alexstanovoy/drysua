@@ -1,6 +1,5 @@
 //! Full-batch actor routing; the shared encoder and value head never branch.
 use super::*;
-#[cfg(feature = "side-actors")]
 use std::cell::RefCell;
 
 #[derive(Clone, Copy, Debug)]
@@ -19,7 +18,6 @@ pub(super) enum ActorHead {
     PointQuery,
 }
 
-#[cfg(feature = "side-actors")]
 impl ActorHead {
     const ALL: [Self; 12] = [
         Self::Kind,
@@ -58,10 +56,8 @@ impl ActorHead {
     }
 }
 
-#[cfg(feature = "side-actors")]
 pub(super) struct ActorHeads([Linear; 12]);
 
-#[cfg(feature = "side-actors")]
 impl ActorHeads {
     pub(super) fn fresh(generator: &mut Initializer, device: &Device) -> Result<Self, ModelError> {
         let mut heads = Vec::with_capacity(12);
@@ -102,7 +98,6 @@ impl ActorHeads {
 }
 
 impl PolicyModel {
-    #[cfg(feature = "side-actors")]
     pub(super) fn raw_actor_pair(
         &self,
         head: ActorHead,
@@ -133,11 +128,8 @@ impl PolicyModel {
 }
 
 pub(super) struct ActorRouting {
-    #[cfg(feature = "side-actors")]
     mask: Tensor,
-    #[cfg(feature = "side-actors")]
     training: bool,
-    #[cfg(feature = "side-actors")]
     raw: RefCell<[Option<[Tensor; 2]>; 12]>,
 }
 
@@ -147,27 +139,19 @@ impl ActorRouting {
         device: &Device,
         training: bool,
     ) -> Result<Self, ModelError> {
-        #[cfg(feature = "side-actors")]
-        {
-            assert!(!frames.is_empty());
-            assert!(frames.len() <= MODEL_PPO_MAX_MICROBATCH);
-            validate_sides(frames)?;
-            let rows = frames
-                .iter()
-                .enumerate()
-                .map(|(index, frame)| side_row(frame, index))
-                .collect::<Result<Vec<_>, _>>()?;
-            Ok(Self {
-                mask: Tensor::from_vec(rows, (frames.len(), 1), device)?,
-                training,
-                raw: RefCell::new(std::array::from_fn(|_| None)),
-            })
-        }
-        #[cfg(not(feature = "side-actors"))]
-        {
-            let _ = (frames, device, training);
-            Ok(Self {})
-        }
+        assert!(!frames.is_empty());
+        assert!(frames.len() <= MODEL_PPO_MAX_MICROBATCH);
+        validate_sides(frames)?;
+        let rows = frames
+            .iter()
+            .enumerate()
+            .map(|(index, frame)| side_row(frame, index))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self {
+            mask: Tensor::from_vec(rows, (frames.len(), 1), device)?,
+            training,
+            raw: RefCell::new(std::array::from_fn(|_| None)),
+        })
     }
 
     pub(super) fn forward(
@@ -176,35 +160,25 @@ impl ActorRouting {
         head: ActorHead,
         input: &Tensor,
     ) -> Result<Tensor, ModelError> {
-        #[cfg(not(feature = "side-actors"))]
-        let radiant = model.radiant_head(head).forward(input)?;
-        #[cfg(feature = "side-actors")]
-        {
-            let [radiant, dire] = model.raw_actor_pair(head, input)?;
-            assert_eq!(radiant.dims(), dire.dims());
-            assert_eq!(radiant.dim(0)?, self.mask.dim(0)?);
-            if !self.training {
-                let names = head.fields();
-                validate_named(&[(names[0], &radiant), (names[1], &dire)])?;
-            }
-            let selected = self
-                .mask
-                .broadcast_as(radiant.shape())?
-                .where_cond(&radiant, &dire)?;
-            if self.training {
-                let mut raw = self.raw.borrow_mut();
-                assert!(raw[head as usize].is_none());
-                raw[head as usize] = Some([radiant, dire]);
-            }
-            Ok(selected)
+        let [radiant, dire] = model.raw_actor_pair(head, input)?;
+        assert_eq!(radiant.dims(), dire.dims());
+        assert_eq!(radiant.dim(0)?, self.mask.dim(0)?);
+        if !self.training {
+            let names = head.fields();
+            validate_named(&[(names[0], &radiant), (names[1], &dire)])?;
         }
-        #[cfg(not(feature = "side-actors"))]
-        {
-            Ok(radiant)
+        let selected = self
+            .mask
+            .broadcast_as(radiant.shape())?
+            .where_cond(&radiant, &dire)?;
+        if self.training {
+            let mut raw = self.raw.borrow_mut();
+            assert!(raw[head as usize].is_none());
+            raw[head as usize] = Some([radiant, dire]);
         }
+        Ok(selected)
     }
 
-    #[cfg(feature = "side-actors")]
     pub(super) fn into_raw(self) -> Result<[[Tensor; 2]; 12], ModelError> {
         let mut raw = Vec::with_capacity(12);
         for pair in self.raw.into_inner() {
@@ -216,7 +190,6 @@ impl ActorRouting {
     }
 }
 
-#[cfg(feature = "side-actors")]
 pub(super) fn validate_sides(frames: &[FeatureFrame]) -> Result<(), ModelError> {
     assert!(frames.len() <= MODEL_MAX_BATCH);
     for (index, frame) in frames.iter().enumerate() {
@@ -230,7 +203,6 @@ pub(super) fn validate_sides(frames: &[FeatureFrame]) -> Result<(), ModelError> 
     Ok(())
 }
 
-#[cfg(feature = "side-actors")]
 fn side_row(frame: &FeatureFrame, index: usize) -> Result<u8, ModelError> {
     let radiant = frame.global[crate::global_feature::SIDE_RADIANT];
     let dire = frame.global[crate::global_feature::SIDE_DIRE];
@@ -247,7 +219,6 @@ fn side_row(frame: &FeatureFrame, index: usize) -> Result<u8, ModelError> {
     })
 }
 
-#[cfg(feature = "side-actors")]
 pub(super) fn validate_training(output: &PolicyTensorTensors) -> Result<(), ModelError> {
     let mut named = Vec::with_capacity(27);
     named.push(("value", &output.value));
@@ -262,7 +233,6 @@ pub(super) fn validate_training(output: &PolicyTensorTensors) -> Result<(), Mode
     validate_named(&named)
 }
 
-#[cfg(feature = "side-actors")]
 fn validate_named(named: &[(&'static str, &Tensor)]) -> Result<(), ModelError> {
     assert!(!named.is_empty());
     assert!(named.len() <= 27);
@@ -316,37 +286,10 @@ fn validate_named(named: &[(&'static str, &Tensor)]) -> Result<(), ModelError> {
     Ok(())
 }
 
-/// Expands a separately authenticated M24 vector without changing any source bit.
-#[cfg(feature = "side-actors")]
-pub(crate) fn expand_m24_side_actor_parameters(source: &[f32]) -> Result<Vec<f32>, ModelError> {
-    if source.len() != LEGACY_MODEL_PARAMETER_COUNT {
-        return Err(ModelError::ParameterLength {
-            actual: source.len(),
-            expected: LEGACY_MODEL_PARAMETER_COUNT,
-        });
-    }
-    if let Some(index) = source.iter().position(|value| !value.is_finite()) {
-        return Err(ModelError::NonFiniteParameter { index });
-    }
-    const KIND: std::ops::Range<usize> = 1_586_113..1_590_225;
-    const OTHER: std::ops::Range<usize> = 1_591_169..1_700_020;
-    const _: () = assert!(
-        MODEL_PARAMETER_COUNT - LEGACY_MODEL_PARAMETER_COUNT
-            == (KIND.end - KIND.start) + (OTHER.end - OTHER.start)
-    );
-    let mut target = Vec::with_capacity(MODEL_PARAMETER_COUNT);
-    target.extend_from_slice(source);
-    target.extend_from_slice(&source[KIND]);
-    target.extend_from_slice(&source[OTHER]);
-    assert_eq!(target.len(), MODEL_PARAMETER_COUNT);
-    assert_eq!(MODEL_PARAMETER_COUNT, 1_812_983);
-    Ok(target)
-}
-
-#[cfg(all(test, feature = "side-actors"))]
+#[cfg(test)]
 thread_local! { static ENCODER_FORWARDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
 
-#[cfg(all(test, feature = "side-actors"))]
+#[cfg(test)]
 pub(super) fn record_encoder_forward() {
     ENCODER_FORWARDS.set(
         ENCODER_FORWARDS
@@ -356,7 +299,7 @@ pub(super) fn record_encoder_forward() {
     );
 }
 
-#[cfg(all(test, feature = "side-actors"))]
+#[cfg(test)]
 pub(crate) fn take_encoder_forwards_for_test() -> usize {
     ENCODER_FORWARDS.replace(0)
 }

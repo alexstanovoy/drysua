@@ -18,7 +18,6 @@ import time
 from typing import BinaryIO
 
 from play_admission import Admission
-from play_weights import read_runtime_metadata
 from play_reward import start_observers, pump_observers, finish_observers, print_interval
 from play_pacing import ACK_TIMEOUT_TICKS
 
@@ -28,6 +27,7 @@ BUILD_TIMEOUT = 1200
 LOG_LIMIT = 16 * 1024 * 1024
 MAX_CHILDREN = 7
 READ_CHUNK = 65536
+RUNTIME_FILE = "drysua.weights.safetensors"
 READINESS_LIMIT = 4096
 READINESS_TIMEOUT = 10
 REPLAY_LIMIT = 2 * 1024**3
@@ -112,7 +112,7 @@ def parse_arguments(arguments):
     parser.add_argument("--bot-side", choices=("radiant", "dire"),
                         help="Opponent side (default: dire, or opposite --human-side)")
     parser.add_argument("--weights-directory", type=Path,
-                        help="Compatible current F22/M24 runtime weights; required for Neural, forbidden for Teacher")
+                        help="Runtime weights exported by train-annealed; required for Neural, forbidden for Teacher")
     result = parser.parse_args(arguments)
     if result.opponent == "teacher" and result.weights_directory is not None:
         parser.error("--opponent teacher forbids --weights-directory")
@@ -159,11 +159,13 @@ def transport_arguments(arguments):
 
 def current_paths(root, weights_directory):
     if weights_directory is None:
-        raise RuntimeError("legacy F12/M14 human-review weights are incompatible with current Map2; "
-                           "provide --weights-directory with compatible F22/M24 runtime weights; "
-                           "no compatible M23 model is selected by default; no Teacher fallback")
+        raise RuntimeError("Neural play requires --weights-directory with runtime weights exported by "
+                           "train-annealed; no default model and no Teacher fallback")
     weights = weights_directory.resolve()
-    read_runtime_metadata(weights)
+    runtime = weights / RUNTIME_FILE
+    if runtime.is_symlink() or not runtime.is_file():
+        # The Rust loader validates the tensor contract; this only fails before any build or child.
+        raise RuntimeError(f"runtime weights preflight failed: {runtime} is not a regular file")
     return root / "drysua/target/release/drysua", weights
 
 
@@ -373,7 +375,7 @@ class Supervisor:
 
     def run(self, root, arguments):
         binary, weights = opponent_paths(root, arguments)
-        label = "pure Neural F22/M24" if arguments.opponent == "neural" else "explicit Teacher (no model)"
+        label = "pure Neural" if arguments.opponent == "neural" else "explicit Teacher (no model)"
         print(f"play: current Map2 {label}; weights: {weights}; executable: {binary}", flush=True)
         if not arguments.no_build:
             binaries = release_paths(root)

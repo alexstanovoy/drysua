@@ -9,9 +9,9 @@
 //! One evaluation is split across disjoint bounded jobs. Each job prints a
 //! single JSON line so an aggregator can sum offsets without replaying a game.
 //!
-//! The CUDA-only test drives every helper below. A `side-actors` build without
-//! the `cuda` feature has no caller, so dead code is allowed for that
-//! configuration only, keeping the CPU validation tests in every build.
+//! The CUDA-only test drives every helper below. A build without the `cuda`
+//! feature has no caller, so dead code is allowed for that configuration only,
+//! keeping the CPU validation tests in every build.
 #![cfg_attr(
     not(all(feature = "cuda", any(target_os = "linux", target_os = "windows"))),
     allow(dead_code)

@@ -7,7 +7,6 @@ edition = "2024"
 default = []
 builtin = ["dep:bota-server"]
 cuda = ["dep:candle-cuda-feature"]
-side-actors = []
 
 [dependencies]
 bota-proto = { path = "../bota/crates/bota-proto", default-features = false }

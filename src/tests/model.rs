@@ -100,12 +100,11 @@ fn assert_training_shapes_and_backward(source: &PolicyModel, frames: &[FeatureFr
         match gradient.gradient_shape() {
             Some(actual) => assert_eq!(actual, shape.as_slice()),
             None => assert!(
-                cfg!(feature = "side-actors") && name.starts_with("dire."),
+                name.starts_with("dire."),
                 "Radiant fixture must differentiate {name}"
             ),
         }
-        if cfg!(feature = "side-actors")
-            && name.starts_with("dire.")
+        if name.starts_with("dire.")
             && let Some(tensor) = gradient.gradient()
         {
             let values = tensor
@@ -562,12 +561,7 @@ fn sampled_examples(model: &PolicyModel, count: usize) -> Vec<PpoPreparedSample>
 }
 
 fn test_frame() -> FeatureFrame {
-    let frame = FeatureFrame::new();
-    #[cfg(feature = "side-actors")]
-    let frame = {
-        let mut frame = frame;
-        frame.global[crate::global_feature::SIDE_RADIANT] = 1.0;
-        frame
-    };
+    let mut frame = FeatureFrame::new();
+    frame.global[crate::global_feature::SIDE_RADIANT] = 1.0;
     frame
 }

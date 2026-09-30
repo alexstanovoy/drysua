@@ -169,7 +169,7 @@ class CampaignTests(unittest.TestCase):
 NATIVE_CONTRACT = {
     "schema": "drysua-checkpoint-inspection/v1", "kind": "contract",
     "model": {"version": 25, "hash": "1234567890abcdef", "parameters": 1812983},
-    "enabled_features": "builtin,cuda,side-actors",
+    "enabled_features": "builtin,cuda",
     "capabilities": {"inspection": True, "annealed_history": True, "read_only": True,
                      "strict_build_features": True, "controller_run_kind": "train-annealed"},
     "limits": {"max_json_bytes": 4194304, "max_snapshots": 10000, "max_files": 10004,
@@ -244,7 +244,7 @@ inspection = {"schema": "drysua-checkpoint-inspection/v1", "kind": "train-anneal
                            "best_evaluation": 0.0, "rng_states": [{"name": "actor", "state": 10, "draws": updates}],
                            "shuffle_rng": {"state": 20, "draws": updates}, "league_references": []},
               "run": {"git_commit": "a" * 40, "simulator_commit": "b" * 40,
-                      "enabled_features": "builtin,cuda,side-actors", "command_line": "train-annealed --games 2",
+                      "enabled_features": "builtin,cuda", "command_line": "train-annealed --games 2",
                       "run_seed": 9001, "map": 2, "hero": 11, "device": {"kind": "cpu", "ordinal": None},
                       "batch_size": 2, "rules_audit_version": 32},
               "ppo": {"sample_budget": {"name": "annealed-v1", "code": 1}, "schema_version": 38,

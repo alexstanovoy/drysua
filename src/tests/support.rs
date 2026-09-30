@@ -7,23 +7,7 @@ use std::collections::VecDeque;
 
 use bota_proto::{EntityId, Order, ServerMsg};
 
-#[cfg(not(feature = "side-actors"))]
-use crate::CheckpointRun;
 use crate::{PolicyModel, Wire};
-
-/// Git and simulator provenance variable names for one test family.
-#[cfg(not(feature = "side-actors"))]
-pub(crate) struct ProvenanceVariables {
-    pub(crate) source: &'static str,
-    pub(crate) simulator: &'static str,
-}
-
-/// The training-job utilities read the compiled command-line embedded revisions.
-#[cfg(not(feature = "side-actors"))]
-pub(crate) const TRAINING_PROVENANCE: ProvenanceVariables = ProvenanceVariables {
-    source: "DRYSUA_GIT_COMMIT",
-    simulator: "BOTA_GIT_COMMIT",
-};
 
 /// In-memory match connection that records orders and acknowledgements.
 pub(crate) struct RecordingWire {
@@ -46,30 +30,6 @@ impl Wire for RecordingWire {
     fn acknowledge(&mut self, tick: u32) -> std::io::Result<()> {
         self.acknowledgements.push(tick);
         Ok(())
-    }
-}
-
-/// Builds the strict run identity shared by every pinned source utility.
-#[cfg(not(feature = "side-actors"))]
-pub(crate) fn initialization_run(
-    seed: u64,
-    batch_size: usize,
-    command_line: String,
-    provenance: &ProvenanceVariables,
-) -> CheckpointRun {
-    assert!(!command_line.is_empty());
-    assert_ne!(provenance.source, provenance.simulator);
-    CheckpointRun {
-        git_commit: std::env::var(provenance.source).expect("frozen source revision"),
-        simulator_commit: std::env::var(provenance.simulator).expect("frozen simulator revision"),
-        enabled_features: crate::compiled_features(),
-        command_line,
-        run_seed: seed,
-        map: crate::MAP2_ID,
-        hero: crate::SHADOW_FIEND,
-        device: crate::CheckpointDevice::Cpu,
-        batch_size,
-        rules_audit_version: crate::PPO_RULES_AUDIT_VERSION,
     }
 }
 

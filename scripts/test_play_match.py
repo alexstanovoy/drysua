@@ -28,16 +28,6 @@ TEMPORARY = ROOT / "drysua/artifacts/temp"
 # Reject known obsolete binaries even when supplied as current-build attestations.
 BINARY_SHA = "64ba25ebb10e6beabc26ff667a3e3bddeb40dbf391110d4f0e31db6478500a2b"
 HISTORICAL_SERVER_SHA = "24a8efccb285308810678c7e3a8717b57814c9d8fecef386ca923cdb7c04e97c"
-CURRENT_METADATA = {
-    "action_schema_hash": "10658390830565586343",
-    "feature_schema_hash": "10552563335950731440",
-    "model_schema_hash": "12076707506725412686",
-    "ppo_schema_version": "37",
-    "ppo_schema_hash": "12793043235719775693",
-    "ppo_rules_audit_version": "32",
-    "map2_reward_schema_version": "7",
-    "map2_reward_schema_hash": "7274660837025042530",
-}
 # Bounded native client-output assertions moved here from the archived historical
 # release evaluator when that harness left the tracked tree.
 SUMMARY = re.compile(r"played (\d+) ticks as Some\((Radiant|Dire)\); winner "
@@ -111,32 +101,9 @@ def read_client_output(path):
         raise ValueError("client output is not UTF-8") from error
 
 
-# Frozen old reward descriptors whose Rust readers were retired in the wave-5 deslop.
-# Their bytes are preserved here so the rejection tests keep pinning them.
-MAP2_REWARD_V1_DESCRIPTOR = "drysua-map2-reward/v1;map2_1v1_seat_snapshot_events_contiguous_tick_complete;units4096_events4096_identities8192_towers64_tick3600000_amount1000000_xp1000000000;identity_opaque_full_generation_public_scoreboard_heroes_retained_other_metadata480ticks;snapshot_capacity_preflight_death_structure_current_and_prior_role_validation_no_alive_victim_or_known_resurrection;gold_observed_paid_died_own_minus_enemy_no_cash_networth_passive_sales_or_lh_double_payment;xp_public_positive_increments_own_minus_enemy;hero_damage_positive_reported_mitigated_own_hero_to_opposing_hero_no_creep_damage;received_own_hero_from_hero_creep_other_unknown_separate_no_healing_reward;mana_positive_same_body_same_capacity_previous_minus_current_no_request_cost_capacity_change_unobserved;channels=own_gold:.03/300,enemy_gold:-.03/300,own_xp:.03/3000,enemy_xp:-.03/3000,hero_dealt:.08/1600,hero_taken:-.025/1600,creep_taken:-.01/500,other_taken:-.005/500,mana:-.04/1200;channel_payout=budget*scale*amount/((scale+prior_count)*(scale+prior_count+amount));nonreplenishing_separate_unsigned_counts_state_remaining_scale_over_scale_plus_count;tower=.05*(mean_own_hp_fraction-mean_enemy_hp_fraction)_public_cached_no_absence_death;lane=.01*(mean_own_creep_axis+mean_enemy_creep_axis-1)_fountain_axis_public_both_cohorts_else_hold;potentials_exact_gamma1_deltas_not_budget_clipped_first_tick_resources_potentials_baseline_events_counted;terminal_win1_loss-1_draw0_timecap0_distinct_lane_zero_tower_final_retained;gamma1_only_dense_absolute_net_return_bound.4_no_strategy_masks_or_teacher_inputs;"
-MAP2_REWARD_V2_DESCRIPTOR = "drysua-map2-reward/v2;map2_1v1_seat_snapshot_events_contiguous_tick_complete;units4096_events4096_identities8192_towers64_tick27900_amount1000000_xp1000000000;public_metadata=map2_rate30_terrain_axis1to512_pregame0to27900;identity_opaque_full_generation_public_scoreboard_heroes_retained_other_metadata480ticks;snapshot_capacity_preflight_death_structure_current_and_prior_role_validation_no_alive_victim_or_known_resurrection;gold_observed_paid_died_own_minus_enemy_no_cash_networth_passive_sales_or_lh_double_payment;xp_public_positive_increments_own_minus_enemy;hero_damage_positive_reported_mitigated_own_hero_to_opposing_hero_no_creep_damage;received_own_hero_from_hero_creep_other_unknown_separate_no_healing_reward;mana_positive_same_body_same_capacity_previous_minus_current_no_request_cost_capacity_change_unobserved;channels=own_gold:.03/300,enemy_gold:-.03/300,own_xp:.03/3000,enemy_xp:-.03/3000,hero_dealt:.08/1600,hero_taken:-.025/1600,creep_taken:-.01/500,other_taken:-.005/500,mana:-.04/1200;channel_payout=budget*scale*amount/((scale+prior_count)*(scale+prior_count+amount));nonreplenishing_separate_unsigned_counts_state_remaining_scale_over_scale_plus_count;tower=.05*(mean_own_hp_fraction-mean_enemy_hp_fraction)_public_cached_no_absence_death;lane=.01*(mean_own_creep_axis+mean_enemy_creep_axis-1)_fountain_axis_public_both_cohorts_else_hold;potentials_exact_gamma1_deltas_not_budget_clipped_first_tick_resources_potentials_baseline_events_counted;pregame_movement=.005_times_one_minus_clamped_euclidean_distance_to9216_9216_over9216sqrt2,only_pending_tick_lt_public_pregame_ticks,first_complete_observed_body_baseline_free,missing_body_holds_last_observed_potential,reappearance_uses_observed_position,no_cutoff_or_terminal_reversal,no_postspawn_hero_position_reward;fountain_wait=own_live_full_projected_hp_mana_both_consecutive_snapshots_same_full_generation_raw_position_inside_observed_own_fountain1200_inclusive,first_eligible_elapsed0,grace30_at30_base.0001_then.00005_per_second_prorated_div30_per_tick,incremental_negative_cost,any_movement_or_condition_break_resets_without_refund;fountain_purchase=any_confirmed_own_ItemBought_priority_before_condition_break_refunds_entire_open_period_including_drained_charges_then_resets_elapsed0_no_new_wait_interval,enemy_buy_ignored,no_price_intent_channel_saving_exceptions;state_additions=fountain_wait_ticks_u32_and_current_refundable_cost_f32_only;terminal_win1_loss-1_draw0_timecap0_distinct_lane_zero_tower_final_retained;finish_preserves_pregame_hint_and_emitted_wait_total_no_further_wait_charge_or_refund;gamma1_only_dense_absolute_net_return_bound=.4_v1+.005_center+.0001_times27900over30=.498,wait_rate_le_base_refund_le_charged_current_period_no_wait_clipping_no_strategy_masks_or_teacher_inputs;"
-MAP2_REWARD_V3_DESCRIPTOR = "drysua-map2-reward/v3;map2_1v1_seat_snapshot_events_contiguous_tick_complete;units4096_events4096_identities8192_towers64_tick27900_amount1000000_xp1000000000;public_metadata=map2_rate30_terrain_axis1to512_pregame0to27900;identity_opaque_full_generation_public_scoreboard_heroes_retained_other_metadata480ticks;snapshot_capacity_preflight_death_structure_current_and_prior_role_validation_no_alive_victim_or_known_resurrection;gold_observed_paid_died_own_minus_enemy_no_cash_networth_passive_sales_or_lh_double_payment;xp_public_positive_increments_own_minus_enemy;hero_damage_positive_reported_mitigated_own_hero_to_opposing_hero_no_creep_damage;received_own_hero_from_hero_creep_other_unknown_separate_no_healing_reward;mana_positive_same_body_same_capacity_previous_minus_current_no_request_cost_capacity_change_unobserved;channels=own_gold:.03/300,enemy_gold:-.03/300,own_xp:.03/3000,enemy_xp:-.03/3000,hero_dealt:.08/1600,hero_taken:-.025/1600,creep_taken:-.01/500,other_taken:-.005/500,mana:-.04/1200;channel_payout=budget*scale*amount/((scale+prior_count)*(scale+prior_count+amount));nonreplenishing_separate_unsigned_counts_state_remaining_scale_over_scale_plus_count;tower=.05*(mean_own_hp_fraction-mean_enemy_hp_fraction)_public_cached_no_absence_death;lane=.01*(mean_own_creep_axis+mean_enemy_creep_axis-1)_fountain_axis_public_both_cohorts_else_hold;potentials_exact_gamma1_deltas_not_budget_clipped_first_tick_resources_potentials_baseline_events_counted;pregame_movement=.005_times_one_minus_clamped_euclidean_distance_to9216_9216_over9216sqrt2,only_pending_tick_lt_public_pregame_ticks,first_complete_observed_body_baseline_free,missing_body_holds_last_observed_potential,reappearance_uses_observed_position,no_cutoff_or_terminal_reversal,no_postspawn_hero_position_reward;fountain_wait=own_live_full_projected_hp_mana_both_consecutive_snapshots_same_full_generation_raw_position_inside_observed_own_fountain1200_inclusive,first_eligible_elapsed0,grace30_at30_base.0001_then.00005_per_second_prorated_div30_per_tick,incremental_negative_cost,any_movement_or_condition_break_resets_without_refund;fountain_purchase=any_confirmed_own_ItemBought_priority_before_condition_break_refunds_entire_open_period_including_drained_charges_then_resets_elapsed0_no_new_wait_interval,enemy_buy_ignored,no_price_intent_channel_saving_exceptions;wait_state=fountain_wait_ticks_u32_current_refundable_cost_f32;progress_flags=u16_or_per_tick_xp1_gold2_hero_damage4_structure_damage8_creep_kill16_creep_deny32_purchase64_fountain_aura128_pregame_movement256_nearby_wave_pressure512;progress_sources=own_xp_gain_own_paid_bounty_own_hero_to_enemy_hero_damage_own_hero_to_enemy_tower_barracks_ancient_damage_own_nondenied_creep_kill_including_zero_gold_own_creep_deny_any_confirmed_own_purchase;progress_snapshot=own_effect3_positive_ticks_even_full_without_regen_requirement_positive_prewave_center_increment_positive_existing_wave_increment_only_with_live_own_hero_within1500_of_visible_own_live_lane_creep;progress_detection=completed_tick_counter_deltas_before_journal_trim_and_retention_not_accumulated_interval_totals_no_passive_gold_enemy_progress_unknown_targets_clicks_empty_casts_or_other_hero_movement;progress_debt=baseline_free_all_completed_ticks_including_dead_clamp0to2700_any_reason_refreshes30tick_lease_current_tick_included_no_stacking_active_repay_min3_then_consume1_lease_inactive_add1;progress_penalty=base.02_at_first2700_no_rate_same_tick_latch_until_debt0_subsequent_inactive_ticks_at2700_cost.000002_partial_repay_preserves_latch_no_refund_no_reward_clipping;progress_state=stagnation_ticks_u32_activity_ticks_left_u32_stagnation_base_charged_bool_only;progress_purchase=lease_only_never_debt_reset_independent_of_unchanged_v2_fountain_full_refund;terminal_win1_loss-1_draw0_timecap0_distinct_lane_zero_tower_final_retained;finish_preserves_pregame_hint_wait_and_stagnation_totals_no_extra_charge_repayment_or_refund;v2_dense_bound=.4_v1+.005_center+.0001_times27900over30=.498,wait_rate_le_base_refund_le_charged_current_period_no_wait_clipping;progress_bounds=max_base_charges1plus27900minus2700_over2700plus900=8_cost_bound8times.02_plus27900times.000002=.2158;gamma1_only_full_episode_negative_absolute_bound.7138_positive_bound.255_from_positive_budgets.14_tower.1_terminal_lane.01_center.005_sum.9688_lt1_no_strategy_masks_or_teacher_inputs;"
-
-MAP2_REWARD_V6_DESCRIPTOR = "drysua-map2-reward/v6;map2_1v1_seat_snapshot_events_contiguous_tick_complete;units4096_events4096_identities8192_towers64_tick27900_amount1000000_xp1000000000;public_metadata=map2_rate30_terrain_axis1to512_pregame0to27900;identity_opaque_full_generation_public_scoreboard_heroes_retained_other_metadata480ticks;snapshot_capacity_preflight_death_structure_current_and_prior_role_validation_no_alive_victim_or_known_resurrection;gold_observed_paid_died_own_minus_enemy_no_cash_networth_passive_sales_or_lh_double_payment;xp_public_positive_increments_own_minus_enemy;hero_damage_positive_reported_mitigated_own_hero_to_opposing_hero_no_creep_damage;received_own_hero_from_enemy_hero_lane_or_neutral_creep_exclusive_known_Tower_any_team_other_unknown_environment_separate_no_healing_reward;known_Tower_never_charges_other_Ancient_Barracks_Fountain_remain_other;mana_positive_same_body_same_capacity_previous_minus_current_no_request_cost_capacity_change_unobserved;channels=own_gold:.03/300,enemy_gold:-.02/300,own_xp:.03/3000,enemy_xp:-.02/3000,hero_dealt:.08/1600,hero_taken:-.05/1600,creep_taken:-.1/1600,other_taken:-.005/500,mana:-.04/1200,tower_taken:-.1/500;channel_payout=budget*scale*amount/((scale+prior_count)*(scale+prior_count+amount));nonreplenishing_separate_unsigned_counts_state_remaining_scale_over_scale_plus_count;tower=.3*(mean_own_hp_fraction-mean_enemy_hp_fraction)_public_cached_no_absence_death;lane=.1*(mean_own_creep_axis+mean_enemy_creep_axis-1)_fountain_axis_public_both_cohorts_else_hold;potentials_exact_gamma1_deltas_not_budget_clipped_first_tick_resources_potentials_baseline_events_counted;pregame_movement=.005_times_one_minus_clamped_euclidean_distance_to9216_9216_over9216sqrt2,only_pending_tick_lt_public_pregame_ticks,first_complete_observed_body_baseline_free,missing_body_holds_last_observed_potential,reappearance_uses_observed_position,no_cutoff_or_terminal_reversal,no_postspawn_hero_position_reward;fountain_wait=own_live_full_projected_hp_mana_both_consecutive_snapshots_same_full_generation_raw_position_inside_observed_own_fountain1200_inclusive,first_eligible_elapsed0,grace30_at30_base.0001_then.00005_per_second_prorated_div30_per_tick,incremental_negative_cost,any_movement_or_condition_break_resets_without_refund;fountain_purchase=any_confirmed_own_ItemBought_priority_before_condition_break_refunds_entire_open_period_including_drained_charges_then_resets_elapsed0_no_new_wait_interval,enemy_buy_ignored,no_price_intent_channel_saving_exceptions;wait_state=fountain_wait_ticks_u32_current_refundable_cost_f32;progress_flags=u16_or_per_tick_xp1_gold2_hero_damage4_structure_damage8_creep_kill16_creep_deny32_purchase64_fountain_aura128_pregame_movement256_nearby_wave_pressure512;progress_sources=own_xp_gain_own_paid_bounty_own_hero_to_enemy_hero_damage_own_hero_to_enemy_tower_barracks_ancient_damage_own_nondenied_creep_kill_including_zero_gold_own_creep_deny_any_confirmed_own_purchase;progress_snapshot=own_effect3_positive_ticks_even_full_without_regen_requirement_positive_prewave_center_increment_positive_existing_wave_increment_only_with_live_own_hero_within1500_of_visible_own_live_lane_creep;progress_detection=completed_tick_counter_deltas_before_journal_trim_and_retention_not_accumulated_interval_totals_no_passive_gold_enemy_progress_unknown_targets_clicks_empty_casts_or_other_hero_movement;progress_debt=baseline_free_all_completed_ticks_including_dead_clamp0to2700_any_reason_refreshes30tick_lease_current_tick_included_no_stacking_active_repay_min3_then_consume1_lease_inactive_add1;progress_penalty=base.02_at_first2700_no_rate_same_tick_latch_until_debt0_subsequent_inactive_ticks_at2700_cost.000002_partial_repay_preserves_latch_no_refund_no_reward_clipping;progress_state=stagnation_ticks_u32_activity_ticks_left_u32_stagnation_base_charged_bool_only;progress_purchase=lease_only_never_debt_reset_independent_of_unchanged_v2_fountain_full_refund;opening_position=one_shot_first_own_live_not_dead_lane_creep_within1500inclusive_of_center9216_9216_during_public_pregame_to_pregame_plus900_exclusive_else_fallback_at_pregame_plus900_checked_u32_not_clamped_to_earlier_native_cap;first_complete_baseline_free_already_due_or_approaching_baseline_resolves_without_deferred_charge;cost=.1_times_clamp((Euclidean_hero_distance-1500)/1500,0,1)_negative_exact_raw_fixed_1500_and3000_boundaries_missing_or_dead_body_full_cost;resolve_including_zero_never_rearm_on_body_or_purchase_or_wait_changes_finish_cancels_pending_without_cost_no_later_retreat_penalty;state=opening_position_pending_bool;raw=opening_position_checks;terminal_win.2_loss-.2_draw0_timecap-.2_distinct_outcome_labels_lane_zero_tower_final_retained;infrastructure_errors_never_terminal_rewards;finish_preserves_pregame_hint_wait_and_stagnation_totals_no_extra_charge_repayment_or_refund;v2_dense_bound=.4_v1+.005_center+.0001_times27900over30=.498,wait_rate_le_base_refund_le_charged_current_period_no_wait_clipping;progress_bounds=max_base_charges1plus27900minus2700_over2700plus900=8_cost_bound8times.02_plus27900times.000002=.2158;bounds=event_positive.14_event_negative.335_center_abs.005_opening_negative.1_wait_negative.093_stagnation_negative.2158;normal_full_native_start_requires_initial_tower_phi0_lane_phi0_terminal_lane_net0_positive.445_negative1.0488_sum1.4938_exceeds_win_draw_gap.2_and_win_loss_gap.4_no_terminal_dominance;general_allowed_primed_baseline_tower_delta_abs.6_terminal_lane_abs.1_positive.845_negative1.4488_no_unconditional_terminal_dominance_no_clipping_or_budget_shrinking;"
-
-def rust_descriptor(module, name):
-    pattern = rf"(?:pub(?:\((?:crate|super)\))? )?const {name}: &str = concat!\((.*?)\n\);"
-    match = re.search(pattern, (ROOT / f"drysua/src/{module}.rs").read_text(), re.S)
-    assert match is not None, name
-    strings = re.findall(r'"(?:[^"\\]|\\.)*"', match[1])
-    assert strings, name
-    return "".join(json.loads(value) for value in strings)
-
-
-def metadata_fixture():
-    return dict(CURRENT_METADATA, map2_reward_schema_descriptor=rust_descriptor(
-        "map2_reward", "MAP2_REWARD_SCHEMA_DESCRIPTOR"))
-
-
-def header_fixture(metadata):
-    # Header-only test data is not a model; only mock executables consume these fixtures.
-    header = json.dumps({"__metadata__": metadata}).encode()
-    return struct.pack("<Q", len(header)) + header
+def weights_fixture():
+    # Launchers never parse the tensor file; only mock executables consume it.
+    return b"runtime weights fixture"
 
 
 def native_cap_transport_error(error):
@@ -421,7 +388,7 @@ class LauncherTests(unittest.TestCase):
             (directory / "target/release").mkdir(parents=True)
             (directory / "Cargo.toml").write_text("[workspace]\n")
         (self.root / "drysua/scripts").mkdir()
-        for name in ("play.sh", "play_match.py", "play_admission.py", "play_weights.py",
+        for name in ("play.sh", "play_match.py", "play_admission.py",
                      "play_reward.py", "play_pacing.py", "release_wire.py"):
             source = ROOT / "drysua/scripts" / name
             if source.exists():
@@ -435,7 +402,7 @@ class LauncherTests(unittest.TestCase):
             binary.chmod(0o700)
         self.weights = self.root / "current metadata fixture"
         self.weights.mkdir()
-        (self.weights / "drysua.weights.safetensors").write_bytes(header_fixture(metadata_fixture()))
+        (self.weights / "drysua.weights.safetensors").write_bytes(weights_fixture())
         self.listener = socket.socket(socket.AF_UNIX)
         self.addCleanup(self.listener.close)
         address = "play-test-" + Path(self.temporary.name).name
@@ -833,29 +800,16 @@ class LauncherTests(unittest.TestCase):
         self.assertFalse(select.select([self.listener], [], [], 0)[0], "unexpected child started")
         return error.decode()
 
-    def test_no_arguments_fail_closed_before_display_build_logs_or_legacy_selection(self):
+    def test_no_arguments_fail_closed_before_display_build_logs_or_default_model(self):
         self.launch(weights=False, DISPLAY="")
-        error = self.preflight_failure("legacy F12/M14 human-review weights are incompatible")
-        self.assertIn("--weights-directory", error)
-        self.assertIn("F22/M24", error)
-        self.assertIn("no compatible M23 model is selected by default", error)
+        error = self.preflight_failure("Neural play requires --weights-directory")
+        self.assertIn("no default model and no Teacher fallback", error)
 
     def test_missing_weights_checked_before_missing_executables_and_display(self):
         (self.weights / "drysua.weights.safetensors").unlink()
         (self.root / "drysua/target/release/drysua").unlink()
         self.launch("--no-build", DISPLAY="")
         self.preflight_failure("runtime weights")
-
-    def test_old_metadata_fails_before_build_without_rewriting_or_teacher_fallback(self):
-        target = self.weights / "drysua.weights.safetensors"
-        old = {"action_schema_hash": "1755359086494840931", "feature_schema_hash": "1577122233561586211",
-               "model_schema_hash": "7970187849195607202", "ppo_schema_version": "27",
-               "ppo_schema_hash": "9274275648898675046", "ppo_rules_audit_version": "22"}
-        data = header_fixture(old)
-        target.write_bytes(data)
-        self.launch()
-        self.preflight_failure("incompatible runtime weights metadata")
-        self.assertEqual(target.read_bytes(), data)
 
     def test_client_closing_during_admission_cleans_queued_bot_and_listeners(self):
         self.launch("--no-build", "--port", "0", PLAY_TEST_HOLD_HELLO="bota-client")
@@ -871,7 +825,7 @@ class LauncherTests(unittest.TestCase):
     def test_relative_weights_select_current_binary_and_explicit_neural_policy(self):
         weights = self.root / "experimental weights"
         weights.mkdir()
-        (weights / "drysua.weights.safetensors").write_bytes(header_fixture(metadata_fixture()))
+        (weights / "drysua.weights.safetensors").write_bytes(weights_fixture())
         self.game("--no-build", "--weights-directory", str(weights.relative_to(self.temporary.name)))
         arguments = self.child("drysua")["arguments"]
         self.assertEqual(arguments[arguments.index("--policy") + 1], "neural")
@@ -879,165 +833,6 @@ class LauncherTests(unittest.TestCase):
         self.assertEqual(self.child("drysua")["executable"], str(self.root / "drysua/target/release/drysua"))
         self.send("bota-client", b"0")
         self.assertIn("current Map2", self.finish(0))
-
-
-class RuntimeWeightsTests(unittest.TestCase):
-    def setUp(self):
-        self.module = importlib.import_module("play_weights")
-        TEMPORARY.mkdir(parents=True, exist_ok=True)
-        self.temporary = tempfile.TemporaryDirectory(prefix="play-header-", dir=TEMPORARY)
-        self.addCleanup(self.temporary.cleanup)
-        self.directory = Path(self.temporary.name)
-        self.path = self.directory / "drysua.weights.safetensors"
-
-    def test_current_metadata_is_accepted_without_claiming_tensor_validation(self):
-        metadata = metadata_fixture()
-        self.path.write_bytes(header_fixture(metadata))
-
-        actual = self.module.read_runtime_metadata(self.directory)
-
-        self.assertEqual(actual, metadata)
-        self.assertEqual(self.module.CURRENT_METADATA, CURRENT_METADATA)
-
-    def test_historical_nine_key_identities_are_rejected_without_relabelling(self):
-        reward4 = MAP2_REWARD_V3_DESCRIPTOR.replace("drysua-map2-reward/v3;", "drysua-map2-reward/v4;", 1)
-        reward4 = reward4.replace("terminal_win1_loss-1_draw0_timecap0_distinct_lane_zero_tower_final_retained;",
-            "terminal_win1_loss-1_draw-1_timecap-1_distinct_outcome_labels_lane_zero_tower_final_retained;infrastructure_errors_never_terminal_rewards;", 1)
-        reward4 += "terminal_dominance=win1_minus_nonwin_neg1_minus_negative_dense.7138_minus_positive_dense.255=1.0312_gt0;"
-        reward1 = MAP2_REWARD_V1_DESCRIPTOR
-        keys = ("action_schema_hash", "feature_schema_hash", "model_schema_hash", "ppo_schema_version",
-                "ppo_schema_hash", "ppo_rules_audit_version", "map2_reward_schema_version",
-                "map2_reward_schema_hash", "map2_reward_schema_descriptor")
-        identities = (
-            ("M16", "281345351372519059", "16612223928593971806", "16105106472474017042",
-             "29", "6915425029811947603", "24", "1", "798798703797057220", reward1),
-            ("M17", "10658390830565586343", "1861607613534772372", "13592057279889489276",
-             "30", "16275284022255703821", "25", "1", "798798703797057220", reward1),
-            ("M18", "10658390830565586343", "17888785275670453418", "3900982062969752096",
-             "31", "15379677344330093698", "26", "2", "699687995158557285",
-             MAP2_REWARD_V2_DESCRIPTOR),
-            ("M19", "10658390830565586343", "4298252436472980484", "7182549121935768714",
-             "32", "9056229782321552319", "27", "3", "11643768462079275437", MAP2_REWARD_V3_DESCRIPTOR),
-            ("M20", "10658390830565586343", "5307034649837880808", "17593713929660069669",
-             "33", "3388911021249010403", "28", "4", "14419233923370975736", reward4),
-            ("M21", "10658390830565586343", "11343334068766071417", "13521186719558157260",
-             "34", "12153447298094992077", "29", "5", "10775256611790261869",
-             rust_descriptor("checkpoint_reward_v5", "DESCRIPTOR")),
-            ("M23", "10658390830565586343", "7122484902143252742", "2523644068281870656",
-             "36", "8680285590912502029", "31", "6", "1084583101075978392", MAP2_REWARD_V6_DESCRIPTOR),
-        )
-        for model, *values in identities:
-            with self.subTest(model=model):
-                metadata = dict(zip(keys, values, strict=True))
-                self.assertEqual(str(self.module.fnv1a(values[-1].encode())), values[-2])
-                original = header_fixture(metadata)
-                self.path.write_bytes(original)
-                with self.assertRaisesRegex(RuntimeError, "expected exact nine-key F22/M24, A5, PPO37/rules32"):
-                    self.module.read_runtime_metadata(self.directory)
-                self.assertEqual(self.path.read_bytes(), original)
-
-    def test_every_metadata_key_is_required_exactly_once_and_string_typed(self):
-        metadata = metadata_fixture()
-        for key in metadata:
-            for replacement in (None, "wrong", 1, {}, True):
-                changed = dict(metadata)
-                del changed[key]
-                if replacement is not None:
-                    changed[key] = replacement
-                self.path.write_bytes(header_fixture(changed))
-                with self.subTest(key=key, replacement=replacement), \
-                        self.assertRaisesRegex(RuntimeError, "incompatible runtime weights metadata.*F22/M24"):
-                    self.module.read_runtime_metadata(self.directory)
-
-    def test_extra_metadata_and_self_consistent_wrong_reward_hash_are_rejected(self):
-        for metadata in (dict(metadata_fixture(), unexpected="extra"),
-                         dict(metadata_fixture(), map2_reward_schema_descriptor="wrong",
-                              map2_reward_schema_hash=str(self.module.fnv1a(b"wrong")))):
-            self.path.write_bytes(header_fixture(metadata))
-            with self.assertRaisesRegex(RuntimeError, "incompatible runtime weights metadata"):
-                self.module.read_runtime_metadata(self.directory)
-
-    def test_malformed_header_json_never_escapes_as_unbounded_or_ambiguous_input(self):
-        valid = json.dumps({"__metadata__": metadata_fixture()}).encode()
-        version = b'"ppo_schema_version": ' + json.dumps(CURRENT_METADATA["ppo_schema_version"]).encode()
-        headers = (b"[]", b"{}", b"null", b"\xff", b"{", b" " + valid,
-                   valid.replace(version, b'"ppo_schema_version": NaN'),
-                   valid.replace(version, version + b", " + version),
-                   valid[:-1] + b', "__metadata__": {}}',
-                   b'{"nested":' + b"[" * 2000 + b"0" + b"]" * 2000 + b"}")
-        for header in headers:
-            self.assertNotEqual(header, valid, "malformed fixture must actually change the current metadata")
-            self.path.write_bytes(struct.pack("<Q", len(header)) + header)
-            with self.subTest(header=header[:40]), self.assertRaisesRegex(RuntimeError, "runtime weights"):
-                self.module.read_runtime_metadata(self.directory)
-
-    def test_truncated_and_out_of_bounds_headers_fail_before_body_read(self):
-        for data in (b"", b"\x00" * 7, struct.pack("<Q", 0), struct.pack("<Q", 65537),
-                     struct.pack("<Q", 2**64 - 1), struct.pack("<Q", 8) + b"{}"):
-            self.path.write_bytes(data)
-            with self.subTest(data=data), self.assertRaisesRegex(RuntimeError, "runtime weights"):
-                self.module.read_runtime_metadata(self.directory)
-
-    def test_exact_header_and_file_limits_are_accepted_but_one_extra_byte_is_not(self):
-        header = json.dumps({"__metadata__": metadata_fixture()}).encode().ljust(65536, b" ")
-        self.path.write_bytes(struct.pack("<Q", len(header)) + header)
-        with self.path.open("r+b") as stream:
-            stream.truncate(256 * 1024**2)
-
-        self.assertEqual(self.module.read_runtime_metadata(self.directory), metadata_fixture())
-
-        with self.path.open("r+b") as stream:
-            stream.truncate(256 * 1024**2 + 1)
-        with self.assertRaisesRegex(RuntimeError, "runtime weights.*268435456"):
-            self.module.read_runtime_metadata(self.directory)
-
-    def test_symlink_directory_fifo_and_missing_files_fail_without_blocking(self):
-        target = self.directory / "target"
-        target.write_bytes(header_fixture(metadata_fixture()))
-        self.path.symlink_to(target)
-        with self.assertRaisesRegex(RuntimeError, "runtime weights"):
-            self.module.read_runtime_metadata(self.directory)
-        self.path.unlink()
-        self.path.mkdir()
-        with self.assertRaisesRegex(RuntimeError, "runtime weights"):
-            self.module.read_runtime_metadata(self.directory)
-        self.path.rmdir()
-        os.mkfifo(self.path)
-        with self.assertRaisesRegex(RuntimeError, "runtime weights"):
-            self.module.read_runtime_metadata(self.directory)
-        self.path.unlink()
-        with self.assertRaisesRegex(RuntimeError, "runtime weights"):
-            self.module.read_runtime_metadata(self.directory)
-
-    def test_current_tuple_matches_rust_descriptors_linked_hashes_versions_and_nine_keys(self):
-        identities = {}
-        reward = rust_descriptor("map2_reward", "MAP2_REWARD_SCHEMA_DESCRIPTOR").encode()
-
-        def independent_hash(data):
-            value = 0xcbf29ce484222325
-            for byte in data:
-                value = ((value ^ byte) * 0x100000001b3) & (2**64 - 1)
-            return value
-
-        contracts = (("map2_reward", 7, ()), ("action", 5, ()),
-                     ("feature", 22, ("action", "map2_reward")),
-                     ("model", 24, ("action", "feature", "map2_reward")),
-                     ("ppo", 37, ("action", "feature", "model", "map2_reward")))
-        for name, version, links in contracts:
-            source = (ROOT / f"drysua/src/{name}.rs").read_text()
-            self.assertRegex(source, rf"pub const {name.upper()}_SCHEMA_VERSION: u32 = {version};")
-            data = rust_descriptor(name, name.upper() + "_SCHEMA_DESCRIPTOR").encode()
-            if links:
-                data += b"".join(struct.pack("<IQ", *identities[link]) for link in links) + reward
-            digest = independent_hash(data)
-            self.assertEqual(str(digest), self.module.CURRENT_METADATA[name + "_schema_hash"], name)
-            identities[name] = version, digest
-        self.assertEqual(self.module.fnv1a(reward), identities["map2_reward"][1])
-        source = (ROOT / "drysua/src/ppo.rs").read_text()
-        self.assertIn("pub const PPO_RULES_AUDIT_VERSION: u32 = 32;", source)
-        source = (ROOT / "drysua/src/checkpoint.rs").read_text()
-        metadata = source.split("fn runtime_tensor_metadata(budget: PpoSampleBudget)", 1)[1].split("\n}", 1)[0]
-        self.assertEqual(re.findall(r'"([a-z0-9_]+)"', metadata), sorted(metadata_fixture()))
 
 
 class AdmissionTests(unittest.TestCase):

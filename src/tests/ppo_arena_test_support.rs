@@ -1,6 +1,5 @@
 use super::*;
 
-#[cfg(feature = "side-actors")]
 #[path = "side_actor_session.rs"]
 mod side_actor_session_tests;
 

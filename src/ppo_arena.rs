@@ -16,7 +16,7 @@ pub use reward::Map2TrainingReward;
 mod test_support;
 #[cfg(test)]
 pub(crate) use test_support::*;
-#[cfg(all(test, feature = "side-actors"))]
+#[cfg(test)]
 #[path = "tests/m25_evaluation.rs"]
 mod m25_evaluation_tests;
 #[cfg(test)]
@@ -911,7 +911,7 @@ fn neural_policy_request_in_space(
     Ok((action, request))
 }
 
-#[cfg(all(test, feature = "side-actors"))]
+#[cfg(test)]
 fn requests_with_candidate(
     environment: &mut TrainingEnvironment,
     mut candidate_request: Option<Request>,

@@ -22,11 +22,6 @@ mod adaptive_tests;
 #[cfg(test)]
 #[path = "tests/checkpoint_capacity.rs"]
 mod capacity_tests;
-#[cfg(feature = "side-actors")]
-#[path = "checkpoint_side_actors.rs"]
-mod side_actors;
-#[path = "checkpoint_terminal.rs"]
-mod terminal;
 use crate::{
     ACTION_SCHEMA_HASH, ACTION_SCHEMA_VERSION, FEATURE_SCHEMA_HASH, FEATURE_SCHEMA_VERSION,
     MAP2_REWARD_SCHEMA_DESCRIPTOR, MAP2_REWARD_SCHEMA_HASH, MAP2_REWARD_SCHEMA_VERSION,
@@ -51,13 +46,8 @@ macro_rules! checkpoint_schema_descriptor {
     "reward7=terminal_win.2_loss_neg.2_draw0_taskcap_neg.2_dense_unchanged_win_only_victory_time_bonus_continuous_native_clock_distinct_outcomes_errors_not_rewards_no_terminal_dominance;wire_rebase=bota78427bb_new_event_order_missed_ignored_cheat_never_issued_no_reward_effect_attack_time_ms_ticks_bound_collision_no_old_alias;save=immutable_generation,canonical_copy,recoverable_manifest_commit_last,file_and_directory_fsync;"
     ) };
 }
-#[cfg(not(feature = "side-actors"))]
 pub const CHECKPOINT_SCHEMA_DESCRIPTOR: &str = checkpoint_schema_descriptor!(
-    "initialization=explicit_pinned_m14_m16_m17_original_metadata_reward1_and_padding_or_m19u162_9d0b8812_original_metadata_frozen_reward3_full_SHA_finite62_tensor_Candle_append_global_rows90to92_1024_positive_zeros_or_m21u300_b29752ac_original_metadata_frozen_reward5_full_SHA_same_shape1700020_all_bits_preserved_no_critic_or_actor_rescaling_new_provenance_no_gameplay_or_reward_equivalence_fresh_optimizer_progress_mastery_rng_league,no_m18_or_m20_source_pin;"
-);
-#[cfg(feature = "side-actors")]
-pub const CHECKPOINT_SCHEMA_DESCRIPTOR: &str = checkpoint_schema_descriptor!(
-    "initialization=explicit_pinned_m24u428_895e66a79186570ce8f653eadfad59eace8c664f16c5c524806af4936ac9f21f_bounded_full_SHA_before_device_or_mutation_exact_metadata_PPO38_rules32_feature22_action5_reward7_F32_parameters1700020_finite;model25=parameters1812983_tensors86_preserve_first1700020_bits_append_duplicate_dire_actor24_tensors;optimizer_progress_mastery_rng_league=fresh;legacy_runtime_resume=forbidden;m21_initialization=unsupported;"
+    "initialization=current_runtime_weights_parameters_only,optimizer_progress_rng=fresh;"
 );
 /// Ordered linked schema identities captured in every checkpoint manifest.
 const LINKED_SCHEMAS: [(u32, u64); 5] = [
@@ -127,9 +117,6 @@ pub fn compiled_features() -> String {
     }
     if cfg!(feature = "cuda") {
         features.push("cuda");
-    }
-    if cfg!(feature = "side-actors") {
-        features.push("side-actors");
     }
     if features.is_empty() {
         return "none".to_owned();
@@ -520,7 +507,7 @@ impl TrainingArtifact {
     }
 
     /// Constructs a fresh current model from runtime weights without training-state import.
-    #[cfg(all(feature = "builtin", not(feature = "side-actors")))]
+    #[cfg(feature = "builtin")]
     pub(crate) fn initialize_from_weights(
         directory: &Path,
         seed: u64,
@@ -528,7 +515,7 @@ impl TrainingArtifact {
     ) -> Result<PolicyModel, CheckpointError> {
         let model = PolicyModel::fresh_on(seed, device)
             .map_err(|error| CheckpointError::Model(error.to_string()))?;
-        Self::load_initial_weights(&model, directory)?;
+        Self::load_runtime_weights(&model, directory)?;
         Ok(model)
     }
 
@@ -546,15 +533,6 @@ impl TrainingArtifact {
         model
             .import_parameters(&parameters)
             .map_err(|error| CheckpointError::Model(error.to_string()))
-    }
-
-    /// Fresh-session weights under the unchanged default architecture contract.
-    #[cfg(not(feature = "side-actors"))]
-    pub fn load_initial_weights(
-        model: &PolicyModel,
-        directory: &Path,
-    ) -> Result<(), CheckpointError> {
-        Self::load_runtime_weights(model, directory)
     }
 
     fn validate(&self) -> Result<(), CheckpointError> {

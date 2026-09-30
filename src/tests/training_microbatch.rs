@@ -95,11 +95,7 @@ fn internal_training_checks_finite_frames_and_all_unused_output_heads() {
     let error = model
         .ppo_candidate_kl_locked(&examples, transfer_ppo_config(), 128, false)
         .expect_err("all raw outputs checked");
-    let message = if cfg!(feature = "side-actors") {
-        "model radiant.item output at batch 0 index 0 is non-finite"
-    } else {
-        "model item output at batch 0 index 0 is non-finite"
-    };
+    let message = "model radiant.item output at batch 0 index 0 is non-finite";
     assert_eq!(error.to_string(), message);
 }
 

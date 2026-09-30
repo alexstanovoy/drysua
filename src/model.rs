@@ -14,12 +14,10 @@ use candle_core::{DType, Device, Tensor, Var};
 mod host_folding;
 mod sampling;
 mod side_actors;
-#[cfg(feature = "side-actors")]
-pub(crate) use side_actors::expand_m24_side_actor_parameters;
-#[cfg(all(test, feature = "side-actors"))]
+#[cfg(test)]
 pub(crate) use side_actors::take_encoder_forwards_for_test;
 use side_actors::{ActorHead, ActorRouting};
-#[cfg(all(test, feature = "side-actors"))]
+#[cfg(test)]
 #[path = "tests/model_side_actors.rs"]
 mod side_actor_tests;
 #[cfg(test)]
@@ -48,12 +46,7 @@ use crate::{
 };
 
 /// Version of the fixed policy-model layout and linked candidate execution contract.
-pub const MODEL_SCHEMA_VERSION: u32 = if cfg!(feature = "side-actors") {
-    25
-} else {
-    LEGACY_MODEL_SCHEMA_VERSION
-};
-pub(crate) const LEGACY_MODEL_SCHEMA_VERSION: u32 = 24;
+pub const MODEL_SCHEMA_VERSION: u32 = 25;
 /// Maximum frame count accepted by one public batch call.
 pub const MODEL_MAX_BATCH: usize = 8_192;
 /// Frame count evaluated by one bounded host inference tensor graph.
@@ -130,17 +123,17 @@ const SLOT_EMBEDDING: usize = 16;
 const DECODER_CONTEXT: usize = 336;
 const TARGET_MODE_HEAD: usize = 3;
 const PUT_MODE_HEAD: usize = 2;
-const MODEL_PARAMETER_TENSORS: usize = 62 + if cfg!(feature = "side-actors") { 24 } else { 0 };
+const MODEL_PARAMETER_TENSORS: usize = 86;
 static NEXT_MODEL_LINEAGE: AtomicU64 = AtomicU64::new(1);
 static NEXT_OPTIMIZER_LINEAGE: AtomicU64 = AtomicU64::new(1);
 
-/// Canonical model shapes, parameter order, and linked action/feature semantics.
-pub(crate) const LEGACY_MODEL_SCHEMA_DESCRIPTOR: &str = concat!(
-    "bota-drysua-model/v24;",
+/// Canonical model shapes, parameter order, side routing and linked action/feature semantics.
+pub const MODEL_SCHEMA_DESCRIPTOR: &str = concat!(
+    "bota-drysua-model/v25;",
     "linked_schemas=action,feature,map2_reward;linked_hash=fnv1a_descriptor_then_ordered_version_le32_hash_le64_then_map2_reward_descriptor_utf8;",
-    "scope=map2_mid_only_cap27900_including900_pregame;candidate_execution=feature19_candidate_order_bookkeeping_action5_walkable_building_landing_move_only_mango_unchanged;layout=62_named_tensors_1700020_f32;transfer=explicit_pinned_m14_u4_or_initial_or_m16_initial_and_advantage_or_m17_initial05e78663_and_recovery004107e19e6_or_m19_u162_9d0b8812_new_owned_model_fresh_optimizer_progress_mastery_rng_league_not_resume_or_old_gameplay_compatibility,no_m18_or_m20_source_pin;model13_reserved_isolated_wide_experiment;",
-    "map2_inputs=global92_unit84_unchanged_from_m21,wire_rebase_unit_bound_and_collision_and_attack_time;reward7=terminal_values_and_victory_time_bonus_dense_wait_opening_and_progress_rules_unchanged;initialization_padding=m14_unit.0.weight_rows73..84_positive_zero_trunk.0.weight_rows72..92_positive_zero_shift20,m16_m17_trunk.0.weight_rows85..92_positive_zero_shift7,m19_trunk.0.weight_rows90..92_positive_zero_shift2_all_other_parameter_bits_unchanged;m21u300_same_shape_all_parameter_bits_preserved_no_critic_or_actor_rescaling;",
-    "dtype=f32;device=cpu_actor,cpu_cuda_or_metal_learner,one_learner_per_device;architecture=deepsets;activations=relu_after_every_encoder_and_trunk_linear;",
+    "scope=map2_mid_only_cap27900_including900_pregame;candidate_execution=feature19_candidate_order_bookkeeping_action5_walkable_building_landing_move_only_mango_unchanged;layout=86_named_tensors_1812983_f32;",
+    "map2_inputs=global92_unit84,wire_rebase_unit_bound_and_collision_and_attack_time;",
+    "dtype=f32;device=cpu_actor,cpu_or_cuda_learner,one_learner_per_device;architecture=deepsets;activations=relu_after_every_encoder_and_trunk_linear;",
     "input_conditioning=host_before_tensor_after_presence_mask,feature_v9_unchanged;category_divisors=global10:5,12:3,32:16,55:12;policy_history3:16;unit5:12;ability1:2,2:8,11:5;item1:5,2:64,9:5,13:3;point10:8,12:8,16:12;semantic_ids=ability5_and_projectile6:ln1p(x)/ln(65548),item4_and_loot1:ln1p(x)/ln(65537);all_other_features_identity;",
     "output_initialization=all_linear_outside_relu_mlps_including_value_and_pointer_queries:he_uniform_times0.01,bias_zero,no_extra_rng_draws;pointer_scaling=dot_div_sqrt_embedding_width_all_actor_batch_and_training_paths;",
     "numeric_semantics=semantic_id_signed_ln1p_abs_extension_preserves_zero,bc_and_ppo_masked_cross_entropy_center_legal_logits_by_detached_row_max_before_logsumexp_and_selected_subtraction;",
@@ -161,28 +154,18 @@ pub(crate) const LEGACY_MODEL_SCHEMA_DESCRIPTOR: &str = concat!(
     "nonfinite=finite_parameters_required_on_import,finite_frame_required,all_public_host_outputs_and_every_traversed_decoder_head_checked_with_batch_and_index,error_on_overflow_no_policy_choice,training_output_exposes_optional_graph_preserving_finite_validation;",
     "initialization=splitmix64_state_plus_9e3779b97f4a7c15_then_mix_bf58476d1ce4e5b9_94d049bb133111eb_top24_to_symmetric_closed_interval;linear_weight_scale=sqrt(6/fan_in),linear_bias_zero,embedding_scale=sqrt(3/columns);draw_order=unit_ability_item_point_projectile_loot_trunk_value_kind_kind_embedding_unit_embedding_ability_embedding_item_embedding_controlled_ability_head_item_head_swap_head_learn_head_shop_head_loot_head_target_mode_put_mode_entity_query_point_query;seed_is_not_input_or_parameter;",
     "batch=public_host_limit8192,evaluation_microbatch64_under_one_parameter_read_lock,training_tensor_limit64,larger_effective_training_batches_require_gradient_accumulation;",
-    "runtime_identity=checked_process_local_nonzero_model_lineage_plus_monotonic_parameter_revision,immutable_cpu_actor_snapshot_preserves_identity_and_forbids_optimizer,one_internal_learner_optimizer_lineage_bound_to_exact_policy_identity,raw_import_advances_revision_and_unbinds_optimizer,evidence_never_enters_tensors;",
-    "updates=single_model_rwlock,all_inference_and_export_reads_hold_one_shared_lock,training_output_owns_shared_lock_for_full_forward_loss_backward_lifetime,named_backward_requires_same_model_guarded_output_and_returns62_stable_named_optional_gradient_tensors,no_unlocked_vars_exposed,parameter_import_deep_copies_originals_and_builds_and_replaces_all62_vars_under_one_exclusive_lock_with_exact_rollback_on_failure,readers_observe_complete_old_or_complete_new_parameter_set;",
+    "runtime_identity=checked_process_local_nonzero_model_lineage_plus_monotonic_parameter_revision,one_internal_learner_optimizer_lineage_bound_to_exact_policy_identity,raw_import_advances_revision_and_unbinds_optimizer,evidence_never_enters_tensors;",
+    "updates=single_model_rwlock,all_inference_and_export_reads_hold_one_shared_lock,training_output_owns_shared_lock_for_full_forward_loss_backward_lifetime,named_backward_requires_same_model_guarded_output_and_returns86_stable_named_optional_gradient_tensors,no_unlocked_vars_exposed,parameter_import_deep_copies_originals_and_builds_and_replaces_all86_vars_under_one_exclusive_lock_with_exact_rollback_on_failure,readers_observe_complete_old_or_complete_new_parameter_set;",
     "parameter_order=unit_mlp,ability_mlp,item_mlp,point_mlp,projectile_mlp,loot_mlp,trunk,value,kind,kind_embedding,unit_embedding,ability_embedding,item_embedding,unit_head,ability_head,item_head,swap_head,learn_head,shop_head,loot_head,target_mode_head,put_mode_head,entity_query,point_query;",
-    "reward7=win.2_loss_neg.2_draw0_completed_taskcap_neg.2_win_only_victory_time_bonus_architecture_unchanged;mastery_configuration_and_window_never_model_inputs;m19_initialization_1698996_to1700020_f32_with1024_positive_zeros_all_old_parameter_bits_preserved_no_reward_or_gameplay_equivalence;"
-);
-
-#[cfg(not(feature = "side-actors"))]
-pub const MODEL_SCHEMA_DESCRIPTOR: &str = LEGACY_MODEL_SCHEMA_DESCRIPTOR;
-#[cfg(feature = "side-actors")]
-pub const MODEL_SCHEMA_DESCRIPTOR: &str = concat!(
-    "bota-drysua-model/v25;linked_schemas=model24,action,feature,map2_reward;",
-    "layout=86_named_tensors_1812983_f32;prefix=all62_model24_tensors_names_order_and_shapes_unchanged;",
-    "shared=model24_encoder_trunk_value_kind_unit_ability_item_embeddings;ppo_value_input_detach_unchanged;",
-    "actor=radiant_original12_linear_heads,dire12_independent_linear_heads_appended_in_original_actor_order;",
+    "reward7=win.2_loss_neg.2_draw0_completed_taskcap_neg.2_win_only_victory_time_bonus;",
+    "actor=radiant12_linear_heads_then_dire12_independent_linear_heads_in_the_same_order,shared_encoder_trunk_value_and_embeddings;ppo_value_input_detached;",
     "dire_order=kind,controlled,ability_head,item_head,swap_head,learn_head,shop_head,loot_head,target_mode,put_mode,entity_query,point_query;",
     "routing=observed_global4_Radiant_global5_Dire_exact_numeric_onehot_only,validate_before_tensors,negative_zero_is_zero;",
     "geometry=existing_team_canonical_position_and_delta_unchanged;no_seat_stream_seed_outcome_or_modifier_routing;",
     "math=both_actor_linears_full_original_batch_then_u8_where,select_queries_before_pointer_dot,no_row_compaction;",
     "finite=both_raw_branches_all_rows_of_exercised_heads,all_training_heads_and_selected_pointer_scores_before_backward,unused_inference_families_skipped;",
     "optimizer=one_shared_parameter_lock_global_Adam_norm_and_transaction_over86_tensors;",
-    "initialization=original_model24_seed_draw_prefix_unchanged_then_dire_heads;",
-    "migration=explicit_authenticated_m24_vector_copy_prefix_and_duplicate_actor_heads,new_optimizer_rng_progress_not_resume;"
+    "initialization_suffix=dire_heads_drawn_after_the_radiant_parameter_order;"
 );
 
 pub(crate) const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
@@ -210,30 +193,14 @@ pub(crate) const fn linked_schema_hash(descriptor: &str, schemas: &[(u32, u64)])
     fnv1a_extend(hash, crate::MAP2_REWARD_SCHEMA_DESCRIPTOR.as_bytes())
 }
 
-/// FNV-1a of the descriptor, ordered linked versions/hashes, and reward descriptor.
-pub(crate) const LEGACY_MODEL_SCHEMA_HASH: u64 = linked_schema_hash(
-    LEGACY_MODEL_SCHEMA_DESCRIPTOR,
-    &[
-        (crate::ACTION_SCHEMA_VERSION, crate::ACTION_SCHEMA_HASH),
-        (FEATURE_SCHEMA_VERSION, FEATURE_SCHEMA_HASH),
-        (
-            crate::MAP2_REWARD_SCHEMA_VERSION,
-            crate::MAP2_REWARD_SCHEMA_HASH,
-        ),
-    ],
-);
-
 const fn linear_parameters(input: usize, output: usize) -> usize {
     input * output + output
 }
 
-#[cfg(not(feature = "side-actors"))]
-pub const MODEL_SCHEMA_HASH: u64 = LEGACY_MODEL_SCHEMA_HASH;
-#[cfg(feature = "side-actors")]
+/// FNV-1a of the descriptor, ordered linked versions/hashes, and reward descriptor.
 pub const MODEL_SCHEMA_HASH: u64 = linked_schema_hash(
     MODEL_SCHEMA_DESCRIPTOR,
     &[
-        (LEGACY_MODEL_SCHEMA_VERSION, LEGACY_MODEL_SCHEMA_HASH),
         (crate::ACTION_SCHEMA_VERSION, crate::ACTION_SCHEMA_HASH),
         (FEATURE_SCHEMA_VERSION, FEATURE_SCHEMA_HASH),
         (
@@ -243,14 +210,8 @@ pub const MODEL_SCHEMA_HASH: u64 = linked_schema_hash(
     ],
 );
 
-/// Exact number of F32 parameters in the selected compile-time model layout.
-pub const MODEL_PARAMETER_COUNT: usize = LEGACY_MODEL_PARAMETER_COUNT
-    + if cfg!(feature = "side-actors") {
-        112_963
-    } else {
-        0
-    };
-pub(crate) const LEGACY_MODEL_PARAMETER_COUNT: usize = 1_700_020;
+/// Exact number of F32 parameters in the model layout.
+pub const MODEL_PARAMETER_COUNT: usize = 1_812_983;
 
 const _: () = assert!(FEATURE_SCHEMA_VERSION == 22);
 const _: () = assert!(crate::ACTION_SCHEMA_VERSION == 5);
@@ -303,14 +264,12 @@ const fn decoder_parameter_count() -> usize {
         + linear_parameters(DECODER_CONTEXT, PUT_MODE_HEAD)
         + linear_parameters(DECODER_CONTEXT, UNIT_EMBEDDING)
         + linear_parameters(DECODER_CONTEXT, TOKEN_EMBEDDING);
+    // Radiant and Dire own independent kind and conditional actor heads.
     embeddings
         + direct
         + conditional
-        + if cfg!(feature = "side-actors") {
-            linear_parameters(TRUNK_WIDTH, MODEL_KIND_HEAD) + conditional
-        } else {
-            0
-        }
+        + linear_parameters(TRUNK_WIDTH, MODEL_KIND_HEAD)
+        + conditional
 }
 
 fn allocate_lineage(counter: &AtomicU64, exhausted: ModelError) -> Result<NonZeroU64, ModelError> {
@@ -325,7 +284,6 @@ fn allocate_lineage(counter: &AtomicU64, exhausted: ModelError) -> Result<NonZer
 /// Model construction, evaluation, selection, or parameter-validation failure.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ModelError {
-    #[cfg(feature = "side-actors")]
     InvalidSideOneHot {
         index: usize,
         radiant_bits: u32,
@@ -564,7 +522,6 @@ impl ModelError {
 
     fn fmt_runtime(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            #[cfg(feature = "side-actors")]
             Self::InvalidSideOneHot {
                 index,
                 radiant_bits,
@@ -872,7 +829,6 @@ impl TrainingPrefix {
 }
 
 struct PolicyTensorTensors {
-    #[cfg(feature = "side-actors")]
     side_raw: [[Tensor; 2]; 12],
     value: Tensor,
     kind: Tensor,
@@ -1023,26 +979,7 @@ impl PolicyTensorOutput<'_> {
 
     /// Checks every tensor value while preserving the existing autograd graph.
     pub fn validate_finite(&self) -> Result<(), ModelError> {
-        #[cfg(feature = "side-actors")]
-        {
-            side_actors::validate_training(&self.tensors)
-        }
-        #[cfg(not(feature = "side-actors"))]
-        {
-            validate_tensor_finite("value", self.value())?;
-            validate_tensor_finite("kind", self.kind())?;
-            validate_tensor_finite("controlled", self.controlled())?;
-            validate_tensor_finite("ability", self.ability())?;
-            validate_tensor_finite("item", self.item())?;
-            validate_tensor_finite("swap", self.swap())?;
-            validate_tensor_finite("learn", self.learn())?;
-            validate_tensor_finite("shop", self.shop())?;
-            validate_tensor_finite("loot", self.loot())?;
-            validate_tensor_finite("target mode", self.target_mode())?;
-            validate_tensor_finite("put mode", self.put_mode())?;
-            validate_tensor_finite("entity pointer", self.entity_pointer())?;
-            validate_tensor_finite("point pointer", self.point_pointer())
-        }
+        side_actors::validate_training(&self.tensors)
     }
 
     /// Sums all heads into one scalar graph-connected probe loss.
@@ -1293,7 +1230,6 @@ impl PolicyDevice {
 
 /// F32 DeepSets policy with an autoregressive masked decoder.
 pub struct PolicyModel {
-    #[cfg(feature = "side-actors")]
     dire: side_actors::ActorHeads,
     parameter_lock: RwLock<()>,
     lineage: NonZeroU64,
@@ -1441,7 +1377,6 @@ impl PolicyModel {
             put_mode: Linear::fresh(336, 2, &mut generator, &tensor_device)?,
             entity_query: Linear::fresh(336, 128, &mut generator, &tensor_device)?,
             point_query: Linear::fresh(336, 64, &mut generator, &tensor_device)?,
-            #[cfg(feature = "side-actors")]
             dire: side_actors::ActorHeads::fresh(&mut generator, &tensor_device)?,
         })
     }
@@ -1558,7 +1493,6 @@ impl PolicyModel {
             .forward(&state.trunk)?
             .flatten_all()?
             .to_vec1::<f32>()?;
-        #[cfg(feature = "side-actors")]
         validate_value_rows(&values, batch_offset)?;
         let kinds = routing
             .forward(self, ActorHead::Kind, &state.trunk)
@@ -1660,7 +1594,6 @@ impl PolicyModel {
             .forward(&state.trunk)?
             .flatten_all()?
             .to_vec1::<f32>()?[0];
-        #[cfg(feature = "side-actors")]
         validate_value_rows(std::slice::from_ref(&value), 0)?;
         let mut source = ModelDecoder {
             model: self,
@@ -1717,7 +1650,6 @@ impl PolicyModel {
         action_spaces: &[ActionSpace],
         rngs: Option<&mut [PpoRng]>,
     ) -> Result<Vec<BatchSelection>, ModelError> {
-        #[cfg(feature = "side-actors")]
         side_actors::validate_sides(frames)?;
         let state = self.forward_frames(frames)?;
         self.selection_from_state_locked(state, frames, action_spaces, rngs)
@@ -1983,7 +1915,6 @@ impl PolicyModel {
             put_mode: routing.forward(self, ActorHead::PutMode, &contexts.slot)?,
             entity_pointer: scaled_pointer_dot(&state.current_units, &entity_query)?,
             point_pointer: scaled_pointer_dot(&state.points, &point_query)?,
-            #[cfg(feature = "side-actors")]
             side_raw: routing.into_raw()?,
         })
     }
@@ -2278,7 +2209,6 @@ impl PolicyModel {
         routing: &ActorRouting,
     ) -> Result<SamplingBaseLogits, ModelError> {
         let value = self.value.forward(&state.trunk)?.flatten_all()?.to_vec1()?;
-        #[cfg(feature = "side-actors")]
         validate_value_rows(&value, 0)?;
         Ok(SamplingBaseLogits {
             value,
@@ -2606,7 +2536,7 @@ impl PolicyModel {
     }
 
     fn forward_encoder_inputs(&self, inputs: &EncoderInputs) -> Result<ForwardState, ModelError> {
-        #[cfg(all(test, feature = "side-actors"))]
+        #[cfg(test)]
         side_actors::record_encoder_forward();
         let batch = inputs.batch;
         let units = encode_units(
@@ -2707,7 +2637,6 @@ impl PolicyModel {
             &mut output,
         );
         self.decoder_parameters(&mut output);
-        #[cfg(feature = "side-actors")]
         self.dire.parameters(&mut output);
         assert_eq!(output.len(), MODEL_PARAMETER_TENSORS);
         output
@@ -3693,7 +3622,6 @@ fn validate_batch(frames: &[FeatureFrame]) -> Result<(), ModelError> {
     {
         return Err(ModelError::NonFiniteFrame { index });
     }
-    #[cfg(feature = "side-actors")]
     side_actors::validate_sides(frames)?;
     Ok(())
 }
@@ -3730,7 +3658,6 @@ fn validate_policy_batch(
     {
         return Err(ModelError::BatchFrameActionSpaceMismatch { index });
     }
-    #[cfg(feature = "side-actors")]
     side_actors::validate_sides(frames)?;
     Ok(())
 }
@@ -3799,7 +3726,6 @@ fn validate_training_batch_inputs(
     {
         return Err(ModelError::NonFiniteFrame { index });
     }
-    #[cfg(feature = "side-actors")]
     side_actors::validate_sides(frames)?;
     Ok(())
 }
@@ -4064,7 +3990,6 @@ fn sample_sampling_head<const WIDTH: usize>(
     Ok(sampled)
 }
 
-#[cfg(feature = "side-actors")]
 fn validate_value_rows(values: &[f32], batch_offset: usize) -> Result<(), ModelError> {
     assert!(!values.is_empty());
     assert!(batch_offset + values.len() <= MODEL_MAX_BATCH);
@@ -4096,26 +4021,7 @@ fn validate_tensor_finite(field: &'static str, tensor: &Tensor) -> Result<(), Mo
 }
 
 fn validate_training_tensors_finite(output: &PolicyTensorTensors) -> Result<(), ModelError> {
-    #[cfg(feature = "side-actors")]
-    {
-        side_actors::validate_training(output)
-    }
-    #[cfg(not(feature = "side-actors"))]
-    {
-        validate_tensor_finite("value", &output.value)?;
-        validate_tensor_finite("kind", &output.kind)?;
-        validate_tensor_finite("controlled", &output.controlled)?;
-        validate_tensor_finite("ability", &output.ability)?;
-        validate_tensor_finite("item", &output.item)?;
-        validate_tensor_finite("swap", &output.swap)?;
-        validate_tensor_finite("learn", &output.learn)?;
-        validate_tensor_finite("shop", &output.shop)?;
-        validate_tensor_finite("loot", &output.loot)?;
-        validate_tensor_finite("target mode", &output.target_mode)?;
-        validate_tensor_finite("put mode", &output.put_mode)?;
-        validate_tensor_finite("entity pointer", &output.entity_pointer)?;
-        validate_tensor_finite("point pointer", &output.point_pointer)
-    }
+    side_actors::validate_training(output)
 }
 
 fn sum_training_tensors(output: &PolicyTensorTensors) -> Result<Tensor, ModelError> {

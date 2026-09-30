@@ -72,9 +72,7 @@ fn training_contract_exact_ppo26_runtime_rejects_without_changing_parameters_pre
     let identity = target.policy_identity().expect("identity");
     let trainer = PpoTrainer::new(&target, checkpoint_config(), 1).expect("bound optimizer");
     let mut frame = crate::FeatureFrame::new();
-    if cfg!(feature = "side-actors") {
-        frame.global[crate::global_feature::SIDE_RADIANT] = 1.0;
-    }
+    frame.global[crate::global_feature::SIDE_RADIANT] = 1.0;
     let prediction = target.evaluate(&frame).expect("before prediction");
 
     let error = TrainingArtifact::load_runtime_weights(&target, &directory)
