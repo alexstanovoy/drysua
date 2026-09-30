@@ -769,8 +769,13 @@ impl AdamState {
 /// both moments are finite and the second moment is nonnegative (up to a sum
 /// overflow, which [`moments_pass`] callers resolve on the host).
 fn moment_flags(first: &Tensor, second: &Tensor) -> Result<Tensor, ModelError> {
+    let sum = |tensor: &Tensor, dim: usize| tensor.sum(dim);
     Ok(Tensor::stack(
-        &[first.sum_all()?, second.sum_all()?, second.min(0)?],
+        &[
+            device_learner::reduce_flat(first, sum)?,
+            device_learner::reduce_flat(second, sum)?,
+            device_learner::reduce_flat(second, |tensor, dim| tensor.min(dim))?,
+        ],
         0,
     )?)
 }

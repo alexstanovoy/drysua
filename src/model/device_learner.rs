@@ -267,7 +267,7 @@ impl PolicyModel {
         if report.approximate_kl > f64::from(config.target_kl) {
             return Ok(report);
         }
-        let original = self.device_parameter_copies()?;
+        let original = self.device_parameter_copy()?;
         let original_adam = adam.clone();
         let diagnostics = self.apply_adam_device(adam, &gradients, &original)?;
         let candidate_kl = self.staged_candidate_kl(staged, &rows, microbatch);
@@ -285,7 +285,7 @@ impl PolicyModel {
             .is_ok_and(|kl| *kl <= f64::from(config.target_kl))
         {
             self.rollback_device_candidate(
-                &original,
+                &original.parameters,
                 original_adam,
                 adam,
                 &candidate_kl,
@@ -401,12 +401,18 @@ impl PolicyModel {
         ModelError::NonFiniteLoss
     }
 
-    /// Device copies of every parameter, the rollback point of one Adam step.
-    fn device_parameter_copies(&self) -> Result<Vec<Tensor>, ModelError> {
-        self.parameters()
+    /// One flat device copy of every parameter, the rollback point and Adam
+    /// input of one step.
+    fn device_parameter_copy(&self) -> Result<ParameterCopy, ModelError> {
+        let parameters = self.parameters();
+        let flat = parameters
             .iter()
-            .map(|parameter| Ok(parameter.value.as_tensor().copy()?.detach()))
-            .collect()
+            .map(|parameter| parameter.value.as_tensor().flatten_all())
+            .collect::<Result<Vec<_>, _>>()?;
+        let flat = Tensor::cat(&flat, 0)?.detach();
+        assert_eq!(flat.elem_count(), MODEL_PARAMETER_COUNT);
+        let parameters = unflatten(&flat, &parameters)?;
+        Ok(ParameterCopy { flat, parameters })
     }
 
     fn rollback_device_candidate(
@@ -446,7 +452,7 @@ impl PolicyModel {
         &self,
         adam: &mut AdamState,
         gradients: &[Option<Tensor>],
-        original: &[Tensor],
+        original: &ParameterCopy,
     ) -> Result<AdamDiagnostics, ModelError> {
         assert_eq!(adam.binding.policy, self.policy_identity_locked());
         let next = self.next_policy_identity_locked()?;
@@ -458,8 +464,8 @@ impl PolicyModel {
         let norm = gradient_norm_device(gradients)?;
         let (scale, corrections) = adam_step_factors(adam.config, norm, step);
         let (updated, first, second) =
-            self.adam_update_parameters(adam, gradients, scale, corrections)?;
-        apply_parameter_tensors(&self.parameters(), &updated, original, None)?;
+            self.adam_update_parameters(adam, gradients, &original.flat, (scale, corrections))?;
+        apply_parameter_tensors(&self.parameters(), &updated, &original.parameters, None)?;
         // A tracked moment would chain every step's autograd graph (and its
         // activations) to the optimizer.
         assert!(!first.track_op());
@@ -477,52 +483,35 @@ impl PolicyModel {
     }
 
     /// Every parameter's Adam update and the new moments, checked finite.
+    ///
+    /// Adam is elementwise, so it runs once over the flat parameters instead
+    /// of once per tensor; each element sees the same operations either way.
     fn adam_update_parameters(
         &self,
         adam: &AdamState,
         gradients: &[Option<Tensor>],
-        scale: f64,
-        corrections: (f64, f64),
+        values: &Tensor,
+        (scale, corrections): (f64, (f64, f64)),
     ) -> Result<AdamUpdate, ModelError> {
-        let config = adam.config;
-        let (first, second) = (&adam.first_moment, &adam.second_moment);
         let parameters = self.parameters();
-        let mut updated = Vec::with_capacity(parameters.len());
-        let mut moments = (
-            Vec::with_capacity(parameters.len()),
-            Vec::with_capacity(parameters.len()),
-        );
-        let mut offset = 0;
-        for (parameter, gradient) in parameters.iter().zip(gradients) {
-            let value = parameter.value.as_tensor();
-            let count = value.elem_count();
-            let gradient = match gradient {
-                Some(gradient) => gradient.affine(scale, 0.0)?,
-                None => value.zeros_like()?,
-            };
-            let moments_in = (
-                first.narrow(0, offset, count)?.reshape(value.shape())?,
-                second.narrow(0, offset, count)?.reshape(value.shape())?,
-            );
-            let (value, m, v) =
-                adam_tensor_step(value, &gradient, moments_in, config, corrections)?;
-            updated.push(value);
-            moments.0.push(m.flatten_all()?);
-            moments.1.push(v.flatten_all()?);
-            offset += count;
-        }
-        assert_eq!(offset, MODEL_PARAMETER_COUNT);
-        let first = Tensor::cat(&moments.0, 0)?.detach();
-        let second = Tensor::cat(&moments.1, 0)?.detach();
-        let check = updated
+        let gradients = parameters
             .iter()
-            .map(|tensor| tensor.sum_all())
+            .zip(gradients)
+            .map(|(parameter, gradient)| match gradient {
+                Some(gradient) => gradient.flatten_all(),
+                None => parameter.value.as_tensor().zeros_like()?.flatten_all(),
+            })
             .collect::<Result<Vec<_>, _>>()?;
-        // One readback: the moment flags, then the updated parameters' sum.
+        let gradient = Tensor::cat(&gradients, 0)?.affine(scale, 0.0)?;
+        let moments = (adam.first_moment.clone(), adam.second_moment.clone());
+        let (updated, first, second) =
+            adam_tensor_step(values, &gradient, moments, adam.config, corrections)?;
+        let (first, second) = (first.detach(), second.detach());
+        // One readback for the moment and updated-parameter checks.
         let flags = Tensor::cat(
             &[
                 super::moment_flags(&first, &second)?,
-                Tensor::stack(&check, 0)?.sum_all()?.reshape(1)?,
+                reduce_flat(&updated, |tensor, dim| tensor.sum(dim))?.reshape(1)?,
             ],
             0,
         )?
@@ -539,11 +528,62 @@ impl PolicyModel {
                 return Err(ModelError::NonFiniteOptimizerUpdate { index });
             }
         }
-        if !flags[3].is_finite() {
-            return Err(ModelError::NonFiniteOptimizerUpdate { index: 0 });
+        // A non-finite element makes any sum non-finite; a finite sum can
+        // only overflow for finite elements, which the host scan clears.
+        if !flags[3].is_finite()
+            && let Some(index) = updated
+                .to_vec1::<f32>()?
+                .iter()
+                .position(|value| !value.is_finite())
+        {
+            return Err(ModelError::NonFiniteOptimizerUpdate { index });
         }
-        Ok((updated, first, second))
+        Ok((unflatten(&updated, &parameters)?, first, second))
     }
+}
+
+/// A flat parameter copy and its per-parameter views.
+struct ParameterCopy {
+    flat: Tensor,
+    parameters: Vec<Tensor>,
+}
+
+/// Views of a flat tensor shaped like each parameter, in parameter order.
+fn unflatten(flat: &Tensor, parameters: &[NamedParameter<'_>]) -> Result<Vec<Tensor>, ModelError> {
+    let mut offset = 0;
+    let mut views = Vec::with_capacity(parameters.len());
+    for parameter in parameters {
+        let shape = parameter.value.shape();
+        views.push(flat.narrow(0, offset, shape.elem_count())?.reshape(shape)?);
+        offset += shape.elem_count();
+    }
+    assert_eq!(offset, flat.elem_count());
+    Ok(views)
+}
+
+/// Reduces a flat tensor in two stages (rows of 1024, then the row results
+/// and the tail): a one-stage reduction of a long vector runs in one block.
+pub(super) fn reduce_flat(
+    flat: &Tensor,
+    reduce: impl Fn(&Tensor, usize) -> candle_core::Result<Tensor>,
+) -> Result<Tensor, ModelError> {
+    const COLUMNS: usize = 1024;
+    let count = flat.elem_count();
+    let rows = count / COLUMNS;
+    let mut parts = Vec::with_capacity(2);
+    if rows > 0 {
+        let head = flat
+            .narrow(0, 0, rows * COLUMNS)?
+            .reshape((rows, COLUMNS))?;
+        parts.push(reduce(&reduce(&head, 1)?, 0)?);
+    }
+    if count > rows * COLUMNS {
+        parts.push(reduce(
+            &flat.narrow(0, rows * COLUMNS, count - rows * COLUMNS)?,
+            0,
+        )?);
+    }
+    Ok(reduce(&Tensor::stack(&parts, 0)?, 0)?)
 }
 
 /// One Adam update of a parameter tensor from its already clipped gradient.

@@ -392,9 +392,9 @@ impl AnnealedSession {
         let update = self.state.completed_updates;
         let config = settings.ppo;
         timing.enter(TrainingStage::Collection);
-        let parts = pipeline.collector.take(update)?;
+        let mut parts = pipeline.collector.take(update)?;
         timing.enter(TrainingStage::BatchPreparation);
-        let (rollout, report, snapshots) = assemble(&parts, settings.slots, config)?;
+        let (rollout, report, snapshots) = assemble(&mut parts, settings.slots, config)?;
         self.record_outcomes(&parts, pool, update)?;
         let samples = rollout.len();
         timing.set_samples(samples);
@@ -539,9 +539,10 @@ impl Pipeline {
     }
 }
 
-/// One update's batch, report and next-update snapshots from its lane parts.
+/// One update's batch, report and next-update snapshots from its lane parts;
+/// the samples move into the rollout (a clone would copy every frame).
 fn assemble(
-    parts: &[PartDone],
+    parts: &mut [PartDone],
     slots: usize,
     config: PpoConfig,
 ) -> Result<(PpoRollout, CollectionReport, Vec<SlotSnapshot>), PpoError> {
@@ -550,7 +551,8 @@ fn assemble(
     let mut report = CollectionReport::default();
     let mut snapshots: Vec<Option<SlotSnapshot>> = (0..slots).map(|_| None).collect();
     for part in parts {
-        for sample in &part.samples {
+        let samples = part.samples.len();
+        for sample in std::mem::take(&mut part.samples) {
             let next = streams.len();
             let stream = *streams.entry((sample.slot, sample.game)).or_insert(next);
             if stream >= PPO_MAX_STREAMS {
@@ -558,7 +560,7 @@ fn assemble(
                     "update exceeds its game stream bound",
                 ));
             }
-            let mut transition = sample.transition.clone();
+            let mut transition = sample.transition;
             transition.stream = stream;
             rollout.push(transition)?;
         }
@@ -574,7 +576,7 @@ fn assemble(
             part.update,
             part.lane,
             part.rounds,
-            part.samples.len(),
+            samples,
             part.episodes.len(),
             part.inference.as_secs_f64(),
             part.simulation.as_secs_f64(),
