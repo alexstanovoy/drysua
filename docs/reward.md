@@ -36,40 +36,24 @@ recorded in checkpoints, runtime weights and reward reports.
 ## Rationale
 
 1. **Only the outcome defines what is optimal.** Shaping is potential-based
-   (Ng, Harada and Russell 1999) with γ = 1, and the potential is returned at the
-   terminal (`closure = −Φ`).
-   - Over any episode the shaping terms sum to `−Φ(s_0)`, and `Φ(s_0) = 0` at a
-     native start.
-   - So every episode's return is exactly `R(end)`, and no dense term can be
-     farmed.
-   - Shaping only moves credit earlier. The terminal no longer has to reach a
-     decision made minutes before through GAE's roughly 40-second λ horizon.
-2. **The potential tracks the decisive quantities only.**
-   - Φ approximates `E[outcome | s]` in the units of the terminal.
-   - The four terms and their signs follow the Map2 rules.
-   - The weights are set conservatively from a least-squares fit of the outcome on
-     these features, using 240 offline U200v2-vs-Teacher games and 400 Teacher-mirror games
-     (`temp/` harness, not committed).
-   - The weakest-tower lead predicts the outcome best, with a coefficient of about
-     0.8–1.0. The XP lead predicts it in the Teacher matchup (0.6–1.3), and deaths
-     and HP predict it in the mirror.
-   - In the rules, one death is half of a loss.
-   - Two orderings are enforced by assertions: `health < deaths` (a kill is worth
-     more than the damage that landed it) and `xp < deaths`.
-   - `|Φ| < 2` always holds, so shaping never outweighs the gap between a win and a
-     loss.
-3. **Win fast.** The bonus falls linearly from +0.5 after pregame to 0 at the cap.
-   Winning five minutes earlier is worth about +0.17, which equals about 8 points
-   of win probability. The outcome still dominates, since a win is worth at least
-   2 more than a loss.
-4. **What was removed and why.** Reward 7's ten diminishing channels are gone:
-   gold, XP, hero damage, damage taken from heroes, creeps, towers and other sources,
-   and mana. So are its lane, pregame, opening-position, fountain-wait and stagnation
-   terms. They were not potential-based, so they changed the objective. They were
-   net-negative in both wins and losses, and they charged for harassing and for
-   pushing, which are the two ways to win. The tower potential averaged over 11
-   towers, so the tower that decides the game paid only +0.027. The raw measurements
-   survive as diagnostics.
+   (Ng, Harada and Russell 1999) with γ = 1 and `Φ(terminal) = 0`, so over an
+   episode the shaping terms sum to `−Φ(s_0) = 0` and every return equals `R(end)`.
+   No dense term can be farmed; shaping only moves credit earlier than GAE's
+   roughly 40-second horizon would.
+2. **Φ tracks the decisive quantities.** It approximates `E[outcome | s]` in terminal
+   units. The weights come from a least-squares fit of the outcome on these features
+   (240 U200v2-vs-Teacher and 400 Teacher-mirror games), set conservatively: the
+   weakest-tower lead predicts best (0.8–1.0), XP predicts in the Teacher matchup,
+   deaths and HP in the mirror. By the rules one death is half a loss. Assertions
+   keep `health < deaths`, `xp < deaths` and `|Φ| < 2`, so shaping never outweighs
+   the gap between a win and a loss.
+3. **Win fast.** The bonus falls linearly from +0.5 after pregame to 0 at the cap;
+   winning five minutes earlier is worth about +0.17.
+4. **Reward 7 was removed.** Its ten diminishing channels (gold, XP, damage, creeps,
+   towers, mana) and its lane, pregame, position and stagnation terms were not
+   potential-based, were net-negative in wins and losses, and charged for harassing
+   and pushing. Its tower term averaged 11 towers, so the deciding tower paid
+   +0.027. The raw measurements remain as diagnostic counters.
 
 ## Logs and reports
 
@@ -86,33 +70,21 @@ recorded in checkpoints, runtime weights and reward reports.
 - `event=map2_training_reward` carries the same fields summed per checkpoint or
   invocation.
 - `drysua reward-observer` (`play.sh --reward-report`) writes the same components and
-  counters for each seat of a human-vs-bot game. See
-  [human-reward-play.md](human-reward-play.md).
+  counters for each seat of a human game ([human reward play](human-reward-play.md)).
 
 ## Policy inputs
 
-Global features 73–80 carry the potential's inputs:
-- own and enemy weakest-tower HP;
-- deaths divided by 2;
-- own and enemy last-seen hero HP;
-- the clamped XP lead;
-- Φ itself.
+Global features 73–80 carry the potential's inputs (own and enemy weakest-tower HP,
+deaths over 2, last-seen hero HP, the clamped XP lead) and Φ itself, so a linear
+critic can subtract the shaping. Features 81–91 are reserved zeros.
 
-A linear critic can then subtract the shaping. Features 81–91 are reserved zeros,
-which keeps the model width.
+## Offline check
 
-## Offline sanity check
+Builtin games scored per seat by `Map2Reward` (harness not committed).
 
-Games were played with the uncommitted harness in the worktree's `temp/`. The harness
-runs builtin arena games, and each seat is scored by its own `Map2Reward`.
-
-**Neural against Teacher.** There were 240 games of greedy U200v2 against Teacher,
-with seats alternating. The neural seat went 50 W, 189 L and 1 D. Its reward-state
-inputs are reinterpreted by version 8, so the win rate is below the live 35%.
-
-Per-episode returns of the neural seat (mean ± SD). "Dense" is the sum of
-`towers`, `deaths`, `health` and `xp` before closure. For comparison, reward 7's
-shaping measured −0.065 in wins and −0.105 in losses.
+**U200v2 (greedy) against Teacher**, 240 games, 50 W / 189 L / 1 D. Per-episode
+means ± SD of the neural seat; "dense" is `towers + deaths + health + xp` before
+closure (reward 7's shaping was −0.065 in wins and −0.105 in losses):
 
 | Component | Win | Loss |
 |---|---:|---:|
@@ -123,18 +95,12 @@ shaping measured −0.065 in wins and −0.105 in losses.
 | dense | **+0.51 ± 0.33** | **−0.82 ± 0.31** |
 | terminal + fast_win | +1.23 | −1.00 |
 
-The AUC of Φ for predicting a win depends on game time:
-- **0.50 at 1–2 minutes.** Greedy openings are identical across seeds.
-- **0.60 at 3 minutes.**
-- **0.68 at 5 minutes.**
-- **0.73 at 6 minutes.**
+AUC of Φ for predicting a win: 0.50 at 1–2 minutes (greedy openings are identical),
+0.60 at 3, 0.68 at 5, 0.73 at 6.
 
-**Teacher mirror.** There were 400 Teacher-against-Teacher games, and Radiant won
-330 of them. Mean dense progress was +0.36 in wins and −0.35 in losses, carried by
-`deaths` (±0.37), since the mirror is decided by kills. The AUC of Φ was 0.83 at
-1 and 2 minutes.
+**Teacher mirror**, 400 games, Radiant won 330. Dense progress +0.36 in wins and
+−0.35 in losses, carried by deaths; AUC of Φ 0.83 at 1–2 minutes.
 
-**The deaths term does not separate the U200v2 matchup.** That policy dies about as
-often in its wins as in its losses, and it wins or loses by the tower. The deaths
-term is kept because the rules make it decisive. It is a candidate to revisit once
-policies can kill reliably.
+The deaths term does not separate the U200v2 matchup: that policy dies about as often
+in wins as in losses and is decided by the tower. It stays because the rules make
+deaths decisive; revisit once policies kill reliably.
