@@ -345,7 +345,7 @@ fn assert_mixed_gradients(device: PolicyDevice) {
     let mut frames = [side_frame(false), side_frame(true)];
     for frame in &mut frames {
         frame.units[0][unit_feature::TOKEN_PRESENT] = 1.0;
-        frame.units[0][unit_feature::KIND_TOKEN] = 1.0;
+        frame.units[0][unit_feature::KIND_START] = 1.0;
         frame.points[0][point_feature::TOKEN_PRESENT] = 1.0;
     }
     let prefixes = [
@@ -845,12 +845,12 @@ fn assert_ppo_rollback(device: PolicyDevice) {
         let (after_first, after_second) = after.adam.moments().expect("after moments");
         for moments in [&after_first, &after_second] {
             assert!(
-                moments[1_651_905..1_656_017]
+                moments[1_777_793..1_781_905]
                     .iter()
                     .any(|value| *value != 0.0)
             );
             assert!(
-                moments[1_765_812..1_769_924]
+                moments[1_891_700..1_895_812]
                     .iter()
                     .any(|value| *value != 0.0)
             );

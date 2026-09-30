@@ -1,6 +1,7 @@
 //! Encoder inputs packed once per frame, on the thread that encoded it.
 //!
-//! A row holds one frame's conditioned encoder parts in device buffer order.
+//! A row holds one frame's encoder parts in device buffer order. Frames are
+//! already scaled and one-hot, so packing only masks absent tokens.
 //! Batches concatenate rows part by part, so a batch built from rows equals the
 //! historical per-batch staging value for value.
 
@@ -90,13 +91,7 @@ impl EncoderRow {
         self.radiant = side_actors::side_row(frame, 0)? == 1;
         self.pack_units(frame);
         let own = self.parts(7);
-        pack_present_rows(
-            &frame.own_units,
-            unit_feature::TOKEN_PRESENT,
-            &[(unit_feature::KIND_TOKEN, 12.0)],
-            None,
-            own,
-        );
+        pack_present_rows(&frame.own_units, unit_feature::TOKEN_PRESENT, own);
         self.pack_tokens(frame);
         pack_scalars(frame, self.part(19));
         Ok(())
@@ -139,7 +134,7 @@ impl EncoderRow {
             } else {
                 target.fill(0.0);
             }
-            let group = unit_group(row[unit_feature::KIND_TOKEN]);
+            let group = unit_group(row);
             let mut any = false;
             for index in 0..UNIT_GROUPS {
                 let member = present && group == Some(index);
@@ -148,71 +143,28 @@ impl EncoderRow {
             }
             presence[token] = any as u8 as f32;
         }
-        condition_rows(
-            values,
-            UNIT_FEATURES,
-            &[(unit_feature::KIND_TOKEN, 12.0)],
-            None,
-        );
     }
 
     fn pack_tokens(&mut self, frame: &FeatureFrame) {
         pack_present_rows(
             &frame.abilities,
             ability_feature::TOKEN_PRESENT,
-            &[
-                (ability_feature::BODY_TOKEN, 2.0),
-                (ability_feature::SEMANTIC_SLOT_TOKEN, 8.0),
-                (ability_feature::AIM_TOKEN, 5.0),
-            ],
-            Some((ability_feature::ID_TOKEN, 65_547.0)),
             self.parts(9),
         );
-        pack_present_rows(
-            &frame.items,
-            item_feature::TOKEN_PRESENT,
-            &[
-                (item_feature::LOCATION_TOKEN, 5.0),
-                (item_feature::SLOT_TOKEN, 64.0),
-                (item_feature::AIM_TOKEN, 5.0),
-                (item_feature::ATTRIBUTE_TOKEN, 3.0),
-            ],
-            Some((item_feature::ITEM_TOKEN, 65_536.0)),
-            self.parts(11),
-        );
-        pack_present_rows(
-            &frame.points,
-            point_feature::TOKEN_PRESENT,
-            &[
-                (point_feature::SOURCE_TOKEN, 8.0),
-                (point_feature::SOURCE_DIRECTION_TOKEN, 8.0),
-                (point_feature::SOURCE_KIND_TOKEN, 12.0),
-            ],
-            None,
-            self.parts(13),
-        );
+        pack_present_rows(&frame.items, item_feature::TOKEN_PRESENT, self.parts(11));
+        pack_present_rows(&frame.points, point_feature::TOKEN_PRESENT, self.parts(13));
         pack_present_rows(
             &frame.projectiles,
             projectile_feature::TOKEN_PRESENT,
-            &[],
-            Some((projectile_feature::ABILITY_TOKEN, 65_547.0)),
             self.parts(15),
         );
-        pack_present_rows(
-            &frame.loot,
-            loot_feature::TOKEN_PRESENT,
-            &[],
-            Some((loot_feature::ITEM_TOKEN, 65_536.0)),
-            self.parts(17),
-        );
+        pack_present_rows(&frame.loot, loot_feature::TOKEN_PRESENT, self.parts(17));
     }
 }
 
 fn pack_present_rows<const TOKENS: usize, const FEATURES: usize>(
     rows: &[[f32; FEATURES]; TOKENS],
     presence: usize,
-    categories: &[(usize, f32)],
-    semantic_id: Option<(usize, f32)>,
     (values, mask): (&mut [f32], &mut [f32]),
 ) {
     assert_eq!(values.len(), TOKENS * FEATURES);
@@ -227,30 +179,17 @@ fn pack_present_rows<const TOKENS: usize, const FEATURES: usize>(
         }
         mask[token] = present as u8 as f32;
     }
-    condition_rows(values, FEATURES, categories, semantic_id);
 }
 
 fn pack_scalars(frame: &FeatureFrame, values: &mut [f32]) {
     assert_eq!(values.len(), ENCODER_SCALARS);
     let (global, rest) = values.split_at_mut(GLOBAL_FEATURES);
-    global.copy_from_slice(&frame.global);
-    condition_rows(
-        global,
-        GLOBAL_FEATURES,
-        &[
-            (crate::global_feature::ROLE_TOKEN, 5.0),
-            (crate::global_feature::LANE_TOKEN, 3.0),
-            (crate::global_feature::ACTIVE_ORDER_KIND, 16.0),
-            (crate::global_feature::ACTIVE_TARGET_KIND_TOKEN, 12.0),
-        ],
-        None,
-    );
+    global.copy_from_slice(&frame.global[..]);
     let (history, rest) = rest.split_at_mut(HISTORY_SAMPLES * HISTORY_FEATURES);
     history.copy_from_slice(frame.history.as_flattened());
     let (policy, map) = rest.split_at_mut(MAX_POLICY_HISTORY * POLICY_HISTORY_FEATURES);
     policy.copy_from_slice(frame.policy_history.as_flattened());
-    condition_rows(policy, POLICY_HISTORY_FEATURES, &[(3, 16.0)], None);
-    map.copy_from_slice(&frame.map);
+    map.copy_from_slice(&frame.map[..]);
 }
 
 /// Concatenates rows part by part into one host buffer and its part lengths.

@@ -201,7 +201,6 @@ fn inspect_fixture(side: usize, place: Place) -> Evidence {
         assert!(candidate.allied_building);
         assert!(!candidate.standing_tree);
         assert_eq!(frame.points()[index][point_feature::TOKEN_PRESENT], 1.0);
-        assert_eq!(frame.points()[index][point_feature::POINTER_VALID], 1.0);
         assert!(view.units.iter().any(|unit| unit.team == tracker.team()
             && PointSource::BuildingLanding(unit.kind) == candidate.source
             && unit.pos.within(candidate.position, Fixed::from_int(600))));

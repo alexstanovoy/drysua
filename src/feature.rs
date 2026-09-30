@@ -21,6 +21,8 @@ use crate::{
     SHADOW_FIEND_ABILITY_SLOTS, StateTracker, TERRAIN_CELL_SIZE, UNIT_TOKENS,
 };
 
+mod combat;
+
 #[cfg(test)]
 #[path = "tests/feature_capacity.rs"]
 mod capacity_tests;
@@ -30,19 +32,19 @@ mod capacity_tests;
 mod test_support;
 
 /// Version of the policy feature layout and candidate input-state semantics.
-pub const FEATURE_SCHEMA_VERSION: u32 = 25;
+pub const FEATURE_SCHEMA_VERSION: u32 = 26;
 /// Number of scalar global features.
-pub const GLOBAL_FEATURES: usize = 92;
+pub const GLOBAL_FEATURES: usize = global_feature::WIDTH;
 /// Number of scalar features in one global-history sample.
-pub const HISTORY_FEATURES: usize = 24;
+pub const HISTORY_FEATURES: usize = history_feature::WIDTH;
 /// Number of global-history samples.
 pub const HISTORY_SAMPLES: usize = HISTORY_AGES.len();
 /// Number of scalar features in one local policy-history sample.
-pub const POLICY_HISTORY_FEATURES: usize = 4;
+pub const POLICY_HISTORY_FEATURES: usize = policy_history_feature::WIDTH;
 /// Maximum number of local policy-history samples.
 pub const MAX_POLICY_HISTORY: usize = 16;
 /// Number of scalar features in one unit token.
-pub const UNIT_FEATURES: usize = 84;
+pub const UNIT_FEATURES: usize = unit_feature::WIDTH;
 /// Number of unit tokens in exact ActionSpace entity-candidate order.
 pub const UNIT_FEATURE_TOKENS: usize = UNIT_TOKENS;
 /// Number of fixed own hero and courier unit tokens.
@@ -50,55 +52,104 @@ pub const OWN_UNIT_FEATURE_TOKENS: usize = 2;
 /// Maximum number of non-targetable remembered unit tokens.
 pub const REMEMBERED_UNIT_FEATURE_TOKENS: usize = 32;
 /// Number of scalar features in one point-candidate token.
-pub const POINT_FEATURES: usize = 32;
+pub const POINT_FEATURES: usize = point_feature::WIDTH;
 /// Number of point tokens in exact ActionSpace point-candidate order.
 pub const POINT_FEATURE_TOKENS: usize = MAX_POINT_CANDIDATES;
 /// Number of scalar features in one ability token.
-pub const ABILITY_FEATURES: usize = 24;
+pub const ABILITY_FEATURES: usize = ability_feature::WIDTH;
 /// Number of fixed own hero and courier ability tokens.
 pub const ABILITY_FEATURE_TOKENS: usize = SHADOW_FIEND_ABILITY_SLOTS + 8;
 /// Number of scalar features in one item token.
-pub const ITEM_FEATURES: usize = 28;
-/// Number of fixed own inventory and shop item tokens.
-pub const ITEM_FEATURE_TOKENS: usize = OWN_ITEM_SLOTS + MAX_SHOP_ITEMS;
+pub const ITEM_FEATURES: usize = item_feature::WIDTH;
+/// Inventory and backpack slots of the nearest enemy hero, after the shop rows.
+pub const ENEMY_ITEM_SLOTS: usize = 9;
+/// Number of fixed own inventory, shop and enemy-hero item tokens.
+pub const ITEM_FEATURE_TOKENS: usize = OWN_ITEM_SLOTS + MAX_SHOP_ITEMS + ENEMY_ITEM_SLOTS;
 /// Number of scalar features in one projectile token.
-pub const PROJECTILE_FEATURES: usize = 20;
+pub const PROJECTILE_FEATURES: usize = projectile_feature::WIDTH;
 /// Number of fixed projectile tokens.
 pub const PROJECTILE_FEATURE_TOKENS: usize = 32;
 /// Number of scalar features in one loot token.
-pub const LOOT_FEATURES: usize = 16;
+pub const LOOT_FEATURES: usize = loot_feature::WIDTH;
 /// Number of fixed loot tokens.
 pub const LOOT_FEATURE_TOKENS: usize = MAX_LOOT;
 /// Number of scalar local map-context features.
-pub const MAP_FEATURES: usize = 96;
+pub const MAP_FEATURES: usize = map_feature::WIDTH;
 /// Maximum encoded observation states retained for deterministic rollback.
 pub const MAX_FEATURE_OBSERVATION_HISTORY: usize = 16;
-
-const MAX_TICK: u32 = 3_600_000;
-const MAX_AGE: u32 = 4_800;
-const MAX_GOLD: i64 = 100_000;
-const MAX_SCORE: i64 = 1_000;
-const MAX_XP: i64 = 100_000;
-const MAX_HP: i64 = 100_000;
-const MAX_MANA: i64 = 20_000;
-const MAX_DAMAGE: i64 = 10_000;
-const MAX_ATTACK_INTERVAL: i64 = 600;
+/// One-hot ability identifier classes: ids below the last class, then "other".
+pub const ABILITY_ID_CLASSES: usize = 25;
+/// One-hot item identifier classes: ids below the last class, then "other".
+pub const ITEM_ID_CLASSES: usize = 65;
 
 /// Whole ticks of an attack cadence the wire reports in milliseconds.
 ///
-/// The native wire reports attack speed-scaled cadence in milliseconds; the
-/// feature contract keeps the historical whole-tick unit. Tick rate is pinned
-/// to the validated 30 by every accepted match.
+/// Tick rate is pinned to the validated 30 by every accepted match.
 pub(crate) fn attack_interval_ticks(attack_time_ms: u32) -> u32 {
     ((u64::from(attack_time_ms) * 30) / 1000) as u32
 }
-const MAX_SPEED: i64 = 2_000;
-const MAX_ARMOR_RAW: i64 = 100 << Fixed::FRAC_BITS;
-const MAX_LEVEL: i64 = 30;
-const MAX_CHARGES: i64 = 255;
-const MAX_COOLDOWN: i64 = 36_000;
-const MAX_ITEM_COST: i64 = 100_000;
-const MAX_STRUCTURE_COUNT: i64 = 64;
+
+/// Normalisers in world units, ticks, whole points and counts. Tactical
+/// quantities saturate where the fight stops caring, so raze reaches, attack
+/// ranges, cooldowns and last-hit health keep resolution inside [-1, 1].
+mod scale {
+    pub const NEAR_DISTANCE: f32 = 2_000.0;
+    pub const LOG_DISTANCE_UNIT: f32 = 100.0;
+    pub const LOG_DISTANCE_MAX: f32 = 26_000.0;
+    pub const HEALTH_NEAR: f32 = 1_000.0;
+    pub const HEALTH_LOG_MAX: f32 = 5_000.0;
+    pub const EFFECTIVE_HEALTH_LOG_MAX: f32 = 10_000.0;
+    pub const MANA_NEAR: f32 = 1_000.0;
+    pub const POOL_DELTA: f32 = 100.0;
+    pub const DAMAGE: f32 = 300.0;
+    pub const RANGE: f32 = 1_000.0;
+    pub const ATTACK_TIME_MS: f32 = 3_000.0;
+    pub const ATTACK_POINT_MS: f32 = 1_000.0;
+    pub const ATTACK_SPEED: f32 = 700.0;
+    pub const MOVE_SPEED: f32 = 550.0;
+    pub const ARMOR: f32 = 30.0;
+    pub const VISION: f32 = 2_000.0;
+    pub const BOUND: f32 = 300.0;
+    pub const VELOCITY: f32 = 600.0;
+    pub const HITS: f32 = 20.0;
+    pub const REACH_SECONDS: f32 = 10.0;
+    pub const MARGIN: f32 = 1_000.0;
+    pub const RAZE_DAMAGE: f32 = 500.0;
+    pub const RAZES_TO_KILL: u32 = 5;
+    pub const RAZE_STACKS: u32 = 4;
+    pub const LEVEL: f32 = 25.0;
+    pub const COOLDOWN_NEAR_TICKS: f32 = 300.0;
+    pub const COOLDOWN_LOG_TICKS: f32 = 3_600.0;
+    pub const RESTORED_HEALTH: f32 = 500.0;
+    pub const RESTORED_MANA: f32 = 300.0;
+    pub const GOLD: f32 = 5_000.0;
+    pub const XP: f32 = 5_000.0;
+    pub const LAST_HITS: f32 = 100.0;
+    pub const DENIES: f32 = 50.0;
+    pub const SNAPSHOT_DAMAGE: f32 = 200.0;
+    pub const ORDER_AGE_TICKS: f32 = 900.0;
+    pub const RESPAWN_TICKS: f32 = 1_800.0;
+    pub const VISIBLE_UNITS: f32 = 64.0;
+    pub const CREEPS: f32 = 8.0;
+    pub const CREEP_BALANCE_RADIUS: f32 = 1_200.0;
+    pub const ABILITY_MANA: f32 = 200.0;
+    pub const ITEM_VALUE: f32 = 5_000.0;
+    pub const CHARGES: f32 = 10.0;
+    pub const MUTE_TICKS: f32 = 180.0;
+    pub const SHARED_WAIT_TICKS: f32 = 2_100.0;
+    pub const LAST_CAST_TICKS: f32 = 1_800.0;
+    pub const PROJECTILE_RELATIVE: f32 = 2_000.0;
+    pub const PROJECTILE_VELOCITY: f32 = 1_500.0;
+    pub const PROJECTILE_AGE_TICKS: f32 = 60.0;
+    pub const PROJECTILE_APPROACH: f32 = 500.0;
+    pub const LOOT_AGE_TICKS: f32 = 300.0;
+    pub const REQUIEM_COOLDOWN_TICKS: f32 = 3_600.0;
+    pub const RAZE_COOLDOWN_TICKS: f32 = 300.0;
+    pub const RECENT_ATTACK_TICKS: u32 = 60;
+}
+
+/// Journal events older than this never feed recent-damage and cast inputs.
+const RECENT_EVENT_TICKS: u32 = 4_800;
 const MAP_RAY_CELLS: usize = 20;
 const MAP_DIRECTIONS: [(i32, i32); 8] = [
     (1, 0),
@@ -111,7 +162,7 @@ const MAP_DIRECTIONS: [(i32, i32); 8] = [
     (1, -1),
 ];
 
-/// Stable indices in the global feature vector.
+/// Stable indices in each global vector; widths above one start a one-hot or fixed block.
 pub mod global_feature {
     pub const TICK: usize = 0;
     pub const PREGAME_PROGRESS: usize = 1;
@@ -119,252 +170,59 @@ pub mod global_feature {
     pub const JUNGLE_PHASE: usize = 3;
     pub const SIDE_RADIANT: usize = 4;
     pub const SIDE_DIRE: usize = 5;
-    pub const MAP_ZERO: usize = 6;
-    pub const MAP_ONE: usize = 7;
-    pub const SEAT_COUNT: usize = 8;
-    pub const ROLE_PRESENT: usize = 9;
-    pub const ROLE_TOKEN: usize = 10;
-    pub const LANE_PRESENT: usize = 11;
-    pub const LANE_TOKEN: usize = 12;
-    pub const KILL_ADVANTAGE: usize = 13;
-    pub const DEATH_ADVANTAGE: usize = 14;
-    pub const ASSIST_ADVANTAGE: usize = 15;
-    pub const XP_ADVANTAGE: usize = 16;
-    pub const LEVEL_ADVANTAGE: usize = 17;
-    pub const LAST_HIT_ADVANTAGE: usize = 18;
-    pub const DENY_ADVANTAGE: usize = 19;
-    pub const OWN_GOLD: usize = 20;
-    pub const OWN_ASSET_VALUE: usize = 21;
-    pub const RESPAWN_PRESENT: usize = 22;
-    pub const RESPAWN_LEFT: usize = 23;
-    pub const OWN_ALIVE: usize = 24;
-    pub const ALLIED_ALIVE_HEROES: usize = 25;
-    pub const ENEMY_ALIVE_HEROES: usize = 26;
-    pub const ALLIED_STRUCTURE_HP: usize = 27;
-    pub const ENEMY_STRUCTURE_HP: usize = 28;
-    pub const DESTROYED_STRUCTURES_PRESENT: usize = 29;
-    pub const DESTROYED_STRUCTURES: usize = 30;
-    pub const ACTIVE_ORDER_PRESENT: usize = 31;
-    pub const ACTIVE_ORDER_KIND: usize = 32;
-    pub const ACTIVE_ORDER_AGE: usize = 33;
-    pub const LAST_DECISION_PRESENT: usize = 34;
-    pub const TICKS_SINCE_DECISION: usize = 35;
-    pub const SNAPSHOT_DAMAGE_DEALT: usize = 36;
-    pub const SNAPSHOT_DAMAGE_TAKEN: usize = 37;
-    pub const OWN_LEVEL: usize = 38;
-    pub const OWN_XP: usize = 39;
-    pub const OWN_KILLS: usize = 40;
-    pub const OWN_DEATHS: usize = 41;
-    pub const OWN_ASSISTS: usize = 42;
-    pub const OWN_LAST_HITS: usize = 43;
-    pub const OWN_DENIES: usize = 44;
-    pub const VISIBLE_ALLIED_UNITS: usize = 45;
-    pub const VISIBLE_ENEMY_UNITS: usize = 46;
-    pub const ENEMY_SCOREBOARD_ENABLED: usize = 47;
-    pub const ACTIVE_TARGET_PRESENT: usize = 48;
-    pub const ACTIVE_TARGET_POINT: usize = 49;
-    pub const ACTIVE_TARGET_UNIT: usize = 50;
-    pub const ACTIVE_TARGET_VISIBLE: usize = 51;
-    pub const ACTIVE_TARGET_RELATIVE_X: usize = 52;
-    pub const ACTIVE_TARGET_RELATIVE_Y: usize = 53;
-    pub const ACTIVE_TARGET_DISTANCE: usize = 54;
-    pub const ACTIVE_TARGET_KIND_TOKEN: usize = 55;
-    pub const ACTIVE_TARGET_ALLIED: usize = 56;
-    pub const ACTIVE_TARGET_ENEMY: usize = 57;
-    pub const ACTIVE_TARGET_NEUTRAL: usize = 58;
-    pub const OWN_ANCIENT_PRESENT: usize = 64;
-    pub const OWN_ANCIENT_RELATIVE_X: usize = 65;
-    pub const OWN_ANCIENT_RELATIVE_Y: usize = 66;
-    pub const OWN_ANCIENT_DISTANCE: usize = 67;
-    pub const ENEMY_ANCIENT_PRESENT: usize = 68;
-    pub const ENEMY_ANCIENT_RELATIVE_X: usize = 69;
-    pub const ENEMY_ANCIENT_RELATIVE_Y: usize = 70;
-    pub const ENEMY_ANCIENT_DISTANCE: usize = 71;
-    pub const MAP_TWO: usize = 72;
-    /// Own and enemy weakest-tower HP fractions from the Map2 reward potential.
-    pub const MAP2_OWN_TOWER_HEALTH: usize = 73;
-    pub const MAP2_ENEMY_TOWER_HEALTH: usize = 74;
-    /// Own and enemy hero deaths over the Map2 death limit.
-    pub const MAP2_OWN_DEATHS: usize = 75;
-    pub const MAP2_ENEMY_DEATHS: usize = 76;
-    /// Own and enemy hero HP fractions as last seen; one while dead.
-    pub const MAP2_OWN_HERO_HEALTH: usize = 77;
-    pub const MAP2_ENEMY_HERO_HEALTH: usize = 78;
-    /// Clamped experience lead over the reward's saturation scale.
-    pub const MAP2_XP_LEAD: usize = 79;
-    /// Current Map2 reward potential, in reward units.
-    pub const MAP2_REWARD_POTENTIAL: usize = 80;
-    /// First of the always-zero reserved global slots.
-    pub const RESERVED_START: usize = 81;
+    pub const OWN_ASSET_VALUE: usize = 6;
+    pub const ACTIVE_ORDER_PRESENT: usize = 7;
+    pub const ACTIVE_ORDER_KIND_START: usize = 8;
+    pub const ACTIVE_ORDER_AGE: usize = 24;
+    pub const LAST_DECISION_PRESENT: usize = 25;
+    pub const SNAPSHOT_DAMAGE_DEALT: usize = 26;
+    pub const SNAPSHOT_DAMAGE_TAKEN: usize = 27;
+    pub const OWN_LEVEL: usize = 28;
+    pub const OWN_XP: usize = 29;
+    pub const OWN_LAST_HITS: usize = 30;
+    pub const OWN_DENIES: usize = 31;
+    pub const ACTIVE_TARGET_PRESENT: usize = 32;
+    pub const ACTIVE_TARGET_POINT: usize = 33;
+    pub const ACTIVE_TARGET_UNIT: usize = 34;
+    pub const ACTIVE_TARGET_VISIBLE: usize = 35;
+    pub const ACTIVE_TARGET_RELATIVE_X: usize = 36;
+    pub const ACTIVE_TARGET_RELATIVE_Y: usize = 37;
+    pub const ACTIVE_TARGET_DISTANCE_NEAR: usize = 38;
+    pub const ACTIVE_TARGET_DISTANCE_LOG: usize = 39;
+    pub const ACTIVE_TARGET_KIND_START: usize = 40;
+    pub const ACTIVE_TARGET_ALLIED: usize = 52;
+    pub const ACTIVE_TARGET_ENEMY: usize = 53;
+    pub const ACTIVE_TARGET_NEUTRAL: usize = 54;
+    pub const OWN_ANCIENT_RELATIVE_X: usize = 55;
+    pub const OWN_ANCIENT_RELATIVE_Y: usize = 56;
+    pub const OWN_ANCIENT_DISTANCE_LOG: usize = 57;
+    pub const ENEMY_ANCIENT_RELATIVE_X: usize = 58;
+    pub const ENEMY_ANCIENT_RELATIVE_Y: usize = 59;
+    pub const ENEMY_ANCIENT_DISTANCE_LOG: usize = 60;
+    pub const MAP2_OWN_TOWER_HEALTH: usize = 61;
+    pub const MAP2_ENEMY_TOWER_HEALTH: usize = 62;
+    pub const MAP2_OWN_DEATHS: usize = 63;
+    pub const MAP2_ENEMY_DEATHS: usize = 64;
+    pub const MAP2_OWN_HERO_HEALTH: usize = 65;
+    pub const MAP2_ENEMY_HERO_HEALTH: usize = 66;
+    pub const MAP2_XP_LEAD: usize = 67;
+    pub const MAP2_REWARD_POTENTIAL: usize = 68;
+    pub const ENEMY_HERO_VISIBLE: usize = 69;
+    pub const SECONDS_TO_KILL_ENEMY: usize = 70;
+    pub const SECONDS_TO_BE_KILLED: usize = 71;
+    pub const ENEMY_CREEPS_ACQUIRING: usize = 72;
+    pub const ENEMY_CREEPS_ATTACKING: usize = 73;
+    pub const CREEP_BALANCE: usize = 74;
+    pub const ALLIED_CREEPS_UNDER_ENEMY_TOWER: usize = 75;
+    pub const ENEMY_CREEPS_UNDER_OWN_TOWER: usize = 76;
+    pub const IN_ENEMY_TOWER_RANGE: usize = 77;
+    pub const ENEMY_TOWER_TARGETING: usize = 78;
+    pub const RAZES_READY: usize = 79;
+    pub const RAZES_AFFORDABLE: usize = 80;
+    pub(crate) const WIDTH: usize = 81;
 }
 
-/// Stable indices in each unit token.
-pub mod unit_feature {
-    pub const TOKEN_PRESENT: usize = 0;
-    pub const RELATION_START: usize = 1;
-    pub const KIND_TOKEN: usize = 5;
-    pub const OWNER_START: usize = 6;
-    pub const OWNER_PRESENT: usize = 9;
-    pub const OBSERVATION_PRESENT: usize = 10;
-    pub const VISIBLE: usize = 11;
-    pub const REMEMBERED: usize = 12;
-    pub const ORIGIN_PRESENT: usize = 13;
-    pub const AGE: usize = 14;
-    pub const POSITION_X: usize = 15;
-    pub const POSITION_Y: usize = 16;
-    pub const RELATIVE_X: usize = 17;
-    pub const RELATIVE_Y: usize = 18;
-    pub const DISTANCE: usize = 19;
-    pub const DIRECTION_X: usize = 20;
-    pub const DIRECTION_Y: usize = 21;
-    pub const FACING: usize = 22;
-    pub const RADIUS: usize = 23;
-    pub const VELOCITY_PRESENT: usize = 24;
-    pub const VELOCITY_X: usize = 25;
-    pub const VELOCITY_Y: usize = 26;
-    pub const HP_PRESENT: usize = 27;
-    pub const ELEVATION: usize = 28;
-    pub const WALKABLE: usize = 29;
-    pub const HP_RATIO: usize = 30;
-    pub const MANA_PRESENT: usize = 31;
-    pub const MANA_RATIO: usize = 32;
-    pub const HP_DELTA_PRESENT: usize = 33;
-    pub const HP_DELTA: usize = 34;
-    pub const MANA_DELTA_PRESENT: usize = 35;
-    pub const MANA_DELTA: usize = 36;
-    pub const ATTACK_DAMAGE: usize = 37;
-    pub const ATTACK_RANGE: usize = 38;
-    pub const ATTACK_INTERVAL: usize = 39;
-    pub const ATTACK_SPEED: usize = 40;
-    pub const MOVE_SPEED: usize = 41;
-    pub const ARMOR: usize = 42;
-    pub const MAGIC_RESISTANCE: usize = 43;
-    pub const VISION: usize = 44;
-    pub const TRUE_SIGHT: usize = 45;
-    pub const ATTACKS_TO_KILL_PRESENT: usize = 46;
-    pub const ATTACKS_TO_KILL: usize = 47;
-    pub const TIME_TO_REACH_PRESENT: usize = 48;
-    pub const TIME_TO_REACH: usize = 49;
-    pub const OWN_IN_ATTACK_RANGE: usize = 50;
-    pub const UNIT_IN_ATTACK_RANGE: usize = 51;
-    pub const STUNNED: usize = 52;
-    pub const SLOWED: usize = 56;
-    pub const DOT: usize = 57;
-    pub const INVISIBLE: usize = 58;
-    pub const MAGIC_IMMUNE: usize = 59;
-    pub const RECENT_DAMAGE_TAKEN: usize = 61;
-    pub const RECENT_DAMAGE_DEALT_PRESENT: usize = 62;
-    pub const RECENT_DAMAGE_DEALT: usize = 63;
-    pub const ATTACK_PHASE_PRESENT: usize = 64;
-    pub const ATTACK_PHASE: usize = 65;
-    pub const ITEM_SLOT_COUNT: usize = 66;
-    pub const FREE_ITEM_SLOTS: usize = 67;
-    pub const ITEM_CAPACITY_AVAILABLE: usize = 68;
-    pub const INVULNERABLE: usize = 69;
-    pub const CHANNELLING: usize = 70;
-    pub const FACING_COS: usize = 71;
-    pub const FACING_SIN: usize = 72;
-    pub const RAZE_EFFECT_PRESENT: usize = 73;
-    pub const RAZE_STACKS: usize = 74;
-    pub const RAZE_TICKS_LEFT: usize = 75;
-    /// Guarded effect13 remaining ticks / 15; positive implies observed presence.
-    pub const GUARDED_TICKS_LEFT: usize = 76;
-    /// Inspired effect14 remaining ticks / 15; positive implies observed presence.
-    pub const INSPIRED_TICKS_LEFT: usize = 77;
-    pub const HEALTH_RESTORE_REPORT_PRESENT: usize = 78;
-    pub const HEALTH_RESTORE_REPORT_AMOUNT: usize = 79;
-    pub const HEALTH_RESTORE_REPORT_AGE: usize = 80;
-    pub const MANA_RESTORE_REPORT_PRESENT: usize = 81;
-    pub const MANA_RESTORE_REPORT_AMOUNT: usize = 82;
-    pub const MANA_RESTORE_REPORT_AGE: usize = 83;
-}
-
-/// Stable indices in each point-candidate token.
-pub mod point_feature {
-    pub const TOKEN_PRESENT: usize = 0;
-    pub const POINTER_VALID: usize = 1;
-    pub const POSITION_X: usize = 2;
-    pub const POSITION_Y: usize = 3;
-    pub const ORIGIN_PRESENT: usize = 4;
-    pub const RELATIVE_X: usize = 5;
-    pub const RELATIVE_Y: usize = 6;
-    pub const DISTANCE: usize = 7;
-    pub const DIRECTION_X: usize = 8;
-    pub const DIRECTION_Y: usize = 9;
-    pub const SOURCE_TOKEN: usize = 10;
-    pub const SOURCE_DIRECTION_PRESENT: usize = 11;
-    pub const SOURCE_DIRECTION_TOKEN: usize = 12;
-    pub const SOURCE_RADIUS_PRESENT: usize = 13;
-    pub const SOURCE_RADIUS: usize = 14;
-    pub const SOURCE_KIND_PRESENT: usize = 15;
-    pub const SOURCE_KIND_TOKEN: usize = 16;
-    pub const SOURCE_RELATION_PRESENT: usize = 17;
-    pub const SOURCE_RELATION_START: usize = 18;
-    pub const WALKABLE: usize = 22;
-    pub const STANDING_TREE: usize = 23;
-    pub const ALLIED_BUILDING: usize = 24;
-    pub const SIGHTING_AGE: usize = 25;
-    /// Visible hostile non-hero units struck per raze reach, near to far.
-    pub const RAZE_UNITS_START: usize = 26;
-    /// Visible enemy heroes struck per raze reach, near to far.
-    pub const RAZE_HEROES_START: usize = 29;
-}
-
-/// Stable indices in each ability token.
-pub mod ability_feature {
-    pub const TOKEN_PRESENT: usize = 0;
-    pub const BODY_TOKEN: usize = 1;
-    pub const SEMANTIC_SLOT_TOKEN: usize = 2;
-    pub const OBSERVATION_PRESENT: usize = 3;
-    pub const ID_PRESENT: usize = 4;
-    pub const ID_TOKEN: usize = 5;
-    pub const LEVEL: usize = 6;
-    pub const MAX_LEVEL: usize = 7;
-    pub const COOLDOWN: usize = 8;
-    pub const MANA_COST: usize = 9;
-    pub const RANGE: usize = 10;
-    pub const AIM_TOKEN: usize = 11;
-    pub const PASSIVE: usize = 12;
-    pub const TOGGLE_ON: usize = 13;
-    pub const CAN_LEVEL: usize = 14;
-    pub const LEGAL: usize = 15;
-    pub const LAST_CAST_PRESENT: usize = 16;
-    pub const LAST_CAST_AGE: usize = 17;
-    pub const SCOREBOARD_KIT_SOURCE: usize = 18;
-}
-
-/// Stable indices in each item token.
-pub mod item_feature {
-    pub const TOKEN_PRESENT: usize = 0;
-    pub const LOCATION_TOKEN: usize = 1;
-    pub const SLOT_TOKEN: usize = 2;
-    pub const ITEM_PRESENT: usize = 3;
-    pub const ITEM_TOKEN: usize = 4;
-    pub const CHARGES_PRESENT: usize = 5;
-    pub const CHARGES: usize = 6;
-    pub const COOLDOWN: usize = 7;
-    pub const AIM_PRESENT: usize = 8;
-    pub const AIM_TOKEN: usize = 9;
-    pub const RANGE: usize = 10;
-    pub const MANA_COST: usize = 11;
-    pub const ATTRIBUTE_PRESENT: usize = 12;
-    pub const ATTRIBUTE_TOKEN: usize = 13;
-    pub const FOR_SALE: usize = 14;
-    pub const MUTED: usize = 15;
-    pub const VALUE_PRESENT: usize = 16;
-    pub const VALUE: usize = 17;
-    pub const RECIPE_COMPONENT: usize = 18;
-    pub const COMPOSITE: usize = 19;
-    pub const LEGAL: usize = 20;
-    pub const SHOP_CANDIDATE: usize = 21;
-    pub const MUTE_REMAINING_PRESENT: usize = 22;
-    pub const MUTE_REMAINING: usize = 23;
-    pub const SHARED_WAIT_PRESENT: usize = 24;
-    pub const SHARED_WAIT_REMAINING: usize = 25;
-    pub const SCOREBOARD_KIT_SOURCE: usize = 26;
-}
-
-/// Stable indices in each global-history sample.
+/// Stable indices in each global-history sample; widths above one start a one-hot or fixed block.
 pub mod history_feature {
     pub const SAMPLE_PRESENT: usize = 0;
     pub const AGE: usize = 1;
@@ -378,76 +236,278 @@ pub mod history_feature {
     pub const RESPAWN_LEFT: usize = 9;
     pub const VISIBLE_ALLIED_UNITS: usize = 10;
     pub const VISIBLE_ENEMY_UNITS: usize = 11;
-    pub const XP_ADVANTAGE: usize = 12;
-    pub const LEVEL_ADVANTAGE: usize = 13;
-    pub const KILL_ADVANTAGE: usize = 14;
-    pub const DEATH_ADVANTAGE: usize = 15;
-    pub const ASSIST_ADVANTAGE: usize = 16;
-    pub const LAST_HIT_ADVANTAGE: usize = 17;
-    pub const DENY_ADVANTAGE: usize = 18;
-    pub const ALLIED_STRUCTURE_HP: usize = 19;
-    pub const ENEMY_STRUCTURE_HP: usize = 20;
-    pub const DESTROYED_STRUCTURES_PRESENT: usize = 21;
-    pub const DESTROYED_STRUCTURES: usize = 22;
-    pub const ENEMY_SCOREBOARD_ENABLED: usize = 23;
+    pub(crate) const WIDTH: usize = 12;
 }
 
-/// Stable indices in each projectile token.
+/// Stable indices in each local policy-history sample; widths above one start a one-hot or fixed block.
+pub mod policy_history_feature {
+    pub const KIND_START: usize = 0;
+    pub(crate) const WIDTH: usize = 16;
+}
+
+/// Stable indices in each local map context; widths above one start a one-hot or fixed block.
+pub mod map_feature {
+    pub const WALKABLE: usize = 0;
+    pub const WATER: usize = 1;
+    pub const ELEVATION: usize = 2;
+    pub const OWN_FOUNTAIN_DISTANCE_LOG: usize = 3;
+    pub const ENEMY_FOUNTAIN_DISTANCE_LOG: usize = 4;
+    pub const OWN_TOWER_DISTANCE_LOG: usize = 5;
+    pub const ENEMY_TOWER_DISTANCE_LOG: usize = 6;
+    pub const RAYS_START: usize = 7;
+    pub(crate) const WIDTH: usize = 87;
+}
+
+/// Stable indices in each unit token; widths above one start a one-hot or fixed block.
+pub mod unit_feature {
+    pub const TOKEN_PRESENT: usize = 0;
+    pub const RELATION_START: usize = 1;
+    pub const KIND_START: usize = 5;
+    pub const ENEMY_OWNED: usize = 17;
+    pub const VISIBLE: usize = 18;
+    pub const AGE: usize = 19;
+    pub const POSITION_X: usize = 20;
+    pub const POSITION_Y: usize = 21;
+    pub const RELATIVE_X: usize = 22;
+    pub const RELATIVE_Y: usize = 23;
+    pub const DIRECTION_X: usize = 24;
+    pub const DIRECTION_Y: usize = 25;
+    pub const DISTANCE_NEAR: usize = 26;
+    pub const DISTANCE_LOG: usize = 27;
+    pub const BEARING_COS: usize = 28;
+    pub const BEARING_SIN: usize = 29;
+    pub const FACING_COS: usize = 30;
+    pub const FACING_SIN: usize = 31;
+    pub const BOUND: usize = 32;
+    pub const MOTION_PRESENT: usize = 33;
+    pub const VELOCITY_X: usize = 34;
+    pub const VELOCITY_Y: usize = 35;
+    pub const ELEVATION: usize = 36;
+    pub const WALKABLE: usize = 37;
+    pub const HP_RATIO: usize = 38;
+    pub const HP_NEAR: usize = 39;
+    pub const HP_LOG: usize = 40;
+    pub const MAX_HP_LOG: usize = 41;
+    pub const MANA_PRESENT: usize = 42;
+    pub const MANA_RATIO: usize = 43;
+    pub const MANA_NEAR: usize = 44;
+    pub const MAX_MANA_NEAR: usize = 45;
+    pub const HP_DELTA: usize = 46;
+    pub const MANA_DELTA: usize = 47;
+    pub const EFFECTIVE_HP_PHYSICAL: usize = 48;
+    pub const EFFECTIVE_HP_MAGICAL: usize = 49;
+    pub const LEVEL: usize = 50;
+    pub const ATTACK_DAMAGE: usize = 51;
+    pub const ATTACK_RANGE: usize = 52;
+    pub const ATTACK_TIME: usize = 53;
+    pub const ATTACK_POINT: usize = 54;
+    pub const ATTACK_SPEED: usize = 55;
+    pub const MOVE_SPEED: usize = 56;
+    pub const ARMOR: usize = 57;
+    pub const MAGIC_RESISTANCE: usize = 58;
+    pub const VISION: usize = 59;
+    pub const HERO_RELATIVE_PRESENT: usize = 60;
+    pub const OWN_HIT: usize = 61;
+    pub const OWN_HITS_TO_KILL: usize = 62;
+    pub const ITS_HIT: usize = 63;
+    pub const ITS_HITS_TO_KILL_OWN: usize = 64;
+    pub const TIME_TO_REACH: usize = 65;
+    pub const OWN_IN_ATTACK_RANGE: usize = 66;
+    pub const UNIT_IN_ATTACK_RANGE: usize = 67;
+    pub const OWN_RANGE_MARGIN: usize = 68;
+    pub const UNIT_RANGE_MARGIN: usize = 69;
+    pub const OWN_IN_ACQUISITION: usize = 70;
+    pub const KILLABLE_NOW: usize = 71;
+    pub const OWN_RAZE_DAMAGE: usize = 72;
+    pub const OWN_RAZES_TO_KILL: usize = 73;
+    pub const IN_OWN_RAZE_START: usize = 74;
+    pub const SLOWED: usize = 77;
+    pub const INVULNERABLE: usize = 78;
+    pub const CHANNELLING: usize = 79;
+    pub const RECENT_DAMAGE_TAKEN: usize = 80;
+    pub const RECENT_DAMAGE_DEALT_PRESENT: usize = 81;
+    pub const RECENT_DAMAGE_DEALT: usize = 82;
+    pub const ATTACK_PHASE_PRESENT: usize = 83;
+    pub const ATTACK_PHASE: usize = 84;
+    pub const ATTACKING_OWN_HERO: usize = 85;
+    pub const ATTACKING_OWN_SIDE: usize = 86;
+    pub const RAZE_EFFECT_PRESENT: usize = 87;
+    pub const RAZE_STACKS: usize = 88;
+    pub const RAZE_TICKS_LEFT: usize = 89;
+    pub const GUARDED_TICKS_LEFT: usize = 90;
+    pub const INSPIRED_TICKS_LEFT: usize = 91;
+    pub const HEALTH_RESTORE_REPORT_PRESENT: usize = 92;
+    pub const HEALTH_RESTORE_REPORT_AMOUNT: usize = 93;
+    pub const HEALTH_RESTORE_REPORT_AGE: usize = 94;
+    pub const MANA_RESTORE_REPORT_PRESENT: usize = 95;
+    pub const MANA_RESTORE_REPORT_AMOUNT: usize = 96;
+    pub const MANA_RESTORE_REPORT_AGE: usize = 97;
+    pub const KIT_PRESENT: usize = 98;
+    pub const RAZE_COOLDOWN_START: usize = 99;
+    pub const RAZE_LEVEL: usize = 102;
+    pub const REQUIEM_COOLDOWN: usize = 103;
+    pub const REQUIEM_LEVEL: usize = 104;
+    pub const CAN_AFFORD_RAZE: usize = 105;
+    pub const RAZE_THREAT_START: usize = 106;
+    pub(crate) const WIDTH: usize = 109;
+}
+
+/// Stable indices in each point-candidate token; widths above one start a one-hot or fixed block.
+pub mod point_feature {
+    pub const TOKEN_PRESENT: usize = 0;
+    pub const POSITION_X: usize = 1;
+    pub const POSITION_Y: usize = 2;
+    pub const RELATIVE_X: usize = 3;
+    pub const RELATIVE_Y: usize = 4;
+    pub const DIRECTION_X: usize = 5;
+    pub const DIRECTION_Y: usize = 6;
+    pub const DISTANCE_NEAR: usize = 7;
+    pub const DISTANCE_LOG: usize = 8;
+    pub const BEARING_COS: usize = 9;
+    pub const BEARING_SIN: usize = 10;
+    pub const SOURCE_START: usize = 11;
+    pub const SOURCE_DIRECTION_START: usize = 24;
+    pub const SOURCE_RADIUS_PRESENT: usize = 32;
+    pub const SOURCE_RADIUS: usize = 33;
+    pub const SOURCE_KIND_START: usize = 34;
+    pub const SOURCE_RELATION_START: usize = 46;
+    pub const WALKABLE: usize = 50;
+    pub const STANDING_TREE: usize = 51;
+    pub const ALLIED_BUILDING: usize = 52;
+    pub const SIGHTING_AGE: usize = 53;
+    pub const RAZE_UNITS_START: usize = 54;
+    pub const RAZE_HEROES_START: usize = 57;
+    pub(crate) const WIDTH: usize = 60;
+}
+
+/// Stable indices in each ability token; widths above one start a one-hot or fixed block.
+pub mod ability_feature {
+    pub const TOKEN_PRESENT: usize = 0;
+    pub const BODY_START: usize = 1;
+    pub const SLOT_START: usize = 3;
+    pub const OBSERVED: usize = 11;
+    pub const ID_START: usize = 12;
+    pub const LEVEL: usize = 37;
+    pub const MAX_LEVEL: usize = 38;
+    pub const COOLDOWN_NEAR: usize = 39;
+    pub const COOLDOWN_LOG: usize = 40;
+    pub const MANA_COST: usize = 41;
+    pub const RANGE: usize = 42;
+    pub const AIM_START: usize = 43;
+    pub const PASSIVE: usize = 48;
+    pub const TOGGLE_ON: usize = 49;
+    pub const CAN_LEVEL: usize = 50;
+    pub const LEGAL: usize = 51;
+    pub const LAST_CAST_PRESENT: usize = 52;
+    pub const LAST_CAST_AGE: usize = 53;
+    pub const SCOREBOARD_KIT_SOURCE: usize = 54;
+    pub const MANA_SUFFICIENT: usize = 55;
+    pub(crate) const WIDTH: usize = 56;
+}
+
+/// Stable indices in each item token; widths above one start a one-hot or fixed block.
+pub mod item_feature {
+    pub const TOKEN_PRESENT: usize = 0;
+    pub const LOCATION_START: usize = 1;
+    pub const SLOT: usize = 6;
+    pub const ITEM_PRESENT: usize = 7;
+    pub const ITEM_START: usize = 8;
+    pub const CHARGES_PRESENT: usize = 73;
+    pub const CHARGES: usize = 74;
+    pub const COOLDOWN_NEAR: usize = 75;
+    pub const COOLDOWN_LOG: usize = 76;
+    pub const AIM_PRESENT: usize = 77;
+    pub const AIM_START: usize = 78;
+    pub const RANGE: usize = 83;
+    pub const MANA_COST: usize = 84;
+    pub const ATTRIBUTE_PRESENT: usize = 85;
+    pub const ATTRIBUTE_START: usize = 86;
+    pub const FOR_SALE: usize = 89;
+    pub const MUTED: usize = 90;
+    pub const VALUE_PRESENT: usize = 91;
+    pub const VALUE: usize = 92;
+    pub const RECIPE_COMPONENT: usize = 93;
+    pub const COMPOSITE: usize = 94;
+    pub const LEGAL: usize = 95;
+    pub const SHOP_CANDIDATE: usize = 96;
+    pub const MUTE_REMAINING_PRESENT: usize = 97;
+    pub const MUTE_REMAINING: usize = 98;
+    pub const SHARED_WAIT_PRESENT: usize = 99;
+    pub const SHARED_WAIT_REMAINING: usize = 100;
+    pub const SCOREBOARD_KIT_SOURCE: usize = 101;
+    pub(crate) const WIDTH: usize = 102;
+}
+
+/// Stable indices in each projectile token; widths above one start a one-hot or fixed block.
 pub mod projectile_feature {
     pub const TOKEN_PRESENT: usize = 0;
     pub const RELATION_START: usize = 1;
     pub const ABILITY_PRESENT: usize = 5;
-    pub const ABILITY_TOKEN: usize = 6;
-    pub const RELATIVE_X: usize = 7;
-    pub const RELATIVE_Y: usize = 8;
-    pub const FACING: usize = 9;
-    pub const VELOCITY_PRESENT: usize = 10;
-    pub const VELOCITY_X: usize = 11;
-    pub const VELOCITY_Y: usize = 12;
-    pub const AGE_PRESENT: usize = 13;
-    pub const AGE: usize = 14;
-    pub const CLOSEST_APPROACH_PRESENT: usize = 15;
-    pub const CLOSEST_APPROACH: usize = 16;
-    pub const ORIGIN_PRESENT: usize = 17;
+    pub const ABILITY_START: usize = 6;
+    pub const RELATIVE_X: usize = 31;
+    pub const RELATIVE_Y: usize = 32;
+    pub const FACING_COS: usize = 33;
+    pub const FACING_SIN: usize = 34;
+    pub const VELOCITY_PRESENT: usize = 35;
+    pub const VELOCITY_X: usize = 36;
+    pub const VELOCITY_Y: usize = 37;
+    pub const AGE: usize = 38;
+    pub const CLOSEST_APPROACH_PRESENT: usize = 39;
+    pub const CLOSEST_APPROACH: usize = 40;
+    pub(crate) const WIDTH: usize = 41;
 }
 
-/// Stable indices in each ground-loot token.
+/// Stable indices in each ground-loot token; widths above one start a one-hot or fixed block.
 pub mod loot_feature {
     pub const TOKEN_PRESENT: usize = 0;
-    pub const ITEM_TOKEN: usize = 1;
-    pub const CHARGES_PRESENT: usize = 2;
-    pub const CHARGES: usize = 3;
-    pub const RELATIVE_X: usize = 4;
-    pub const RELATIVE_Y: usize = 5;
-    pub const DIRECT_DISTANCE: usize = 6;
-    pub const PATH_DISTANCE_PRESENT: usize = 7;
-    pub const PATH_DISTANCE: usize = 8;
-    pub const VISIBLE_AGE_PRESENT: usize = 9;
-    pub const VISIBLE_AGE: usize = 10;
-    pub const ORIGIN_PRESENT: usize = 11;
+    pub const ITEM_START: usize = 1;
+    pub const CHARGES_PRESENT: usize = 66;
+    pub const CHARGES: usize = 67;
+    pub const RELATIVE_X: usize = 68;
+    pub const RELATIVE_Y: usize = 69;
+    pub const DISTANCE_NEAR: usize = 70;
+    pub const PATH_DISTANCE_PRESENT: usize = 71;
+    pub const PATH_DISTANCE: usize = 72;
+    pub const VISIBLE_AGE_PRESENT: usize = 73;
+    pub const VISIBLE_AGE: usize = 74;
+    pub(crate) const WIDTH: usize = 75;
 }
 
 /// Canonical schema text covered by [`FEATURE_SCHEMA_HASH`].
 pub const FEATURE_SCHEMA_DESCRIPTOR: &str = concat!(
-    "bota-drysua-feature/v23;",
-    "action_schema_version=5;action_schema_hash=linked;",
-    "navigation_contract=existing_walkable_building_landing_move_pointers_allowed,attack_move_veto_and_tp_provenance_unchanged;frame_legality_and_action_space_provenance=new_contract,raw_dimensions_field_ids_point_order_and_sources_unchanged,no_old_frame_or_corpus_relabel;",
-    "shapes=global:92,history:7x24,policy_history:16x4,unit:96x84,own_unit:2x84,remembered_unit:32x84,point:48x32,ability:14x24,item:85x28,projectile:32x20,loot:16x16,map:96;",
-    "scalar_ranges=presence_and_one_hot:[0,1],unsigned_continuous:[0,1],signed_continuous:[-1,1],category:positive_exact_integer,all_finite;",
+    "bota-drysua-feature/v26;",
+    "shapes=global:81,history:7x12,policy_history:16x16,unit:96x109,own_unit:2x109,remembered_unit:32x109,point:64x60,ability:14x56,item:94x102,projectile:32x41,loot:16x75,map:87;",
+    "scalar_ranges=all_finite_within_minus1_1,one_hot_blocks_one_hot_or_all_zero,no_host_conditioning;",
     "history_ages=480,240,120,60,30,15,0;",
-    "normalizers=tick:3600000,age:4800,history_age:480,gold_asset_item_cost:100000,score:1000,xp:100000,hp:100000,mana:20000,damage:10000,attack_interval:600,speed:2000,armor_raw:6553600,level:30,charges:255,cooldown:36000,structures:64;",
+    "normalizers=distance:euclidean_centres_near_min(d,2000)/2000_log_ln(1+d/100)/ln(261),position_and_relative:extent,health:ratio_near_min(hp,1000)/1000_log_ln1p(hp)/ln1p(5000),effective_health:ln1p(hp/kept)/ln1p(10000),mana:ratio_near1000,pool_delta:100,damage:300,range:1000,attack_time_ms:3000,attack_point_ms:1000,attack_speed:700,move_speed:550,armor:30,vision:2000,bound:300,velocity_units_per_second:600,hits:20_ceil,reach_seconds:10,margin:1000,raze_damage:500,razes_to_kill:cap5,raze_stacks:4,level:25,cooldown_ticks:near300_log3600,restored_health:500,restored_mana:300,gold_assets_xp:5000,last_hits:100,denies:50,snapshot_damage:200,order_age_ticks:900,respawn_ticks:1800,visible_units:64,creeps:8,ability_mana:200,item_value:5000,charges:10,mute_ticks:180,shared_wait_ticks:2100,last_cast_ticks:1800,projectile:relative2000_velocity1500_age60_approach500,loot_age_ticks:300,raze_cooldown_ticks:300,requiem_cooldown_ticks:3600,tick:27900;all_clamped;",
+    "one_hot=unit_kind:Hero,CreepMelee,CreepFlagbearer,CreepRanged,CreepSiege,CreepNeutral,Tower,Ancient,Barracks,Fountain,Ward,Courier;action_kind:append_only16;relation:own,allied,enemy,neutral;ability_id:0..23_then_other;item_id:0..63_then_other;aim:Own,Point,Unit,Tree,Building;attribute:Strength,Agility,Intelligence;body:hero,courier;ability_slot:0..7;item_location:hero,stash,courier,shop,enemy_hero;point_source:Tactical,StaticTree,PlantedTree,BuildingLanding,Fountain,Tower,PredictedHero,PredictedCreep,RazeFacing,RazeCluster,LastSeenHero,ExtrapolatedHero,RazeRing;point_direction:E,NE,N,NW,W,SW,S,SE;",
+    "global_layout=tick,pregame_progress,wave_phase,jungle_phase,side_radiant,side_dire,own_asset_value,active_order_present,active_order_kind16,active_order_age,last_decision_present,snapshot_damage_dealt,snapshot_damage_taken,own_level,own_xp,own_last_hits,own_denies,active_target_present,active_target_point,active_target_unit,active_target_visible,active_target_relative_x,active_target_relative_y,active_target_distance_near,active_target_distance_log,active_target_kind12,active_target_allied,active_target_enemy,active_target_neutral,own_ancient_relative_x,own_ancient_relative_y,own_ancient_distance_log,enemy_ancient_relative_x,enemy_ancient_relative_y,enemy_ancient_distance_log,map2_own_tower_health,map2_enemy_tower_health,map2_own_deaths,map2_enemy_deaths,map2_own_hero_health,map2_enemy_hero_health,map2_xp_lead,map2_reward_potential,enemy_hero_visible,seconds_to_kill_enemy,seconds_to_be_killed,enemy_creeps_acquiring,enemy_creeps_attacking,creep_balance,allied_creeps_under_enemy_tower,enemy_creeps_under_own_tower,in_enemy_tower_range,enemy_tower_targeting,razes_ready,razes_affordable;",
+    "history_layout=sample_present,age,hp_present,hp_ratio,mana_present,mana_ratio,own_level,own_gold,own_alive,respawn_left,visible_allied_units,visible_enemy_units;",
+    "policy_history_layout=kind16;",
+    "map_layout=walkable,water,elevation,own_fountain_distance_log,enemy_fountain_distance_log,own_tower_distance_log,enemy_tower_distance_log,rays80;",
+    "unit_layout=token_present,relation4,kind12,enemy_owned,visible,age,position_x,position_y,relative_x,relative_y,direction_x,direction_y,distance_near,distance_log,bearing_cos,bearing_sin,facing_cos,facing_sin,bound,motion_present,velocity_x,velocity_y,elevation,walkable,hp_ratio,hp_near,hp_log,max_hp_log,mana_present,mana_ratio,mana_near,max_mana_near,hp_delta,mana_delta,effective_hp_physical,effective_hp_magical,level,attack_damage,attack_range,attack_time,attack_point,attack_speed,move_speed,armor,magic_resistance,vision,hero_relative_present,own_hit,own_hits_to_kill,its_hit,its_hits_to_kill_own,time_to_reach,own_in_attack_range,unit_in_attack_range,own_range_margin,unit_range_margin,own_in_acquisition,killable_now,own_raze_damage,own_razes_to_kill,in_own_raze3,slowed,invulnerable,channelling,recent_damage_taken,recent_damage_dealt_present,recent_damage_dealt,attack_phase_present,attack_phase,attacking_own_hero,attacking_own_side,raze_effect_present,raze_stacks,raze_ticks_left,guarded_ticks_left,inspired_ticks_left,health_restore_report_present,health_restore_report_amount,health_restore_report_age,mana_restore_report_present,mana_restore_report_amount,mana_restore_report_age,kit_present,raze_cooldown3,raze_level,requiem_cooldown,requiem_level,can_afford_raze,raze_threat3;",
+    "point_layout=token_present,position_x,position_y,relative_x,relative_y,direction_x,direction_y,distance_near,distance_log,bearing_cos,bearing_sin,source13,source_direction8,source_radius_present,source_radius,source_kind12,source_relation4,walkable,standing_tree,allied_building,sighting_age,raze_units3,raze_heroes3;",
+    "ability_layout=token_present,body2,slot8,observed,id25,level,max_level,cooldown_near,cooldown_log,mana_cost,range,aim5,passive,toggle_on,can_level,legal,last_cast_present,last_cast_age,scoreboard_kit_source,mana_sufficient;",
+    "item_layout=token_present,location5,slot,item_present,item65,charges_present,charges,cooldown_near,cooldown_log,aim_present,aim5,range,mana_cost,attribute_present,attribute3,for_sale,muted,value_present,value,recipe_component,composite,legal,shop_candidate,mute_remaining_present,mute_remaining,shared_wait_present,shared_wait_remaining,scoreboard_kit_source;",
+    "projectile_layout=token_present,relation4,ability_present,ability25,relative_x,relative_y,facing_cos,facing_sin,velocity_present,velocity_x,velocity_y,age,closest_approach_present,closest_approach;",
+    "loot_layout=token_present,item65,charges_present,charges,relative_x,relative_y,distance_near,path_distance_present,path_distance,visible_age_present,visible_age;",
+    "unit_leading_when_present=own-hero-then-own-courier;item_fixed=hero9,stash6,courier6,shop64,enemy_hero9;",
+    "derived=own_hero_perspective_zero_without_live_own_hero,armor_kept:100/(100+6max(armor,0)),magic_kept:1-magic_resist,own_hit_and_its_hit_after_target_mitigation,hits_to_kill_ceil,time_to_reach_euclidean_over_own_move_speed,range_margins_centre_distance_minus_range_minus_both_bounds,acquisition:melee_flagbearer_neutral500_ranged600_siege800_tower_fountain_attack_range_plus_both_bounds,killable_now:last_hit_or_deny_below50pct_building10pct,raze_damage:90_160_230_300_plus_stack50_60_70_80_per_held_stack_times_magic_kept,raze_strikes:centre_within250_of_landing_along_current_facing_live_uninvulnerable_nonstructure;",
+    "hero_kit=every_hero_token_visible_or_remembered,raze_and_requiem_cooldown_minus_age,shared_raze_level,requiem_level,can_afford_next_raze;raze_threat=hostile_hero_landing_along_its_facing_strikes_own_hero;recent_attack=last_damage_dealt_within60_ticks_on_own_hero_or_other_own_side_unit;",
+    "global_derived=seconds_to_kill_enemy_and_to_be_killed:ready_affordable_razes_stacking_then_attacks_cap30_div30,enemy_hero_visible,enemy_creeps_acquiring_and_attacking_own_hero,creep_balance_within1200,allied_creeps_in_enemy_tower_range,enemy_creeps_in_own_tower_range,own_hero_in_enemy_tower_range,enemy_tower_hit_own_hero_within60,razes_ready_and_affordable_div3;",
+    "enemy_items=nearest_visible_else_most_recent_remembered_enemy_hero_inventory9;",
+    "active_target=opaque_local_point_or_full_generation_unit_key_never_encoded_as_identifier,canonical_relative_extent,euclidean_near_and_log_distance,point_or_unit,visibility,unit_kind_one_hot_and_relation;",
+    "policy_history=16_newest_first_selected_kind_one_hot_only,no_ages_targets_slots_outcomes;fallback_bookkeeping=no_wire_request_no_selected_action_no_sent_history_insertion;",
+    "ancient_geometry=seat_observed_current_or_remembered_Ancient_kind_exact_team,only_unique_known_position_per_team,requires_live_own_hero_origin,canonical_delta_extent_log_distance,missing_or_ambiguous_all_zero;",
+    "map2_slots=own_and_enemy_weakest_tower_hp,deaths_div_limit,hero_hp_last_seen_dead1,xp_lead_clamped,reward_potential;",
+    "raze_effect=anonymous_effect15_present,stacks_div4_clamped,ticks_left_div240;pair=max_lexicographic_valid_active_row_stacks_then_remaining_ticks,never_sum_or_source_attribution;memory_timer=observed_ticks_minus_age_expired_zero,no_fog_refresh,known_death_clears;",
+    "manual_restoration=Healed_amount_health_and_mana_independent_reports,latest_positive_per_channel,amount_health_div500_mana_div300_clamped,age_div480;",
+    "navigation_contract=existing_walkable_building_landing_move_pointers_allowed,attack_move_veto_and_tp_provenance_unchanged;frame_legality_and_action_space_provenance=new_contract,raw_dimensions_field_ids_point_order_and_sources_unchanged,no_old_frame_or_corpus_relabel;",
     "coordinates=raw_extent:terrain_cells*64*65536,dire_position:(extent_raw-1)-raw,dire_delta:negated,dire_facing:brads+32768_wrapping,absolute_side:global[4:6];",
-    "categories=unit_kind:Hero1,CreepMelee2,CreepFlagbearer3,CreepRanged4,CreepSiege5,CreepNeutral6,Tower7,Ancient8,Barracks9,Fountain10,Ward11,Courier12;",
-    "ability_category=id8:1,id9:2,id10:3,id11:4,id12:5,id13:6,id14:7,id15:8,id16:9,id17:10,id18:11,other:raw+12,range:1..65547;",
-    "item_category=raw+1,range:1..65536;aim=Own1,Point2,Unit3,Tree4,Building5;attribute=Strength1,Agility2,Intelligence3;",
-    "action_category=Continue1,Stop2,MovePoint3,FollowUnit4,Hold5,AttackMovePoint6,AttackUnit7,Cast8,Use9,PutPoint10,PutUnit11,Take12,Buy13,Sell14,Swap15,Learn16;",
-    "role_category=Carry1,Mid2,Offlane3,Support4,HardSupport5;lane_category=Safe1,Mid2,Offlane3;body_category=Hero1,Courier2;item_location=hero2,stash3,courier4,shop5;slots=zero_based_plus_one;",
-    "unit_leading_when_present=own-hero-then-own-courier;item_fixed=hero9,stash6,courier6,shop64;",
     "unit_candidates=current_visible_live_only,cap96,priority:own_body_then_hero_then_structure_then_within1200_then_other,distance_then_relation_then_owner_relation_then_canonical_model_semantics_then_entity_id_only_for_semantically_identical_ties;",
     "unit_semantic_order=kind,canonical_position,canonical_facing,hp,max_hp,mana,max_mana,move_speed,attack_damage,attack_range,attack_time,attack_point,attack_speed,armor,magic_resistance,bound,collision,vision,true_sight,statuses,item_slot_count,free_item_slots,item_capacity_available,canonical_velocity,hp_delta,mana_delta,recent_damage,recent_cast,recent_attack;",
     "unit_memory=units_exact_current_pointer_order,own_units_fixed_hero_courier_current_or_remembered,remembered_units_nonown_hidden_cap32_lexicographic_complete_encoded_token,tracker_cap4096_evict_complete_oldest_invisible_last_seen_tick_cohorts,no_target_handles;",
     "point_candidates=cap64,deduplicate_position_keep_first_source,canonical_team_directions,generate:general_cap48_tactical_radii200_600_1200_in_E_NE_N_NW_W_SW_S_SE_order_then_allied_building_landings_then_nearest8_visible_or_static-baseline_trees_then_own_fountain_enemy_fountain_own_tower_enemy_tower_then_predicted_units,then_live_own_hero_raze_only_cap16_facing_then_best_landing_near_mid_far_then_fogged_enemy_heroes_last_seen_extrapolated_then_blind_ring8;",
-    "point_features=exact_action_pointer_prefix,present,pointer_valid,canonical_position,relative_position,distance,direction,source_category,direction_radius_kind_relation_parameters,walkable,standing_tree,allied_building,fog_sighting_age,raze_coverage_along_heading_to_point_units_and_heroes_per_reach_200_450_700_visible_hostile_live_uninvulnerable_nonstructure_within250_of_landing;",
     "point_order=building:distance_kind_canonical_landing_position_entity_id_identical_tie,tree:distance_canonical_position_planted,predicted:distance_source_relation_canonical_position_entity_id_identical_tie,landmark:distance_canonical_position_entity_id_identical_tie;shop_order=item_id;",
     "loot_candidates=current_visible,cap16,order:item_then_charges_then_position_then_entity_id_only_for_semantically_identical_ties;",
     "projectile_order=lexicographic_encoded_semantics,select_first32,feature_identical_ties_indistinguishable;",
@@ -460,48 +520,19 @@ pub const FEATURE_SCHEMA_DESCRIPTOR: &str = concat!(
     "trees=opaque_cells_include_static_map_tree_cells,static_occupancy_baseline,dynamic_delta_proof_requires_live_allied_body_in_same_or_adjacent_cell,proof_ignores_all_dynamic_tree_entries,local_felled_unblocks_passability_and_tree_mask,local_planted_blocks_passability_and_enters_tree_mask,remote_dynamic_changes_invariant,no_hidden_dynamic_blocker_channel;",
     "events=input_batch_cap:payload_len_div_2:2097152_reject_before_mutation,snapshot_event_journal_cap64,only_ticks_strictly_before_snapshot,same_tick_delivery_cannot_overwrite_or_evict_prior_snapshot_features,ability_cast_age_per_caster_and_ability,combat_phase_for_any_tracked_source;",
     "readiness=wire_item_mute_exact,local_backpack_mute:180_from_apply_tick,effective_mute_max_wire_and_local,teleport_shared_wait:2100_from_apply_tick,hero_inventory_journals6,body_shared_journals2,recent_request_cap8,effective_evicted_base_retained,rejection_exact_for_retained_sequences,evicted_sequence_rejection_unsupported,retained_rejections_restore_base;",
-    "local_rollback=active_assignment_transition_cap16,evicted_effective_base_retained,earliest_supported_tick_tracked,rollback_before_horizon_exact_error_and_atomic,decision_eviction_advances_horizon_to_incoming_tick;",
-    "active_target=opaque_local_point_or_full_generation_unit_key_never_encoded_as_identifier,canonical_relative_position_distance,point_or_unit,visibility,unit_kind_and_relation;",
+    "local_rollback=active_transition_cap16,evicted_effective_base_retained,earliest_supported_tick_tracked,rollback_before_horizon_exact_error_and_atomic,decision_eviction_advances_horizon_to_incoming_tick;",
     "candidate_order=opt_in_live_pure_neural_ppo_learner_and_greedy_candidate_neuralseat_learner;legacy_order=teacher_tactical_hybrid_frozen_opponents_expert_collection_and_dagger_labeler_ledger_unchanged;",
     "own_cast=implicit_own_shadow_fiend_nonpassive_visible_aimOwn_ability13_14_15_16_targetNone,preserve_body_directive_sequence_kind_target_start_and_pending_rollback_advance_actual_sent_sequence,not_attack_animation_phase;other_casts_use_put_take_legacy_interruption;",
     "reconcile=complete_snapshot_and_current_tick_events_before_features,full_validated_snapshot_living_handles_not_cap96;fallback=absent_full_handle_attack_or_move_unit_to_last_observed_point_only_immediately_previous_tick_without_observed_death,keep_request_sequence,set_hero_AttackMovePoint_or_MovePoint_start_at_fallback_tick,reappearance_does_not_restore_unit_or_reset_age;unknown_target_or_unproved_final_position_clear_not_Stop;",
     "candidate_ledgers=separate_legacy_actual_requests_and_candidate_effective_directives,two_bodies_one_previous_transition_each_one_hero_pending_rollback,reconcile_current_and_rollback_atomically_after_local_chronology_check,older_rejections_noop,hero_lifecycle_clears_both_hero_states,courier_death_disappearance_generation_invalidates_only_candidate_courier;prefix_replay=observations_actual_sends_rejections_and_explicit_candidate_role_both_ledgers;",
-    "policy_history=unchanged16x4_selected_kind_age_presence_only_no_targets_slots_outcomes_or_enriched_sent_history;fallback_bookkeeping=no_wire_request_no_selected_action_no_sent_history_insertion;numeric_event_features=unchanged_prior_snapshot_tick_filter_current_tick_death_used_only_for_candidate_reconciliation;",
     "own_payloads=live_body_current,hero_scoreboard_kit_current_with_source_bit,absent_courier_ability_and_item_payloads_missing,no_remembered_body_payload_fallback;",
     "provenance=private_nonzero_checked_tracker_lineage_clone_gets_fresh_lineage_move_preserves_lineage,action_space_exact_bounded_lineage_slot_static_snapshot_tracker_comparison,readiness_exact_bounded_comparison,observation_exact_bounded_lineage_slot_static_snapshot_tracker_comparison,encoder_static_exact_bounded_comparison,no_correctness_claim_for_fnv_schema_hash;",
-    "audit=enemy_scoreboard_disabled_by_default,global47_and_history23_presence,disabled_zeros_enemy_alive_and_score_xp_level_kda_last_hit_deny_advantages;",
     "ids=entity_match_seed_tracker_lineage_excluded_from_frame,entity_full_handle_only_memory_key_and_final_identical_tie,ability_and_item_semantic_categories_visible;",
-    "global_indices=0:tick,1:pregame,2:wave,3:jungle,4:radiant,5:dire,6:map0,7:map1,8:seats,9:role_present,10:role,11:lane_present,12:lane,13:kill_adv,14:death_adv,15:assist_adv,16:xp_adv,17:level_adv,18:lh_adv,19:deny_adv,20:gold,21:assets,22:respawn_present,23:respawn,24:alive,25:allied_alive,26:enemy_alive,27:allied_structure_hp,28:enemy_structure_hp,29:destroyed_present,30:destroyed,31:order_present,32:order,33:order_age,34:decision_present,35:decision_age,36:damage_dealt,37:damage_taken,38:level,39:xp,40:kills,41:deaths,42:assists,43:lh,44:denies,45:allied_visible,46:enemy_visible,47:enemy_scoreboard_enabled,48:active_target_present,49:active_target_point,50:active_target_unit,51:active_target_visible,52:active_target_relative_x,53:active_target_relative_y,54:active_target_distance,55:active_target_kind,56:active_target_allied,57:active_target_enemy,58:active_target_neutral,59-63:reserved;",
-    "history_indices=0:present,1:age,2:hp_present,3:hp,4:mana_present,5:mana,6:level,7:gold,8:alive,9:respawn,10:allied_visible,11:enemy_visible,12:xp_adv,13:level_adv,14:kill_adv,15:death_adv,16:assist_adv,17:lh_adv,18:deny_adv,19:allied_structure_hp,20:enemy_structure_hp,21:destroyed_present,22:destroyed,23:enemy_scoreboard_enabled;",
-    "policy_history_indices=0:present,1:age,2:kind_present,3:kind;",
-    "unit_indices=0:present,1-4:relation,5:kind,6-8:owner_relation,9:owner_present,10:observation,11:visible,12:remembered,13:origin_present,14:age,15-16:position,17-18:relative,19:distance,20-21:direction,22:facing,23:radius,24:velocity_present,25-26:velocity,27:hp_present,28:elevation,29:walkable,30:hp,31:mana_present,32:mana,33:hp_delta_present,34:hp_delta,35:mana_delta_present,36:mana_delta,37:attack_damage,38:attack_range,39:attack_interval,40:attack_speed,41:move_speed,42:armor,43:magic_resistance,44:vision,45:true_sight,46:attacks_present,47:attacks,48:reach_present,49:reach,50-51:mutual_range,52:stunned,53-55:reserved,56:slowed,57:dot,58:invisible,59:magic_immune,60:reserved,61:damage_taken,62:damage_dealt_present,63:damage_dealt,64:attack_phase_present,65:attack_phase,66:item_slot_count,67:free_item_slots,68:item_capacity_available;",
-    "point_indices=0:present,1:pointer_valid,2-3:position,4:origin_present,5-6:relative,7:distance,8-9:direction,10:source,11:source_direction_present,12:source_direction,13:source_radius_present,14:source_radius,15:source_kind_present,16:source_kind,17:source_relation_present,18-21:source_relation,22:walkable,23:standing_tree,24:allied_building,25:sighting_age,26-28:raze_units_near_mid_far,29-31:raze_heroes_near_mid_far;",
-    "ability_indices=0:present,1:body,2:slot,3:observation,4:id_present,5:id,6:level,7:max_level,8:cooldown,9:mana,10:range,11:aim,12:passive,13:toggle,14:can_level,15:legal,16:last_cast_present,17:last_cast_age,18:scoreboard_kit_source,19-23:reserved;",
-    "item_indices=0:present,1:location,2:slot,3:item_present,4:item,5:charges_present,6:charges,7:cooldown,8:aim_present,9:aim,10:range,11:mana,12:attribute_present,13:attribute,14:for_sale,15:muted,16:value_present,17:value,18:recipe_component,19:composite,20:legal,21:shop,22:mute_present,23:mute_left,24:shared_wait_present,25:shared_wait_left,26:scoreboard_kit_source,27:reserved;",
-    "projectile_indices=0:present,1-4:relation,5:ability_present,6:ability,7-8:relative,9:facing,10:velocity_present,11-12:velocity,13:age_present,14:age,15:approach_present,16:approach,17:origin_present,18-19:reserved;",
-    "loot_indices=0:present,1:item,2:charges_present,3:charges,4-5:relative,6:direct_distance,7:path_present,8:path,9:age_present,10:age,11:origin_present,12-15:reserved;",
-    "map_indices=0:present,1:walkable,2:water,3:elevation,4:opaque,5:tree,6-13:landmark_presence_distance_pairs,14-15:reserved,16-95:eight_rays_each_four_presence_distance_pairs_plus_endpoint_elevation_walkable;",
-    "global_scalars=normalizers:tick3600000_pregame_ticks_wave30s_jungle60s_seats10_score1000_xp100000_gold100000_age4800_damage10000_hp100000_structures64_visible256_level30_active_target_relative_extent_distance_extent,categories:role1..5_lane1..3_action1..16_map_onehot_side_onehot_active_target_kind1..12_relation_onehot3,reserved:59..63;",
-    "history_scalars=normalizers:age480_hp_ratio_mana_ratio_level30_gold100000_visible256_score1000_xp100000_hp100000_structures64,categories:none,reserved:none;",
-    "policy_history_scalars=normalizers:age4800,categories:action1..16,reserved:none;",
-    "unit_scalars=normalizers:age480_position_extent_delta_extent_distance_extent_facing65535_radius_extent_hp_ratio_mana_ratio_damage10000_attack_range_fixed_max_attack_interval600_attack_speed2000_move_speed2000_armor_raw6553600_magic_resistance_fixed_max_vision_fixed_max_attacks100_reach4800_item_slots9,categories:relation_onehot4_kind1..12_owner_relation_onehot3_status_bits_stunned_slowed_dot_invisible_magic_immune,reserved:53..55_60;",
-    "point_scalars=normalizers:position_extent_relative_extent_distance_extent_radius1200_sighting_age150_raze_units4_raze_heroes1_saturating,categories:source1..13_direction1..8_kind1..12_relation_onehot4,reserved:none;",
-    "ability_scalars=normalizers:level30_cooldown36000_mana20000_range_fixed_max_age4800,categories:body1..2_slot1..8_ability1..65547_aim1..5,reserved:19..23;",
-    "item_scalars=normalizers:charges255_cooldown36000_range_fixed_max_mana20000_value100000_mute36000_shared_wait36000,categories:location_hero2_stash3_courier4_shop5_with1_reserved_slot1..64_item1..65536_aim1..5_attribute1..3,reserved:27;",
-    "projectile_scalars=normalizers:relative_extent_facing65535_velocity_extent_per_tick_age4800_closest_approach_extent,categories:relation_onehot4_ability1..65547,reserved:18..19;",
-    "loot_scalars=normalizers:charges255_relative_extent_direct_extent_path_axis_squared_age4800,categories:item1..65536,reserved:12..15;",
-    "map_scalars=normalizers:elevation63_landmark_squared_extent_ray_step20,categories:direction_fixed_E_NE_N_NW_W_SW_S_SE_hit_kind_walkable_water_opaque_tree,reserved:14..15;",
-    "unit_append_indices=69:invulnerable,70:channelling,71:facing_cos,72:facing_sin;unit_append_semantics=wire_status_bits9_10,last_observed_only_with_visible_remembered_age_provenance,canonical_facing_brads_times_TAU_div65536_f32_sin_cos,absent_token_zero;",
-    "global_append_indices=64:own_ancient_present,65:own_ancient_relative_x,66:own_ancient_relative_y,67:own_ancient_distance,68:enemy_ancient_present,69:enemy_ancient_relative_x,70:enemy_ancient_relative_y,71:enemy_ancient_distance;ancient_geometry=seat_observed_current_or_remembered_Ancient_kind_exact_team,only_unique_known_position_per_team,requires_live_own_hero_origin,canonical_delta_extent_chebyshev_distance_extent,missing_or_ambiguous_all_zero,no_hidden_map_lookup_no_goal_priority;",
-    "map2_global_append=72:map2_present,73:own_weakest_tower_hp,74:enemy_weakest_tower_hp,75:own_deaths_div_limit,76:enemy_deaths_div_limit,77:own_hero_hp_last_seen_dead1,78:enemy_hero_hp_last_seen_dead1,79:xp_lead_clamped,80:reward_potential,81-91:reserved;legacy_map0_map1_append_zero;",
     "map2_reward=only_map2_tracker_owned_complete_contiguous_seat_snapshot_events,public_scoreboard_buildings_and_visible_heroes_only,complete_pair_required_before_observe_and_encode,drain_does_not_invalidate_features,finish_advances_revision;reward_schema=linked_version;",
-    "raze_append=73:anonymous_effect15_present,74:stacks_div255,75:ticks_left_div240;pair=max_lexicographic_valid_active_row_stacks_then_remaining_ticks,never_sum_or_source_attribution;valid_stacks1..255_ticks1..240;memory_timer=observed_ticks_minus_age_expired_zero,no_fog_refresh,known_death_clears;rows_order_independent;entity_sort_pair_before_opaque_id;absent_incomplete_out_of_range_rows_zero;",
     "rebase_effects=Guarded13_Inspired14_Shadowraze15;auras=unit76:guarded_remaining_div15,77:inspired_remaining_div15,positive_means_presence,anonymous_max_timer_valid1..15_no_stacks,age_subtracted_no_hidden_refresh_or_source,expired_absent_dead_zero;",
-    "manual_restoration=Healed_amount_health_and_mana_independent_reports_0..1000000_reject_invalid_before_tracker_mutation,positive_updates_only_other_channel_retained,instant_or_interruptible_overtime_promise_not_confirmed_tickregen,no_passive_or_fountain_report,no_pool_mutation_no_reward_credit_or_refund;unit78:health_report_present,79:amount_div100000_clamped,80:age_div480,81:mana_report_present,82:amount_div20000_clamped,83:age_div480;received_only_latest_positive_per_channel_from_existing64_prior_snapshot_event_journal,strict_tick_before_snapshot_age1..480,full_generation_bookkeeping_no_source_id;sorting=raze_pair_then_aura_timers_then_received_report_semantics_before_opaque_id;",
     "map2_scope=cap27900_including900_pregame_15minute_gameplay;",
     "mango=item42_category43_existing_item_and_loot_token_fields,no_new_item_rows;map2_geometry=map0_public_geometry_no_metadata_relabel;",
-    "wire_rebase=bota78427bb_damaged_then_missed_then_healed_died_cast_level_bought_structure_event_order_shift,missed_is_not_damage_or_healing_and_never_scores,cheat_orders_decoded_structurally_and_never_issued_by_any_seat,NoCheats_rejection_has_no_reward_effect,unit_attack_time_and_attack_point_milliseconds_after_speed_converted_to_historical_whole_ticks_at_30,attack_interval_feature_unchanged_in_ticks,unit_collision_and_bound_split_from_the_old_radius,bound_feeds_every_combat_range_and_area_and_the_radius_feature,collision_feeds_movement_clearance_and_walkability_no_hidden_radius;",
-    "mastery_stage_thresholds_and_rolling_window_excluded_from_features;"
+    "mastery_stage_thresholds_and_rolling_window_excluded_from_features;",
 );
 
 /// FNV-1a of the descriptor, action version-le32/hash-le64 pair, and reward version.
@@ -513,12 +544,27 @@ pub const FEATURE_SCHEMA_HASH: u64 = crate::model::linked_schema_hash(
 const _: () = assert!(crate::ACTION_SCHEMA_VERSION == 8);
 const _: () = assert!(StatusFlags::INVULNERABLE == 1 << 9);
 const _: () = assert!(StatusFlags::CHANNELLING == 1 << 10);
-const _: () = assert!(global_feature::MAP2_REWARD_POTENTIAL + 1 == global_feature::RESERVED_START);
-const _: () = assert!(global_feature::RESERVED_START < GLOBAL_FEATURES);
 const _: () = assert!(crate::MAP2_TICK_CAP == 27_900);
-const _: () = assert!(unit_feature::MANA_RESTORE_REPORT_AGE + 1 == UNIT_FEATURES);
-const _: () =
-    assert!(unit_feature::INSPIRED_TICKS_LEFT + 1 == unit_feature::HEALTH_RESTORE_REPORT_PRESENT);
+// The descriptor's shapes line spells these widths out.
+const _: () = assert!(
+    GLOBAL_FEATURES == 81
+        && HISTORY_FEATURES == 12
+        && POLICY_HISTORY_FEATURES == ActionKind::COUNT
+        && UNIT_FEATURES == 109
+        && POINT_FEATURES == 60
+        && ABILITY_FEATURES == 56
+        && ITEM_FEATURES == 102
+        && ITEM_FEATURE_TOKENS == 94
+        && PROJECTILE_FEATURES == 41
+        && LOOT_FEATURES == 75
+        && MAP_FEATURES == 87
+);
+const _: () = assert!(
+    global_feature::ACTIVE_ORDER_KIND_START + ActionKind::COUNT == global_feature::ACTIVE_ORDER_AGE
+);
+const _: () = assert!(map_feature::RAYS_START + 8 * 10 == MAP_FEATURES);
+const _: () = assert!(ability_feature::ID_START + ABILITY_ID_CLASSES == ability_feature::LEVEL);
+const _: () = assert!(item_feature::ITEM_START + ITEM_ID_CLASSES == item_feature::CHARGES_PRESENT);
 const _: () = assert!(crate::MAX_TRACKED_ENTITIES == 4_096);
 const _: () = assert!(MAX_PROJECTILES == 4_096);
 const _: () = assert!(PROJECTILE_FEATURE_TOKENS == 32);
@@ -552,109 +598,155 @@ impl FeatureFrameProvenance {
     }
 }
 
+/// Token and scalar storage lives on the heap: a frame is about 126 KiB, and
+/// decisions move several of them through threads with small stacks.
 #[derive(Clone, Debug)]
 pub struct FeatureFrame {
     provenance: Option<FeatureFrameProvenance>,
-    pub(crate) global: [f32; GLOBAL_FEATURES],
-    pub(crate) history: [[f32; HISTORY_FEATURES]; HISTORY_SAMPLES],
-    pub(crate) policy_history: [[f32; POLICY_HISTORY_FEATURES]; MAX_POLICY_HISTORY],
-    pub(crate) units: [[f32; UNIT_FEATURES]; UNIT_FEATURE_TOKENS],
-    pub(crate) own_units: [[f32; UNIT_FEATURES]; OWN_UNIT_FEATURE_TOKENS],
-    pub(crate) remembered_units: [[f32; UNIT_FEATURES]; REMEMBERED_UNIT_FEATURE_TOKENS],
-    pub(crate) points: [[f32; POINT_FEATURES]; POINT_FEATURE_TOKENS],
-    pub(crate) abilities: [[f32; ABILITY_FEATURES]; ABILITY_FEATURE_TOKENS],
-    pub(crate) items: [[f32; ITEM_FEATURES]; ITEM_FEATURE_TOKENS],
-    pub(crate) projectiles: [[f32; PROJECTILE_FEATURES]; PROJECTILE_FEATURE_TOKENS],
-    pub(crate) loot: [[f32; LOOT_FEATURES]; LOOT_FEATURE_TOKENS],
-    pub(crate) map: [f32; MAP_FEATURES],
+    pub(crate) global: Box<[f32; GLOBAL_FEATURES]>,
+    pub(crate) history: Box<[[f32; HISTORY_FEATURES]; HISTORY_SAMPLES]>,
+    pub(crate) policy_history: Box<[[f32; POLICY_HISTORY_FEATURES]; MAX_POLICY_HISTORY]>,
+    pub(crate) units: Box<[[f32; UNIT_FEATURES]; UNIT_FEATURE_TOKENS]>,
+    pub(crate) own_units: Box<[[f32; UNIT_FEATURES]; OWN_UNIT_FEATURE_TOKENS]>,
+    pub(crate) remembered_units: Box<[[f32; UNIT_FEATURES]; REMEMBERED_UNIT_FEATURE_TOKENS]>,
+    pub(crate) points: Box<[[f32; POINT_FEATURES]; POINT_FEATURE_TOKENS]>,
+    pub(crate) abilities: Box<[[f32; ABILITY_FEATURES]; ABILITY_FEATURE_TOKENS]>,
+    pub(crate) items: Box<[[f32; ITEM_FEATURES]; ITEM_FEATURE_TOKENS]>,
+    pub(crate) projectiles: Box<[[f32; PROJECTILE_FEATURES]; PROJECTILE_FEATURE_TOKENS]>,
+    pub(crate) loot: Box<[[f32; LOOT_FEATURES]; LOOT_FEATURE_TOKENS]>,
+    pub(crate) map: Box<[f32; MAP_FEATURES]>,
+}
+
+/// Heap bytes one frame owns beside its inline handles.
+pub const FEATURE_FRAME_HEAP_BYTES: usize = 4
+    * (GLOBAL_FEATURES
+        + HISTORY_SAMPLES * HISTORY_FEATURES
+        + MAX_POLICY_HISTORY * POLICY_HISTORY_FEATURES
+        + (UNIT_FEATURE_TOKENS + OWN_UNIT_FEATURE_TOKENS + REMEMBERED_UNIT_FEATURE_TOKENS)
+            * UNIT_FEATURES
+        + POINT_FEATURE_TOKENS * POINT_FEATURES
+        + ABILITY_FEATURE_TOKENS * ABILITY_FEATURES
+        + ITEM_FEATURE_TOKENS * ITEM_FEATURES
+        + PROJECTILE_FEATURE_TOKENS * PROJECTILE_FEATURES
+        + LOOT_FEATURE_TOKENS * LOOT_FEATURES
+        + MAP_FEATURES);
+
+/// A zeroed fixed-size array built directly on the heap.
+fn zeroed<T: Copy + Default, const N: usize>() -> Box<[T; N]> {
+    vec![T::default(); N]
+        .into_boxed_slice()
+        .try_into()
+        .unwrap_or_else(|_| unreachable!("vector has exactly N elements"))
+}
+
+fn zeroed_rows<const F: usize, const N: usize>() -> Box<[[f32; F]; N]> {
+    vec![[0.0; F]; N]
+        .into_boxed_slice()
+        .try_into()
+        .unwrap_or_else(|_| unreachable!("vector has exactly N rows"))
 }
 
 impl FeatureFrame {
     /// Creates a zeroed fixed-shape frame.
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             provenance: None,
-            global: [0.0; GLOBAL_FEATURES],
-            history: [[0.0; HISTORY_FEATURES]; HISTORY_SAMPLES],
-            policy_history: [[0.0; POLICY_HISTORY_FEATURES]; MAX_POLICY_HISTORY],
-            units: [[0.0; UNIT_FEATURES]; UNIT_FEATURE_TOKENS],
-            own_units: [[0.0; UNIT_FEATURES]; OWN_UNIT_FEATURE_TOKENS],
-            remembered_units: [[0.0; UNIT_FEATURES]; REMEMBERED_UNIT_FEATURE_TOKENS],
-            points: [[0.0; POINT_FEATURES]; POINT_FEATURE_TOKENS],
-            abilities: [[0.0; ABILITY_FEATURES]; ABILITY_FEATURE_TOKENS],
-            items: [[0.0; ITEM_FEATURES]; ITEM_FEATURE_TOKENS],
-            projectiles: [[0.0; PROJECTILE_FEATURES]; PROJECTILE_FEATURE_TOKENS],
-            loot: [[0.0; LOOT_FEATURES]; LOOT_FEATURE_TOKENS],
-            map: [0.0; MAP_FEATURES],
+            global: zeroed(),
+            history: zeroed_rows(),
+            policy_history: zeroed_rows(),
+            units: zeroed_rows(),
+            own_units: zeroed_rows(),
+            remembered_units: zeroed_rows(),
+            points: zeroed_rows(),
+            abilities: zeroed_rows(),
+            items: zeroed_rows(),
+            projectiles: zeroed_rows(),
+            loot: zeroed_rows(),
+            map: zeroed(),
         }
     }
 
+    /// Zeroes every value in place, keeping the allocations.
+    fn clear(&mut self) {
+        self.provenance = None;
+        self.global.fill(0.0);
+        self.history.as_flattened_mut().fill(0.0);
+        self.policy_history.as_flattened_mut().fill(0.0);
+        self.units.as_flattened_mut().fill(0.0);
+        self.own_units.as_flattened_mut().fill(0.0);
+        self.remembered_units.as_flattened_mut().fill(0.0);
+        self.points.as_flattened_mut().fill(0.0);
+        self.abilities.as_flattened_mut().fill(0.0);
+        self.items.as_flattened_mut().fill(0.0);
+        self.projectiles.as_flattened_mut().fill(0.0);
+        self.loot.as_flattened_mut().fill(0.0);
+        self.map.fill(0.0);
+    }
+
     /// Global scalar features in stable schema order.
-    pub const fn global(&self) -> &[f32; GLOBAL_FEATURES] {
+    pub fn global(&self) -> &[f32; GLOBAL_FEATURES] {
         &self.global
     }
 
     /// Global-history samples in oldest-to-newest schema order.
-    pub const fn history(&self) -> &[[f32; HISTORY_FEATURES]; HISTORY_SAMPLES] {
+    pub fn history(&self) -> &[[f32; HISTORY_FEATURES]; HISTORY_SAMPLES] {
         &self.history
     }
 
     /// Local policy-history samples in newest-first encoded order.
-    pub const fn policy_history(&self) -> &[[f32; POLICY_HISTORY_FEATURES]; MAX_POLICY_HISTORY] {
+    pub fn policy_history(&self) -> &[[f32; POLICY_HISTORY_FEATURES]; MAX_POLICY_HISTORY] {
         &self.policy_history
     }
 
     /// Current unit tokens in exact entity-pointer order.
-    pub const fn units(&self) -> &[[f32; UNIT_FEATURES]; UNIT_FEATURE_TOKENS] {
+    pub fn units(&self) -> &[[f32; UNIT_FEATURES]; UNIT_FEATURE_TOKENS] {
         &self.units
     }
 
     /// Fixed own hero and courier unit tokens.
-    pub const fn own_units(&self) -> &[[f32; UNIT_FEATURES]; OWN_UNIT_FEATURE_TOKENS] {
+    pub fn own_units(&self) -> &[[f32; UNIT_FEATURES]; OWN_UNIT_FEATURE_TOKENS] {
         &self.own_units
     }
 
     /// Non-targetable remembered unit tokens.
-    pub const fn remembered_units(
-        &self,
-    ) -> &[[f32; UNIT_FEATURES]; REMEMBERED_UNIT_FEATURE_TOKENS] {
+    pub fn remembered_units(&self) -> &[[f32; UNIT_FEATURES]; REMEMBERED_UNIT_FEATURE_TOKENS] {
         &self.remembered_units
     }
 
     /// Point tokens in exact point-pointer order.
-    pub const fn points(&self) -> &[[f32; POINT_FEATURES]; POINT_FEATURE_TOKENS] {
+    pub fn points(&self) -> &[[f32; POINT_FEATURES]; POINT_FEATURE_TOKENS] {
         &self.points
     }
 
     /// Fixed own-body ability tokens.
-    pub const fn abilities(&self) -> &[[f32; ABILITY_FEATURES]; ABILITY_FEATURE_TOKENS] {
+    pub fn abilities(&self) -> &[[f32; ABILITY_FEATURES]; ABILITY_FEATURE_TOKENS] {
         &self.abilities
     }
 
     /// Fixed inventory and shop item tokens.
-    pub const fn items(&self) -> &[[f32; ITEM_FEATURES]; ITEM_FEATURE_TOKENS] {
+    pub fn items(&self) -> &[[f32; ITEM_FEATURES]; ITEM_FEATURE_TOKENS] {
         &self.items
     }
 
     /// Current projectile tokens in deterministic semantic order.
-    pub const fn projectiles(&self) -> &[[f32; PROJECTILE_FEATURES]; PROJECTILE_FEATURE_TOKENS] {
+    pub fn projectiles(&self) -> &[[f32; PROJECTILE_FEATURES]; PROJECTILE_FEATURE_TOKENS] {
         &self.projectiles
     }
 
     /// Current loot tokens in exact loot-pointer order.
-    pub const fn loot(&self) -> &[[f32; LOOT_FEATURES]; LOOT_FEATURE_TOKENS] {
+    pub fn loot(&self) -> &[[f32; LOOT_FEATURES]; LOOT_FEATURE_TOKENS] {
         &self.loot
     }
 
     /// Fixed local map-context scalars.
-    pub const fn map(&self) -> &[f32; MAP_FEATURES] {
+    pub fn map(&self) -> &[f32; MAP_FEATURES] {
         &self.map
     }
 
     /// Whether every scalar in the frame is finite.
     pub fn is_finite(&self) -> bool {
         let fields: [&[f32]; 12] = [
-            &self.global,
+            &self.global[..],
             self.history.as_flattened(),
             self.policy_history.as_flattened(),
             self.units.as_flattened(),
@@ -665,7 +757,7 @@ impl FeatureFrame {
             self.items.as_flattened(),
             self.projectiles.as_flattened(),
             self.loot.as_flattened(),
-            &self.map,
+            &self.map[..],
         ];
         fields
             .into_iter()
@@ -843,11 +935,11 @@ impl RaggedFeatureArena {
         )?;
         Ok(RaggedFeatureHeader {
             provenance: frame.provenance,
-            global: frame.global,
-            history: frame.history,
-            policy_history: frame.policy_history,
-            own_units: frame.own_units,
-            map: frame.map,
+            global: *frame.global,
+            history: *frame.history,
+            policy_history: *frame.policy_history,
+            own_units: *frame.own_units,
+            map: *frame.map,
             units,
             remembered_units,
             points,
@@ -911,11 +1003,11 @@ impl RaggedFeatureArena {
     ) -> Result<FeatureFrame, &'static str> {
         let mut frame = FeatureFrame {
             provenance: header.provenance,
-            global: header.global,
-            history: header.history,
-            policy_history: header.policy_history,
-            own_units: header.own_units,
-            map: header.map,
+            global: Box::new(header.global),
+            history: Box::new(header.history),
+            policy_history: Box::new(header.policy_history),
+            own_units: Box::new(header.own_units),
+            map: Box::new(header.map),
             ..FeatureFrame::new()
         };
         restore_feature_rows(&self.units, header.units, &mut frame.units)?;
@@ -1076,31 +1168,6 @@ pub enum ActivePolicyTarget {
     Unit(EntityId),
 }
 
-/// Local strategic role supplied by the policy configuration.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PolicyRole {
-    Carry,
-    Mid,
-    Offlane,
-    Support,
-    HardSupport,
-}
-
-/// Local lane assignment supplied by the policy configuration.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PolicyLane {
-    Safe,
-    Mid,
-    Offlane,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct PolicyAssignment {
-    tick: u32,
-    role: Option<PolicyRole>,
-    lane: Option<PolicyLane>,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ActivePolicyTransition {
     tick: u32,
@@ -1144,9 +1211,6 @@ pub struct LocalPolicyState {
     active_base: Option<ActivePolicyOrder>,
     active_transitions: [Option<ActivePolicyTransition>; MAX_POLICY_HISTORY],
     active_transition_count: usize,
-    assignment_base: Option<PolicyAssignment>,
-    assignments: [Option<PolicyAssignment>; MAX_POLICY_HISTORY],
-    assignment_count: usize,
 }
 
 impl LocalPolicyState {
@@ -1160,9 +1224,6 @@ impl LocalPolicyState {
             active_base: None,
             active_transitions: [None; MAX_POLICY_HISTORY],
             active_transition_count: 0,
-            assignment_base: None,
-            assignments: [None; MAX_POLICY_HISTORY],
-            assignment_count: 0,
         }
     }
 
@@ -1190,7 +1251,6 @@ impl LocalPolicyState {
         self.decisions = kept;
         self.decision_count = count;
         self.rollback_active(tick);
-        self.rollback_assignment(tick);
         self.latest_tick = tick;
         Ok(())
     }
@@ -1264,19 +1324,6 @@ impl LocalPolicyState {
         Ok(())
     }
 
-    /// Replaces the explicit role and lane assignment at one local tick.
-    pub fn set_assignment(
-        &mut self,
-        tick: u32,
-        role: Option<PolicyRole>,
-        lane: Option<PolicyLane>,
-    ) -> Result<(), LocalPolicyError> {
-        self.check_tick(tick)?;
-        self.push_assignment(PolicyAssignment { tick, role, lane });
-        self.latest_tick = tick;
-        Ok(())
-    }
-
     /// Decisions in oldest-to-newest order.
     pub fn decisions(&self) -> impl DoubleEndedIterator<Item = &PolicyDecision> {
         self.decisions[..self.decision_count]
@@ -1295,14 +1342,6 @@ impl LocalPolicyState {
             index += 1;
         }
         active
-    }
-
-    fn assignment(&self) -> Option<PolicyAssignment> {
-        self.assignments[..self.assignment_count]
-            .iter()
-            .rev()
-            .find_map(|assignment| *assignment)
-            .or(self.assignment_base)
     }
 
     fn check_tick(&self, tick: u32) -> Result<(), LocalPolicyError> {
@@ -1328,32 +1367,12 @@ impl LocalPolicyState {
         self.active_transition_count += 1;
     }
 
-    fn push_assignment(&mut self, assignment: PolicyAssignment) {
-        if self.assignment_count == MAX_POLICY_HISTORY {
-            let evicted = self.assignments[0].expect("filled assignment transition");
-            self.assignment_base = Some(evicted);
-            self.earliest_rollback_tick = self.earliest_rollback_tick.max(evicted.tick);
-            self.assignments.copy_within(1..MAX_POLICY_HISTORY, 0);
-            self.assignment_count -= 1;
-        }
-        self.assignments[self.assignment_count] = Some(assignment);
-        self.assignment_count += 1;
-    }
-
     fn rollback_active(&mut self, tick: u32) {
         self.active_transition_count = self.active_transitions[..self.active_transition_count]
             .iter()
             .take_while(|entry| entry.is_some_and(|transition| transition.tick <= tick))
             .count();
         self.active_transitions[self.active_transition_count..].fill(None);
-    }
-
-    fn rollback_assignment(&mut self, tick: u32) {
-        self.assignment_count = self.assignments[..self.assignment_count]
-            .iter()
-            .take_while(|entry| entry.is_some_and(|assignment| assignment.tick <= tick))
-            .count();
-        self.assignments[self.assignment_count..].fill(None);
     }
 }
 
@@ -1440,13 +1459,6 @@ impl fmt::Display for FeatureError {
 
 impl Error for FeatureError {}
 
-/// Explicit controls for policy inputs that can expose audited wire data.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct FeatureAuditConfig {
-    /// Whether enemy scoreboard values and derived history enter the model frame.
-    pub enemy_scoreboard: bool,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct ProjectileObservation {
     id: bota_proto::EntityId,
@@ -1494,7 +1506,6 @@ impl FeatureObservationState {
 /// to a current allied body. This proof uses no dynamic tree-list entry; remote
 /// entries preserve the static baseline and cannot change policy observations.
 pub struct FeatureEncoder {
-    audit: FeatureAuditConfig,
     map: bota_proto::MapId,
     static_provenance: std::sync::Arc<StaticTrackerProvenance>,
     lineage: NonZeroU64,
@@ -1524,11 +1535,6 @@ pub struct FeatureEncoder {
 impl FeatureEncoder {
     /// Builds bounded static map context from validated public tracker inputs.
     pub fn new(tracker: &StateTracker) -> Self {
-        Self::new_with_audit(tracker, FeatureAuditConfig::default())
-    }
-
-    /// Builds map context with explicit enemy-scoreboard audit controls.
-    pub fn new_with_audit(tracker: &StateTracker, audit: FeatureAuditConfig) -> Self {
         let axis = usize::try_from(tracker.metadata().terrain_cells)
             .expect("validated terrain axis fits usize");
         let mut terrain = Vec::with_capacity(axis * axis);
@@ -1560,7 +1566,6 @@ impl FeatureEncoder {
             }
         }
         Self {
-            audit,
             map: tracker.metadata().map,
             static_provenance: tracker.static_provenance(),
             lineage: tracker.lineage(),
@@ -1664,17 +1669,18 @@ impl FeatureEncoder {
     ) -> Result<(), FeatureError> {
         let current = tracker.current().ok_or(FeatureError::SnapshotRequired)?;
         self.validate_inputs(tracker, action_space, readiness, local, current.tick)?;
-        *output = FeatureFrame::new();
-        self.encode_global(tracker, local, output);
+        output.clear();
+        let view = Perspective::new(tracker, current.tick);
+        self.encode_global(tracker, local, &view, output);
         self.encode_history(tracker, output);
-        self.encode_policy_history(current.tick, local, output);
-        self.encode_units(tracker, action_space, output);
-        self.encode_own_units(tracker, output);
-        self.encode_remembered_units(tracker, output);
-        self.encode_points(tracker, action_space, output);
+        self.encode_policy_history(local, output);
+        self.encode_units(tracker, action_space, &view, output);
+        self.encode_own_units(tracker, &view, output);
+        self.encode_remembered_units(tracker, &view, output);
+        self.encode_points(action_space, &view, output);
         self.encode_abilities(tracker, action_space, output);
-        self.encode_items(tracker, action_space, readiness, output);
-        self.encode_projectiles(tracker, output);
+        self.encode_items(tracker, action_space, readiness, &view, output);
+        self.encode_projectiles(tracker, &view, output);
         self.encode_loot(tracker, action_space, output);
         self.encode_map(tracker, output);
         if !output.is_finite() {
@@ -1756,76 +1762,41 @@ impl FeatureEncoder {
         &self,
         tracker: &StateTracker,
         local: &LocalPolicyState,
+        view: &Perspective<'_>,
         output: &mut FeatureFrame,
     ) {
         use global_feature as index;
         let current = tracker.current().expect("snapshot was checked");
         let metadata = tracker.metadata();
         let own = tracker.own_player().expect("own player was validated");
-        let summary = tracker.history()[HISTORY_SAMPLES - 1];
-        output.global[index::TICK] = unit_ratio(current.tick, MAX_TICK);
-        output.global[index::PREGAME_PROGRESS] =
-            pregame_progress(current.tick, metadata.pregame_ticks);
-        output.global[index::WAVE_PHASE] =
+        let global = &mut output.global;
+        global[index::TICK] = unit_ratio(current.tick, crate::MAP2_TICK_CAP);
+        global[index::PREGAME_PROGRESS] = pregame_progress(current.tick, metadata.pregame_ticks);
+        global[index::WAVE_PHASE] =
             periodic_phase(current.tick, metadata.pregame_ticks, metadata.tick_rate, 30);
-        output.global[index::JUNGLE_PHASE] =
+        global[index::JUNGLE_PHASE] =
             periodic_phase(current.tick, metadata.pregame_ticks, metadata.tick_rate, 60);
-        output.global[index::SIDE_RADIANT] = bool_feature(tracker.team() == Team::Radiant);
-        output.global[index::SIDE_DIRE] = bool_feature(tracker.team() == Team::Dire);
-        output.global[index::MAP_ZERO] = bool_feature(metadata.map.0 == 0);
-        output.global[index::MAP_ONE] = bool_feature(metadata.map.0 == 1);
-        output.global[index::SEAT_COUNT] = ratio(i64::from(metadata.seats), 1, 10);
-        encode_assignment(local, &mut output.global);
-        output.global[index::ENEMY_SCOREBOARD_ENABLED] = bool_feature(self.audit.enemy_scoreboard);
-        if self.audit.enemy_scoreboard {
-            encode_score_advantages(&mut output.global, &summary);
-        }
-        output.global[index::OWN_GOLD] = signed_ratio(i64::from(own.gold.unwrap_or(0)), MAX_GOLD);
-        output.global[index::OWN_ASSET_VALUE] = signed_ratio(own_asset_value(tracker), MAX_GOLD);
-        output.global[index::RESPAWN_PRESENT] = bool_feature(own.unit.is_none());
-        output.global[index::RESPAWN_LEFT] = unit_ratio(own.respawn_left, MAX_AGE);
-        output.global[index::OWN_ALIVE] = bool_feature(own.unit.is_some());
-        let (allied_alive, enemy_alive) =
-            alive_hero_counts(current.players.as_slice(), tracker.team());
-        output.global[index::ALLIED_ALIVE_HEROES] = ratio(allied_alive, 0, 5);
-        if self.audit.enemy_scoreboard {
-            output.global[index::ENEMY_ALIVE_HEROES] = ratio(enemy_alive, 0, 5);
-        }
-        output.global[index::ALLIED_STRUCTURE_HP] =
-            signed_ratio(summary.allied_structure_hp, MAX_HP);
-        output.global[index::ENEMY_STRUCTURE_HP] = signed_ratio(summary.enemy_structure_hp, MAX_HP);
-        output.global[index::DESTROYED_STRUCTURES_PRESENT] =
-            bool_feature(summary.destroyed_structures_present);
-        let destroyed = summary
-            .allied_structures_destroyed
-            .saturating_add(summary.enemy_structures_destroyed);
-        output.global[index::DESTROYED_STRUCTURES] =
-            ratio(i64::from(destroyed), 0, MAX_STRUCTURE_COUNT);
-        encode_local_global(self, tracker, current.tick, local, &mut output.global);
-        encode_own_score(own, &mut output.global);
-        output.global[index::VISIBLE_ALLIED_UNITS] =
-            ratio(i64::from(summary.visible_allied_units), 0, 256);
-        output.global[index::VISIBLE_ENEMY_UNITS] =
-            ratio(i64::from(summary.visible_enemy_units), 0, 256);
+        global[index::SIDE_RADIANT] = bool_feature(tracker.team() == Team::Radiant);
+        global[index::SIDE_DIRE] = bool_feature(tracker.team() == Team::Dire);
+        global[index::OWN_ASSET_VALUE] = fraction(own_asset_value(tracker) as f32, scale::GOLD);
+        encode_local_global(self, tracker, current.tick, local, global);
+        encode_own_score(own, global);
         let (dealt, taken) = snapshot_damage(tracker);
-        output.global[index::SNAPSHOT_DAMAGE_DEALT] = signed_ratio(dealt, MAX_DAMAGE);
-        output.global[index::SNAPSHOT_DAMAGE_TAKEN] = signed_ratio(taken, MAX_DAMAGE);
-        self.encode_ancient_geometry(tracker, &mut output.global);
-        encode_map2_reward(tracker, &mut output.global);
+        global[index::SNAPSHOT_DAMAGE_DEALT] = fraction(dealt as f32, scale::SNAPSHOT_DAMAGE);
+        global[index::SNAPSHOT_DAMAGE_TAKEN] = fraction(taken as f32, scale::SNAPSHOT_DAMAGE);
+        self.encode_ancient_geometry(tracker, global);
+        encode_map2_reward(tracker, global);
+        encode_global_combat(tracker, view, global);
     }
 
     fn encode_ancient_geometry(&self, tracker: &StateTracker, global: &mut [f32; GLOBAL_FEATURES]) {
+        use global_feature as index;
         let Some(origin) = tracker.own_hero().map(|unit| unit.pos) else {
             return;
         };
-        let enemy = match tracker.team() {
-            Team::Radiant => Team::Dire,
-            Team::Dire => Team::Radiant,
-            Team::Neutral => return,
-        };
         for (team, offset) in [
-            (tracker.team(), global_feature::OWN_ANCIENT_PRESENT),
-            (enemy, global_feature::ENEMY_ANCIENT_PRESENT),
+            (tracker.team(), index::OWN_ANCIENT_RELATIVE_X),
+            (opposing(tracker.team()), index::ENEMY_ANCIENT_RELATIVE_X),
         ] {
             let mut positions = tracker
                 .entities()
@@ -1839,13 +1810,9 @@ impl FeatureEncoder {
                 continue;
             }
             let delta = self.canonical_delta(tracker.team(), position, origin);
-            global[offset] = 1.0;
-            global[offset + 1] = signed_raw_ratio(delta.0, self.extent_raw);
-            global[offset + 2] = signed_raw_ratio(delta.1, self.extent_raw);
-            global[offset + 3] =
-                raw_distance_ratio_i64(delta.0.abs().max(delta.1.abs()), self.extent_raw);
-            assert!(global[offset + 1].is_finite());
-            assert!((0.0..=1.0).contains(&global[offset + 3]));
+            global[offset] = signed_raw_ratio(delta.0, self.extent_raw);
+            global[offset + 1] = signed_raw_ratio(delta.1, self.extent_raw);
+            global[offset + 2] = log_distance(combat::distance(origin, position));
         }
     }
 
@@ -1855,30 +1822,20 @@ impl FeatureEncoder {
         for (sample_index, age) in HISTORY_AGES.iter().copied().enumerate() {
             let summary = summaries[sample_index];
             let target = current_tick.saturating_sub(age);
-            let present = age == 0 || summary.tick <= target;
-            if present {
-                encode_history_sample(
-                    &mut output.history[sample_index],
-                    summary,
-                    current_tick,
-                    self.audit.enemy_scoreboard,
-                );
+            if age == 0 || summary.tick <= target {
+                encode_history_sample(&mut output.history[sample_index], summary, current_tick);
             }
         }
     }
 
-    fn encode_policy_history(
-        &self,
-        tick: u32,
-        local: &LocalPolicyState,
-        output: &mut FeatureFrame,
-    ) {
+    fn encode_policy_history(&self, local: &LocalPolicyState, output: &mut FeatureFrame) {
         for (output_index, decision) in local.decisions().rev().enumerate() {
-            let token = &mut output.policy_history[output_index];
-            token[0] = 1.0;
-            token[1] = unit_ratio(tick.saturating_sub(decision.tick), MAX_AGE);
-            token[2] = 1.0;
-            token[3] = category_token(decision.kind.index());
+            one_hot(
+                &mut output.policy_history[output_index],
+                policy_history_feature::KIND_START,
+                POLICY_HISTORY_FEATURES,
+                decision.kind.index(),
+            );
         }
     }
 
@@ -1886,64 +1843,69 @@ impl FeatureEncoder {
         &self,
         tracker: &StateTracker,
         action_space: &ActionSpace,
+        view: &Perspective<'_>,
         output: &mut FeatureFrame,
     ) {
-        let origin = own_origin(tracker);
         for (index, candidate) in action_space.entity_candidates().iter().enumerate() {
             let track = tracker
                 .entity(candidate.id())
                 .expect("action candidate has a visible tracker record");
-            output.units[index] = self.encode_unit_track(tracker, track, origin);
+            output.units[index] = self.encode_unit_track(tracker, track, view);
         }
     }
 
-    fn encode_own_units(&self, tracker: &StateTracker, output: &mut FeatureFrame) {
-        let origin = own_origin(tracker);
+    fn encode_own_units(
+        &self,
+        tracker: &StateTracker,
+        view: &Perspective<'_>,
+        output: &mut FeatureFrame,
+    ) {
         for (index, kind) in [UnitKind::Hero, UnitKind::Courier].into_iter().enumerate() {
             if let Some(track) = own_body_track(tracker, kind) {
-                output.own_units[index] = self.encode_unit_track(tracker, track, origin);
+                output.own_units[index] = self.encode_unit_track(tracker, track, view);
             }
         }
     }
 
-    fn encode_remembered_units(&self, tracker: &StateTracker, output: &mut FeatureFrame) {
-        let origin = own_origin(tracker);
+    fn encode_remembered_units(
+        &self,
+        tracker: &StateTracker,
+        view: &Perspective<'_>,
+        output: &mut FeatureFrame,
+    ) {
         let mut count = 0usize;
         for track in tracker.entities() {
             if snapshot_visible(tracker, track) || is_own_body_track(tracker, track) {
                 continue;
             }
-            let token = self.encode_unit_track(tracker, track, origin);
+            let token = self.encode_unit_track(tracker, track, view);
             insert_sorted_token(&mut output.remembered_units, &mut count, token);
         }
     }
 
     fn encode_points(
         &self,
-        tracker: &StateTracker,
         action_space: &ActionSpace,
+        view: &Perspective<'_>,
         output: &mut FeatureFrame,
     ) {
-        let origin = own_origin(tracker);
         for (index, point) in action_space.point_candidates().iter().enumerate() {
-            output.points[index] = self.encode_point(tracker.team(), point, origin);
+            output.points[index] = self.encode_point(point, view);
         }
     }
 
     fn encode_point(
         &self,
-        team: Team,
         point: &PointCandidate,
-        origin: Option<Vec2>,
+        view: &Perspective<'_>,
     ) -> [f32; POINT_FEATURES] {
         use point_feature as index;
         let mut token = [0.0; POINT_FEATURES];
         token[index::TOKEN_PRESENT] = 1.0;
-        token[index::POINTER_VALID] = 1.0;
-        let position = self.canonical_position(team, point.position);
+        let position = self.canonical_position(view.team, point.position);
         token[index::POSITION_X] = coordinate_ratio(position.x.raw, self.extent_raw);
         token[index::POSITION_Y] = coordinate_ratio(position.y.raw, self.extent_raw);
-        encode_point_origin(self, &mut token, team, point.position, origin);
+        self.encode_relative(&mut token, index::RELATIVE_X, point.position, view);
         encode_point_source(&mut token, point.source);
         token[index::WALKABLE] = bool_feature(point.walkable);
         token[index::STANDING_TREE] = bool_feature(point.standing_tree);
@@ -1960,80 +1922,98 @@ impl FeatureEncoder {
         token
     }
 
+    /// Writes relative x, y, direction x, y, near and log distance, and bearing
+    /// cos, sin into the eight slots from `start`, in that order.
+    fn encode_relative(
+        &self,
+        token: &mut [f32],
+        start: usize,
+        position: Vec2,
+        view: &Perspective<'_>,
+    ) {
+        let Some(origin) = view.origin else {
+            return;
+        };
+        let delta = self.canonical_delta(view.team, position, origin);
+        token[start] = signed_raw_ratio(delta.0, self.extent_raw);
+        token[start + 1] = signed_raw_ratio(delta.1, self.extent_raw);
+        let distance = combat::distance(origin, position);
+        if distance > 0.0 {
+            let raw_distance = distance * 65_536.0;
+            token[start + 2] = (delta.0 as f32 / raw_distance).clamp(-1.0, 1.0);
+            token[start + 3] = (delta.1 as f32 / raw_distance).clamp(-1.0, 1.0);
+        }
+        token[start + 4] = near_distance(distance);
+        token[start + 5] = log_distance(distance);
+        if let Some(hero) = view.hero
+            && distance > 0.0
+            && hero.pos == origin
+        {
+            let (cosine, sine) = bearing(delta, canonical_facing(view.team, hero.facing), distance);
+            token[start + 6] = cosine;
+            token[start + 7] = sine;
+        }
+    }
+
     fn encode_unit_track(
         &self,
         tracker: &StateTracker,
         track: &crate::EntityTrack,
-        origin: Option<Vec2>,
+        view: &Perspective<'_>,
     ) -> [f32; UNIT_FEATURES] {
+        use unit_feature as index;
         let mut token = [0.0; UNIT_FEATURES];
         let unit = &track.unit;
-        let tick = tracker.current().expect("snapshot was checked").tick;
-        token[unit_feature::TOKEN_PRESENT] = 1.0;
-        encode_relation(&mut token, unit_relation(tracker, unit));
-        token[unit_feature::KIND_TOKEN] = unit_kind_token(unit.kind);
-        encode_owner_relation(&mut token, owner_relation(tracker, unit));
-        token[unit_feature::OBSERVATION_PRESENT] = 1.0;
-        let visible = snapshot_visible(tracker, track);
-        token[unit_feature::VISIBLE] = bool_feature(visible);
-        token[unit_feature::REMEMBERED] = bool_feature(!visible);
-        token[unit_feature::AGE] = unit_ratio(
-            tick.saturating_sub(track.last_seen_tick),
-            crate::HISTORY_TICKS,
+        token[index::TOKEN_PRESENT] = 1.0;
+        let relation = unit_relation(tracker, unit);
+        one_hot(
+            &mut token,
+            index::RELATION_START,
+            4,
+            relation_index(relation),
         );
-        self.encode_unit_geometry(&mut token, tracker.team(), unit, origin);
-        self.encode_unit_motion(&mut token, tracker.team(), track);
+        one_hot(
+            &mut token,
+            index::KIND_START,
+            12,
+            unit_kind_index(unit.kind),
+        );
+        token[index::ENEMY_OWNED] =
+            bool_feature(owner_relation(tracker, unit) == Some(EntityRelation::Enemy));
+        token[index::VISIBLE] = bool_feature(snapshot_visible(tracker, track));
+        let age = view.tick.saturating_sub(track.last_seen_tick);
+        token[index::AGE] = unit_ratio(age, crate::HISTORY_TICKS);
+        self.encode_unit_geometry(&mut token, unit, view);
+        self.encode_unit_motion(&mut token, view.team, track);
         self.encode_unit_terrain(&mut token, unit.pos);
         encode_unit_resources(&mut token, track);
         encode_unit_combat(&mut token, unit);
-        encode_unit_inventory(&mut token, unit);
-        encode_unit_tactics(
-            &mut token,
-            unit,
-            origin,
-            tracker.own_hero(),
-            tracker.metadata().tick_rate,
-        );
         encode_statuses(&mut token, unit.statuses);
-        encode_unit_recent(&mut token, tracker, track, tick);
-        encode_unit_effects(&mut token, track, tick);
-        encode_restoration_reports(&mut token, tracker, track.id, tick);
+        encode_unit_recent(&mut token, tracker, track, view);
+        encode_unit_effects(&mut token, track, view.tick);
+        encode_restoration_reports(&mut token, tracker, track.id, view.tick);
+        encode_hero_kit(&mut token, unit, age, relation, view);
+        if let Some(hero) = view.hero {
+            encode_unit_tactics(&mut token, unit, hero, relation, age, view.team);
+        }
         token
     }
 
     fn encode_unit_geometry(
         &self,
         token: &mut [f32; UNIT_FEATURES],
-        team: Team,
         unit: &UnitView,
-        origin: Option<Vec2>,
+        view: &Perspective<'_>,
     ) {
-        let position = self.canonical_position(team, unit.pos);
-        token[unit_feature::POSITION_X] = coordinate_ratio(position.x.raw, self.extent_raw);
-        token[unit_feature::POSITION_Y] = coordinate_ratio(position.y.raw, self.extent_raw);
-        token[unit_feature::FACING] = facing_feature(team, unit.facing);
-        let brads = if team == Team::Dire {
-            unit.facing.brads.wrapping_add(32768)
-        } else {
-            unit.facing.brads
-        };
-        let radians = f32::from(brads) * (std::f32::consts::TAU / 65536.0);
-        let (sine, cosine) = radians.sin_cos();
-        token[unit_feature::FACING_COS] = cosine;
-        token[unit_feature::FACING_SIN] = sine;
-        token[unit_feature::RADIUS] = raw_distance_ratio(unit.bound.raw, self.extent_raw);
-        if let Some(origin) = origin {
-            token[unit_feature::ORIGIN_PRESENT] = 1.0;
-            let delta = self.canonical_delta(team, unit.pos, origin);
-            token[unit_feature::RELATIVE_X] = signed_raw_ratio(delta.0, self.extent_raw);
-            token[unit_feature::RELATIVE_Y] = signed_raw_ratio(delta.1, self.extent_raw);
-            let distance = delta.0.abs().max(delta.1.abs());
-            token[unit_feature::DISTANCE] = raw_distance_ratio_i64(distance, self.extent_raw);
-            if distance > 0 {
-                token[unit_feature::DIRECTION_X] = delta.0 as f32 / distance as f32;
-                token[unit_feature::DIRECTION_Y] = delta.1 as f32 / distance as f32;
-            }
-        }
+        use unit_feature as index;
+        let position = self.canonical_position(view.team, unit.pos);
+        token[index::POSITION_X] = coordinate_ratio(position.x.raw, self.extent_raw);
+        token[index::POSITION_Y] = coordinate_ratio(position.y.raw, self.extent_raw);
+        let (cosine, sine) = canonical_facing(view.team, unit.facing);
+        token[index::FACING_COS] = cosine;
+        token[index::FACING_SIN] = sine;
+        token[index::BOUND] = fraction(unit.bound.to_f32(), scale::BOUND);
+        self.encode_relative(token, index::RELATIVE_X, unit.pos, view);
     }
 
     fn encode_unit_motion(
@@ -2045,16 +2025,16 @@ impl FeatureEncoder {
         let Some(velocity) = track.velocity else {
             return;
         };
-        token[unit_feature::VELOCITY_PRESENT] = 1.0;
-        let mut x = i64::from(velocity.delta.x.raw);
-        let mut y = i64::from(velocity.delta.y.raw);
-        if team == Team::Dire {
-            x = -x;
-            y = -y;
+        token[unit_feature::MOTION_PRESENT] = 1.0;
+        let sign = if team == Team::Dire { -1.0 } else { 1.0 };
+        let per_second = TICKS_PER_SECOND / velocity.elapsed_ticks.max(1) as f32;
+        for (offset, raw) in [velocity.delta.x.raw, velocity.delta.y.raw]
+            .into_iter()
+            .enumerate()
+        {
+            let units = sign * raw as f32 / 65_536.0 * per_second;
+            token[unit_feature::VELOCITY_X + offset] = signed_fraction(units, scale::VELOCITY);
         }
-        let divisor = i64::from(velocity.elapsed_ticks.max(1));
-        token[unit_feature::VELOCITY_X] = signed_raw_ratio(x / divisor, self.extent_raw);
-        token[unit_feature::VELOCITY_Y] = signed_raw_ratio(y / divisor, self.extent_raw);
     }
 
     fn encode_unit_terrain(&self, token: &mut [f32; UNIT_FEATURES], position: Vec2) {
@@ -2072,34 +2052,35 @@ impl FeatureEncoder {
         action_space: &ActionSpace,
         output: &mut FeatureFrame,
     ) {
-        let hero_abilities = own_hero_abilities(tracker);
-        let courier_abilities = own_courier_abilities(tracker);
         let tick = tracker.current().expect("snapshot was checked").tick;
-        let hero_track = own_body_track(tracker, UnitKind::Hero);
-        let courier_track = own_body_track(tracker, UnitKind::Courier);
-        for slot in 0..SHADOW_FIEND_ABILITY_SLOTS {
-            let ability = hero_abilities.and_then(|(abilities, _)| abilities.get(slot));
-            let mut token = encode_ability_token(
+        for (body, unit, abilities, first, count) in [
+            (
                 ControlledUnit::Hero,
-                slot,
-                ability,
-                ability_legal(action_space, ControlledUnit::Hero, slot),
-            );
-            token[ability_feature::SCOREBOARD_KIT_SOURCE] =
-                bool_feature(hero_abilities.is_some_and(|(_, kit)| kit));
-            encode_ability_history(&mut token, tracker, hero_track, ability, tick);
-            output.abilities[slot] = token;
-        }
-        for slot in 0..8 {
-            let ability = courier_abilities.and_then(|(abilities, _)| abilities.get(slot));
-            let mut token = encode_ability_token(
+                own_body_track(tracker, UnitKind::Hero),
+                own_hero_abilities(tracker),
+                0,
+                SHADOW_FIEND_ABILITY_SLOTS,
+            ),
+            (
                 ControlledUnit::Courier,
-                slot,
-                ability,
-                ability_legal(action_space, ControlledUnit::Courier, slot),
-            );
-            encode_ability_history(&mut token, tracker, courier_track, ability, tick);
-            output.abilities[SHADOW_FIEND_ABILITY_SLOTS + slot] = token;
+                own_body_track(tracker, UnitKind::Courier),
+                own_courier_abilities(tracker),
+                SHADOW_FIEND_ABILITY_SLOTS,
+                8,
+            ),
+        ] {
+            let mana = unit.map(|track| track.unit.mana);
+            for slot in 0..count {
+                let ability = abilities.and_then(|(abilities, _)| abilities.get(slot));
+                let legal = ability_legal(action_space, body, slot);
+                let mut token = encode_ability_token(body, slot, ability, legal, mana);
+                if body == ControlledUnit::Hero {
+                    token[ability_feature::SCOREBOARD_KIT_SOURCE] =
+                        bool_feature(abilities.is_some_and(|(_, kit)| kit));
+                }
+                encode_ability_history(&mut token, tracker, unit, ability, tick);
+                output.abilities[first + slot] = token;
+            }
         }
     }
 
@@ -2108,72 +2089,58 @@ impl FeatureEncoder {
         tracker: &StateTracker,
         action_space: &ActionSpace,
         readiness: &ItemReadiness,
+        view: &Perspective<'_>,
         output: &mut FeatureFrame,
     ) {
-        let tick = tracker.current().expect("snapshot was checked").tick;
+        let context = OwnedItemContext {
+            tracker,
+            action_space,
+            readiness,
+            tick: view.tick,
+        };
         let hero_items = own_hero_items(tracker);
         let stash = tracker
             .own_player()
             .and_then(|player| player.stash.as_deref());
         let courier_items = own_courier_items(tracker);
-        for slot in 0..9 {
-            let item = hero_items
-                .and_then(|(items, _)| items.get(slot))
-                .copied()
-                .flatten();
-            output.items[slot] = encode_owned_item(
-                tracker,
-                action_space,
-                readiness,
-                tick,
+        for (first, count, body, location, items) in [
+            (
+                0,
+                9,
                 ControlledUnit::Hero,
-                1,
-                slot,
-                item,
-            );
-            output.items[slot][item_feature::SCOREBOARD_KIT_SOURCE] =
-                bool_feature(hero_items.is_some_and(|(_, kit)| kit));
+                0,
+                hero_items.map(|(items, _)| items),
+            ),
+            (9, 6, ControlledUnit::Hero, 1, stash),
+            (15, 6, ControlledUnit::Courier, 2, courier_items),
+        ] {
+            for slot in 0..count {
+                let item = items.and_then(|items| items.get(slot)).copied().flatten();
+                // Stash rows keep their historical slot numbers after the bag's nine.
+                let slot_token = if location == 1 { first + slot } else { slot };
+                output.items[first + slot] = context.encode(body, location, slot_token, slot, item);
+            }
         }
-        for slot in 0..6 {
-            let item = stash.and_then(|items| items.get(slot)).copied().flatten();
-            output.items[9 + slot] = encode_owned_item(
-                tracker,
-                action_space,
-                readiness,
-                tick,
-                ControlledUnit::Hero,
-                2,
-                9 + slot,
-                item,
-            );
-        }
-        for slot in 0..6 {
-            let item = courier_items
-                .and_then(|items| items.get(slot))
-                .copied()
-                .flatten();
-            output.items[15 + slot] = encode_owned_item(
-                tracker,
-                action_space,
-                readiness,
-                tick,
-                ControlledUnit::Courier,
-                3,
-                slot,
-                item,
-            );
+        let kit = bool_feature(hero_items.is_some_and(|(_, kit)| kit));
+        for token in &mut output.items[..9] {
+            token[item_feature::SCOREBOARD_KIT_SOURCE] = kit;
         }
         encode_shop_items(tracker, action_space, &mut output.items);
+        encode_enemy_items(tracker, &mut output.items);
     }
 
-    fn encode_projectiles(&self, tracker: &StateTracker, output: &mut FeatureFrame) {
+    fn encode_projectiles(
+        &self,
+        tracker: &StateTracker,
+        view: &Perspective<'_>,
+        output: &mut FeatureFrame,
+    ) {
         let current = tracker.current().expect("snapshot was checked");
         assert!(current.projectiles.len() <= MAX_PROJECTILES);
-        let origin = own_origin(tracker);
         let mut count = 0usize;
         for projectile in &current.projectiles {
             let history = self.projectile_observation(projectile.id);
-            let token = self.projectile_token(tracker.team(), projectile, origin, history);
+            let token = self.projectile_token(projectile, view, history);
             insert_sorted_token(&mut output.projectiles, &mut count, token);
         }
         assert!(count <= PROJECTILE_FEATURE_TOKENS);
@@ -2181,52 +2148,56 @@ impl FeatureEncoder {
 
     fn projectile_token(
         &self,
-        team: Team,
         projectile: &ProjectileView,
-        origin: Option<Vec2>,
+        view: &Perspective<'_>,
         history: Option<ProjectileObservation>,
     ) -> [f32; PROJECTILE_FEATURES] {
         use projectile_feature as index;
+        let team = view.team;
         let mut token = [0.0; PROJECTILE_FEATURES];
         token[index::TOKEN_PRESENT] = 1.0;
-        encode_small_relation(
-            &mut token[index::RELATION_START..index::RELATION_START + 4],
-            team_relation(team, projectile.team),
+        let relation = team_relation(team, projectile.team);
+        one_hot(
+            &mut token,
+            index::RELATION_START,
+            4,
+            relation_index(relation),
         );
-        token[index::ABILITY_PRESENT] = bool_feature(projectile.ability.is_some());
-        token[index::ABILITY_TOKEN] = projectile.ability.map_or(0.0, ability_id_token);
-        if let Some(origin) = origin {
-            token[index::ORIGIN_PRESENT] = 1.0;
-            let delta = self.canonical_delta(team, projectile.pos, origin);
-            token[index::RELATIVE_X] = signed_raw_ratio(delta.0, self.extent_raw);
-            token[index::RELATIVE_Y] = signed_raw_ratio(delta.1, self.extent_raw);
+        if let Some(ability) = projectile.ability {
+            token[index::ABILITY_PRESENT] = 1.0;
+            let class = ability_id_class(ability);
+            one_hot(&mut token, index::ABILITY_START, ABILITY_ID_CLASSES, class);
         }
-        token[index::FACING] = facing_feature(team, projectile.facing);
-        if let Some(history) = history {
-            token[index::AGE_PRESENT] = 1.0;
-            token[index::AGE] = unit_ratio(history.last_tick - history.first_tick, MAX_AGE);
-            if let Some(previous_tick) = history.previous_tick {
-                let elapsed = history.last_tick - previous_tick;
-                let mut delta_x =
-                    i64::from(history.position.x.raw) - i64::from(history.previous_position.x.raw);
-                let mut delta_y =
-                    i64::from(history.position.y.raw) - i64::from(history.previous_position.y.raw);
-                if team == Team::Dire {
-                    delta_x = -delta_x;
-                    delta_y = -delta_y;
-                }
-                token[index::VELOCITY_PRESENT] = 1.0;
-                token[index::VELOCITY_X] =
-                    signed_raw_ratio(delta_x / i64::from(elapsed), self.extent_raw);
-                token[index::VELOCITY_Y] =
-                    signed_raw_ratio(delta_y / i64::from(elapsed), self.extent_raw);
-                if let Some(origin) = origin {
-                    let relative = self.canonical_delta(team, projectile.pos, origin);
-                    token[index::CLOSEST_APPROACH_PRESENT] = 1.0;
-                    token[index::CLOSEST_APPROACH] =
-                        closest_approach_ratio(relative, delta_x, delta_y, self.extent_raw);
-                }
-            }
+        if let Some(origin) = view.origin {
+            let delta = self.canonical_delta(team, projectile.pos, origin);
+            token[index::RELATIVE_X] = raw_units(delta.0, scale::PROJECTILE_RELATIVE);
+            token[index::RELATIVE_Y] = raw_units(delta.1, scale::PROJECTILE_RELATIVE);
+        }
+        let (cosine, sine) = canonical_facing(team, projectile.facing);
+        token[index::FACING_COS] = cosine;
+        token[index::FACING_SIN] = sine;
+        let Some(history) = history else {
+            return token;
+        };
+        let age = (history.last_tick - history.first_tick) as f32;
+        token[index::AGE] = fraction(age, scale::PROJECTILE_AGE_TICKS);
+        let Some(previous_tick) = history.previous_tick else {
+            return token;
+        };
+        let elapsed = i64::from(history.last_tick - previous_tick);
+        let sign = if team == Team::Dire { -1 } else { 1 };
+        let delta_x =
+            sign * (i64::from(history.position.x.raw) - i64::from(history.previous_position.x.raw));
+        let delta_y =
+            sign * (i64::from(history.position.y.raw) - i64::from(history.previous_position.y.raw));
+        let per_second = TICKS_PER_SECOND / elapsed as f32;
+        token[index::VELOCITY_PRESENT] = 1.0;
+        token[index::VELOCITY_X] = raw_units(delta_x, scale::PROJECTILE_VELOCITY / per_second);
+        token[index::VELOCITY_Y] = raw_units(delta_y, scale::PROJECTILE_VELOCITY / per_second);
+        if let Some(origin) = view.origin {
+            let relative = self.canonical_delta(team, projectile.pos, origin);
+            token[index::CLOSEST_APPROACH_PRESENT] = 1.0;
+            token[index::CLOSEST_APPROACH] = closest_approach(relative, delta_x, delta_y);
         }
         token
     }
@@ -2258,38 +2229,55 @@ impl FeatureEncoder {
                 .iter()
                 .find(|loot| loot.id == candidate.id())
                 .expect("action loot candidate belongs to current snapshot");
-            use loot_feature as index;
-            let mut token = [0.0; LOOT_FEATURES];
-            token[index::TOKEN_PRESENT] = 1.0;
-            token[index::ITEM_TOKEN] = item_id_token(loot.item);
-            token[index::CHARGES_PRESENT] = bool_feature(loot.charges.is_some());
-            token[index::CHARGES] = ratio(i64::from(loot.charges.unwrap_or(0)), 0, MAX_CHARGES);
             let duplicate_semantics = action_space.loot_candidates().iter().any(|other| {
                 other.id() != candidate.id()
                     && other.item == candidate.item
                     && other.charges == candidate.charges
                     && other.position == candidate.position
             });
-            if !duplicate_semantics && let Some(history) = self.loot_observation(loot.id) {
-                token[index::VISIBLE_AGE_PRESENT] = 1.0;
-                token[index::VISIBLE_AGE] =
-                    unit_ratio(history.last_tick - history.first_tick, MAX_AGE);
-            }
-            if let Some(origin) = origin {
-                token[index::ORIGIN_PRESENT] = 1.0;
-                let delta = self.canonical_delta(tracker.team(), loot.pos, origin);
-                token[index::RELATIVE_X] = signed_raw_ratio(delta.0, self.extent_raw);
-                token[index::RELATIVE_Y] = signed_raw_ratio(delta.1, self.extent_raw);
-                token[index::DIRECT_DISTANCE] =
-                    raw_distance_ratio_i64(delta.0.abs().max(delta.1.abs()), self.extent_raw);
-                if let Some(steps) = self.path_steps(loot.pos) {
-                    token[index::PATH_DISTANCE_PRESENT] = 1.0;
-                    token[index::PATH_DISTANCE] =
-                        ratio(i64::from(steps), 0, self.path_distances.len() as i64);
-                }
-            }
-            output.loot[candidate_index] = token;
+            let history = (!duplicate_semantics)
+                .then(|| self.loot_observation(loot.id))
+                .flatten();
+            output.loot[candidate_index] = self.loot_token(tracker.team(), loot, origin, history);
         }
+    }
+
+    fn loot_token(
+        &self,
+        team: Team,
+        loot: &bota_proto::LootView,
+        origin: Option<Vec2>,
+        history: Option<LootObservation>,
+    ) -> [f32; LOOT_FEATURES] {
+        use loot_feature as index;
+        let mut token = [0.0; LOOT_FEATURES];
+        token[index::TOKEN_PRESENT] = 1.0;
+        one_hot(
+            &mut token,
+            index::ITEM_START,
+            ITEM_ID_CLASSES,
+            item_id_class(loot.item),
+        );
+        token[index::CHARGES_PRESENT] = bool_feature(loot.charges.is_some());
+        token[index::CHARGES] = fraction(f32::from(loot.charges.unwrap_or(0)), scale::CHARGES);
+        if let Some(history) = history {
+            token[index::VISIBLE_AGE_PRESENT] = 1.0;
+            let age = (history.last_tick - history.first_tick) as f32;
+            token[index::VISIBLE_AGE] = fraction(age, scale::LOOT_AGE_TICKS);
+        }
+        let Some(origin) = origin else {
+            return token;
+        };
+        let delta = self.canonical_delta(team, loot.pos, origin);
+        token[index::RELATIVE_X] = raw_units(delta.0, scale::NEAR_DISTANCE);
+        token[index::RELATIVE_Y] = raw_units(delta.1, scale::NEAR_DISTANCE);
+        token[index::DISTANCE_NEAR] = near_distance(combat::distance(origin, loot.pos));
+        if let Some(steps) = self.path_steps(loot.pos) {
+            token[index::PATH_DISTANCE_PRESENT] = 1.0;
+            token[index::PATH_DISTANCE] =
+                ratio(i64::from(steps), 0, self.path_distances.len() as i64);
+        }
+        token
     }
 
     fn projectile_observation(&self, id: bota_proto::EntityId) -> Option<ProjectileObservation> {
@@ -2309,58 +2297,25 @@ impl FeatureEncoder {
     }
 
     fn encode_map(&self, tracker: &StateTracker, output: &mut FeatureFrame) {
+        use map_feature as index;
         let Some(origin) = own_origin(tracker) else {
             return;
         };
-        output.map[0] = 1.0;
         if let Some(cell) = self.cell(origin) {
             let terrain = self.terrain[cell];
-            output.map[1] = bool_feature(terrain & 0x80 != 0);
-            output.map[2] = bool_feature(terrain & 0x40 != 0);
-            output.map[3] = ratio(i64::from(terrain & 0x3f), 0, 63);
-            output.map[4] = bool_feature(self.opaque[cell]);
+            output.map[index::WALKABLE] = bool_feature(terrain & 0x80 != 0);
+            output.map[index::WATER] = bool_feature(terrain & 0x40 != 0);
+            output.map[index::ELEVATION] = ratio(i64::from(terrain & 0x3f), 0, 63);
         }
-        output.map[5] = bool_feature(self.tree_at_visible_context(tracker, origin));
-        self.encode_landmark_distances(tracker, origin, &mut output.map);
+        encode_landmark_distances(tracker, origin, &mut output.map);
         for (direction_index, direction) in MAP_DIRECTIONS.into_iter().enumerate() {
-            let start = 16 + direction_index * 10;
+            let start = index::RAYS_START + direction_index * 10;
             self.encode_map_ray(
                 tracker,
                 origin,
                 direction,
                 &mut output.map[start..start + 10],
             );
-        }
-    }
-
-    fn encode_landmark_distances(
-        &self,
-        tracker: &StateTracker,
-        origin: Vec2,
-        output: &mut [f32; MAP_FEATURES],
-    ) {
-        let current = tracker.current().expect("snapshot was checked");
-        for (pair, kind, own) in [
-            (0usize, UnitKind::Fountain, true),
-            (1, UnitKind::Fountain, false),
-            (2, UnitKind::Tower, true),
-            (3, UnitKind::Tower, false),
-        ] {
-            let relation_team = if own {
-                tracker.team()
-            } else {
-                opposing(tracker.team())
-            };
-            let nearest = current
-                .units
-                .iter()
-                .filter(|unit| unit.kind == kind && unit.team == relation_team)
-                .map(|unit| origin.distance_squared(unit.pos))
-                .min();
-            if let Some(distance_squared) = nearest {
-                output[6 + pair * 2] = 1.0;
-                output[7 + pair * 2] = squared_distance_ratio(distance_squared, self.extent_raw);
-            }
         }
     }
 
@@ -2587,32 +2542,232 @@ fn validate_map2_reward(tracker: &StateTracker, tick: u32) -> Result<(), Feature
     Ok(())
 }
 
+/// The own hero's point of view shared by every token of one frame.
+struct Perspective<'a> {
+    team: Team,
+    tick: u32,
+    /// Own hero position, else own courier position.
+    origin: Option<Vec2>,
+    /// The live own hero.
+    hero: Option<&'a UnitView>,
+    kit: Option<combat::HeroKit>,
+}
+
+impl<'a> Perspective<'a> {
+    fn new(tracker: &'a StateTracker, tick: u32) -> Self {
+        let hero = tracker.own_hero().filter(|hero| hero.hp > 0);
+        Self {
+            team: tracker.team(),
+            tick,
+            origin: own_origin(tracker),
+            hero,
+            kit: hero.and_then(|hero| combat::HeroKit::of(hero, 0)),
+        }
+    }
+
+    /// Whether `track` dealt its latest damage to the own hero, or to another own-side unit.
+    fn recent_victim(&self, tracker: &StateTracker, track: &crate::EntityTrack) -> [bool; 2] {
+        let Some(damage) = track.last_damage_dealt else {
+            return [false; 2];
+        };
+        if self.tick.saturating_sub(damage.tick) > scale::RECENT_ATTACK_TICKS {
+            return [false; 2];
+        }
+        let Some(victim) = damage.counterpart else {
+            return [false; 2];
+        };
+        if self.hero.is_some_and(|hero| hero.id == victim) {
+            return [true, false];
+        }
+        let own_side = tracker
+            .entity(victim)
+            .is_some_and(|victim| victim.unit.team == self.team);
+        [false, own_side]
+    }
+}
+
 fn encode_map2_reward(tracker: &StateTracker, global: &mut [f32; GLOBAL_FEATURES]) {
+    use global_feature as index;
     let Some(state) = tracker.map2_reward_state() else {
         return;
     };
-    assert_eq!(tracker.metadata().map.0, 2);
+    assert_eq!(tracker.metadata().map, crate::MAP2_ID);
     assert_eq!(
         state.completed_tick,
         tracker.current().map(|view| view.tick)
     );
-    global[global_feature::MAP_TWO] = 1.0;
-    global[global_feature::MAP2_OWN_TOWER_HEALTH] = state.tower_health[0];
-    global[global_feature::MAP2_ENEMY_TOWER_HEALTH] = state.tower_health[1];
-    global[global_feature::MAP2_OWN_DEATHS] = state.deaths[0];
-    global[global_feature::MAP2_ENEMY_DEATHS] = state.deaths[1];
-    global[global_feature::MAP2_OWN_HERO_HEALTH] = state.hero_health[0];
-    global[global_feature::MAP2_ENEMY_HERO_HEALTH] = state.hero_health[1];
-    global[global_feature::MAP2_XP_LEAD] = state.xp_lead;
-    global[global_feature::MAP2_REWARD_POTENTIAL] = state.potential;
-    assert!(
-        global[global_feature::RESERVED_START..]
+    global[index::MAP2_OWN_TOWER_HEALTH] = state.tower_health[0];
+    global[index::MAP2_ENEMY_TOWER_HEALTH] = state.tower_health[1];
+    global[index::MAP2_OWN_DEATHS] = state.deaths[0];
+    global[index::MAP2_ENEMY_DEATHS] = state.deaths[1];
+    global[index::MAP2_OWN_HERO_HEALTH] = state.hero_health[0];
+    global[index::MAP2_ENEMY_HERO_HEALTH] = state.hero_health[1];
+    global[index::MAP2_XP_LEAD] = state.xp_lead;
+    global[index::MAP2_REWARD_POTENTIAL] = state.potential;
+}
+
+/// Creep, tower and duel summaries from the own hero's point of view.
+fn encode_global_combat(
+    tracker: &StateTracker,
+    view: &Perspective<'_>,
+    global: &mut [f32; GLOBAL_FEATURES],
+) {
+    use global_feature as index;
+    let Some(hero) = view.hero else {
+        return;
+    };
+    let current = tracker.current().expect("snapshot was checked");
+    let enemy = opposing(view.team);
+    let mut counts = [0.0f32; 5];
+    for track in tracker.entities().iter().filter(|track| track.visible) {
+        let unit = &track.unit;
+        if unit.hp <= 0 {
+            continue;
+        }
+        if unit.team == enemy && is_lane_creep(unit.kind) {
+            counts[0] += f32::from(u8::from(own_in_acquisition(hero, unit)));
+            counts[1] += f32::from(u8::from(view.recent_victim(tracker, track)[0]));
+        }
+        if is_lane_creep(unit.kind)
+            && combat::distance(hero.pos, unit.pos) <= scale::CREEP_BALANCE_RADIUS
+        {
+            counts[2] += if unit.team == view.team {
+                1.0
+            } else if unit.team == enemy {
+                -1.0
+            } else {
+                0.0
+            };
+        }
+        if unit.kind == UnitKind::Tower && unit.team == enemy {
+            global[index::IN_ENEMY_TOWER_RANGE] =
+                global[index::IN_ENEMY_TOWER_RANGE].max(bool_feature(in_tower_range(unit, hero)));
+            let targeting = view.recent_victim(tracker, track)[0];
+            global[index::ENEMY_TOWER_TARGETING] =
+                global[index::ENEMY_TOWER_TARGETING].max(bool_feature(targeting));
+        }
+        if is_lane_creep(unit.kind) {
+            let (tower_team, slot) = if unit.team == view.team {
+                (enemy, 3)
+            } else {
+                (view.team, 4)
+            };
+            let covered = current.units.iter().any(|tower| {
+                tower.kind == UnitKind::Tower
+                    && tower.team == tower_team
+                    && tower.hp > 0
+                    && in_tower_range(tower, unit)
+            });
+            counts[slot] += f32::from(u8::from(covered));
+        }
+    }
+    global[index::ENEMY_CREEPS_ACQUIRING] = fraction(counts[0], scale::CREEPS);
+    global[index::ENEMY_CREEPS_ATTACKING] = fraction(counts[1], scale::CREEPS);
+    global[index::CREEP_BALANCE] = signed_fraction(counts[2], scale::CREEPS);
+    global[index::ALLIED_CREEPS_UNDER_ENEMY_TOWER] = fraction(counts[3], scale::CREEPS);
+    global[index::ENEMY_CREEPS_UNDER_OWN_TOWER] = fraction(counts[4], scale::CREEPS);
+    encode_duel(current, view, hero, global);
+}
+
+/// Seconds each hero needs to kill the other and the own hero's ready razes.
+fn encode_duel(
+    current: &bota_proto::WorldView,
+    view: &Perspective<'_>,
+    hero: &UnitView,
+    global: &mut [f32; GLOBAL_FEATURES],
+) {
+    use global_feature as index;
+    if let Some(kit) = view.kit {
+        let ready = kit.razes.iter().filter(|left| **left == Some(0)).count();
+        global[index::RAZES_READY] = ready as f32 / 3.0;
+        if kit.raze_level > 0 && kit.raze_mana > 0 {
+            global[index::RAZES_AFFORDABLE] = fraction((kit.mana / kit.raze_mana) as f32, 3.0);
+        }
+    }
+    let enemy_team = opposing(view.team);
+    let Some(enemy) = current
+        .units
+        .iter()
+        .filter(|unit| unit.kind == UnitKind::Hero && unit.team == enemy_team && unit.hp > 0)
+        .min_by_key(|unit| hero.pos.distance_squared(unit.pos))
+    else {
+        return;
+    };
+    global[index::ENEMY_HERO_VISIBLE] = 1.0;
+    if let Some(kit) = view.kit {
+        let seconds = kit.seconds_to_kill(hero, enemy, raze_stacks(enemy));
+        global[index::SECONDS_TO_KILL_ENEMY] = fraction(seconds, combat::MAX_TTK_SECONDS);
+    }
+    if let Some(kit) = combat::HeroKit::of(enemy, 0) {
+        let seconds = kit.seconds_to_kill(enemy, hero, raze_stacks(hero));
+        global[index::SECONDS_TO_BE_KILLED] = fraction(seconds, combat::MAX_TTK_SECONDS);
+    }
+}
+
+fn raze_stacks(unit: &UnitView) -> u32 {
+    crate::tracker::shadowraze_effect(unit, 0).map_or(0, |(stacks, _)| stacks)
+}
+
+const fn is_lane_creep(kind: UnitKind) -> bool {
+    matches!(
+        kind,
+        UnitKind::CreepMelee
+            | UnitKind::CreepFlagbearer
+            | UnitKind::CreepRanged
+            | UnitKind::CreepSiege
+    )
+}
+
+/// Whether `unit` stands inside `tower`'s attack reach, bound to bound.
+fn in_tower_range(tower: &UnitView, unit: &UnitView) -> bool {
+    let reach = tower.attack_range + tower.bound + unit.bound;
+    tower.pos.distance_squared(unit.pos) <= reach.squared_raw()
+}
+
+/// Whether the own hero stands where a hostile `unit` acquires targets on its own.
+fn own_in_acquisition(hero: &UnitView, unit: &UnitView) -> bool {
+    combat::acquisition(unit).is_some_and(|range| {
+        combat::distance(hero.pos, unit.pos) <= range + hero.bound.to_f32() + unit.bound.to_f32()
+    })
+}
+
+fn encode_landmark_distances(
+    tracker: &StateTracker,
+    origin: Vec2,
+    output: &mut [f32; MAP_FEATURES],
+) {
+    use map_feature as index;
+    let current = tracker.current().expect("snapshot was checked");
+    for (slot, kind, own) in [
+        (index::OWN_FOUNTAIN_DISTANCE_LOG, UnitKind::Fountain, true),
+        (
+            index::ENEMY_FOUNTAIN_DISTANCE_LOG,
+            UnitKind::Fountain,
+            false,
+        ),
+        (index::OWN_TOWER_DISTANCE_LOG, UnitKind::Tower, true),
+        (index::ENEMY_TOWER_DISTANCE_LOG, UnitKind::Tower, false),
+    ] {
+        let team = if own {
+            tracker.team()
+        } else {
+            opposing(tracker.team())
+        };
+        let nearest = current
+            .units
             .iter()
-            .all(|value| *value == 0.0)
-    );
+            .filter(|unit| unit.kind == kind && unit.team == team)
+            .map(|unit| origin.distance_squared(unit.pos))
+            .min();
+        if let Some(distance_squared) = nearest {
+            let distance = (distance_squared as f64).sqrt() as f32 / 65_536.0;
+            output[slot] = log_distance(distance);
+        }
+    }
 }
 
 fn encode_unit_effects(token: &mut [f32; UNIT_FEATURES], track: &crate::EntityTrack, tick: u32) {
+    use unit_feature as index;
     if track.unit.hp <= 0
         || track
             .last_death
@@ -2622,13 +2777,13 @@ fn encode_unit_effects(token: &mut [f32; UNIT_FEATURES], track: &crate::EntityTr
     }
     let age = tick.saturating_sub(track.last_seen_tick);
     if let Some((stacks, ticks)) = crate::tracker::shadowraze_effect(&track.unit, age) {
-        token[unit_feature::RAZE_EFFECT_PRESENT] = 1.0;
-        token[unit_feature::RAZE_STACKS] = unit_ratio(stacks, crate::SHADOWRAZE_EFFECT_STACKS);
-        token[unit_feature::RAZE_TICKS_LEFT] = unit_ratio(ticks, crate::SHADOWRAZE_EFFECT_TICKS);
+        token[index::RAZE_EFFECT_PRESENT] = 1.0;
+        token[index::RAZE_STACKS] = unit_ratio(stacks, scale::RAZE_STACKS);
+        token[index::RAZE_TICKS_LEFT] = unit_ratio(ticks, crate::SHADOWRAZE_EFFECT_TICKS);
     }
     let [guarded, inspired] = crate::tracker::aura_effects(&track.unit, age);
-    token[unit_feature::GUARDED_TICKS_LEFT] = unit_ratio(guarded, crate::AURA_EFFECT_TICKS);
-    token[unit_feature::INSPIRED_TICKS_LEFT] = unit_ratio(inspired, crate::AURA_EFFECT_TICKS);
+    token[index::GUARDED_TICKS_LEFT] = unit_ratio(guarded, crate::AURA_EFFECT_TICKS);
+    token[index::INSPIRED_TICKS_LEFT] = unit_ratio(inspired, crate::AURA_EFFECT_TICKS);
 }
 
 fn encode_restoration_reports(
@@ -2642,21 +2797,691 @@ fn encode_restoration_reports(
         (
             reports[0],
             unit_feature::HEALTH_RESTORE_REPORT_PRESENT,
-            MAX_HP,
+            scale::RESTORED_HEALTH,
         ),
         (
             reports[1],
             unit_feature::MANA_RESTORE_REPORT_PRESENT,
-            MAX_MANA,
+            scale::RESTORED_MANA,
         ),
     ] {
         if let Some((reported_tick, amount)) = report {
             assert!(reported_tick < tick);
             assert!(tick - reported_tick <= crate::HISTORY_TICKS);
             token[offset] = 1.0;
-            token[offset + 1] = ratio(i64::from(amount), 0, maximum);
+            token[offset + 1] = fraction(amount as f32, maximum);
             token[offset + 2] = unit_ratio(tick - reported_tick, crate::HISTORY_TICKS);
         }
+    }
+}
+
+/// Razes, Requiem and mana of any hero token; raze threat of a hostile one.
+fn encode_hero_kit(
+    token: &mut [f32; UNIT_FEATURES],
+    unit: &UnitView,
+    age: u32,
+    relation: EntityRelation,
+    view: &Perspective<'_>,
+) {
+    use unit_feature as index;
+    let Some(kit) = combat::HeroKit::of(unit, age) else {
+        return;
+    };
+    token[index::KIT_PRESENT] = 1.0;
+    for (reach, left) in kit.razes.iter().enumerate() {
+        if let Some(left) = left {
+            token[index::RAZE_COOLDOWN_START + reach] =
+                fraction(*left as f32, scale::RAZE_COOLDOWN_TICKS);
+        }
+    }
+    token[index::RAZE_LEVEL] = f32::from(kit.raze_level) / 4.0;
+    if let Some(left) = kit.requiem {
+        token[index::REQUIEM_COOLDOWN] = fraction(left as f32, scale::REQUIEM_COOLDOWN_TICKS);
+    }
+    token[index::REQUIEM_LEVEL] = f32::from(kit.requiem_level) / 3.0;
+    token[index::CAN_AFFORD_RAZE] = bool_feature(kit.can_afford_raze());
+    let hostile = matches!(relation, EntityRelation::Enemy | EntityRelation::Neutral);
+    let Some(hero) = view
+        .hero
+        .filter(|hero| hostile && age == 0 && combat::razeable(hero))
+    else {
+        return;
+    };
+    let offset = canonical_offset(view.team, unit.pos, hero.pos);
+    let facing = canonical_facing(view.team, unit.facing);
+    for (reach, (_, distance)) in crate::raze_aim::SHADOWRAZES.iter().enumerate() {
+        let strikes = kit.razes[reach].is_some() && combat::raze_strikes(offset, facing, *distance);
+        token[index::RAZE_THREAT_START + reach] = bool_feature(strikes);
+    }
+}
+
+fn encode_local_global(
+    encoder: &FeatureEncoder,
+    tracker: &StateTracker,
+    tick: u32,
+    local: &LocalPolicyState,
+    global: &mut [f32; GLOBAL_FEATURES],
+) {
+    use global_feature as index;
+    if let Some(active) = local.active_order() {
+        global[index::ACTIVE_ORDER_PRESENT] = 1.0;
+        one_hot(
+            global,
+            index::ACTIVE_ORDER_KIND_START,
+            ActionKind::COUNT,
+            active.kind.index(),
+        );
+        let age = tick.saturating_sub(active.started_tick) as f32;
+        global[index::ACTIVE_ORDER_AGE] = fraction(age, scale::ORDER_AGE_TICKS);
+        encode_active_target(encoder, tracker, active.target, global);
+    }
+    if local.decisions().next_back().is_some() {
+        global[index::LAST_DECISION_PRESENT] = 1.0;
+    }
+}
+
+fn encode_active_target(
+    encoder: &FeatureEncoder,
+    tracker: &StateTracker,
+    target: ActivePolicyTarget,
+    global: &mut [f32; GLOBAL_FEATURES],
+) {
+    use global_feature as index;
+    let (position, visible, unit) = match target {
+        ActivePolicyTarget::None => return,
+        ActivePolicyTarget::Point(position) => (position, true, None),
+        ActivePolicyTarget::Unit(id) => {
+            let Some(entity) = tracker.entity(id) else {
+                global[index::ACTIVE_TARGET_PRESENT] = 1.0;
+                global[index::ACTIVE_TARGET_UNIT] = 1.0;
+                return;
+            };
+            (entity.unit.pos, entity.visible, Some(&entity.unit))
+        }
+    };
+    global[index::ACTIVE_TARGET_PRESENT] = 1.0;
+    global[index::ACTIVE_TARGET_POINT] = bool_feature(unit.is_none());
+    global[index::ACTIVE_TARGET_UNIT] = bool_feature(unit.is_some());
+    global[index::ACTIVE_TARGET_VISIBLE] = bool_feature(visible);
+    if let Some(hero) = tracker.own_hero() {
+        let delta = encoder.canonical_delta(tracker.team(), position, hero.pos);
+        global[index::ACTIVE_TARGET_RELATIVE_X] = signed_raw_ratio(delta.0, encoder.extent_raw);
+        global[index::ACTIVE_TARGET_RELATIVE_Y] = signed_raw_ratio(delta.1, encoder.extent_raw);
+        let distance = combat::distance(hero.pos, position);
+        global[index::ACTIVE_TARGET_DISTANCE_NEAR] = near_distance(distance);
+        global[index::ACTIVE_TARGET_DISTANCE_LOG] = log_distance(distance);
+    }
+    if let Some(unit) = unit {
+        one_hot(
+            global,
+            index::ACTIVE_TARGET_KIND_START,
+            12,
+            unit_kind_index(unit.kind),
+        );
+        if unit.team == Team::Neutral {
+            global[index::ACTIVE_TARGET_NEUTRAL] = 1.0;
+        } else if unit.team == tracker.team() {
+            global[index::ACTIVE_TARGET_ALLIED] = 1.0;
+        } else {
+            global[index::ACTIVE_TARGET_ENEMY] = 1.0;
+        }
+    }
+}
+
+fn encode_own_score(own: &PlayerView, global: &mut [f32; GLOBAL_FEATURES]) {
+    use global_feature as index;
+    global[index::OWN_LEVEL] = fraction(f32::from(own.level), scale::LEVEL);
+    global[index::OWN_XP] = fraction(own.xp as f32, scale::XP);
+    global[index::OWN_LAST_HITS] = fraction(f32::from(own.last_hits), scale::LAST_HITS);
+    global[index::OWN_DENIES] = fraction(f32::from(own.denies), scale::DENIES);
+}
+
+fn encode_history_sample(
+    output: &mut [f32; HISTORY_FEATURES],
+    summary: crate::GlobalSummary,
+    current_tick: u32,
+) {
+    use history_feature as index;
+    output[index::SAMPLE_PRESENT] = 1.0;
+    output[index::AGE] = unit_ratio(
+        current_tick.saturating_sub(summary.tick),
+        crate::HISTORY_TICKS,
+    );
+    output[index::HP_PRESENT] = bool_feature(summary.own_hp_present);
+    output[index::HP_RATIO] = safe_fraction(summary.own_hp, summary.own_max_hp);
+    output[index::MANA_PRESENT] = bool_feature(summary.own_mana_present);
+    output[index::MANA_RATIO] = safe_fraction(summary.own_mana, summary.own_max_mana);
+    output[index::OWN_LEVEL] = fraction(f32::from(summary.own_level), scale::LEVEL);
+    output[index::OWN_GOLD] = fraction(summary.own_gold as f32, scale::GOLD);
+    output[index::OWN_ALIVE] = bool_feature(summary.own_hp_present);
+    output[index::RESPAWN_LEFT] = fraction(summary.own_respawn_left as f32, scale::RESPAWN_TICKS);
+    output[index::VISIBLE_ALLIED_UNITS] =
+        fraction(summary.visible_allied_units as f32, scale::VISIBLE_UNITS);
+    output[index::VISIBLE_ENEMY_UNITS] =
+        fraction(summary.visible_enemy_units as f32, scale::VISIBLE_UNITS);
+}
+
+fn encode_point_source(token: &mut [f32; POINT_FEATURES], source: PointSource) {
+    use point_feature as index;
+    let (category, direction, radius, kind, relation) = point_source_semantics(source);
+    one_hot(token, index::SOURCE_START, 13, category);
+    if let Some(direction) = direction {
+        one_hot(
+            token,
+            index::SOURCE_DIRECTION_START,
+            8,
+            point_direction_index(direction),
+        );
+    }
+    if let Some(radius) = radius {
+        token[index::SOURCE_RADIUS_PRESENT] = 1.0;
+        token[index::SOURCE_RADIUS] = ratio(i64::from(radius), 0, 1_200);
+    }
+    if let Some(kind) = kind {
+        one_hot(token, index::SOURCE_KIND_START, 12, unit_kind_index(kind));
+    }
+    if let Some(relation) = relation {
+        one_hot(
+            token,
+            index::SOURCE_RELATION_START,
+            4,
+            relation_index(relation),
+        );
+    }
+}
+
+fn encode_unit_resources(token: &mut [f32; UNIT_FEATURES], track: &crate::EntityTrack) {
+    use unit_feature as index;
+    let unit = &track.unit;
+    if unit.max_hp > 0 {
+        token[index::HP_RATIO] = safe_fraction(unit.hp, unit.max_hp);
+        token[index::HP_NEAR] = fraction(combat::health(unit), scale::HEALTH_NEAR);
+        token[index::HP_LOG] = log_fraction(combat::health(unit), scale::HEALTH_LOG_MAX);
+        token[index::MAX_HP_LOG] = log_fraction(unit.max_hp as f32, scale::HEALTH_LOG_MAX);
+        let [physical, magical] = combat::effective_health(unit);
+        token[index::EFFECTIVE_HP_PHYSICAL] =
+            log_fraction(physical, scale::EFFECTIVE_HEALTH_LOG_MAX);
+        token[index::EFFECTIVE_HP_MAGICAL] = log_fraction(magical, scale::EFFECTIVE_HEALTH_LOG_MAX);
+    }
+    if unit.max_mana > 0 {
+        token[index::MANA_PRESENT] = 1.0;
+        token[index::MANA_RATIO] = safe_fraction(unit.mana, unit.max_mana);
+        token[index::MANA_NEAR] = fraction(unit.mana.max(0) as f32, scale::MANA_NEAR);
+        token[index::MAX_MANA_NEAR] = fraction(unit.max_mana as f32, scale::MANA_NEAR);
+    }
+    if track.velocity.is_some() {
+        token[index::HP_DELTA] = signed_fraction(track.hp_delta as f32, scale::POOL_DELTA);
+        token[index::MANA_DELTA] = signed_fraction(track.mana_delta as f32, scale::POOL_DELTA);
+    }
+    token[index::LEVEL] = fraction(f32::from(unit.level), scale::LEVEL);
+}
+
+fn encode_unit_combat(token: &mut [f32; UNIT_FEATURES], unit: &UnitView) {
+    use unit_feature as index;
+    token[index::ATTACK_DAMAGE] = fraction(unit.attack_damage as f32, scale::DAMAGE);
+    token[index::ATTACK_RANGE] = fraction(unit.attack_range.to_f32(), scale::RANGE);
+    token[index::ATTACK_TIME] = fraction(unit.attack_time as f32, scale::ATTACK_TIME_MS);
+    token[index::ATTACK_POINT] = fraction(unit.attack_point as f32, scale::ATTACK_POINT_MS);
+    token[index::ATTACK_SPEED] = fraction(unit.attack_speed as f32, scale::ATTACK_SPEED);
+    token[index::MOVE_SPEED] = fraction(unit.move_speed.to_f32(), scale::MOVE_SPEED);
+    token[index::ARMOR] = signed_fraction(unit.armor.to_f32(), scale::ARMOR);
+    token[index::MAGIC_RESISTANCE] = unit.magic_resist.to_f32().clamp(-1.0, 1.0);
+    token[index::VISION] = fraction(unit.vision_radius.to_f32(), scale::VISION);
+}
+
+/// Fight arithmetic between the live own hero and `unit` from the hero's side.
+fn encode_unit_tactics(
+    token: &mut [f32; UNIT_FEATURES],
+    unit: &UnitView,
+    hero: &UnitView,
+    relation: EntityRelation,
+    age: u32,
+    team: Team,
+) {
+    use unit_feature as index;
+    token[index::HERO_RELATIVE_PRESENT] = 1.0;
+    let distance = combat::distance(hero.pos, unit.pos);
+    let hulls = hero.bound + unit.bound;
+    let distance_squared = hero.pos.distance_squared(unit.pos);
+    token[index::OWN_IN_ATTACK_RANGE] =
+        bool_feature(distance_squared <= (hero.attack_range + hulls).squared_raw());
+    token[index::UNIT_IN_ATTACK_RANGE] =
+        bool_feature(distance_squared <= (unit.attack_range + hulls).squared_raw());
+    let edge = distance - hulls.to_f32();
+    token[index::OWN_RANGE_MARGIN] =
+        signed_fraction(edge - hero.attack_range.to_f32(), scale::MARGIN);
+    token[index::UNIT_RANGE_MARGIN] =
+        signed_fraction(edge - unit.attack_range.to_f32(), scale::MARGIN);
+    let speed = hero.move_speed.to_f32();
+    if speed > 0.0 {
+        token[index::TIME_TO_REACH] = fraction(distance / speed, scale::REACH_SECONDS);
+    }
+    if relation == EntityRelation::Own {
+        return;
+    }
+    token[index::OWN_HIT] = fraction(combat::hit_damage(hero, unit), scale::DAMAGE);
+    token[index::OWN_HITS_TO_KILL] = fraction(combat::hits_to_kill(hero, unit), scale::HITS);
+    let allied = relation == EntityRelation::Allied;
+    token[index::KILLABLE_NOW] = bool_feature(age == 0 && combat::killable_now(hero, unit, allied));
+    if allied {
+        return;
+    }
+    token[index::ITS_HIT] = fraction(combat::hit_damage(unit, hero), scale::DAMAGE);
+    token[index::ITS_HITS_TO_KILL_OWN] = fraction(combat::hits_to_kill(unit, hero), scale::HITS);
+    token[index::OWN_IN_ACQUISITION] = bool_feature(own_in_acquisition(hero, unit));
+    encode_own_raze(token, unit, hero, age, team);
+}
+
+/// What the own hero's next raze does to a hostile `unit`, and which reaches strike it now.
+fn encode_own_raze(
+    token: &mut [f32; UNIT_FEATURES],
+    unit: &UnitView,
+    hero: &UnitView,
+    age: u32,
+    team: Team,
+) {
+    use unit_feature as index;
+    if !combat::razeable(unit) {
+        return;
+    }
+    if let Some(kit) = combat::HeroKit::of(hero, 0) {
+        let stacks = crate::tracker::shadowraze_effect(unit, age).map_or(0, |(stacks, _)| stacks);
+        token[index::OWN_RAZE_DAMAGE] = fraction(kit.raze_damage(unit, stacks), scale::RAZE_DAMAGE);
+        if kit.raze_level > 0 {
+            let razes = kit.razes_to_kill(unit, stacks, scale::RAZES_TO_KILL);
+            token[index::OWN_RAZES_TO_KILL] = unit_ratio(razes, scale::RAZES_TO_KILL);
+        }
+    }
+    if age > 0 {
+        return;
+    }
+    let offset = canonical_offset(team, hero.pos, unit.pos);
+    let facing = canonical_facing(team, hero.facing);
+    for (reach, (_, distance)) in crate::raze_aim::SHADOWRAZES.iter().enumerate() {
+        let strikes = combat::raze_strikes(offset, facing, *distance);
+        token[index::IN_OWN_RAZE_START + reach] = bool_feature(strikes);
+    }
+}
+
+fn encode_unit_recent(
+    token: &mut [f32; UNIT_FEATURES],
+    tracker: &StateTracker,
+    track: &crate::EntityTrack,
+    view: &Perspective<'_>,
+) {
+    use unit_feature as index;
+    let current_tick = view.tick;
+    let [own_hero, own_side] = view.recent_victim(tracker, track);
+    token[index::ATTACKING_OWN_HERO] = bool_feature(own_hero);
+    token[index::ATTACKING_OWN_SIDE] = bool_feature(own_side);
+    if recent_damage(tracker, track.id, current_tick, false).is_some() {
+        token[index::RECENT_DAMAGE_TAKEN] = 1.0;
+    }
+    if let Some((_, amount)) = recent_damage(tracker, track.id, current_tick, true) {
+        token[index::RECENT_DAMAGE_DEALT_PRESENT] = 1.0;
+        token[index::RECENT_DAMAGE_DEALT] = fraction(amount as f32, scale::DAMAGE);
+    }
+    let Some(attack_tick) = recent_possible_attack(tracker, track.id, current_tick) else {
+        return;
+    };
+    let age = current_tick - attack_tick;
+    let interval = attack_interval_ticks(track.unit.attack_time).max(1);
+    if age > interval {
+        return;
+    }
+    token[index::ATTACK_PHASE_PRESENT] = 1.0;
+    token[index::ATTACK_PHASE] = unit_ratio(age, interval);
+}
+
+fn encode_ability_history(
+    token: &mut [f32; ABILITY_FEATURES],
+    tracker: &StateTracker,
+    track: Option<&crate::EntityTrack>,
+    ability: Option<&AbilityView>,
+    current_tick: u32,
+) {
+    let (Some(track), Some(ability)) = (track, ability) else {
+        return;
+    };
+    let Some(cast_tick) = recent_ability_cast(tracker, track.id, ability.id, current_tick) else {
+        return;
+    };
+    token[ability_feature::LAST_CAST_PRESENT] = 1.0;
+    token[ability_feature::LAST_CAST_AGE] =
+        fraction((current_tick - cast_tick) as f32, scale::LAST_CAST_TICKS);
+}
+
+fn encode_statuses(token: &mut [f32; UNIT_FEATURES], statuses: StatusFlags) {
+    for (index, flag) in [
+        (unit_feature::SLOWED, StatusFlags::SLOWED),
+        (unit_feature::INVULNERABLE, StatusFlags::INVULNERABLE),
+        (unit_feature::CHANNELLING, StatusFlags::CHANNELLING),
+    ] {
+        token[index] = bool_feature(statuses.bits & flag != 0);
+    }
+}
+
+fn encode_ability_token(
+    unit: ControlledUnit,
+    slot: usize,
+    ability: Option<&AbilityView>,
+    legal: bool,
+    mana: Option<i32>,
+) -> [f32; ABILITY_FEATURES] {
+    use ability_feature as index;
+    let mut token = [0.0; ABILITY_FEATURES];
+    token[index::TOKEN_PRESENT] = 1.0;
+    one_hot(&mut token, index::BODY_START, 2, unit.index());
+    one_hot(&mut token, index::SLOT_START, 8, slot);
+    let Some(ability) = ability else {
+        return token;
+    };
+    token[index::OBSERVED] = 1.0;
+    one_hot(
+        &mut token,
+        index::ID_START,
+        ABILITY_ID_CLASSES,
+        ability_id_class(ability.id),
+    );
+    token[index::LEVEL] = f32::from(ability.level.min(4)) / 4.0;
+    token[index::MAX_LEVEL] = f32::from(ability.max_level.min(4)) / 4.0;
+    encode_cooldown(&mut token, index::COOLDOWN_NEAR, ability.cooldown_left);
+    token[index::MANA_COST] = fraction(ability.mana_cost as f32, scale::ABILITY_MANA);
+    token[index::RANGE] = fraction(ability.range as f32, scale::RANGE);
+    one_hot(&mut token, index::AIM_START, 5, aim_index(ability.aim));
+    token[index::PASSIVE] = bool_feature(ability.passive);
+    token[index::TOGGLE_ON] = bool_feature(ability.on);
+    token[index::CAN_LEVEL] = bool_feature(ability.can_level);
+    token[index::LEGAL] = bool_feature(legal);
+    token[index::MANA_SUFFICIENT] =
+        bool_feature(mana.is_some_and(|mana| mana >= ability.mana_cost));
+    token
+}
+
+/// Near (saturating at ten seconds) and log cooldown in the two slots from `start`.
+fn encode_cooldown(token: &mut [f32], start: usize, left: u32) {
+    token[start] = fraction(left as f32, scale::COOLDOWN_NEAR_TICKS);
+    token[start + 1] = log_fraction(left as f32, scale::COOLDOWN_LOG_TICKS);
+}
+
+/// Read-only context shared by the own inventory, stash and courier rows.
+struct OwnedItemContext<'a> {
+    tracker: &'a StateTracker,
+    action_space: &'a ActionSpace,
+    readiness: &'a ItemReadiness,
+    tick: u32,
+}
+
+impl OwnedItemContext<'_> {
+    fn encode(
+        &self,
+        unit: ControlledUnit,
+        location: usize,
+        slot_token: usize,
+        slot: usize,
+        item: Option<ItemView>,
+    ) -> [f32; ITEM_FEATURES] {
+        use item_feature as index;
+        let mut token = [0.0; ITEM_FEATURES];
+        token[index::TOKEN_PRESENT] = 1.0;
+        one_hot(&mut token, index::LOCATION_START, 5, location);
+        token[index::SLOT] = slot_value(slot_token);
+        let Some(item) = item else {
+            return token;
+        };
+        encode_item_view(&mut token, self.tracker.shop(), item);
+        let wire_slot = ItemSlot(u8::try_from(slot).unwrap_or(u8::MAX));
+        let local_mute = self
+            .readiness
+            .inventory_mute_left(unit, wire_slot, self.tick)
+            .unwrap_or(0);
+        let mute_left = item.mute_left.max(local_mute);
+        token[index::MUTE_REMAINING_PRESENT] = 1.0;
+        token[index::MUTE_REMAINING] = fraction(mute_left as f32, scale::MUTE_TICKS);
+        token[index::MUTED] = bool_feature(mute_left > 0);
+        // Stash rows never wait on a shared scroll cooldown.
+        if location != 1
+            && let Some(left) = self.readiness.shared_wait_left(unit, item.id, self.tick)
+        {
+            token[index::SHARED_WAIT_PRESENT] = 1.0;
+            token[index::SHARED_WAIT_REMAINING] = fraction(left as f32, scale::SHARED_WAIT_TICKS);
+        }
+        if slot < 6 {
+            token[index::LEGAL] = bool_feature(item_legal(self.action_space, unit, slot));
+        }
+        token
+    }
+}
+
+/// The historical one-based slot scalar shared by every item row.
+fn slot_value(slot: usize) -> f32 {
+    (slot + 1) as f32 / 64.0
+}
+
+fn encode_item_view(token: &mut [f32; ITEM_FEATURES], shop: &[ShopEntry], item: ItemView) {
+    use item_feature as index;
+    token[index::ITEM_PRESENT] = 1.0;
+    one_hot(
+        token,
+        index::ITEM_START,
+        ITEM_ID_CLASSES,
+        item_id_class(item.id),
+    );
+    token[index::CHARGES_PRESENT] = bool_feature(item.charges.is_some());
+    token[index::CHARGES] = fraction(f32::from(item.charges.unwrap_or(0)), scale::CHARGES);
+    encode_cooldown(token, index::COOLDOWN_NEAR, item.cooldown_left);
+    if let Some(aim) = item.aim {
+        token[index::AIM_PRESENT] = 1.0;
+        one_hot(token, index::AIM_START, 5, aim_index(aim));
+    }
+    token[index::RANGE] = fraction(item.range as f32, scale::RANGE);
+    token[index::MANA_COST] = fraction(item.mana_cost as f32, scale::ABILITY_MANA);
+    if let Some(mode) = item.mode {
+        token[index::ATTRIBUTE_PRESENT] = 1.0;
+        one_hot(token, index::ATTRIBUTE_START, 3, attribute_index(mode));
+    }
+    token[index::FOR_SALE] = bool_feature(item.for_sale);
+    if let Some(entry) = shop.iter().find(|entry| entry.id == item.id) {
+        token[index::VALUE_PRESENT] = 1.0;
+        token[index::VALUE] = fraction(entry.cost as f32, scale::ITEM_VALUE);
+        token[index::COMPOSITE] = bool_feature(!entry.components.is_empty());
+    }
+    token[index::RECIPE_COMPONENT] =
+        bool_feature(shop.iter().any(|entry| entry.components.contains(&item.id)));
+}
+
+fn encode_shop_items(
+    tracker: &StateTracker,
+    action_space: &ActionSpace,
+    output: &mut [[f32; ITEM_FEATURES]; ITEM_FEATURE_TOKENS],
+) {
+    use item_feature as index;
+    for (slot, candidate) in action_space.shop_candidates().iter().enumerate() {
+        let mut token = [0.0; ITEM_FEATURES];
+        token[index::TOKEN_PRESENT] = 1.0;
+        one_hot(&mut token, index::LOCATION_START, 5, 3);
+        token[index::SLOT] = slot_value(slot);
+        token[index::ITEM_PRESENT] = 1.0;
+        one_hot(
+            &mut token,
+            index::ITEM_START,
+            ITEM_ID_CLASSES,
+            item_id_class(candidate.item),
+        );
+        token[index::VALUE_PRESENT] = 1.0;
+        token[index::VALUE] = fraction(candidate.cost as f32, scale::ITEM_VALUE);
+        token[index::SHOP_CANDIDATE] = 1.0;
+        token[index::LEGAL] = bool_feature(action_space.buy_mask(ControlledUnit::Hero)[slot]);
+        if let Some(entry) = tracker
+            .shop()
+            .iter()
+            .find(|entry| entry.id == candidate.item)
+        {
+            token[index::COMPOSITE] = bool_feature(!entry.components.is_empty());
+        }
+        output[OWN_ITEM_SLOTS + slot] = token;
+    }
+}
+
+/// The bag of the nearest visible enemy hero, else of the most recently seen one.
+fn encode_enemy_items(
+    tracker: &StateTracker,
+    output: &mut [[f32; ITEM_FEATURES]; ITEM_FEATURE_TOKENS],
+) {
+    let enemy = opposing(tracker.team());
+    let origin = own_origin(tracker);
+    let Some(hero) = tracker
+        .entities()
+        .iter()
+        .filter(|track| track.unit.kind == UnitKind::Hero && track.unit.team == enemy)
+        .min_by_key(|track| {
+            let distance = origin.map_or(0, |origin| origin.distance_squared(track.unit.pos));
+            (!track.visible, u32::MAX - track.last_seen_tick, distance)
+        })
+    else {
+        return;
+    };
+    let first = OWN_ITEM_SLOTS + MAX_SHOP_ITEMS;
+    for (slot, item) in hero.unit.items.iter().take(ENEMY_ITEM_SLOTS).enumerate() {
+        let token = &mut output[first + slot];
+        token[item_feature::TOKEN_PRESENT] = 1.0;
+        one_hot(token, item_feature::LOCATION_START, 5, 4);
+        token[item_feature::SLOT] = slot_value(slot);
+        if let Some(item) = item {
+            encode_item_view(token, tracker.shop(), *item);
+        }
+    }
+}
+
+const TICKS_PER_SECOND: f32 = 30.0;
+
+/// Sets `token[start + index]` when `index` lies inside the `width`-wide block.
+fn one_hot(token: &mut [f32], start: usize, width: usize, index: usize) {
+    if index < width {
+        token[start + index] = 1.0;
+    }
+}
+
+fn fraction(value: f32, scale: f32) -> f32 {
+    (value / scale).clamp(0.0, 1.0)
+}
+
+fn signed_fraction(value: f32, scale: f32) -> f32 {
+    (value / scale).clamp(-1.0, 1.0)
+}
+
+/// ln(1 + value) against ln(1 + maximum), saturating at one.
+fn log_fraction(value: f32, maximum: f32) -> f32 {
+    (value.max(0.0).ln_1p() / maximum.ln_1p()).min(1.0)
+}
+
+fn near_distance(distance: f32) -> f32 {
+    fraction(distance, scale::NEAR_DISTANCE)
+}
+
+fn log_distance(distance: f32) -> f32 {
+    log_fraction(
+        distance / scale::LOG_DISTANCE_UNIT,
+        scale::LOG_DISTANCE_MAX / scale::LOG_DISTANCE_UNIT,
+    )
+}
+
+/// A raw fixed-point length in world units over `scale`, clamped to [-1, 1].
+fn raw_units(raw: i64, scale: f32) -> f32 {
+    signed_fraction(raw as f32 / 65_536.0, scale)
+}
+
+/// Canonical cosine and sine of a facing: Dire facings turn half round.
+fn canonical_facing(team: Team, angle: Angle) -> (f32, f32) {
+    let brads = if team == Team::Dire {
+        angle.brads.wrapping_add(1 << 15)
+    } else {
+        angle.brads
+    };
+    let radians = f32::from(brads) * (std::f32::consts::TAU / 65_536.0);
+    let (sine, cosine) = radians.sin_cos();
+    (cosine, sine)
+}
+
+/// World-unit offset from `from` to `to`, turned half round on the Dire side.
+fn canonical_offset(team: Team, from: Vec2, to: Vec2) -> (f32, f32) {
+    let sign = if team == Team::Dire { -1.0 } else { 1.0 };
+    let dx = (i64::from(to.x.raw) - i64::from(from.x.raw)) as f32 / 65_536.0;
+    let dy = (i64::from(to.y.raw) - i64::from(from.y.raw)) as f32 / 65_536.0;
+    (sign * dx, sign * dy)
+}
+
+/// Cosine and sine of a canonical delta's direction relative to a canonical facing.
+fn bearing(delta: (i64, i64), facing: (f32, f32), distance: f32) -> (f32, f32) {
+    let dx = delta.0 as f32 / 65_536.0;
+    let dy = delta.1 as f32 / 65_536.0;
+    let (cosine, sine) = facing;
+    (
+        ((dx * cosine + dy * sine) / distance).clamp(-1.0, 1.0),
+        ((dy * cosine - dx * sine) / distance).clamp(-1.0, 1.0),
+    )
+}
+
+/// Chebyshev closest approach of a projectile, in world units over the approach scale.
+fn closest_approach(relative: (i64, i64), velocity_x: i64, velocity_y: i64) -> f32 {
+    let relative_x = relative.0 as f32;
+    let relative_y = relative.1 as f32;
+    let velocity_x = velocity_x as f32;
+    let velocity_y = velocity_y as f32;
+    let speed_squared = velocity_x * velocity_x + velocity_y * velocity_y;
+    let time = if speed_squared > 0.0 {
+        (-(relative_x * velocity_x + relative_y * velocity_y) / speed_squared).max(0.0)
+    } else {
+        0.0
+    };
+    let closest_x = relative_x + velocity_x * time;
+    let closest_y = relative_y + velocity_y * time;
+    fraction(
+        closest_x.abs().max(closest_y.abs()) / 65_536.0,
+        scale::PROJECTILE_APPROACH,
+    )
+}
+
+const fn unit_kind_index(kind: UnitKind) -> usize {
+    match kind {
+        UnitKind::Hero => 0,
+        UnitKind::CreepMelee => 1,
+        UnitKind::CreepFlagbearer => 2,
+        UnitKind::CreepRanged => 3,
+        UnitKind::CreepSiege => 4,
+        UnitKind::CreepNeutral => 5,
+        UnitKind::Tower => 6,
+        UnitKind::Ancient => 7,
+        UnitKind::Barracks => 8,
+        UnitKind::Fountain => 9,
+        UnitKind::Ward => 10,
+        UnitKind::Courier => 11,
+    }
+}
+
+fn ability_id_class(id: AbilityId) -> usize {
+    usize::from(id.0).min(ABILITY_ID_CLASSES - 1)
+}
+
+fn item_id_class(id: ItemId) -> usize {
+    usize::from(id.0).min(ITEM_ID_CLASSES - 1)
+}
+
+const fn aim_index(aim: Aim) -> usize {
+    match aim {
+        Aim::Own => 0,
+        Aim::Point => 1,
+        Aim::Unit => 2,
+        Aim::Tree => 3,
+        Aim::Building => 4,
+    }
+}
+
+const fn attribute_index(attribute: Attribute) -> usize {
+    match attribute {
+        Attribute::Strength => 0,
+        Attribute::Agility => 1,
+        Attribute::Intelligence => 2,
     }
 }
 
@@ -2709,246 +3534,6 @@ fn next_observation_state(
         });
     }
     std::sync::Arc::new(next)
-}
-
-/// The seven scoreboard advantage values shared by the global and history layouts.
-fn advantage_values(summary: &crate::GlobalSummary) -> [f32; 7] {
-    [
-        signed_ratio(summary.allied.xp.saturating_sub(summary.enemy.xp), MAX_XP),
-        signed_ratio(
-            difference(summary.allied.levels, summary.enemy.levels),
-            MAX_SCORE,
-        ),
-        signed_ratio(
-            difference(summary.allied.kills, summary.enemy.kills),
-            MAX_SCORE,
-        ),
-        signed_ratio(
-            difference(summary.enemy.deaths, summary.allied.deaths),
-            MAX_SCORE,
-        ),
-        signed_ratio(
-            difference(summary.allied.assists, summary.enemy.assists),
-            MAX_SCORE,
-        ),
-        signed_ratio(
-            difference(summary.allied.last_hits, summary.enemy.last_hits),
-            MAX_SCORE,
-        ),
-        signed_ratio(
-            difference(summary.allied.denies, summary.enemy.denies),
-            MAX_SCORE,
-        ),
-    ]
-}
-
-fn encode_score_advantages(global: &mut [f32; GLOBAL_FEATURES], summary: &crate::GlobalSummary) {
-    use global_feature as index;
-    let values = advantage_values(summary);
-    global[index::KILL_ADVANTAGE] = values[2];
-    global[index::DEATH_ADVANTAGE] = values[3];
-    global[index::ASSIST_ADVANTAGE] = values[4];
-    global[index::XP_ADVANTAGE] = values[0];
-    global[index::LEVEL_ADVANTAGE] = values[1];
-    global[index::LAST_HIT_ADVANTAGE] = values[5];
-    global[index::DENY_ADVANTAGE] = values[6];
-}
-
-fn encode_assignment(local: &LocalPolicyState, global: &mut [f32; GLOBAL_FEATURES]) {
-    use global_feature as index;
-    let Some(assignment) = local.assignment() else {
-        return;
-    };
-    if let Some(role) = assignment.role {
-        global[index::ROLE_PRESENT] = 1.0;
-        global[index::ROLE_TOKEN] = category_token(role_index(role));
-    }
-    if let Some(lane) = assignment.lane {
-        global[index::LANE_PRESENT] = 1.0;
-        global[index::LANE_TOKEN] = category_token(lane_index(lane));
-    }
-}
-
-fn encode_local_global(
-    encoder: &FeatureEncoder,
-    tracker: &StateTracker,
-    tick: u32,
-    local: &LocalPolicyState,
-    global: &mut [f32; GLOBAL_FEATURES],
-) {
-    use global_feature as index;
-    if let Some(active) = local.active_order() {
-        global[index::ACTIVE_ORDER_PRESENT] = 1.0;
-        global[index::ACTIVE_ORDER_KIND] = category_token(active.kind.index());
-        global[index::ACTIVE_ORDER_AGE] =
-            unit_ratio(tick.saturating_sub(active.started_tick), MAX_AGE);
-        encode_active_target(encoder, tracker, active.target, global);
-    }
-    if let Some(decision) = local.decisions().next_back() {
-        global[index::LAST_DECISION_PRESENT] = 1.0;
-        global[index::TICKS_SINCE_DECISION] =
-            unit_ratio(tick.saturating_sub(decision.tick), MAX_AGE);
-    }
-}
-
-fn encode_active_target(
-    encoder: &FeatureEncoder,
-    tracker: &StateTracker,
-    target: ActivePolicyTarget,
-    global: &mut [f32; GLOBAL_FEATURES],
-) {
-    use global_feature as index;
-    let (position, visible, unit) = match target {
-        ActivePolicyTarget::None => return,
-        ActivePolicyTarget::Point(position) => (position, true, None),
-        ActivePolicyTarget::Unit(id) => {
-            let Some(entity) = tracker.entity(id) else {
-                global[index::ACTIVE_TARGET_PRESENT] = 1.0;
-                global[index::ACTIVE_TARGET_UNIT] = 1.0;
-                return;
-            };
-            (entity.unit.pos, entity.visible, Some(&entity.unit))
-        }
-    };
-    global[index::ACTIVE_TARGET_PRESENT] = 1.0;
-    global[index::ACTIVE_TARGET_POINT] = bool_feature(unit.is_none());
-    global[index::ACTIVE_TARGET_UNIT] = bool_feature(unit.is_some());
-    global[index::ACTIVE_TARGET_VISIBLE] = bool_feature(visible);
-    if let Some(hero) = tracker.own_hero() {
-        let delta = encoder.canonical_delta(tracker.team(), position, hero.pos);
-        global[index::ACTIVE_TARGET_RELATIVE_X] = signed_raw_ratio(delta.0, encoder.extent_raw);
-        global[index::ACTIVE_TARGET_RELATIVE_Y] = signed_raw_ratio(delta.1, encoder.extent_raw);
-        global[index::ACTIVE_TARGET_DISTANCE] =
-            raw_distance_ratio_i64(delta.0.abs().max(delta.1.abs()), encoder.extent_raw);
-    }
-    if let Some(unit) = unit {
-        global[index::ACTIVE_TARGET_KIND_TOKEN] = unit_kind_token(unit.kind);
-        if unit.team == Team::Neutral {
-            global[index::ACTIVE_TARGET_NEUTRAL] = 1.0;
-        } else if unit.team == tracker.team() {
-            global[index::ACTIVE_TARGET_ALLIED] = 1.0;
-        } else {
-            global[index::ACTIVE_TARGET_ENEMY] = 1.0;
-        }
-    }
-}
-
-fn encode_own_score(own: &PlayerView, global: &mut [f32; GLOBAL_FEATURES]) {
-    use global_feature as index;
-    global[index::OWN_LEVEL] = ratio(i64::from(own.level), 0, MAX_LEVEL);
-    global[index::OWN_XP] = signed_ratio(i64::from(own.xp), MAX_XP);
-    global[index::OWN_KILLS] = ratio(i64::from(own.kills), 0, MAX_SCORE);
-    global[index::OWN_DEATHS] = ratio(i64::from(own.deaths), 0, MAX_SCORE);
-    global[index::OWN_ASSISTS] = ratio(i64::from(own.assists), 0, MAX_SCORE);
-    global[index::OWN_LAST_HITS] = ratio(i64::from(own.last_hits), 0, MAX_SCORE);
-    global[index::OWN_DENIES] = ratio(i64::from(own.denies), 0, MAX_SCORE);
-}
-
-fn encode_history_sample(
-    output: &mut [f32; HISTORY_FEATURES],
-    summary: crate::GlobalSummary,
-    current_tick: u32,
-    enemy_scoreboard: bool,
-) {
-    use history_feature as index;
-    output[index::SAMPLE_PRESENT] = 1.0;
-    output[index::AGE] = unit_ratio(
-        current_tick.saturating_sub(summary.tick),
-        crate::HISTORY_TICKS,
-    );
-    output[index::HP_PRESENT] = bool_feature(summary.own_hp_present);
-    output[index::HP_RATIO] = safe_fraction(summary.own_hp, summary.own_max_hp);
-    output[index::MANA_PRESENT] = bool_feature(summary.own_mana_present);
-    output[index::MANA_RATIO] = safe_fraction(summary.own_mana, summary.own_max_mana);
-    output[index::OWN_LEVEL] = ratio(i64::from(summary.own_level), 0, MAX_LEVEL);
-    output[index::OWN_GOLD] = signed_ratio(i64::from(summary.own_gold), MAX_GOLD);
-    output[index::OWN_ALIVE] = bool_feature(summary.own_hp_present);
-    output[index::RESPAWN_LEFT] = unit_ratio(summary.own_respawn_left, MAX_AGE);
-    output[index::VISIBLE_ALLIED_UNITS] = ratio(i64::from(summary.visible_allied_units), 0, 256);
-    output[index::VISIBLE_ENEMY_UNITS] = ratio(i64::from(summary.visible_enemy_units), 0, 256);
-    output[index::ENEMY_SCOREBOARD_ENABLED] = bool_feature(enemy_scoreboard);
-    if enemy_scoreboard {
-        encode_history_advantages(output, summary);
-    }
-    output[index::ALLIED_STRUCTURE_HP] = signed_ratio(summary.allied_structure_hp, MAX_HP);
-    output[index::ENEMY_STRUCTURE_HP] = signed_ratio(summary.enemy_structure_hp, MAX_HP);
-    output[index::DESTROYED_STRUCTURES_PRESENT] =
-        bool_feature(summary.destroyed_structures_present);
-    let destroyed = summary
-        .allied_structures_destroyed
-        .saturating_add(summary.enemy_structures_destroyed);
-    output[index::DESTROYED_STRUCTURES] = ratio(i64::from(destroyed), 0, MAX_STRUCTURE_COUNT);
-}
-
-fn encode_history_advantages(output: &mut [f32; HISTORY_FEATURES], summary: crate::GlobalSummary) {
-    use history_feature as index;
-    let values = advantage_values(&summary);
-    output[index::XP_ADVANTAGE] = values[0];
-    output[index::LEVEL_ADVANTAGE] = values[1];
-    output[index::KILL_ADVANTAGE] = values[2];
-    output[index::DEATH_ADVANTAGE] = values[3];
-    output[index::ASSIST_ADVANTAGE] = values[4];
-    output[index::LAST_HIT_ADVANTAGE] = values[5];
-    output[index::DENY_ADVANTAGE] = values[6];
-}
-
-fn encode_relation(token: &mut [f32; UNIT_FEATURES], relation: EntityRelation) {
-    token[unit_feature::RELATION_START + relation_index(relation)] = 1.0;
-}
-
-fn encode_owner_relation(token: &mut [f32; UNIT_FEATURES], relation: Option<EntityRelation>) {
-    if let Some(relation) = relation {
-        token[unit_feature::OWNER_PRESENT] = 1.0;
-        let index = relation_index(relation);
-        if index < 3 {
-            token[unit_feature::OWNER_START + index] = 1.0;
-        }
-    }
-}
-
-fn encode_point_origin(
-    encoder: &FeatureEncoder,
-    token: &mut [f32; POINT_FEATURES],
-    team: Team,
-    position: Vec2,
-    origin: Option<Vec2>,
-) {
-    use point_feature as index;
-    let Some(origin) = origin else {
-        return;
-    };
-    token[index::ORIGIN_PRESENT] = 1.0;
-    let delta = encoder.canonical_delta(team, position, origin);
-    token[index::RELATIVE_X] = signed_raw_ratio(delta.0, encoder.extent_raw);
-    token[index::RELATIVE_Y] = signed_raw_ratio(delta.1, encoder.extent_raw);
-    let distance = delta.0.abs().max(delta.1.abs());
-    token[index::DISTANCE] = raw_distance_ratio_i64(distance, encoder.extent_raw);
-    if distance > 0 {
-        token[index::DIRECTION_X] = delta.0 as f32 / distance as f32;
-        token[index::DIRECTION_Y] = delta.1 as f32 / distance as f32;
-    }
-}
-
-fn encode_point_source(token: &mut [f32; POINT_FEATURES], source: PointSource) {
-    use point_feature as index;
-    let (category, direction, radius, kind, relation) = point_source_semantics(source);
-    token[index::SOURCE_TOKEN] = category_token(category);
-    if let Some(direction) = direction {
-        token[index::SOURCE_DIRECTION_PRESENT] = 1.0;
-        token[index::SOURCE_DIRECTION_TOKEN] = category_token(point_direction_index(direction));
-    }
-    if let Some(radius) = radius {
-        token[index::SOURCE_RADIUS_PRESENT] = 1.0;
-        token[index::SOURCE_RADIUS] = ratio(i64::from(radius), 0, 1_200);
-    }
-    if let Some(kind) = kind {
-        token[index::SOURCE_KIND_PRESENT] = 1.0;
-        token[index::SOURCE_KIND_TOKEN] = unit_kind_token(kind);
-    }
-    if let Some(relation) = relation {
-        token[index::SOURCE_RELATION_PRESENT] = 1.0;
-        token[index::SOURCE_RELATION_START + relation_index(relation)] = 1.0;
-    }
 }
 
 type PointSourceSemantics = (
@@ -3008,266 +3593,6 @@ const fn point_direction_index(direction: PointDirection) -> usize {
         PointDirection::SouthWest => 5,
         PointDirection::South => 6,
         PointDirection::SouthEast => 7,
-    }
-}
-
-fn encode_unit_resources(token: &mut [f32; UNIT_FEATURES], track: &crate::EntityTrack) {
-    let unit = &track.unit;
-    if unit.max_hp > 0 {
-        token[unit_feature::HP_PRESENT] = 1.0;
-        token[unit_feature::HP_RATIO] = safe_fraction(unit.hp, unit.max_hp);
-    }
-    if unit.max_mana > 0 {
-        token[unit_feature::MANA_PRESENT] = 1.0;
-        token[unit_feature::MANA_RATIO] = safe_fraction(unit.mana, unit.max_mana);
-    }
-    if track.velocity.is_some() {
-        token[unit_feature::HP_DELTA_PRESENT] = 1.0;
-        token[unit_feature::HP_DELTA] = signed_ratio(track.hp_delta, MAX_HP);
-        token[unit_feature::MANA_DELTA_PRESENT] = 1.0;
-        token[unit_feature::MANA_DELTA] = signed_ratio(track.mana_delta, MAX_MANA);
-    }
-}
-
-fn encode_unit_combat(token: &mut [f32; UNIT_FEATURES], unit: &UnitView) {
-    token[unit_feature::ATTACK_DAMAGE] = signed_ratio(i64::from(unit.attack_damage), MAX_DAMAGE);
-    token[unit_feature::ATTACK_RANGE] =
-        raw_distance_ratio_i64(i64::from(unit.attack_range.raw), i64::from(Fixed::MAX.raw));
-    token[unit_feature::ATTACK_INTERVAL] = ratio(
-        i64::from(attack_interval_ticks(unit.attack_time)),
-        0,
-        MAX_ATTACK_INTERVAL,
-    );
-    token[unit_feature::ATTACK_SPEED] = signed_ratio(i64::from(unit.attack_speed), MAX_SPEED);
-    token[unit_feature::MOVE_SPEED] = signed_ratio(
-        i64::from(unit.move_speed.raw),
-        MAX_SPEED << Fixed::FRAC_BITS,
-    );
-    token[unit_feature::ARMOR] = signed_ratio(i64::from(unit.armor.raw), MAX_ARMOR_RAW);
-    token[unit_feature::MAGIC_RESISTANCE] =
-        signed_ratio(i64::from(unit.magic_resist.raw), i64::from(Fixed::ONE.raw));
-    token[unit_feature::VISION] =
-        raw_distance_ratio_i64(i64::from(unit.vision_radius.raw), i64::from(Fixed::MAX.raw));
-    token[unit_feature::TRUE_SIGHT] = raw_distance_ratio_i64(
-        i64::from(unit.true_sight_radius.raw),
-        i64::from(Fixed::MAX.raw),
-    );
-}
-
-fn encode_unit_inventory(token: &mut [f32; UNIT_FEATURES], unit: &UnitView) {
-    let free = unit.items.iter().filter(|slot| slot.is_none()).count();
-    token[unit_feature::ITEM_SLOT_COUNT] = ratio(unit.items.len() as i64, 0, 9);
-    token[unit_feature::FREE_ITEM_SLOTS] = ratio(free as i64, 0, 9);
-    token[unit_feature::ITEM_CAPACITY_AVAILABLE] = bool_feature(free > 0);
-}
-
-fn encode_unit_tactics(
-    token: &mut [f32; UNIT_FEATURES],
-    unit: &UnitView,
-    origin: Option<Vec2>,
-    own_hero: Option<&UnitView>,
-    tick_rate: u16,
-) {
-    let (Some(origin), Some(hero)) = (origin, own_hero) else {
-        return;
-    };
-    let distance_squared = origin.distance_squared(unit.pos);
-    if hero.attack_damage > 0 && unit.hp > 0 {
-        let attacks = (i64::from(unit.hp) + i64::from(hero.attack_damage) - 1)
-            / i64::from(hero.attack_damage);
-        token[unit_feature::ATTACKS_TO_KILL_PRESENT] = 1.0;
-        token[unit_feature::ATTACKS_TO_KILL] = ratio(attacks, 1, 100);
-    }
-    if hero.move_speed.raw > 0 {
-        token[unit_feature::TIME_TO_REACH_PRESENT] = 1.0;
-        let distance = maximum_axis_distance(origin, unit.pos);
-        let ticks = distance
-            .saturating_mul(i64::from(tick_rate))
-            .checked_div(i64::from(hero.move_speed.raw))
-            .unwrap_or(i64::MAX);
-        token[unit_feature::TIME_TO_REACH] = ratio(ticks, 0, i64::from(MAX_AGE));
-    }
-    let hulls = hero.bound + unit.bound;
-    token[unit_feature::OWN_IN_ATTACK_RANGE] =
-        bool_feature(distance_squared <= (hero.attack_range + hulls).squared_raw());
-    token[unit_feature::UNIT_IN_ATTACK_RANGE] =
-        bool_feature(distance_squared <= (unit.attack_range + hulls).squared_raw());
-}
-
-fn encode_unit_recent(
-    token: &mut [f32; UNIT_FEATURES],
-    tracker: &StateTracker,
-    track: &crate::EntityTrack,
-    current_tick: u32,
-) {
-    let taken = recent_damage(tracker, track.id, current_tick, false);
-    if taken.is_some() {
-        token[unit_feature::RECENT_DAMAGE_TAKEN] = 1.0;
-    }
-    if let Some((_, amount)) = recent_damage(tracker, track.id, current_tick, true) {
-        token[unit_feature::RECENT_DAMAGE_DEALT_PRESENT] = 1.0;
-        token[unit_feature::RECENT_DAMAGE_DEALT] = signed_ratio(i64::from(amount), MAX_DAMAGE);
-    }
-    let Some(attack_tick) = recent_possible_attack(tracker, track.id, current_tick) else {
-        return;
-    };
-    let age = current_tick - attack_tick;
-    let interval = attack_interval_ticks(track.unit.attack_time).max(1);
-    if age > interval {
-        return;
-    }
-    token[unit_feature::ATTACK_PHASE_PRESENT] = 1.0;
-    token[unit_feature::ATTACK_PHASE] = unit_ratio(age, interval);
-}
-
-fn encode_ability_history(
-    token: &mut [f32; ABILITY_FEATURES],
-    tracker: &StateTracker,
-    track: Option<&crate::EntityTrack>,
-    ability: Option<&AbilityView>,
-    current_tick: u32,
-) {
-    let (Some(track), Some(ability)) = (track, ability) else {
-        return;
-    };
-    let Some(cast_tick) = recent_ability_cast(tracker, track.id, ability.id, current_tick) else {
-        return;
-    };
-    token[ability_feature::LAST_CAST_PRESENT] = 1.0;
-    token[ability_feature::LAST_CAST_AGE] = unit_ratio(current_tick - cast_tick, MAX_AGE);
-}
-
-fn encode_statuses(token: &mut [f32; UNIT_FEATURES], statuses: StatusFlags) {
-    token[unit_feature::INVULNERABLE] =
-        bool_feature(statuses.bits & StatusFlags::INVULNERABLE != 0);
-    token[unit_feature::CHANNELLING] = bool_feature(statuses.bits & StatusFlags::CHANNELLING != 0);
-    for (index, flag) in [
-        (unit_feature::STUNNED, StatusFlags::STUNNED),
-        (unit_feature::SLOWED, StatusFlags::SLOWED),
-        (unit_feature::DOT, StatusFlags::DOT),
-        (unit_feature::INVISIBLE, StatusFlags::INVISIBLE),
-        (unit_feature::MAGIC_IMMUNE, StatusFlags::MAGIC_IMMUNE),
-    ] {
-        token[index] = bool_feature(statuses.bits & flag != 0);
-    }
-}
-
-fn encode_ability_token(
-    unit: ControlledUnit,
-    slot: usize,
-    ability: Option<&AbilityView>,
-    legal: bool,
-) -> [f32; ABILITY_FEATURES] {
-    use ability_feature as index;
-    let mut token = [0.0; ABILITY_FEATURES];
-    token[index::TOKEN_PRESENT] = 1.0;
-    token[index::BODY_TOKEN] = category_token(unit.index());
-    token[index::SEMANTIC_SLOT_TOKEN] = category_token(slot);
-    let Some(ability) = ability else {
-        return token;
-    };
-    token[index::OBSERVATION_PRESENT] = 1.0;
-    token[index::ID_PRESENT] = 1.0;
-    token[index::ID_TOKEN] = ability_id_token(ability.id);
-    token[index::LEVEL] = ratio(i64::from(ability.level), 0, 30);
-    token[index::MAX_LEVEL] = ratio(i64::from(ability.max_level), 0, 30);
-    token[index::COOLDOWN] = unit_ratio(ability.cooldown_left, MAX_COOLDOWN as u32);
-    token[index::MANA_COST] = signed_ratio(i64::from(ability.mana_cost), MAX_MANA);
-    token[index::RANGE] = signed_ratio(i64::from(ability.range), Fixed::MAX.to_int() as i64);
-    token[index::AIM_TOKEN] = aim_token(ability.aim);
-    token[index::PASSIVE] = bool_feature(ability.passive);
-    token[index::TOGGLE_ON] = bool_feature(ability.on);
-    token[index::CAN_LEVEL] = bool_feature(ability.can_level);
-    token[index::LEGAL] = bool_feature(legal);
-    token
-}
-
-#[allow(clippy::too_many_arguments)]
-fn encode_owned_item(
-    tracker: &StateTracker,
-    action_space: &ActionSpace,
-    readiness: &ItemReadiness,
-    tick: u32,
-    unit: ControlledUnit,
-    location: usize,
-    slot: usize,
-    item: Option<ItemView>,
-) -> [f32; ITEM_FEATURES] {
-    let mut token = [0.0; ITEM_FEATURES];
-    token[item_feature::TOKEN_PRESENT] = 1.0;
-    token[item_feature::LOCATION_TOKEN] = category_token(location);
-    token[item_feature::SLOT_TOKEN] = category_token(slot);
-    let Some(item) = item else {
-        return token;
-    };
-    encode_item_view(&mut token, tracker.shop(), item);
-    let wire_slot = ItemSlot(u8::try_from(slot).unwrap_or(u8::MAX));
-    let local_mute = readiness
-        .inventory_mute_left(unit, wire_slot, tick)
-        .unwrap_or(0);
-    let mute_left = item.mute_left.max(local_mute);
-    token[item_feature::MUTE_REMAINING_PRESENT] = 1.0;
-    token[item_feature::MUTE_REMAINING] = unit_ratio(mute_left, MAX_COOLDOWN as u32);
-    token[item_feature::MUTED] = bool_feature(mute_left > 0);
-    if location != 2
-        && let Some(left) = readiness.shared_wait_left(unit, item.id, tick)
-    {
-        token[item_feature::SHARED_WAIT_PRESENT] = 1.0;
-        token[item_feature::SHARED_WAIT_REMAINING] = unit_ratio(left, MAX_COOLDOWN as u32);
-    }
-    if slot < 6 {
-        token[item_feature::LEGAL] = bool_feature(item_legal(action_space, unit, slot));
-    }
-    token
-}
-
-fn encode_item_view(token: &mut [f32; ITEM_FEATURES], shop: &[ShopEntry], item: ItemView) {
-    token[item_feature::ITEM_PRESENT] = 1.0;
-    token[item_feature::ITEM_TOKEN] = item_id_token(item.id);
-    token[item_feature::CHARGES_PRESENT] = bool_feature(item.charges.is_some());
-    token[item_feature::CHARGES] = ratio(i64::from(item.charges.unwrap_or(0)), 0, MAX_CHARGES);
-    token[item_feature::COOLDOWN] = unit_ratio(item.cooldown_left, MAX_COOLDOWN as u32);
-    token[item_feature::AIM_PRESENT] = bool_feature(item.aim.is_some());
-    token[item_feature::AIM_TOKEN] = item.aim.map_or(0.0, aim_token);
-    token[item_feature::RANGE] = signed_ratio(i64::from(item.range), Fixed::MAX.to_int() as i64);
-    token[item_feature::MANA_COST] = signed_ratio(i64::from(item.mana_cost), MAX_MANA);
-    token[item_feature::ATTRIBUTE_PRESENT] = bool_feature(item.mode.is_some());
-    token[item_feature::ATTRIBUTE_TOKEN] = item.mode.map_or(0.0, attribute_token);
-    token[item_feature::FOR_SALE] = bool_feature(item.for_sale);
-    if let Some(entry) = shop.iter().find(|entry| entry.id == item.id) {
-        token[item_feature::VALUE_PRESENT] = 1.0;
-        token[item_feature::VALUE] = signed_ratio(i64::from(entry.cost), MAX_ITEM_COST);
-        token[item_feature::COMPOSITE] = bool_feature(!entry.components.is_empty());
-    }
-    token[item_feature::RECIPE_COMPONENT] =
-        bool_feature(shop.iter().any(|entry| entry.components.contains(&item.id)));
-}
-
-fn encode_shop_items(
-    tracker: &StateTracker,
-    action_space: &ActionSpace,
-    output: &mut [[f32; ITEM_FEATURES]; ITEM_FEATURE_TOKENS],
-) {
-    for (slot, candidate) in action_space.shop_candidates().iter().enumerate() {
-        let mut token = [0.0; ITEM_FEATURES];
-        token[item_feature::TOKEN_PRESENT] = 1.0;
-        token[item_feature::LOCATION_TOKEN] = category_token(4);
-        token[item_feature::SLOT_TOKEN] = category_token(slot);
-        token[item_feature::ITEM_PRESENT] = 1.0;
-        token[item_feature::ITEM_TOKEN] = item_id_token(candidate.item);
-        token[item_feature::VALUE_PRESENT] = 1.0;
-        token[item_feature::VALUE] = signed_ratio(i64::from(candidate.cost), MAX_ITEM_COST);
-        token[item_feature::SHOP_CANDIDATE] = 1.0;
-        token[item_feature::LEGAL] =
-            bool_feature(action_space.buy_mask(ControlledUnit::Hero)[slot]);
-        if let Some(entry) = tracker
-            .shop()
-            .iter()
-            .find(|entry| entry.id == candidate.item)
-        {
-            token[item_feature::COMPOSITE] = bool_feature(!entry.components.is_empty());
-        }
-        output[OWN_ITEM_SLOTS + slot] = token;
     }
 }
 
@@ -3540,22 +3865,6 @@ fn own_asset_value(tracker: &StateTracker) -> i64 {
     total
 }
 
-fn alive_hero_counts(players: &[PlayerView], own_team: Team) -> (i64, i64) {
-    let mut allied = 0i64;
-    let mut enemy = 0i64;
-    for player in players {
-        if player.unit.is_none() {
-            continue;
-        }
-        if player.team == own_team {
-            allied += 1;
-        } else if player.team == opposing(own_team) {
-            enemy += 1;
-        }
-    }
-    (allied, enemy)
-}
-
 fn pregame_progress(tick: u32, pregame_ticks: u32) -> f32 {
     if pregame_ticks == 0 || tick >= pregame_ticks {
         return 1.0;
@@ -3609,15 +3918,6 @@ fn cell_index(axis: usize, position: Vec2) -> Option<usize> {
     (x < axis && y < axis).then_some(y * axis + x)
 }
 
-fn facing_feature(team: Team, angle: Angle) -> f32 {
-    let brads = if team == Team::Dire {
-        angle.brads.wrapping_add(1 << 15)
-    } else {
-        angle.brads
-    };
-    brads as f32 / u16::MAX as f32
-}
-
 fn relation_index(relation: EntityRelation) -> usize {
     match relation {
         EntityRelation::Own => 0,
@@ -3637,88 +3937,6 @@ fn team_relation(own: Team, other: Team) -> EntityRelation {
     }
 }
 
-fn encode_small_relation(output: &mut [f32], relation: EntityRelation) {
-    output[relation_index(relation)] = 1.0;
-}
-
-fn unit_kind_token(kind: UnitKind) -> f32 {
-    category_token(match kind {
-        UnitKind::Hero => 0,
-        UnitKind::CreepMelee => 1,
-        UnitKind::CreepFlagbearer => 2,
-        UnitKind::CreepRanged => 3,
-        UnitKind::CreepSiege => 4,
-        UnitKind::CreepNeutral => 5,
-        UnitKind::Tower => 6,
-        UnitKind::Ancient => 7,
-        UnitKind::Barracks => 8,
-        UnitKind::Fountain => 9,
-        UnitKind::Ward => 10,
-        UnitKind::Courier => 11,
-    })
-}
-
-fn ability_id_token(id: AbilityId) -> f32 {
-    category_token(match id.0 {
-        8 => 0,
-        9 => 1,
-        10 => 2,
-        11 => 3,
-        12 => 4,
-        13 => 5,
-        14 => 6,
-        15 => 7,
-        16 => 8,
-        17 => 9,
-        18 => 10,
-        other => 11 + usize::from(other),
-    })
-}
-
-fn item_id_token(id: ItemId) -> f32 {
-    category_token(usize::from(id.0))
-}
-
-fn aim_token(aim: Aim) -> f32 {
-    category_token(match aim {
-        Aim::Own => 0,
-        Aim::Point => 1,
-        Aim::Unit => 2,
-        Aim::Tree => 3,
-        Aim::Building => 4,
-    })
-}
-
-fn attribute_token(attribute: Attribute) -> f32 {
-    category_token(match attribute {
-        Attribute::Strength => 0,
-        Attribute::Agility => 1,
-        Attribute::Intelligence => 2,
-    })
-}
-
-const fn role_index(role: PolicyRole) -> usize {
-    match role {
-        PolicyRole::Carry => 0,
-        PolicyRole::Mid => 1,
-        PolicyRole::Offlane => 2,
-        PolicyRole::Support => 3,
-        PolicyRole::HardSupport => 4,
-    }
-}
-
-const fn lane_index(lane: PolicyLane) -> usize {
-    match lane {
-        PolicyLane::Safe => 0,
-        PolicyLane::Mid => 1,
-        PolicyLane::Offlane => 2,
-    }
-}
-
-fn category_token(index: usize) -> f32 {
-    (index + 1) as f32
-}
-
 fn safe_fraction(value: i32, maximum: i32) -> f32 {
     if maximum <= 0 {
         return 0.0;
@@ -3730,61 +3948,16 @@ fn coordinate_ratio(raw: i32, extent_raw: i64) -> f32 {
     ratio(i64::from(raw), 0, extent_raw.saturating_sub(1).max(1))
 }
 
-fn raw_distance_ratio(raw: i32, maximum: i64) -> f32 {
-    raw_distance_ratio_i64(i64::from(raw), maximum)
-}
-
-fn raw_distance_ratio_i64(raw: i64, maximum: i64) -> f32 {
-    ratio(raw, 0, maximum)
-}
-
 fn signed_raw_ratio(raw: i64, maximum: i64) -> f32 {
-    signed_ratio(raw, maximum)
-}
-
-fn squared_distance_ratio(distance_squared: i64, extent_raw: i64) -> f32 {
-    let maximum = extent_raw.saturating_mul(extent_raw).max(1);
-    ratio(distance_squared, 0, maximum)
-}
-
-fn closest_approach_ratio(
-    relative: (i64, i64),
-    velocity_x: i64,
-    velocity_y: i64,
-    extent_raw: i64,
-) -> f32 {
-    let relative_x = relative.0 as f32;
-    let relative_y = relative.1 as f32;
-    let velocity_x = velocity_x as f32;
-    let velocity_y = velocity_y as f32;
-    let speed_squared = velocity_x * velocity_x + velocity_y * velocity_y;
-    let time = if speed_squared > 0.0 {
-        (-(relative_x * velocity_x + relative_y * velocity_y) / speed_squared).max(0.0)
-    } else {
-        0.0
-    };
-    let closest_x = relative_x + velocity_x * time;
-    let closest_y = relative_y + velocity_y * time;
-    let distance = closest_x.abs().max(closest_y.abs());
-    (distance / extent_raw.max(1) as f32).clamp(0.0, 1.0)
-}
-
-fn maximum_axis_distance(left: Vec2, right: Vec2) -> i64 {
-    let x = i64::from(left.x.raw).saturating_sub(i64::from(right.x.raw));
-    let y = i64::from(left.y.raw).saturating_sub(i64::from(right.y.raw));
-    x.abs().max(y.abs())
+    (raw as f32 / maximum.max(1) as f32).clamp(-1.0, 1.0)
 }
 
 fn recent_before(event_tick: Option<u32>, current_tick: u32) -> bool {
-    event_tick.is_some_and(|tick| tick < current_tick && current_tick - tick <= MAX_AGE)
+    event_tick.is_some_and(|tick| tick < current_tick && current_tick - tick <= RECENT_EVENT_TICKS)
 }
 
 fn unit_ratio(value: u32, maximum: u32) -> f32 {
     ratio(i64::from(value), 0, i64::from(maximum.max(1)))
-}
-
-fn signed_ratio(value: i64, maximum: i64) -> f32 {
-    ratio(value, -maximum.abs().max(1), maximum.abs().max(1)) * 2.0 - 1.0
 }
 
 fn ratio(value: i64, minimum: i64, maximum: i64) -> f32 {
@@ -3795,12 +3968,6 @@ fn ratio(value: i64, minimum: i64, maximum: i64) -> f32 {
 
 fn bool_feature(value: bool) -> f32 {
     if value { 1.0 } else { 0.0 }
-}
-
-fn difference(left: u64, right: u64) -> i64 {
-    i64::try_from(left)
-        .unwrap_or(i64::MAX)
-        .saturating_sub(i64::try_from(right).unwrap_or(i64::MAX))
 }
 
 fn clamp_raw(raw: i64) -> i32 {

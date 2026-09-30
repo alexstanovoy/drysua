@@ -8,6 +8,10 @@ use super::map2_inference::{advance, effect, frame, initial, stage_next, tracker
 use crate::{ActionSpace, unit_feature};
 use bota_proto::{EntityId, EventKind, Team};
 
+/// Health then mana restoration reports: presence, amount and age each.
+const REPORTS: std::ops::RangeInclusive<usize> =
+    unit_feature::HEALTH_RESTORE_REPORT_PRESENT..=unit_feature::MANA_RESTORE_REPORT_AGE;
+
 #[test]
 fn restoration_channels_preserve_each_other_and_invalidate_pre_event_provenance() {
     let (mut view, mut tracker) = initial(Team::Radiant);
@@ -95,7 +99,7 @@ fn prior_tick_restoration_features_expire_or_evict_without_erasing_reports() {
             events.extend((0..crate::MAX_RECENT_EVENTS).map(|_| heal(None, own, 0, 0)));
         }
         advance(&mut tracker, &mut view, &events);
-        assert_eq!(&frame(&tracker).own_units()[0][78..84], &[0.0; 6]);
+        assert_eq!(&frame(&tracker).own_units()[0][REPORTS], &[0.0; 6]);
         for tick in 3..=if evicted { 3 } else { 483 } {
             advance(&mut tracker, &mut view, &[]);
             if ![3, 482, 483].contains(&tick) {
@@ -105,10 +109,10 @@ fn prior_tick_restoration_features_expire_or_evict_without_erasing_reports() {
                 [0.0; 6]
             } else {
                 let age = (tick - 2) as f32 / 480.0;
-                [1.0, 100.0 / 100_000.0, age, 1.0, 75.0 / 20_000.0, age]
+                [1.0, 100.0 / 500.0, age, 1.0, 75.0 / 300.0, age]
             };
             assert_eq!(
-                &frame(&tracker).own_units()[0][78..84],
+                &frame(&tracker).own_units()[0][REPORTS],
                 &expected,
                 "evicted={evicted} tick={tick}"
             );
@@ -140,14 +144,17 @@ fn fog_decays_aura_and_raze_without_refresh_or_target_pointer() {
     let mut tracker = tracker(Team::Radiant, view.clone());
     view.units.retain(|unit| unit.id != enemy);
     for expected in [
-        [1.0, 3.0 / 255.0, 1.0 / 240.0, 1.0 / 15.0, 1.0 / 15.0],
+        [1.0, 3.0 / 4.0, 1.0 / 240.0, 1.0 / 15.0, 1.0 / 15.0],
         [0.0; 5],
     ] {
         advance(&mut tracker, &mut view, &[]);
         let output = frame(&tracker);
         let token = &output.remembered_units()[0];
-        assert_eq!(token[unit_feature::REMEMBERED], 1.0);
-        assert_eq!(&token[73..78], &expected);
+        assert_eq!(token[unit_feature::VISIBLE], 0.0);
+        assert_eq!(
+            &token[unit_feature::RAZE_EFFECT_PRESENT..=unit_feature::INSPIRED_TICKS_LEFT],
+            &expected
+        );
         assert!(
             ActionSpace::from_tracker(&tracker)
                 .expect("space")

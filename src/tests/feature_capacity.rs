@@ -52,7 +52,7 @@ fn bounded_feature_arena_caps_every_vector_and_roundtrips_dense_frame() {
 #[test]
 fn bounded_feature_arena_rejects_late_row_overflow_before_appending_any_rows() {
     let mut frame = FeatureFrame::new();
-    for row in &mut frame.loot {
+    for row in frame.loot.iter_mut() {
         row[loot_feature::TOKEN_PRESENT] = 1.0;
     }
     let mut arena = RaggedFeatureArena::new(1).expect("one frame");
@@ -138,8 +138,8 @@ fn bounded_feature_reservation_reports_allocation_failure_without_allocating() {
 
 #[test]
 fn feature_peak_counts_all_row_capacities_and_one_largest_reallocation() {
-    let counts = [96u64, 32, 64, 14, 85, 32, 16];
-    let sizes = [340u64, 340, 132, 100, 116, 84, 68];
+    let counts = [96u64, 32, 64, 14, 94, 32, 16];
+    let sizes = [440u64, 440, 244, 228, 412, 168, 304];
     let mut total = 0;
     let mut largest = 0;
     for (tokens, size) in counts.into_iter().zip(sizes) {
@@ -150,10 +150,10 @@ fn feature_peak_counts_all_row_capacities_and_one_largest_reallocation() {
         largest = largest.max(bytes);
     }
 
-    assert_eq!(total, 2_229_893_120);
-    assert_eq!(largest, 1_086_259_200);
+    assert_eq!(total, 4_129_914_880);
+    assert_eq!(largest, 1_405_747_200);
     assert_eq!(FEATURE_ARENA_PEAK_BYTES, total + largest);
-    assert_eq!(FEATURE_ARENA_PEAK_BYTES, 3_316_152_320);
+    assert_eq!(FEATURE_ARENA_PEAK_BYTES, 5_535_662_080);
 }
 
 fn arena_capacities(arena: &RaggedFeatureArena) -> [usize; 7] {
@@ -182,22 +182,26 @@ fn token_counts() -> [usize; 7] {
 
 fn dense_frame() -> FeatureFrame {
     let mut frame = FeatureFrame::new();
-    for row in frame.units.iter_mut().chain(&mut frame.remembered_units) {
+    for row in frame
+        .units
+        .iter_mut()
+        .chain(frame.remembered_units.iter_mut())
+    {
         row[unit_feature::TOKEN_PRESENT] = 1.0;
     }
-    for row in &mut frame.points {
+    for row in frame.points.iter_mut() {
         row[point_feature::TOKEN_PRESENT] = 1.0;
     }
-    for row in &mut frame.abilities {
+    for row in frame.abilities.iter_mut() {
         row[ability_feature::TOKEN_PRESENT] = 1.0;
     }
-    for row in &mut frame.items {
+    for row in frame.items.iter_mut() {
         row[item_feature::TOKEN_PRESENT] = 1.0;
     }
-    for row in &mut frame.projectiles {
+    for row in frame.projectiles.iter_mut() {
         row[projectile_feature::TOKEN_PRESENT] = 1.0;
     }
-    for row in &mut frame.loot {
+    for row in frame.loot.iter_mut() {
         row[loot_feature::TOKEN_PRESENT] = 1.0;
     }
     frame

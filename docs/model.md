@@ -2,20 +2,41 @@
 
 ## Observations
 
-`FeatureEncoder` (`src/feature.rs`, schema 24) turns one `StateTracker` view into a
+`FeatureEncoder` (`src/feature.rs`, schema 26) turns one `StateTracker` view into a
 fixed-size `FeatureFrame`. Coordinates are team-canonical; every value is finite,
-bounded and has an explicit presence flag where it can be unknown.
+lies in [-1, 1] and has an explicit presence flag where it can be unknown. The
+index modules (`global_feature`, `unit_feature`, ...) name every column.
 
 | Part | Size |
 | --- | --- |
-| Global | 92 features; 73–80 are the reward potential inputs ([reward](reward.md#policy-inputs)), 81–91 reserved zeros |
-| History | 7 global samples × 24 at ages 480, 240, 120, 60, 30, 15, 0 ticks; 16 policy-history samples × 4 |
-| Map | 96 |
-| Units | 96 current + 32 remembered + 2 own tokens × 84 |
-| Tokens | abilities 24, items 28, point candidates 32 (64 tokens), projectiles 20 (32), loot 16 (16) |
+| Global | 81, including the reward potential inputs ([reward](reward.md#policy-inputs)) |
+| History | 7 global samples × 12 at ages 480, 240, 120, 60, 30, 15, 0 ticks; 16 policy-history samples × 16 (one-hot kind) |
+| Map | 87 |
+| Units | 96 current + 32 remembered + 2 own tokens × 109 |
+| Tokens | abilities 56, items 102 (own bag, stash, courier, shop, then the nearest enemy hero's bag: 94 tokens), point candidates 60 (64 tokens), projectiles 41 (32), loot 75 (16) |
 
-Enemy ability cooldowns are not encoded, and there is no recurrent state beyond this
-history.
+Scales follow the fight rather than the map: distances are Euclidean in world
+units, both near (saturating at 2,000, so the 200/450/700 raze reaches and 525
+attack range keep resolution) and logarithmic; health and mana carry a fraction,
+an absolute value and a log; cooldowns a near (10 s) and a log value; categories
+(unit kind, action kind, point source, ability and item ids, aim, slots) are
+one-hot. Derived inputs, all from the seat's own messages and the public rules
+(`src/feature/combat.rs`):
+
+- per unit, from the own hero's side: its hit and hits to kill both ways after
+  armor, range margins, whether the hero stands in its acquisition range, last hit
+  or deny now, the next raze's damage (magic resist and held stacks) and razes to
+  kill, whether each raze reach strikes it along the current facing, and whether
+  it attacked the own hero or side in the last 2 s;
+- per hero (own or enemy, visible or remembered): raze and Requiem cooldowns and
+  levels, whether it can pay a raze, and for a hostile hero whether each of its
+  razes would strike the own hero along its facing;
+- global: seconds to kill the visible enemy hero and to be killed (ready razes
+  stacking, then attacks), creeps acquiring or attacking the own hero, creep
+  balance near it, creeps under either tower, tower range and aggro, ready and
+  affordable razes.
+
+There is no recurrent state beyond this history.
 
 ## Actions
 
@@ -71,12 +92,13 @@ decisions per mode (`raze_mode_*`) and razes that struck any hostile unit
 
 ## Network
 
-`PolicyModel` (`src/model.rs`, schema 26) has 1,878,775 f32 parameters in 88 named
+`PolicyModel` (`src/model.rs`, schema 27) has 2,004,663 f32 parameters in 88 named
 tensors:
 
-- Unit encoder 84 → 64 → 128 → 128, shared by all unit tokens; token encoders
-  → 64 → 64 per token family; pooled per group into the trunk input (2,596).
-- Trunk 2,596 → 512 → 256 → 256.
+- Unit encoder 109 → 64 → 128 → 128, shared by all unit tokens; token encoders
+  → 64 → 64 per token family; pooled per group (units by kind; items as own and
+  shop rows, then the enemy bag) into the trunk input (2,812).
+- Trunk 2,812 → 512 → 256 → 256.
 - Value head 256 → 256 (ReLU) → 1, its read-out multiplied by a fixed 16 (a
   critic-only learning-rate multiplier under Adam). The value loss trains the shared
   trunk and encoders too.

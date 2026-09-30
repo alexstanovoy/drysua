@@ -74,9 +74,9 @@ recorded in checkpoints, runtime weights and reward reports.
 
 ## Policy inputs
 
-Global features 73–80 carry the potential's inputs (own and enemy weakest-tower HP,
-deaths over 2, last-seen hero HP, the clamped XP lead) and Φ itself, so a linear
-critic can subtract the shaping. Features 81–91 are reserved zeros.
+The global `MAP2_*` features carry the potential's inputs (own and enemy
+weakest-tower HP, deaths over 2, last-seen hero HP, the clamped XP lead) and Φ
+itself, so a linear critic can subtract the shaping.
 
 ## Offline check
 

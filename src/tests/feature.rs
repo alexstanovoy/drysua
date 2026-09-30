@@ -12,9 +12,9 @@ use bota_proto::{
 use super::{action, fixtures};
 use crate::feature::RaggedFeatureArena;
 use crate::{
-    ActionSpace, FeatureEncoder, FeatureFrame, GLOBAL_FEATURES, ItemReadiness, LocalPolicyState,
-    SHADOW_FIEND, StateTracker, UNIT_FEATURES, ability_feature, global_feature, item_feature,
-    loot_feature, projectile_feature, unit_feature,
+    ActionSpace, FeatureEncoder, FeatureFrame, ItemReadiness, LocalPolicyState, SHADOW_FIEND,
+    StateTracker, UNIT_FEATURES, ability_feature, global_feature, item_feature, loot_feature,
+    projectile_feature, unit_feature,
 };
 
 const AXIS: u32 = 128;
@@ -131,13 +131,12 @@ fn coordinate_and_angle_boundaries_are_canonical_on_both_sides() {
         (Team::Dire, 0, (1 << 15) - 1, 1.0),
     ] {
         let frame = boundary_frame(side, position, angle);
-        assert_eq!(
-            [
-                frame.units[0][unit_feature::POSITION_X],
-                frame.units[0][unit_feature::FACING]
-            ],
-            [expected; 2]
-        );
+        let row = &frame.units[0];
+        assert_eq!(row[unit_feature::POSITION_X], expected);
+        // Both sides see the same canonical heading: east, or one brad short of it.
+        let sine = -expected * (std::f32::consts::TAU / 65_536.0).sin();
+        assert!((row[unit_feature::FACING_COS] - 1.0).abs() < 1.0e-6);
+        assert!((row[unit_feature::FACING_SIN] - sine).abs() < 1.0e-6);
     }
 }
 
@@ -160,20 +159,22 @@ fn extreme_resources_and_identifiers_remain_finite_and_use_combat_hulls() {
         view.loot[0].item = ItemId(u16::MAX);
         let frame = encoded_frame(Team::Radiant, view);
         // Nonpositive HP removes the hero from action pointers, not fixed own-body rows.
+        let current = &frame.history[crate::HISTORY_SAMPLES - 1];
         assert_eq!(
             [
                 frame.global[global_feature::TICK],
-                frame.global[global_feature::OWN_GOLD],
+                current[crate::history_feature::OWN_GOLD],
                 frame.own_units[0][unit_feature::HP_RATIO],
                 frame.own_units[0][unit_feature::MANA_PRESENT],
                 frame.own_units[0][unit_feature::MANA_RATIO],
                 frame.own_units[1][unit_feature::MANA_PRESENT],
                 frame.own_units[1][unit_feature::MANA_RATIO],
-                frame.own_units[0][unit_feature::RADIUS],
-                frame.abilities[0][ability_feature::ID_TOKEN],
-                frame.items[0][item_feature::ITEM_TOKEN],
-                frame.projectiles[0][projectile_feature::ABILITY_TOKEN],
-                frame.loot[0][loot_feature::ITEM_TOKEN],
+                frame.own_units[0][unit_feature::BOUND],
+                frame.abilities[0][ability_feature::ID_START + crate::ABILITY_ID_CLASSES - 1],
+                frame.items[0][item_feature::ITEM_START + crate::ITEM_ID_CLASSES - 1],
+                frame.projectiles[0]
+                    [projectile_feature::ABILITY_START + crate::ABILITY_ID_CLASSES - 1],
+                frame.loot[0][loot_feature::ITEM_START + crate::ITEM_ID_CLASSES - 1],
             ],
             [
                 1.0,
@@ -183,17 +184,14 @@ fn extreme_resources_and_identifiers_remain_finite_and_use_combat_hulls() {
                 f32::from(mana != 0),
                 0.0,
                 0.0,
-                24.0 / 8192.0,
-                65_547.0,
-                65_536.0,
-                65_547.0,
-                65_536.0
+                24.0 / 300.0,
+                1.0,
+                1.0,
+                1.0,
+                1.0
             ]
         );
-        assert!(
-            fixtures::feature_values(&frame, None, None)
-                .all(|value| (-1.0..=65_547.0).contains(&value))
-        );
+        assert!(fixtures::feature_values(&frame).all(|value| (-1.0..=1.0).contains(&value)));
     }
 }
 
@@ -215,7 +213,6 @@ fn representative_frames_match_frozen_goldens_and_resource_presence_boundaries()
             }
             encoder.observe(&tracker).expect("feature observation");
             let frame = encode_with_encoder(&tracker, &mut encoder);
-            assert_current_golden_suffix(&frame);
             let mut arena = RaggedFeatureArena::new(1).expect("golden frame arena");
             let header = arena.push(&frame).expect("store golden frame");
             assert_eq!(arena.expand(&header).expect("expand golden frame"), frame);
@@ -223,35 +220,31 @@ fn representative_frames_match_frozen_goldens_and_resource_presence_boundaries()
                 assert_canonical_golden(&frame, count);
             }
             if count == 1 {
-                let expected = if tick == 1 {
-                    [0.0; 4]
-                } else {
-                    [1.0, 0.0, 1.0, 0.0]
+                let expected = [f32::from(tick == 2), 0.0, 0.0];
+                let motion = |row: &[f32; UNIT_FEATURES]| {
+                    [
+                        row[unit_feature::MOTION_PRESENT],
+                        row[unit_feature::HP_DELTA],
+                        row[unit_feature::MANA_DELTA],
+                    ]
                 };
-                assert_eq!(
-                    &frame.units[0][unit_feature::HP_DELTA_PRESENT..=unit_feature::MANA_DELTA],
-                    &expected
-                );
+                assert_eq!(motion(&frame.units[0]), expected);
                 let fresh = encode(&tracker, &LocalPolicyState::new(0));
-                assert_eq!(
-                    &fresh.units[0][unit_feature::HP_DELTA_PRESENT..=unit_feature::MANA_DELTA],
-                    &expected
-                );
+                assert_eq!(motion(&fresh.units[0]), expected);
             }
-            for value in fixtures::feature_values(&frame, Some(64), Some(69)) {
+            for value in fixtures::feature_values(&frame) {
                 digest.update(value.to_bits().to_le_bytes());
             }
             assert!(frame.is_finite());
         }
     }
     let actual: [u8; 32] = digest.finalize().into();
-    // Re-captured for action v7 and feature v24: raze-only point candidates, raze
-    // coverage and sighting age in point tokens, and ready razes legal untargeted.
+    // Re-captured for feature v26: rescaled, one-hot and derived inputs.
     assert_eq!(
         actual,
         [
-            163, 69, 99, 159, 32, 97, 151, 246, 201, 37, 127, 191, 169, 196, 148, 245, 23, 42, 8,
-            190, 209, 135, 22, 135, 50, 39, 35, 229, 69, 12, 57, 170,
+            203, 110, 42, 229, 30, 227, 43, 124, 201, 137, 92, 140, 123, 50, 172, 148, 143, 151,
+            99, 66, 212, 212, 123, 131, 165, 17, 221, 233, 25, 65, 170, 142,
         ]
     );
 }
@@ -288,35 +281,6 @@ fn projectile_capacity_view(team: Team, count: u32) -> WorldView {
         .collect();
     assert_eq!(view.projectiles.len(), count as usize);
     view
-}
-
-fn assert_current_golden_suffix(frame: &FeatureFrame) {
-    // The frozen digest covers the legacy prefix; these facts complete the current frame.
-    assert_eq!(&frame.global[64..], &[0.0; GLOBAL_FEATURES - 64]);
-    for row in frame
-        .units
-        .iter()
-        .chain(&frame.own_units)
-        .chain(&frame.remembered_units)
-    {
-        assert_eq!(&row[69..71], &[0.0; 2]);
-        assert_eq!(&row[73..], &[0.0; UNIT_FEATURES - 73]);
-        let facing = if row[unit_feature::TOKEN_PRESENT] == 0.0 {
-            [0.0, 0.0]
-        } else if row[unit_feature::RELATION_START + 2] == 1.0 {
-            [-1.0, 0.0]
-        } else if row[unit_feature::KIND_TOKEN] == 1.0 {
-            [0.9954076, 0.095727]
-        } else {
-            [1.0, 0.0]
-        };
-        for (actual, expected) in row[71..73].iter().zip(facing) {
-            assert!(
-                (actual - expected).abs() < 1.0e-6,
-                "golden facing {actual} != {expected}"
-            );
-        }
-    }
 }
 
 #[test]

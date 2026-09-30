@@ -48,7 +48,7 @@ use crate::{
 };
 
 /// Version of the fixed policy-model layout and linked candidate execution contract.
-pub const MODEL_SCHEMA_VERSION: u32 = 26;
+pub const MODEL_SCHEMA_VERSION: u32 = 27;
 /// Maximum frame count accepted by one public batch call.
 pub const MODEL_MAX_BATCH: usize = 8_192;
 /// Frame count evaluated by one bounded host inference tensor graph.
@@ -96,7 +96,9 @@ const TRUNK_INPUT: usize = GLOBAL_FEATURES
     + MAP_FEATURES
     + OWN_UNIT_FEATURE_TOKENS * UNIT_EMBEDDING
     + UNIT_GROUPS * UNIT_EMBEDDING * 2
-    + 5 * TOKEN_EMBEDDING * 2;
+    + TOKEN_POOLS * TOKEN_EMBEDDING * 2;
+/// Ability, own and shop item, enemy item, point, projectile and loot pools.
+const TOKEN_POOLS: usize = 6;
 const TRUNK_WIDE: usize = 512;
 const TRUNK_WIDTH: usize = 256;
 const VALUE_HIDDEN: usize = 256;
@@ -113,21 +115,21 @@ static NEXT_OPTIMIZER_LINEAGE: AtomicU64 = AtomicU64::new(1);
 
 /// Canonical model shapes, parameter order, side routing and linked action/feature semantics.
 pub const MODEL_SCHEMA_DESCRIPTOR: &str = concat!(
-    "bota-drysua-model/v26;",
+    "bota-drysua-model/v27;",
     "linked_schemas=action,feature,map2_reward;linked_hash=fnv1a_descriptor_then_ordered_version_le32_hash_le64_then_map2_reward_descriptor_utf8;",
-    "scope=map2_mid_only_cap27900_including900_pregame;candidate_execution=feature19_candidate_order_bookkeeping_action7_walkable_building_landing_move_only_mango_unchanged_point_pointer64_raze_only_points;layout=88_named_tensors_1878775_f32;",
-    "map2_inputs=global92_unit84,wire_rebase_unit_bound_and_collision_and_attack_time;",
+    "scope=map2_mid_only_cap27900_including900_pregame;candidate_execution=feature19_candidate_order_bookkeeping_action7_walkable_building_landing_move_only_mango_unchanged_point_pointer64_raze_only_points;layout=88_named_tensors_2004663_f32;",
+    "map2_inputs=global81_unit109,wire_rebase_unit_bound_and_collision_and_attack_time;",
     "dtype=f32;device=cpu_actor,cpu_or_cuda_learner,one_learner_per_device;architecture=deepsets;activations=relu_after_every_encoder_and_trunk_linear;",
-    "input_conditioning=host_before_tensor_after_presence_mask,feature_v9_unchanged;category_divisors=global10:5,12:3,32:16,55:12;policy_history3:16;unit5:12;ability1:2,2:8,11:5;item1:5,2:64,9:5,13:3;point10:8_sources9..13_exceed_one,12:8,16:12;semantic_ids=ability5_and_projectile6:ln1p(x)/ln(65548),item4_and_loot1:ln1p(x)/ln(65537);all_other_features_identity;",
+    "input_conditioning=none,features_prescaled_and_one_hot,absent_tokens_zeroed_by_presence_mask;",
     "output_initialization=all_linear_outside_relu_mlps_and_pointer_queries:he_uniform_times0.01,value_readout_times0.01_over16,value_hidden_he_uniform,bias_zero,no_extra_rng_draws;pointer_scaling=dot_div_sqrt_embedding_width_all_actor_batch_and_training_paths;",
-    "numeric_semantics=semantic_id_signed_ln1p_abs_extension_preserves_zero,bc_and_ppo_masked_cross_entropy_center_legal_logits_by_detached_row_max_before_logsumexp_and_selected_subtraction;",
-    "unit_mlp=84x64,64x128,128x128;",
-    "ability_mlp=24x64,64x64;item_mlp=28x64,64x64;",
-    "point_mlp=32x64,64x64;projectile_mlp=20x64,64x64;loot_mlp=16x64,64x64;",
-    "unit_groups=hero,creep,structure,neutral,courier_ward;",
+    "numeric_semantics=bc_and_ppo_masked_cross_entropy_center_legal_logits_by_detached_row_max_before_logsumexp_and_selected_subtraction;",
+    "unit_mlp=109x64,64x128,128x128;",
+    "ability_mlp=56x64,64x64;item_mlp=102x64,64x64;",
+    "point_mlp=60x64,64x64;projectile_mlp=41x64,64x64;loot_mlp=75x64,64x64;",
+    "unit_groups=one_hot_kind:hero,creep,structure,neutral,courier_ward;",
     "pool=token_present_and_semantic_group_mask,mean=sum_over_selected/divide_by_positive_count,max=where_selected_embedding_else_negative_infinity_then_argmax_lowest_token_tie_per_channel_then_differentiable_gather_original_embedding,one_token_receives_max_gradient,empty_mean_and_max_exact_zero,cross_group_rows_never_enter_reduction;",
-    "token_pools=ability,item,point,projectile,loot;own_units=hero,courier;",
-    "trunk=2596x512,512x256,256x256;",
+    "token_pools=ability,own_and_shop_item,enemy_item,point,projectile,loot;own_units=hero,courier;",
+    "trunk=2812x512,512x256,256x256;",
     "embeddings=kind:16x32,unit:2x32,ability:8x16,item:15x16;",
     "heads=value:256x256_relu_256x1_times16,kind:16,unit:2,ability:8,item_source_from:15,swap_to:15,learn:6,shop:64,loot:16,target_mode:3,put_mode:2,entity_query:128,point_query:64;",
     "action_kind=0Continue,1Stop,2MovePoint,3FollowUnit,4Hold,5AttackMovePoint,6AttackUnit,7Cast,8Use,9PutPoint,10PutUnit,11Take,12Buy,13Sell,14Swap,15Learn;",
@@ -200,13 +202,13 @@ pub const MODEL_SCHEMA_HASH: u64 = linked_schema_hash(
 );
 
 /// Exact number of F32 parameters in the model layout.
-pub const MODEL_PARAMETER_COUNT: usize = 1_878_775;
+pub const MODEL_PARAMETER_COUNT: usize = 2_004_663;
 
-const _: () = assert!(FEATURE_SCHEMA_VERSION == 25);
+const _: () = assert!(FEATURE_SCHEMA_VERSION == 26);
 const _: () = assert!(crate::ACTION_SCHEMA_VERSION == 8);
-const _: () = assert!(GLOBAL_FEATURES == 92);
-const _: () = assert!(UNIT_FEATURES == 84);
-const _: () = assert!(TRUNK_INPUT == 2_596);
+const _: () = assert!(GLOBAL_FEATURES == 81);
+const _: () = assert!(UNIT_FEATURES == 109);
+const _: () = assert!(TRUNK_INPUT == 2_812);
 const _: () = assert!(
     DECODER_CONTEXT == TRUNK_WIDTH + KIND_EMBEDDING + UNIT_SELECTION_EMBEDDING + SLOT_EMBEDDING
 );
@@ -2423,7 +2425,7 @@ impl PolicyModel {
             encode_tokens(encoder, &pair.0, &pair.1, tokens, batch)
         };
         let abilities = encode(&self.ability, &inputs.abilities, ABILITY_FEATURE_TOKENS)?;
-        let items = encode(&self.item, &inputs.items, ITEM_FEATURE_TOKENS)?;
+        let items = encode_items(&self.item, &inputs.items, batch)?;
         let points = encode(&self.point, &inputs.points, POINT_FEATURE_TOKENS)?;
         let projectiles = encode(
             &self.projectile,
@@ -3524,34 +3526,6 @@ pub(crate) fn scaled_pointer_dot(tokens: &Tensor, query: &Tensor) -> Result<Tens
         .affine(1.0 / (width as f64).sqrt(), 0.0)?)
 }
 
-pub(crate) fn condition_rows(
-    values: &mut [f32],
-    features: usize,
-    divisors: &[(usize, f32)],
-    semantic_id: Option<(usize, f32)>,
-) {
-    assert!(features > 0);
-    assert!(values.len().is_multiple_of(features));
-    assert!(
-        divisors
-            .iter()
-            .all(|&(index, divisor)| index < features && divisor >= 1.0)
-    );
-    if let Some((index, maximum)) = semantic_id {
-        assert!(index < features);
-        assert!(maximum >= 1.0);
-    }
-    for row in values.chunks_exact_mut(features) {
-        for &(index, divisor) in divisors {
-            row[index] /= divisor;
-        }
-        if let Some((index, maximum)) = semantic_id {
-            // Log scaling preserves useful separation of common low IDs without huge unknown-ID activations.
-            row[index] = row[index].signum() * row[index].abs().ln_1p() / maximum.ln_1p();
-        }
-    }
-}
-
 /// Scalar encoder input width for one frame.
 const ENCODER_SCALARS: usize = GLOBAL_FEATURES
     + HISTORY_SAMPLES * HISTORY_FEATURES
@@ -3581,13 +3555,16 @@ fn encode_units(
     Ok(UnitEncoding { pooled, current })
 }
 
-pub(crate) fn unit_group(kind: f32) -> Option<usize> {
-    match kind as u8 {
-        1 => Some(0),
-        2..=5 => Some(1),
-        7..=10 => Some(2),
-        6 => Some(3),
-        11 | 12 => Some(4),
+/// Pooling group of a unit token by its one-hot kind: hero, creep, structure,
+/// neutral, courier or ward.
+pub(crate) fn unit_group(row: &[f32; UNIT_FEATURES]) -> Option<usize> {
+    let kinds = &row[unit_feature::KIND_START..unit_feature::KIND_START + 12];
+    match kinds.iter().position(|value| *value == 1.0)? {
+        0 => Some(0),
+        1..=4 => Some(1),
+        6..=9 => Some(2),
+        5 => Some(3),
+        10 | 11 => Some(4),
         _ => None,
     }
 }
@@ -3630,6 +3607,28 @@ fn encode_tokens(
         tokens,
         TOKEN_EMBEDDING,
     )?;
+    Ok(TokenEncoding { pooled, encoded })
+}
+
+/// Item rows pool in two groups: own and shop rows, then the enemy hero's bag.
+fn encode_items(
+    encoder: &Mlp,
+    (rows, presence): &(Tensor, Tensor),
+    batch: usize,
+) -> Result<TokenEncoding, ModelError> {
+    let tokens = ITEM_FEATURE_TOKENS;
+    let encoded = encoder
+        .forward(rows)?
+        .reshape((batch, tokens, TOKEN_EMBEDDING))?
+        .broadcast_mul(presence)?;
+    let enemy_first = tokens - crate::ENEMY_ITEM_SLOTS;
+    let enemy: Vec<f32> = (0..tokens)
+        .map(|token| f32::from(u8::from(token >= enemy_first)))
+        .collect();
+    let enemy = Tensor::from_vec(enemy, (1, tokens, 1), presence.device())?;
+    let enemy = presence.broadcast_mul(&enemy)?;
+    let own = (presence - &enemy)?;
+    let pooled = pool_groups(&encoded, &[own, enemy], batch, tokens, TOKEN_EMBEDDING)?;
     Ok(TokenEncoding { pooled, encoded })
 }
 

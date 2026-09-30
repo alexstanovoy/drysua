@@ -5,7 +5,7 @@ use crate::{PPO_MAX_SAMPLES, PpoError};
 fn rollout_capacity_bounds_include_peak_memory_and_reject_overflow() {
     const {
         assert!(crate::PPO_STORAGE_PEAK_BYTES > crate::feature::FEATURE_ARENA_PEAK_BYTES);
-        assert!(crate::PPO_STORAGE_PEAK_BYTES < 6 * 1024 * 1024 * 1024);
+        assert!(crate::PPO_STORAGE_PEAK_BYTES < 10 * 1024 * 1024 * 1024);
     }
     assert!(PpoRollout::new(PPO_MAX_SAMPLES).is_ok());
     for capacity in [0, PPO_MAX_SAMPLES + 1] {
