@@ -100,7 +100,7 @@ pub const PPO_SCHEMA_HASH: u64 = crate::model::linked_schema_hash(
     ],
 );
 
-const _: () = assert!(ACTION_SCHEMA_VERSION == 5);
+const _: () = assert!(ACTION_SCHEMA_VERSION == 6);
 const _: () = assert!(FEATURE_SCHEMA_VERSION == 23);
 const _: () = assert!(MODEL_SCHEMA_VERSION == 25);
 const _: () = assert!(PPO_RULES_AUDIT_VERSION == 32);

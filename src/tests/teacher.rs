@@ -61,11 +61,26 @@ fn public_cast_contract_requires_mana_and_cooldown_readiness() {
             },
             0,
         );
-        let (action, space) = decide(&mut teacher, &track(view));
+        let tracker = track(view);
+        let (action, space) = decide(&mut teacher, &tracker);
         assert_eq!(matches!(action, StructuredAction::Cast { .. }), casts);
         if casts {
+            let stopped = IssuedOrder {
+                unit: None,
+                order: Order::Move {
+                    target: Target::None,
+                },
+            };
+            let (issued, _) = crate::RazeAim::default()
+                .resolve(
+                    &tracker,
+                    space.decode(action).expect("aimed raze"),
+                    action.kind(),
+                    Some(stopped),
+                )
+                .expect("facing raze casts at once");
             assert_eq!(
-                wire(&space, action),
+                issued.order,
                 Order::Cast {
                     slot: AbilitySlot(2),
                     target: Target::None

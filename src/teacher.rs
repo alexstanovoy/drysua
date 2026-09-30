@@ -4,6 +4,10 @@ use bota_proto::{
 };
 
 use crate::feature::attack_interval_ticks;
+use crate::raze_aim::{
+    SHADOWRAZE_RADIUS, SHADOWRAZES, TURN_RATE_BRADS, facing_towards, isqrt, point_along,
+    predicted_position, raze_center, raze_contains, raze_radius, raze_reach,
+};
 use crate::teacher_economy::{self, EconomyObservation, attack_damage_against, holds_item};
 use crate::{
     ActionError, ActionSpace, ActionTarget, ControlledUnit, EntityIndex, EntityRelation,
@@ -11,11 +15,6 @@ use crate::{
     StructuredAction, TOWN_PORTAL_SCROLL,
 };
 
-const SHADOWRAZES: [(AbilityId, i32); 3] = [
-    (AbilityId(13), 200),
-    (AbilityId(14), 450),
-    (AbilityId(15), 700),
-];
 const SHADOWRAZE_DAMAGE: [i32; 4] = [90, 160, 230, 300];
 const REQUIEM: AbilityId = AbilityId(16);
 const NECROMASTERY: AbilityId = AbilityId(17);
@@ -29,10 +28,8 @@ const COURIER_SHIELD: AbilityId = AbilityId(12);
 const BUILD_PLAN: [ItemId; 6] = teacher_economy::ECONOMY_PLAN;
 const ATTACK_POINT_TICKS: u32 = 15;
 const ATTACK_PROJECTILE_UNITS_PER_TICK: i32 = 40;
-const TURN_RATE_BRADS: u32 = 5_795;
 const ATTACK_ANGLE_BRADS: u16 = 2_094;
 const ATTACK_RANGE_LEEWAY: i32 = 100;
-const SHADOWRAZE_RADIUS: i32 = 250;
 const REQUIEM_RADIUS: i32 = 900;
 const ARMOR_SCALE: i64 = 6;
 const TELEPORT_CHANNEL_TICKS: u32 = 90;
@@ -127,6 +124,8 @@ pub struct Teacher {
     combat: CombatMemory,
     combat_proposal: Option<CombatPlan>,
     combat_rollback: Option<(u32, CombatMemory)>,
+    /// Hands hero razes straight to the aim macro instead of FollowUnit, Stop, Cast.
+    macro_hero_aim: bool,
 }
 
 impl Default for Teacher {
@@ -156,7 +155,16 @@ impl Teacher {
             },
             combat_proposal: None,
             combat_rollback: None,
+            macro_hero_aim: false,
         }
+    }
+
+    /// A teacher whose hero razes are single aimed decisions resolved by [`crate::RazeAim`].
+    #[cfg(all(test, feature = "builtin"))]
+    pub(crate) const fn with_macro_hero_aim() -> Self {
+        let mut teacher = Self::new();
+        teacher.macro_hero_aim = true;
+        teacher
     }
 
     /// Selects an action and returns the exact action space used to select it.
@@ -662,6 +670,10 @@ impl Teacher {
         let wanted = facing_towards(hero.pos, predicted_position(tracker, enemy));
         let slot = best_hero_raze(tracker, space, hero, enemy, hero.facing.brads)
             .or_else(|| best_hero_raze(tracker, space, hero, enemy, wanted))?;
+        if self.macro_hero_aim {
+            let action = cast_at(slot, target);
+            return space.allows(action).then_some(CombatChoice::plain(action));
+        }
         self.aim_raze_slot(tracker, space, hero, enemy, target, slot)
     }
 
@@ -675,10 +687,10 @@ impl Teacher {
         slot: usize,
     ) -> Option<CombatChoice> {
         let reach = raze_reach(hero.abilities.get(slot)?.id)?;
-        assert!(space.allows(cast_none(slot)));
+        assert!(raze_ready(space, slot));
         if raze_contains(tracker, hero, enemy, hero.facing.brads, reach) {
             let action = if self.facing_stable(tracker) {
-                cast_none(slot)
+                cast_at(slot, target)
             } else {
                 StructuredAction::Stop {
                     unit: ControlledUnit::Hero,
@@ -865,7 +877,7 @@ impl Teacher {
         {
             // Attack speed scales the interval, not Shadow Fiend's attack point.
             let windup = ATTACK_POINT_TICKS;
-            let maximum_turn = 32_768u32.div_ceil(TURN_RATE_BRADS);
+            let maximum_turn = 32_768u32.div_ceil(u32::from(TURN_RATE_BRADS));
             return space.tick().saturating_sub(note.tick) <= windup.saturating_add(maximum_turn)
                 && self.continue_attack(tracker, space, target);
         }
@@ -1107,21 +1119,22 @@ impl Teacher {
             let Some(reach) = raze_reach(ability.id) else {
                 continue;
             };
-            let action = cast_none(slot);
-            if !space.allows(action) {
+            if !raze_ready(space, slot) {
                 continue;
             }
             let center = raze_center(hero.pos, hero.facing.brads, reach);
-            if view.units.iter().any(|enemy| {
+            let struck = view.units.iter().find(|enemy| {
                 enemy.kind == kind
                     && enemy.team != tracker.team()
                     && enemy.team != Team::Neutral
                     && enemy.hp > 0
                     && magical_damage(raze_damage(ability.level), enemy.magic_resist) > 0
                     && center.within(enemy.pos, Fixed::from_int(SHADOWRAZE_RADIUS))
-            }) {
+            });
+            if let Some(target) = struck.and_then(|enemy| space.entity_index(enemy.id)) {
+                let action = cast_at(slot, target);
                 return if self.facing_stable(tracker) {
-                    Some(action)
+                    space.allows(action).then_some(action)
                 } else {
                     let stop = StructuredAction::Stop {
                         unit: ControlledUnit::Hero,
@@ -1373,7 +1386,7 @@ fn tactical_burst(source: &UnitView, target: &UnitView, space: Option<&ActionSpa
                 && ability.level > 0
                 && ability.cooldown_left == 0
                 && ability.mana_cost <= source.mana
-                && space.is_none_or(|space| space.allows(cast_none(*slot)))
+                && space.is_none_or(|space| raze_ready(space, *slot))
         })
         .fold(0i32, |damage, (_, ability)| {
             if mana < ability.mana_cost {
@@ -1488,59 +1501,6 @@ fn early_aggro_eligible(tracker: &StateTracker, creep: &UnitView) -> bool {
     })
 }
 
-pub(crate) fn predicted_position(tracker: &StateTracker, unit: &UnitView) -> Vec2 {
-    let Some(velocity) = tracker.entity(unit.id).and_then(|entity| entity.velocity) else {
-        return unit.pos;
-    };
-    assert!(velocity.elapsed_ticks > 0);
-    let divisor = i64::from(velocity.elapsed_ticks);
-    let delta = Vec2 {
-        x: Fixed {
-            raw: (i64::from(velocity.delta.x.raw) / divisor) as i32,
-        },
-        y: Fixed {
-            raw: (i64::from(velocity.delta.y.raw) / divisor) as i32,
-        },
-    };
-    let distance = isqrt(delta.distance_squared(Vec2::ZERO) as u64).min(i32::MAX as u64) as i32;
-    let step = Fixed {
-        raw: distance.min(unit.move_speed.raw.max(0) / 30),
-    };
-    let maximum = crate::tracker::map_maximum_raw(tracker.metadata().terrain_cells) as i32;
-    assert!(maximum > 0);
-    let target = Vec2 {
-        x: Fixed {
-            raw: unit.pos.x.raw.saturating_add(delta.x.raw).clamp(0, maximum),
-        },
-        y: Fixed {
-            raw: unit.pos.y.raw.saturating_add(delta.y.raw).clamp(0, maximum),
-        },
-    };
-    let available = isqrt(unit.pos.distance_squared(target) as u64).min(i32::MAX as u64) as i32;
-    let predicted = point_along(
-        unit.pos,
-        target,
-        Fixed {
-            raw: step.raw.min(available),
-        },
-    );
-    assert!(predicted.x.raw >= 0);
-    assert!(predicted.x.raw <= maximum);
-    assert!(predicted.y.raw >= 0);
-    assert!(predicted.y.raw <= maximum);
-    predicted
-}
-
-/// Raze reach shrinks with the target's move speed uncertainty.
-fn raze_radius(unit: &UnitView) -> Fixed {
-    Fixed {
-        raw: Fixed::from_int(SHADOWRAZE_RADIUS)
-            .raw
-            .saturating_sub(unit.move_speed.raw.max(0) / 30)
-            .max(0),
-    }
-}
-
 fn best_hero_raze(
     tracker: &StateTracker,
     space: &ActionSpace,
@@ -1556,7 +1516,7 @@ fn best_hero_raze(
         .filter_map(|(slot, ability)| {
             let reach = raze_reach(ability.id)?;
             let center = raze_center(hero.pos, facing, reach);
-            (space.allows(cast_none(slot))
+            (raze_ready(space, slot)
                 && magical_damage(raze_damage(ability.level), enemy.magic_resist) > 0
                 && center.within(predicted, radius))
             .then_some((center.distance_squared(predicted), slot))
@@ -1590,7 +1550,7 @@ fn attack_turn_ticks(hero: &UnitView, target: &UnitView) -> u32 {
         facing_towards(hero.pos, target.pos),
     ));
     gap.saturating_sub(u32::from(ATTACK_ANGLE_BRADS))
-        .div_ceil(TURN_RATE_BRADS)
+        .div_ceil(u32::from(TURN_RATE_BRADS))
 }
 
 fn finish_estimated_ticks(hero: &UnitView, enemy: &UnitView) -> u32 {
@@ -2041,7 +2001,7 @@ fn best_farm_raze(
                 continue;
             };
             let damage = raze_damage(ability.level);
-            if !space.allows(cast_none(slot))
+            if !raze_ready(space, slot)
                 || hero.mana < ability.mana_cost.saturating_mul(2)
                 || !raze_farm_target(hero, creep, damage)
             {
@@ -2084,17 +2044,6 @@ fn raze_farm_target(hero: &UnitView, creep: &UnitView, damage: i32) -> bool {
             || creep.hp > physical_damage(attack_damage_against(hero, creep), creep.armor))
 }
 
-fn raze_contains(
-    tracker: &StateTracker,
-    hero: &UnitView,
-    target: &UnitView,
-    facing: u16,
-    reach: i32,
-) -> bool {
-    let radius = raze_radius(target);
-    raze_center(hero.pos, facing, reach).within(predicted_position(tracker, target), radius)
-}
-
 fn farm_raze_hits(
     tracker: &StateTracker,
     hero: &UnitView,
@@ -2119,12 +2068,6 @@ fn farm_raze_hits(
     })
 }
 
-fn raze_reach(id: AbilityId) -> Option<i32> {
-    SHADOWRAZES
-        .iter()
-        .find_map(|(raze, reach)| (*raze == id).then_some(*reach))
-}
-
 fn raze_damage(level: u8) -> i32 {
     SHADOWRAZE_DAMAGE[usize::from(level.clamp(1, 4) - 1)]
 }
@@ -2137,9 +2080,17 @@ fn cast_none(slot: usize) -> StructuredAction {
     }
 }
 
-fn raze_center(position: Vec2, facing: u16, distance: i32) -> Vec2 {
-    let ahead = position + heading_of(facing);
-    point_along(position, ahead, Fixed::from_int(distance))
+/// An aimed raze; the aim macro casts it at once when the current facing already covers the target.
+fn cast_at(slot: usize, target: EntityIndex) -> StructuredAction {
+    StructuredAction::Cast {
+        unit: ControlledUnit::Hero,
+        slot: AbilitySlot(slot as u8),
+        target: ActionTarget::Entity(target),
+    }
+}
+
+fn raze_ready(space: &ActionSpace, slot: usize) -> bool {
+    u8::try_from(slot).is_ok_and(|slot| space.cast_ready(ControlledUnit::Hero, AbilitySlot(slot)))
 }
 
 fn enemy_heroes(tracker: &StateTracker) -> impl Iterator<Item = &UnitView> {
@@ -2284,88 +2235,8 @@ const fn is_notable_order(order: Order) -> bool {
     )
 }
 
-fn facing_towards(from: Vec2, to: Vec2) -> u16 {
-    let dx = i64::from(to.x.raw) - i64::from(from.x.raw);
-    let dy = i64::from(to.y.raw) - i64::from(from.y.raw);
-    if dx == 0 && dy == 0 {
-        return 0;
-    }
-    let (absolute_x, absolute_y) = (dx.abs(), dy.abs());
-    let slope = if absolute_x >= absolute_y {
-        (absolute_y << 13) / absolute_x
-    } else {
-        (absolute_x << 13) / absolute_y
-    };
-    let octant = match (dx >= 0, dy >= 0, absolute_x >= absolute_y) {
-        (true, true, true) => slope,
-        (true, true, false) => 16_384 - slope,
-        (false, true, false) => 16_384 + slope,
-        (false, true, true) => 32_768 - slope,
-        (false, false, true) => 32_768 + slope,
-        (false, false, false) => 49_152 - slope,
-        (true, false, false) => 49_152 + slope,
-        (true, false, true) => 65_536 - slope,
-    };
-    (octant & 0xffff) as u16
-}
-
 fn facing_gap(one: u16, other: u16) -> u16 {
     let clockwise = one.wrapping_sub(other);
     let counterclockwise = other.wrapping_sub(one);
     clockwise.min(counterclockwise)
-}
-
-fn heading_of(facing: u16) -> Vec2 {
-    let brads = i32::from(facing);
-    let slope = brads % 8_192;
-    let (x, y) = match brads / 8_192 {
-        0 => (8_192, slope),
-        1 => (8_192 - slope, 8_192),
-        2 => (-slope, 8_192),
-        3 => (-8_192, 8_192 - slope),
-        4 => (-8_192, -slope),
-        5 => (-(8_192 - slope), -8_192),
-        6 => (slope, -8_192),
-        _ => (8_192, -(8_192 - slope)),
-    };
-    Vec2::from_ints(x, y)
-}
-
-fn point_along(from: Vec2, towards: Vec2, distance: Fixed) -> Vec2 {
-    let x = i64::from(towards.x.raw) - i64::from(from.x.raw);
-    let y = i64::from(towards.y.raw) - i64::from(from.y.raw);
-    let span = isqrt((x * x + y * y) as u64) as i64;
-    if span == 0 {
-        return from;
-    }
-    Vec2 {
-        x: Fixed {
-            raw: from
-                .x
-                .raw
-                .saturating_add((x * i64::from(distance.raw) / span) as i32),
-        },
-        y: Fixed {
-            raw: from
-                .y
-                .raw
-                .saturating_add((y * i64::from(distance.raw) / span) as i32),
-        },
-    }
-}
-
-fn isqrt(value: u64) -> u64 {
-    let mut remainder = value;
-    let mut root = 0_u64;
-    let mut bit = 1_u64 << 62;
-    for _ in 0..32 {
-        if remainder >= root.saturating_add(bit) {
-            remainder -= root + bit;
-            root = (root >> 1) + bit;
-        } else {
-            root >>= 1;
-        }
-        bit >>= 2;
-    }
-    root
 }

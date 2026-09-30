@@ -23,11 +23,11 @@ fn feared_use_and_cast_masks_match_native_rejection_then_expiry_acceptance() {
         (
             StructuredAction::Cast {
                 unit: ControlledUnit::Hero,
-                slot: AbilitySlot(0),
+                slot: AbilitySlot(5),
                 target: ActionTarget::None,
             },
             Order::Cast {
-                slot: AbilitySlot(0),
+                slot: AbilitySlot(5),
                 target: Target::None,
             },
         ),
@@ -121,7 +121,7 @@ fn feared_arena() -> (Arena, StateTracker) {
         stick.charges = 6;
         world.inventory.get_mut(hero).expect("bag").slots[2] = Some(stick);
         world.level.get_mut(hero).expect("level").0 = 6;
-        world.abilities.get_mut(hero).expect("abilities").slots[0].level = 1;
+        world.abilities.get_mut(hero).expect("abilities").slots[5].level = 1;
         world.settle();
         world.mana.get_mut(hero).expect("mana").mana = Fixed::from_int(292);
         world.health.get_mut(hero).expect("health").hp = Fixed::from_int(200);

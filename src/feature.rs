@@ -501,7 +501,7 @@ pub const FEATURE_SCHEMA_HASH: u64 = crate::model::linked_schema_hash(
     &[(crate::ACTION_SCHEMA_VERSION, crate::ACTION_SCHEMA_HASH)],
 );
 
-const _: () = assert!(crate::ACTION_SCHEMA_VERSION == 5);
+const _: () = assert!(crate::ACTION_SCHEMA_VERSION == 6);
 const _: () = assert!(StatusFlags::INVULNERABLE == 1 << 9);
 const _: () = assert!(StatusFlags::CHANNELLING == 1 << 10);
 const _: () = assert!(global_feature::MAP2_REWARD_POTENTIAL + 1 == global_feature::RESERVED_START);

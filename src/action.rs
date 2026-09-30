@@ -2,8 +2,8 @@ use std::error::Error;
 use std::fmt;
 
 use bota_proto::{
-    AbilitySlot, Aim, EntityId, Fixed, ItemId, ItemSlot, ItemView, Order, ShopEntry, StatusFlags,
-    Target, Team, UnitKind, UnitView, Vec2, WorldView,
+    AbilitySlot, AbilityView, Aim, EntityId, Fixed, ItemId, ItemSlot, ItemView, Order, ShopEntry,
+    StatusFlags, Target, Team, UnitKind, UnitView, Vec2, WorldView,
 };
 
 use crate::tracker::{
@@ -12,6 +12,7 @@ use crate::tracker::{
 };
 use smallvec::SmallVec;
 
+use crate::raze_aim::{raze_reach, within_reach_window};
 use crate::{
     ItemReadiness, MAX_ABILITY_SLOTS, MAX_LOOT, MAX_POINT_CANDIDATES, MAX_SHOP_ITEMS, StateTracker,
     TERRAIN_CELL_SIZE, UNIT_TOKENS,
@@ -26,17 +27,18 @@ pub(crate) use test_support::*;
 /// Distance at which drysua permits stash swaps around the own fountain.
 pub const STASH_ACCESS_RANGE: i32 = 1_000;
 /// Version of the append-only structured-action schema.
-pub const ACTION_SCHEMA_VERSION: u32 = 5;
+pub const ACTION_SCHEMA_VERSION: u32 = 6;
 /// Canonical action families, head widths, and autoregressive branch order.
 pub const ACTION_SCHEMA_DESCRIPTOR: &str = concat!(
-    "bota-drysua-action/v5;kinds=Continue,Stop,MovePoint,FollowUnit,Hold,AttackMovePoint,AttackUnit,Cast,Use,PutPoint,PutUnit,Take,Buy,Sell,Swap,Learn;",
+    "bota-drysua-action/v6;kinds=Continue,Stop,MovePoint,FollowUnit,Hold,AttackMovePoint,AttackUnit,Cast,Use,PutPoint,PutUnit,Take,Buy,Sell,Swap,Learn;",
     "heads=kind16,controlled2,ability8,item15,swap15,learn6,shop64,loot16,target_mode3,put_mode2,entity96,point48;",
     "target_modes=None,Entity,Point;put_modes=Underfoot,Point;put_point_legality=underfoot_only;",
     "buy_legality=positive_missing_leaves_and_total_missing_cost_and_leaf_capacity;buy_decode=root_or_first_missing_leaf;",
     "buy_mango=item42_one_charge_repeatable_home_bag_then_stash_remote_stash_empty_or_visible_compatible_stack_below3;",
     "use_mango=hero_active_slots0..5_unmuted_charges1..3_target_none_provable_positive_own_mana_deficit;",
     "mana_legality=all_casts_and_uses_conservative_own_wire_mana_affordability;",
-    "raze_legality=mechanical_only_empty_and_beneficial_allowed;",
+    "raze_legality=ready_entity_target_only_live_enemy_or_neutral_candidate_within_reach_pm_radius250_plus1_no_none_or_point;",
+    "raze_execution=entity_intent_decodes_to_unit_cast_resolved_by_aim_macro_walk48_toward_one_tick_prediction_until_next_tick_landing_covers_it_then_untargeted_cast_limit15_ticks_continue_advances_other_decisions_replace;",
     "move_point_legality=live_body_unstunned_unrooted_and_walkable_including_existing_building_landing;attack_move_point_legality=unchanged_building_landing_source_excluded;building_landing_provenance=unchanged_tp_walkability_allied_anchor_and_target_kind_checks,no_new_points_or_goal_features;",
     "entity_order=active_effect15_max_lexicographic_stacks_remaining_then_guarded13_inspired14_timers_then_prior_received_manual_hp_mana_report_semantics_before_opaque_id;",
 );
@@ -863,6 +865,17 @@ impl ActionSpace {
         self.masks[unit.index()].casts.get(usize::from(slot.0))
     }
 
+    /// Whether a controlled unit may cast the ability in a slot, whatever its target.
+    pub fn cast_ready(&self, unit: ControlledUnit, slot: AbilitySlot) -> bool {
+        self.controlled[unit.index()].as_ref().is_some_and(|state| {
+            state
+                .unit
+                .abilities
+                .get(usize::from(slot.0))
+                .is_some_and(|ability| ability_ready(&state.unit, ability))
+        })
+    }
+
     /// Target mask after selecting a controlled unit and active item slot.
     pub fn use_target_mask(&self, unit: ControlledUnit, slot: ItemSlot) -> Option<&TargetMask> {
         self.masks[unit.index()].uses.get(usize::from(slot.0))
@@ -929,6 +942,9 @@ impl ActionSpace {
     }
 
     /// Validates the exact action and converts candidate indices to wire values.
+    ///
+    /// An aimed raze decodes to its intent, a cast at the target unit, which the
+    /// wire rejects; [`crate::RazeAim::resolve`] turns it into the orders to send.
     pub fn decode(&self, action: StructuredAction) -> Result<Option<IssuedOrder>, ActionError> {
         self.validate_candidate_indices(action)?;
         if !self.allows(action) {
@@ -2212,26 +2228,49 @@ fn fill_body_masks(
 }
 
 fn fill_cast_masks(space: &ActionSpace, state: &ControlledState, masks: &mut ControlledMasks) {
-    let disabled = has_status(&state.unit, StatusFlags::STUNNED)
-        || has_status(&state.unit, StatusFlags::FEARED)
-        || has_status(&state.unit, StatusFlags::SILENCED)
-        || has_status(&state.unit, StatusFlags::CHANNELLING);
     masks.casts.reserve(state.unit.abilities.len());
     for ability in state.unit.abilities.iter().take(MAX_ABILITY_SLOTS) {
-        let ready = !disabled
-            && !ability.passive
-            && ability.level > 0
-            && ability.cooldown_left == 0
-            && can_afford_mana(state.unit.mana, ability.mana_cost);
-        masks.casts.push(target_mask(
-            space,
-            state,
-            ability.aim,
-            ability.range,
-            ready,
-            false,
-        ));
+        let ready = ability_ready(&state.unit, ability);
+        masks.casts.push(match raze_reach(ability.id) {
+            Some(reach) => raze_target_mask(space, state, reach, ready),
+            None => target_mask(space, state, ability.aim, ability.range, ready, false),
+        });
     }
+}
+
+/// Whether the wire proves a unit may cast an ability now, ignoring its target.
+pub(crate) fn ability_ready(unit: &UnitView, ability: &AbilityView) -> bool {
+    let disabled = has_status(unit, StatusFlags::STUNNED)
+        || has_status(unit, StatusFlags::FEARED)
+        || has_status(unit, StatusFlags::SILENCED)
+        || has_status(unit, StatusFlags::CHANNELLING);
+    !disabled
+        && !ability.passive
+        && ability.level > 0
+        && ability.cooldown_left == 0
+        && can_afford_mana(unit.mana, ability.mana_cost)
+}
+
+/// A raze is only ever aimed at a live hostile unit it can still cover.
+fn raze_target_mask(
+    space: &ActionSpace,
+    state: &ControlledState,
+    reach: i32,
+    ready: bool,
+) -> TargetMask {
+    let mut mask = empty_target_mask(space);
+    if !ready {
+        return mask;
+    }
+    for (allowed, target) in mask.entities.iter_mut().zip(&space.entities) {
+        *allowed = matches!(
+            target.relation,
+            EntityRelation::Enemy | EntityRelation::Neutral
+        ) && target.unit.hp > 0
+            && !has_status(&target.unit, StatusFlags::DEAD)
+            && within_reach_window(state.unit.pos, target.position, reach);
+    }
+    mask
 }
 
 fn fill_use_masks(

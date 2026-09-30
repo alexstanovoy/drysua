@@ -28,6 +28,10 @@ mod actor_value_reuse_tests;
 mod map2_tests;
 
 #[cfg(test)]
+#[path = "../tests/raze_aim.rs"]
+mod raze_aim_tests;
+
+#[cfg(test)]
 #[path = "../tests/episode_collection_parallel.rs"]
 mod parallel_tests;
 

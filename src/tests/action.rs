@@ -270,6 +270,33 @@ fn public_range_and_ownership_masks_keep_exact_boundaries() {
 }
 
 #[test]
+fn raze_masks_allow_only_live_hostile_entities_within_reach_plus_minus_radius() {
+    for (distance, near, far) in [(300, true, false), (451, true, true), (452, false, true)] {
+        let mut view = world_view(1);
+        view.units[0].abilities = crate::raze_aim::SHADOWRAZES
+            .map(|(id, reach)| AbilityView {
+                id,
+                ..ability(Aim::Own, reach)
+            })
+            .to_vec();
+        let enemy = view.units.iter_mut().find(|unit| unit.id == ENEMY);
+        enemy.expect("enemy").pos = Vec2::from_ints(2_000 + distance, 2_000);
+        let space = space(&match_info(), view);
+        let enemy = ActionTarget::Entity(space.entity_index(ENEMY).expect("enemy"));
+        let courier = ActionTarget::Entity(space.entity_index(COURIER).expect("courier"));
+        for (slot, allowed) in [(0, near), (2, far)] {
+            let mask = space
+                .cast_target_mask(ControlledUnit::Hero, AbilitySlot(slot))
+                .expect("raze slot");
+            assert!(!mask.allows_none());
+            assert!(!mask.points().contains(&true));
+            assert!(!mask.allows(courier));
+            assert_eq!(mask.allows(enemy), allowed, "slot {slot} at {distance}");
+        }
+    }
+}
+
+#[test]
 fn missing_snapshot_and_invalid_recipe_schemas_report_specific_errors() {
     let tracker = StateTracker::new(SlotId(0), &match_info()).expect("tracker");
     assert_eq!(
@@ -538,7 +565,7 @@ pub(super) fn shop_entries(rows: &[(u16, i32, &[u16])]) -> Vec<ShopEntry> {
 
 pub(super) fn ability(aim: Aim, range: i32) -> AbilityView {
     AbilityView {
-        id: AbilityId(13),
+        id: AbilityId(1),
         level: 1,
         max_level: 4,
         cooldown_left: 0,

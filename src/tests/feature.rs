@@ -245,12 +245,12 @@ fn representative_frames_match_frozen_goldens_and_resource_presence_boundaries()
         }
     }
     let actual: [u8; 32] = digest.finalize().into();
-    // Captured from the frozen unpatched feature-v8 implementation.
+    // Re-captured for action v6, where a raze is legal only with a hostile unit in reach.
     assert_eq!(
         actual,
         [
-            249, 170, 21, 90, 136, 15, 9, 154, 230, 182, 38, 80, 211, 216, 220, 69, 73, 37, 62,
-            165, 136, 116, 105, 220, 105, 138, 185, 155, 165, 202, 206, 220,
+            56, 182, 3, 3, 115, 209, 128, 113, 75, 144, 36, 147, 191, 143, 156, 42, 198, 144, 23,
+            70, 79, 5, 131, 16, 242, 182, 109, 183, 251, 64, 16, 222,
         ]
     );
 }

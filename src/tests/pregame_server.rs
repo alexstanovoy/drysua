@@ -9,8 +9,7 @@ use bota_proto::{
 };
 
 use crate::{
-    ActionSpace, ActionTarget, Arena, ArenaConfig, ControlledUnit, OrderPersistence, Request,
-    StateTracker, StructuredAction,
+    ActionSpace, Arena, ArenaConfig, ControlledUnit, OrderPersistence, Request, StateTracker,
 };
 
 const OPENING_SEED: u64 = 9_204_100;
@@ -59,14 +58,9 @@ fn observe_messages(seat: &mut Seat, messages: &[ServerMsg]) {
 #[test]
 fn pregame_server_rejects_an_unlearned_cast_and_the_action_mask_excludes_it() {
     let (mut arena, seat) = pregame_arena();
-    let cast = StructuredAction::Cast {
-        unit: ControlledUnit::Hero,
-        slot: AbilitySlot(0),
-        target: ActionTarget::None,
-    };
     let space = ActionSpace::from_tracker(&seat.tracker).expect("pregame action space");
     assert!(
-        !space.allows(cast),
+        !space.cast_ready(ControlledUnit::Hero, AbilitySlot(0)),
         "unlearned spells stay masked before the horn"
     );
     let invalid = arena
@@ -132,13 +126,8 @@ fn pregame_server_executes_a_learned_cast_and_masks_its_cooldown() {
             slot: AbilitySlot(0),
         },
     );
-    let cast = StructuredAction::Cast {
-        unit: ControlledUnit::Hero,
-        slot: AbilitySlot(0),
-        target: ActionTarget::None,
-    };
     let space = ActionSpace::from_tracker(&seat.tracker).expect("learned space");
-    assert!(space.allows(cast));
+    assert!(space.cast_ready(ControlledUnit::Hero, AbilitySlot(0)));
 
     let cast_completed = pregame_order(
         &mut arena,
@@ -154,7 +143,7 @@ fn pregame_server_executes_a_learned_cast_and_masks_its_cooldown() {
         "server executes the pregame spell, not just accepts it"
     );
     let space = ActionSpace::from_tracker(&seat.tracker).expect("cooldown space");
-    assert!(!space.allows(cast));
+    assert!(!space.cast_ready(ControlledUnit::Hero, AbilitySlot(0)));
     assert!(arena.tick() < 900);
 }
 

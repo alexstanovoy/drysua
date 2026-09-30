@@ -43,6 +43,7 @@ struct LivePolicy {
     local: LocalPolicyState,
     persistence: OrderPersistence,
     neural_persistence: Option<OrderPersistence>,
+    aim: crate::RazeAim,
     readiness: ItemReadiness,
     teacher: Option<Teacher>,
     last_decision_tick: Option<u32>,
@@ -452,6 +453,7 @@ impl LivePolicy {
             persistence: OrderPersistence::default(),
             neural_persistence: matches!(controller, LiveController::Neural(_))
                 .then(OrderPersistence::default),
+            aim: crate::RazeAim::default(),
             readiness: ItemReadiness::new(),
             teacher: if matches!(controller, LiveController::Neural(_)) {
                 None
@@ -574,7 +576,14 @@ impl LivePolicy {
             .neural_persistence
             .as_ref()
             .unwrap_or(&self.persistence);
-        let Some(issued) = persistence.should_send(decoded) else {
+        let active_body = persistence.active_body_order_for(None);
+        let Some((issued, kind)) =
+            self.aim
+                .resolve(&self.tracker, decoded, action.kind(), active_body)
+        else {
+            return Ok(());
+        };
+        let Some(issued) = persistence.should_send(Some(issued)) else {
             return Ok(());
         };
         let previous = self.local.active_order();
@@ -598,7 +607,7 @@ impl LivePolicy {
         let update = if preserves {
             ActiveOrderUpdate::Preserve
         } else {
-            active_order_update_for_sent(persistence, issued.unit, sequence, action.kind())
+            active_order_update_for_sent(persistence, issued.unit, sequence, kind)
         };
         self.pending_active = match update {
             ActiveOrderUpdate::Preserve => self.pending_active,
