@@ -141,7 +141,7 @@ fn initial_weights_then_resume_matches_uninterrupted_parameters_optimizer_and_rn
     assert_eq!(second.completed_updates, 2);
     assert_trajectory_equal(&uninterrupted, &resumed);
     assert_artifact_bits(&uninterrupted, &resumed, PolicyDevice::Cpu);
-    // `play`, frozen opponents and --initial-weights share this loader.
+    // `play` and frozen opponents share this strict loader.
     let exported = PolicyModel::fresh(0).expect("play model");
     TrainingArtifact::load_runtime_weights(&exported, &resumed).expect("exported runtime weights");
     let (checkpoint, _, _) = restored_state(

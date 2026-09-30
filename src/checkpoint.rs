@@ -454,7 +454,11 @@ impl TrainingArtifact {
         sync_directory(directory)
     }
 
-    /// Constructs a fresh current model from runtime weights without training-state import.
+    /// Constructs a fresh current model from architecture-compatible runtime weights.
+    ///
+    /// Unlike deployment loading, the linked action, feature, reward and PPO
+    /// schemas may differ: a warm start only needs the parameters. The flat M25
+    /// layout is fixed by its element count, so every tensor is reused.
     #[cfg(feature = "builtin")]
     pub(crate) fn initialize_from_weights(
         directory: &Path,
@@ -463,7 +467,26 @@ impl TrainingArtifact {
     ) -> Result<PolicyModel, CheckpointError> {
         let model = PolicyModel::fresh_on(seed, device)
             .map_err(|error| CheckpointError::Model(error.to_string()))?;
-        Self::load_runtime_weights(&model, directory)?;
+        validate_directory(directory)?;
+        let bytes = read_recoverable(
+            &directory.join(RUNTIME_TENSOR_FILE),
+            MAX_RUNTIME_TENSOR_BYTES,
+        )?;
+        let (parameters, differences) = decode_warm_start_tensor(&bytes)?;
+        model
+            .import_parameters(&parameters)
+            .map_err(|error| CheckpointError::Model(error.to_string()))?;
+        eprintln!(
+            "level=INFO event=initial_weights_loaded path={} reused_tensors={} reused_parameters={} reinitialized_tensors=0 differing_metadata={}",
+            directory.display(),
+            crate::model::MODEL_PARAMETER_TENSORS,
+            MODEL_PARAMETER_COUNT,
+            if differences.is_empty() {
+                "none".to_owned()
+            } else {
+                differences.join(",")
+            }
+        );
         Ok(model)
     }
 
@@ -781,6 +804,33 @@ fn decode_runtime_tensor(bytes: &[u8]) -> Result<Vec<f32>, CheckpointError> {
         .map_err(|error| CheckpointError::Backend(error.to_string()))?;
     validate_names(&tensors, &["model.parameters"])?;
     decode_tensor(&tensors, "model.parameters")
+}
+
+/// Parameters plus this build's metadata keys whose stored values differ.
+///
+/// Keys only the file carries are counted, never echoed, so the log line stays well formed.
+#[cfg(feature = "builtin")]
+fn decode_warm_start_tensor(bytes: &[u8]) -> Result<(Vec<f32>, Vec<String>), CheckpointError> {
+    let (_, metadata) = SafeTensors::read_metadata(bytes)
+        .map_err(|error| CheckpointError::Backend(error.to_string()))?;
+    let stored = metadata.metadata().clone().unwrap_or_default();
+    let mut differences = runtime_tensor_metadata()
+        .into_iter()
+        .filter(|(key, value)| stored.get(*key) != Some(value))
+        .map(|(key, _)| key.to_owned())
+        .collect::<Vec<_>>();
+    let current = runtime_tensor_metadata_map();
+    let unknown = stored
+        .keys()
+        .filter(|key| !current.contains_key(*key))
+        .count();
+    if unknown > 0 {
+        differences.push(format!("unknown_keys:{unknown}"));
+    }
+    let tensors = SafeTensors::deserialize(bytes)
+        .map_err(|error| CheckpointError::Backend(error.to_string()))?;
+    validate_names(&tensors, &["model.parameters"])?;
+    Ok((decode_tensor(&tensors, "model.parameters")?, differences))
 }
 
 fn validate_names(tensors: &SafeTensors<'_>, expected: &[&str]) -> Result<(), CheckpointError> {

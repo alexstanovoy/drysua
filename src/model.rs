@@ -123,7 +123,7 @@ const SLOT_EMBEDDING: usize = 16;
 const DECODER_CONTEXT: usize = 336;
 const TARGET_MODE_HEAD: usize = 3;
 const PUT_MODE_HEAD: usize = 2;
-const MODEL_PARAMETER_TENSORS: usize = 86;
+pub(crate) const MODEL_PARAMETER_TENSORS: usize = 86;
 static NEXT_MODEL_LINEAGE: AtomicU64 = AtomicU64::new(1);
 static NEXT_OPTIMIZER_LINEAGE: AtomicU64 = AtomicU64::new(1);
 

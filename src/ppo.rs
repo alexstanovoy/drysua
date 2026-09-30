@@ -87,7 +87,7 @@ pub const PPO_SCHEMA_DESCRIPTOR: &str = concat!(
     "navigation=existing_walkable_building_landing_points_allow_MovePoint_only,AttackMovePoint_source_veto_unchanged,no_goal_features_or_forced_retreat,seat_visible_channel_masks_cast_and_use,seat_visible_item_mute_masks_use,put_point_underfoot_only;",
     "deployment=raw_map2_mid_neural_policy_no_teacher_override_or_strategic_masks;",
     "teacher_economy=custom_bota_wraith_band_tango_boots_optional_stick_gloves_belt_once_only;",
-    "initialization=current_runtime_weights_parameters_only_fresh_optimizer_progress_rng;"
+    "initialization=runtime_weights_with_equal_element_count_any_linked_schema_metadata_parameters_only_fresh_optimizer_progress_rng;"
 );
 
 /// FNV-1a of the descriptor, ordered linked identities, and reward version.
