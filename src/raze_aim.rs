@@ -2,9 +2,12 @@
 //!
 //! A raze takes no aim on the wire: it lands at its fixed reach along the
 //! caster's facing. [`RazeAim`] expands one aimed raze decision into a short
-//! deterministic macro of legal wire orders: a short walk toward the target's
-//! predicted position turns the hero, and the cast goes out once the landing
-//! predicted for the next tick covers that position.
+//! deterministic macro of legal wire orders: a short walk toward the aim turns
+//! the hero, and the cast goes out once the landing predicted for the next tick
+//! is on the aim. A unit aim tracks the unit's predicted position until the
+//! landing covers it; a point aim fixes the heading toward the point when the
+//! decision is made, so the landing centre lands as close to the point as the
+//! fixed reach allows.
 
 use bota_proto::{AbilityId, AbilitySlot, EntityId, Fixed, Order, Target, UnitView, Vec2};
 
@@ -25,9 +28,18 @@ pub(crate) const TURN_RATE_BRADS: u16 = 5_795;
 const TURN_WALK: i32 = 48;
 /// An aim that has not fired within this many ticks is abandoned.
 const AIM_LIMIT_TICKS: u32 = 15;
+/// Length of the walk that turns the hero onto a point aim's heading. One walk
+/// node: longer walks route through node centres and leave the facing up to
+/// tens of degrees off the heading, while this one ends on it exactly.
+const HEADING_WALK: i32 = 32;
+/// A point aim fires once the landing centre is this close to the centre along
+/// the chosen heading: a tenth of the raze radius.
+const HEADING_TOLERANCE: i32 = 25;
 
 const _: () = assert!(TURN_WALK > 0);
 const _: () = assert!(AIM_LIMIT_TICKS >= 2 * crate::MAP2_DECISION_INTERVAL_TICKS);
+const _: () = assert!(HEADING_WALK > 0);
+const _: () = assert!(HEADING_TOLERANCE > 0 && HEADING_TOLERANCE < SHADOWRAZE_RADIUS);
 
 /// Bounded state of one hero's aimed-raze macro.
 ///
@@ -42,14 +54,23 @@ struct AimPlan {
     hero: EntityId,
     slot: AbilitySlot,
     reach: i32,
-    target: EntityId,
+    target: AimTarget,
     started: u32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AimTarget {
+    /// A visible unit, followed until the landing covers its predicted position.
+    Unit(EntityId),
+    /// A facing in brads, taken toward the chosen point when the decision is made.
+    Heading(u16),
 }
 
 impl RazeAim {
     /// Translates one decoded decision into the wire order to send now.
     ///
-    /// An aimed raze intent starts the macro and a Continue advances it; both
+    /// An aimed raze intent (a unit or point cast) starts the macro and a
+    /// Continue advances it; an untargeted raze passes through unchanged. Both
     /// report [`ActionKind::Cast`] as the order's family. `active_body` is the
     /// hero's persistent order, which decides how its facing moves next tick.
     pub fn resolve(
@@ -92,15 +113,19 @@ pub(crate) fn within_reach_window(from: Vec2, to: Vec2, reach: i32) -> bool {
 }
 
 fn aim_plan(tracker: &StateTracker, issued: IssuedOrder) -> Option<AimPlan> {
-    let Order::Cast {
-        slot,
-        target: Target::Unit(target),
-    } = issued.order
-    else {
+    let Order::Cast { slot, target } = issued.order else {
         return None;
     };
     let hero = tracker.own_hero().filter(|_| issued.unit.is_none())?;
     let reach = raze_reach(hero.abilities.get(usize::from(slot.0))?.id)?;
+    let target = match target {
+        Target::Unit(unit) => AimTarget::Unit(unit),
+        Target::Pos(point) => {
+            assert_ne!(point, hero.pos, "a raze point aim needs a heading");
+            AimTarget::Heading(facing_towards(hero.pos, point))
+        }
+        Target::None => return None,
+    };
     Some(AimPlan {
         hero: hero.id,
         slot,
@@ -127,21 +152,32 @@ fn aim_order(
     if raze_reach(ability.id) != Some(plan.reach) || !crate::action::ability_ready(hero, ability) {
         return None;
     }
-    let target = visible_unit(tracker, plan.target).filter(|unit| alive(unit))?;
-    if !within_reach_window(hero.pos, target.pos, plan.reach) {
-        return None;
-    }
-    let aim = predicted_position(tracker, target);
     let origin = predicted_position(tracker, hero);
-    let radius = raze_radius(target);
+    // The aim point the landing must reach, how close it must get, and where to walk.
+    let (aim, tolerance, walk_goal) = match plan.target {
+        AimTarget::Unit(target) => {
+            let target = visible_unit(tracker, target).filter(|unit| alive(unit))?;
+            if !within_reach_window(hero.pos, target.pos, plan.reach) {
+                return None;
+            }
+            let aim = predicted_position(tracker, target);
+            let walk = point_along(hero.pos, aim, Fixed::from_int(TURN_WALK));
+            (aim, raze_radius(target), walk)
+        }
+        AimTarget::Heading(heading) => (
+            raze_center(origin, heading, plan.reach),
+            Fixed::from_int(HEADING_TOLERANCE),
+            raze_center(hero.pos, heading, HEADING_WALK),
+        ),
+    };
     // The hero may keep its facing or turn one tick toward its order's goal before
-    // the cast goes off; only a landing that covers the aim either way is taken.
+    // the cast goes off; only a landing on the aim either way is taken.
     let covered = [
         hero.facing.brads,
         predicted_facing(tracker, hero, active_body),
     ]
     .into_iter()
-    .all(|facing| raze_center(origin, facing, plan.reach).within(aim, radius));
+    .all(|facing| raze_center(origin, facing, plan.reach).within(aim, tolerance));
     if covered {
         return Some(Order::Cast {
             slot: plan.slot,
@@ -149,7 +185,7 @@ fn aim_order(
         });
     }
     Some(Order::Move {
-        target: Target::Pos(point_along(hero.pos, aim, Fixed::from_int(TURN_WALK))),
+        target: Target::Pos(walk_goal),
     })
 }
 
@@ -200,45 +236,50 @@ fn alive(unit: &UnitView) -> bool {
 }
 
 pub(crate) fn predicted_position(tracker: &StateTracker, unit: &UnitView) -> Vec2 {
+    extrapolated_position(tracker, unit, 1)
+}
+
+/// Where `unit` would be after `ticks` more ticks at its last tracked velocity,
+/// no faster than its move speed and never off the map.
+pub(crate) fn extrapolated_position(tracker: &StateTracker, unit: &UnitView, ticks: u32) -> Vec2 {
     let Some(velocity) = tracker.entity(unit.id).and_then(|entity| entity.velocity) else {
         return unit.pos;
     };
     assert!(velocity.elapsed_ticks > 0);
     let divisor = i64::from(velocity.elapsed_ticks);
-    let delta = Vec2 {
-        x: Fixed {
-            raw: (i64::from(velocity.delta.x.raw) / divisor) as i32,
-        },
-        y: Fixed {
-            raw: (i64::from(velocity.delta.y.raw) / divisor) as i32,
-        },
-    };
-    let distance = isqrt(delta.distance_squared(Vec2::ZERO) as u64).min(i32::MAX as u64) as i32;
-    let step = Fixed {
-        raw: distance.min(unit.move_speed.raw.max(0) / 30),
-    };
-    let maximum = crate::tracker::map_maximum_raw(tracker.metadata().terrain_cells) as i32;
+    let per_tick = (
+        i64::from(velocity.delta.x.raw) / divisor,
+        i64::from(velocity.delta.y.raw) / divisor,
+    );
+    let speed = isqrt(per_tick.0.unsigned_abs().pow(2) + per_tick.1.unsigned_abs().pow(2)) as i64;
+    let step = speed
+        .min(i64::from(unit.move_speed.raw.max(0) / 30))
+        .saturating_mul(i64::from(ticks))
+        .min(i64::from(i32::MAX));
+    let maximum = crate::tracker::map_maximum_raw(tracker.metadata().terrain_cells);
     assert!(maximum > 0);
+    let ticks = i64::from(ticks);
+    let axis = |position: i32, delta: i64| -> i32 {
+        (i64::from(position) + delta.saturating_mul(ticks)).clamp(0, maximum) as i32
+    };
     let target = Vec2 {
         x: Fixed {
-            raw: unit.pos.x.raw.saturating_add(delta.x.raw).clamp(0, maximum),
+            raw: axis(unit.pos.x.raw, per_tick.0),
         },
         y: Fixed {
-            raw: unit.pos.y.raw.saturating_add(delta.y.raw).clamp(0, maximum),
+            raw: axis(unit.pos.y.raw, per_tick.1),
         },
     };
-    let available = isqrt(unit.pos.distance_squared(target) as u64).min(i32::MAX as u64) as i32;
+    let available = isqrt(unit.pos.distance_squared(target) as u64).min(i32::MAX as u64) as i64;
     let predicted = point_along(
         unit.pos,
         target,
         Fixed {
-            raw: step.raw.min(available),
+            raw: step.min(available) as i32,
         },
     );
-    assert!(predicted.x.raw >= 0);
-    assert!(predicted.x.raw <= maximum);
-    assert!(predicted.y.raw >= 0);
-    assert!(predicted.y.raw <= maximum);
+    assert!((0..=maximum).contains(&i64::from(predicted.x.raw)));
+    assert!((0..=maximum).contains(&i64::from(predicted.y.raw)));
     predicted
 }
 

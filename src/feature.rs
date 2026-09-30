@@ -30,7 +30,7 @@ mod capacity_tests;
 mod test_support;
 
 /// Version of the policy feature layout and candidate input-state semantics.
-pub const FEATURE_SCHEMA_VERSION: u32 = 23;
+pub const FEATURE_SCHEMA_VERSION: u32 = 24;
 /// Number of scalar global features.
 pub const GLOBAL_FEATURES: usize = 92;
 /// Number of scalar features in one global-history sample.
@@ -299,6 +299,11 @@ pub mod point_feature {
     pub const WALKABLE: usize = 22;
     pub const STANDING_TREE: usize = 23;
     pub const ALLIED_BUILDING: usize = 24;
+    pub const SIGHTING_AGE: usize = 25;
+    /// Visible hostile non-hero units struck per raze reach, near to far.
+    pub const RAZE_UNITS_START: usize = 26;
+    /// Visible enemy heroes struck per raze reach, near to far.
+    pub const RAZE_HEROES_START: usize = 29;
 }
 
 /// Stable indices in each ability token.
@@ -420,7 +425,7 @@ pub mod loot_feature {
 
 /// Canonical schema text covered by [`FEATURE_SCHEMA_HASH`].
 pub const FEATURE_SCHEMA_DESCRIPTOR: &str = concat!(
-    "bota-drysua-feature/v22;",
+    "bota-drysua-feature/v23;",
     "action_schema_version=5;action_schema_hash=linked;",
     "navigation_contract=existing_walkable_building_landing_move_pointers_allowed,attack_move_veto_and_tp_provenance_unchanged;frame_legality_and_action_space_provenance=new_contract,raw_dimensions_field_ids_point_order_and_sources_unchanged,no_old_frame_or_corpus_relabel;",
     "shapes=global:92,history:7x24,policy_history:16x4,unit:96x84,own_unit:2x84,remembered_unit:32x84,point:48x32,ability:14x24,item:85x28,projectile:32x20,loot:16x16,map:96;",
@@ -437,8 +442,8 @@ pub const FEATURE_SCHEMA_DESCRIPTOR: &str = concat!(
     "unit_candidates=current_visible_live_only,cap96,priority:own_body_then_hero_then_structure_then_within1200_then_other,distance_then_relation_then_owner_relation_then_canonical_model_semantics_then_entity_id_only_for_semantically_identical_ties;",
     "unit_semantic_order=kind,canonical_position,canonical_facing,hp,max_hp,mana,max_mana,move_speed,attack_damage,attack_range,attack_time,attack_point,attack_speed,armor,magic_resistance,bound,collision,vision,true_sight,statuses,item_slot_count,free_item_slots,item_capacity_available,canonical_velocity,hp_delta,mana_delta,recent_damage,recent_cast,recent_attack;",
     "unit_memory=units_exact_current_pointer_order,own_units_fixed_hero_courier_current_or_remembered,remembered_units_nonown_hidden_cap32_lexicographic_complete_encoded_token,tracker_cap4096_evict_complete_oldest_invisible_last_seen_tick_cohorts,no_target_handles;",
-    "point_candidates=cap48,deduplicate_position_keep_first_source,canonical_team_directions,generate:tactical_radii200_600_1200_in_E_NE_N_NW_W_SW_S_SE_order_then_allied_building_landings_then_nearest8_visible_or_static-baseline_trees_then_own_fountain_enemy_fountain_own_tower_enemy_tower_then_predicted_units;",
-    "point_features=exact_action_pointer_prefix,present,pointer_valid,canonical_position,relative_position,distance,direction,source_category,direction_radius_kind_relation_parameters,walkable,standing_tree,allied_building;",
+    "point_candidates=cap64,deduplicate_position_keep_first_source,canonical_team_directions,generate:general_cap48_tactical_radii200_600_1200_in_E_NE_N_NW_W_SW_S_SE_order_then_allied_building_landings_then_nearest8_visible_or_static-baseline_trees_then_own_fountain_enemy_fountain_own_tower_enemy_tower_then_predicted_units,then_live_own_hero_raze_only_cap16_facing_then_best_landing_near_mid_far_then_fogged_enemy_heroes_last_seen_extrapolated_then_blind_ring8;",
+    "point_features=exact_action_pointer_prefix,present,pointer_valid,canonical_position,relative_position,distance,direction,source_category,direction_radius_kind_relation_parameters,walkable,standing_tree,allied_building,fog_sighting_age,raze_coverage_along_heading_to_point_units_and_heroes_per_reach_200_450_700_visible_hostile_live_uninvulnerable_within250_of_landing;",
     "point_order=building:distance_kind_canonical_landing_position_entity_id_identical_tie,tree:distance_canonical_position_planted,predicted:distance_source_relation_canonical_position_entity_id_identical_tie,landmark:distance_canonical_position_entity_id_identical_tie;shop_order=item_id;",
     "loot_candidates=current_visible,cap16,order:item_then_charges_then_position_then_entity_id_only_for_semantically_identical_ties;",
     "projectile_order=lexicographic_encoded_semantics,select_first32,feature_identical_ties_indistinguishable;",
@@ -466,7 +471,7 @@ pub const FEATURE_SCHEMA_DESCRIPTOR: &str = concat!(
     "history_indices=0:present,1:age,2:hp_present,3:hp,4:mana_present,5:mana,6:level,7:gold,8:alive,9:respawn,10:allied_visible,11:enemy_visible,12:xp_adv,13:level_adv,14:kill_adv,15:death_adv,16:assist_adv,17:lh_adv,18:deny_adv,19:allied_structure_hp,20:enemy_structure_hp,21:destroyed_present,22:destroyed,23:enemy_scoreboard_enabled;",
     "policy_history_indices=0:present,1:age,2:kind_present,3:kind;",
     "unit_indices=0:present,1-4:relation,5:kind,6-8:owner_relation,9:owner_present,10:observation,11:visible,12:remembered,13:origin_present,14:age,15-16:position,17-18:relative,19:distance,20-21:direction,22:facing,23:radius,24:velocity_present,25-26:velocity,27:hp_present,28:elevation,29:walkable,30:hp,31:mana_present,32:mana,33:hp_delta_present,34:hp_delta,35:mana_delta_present,36:mana_delta,37:attack_damage,38:attack_range,39:attack_interval,40:attack_speed,41:move_speed,42:armor,43:magic_resistance,44:vision,45:true_sight,46:attacks_present,47:attacks,48:reach_present,49:reach,50-51:mutual_range,52-60:statuses,61:damage_taken,62:damage_dealt_present,63:damage_dealt,64:attack_phase_present,65:attack_phase,66:item_slot_count,67:free_item_slots,68:item_capacity_available;",
-    "point_indices=0:present,1:pointer_valid,2-3:position,4:origin_present,5-6:relative,7:distance,8-9:direction,10:source,11:source_direction_present,12:source_direction,13:source_radius_present,14:source_radius,15:source_kind_present,16:source_kind,17:source_relation_present,18-21:source_relation,22:walkable,23:standing_tree,24:allied_building,25-31:reserved;",
+    "point_indices=0:present,1:pointer_valid,2-3:position,4:origin_present,5-6:relative,7:distance,8-9:direction,10:source,11:source_direction_present,12:source_direction,13:source_radius_present,14:source_radius,15:source_kind_present,16:source_kind,17:source_relation_present,18-21:source_relation,22:walkable,23:standing_tree,24:allied_building,25:sighting_age,26-28:raze_units_near_mid_far,29-31:raze_heroes_near_mid_far;",
     "ability_indices=0:present,1:body,2:slot,3:observation,4:id_present,5:id,6:level,7:max_level,8:cooldown,9:mana,10:range,11:aim,12:passive,13:toggle,14:can_level,15:legal,16:last_cast_present,17:last_cast_age,18:scoreboard_kit_source,19-23:reserved;",
     "item_indices=0:present,1:location,2:slot,3:item_present,4:item,5:charges_present,6:charges,7:cooldown,8:aim_present,9:aim,10:range,11:mana,12:attribute_present,13:attribute,14:for_sale,15:muted,16:value_present,17:value,18:recipe_component,19:composite,20:legal,21:shop,22:mute_present,23:mute_left,24:shared_wait_present,25:shared_wait_left,26:scoreboard_kit_source,27:reserved;",
     "projectile_indices=0:present,1-4:relation,5:ability_present,6:ability,7-8:relative,9:facing,10:velocity_present,11-12:velocity,13:age_present,14:age,15:approach_present,16:approach,17:origin_present,18-19:reserved;",
@@ -476,7 +481,7 @@ pub const FEATURE_SCHEMA_DESCRIPTOR: &str = concat!(
     "history_scalars=normalizers:age480_hp_ratio_mana_ratio_level30_gold100000_visible256_score1000_xp100000_hp100000_structures64,categories:none,reserved:none;",
     "policy_history_scalars=normalizers:age4800,categories:action1..16,reserved:none;",
     "unit_scalars=normalizers:age480_position_extent_delta_extent_distance_extent_facing65535_radius_extent_hp_ratio_mana_ratio_damage10000_attack_range_fixed_max_attack_interval600_attack_speed2000_move_speed2000_armor_raw6553600_magic_resistance_fixed_max_vision_fixed_max_attacks100_reach4800_item_slots9,categories:relation_onehot4_kind1..12_owner_relation_onehot3_status_bits9,reserved:none;",
-    "point_scalars=normalizers:position_extent_relative_extent_distance_extent_radius1200,categories:source1..8_direction1..8_kind1..12_relation_onehot4,reserved:25..31;",
+    "point_scalars=normalizers:position_extent_relative_extent_distance_extent_radius1200_sighting_age150_raze_units4_raze_heroes1_saturating,categories:source1..13_direction1..8_kind1..12_relation_onehot4,reserved:none;",
     "ability_scalars=normalizers:level30_cooldown36000_mana20000_range_fixed_max_age4800,categories:body1..2_slot1..8_ability1..65547_aim1..5,reserved:19..23;",
     "item_scalars=normalizers:charges255_cooldown36000_range_fixed_max_mana20000_value100000_mute36000_shared_wait36000,categories:location_hero2_stash3_courier4_shop5_with1_reserved_slot1..64_item1..65536_aim1..5_attribute1..3,reserved:27;",
     "projectile_scalars=normalizers:relative_extent_facing65535_velocity_extent_per_tick_age4800_closest_approach_extent,categories:relation_onehot4_ability1..65547,reserved:18..19;",
@@ -501,7 +506,7 @@ pub const FEATURE_SCHEMA_HASH: u64 = crate::model::linked_schema_hash(
     &[(crate::ACTION_SCHEMA_VERSION, crate::ACTION_SCHEMA_HASH)],
 );
 
-const _: () = assert!(crate::ACTION_SCHEMA_VERSION == 6);
+const _: () = assert!(crate::ACTION_SCHEMA_VERSION == 7);
 const _: () = assert!(StatusFlags::INVULNERABLE == 1 << 9);
 const _: () = assert!(StatusFlags::CHANNELLING == 1 << 10);
 const _: () = assert!(global_feature::MAP2_REWARD_POTENTIAL + 1 == global_feature::RESERVED_START);
@@ -1939,6 +1944,15 @@ impl FeatureEncoder {
         token[index::WALKABLE] = bool_feature(point.walkable);
         token[index::STANDING_TREE] = bool_feature(point.standing_tree);
         token[index::ALLIED_BUILDING] = bool_feature(point.allied_building);
+        if let PointSource::LastSeenHero { age } | PointSource::ExtrapolatedHero { age } =
+            point.source
+        {
+            token[index::SIGHTING_AGE] = unit_ratio(age, crate::FOG_GUESS_MAX_AGE_TICKS);
+        }
+        for (reach, coverage) in point.raze_coverage.iter().enumerate() {
+            token[index::RAZE_UNITS_START + reach] = unit_ratio(u32::from(coverage.units), 4);
+            token[index::RAZE_HEROES_START + reach] = unit_ratio(u32::from(coverage.heroes), 1);
+        }
         token
     }
 
@@ -2954,6 +2968,23 @@ fn point_source_semantics(source: PointSource) -> PointSourceSemantics {
         PointSource::Tower(relation) => (5, None, None, None, Some(landmark_relation(relation))),
         PointSource::PredictedHero(relation) => (6, None, None, None, Some(relation)),
         PointSource::PredictedCreep(relation) => (7, None, None, None, Some(relation)),
+        PointSource::RazeFacing => (8, None, Some(crate::RAZE_RING_RADIUS), None, None),
+        PointSource::RazeCluster { reach } => (9, None, Some(reach), None, None),
+        PointSource::LastSeenHero { .. } => (
+            10,
+            None,
+            None,
+            Some(UnitKind::Hero),
+            Some(EntityRelation::Enemy),
+        ),
+        PointSource::ExtrapolatedHero { .. } => (
+            11,
+            None,
+            None,
+            Some(UnitKind::Hero),
+            Some(EntityRelation::Enemy),
+        ),
+        PointSource::RazeRing => (12, None, Some(crate::RAZE_RING_RADIUS), None, None),
     }
 }
 

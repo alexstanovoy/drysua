@@ -169,7 +169,13 @@ fn inspect_fixture(side: usize, place: Place) -> Evidence {
     let frame = encode(&tracker, &space);
     assert_tp_target_kinds(&world, side, &space);
     assert_eq!(space.decode(StructuredAction::Continue), Ok(None));
-    assert_eq!(space.point_candidates().len(), crate::MAX_POINT_CANDIDATES);
+    let general = space
+        .point_candidates()
+        .iter()
+        .filter(|point| !point.source.raze_only())
+        .count();
+    assert_eq!(general, 48, "general candidates fill their cap");
+    assert!(space.point_candidates().len() <= crate::MAX_POINT_CANDIDATES);
     let mut result = Evidence {
         denied: Vec::new(),
         landings: 0,
@@ -180,6 +186,13 @@ fn inspect_fixture(side: usize, place: Place) -> Evidence {
         fountain_regeneration: false,
     };
     for (index, candidate) in space.point_candidates().iter().copied().enumerate() {
+        if candidate.source.raze_only() {
+            for unit in [ControlledUnit::Hero, ControlledUnit::Courier] {
+                assert!(!space.move_point_mask(unit)[index]);
+                assert!(!space.attack_move_point_mask(unit)[index]);
+            }
+            continue;
+        }
         inspect_negative(&mut world, side, &space, index, candidate, &mut result);
         if !matches!(candidate.source, PointSource::BuildingLanding(_)) {
             continue;

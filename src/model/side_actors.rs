@@ -440,7 +440,7 @@ fn validate_named(named: &[(&'static str, &Tensor)]) -> Result<(), ModelError> {
         assert_eq!(tensor.dtype(), DType::F32);
         total += tensor.elem_count();
     }
-    assert!(total <= MODEL_PPO_MAX_MICROBATCH * 823);
+    assert!(total <= MODEL_PPO_MAX_MICROBATCH * 839);
     if named[0].1.device().is_cpu() {
         for &(field, tensor) in named {
             validate_tensor_finite(field, tensor)?;

@@ -270,7 +270,7 @@ fn public_range_and_ownership_masks_keep_exact_boundaries() {
 }
 
 #[test]
-fn raze_masks_allow_only_live_hostile_entities_within_reach_plus_minus_radius() {
+fn raze_masks_allow_none_any_point_and_only_live_hostile_entities_within_reach_plus_minus_radius() {
     for (distance, near, far) in [(300, true, false), (451, true, true), (452, false, true)] {
         let mut view = world_view(1);
         view.units[0].abilities = crate::raze_aim::SHADOWRAZES
@@ -288,8 +288,8 @@ fn raze_masks_allow_only_live_hostile_entities_within_reach_plus_minus_radius() 
             let mask = space
                 .cast_target_mask(ControlledUnit::Hero, AbilitySlot(slot))
                 .expect("raze slot");
-            assert!(!mask.allows_none());
-            assert!(!mask.points().contains(&true));
+            assert!(mask.allows_none());
+            assert!(mask.points().iter().all(|allowed| *allowed));
             assert!(!mask.allows(courier));
             assert_eq!(mask.allows(enemy), allowed, "slot {slot} at {distance}");
         }

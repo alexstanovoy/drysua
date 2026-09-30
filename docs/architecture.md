@@ -80,7 +80,7 @@ Reward: [reward.md](reward.md) (version 8, outcome plus potential-based shaping)
 
 ## Versions
 
-Every contract carries a version and hash: action schema 6, feature schema 23, model
+Every contract carries a version and hash: action schema 7, feature schema 24, model
 schema 25 (1,812,983 parameters), checkpoint format 20, reward 8. Backward
 compatibility is not kept: a change bumps the version and old artifacts are
 rejected; old bots are played from their git commit. `--initial-weights` is the one
@@ -119,8 +119,9 @@ exception: it warm-starts from any runtime weights with the current parameter la
   λ = 0.98 per retained sample reaches back only about 40 s. Reward 8 makes every
   return equal the outcome and moves credit earlier through shaping.
 - **Aiming.** Razes fire along the hero's facing and bota has no face order. Action
-  schema 6 makes an aimed raze one decision (`Cast` at an entity) expanded by
-  `RazeAim`, instead of a turn and a cast that were rarely retained together.
+  schema 7 makes a raze one decision (`Cast` untargeted, at an entity, or toward a
+  point candidate such as a cluster landing or a fog guess) expanded by `RazeAim`,
+  instead of a turn and a cast that were rarely retained together.
 - **Teacher weaknesses** the policy has not found: it retreats at 40% HP without
   hysteresis, never pushes into tower range while the enemy hero is within 1,200,
   spends its mana on creep and tower razes, and can freeze behind a building it walks

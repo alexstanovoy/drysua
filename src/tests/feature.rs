@@ -245,12 +245,13 @@ fn representative_frames_match_frozen_goldens_and_resource_presence_boundaries()
         }
     }
     let actual: [u8; 32] = digest.finalize().into();
-    // Re-captured for action v6, where a raze is legal only with a hostile unit in reach.
+    // Re-captured for action v7 and feature v24: raze-only point candidates, raze
+    // coverage and sighting age in point tokens, and ready razes legal untargeted.
     assert_eq!(
         actual,
         [
-            56, 182, 3, 3, 115, 209, 128, 113, 75, 144, 36, 147, 191, 143, 156, 42, 198, 144, 23,
-            70, 79, 5, 131, 16, 242, 182, 109, 183, 251, 64, 16, 222,
+            163, 69, 99, 159, 32, 97, 151, 246, 201, 37, 127, 191, 169, 196, 148, 245, 23, 42, 8,
+            190, 209, 135, 22, 135, 50, 39, 35, 229, 69, 12, 57, 170,
         ]
     );
 }

@@ -2,6 +2,11 @@ use super::*;
 
 impl Arena {
     #[cfg(test)]
+    /// Read access to the native world for scenario assertions.
+    pub(crate) fn world_for_test(&self) -> &World {
+        &self.world
+    }
+
     pub(crate) fn configure_for_test(&mut self, configure: impl FnOnce(&mut World)) -> ArenaStep {
         configure(&mut self.world);
         self.world.settle();

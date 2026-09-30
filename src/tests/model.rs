@@ -85,7 +85,7 @@ fn assert_training_shapes_and_backward(source: &PolicyModel, frames: &[FeatureFr
         (output.target_mode(), 3),
         (output.put_mode(), 2),
         (output.entity_pointer(), 96),
-        (output.point_pointer(), 48),
+        (output.point_pointer(), 64),
     ] {
         assert_eq!(tensor.dims(), &[prefixes.len(), width]);
     }
