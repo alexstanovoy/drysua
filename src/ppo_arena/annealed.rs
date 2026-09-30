@@ -96,6 +96,8 @@ pub struct AnnealedJobConfig {
     /// from the run scope and does not change the annealing schedule. Finishing
     /// at this boundary forces a durable checkpoint and runtime export.
     pub invocation_updates: Option<std::num::NonZeroU64>,
+    /// Milestone runtime-weight snapshots; excluded from the run scope.
+    pub history: Option<crate::RuntimeHistory>,
     /// Drysua commit recorded in the run scope.
     pub git_commit: String,
     /// Simulator commit recorded in the run scope.
@@ -394,9 +396,12 @@ impl AnnealedSession {
             self.generations,
         );
         generations.adaptive = self.state.adaptive_environment;
+        // A crash between a committed milestone and its export is repaired here.
+        self.export_history(settings)?;
         while self.state.completed_updates < invocation_target {
             self.train_update(settings, harness, config, &mut generations)?;
-            let final_update = self.state.completed_updates == invocation_target;
+            let stop = crate::training_signals::stop_requested();
+            let final_update = self.state.completed_updates == invocation_target || stop;
             if schedule.is_due(self.state.completed_updates, started.elapsed()) || final_update {
                 let report = self.state.checkpoint_report(None);
                 let durable = crate::telemetry::time_training_checkpoint(
@@ -406,15 +411,28 @@ impl AnnealedSession {
                 checkpointed(durable);
                 schedule.mark_committed(started.elapsed())?;
             }
-            if harness
-                .stop_after
-                .is_some_and(|stop| self.state.completed_updates >= stop)
+            self.export_history(settings)?;
+            if stop
+                || harness
+                    .stop_after
+                    .is_some_and(|stop| self.state.completed_updates >= stop)
             {
                 break;
             }
         }
         self.generations = generations.counted_through();
         Ok(())
+    }
+
+    fn export_history(&self, settings: &AnnealedJobConfig) -> Result<(), PpoError> {
+        match &settings.history {
+            Some(history) => history.export(
+                &self.state.model,
+                self.state.completed_updates,
+                settings.updates,
+            ),
+            None => Ok(()),
+        }
     }
 
     fn train_update(

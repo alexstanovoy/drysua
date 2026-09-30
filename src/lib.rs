@@ -28,7 +28,11 @@ mod teacher_economy;
 mod telemetry;
 mod tracker;
 mod training_execution;
+#[cfg(feature = "builtin")]
+mod training_history;
 mod training_outcomes;
+#[cfg(feature = "builtin")]
+mod training_signals;
 mod wire;
 
 pub use action::*;
@@ -53,6 +57,8 @@ pub use seat::*;
 pub use teacher::*;
 pub use tracker::*;
 pub use training_execution::*;
+#[cfg(feature = "builtin")]
+pub use training_history::*;
 pub use training_outcomes::*;
 pub use wire::*;
 

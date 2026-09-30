@@ -21,7 +21,7 @@ fn public_cli_accepts_play_training_and_initialization_contracts() {
         );
     }
     for arguments in [
-        "drysua train-annealed --updates 10000 --generation-games 40 --checkpoint-seconds 300 --checkpoint-directory training/run --resume --device cuda --device-ordinal 1",
+        "drysua train-annealed --updates 10000 --generation-games 40 --history-directory training/history --history-every 20 --checkpoint-directory training/run --resume --device cuda --device-ordinal 1",
         "drysua train-annealed --updates 8 --games 2 --parallel 2 --generation-games 2 --checkpoint-directory training/run --initial-weights training/pretrain",
     ] {
         crate::cli::parse_from(arguments.split_ascii_whitespace()).expect(arguments);

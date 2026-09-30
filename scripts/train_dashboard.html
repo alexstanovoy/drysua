@@ -1,0 +1,383 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<!--REFRESH-->
+<title>Training dashboard</title>
+<style>
+:root {
+  color-scheme: light;
+  --page: #f9f9f7; --surface: #fcfcfb; --ink: #0b0b0b; --ink-2: #52514e; --muted: #898781;
+  --grid: #e1e0d9; --axis: #c3c2b7; --border: rgba(11,11,11,0.10);
+  --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a; --s4: #eda100; --s5: #e87ba4; --s6: #008300; --s7: #4a3aa7; --s8: #e34948;
+  --draw: #a3a29c;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --page: #0d0d0d; --surface: #1a1a19; --ink: #ffffff; --ink-2: #c3c2b7; --muted: #898781;
+    --grid: #2c2c2a; --axis: #383835; --border: rgba(255,255,255,0.10);
+    --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500; --s5: #d55181; --s6: #008300; --s7: #9085e9; --s8: #e66767;
+    --draw: #6d6c67;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --page: #0d0d0d; --surface: #1a1a19; --ink: #ffffff; --ink-2: #c3c2b7; --muted: #898781;
+  --grid: #2c2c2a; --axis: #383835; --border: rgba(255,255,255,0.10);
+  --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500; --s5: #d55181; --s6: #008300; --s7: #9085e9; --s8: #e66767;
+  --draw: #6d6c67;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--page); color: var(--ink); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+main { max-width: 1480px; margin: 0 auto; padding: 20px 16px 48px; }
+header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 8px 16px; }
+h1 { font-size: 20px; margin: 0; font-weight: 600; }
+h2 { font-size: 15px; margin: 28px 0 10px; font-weight: 600; }
+.meta { color: var(--ink-2); font-size: 12px; overflow-wrap: anywhere; }
+button { font: inherit; font-size: 12px; color: var(--ink-2); background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 3px 10px; cursor: pointer; margin-left: auto; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-top: 16px; }
+.tile, .card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; }
+.tile { padding: 10px 14px; }
+.tile .label { color: var(--ink-2); font-size: 12px; }
+.tile .value { font-size: 22px; font-weight: 600; margin-top: 2px; }
+.tile .sub { color: var(--muted); font-size: 12px; }
+.charts { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 560px), 1fr)); gap: 12px; }
+.charts.grid { grid-template-columns: repeat(auto-fill, minmax(min(100%, 330px), 1fr)); }
+.card { padding: 12px 12px 8px; min-width: 0; }
+.card h3 { font-size: 13px; font-weight: 600; margin: 0 0 2px; overflow-wrap: anywhere; }
+.card .note { color: var(--muted); font-size: 12px; margin: 0 0 4px; }
+.legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12px; color: var(--ink-2); margin: 4px 0; }
+.legend span { display: inline-flex; align-items: center; gap: 6px; }
+.key { display: inline-block; width: 14px; height: 2px; border-radius: 1px; }
+.key.box { height: 10px; width: 10px; border-radius: 2px; }
+svg.plot { width: 100%; height: auto; display: block; touch-action: none; }
+svg.plot text { fill: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.empty { color: var(--muted); font-size: 12px; padding: 24px 0; }
+#tip { position: fixed; pointer-events: none; z-index: 10; background: var(--surface); color: var(--ink); border: 1px solid var(--border); border-radius: 8px; padding: 6px 9px; font-size: 12px; box-shadow: 0 4px 14px rgba(0,0,0,0.12); display: none; max-width: 320px; }
+#tip .head { color: var(--ink-2); margin-bottom: 3px; }
+#tip .row { display: flex; align-items: center; gap: 7px; white-space: nowrap; }
+#tip .row b { font-variant-numeric: tabular-nums; }
+#tip .row span:last-child { color: var(--ink-2); overflow: hidden; text-overflow: ellipsis; }
+details { margin-top: 12px; }
+summary { cursor: pointer; color: var(--ink-2); }
+table { border-collapse: collapse; font-size: 12px; margin-top: 8px; font-variant-numeric: tabular-nums; }
+th, td { text-align: right; padding: 3px 10px; border-bottom: 1px solid var(--grid); }
+th:first-child, td:first-child { text-align: left; }
+.scroll { overflow-x: auto; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Training dashboard</h1>
+    <span class="meta" id="source"></span>
+    <button type="button" id="theme" aria-label="Switch color theme">Theme: auto</button>
+  </header>
+  <div class="tiles" id="tiles"></div>
+  <div id="sections"></div>
+  <h2>Outcome blocks</h2>
+  <div class="scroll"><table id="blocks"></table></div>
+  <details><summary>Latest value of every series</summary><div class="scroll"><table id="latest"></table></div></details>
+</main>
+<div id="tip" role="status"></div>
+<script type="application/json" id="dashboard-data">/*DATA*/</script>
+<script>
+(function () {
+  'use strict';
+  var data = JSON.parse(document.getElementById('dashboard-data').textContent);
+  var report = data.report;
+  var NS = 'http://www.w3.org/2000/svg';
+  var SLOTS = ['--s1', '--s2', '--s3', '--s4', '--s5', '--s6', '--s7', '--s8'];
+  var OUTCOME = { Win: '--s1', Draw: '--draw', Loss: '--s2', Other: '--draw' };
+  var tip = document.getElementById('tip');
+
+  function node(tag, attributes, parent, text) {
+    var element = tag.indexOf('svg:') === 0 ? document.createElementNS(NS, tag.slice(4)) : document.createElement(tag);
+    Object.keys(attributes || {}).forEach(function (key) { element.setAttribute(key, attributes[key]); });
+    if (text !== undefined) element.textContent = text;
+    if (parent) parent.appendChild(element);
+    return element;
+  }
+
+  function format(value) {
+    if (value === null || value === undefined) return '–';
+    var size = Math.abs(value);
+    if (size !== 0 && (size < 1e-4 || size >= 1e7)) return value.toExponential(1);
+    if (size >= 1000) return Math.round(value).toLocaleString('en-US');
+    return String(+value.toPrecision(4));
+  }
+
+  function percent(rate) { return rate === null || rate === undefined ? 'n/a' : (100 * rate).toFixed(1) + '%'; }
+
+  function duration(seconds) {
+    if (seconds === null || seconds === undefined) return 'n/a';
+    var minutes = Math.round(seconds / 60);
+    return Math.floor(minutes / 60) + 'h ' + String(minutes % 60).padStart(2, '0') + 'm';
+  }
+
+  function color(chart, entry, index) {
+    if (chart.series.length === 1) return 'var(--s1)';
+    if (OUTCOME[entry.name] && (chart.kind === 'bars' || entry.name === 'Other')) return 'var(' + OUTCOME[entry.name] + ')';
+    return 'var(' + SLOTS[index % SLOTS.length] + ')';
+  }
+
+  function niceTicks(low, high, count) {
+    if (!(high > low)) { high = low + 1; low = low - 1; }
+    var raw = (high - low) / count, magnitude = Math.pow(10, Math.floor(Math.log10(raw))), error = raw / magnitude;
+    var step = (error >= 7.5 ? 10 : error >= 3.5 ? 5 : error >= 1.5 ? 2 : 1) * magnitude;
+    var decimals = Math.max(0, -Math.floor(Math.log10(step))), values = [];
+    for (var index = Math.floor(low / step); values.length < 20; index++) {
+      values.push(+(index * step).toFixed(decimals));
+      if (index * step >= high - step * 1e-9) break;
+    }
+    return values;
+  }
+
+  function extent(chart, count) {
+    var low = Infinity, high = -Infinity;
+    function see(value) { if (value !== null && value !== undefined) { low = Math.min(low, value); high = Math.max(high, value); } }
+    for (var index = 0; index < count; index++) {
+      if (chart.kind === 'bars') {
+        var total = 0;
+        chart.series.forEach(function (entry) { total += entry.values[index] || 0; });
+        see(0); see(total);
+      } else {
+        chart.series.forEach(function (entry) {
+          see(entry.values[index]);
+          if (entry.low) { see(entry.low[index]); see(entry.high[index]); }
+        });
+      }
+    }
+    if (chart.domain) { low = chart.domain[0]; high = chart.domain[1]; }
+    return low === Infinity ? null : [low, high];
+  }
+
+  function linePath(xs, values, X, Y) {
+    var path = '', open = false;
+    for (var index = 0; index < xs.length; index++) {
+      var value = values[index];
+      if (value === null || value === undefined) { open = false; continue; }
+      path += (open ? 'L' : 'M') + X(xs[index]).toFixed(1) + ' ' + Y(value).toFixed(1);
+      open = true;
+    }
+    return path;
+  }
+
+  function bandPath(xs, low, high, X, Y) {
+    var path = '', run = [];
+    function flush() {
+      if (run.length > 1) {
+        path += 'M' + run.map(function (i) { return X(xs[i]).toFixed(1) + ' ' + Y(high[i]).toFixed(1); }).join('L');
+        path += 'L' + run.slice().reverse().map(function (i) { return X(xs[i]).toFixed(1) + ' ' + Y(low[i]).toFixed(1); }).join('L') + 'Z';
+      }
+      run = [];
+    }
+    for (var index = 0; index < xs.length; index++) {
+      if (low[index] === null || high[index] === null) flush(); else run.push(index);
+    }
+    flush();
+    return path;
+  }
+
+  function legend(chart, card) {
+    if (chart.series.length < 2) return;
+    var row = node('div', { class: 'legend' }, card);
+    chart.series.forEach(function (entry, index) {
+      var item = node('span', {}, row);
+      node('i', { class: 'key' + (chart.kind === 'bars' ? ' box' : ''), style: 'background:' + color(chart, entry, index) }, item);
+      node('span', {}, item, entry.name);
+    });
+  }
+
+  function drawAxes(svg, box, ticks, Y, xs, X) {
+    ticks.forEach(function (value) {
+      node('svg:line', { x1: box.left, x2: box.right, y1: Y(value), y2: Y(value), stroke: 'var(--grid)', 'stroke-width': 1 }, svg);
+      node('svg:text', { x: box.left - 6, y: Y(value) + 4, 'text-anchor': 'end' }, svg, format(value));
+    });
+    var count = Math.min(5, xs.length);
+    for (var index = 0; index < count; index++) {
+      var value = xs[Math.round(index * (xs.length - 1) / Math.max(1, count - 1))];
+      node('svg:text', { x: X(value), y: box.bottom + 16, 'text-anchor': 'middle' }, svg, String(value));
+    }
+    // Per-update processes of the old layout would turn markers into noise.
+    (data.starts.length <= 20 ? data.starts : []).forEach(function (start) {
+      if (start >= xs[0] && start <= xs[xs.length - 1]) {
+        node('svg:line', { x1: X(start - 0.5), x2: X(start - 0.5), y1: box.top, y2: box.bottom, stroke: 'var(--axis)', 'stroke-width': 1 }, svg);
+      }
+    });
+    (data.transitions || []).forEach(function (update) {
+      node('svg:line', { x1: X(update), x2: X(update), y1: box.bottom, y2: box.bottom - 5, stroke: 'var(--muted)', 'stroke-width': 1 }, svg);
+    });
+  }
+
+  function drawMarks(svg, chart, xs, X, Y, width) {
+    if (chart.kind === 'bars') {
+      xs.forEach(function (x, index) {
+        var base = 0;
+        chart.series.forEach(function (entry, slot) {
+          var value = entry.values[index] || 0;
+          if (value <= 0) return;
+          var top = Y(base + value), bottom = Y(base);
+          node('svg:rect', { x: X(x) - width / 2, y: top + 1, width: width, height: Math.max(0, bottom - top - 2),
+                             rx: Math.min(2, width / 4), fill: color(chart, entry, slot) }, svg);
+          base += value;
+        });
+      });
+      return;
+    }
+    chart.series.forEach(function (entry, slot) {
+      var stroke = color(chart, entry, slot);
+      if (entry.low) node('svg:path', { d: bandPath(xs, entry.low, entry.high, X, Y), fill: stroke, 'fill-opacity': 0.12 }, svg);
+      node('svg:path', { d: linePath(xs, entry.values, X, Y), fill: 'none', stroke: stroke, 'stroke-width': 2,
+                         'stroke-linejoin': 'round', 'stroke-linecap': 'round' }, svg);
+      entry.values.forEach(function (value, index) {
+        var isolated = value !== null && (index === 0 || entry.values[index - 1] === null) &&
+          (index === entry.values.length - 1 || entry.values[index + 1] === null);
+        if (isolated) node('svg:circle', { cx: X(xs[index]), cy: Y(value), r: 4, fill: stroke, stroke: 'var(--surface)', 'stroke-width': 2 }, svg);
+      });
+    });
+  }
+
+  function hover(svg, chart, xs, X, box, custom) {
+    var cross = node('svg:line', { y1: box.top, y2: box.bottom, stroke: 'var(--axis)', 'stroke-width': 1, visibility: 'hidden' }, svg);
+    var overlay = node('svg:rect', { x: box.left, y: box.top, width: box.right - box.left, height: box.bottom - box.top, fill: 'transparent', tabindex: 0 }, svg);
+    function show(index, clientX, clientY) {
+      cross.setAttribute('x1', X(xs[index])); cross.setAttribute('x2', X(xs[index])); cross.setAttribute('visibility', 'visible');
+      tip.textContent = '';
+      var previous = index > 0 ? xs[index - 1] + 1 : xs[0];
+      node('div', { class: 'head' }, tip, custom && previous !== xs[index] ? 'updates ' + previous + '–' + xs[index] : 'update ' + xs[index]);
+      chart.series.forEach(function (entry, slot) {
+        var row = node('div', { class: 'row' }, tip);
+        node('i', { class: 'key', style: 'background:' + color(chart, entry, slot) }, row);
+        var value = format(entry.values[index]) + (chart.unit && entry.values[index] !== null ? ' ' + chart.unit : '');
+        if (entry.low && entry.low[index] !== null) value += ' [' + format(entry.low[index]) + ', ' + format(entry.high[index]) + ']';
+        node('b', {}, row, value);
+        node('span', {}, row, entry.name);
+      });
+      tip.style.display = 'block';
+      var left = Math.min(clientX + 14, window.innerWidth - tip.offsetWidth - 8);
+      tip.style.left = Math.max(8, left) + 'px';
+      tip.style.top = Math.max(8, clientY - tip.offsetHeight - 12) + 'px';
+    }
+    function nearest(clientX) {
+      var rect = svg.getBoundingClientRect(), scale = svg.viewBox.baseVal.width / rect.width;
+      var x = (clientX - rect.left) * scale, best = 0;
+      for (var index = 1; index < xs.length; index++) {
+        if (Math.abs(X(xs[index]) - x) < Math.abs(X(xs[best]) - x)) best = index;
+      }
+      return best;
+    }
+    overlay.addEventListener('pointermove', function (event) { show(nearest(event.clientX), event.clientX, event.clientY); });
+    overlay.addEventListener('pointerleave', function () { tip.style.display = 'none'; cross.setAttribute('visibility', 'hidden'); });
+    overlay.addEventListener('focus', function () {
+      var rect = svg.getBoundingClientRect();
+      show(xs.length - 1, rect.right - 40, rect.top + 20);
+    });
+    overlay.addEventListener('blur', function () { tip.style.display = 'none'; cross.setAttribute('visibility', 'hidden'); });
+  }
+
+  function drawChart(chart, container, small) {
+    var card = node('div', { class: 'card' }, container);
+    node('h3', {}, card, chart.title + (chart.unit ? ' (' + chart.unit + ')' : ''));
+    if (chart.note) node('p', { class: 'note' }, card, chart.note);
+    legend(chart, card);
+    var xs = chart.x || data.x;
+    var range = xs.length ? extent(chart, xs.length) : null;
+    if (!range) { node('div', { class: 'empty' }, card, 'No values yet.'); return; }
+    // Narrow screens get the small geometry so axis text stays legible.
+    var compact = small || window.innerWidth < 700;
+    var width = compact ? 360 : 720, height = compact ? 170 : 250;
+    var box = { left: 54, right: width - 12, top: 10, bottom: height - 26 };
+    var ticks = niceTicks(range[0], range[1], compact ? 3 : 5);
+    var low = chart.domain ? range[0] : Math.min(ticks[0], range[0]), high = chart.domain ? range[1] : ticks[ticks.length - 1];
+    ticks = ticks.filter(function (value) { return value >= low - 1e-9 && value <= high + 1e-9; });
+    var first = xs[0], span = Math.max(1, xs[xs.length - 1] - first);
+    var step = (box.right - box.left) / Math.max(1, xs.length);
+    var pad = chart.kind === 'bars' ? step / 2 : 0;
+    var X = function (value) { return box.left + pad + (value - first) / span * (box.right - box.left - 2 * pad); };
+    var Y = function (value) { return box.top + (high - value) / (high - low || 1) * (box.bottom - box.top); };
+    var svg = node('svg:svg', { viewBox: '0 0 ' + width + ' ' + height, class: 'plot', role: 'img', 'aria-label': chart.title }, card);
+    drawAxes(svg, box, ticks, Y, xs, X);
+    drawMarks(svg, chart, xs, X, Y, Math.max(1, Math.min(24, step - 2)));
+    hover(svg, chart, xs, X, box, !!chart.x);
+  }
+
+  function tiles() {
+    var container = document.getElementById('tiles');
+    var total = report.total_updates;
+    var recent = report.recent.last20 || report.recent.last10;
+    [['Updates', report.last_update + (total ? ' / ' + total : ''), report.phase ? 'phase ' + report.phase : 'logs only'],
+     ['Win rate', percent(report.overall.win_rate), report.overall.wins + '-' + report.overall.losses + '-' + report.overall.draws + ' W-L-D'],
+     ['Recent win rate', percent(recent ? recent.win_rate : null), report.recent.last20 ? 'last 20 updates' : 'last 10 updates'],
+     ['Seconds per update', format(report.timing.seconds_per_update), 'mean of the last 20'],
+     ['ETA', duration(report.timing.eta_seconds), report.in_flight_games + ' games in flight'],
+     ['Games', format(report.games), report.processes + ' trainer processes']].forEach(function (tile) {
+      var element = node('div', { class: 'tile' }, container);
+      node('div', { class: 'label' }, element, tile[0]);
+      node('div', { class: 'value' }, element, tile[1]);
+      node('div', { class: 'sub' }, element, tile[2]);
+    });
+  }
+
+  function table(id, header, rows) {
+    var element = document.getElementById(id), head = node('tr', {}, node('thead', {}, element)), body = node('tbody', {}, element);
+    header.forEach(function (cell) { node('th', {}, head, cell); });
+    rows.forEach(function (row) {
+      var line = node('tr', {}, body);
+      row.forEach(function (cell) { node('td', {}, line, cell); });
+    });
+  }
+
+  function latestRows() {
+    var rows = [];
+    data.sections.forEach(function (section) {
+      section.charts.forEach(function (chart) {
+        chart.series.forEach(function (entry) {
+          var values = entry.values, index = values.length - 1;
+          while (index >= 0 && values[index] === null) index--;
+          rows.push([chart.series.length > 1 ? chart.title + ': ' + entry.name : chart.title, index >= 0 ? format(values[index]) : '–']);
+        });
+      });
+    });
+    return rows;
+  }
+
+  function themes() {
+    var button = document.getElementById('theme'), modes = ['auto', 'light', 'dark'], mode = 'auto';
+    try { mode = localStorage.getItem('drysua-dashboard-theme') || 'auto'; } catch (error) { mode = 'auto'; }
+    function apply() {
+      if (mode === 'auto') document.documentElement.removeAttribute('data-theme');
+      else document.documentElement.setAttribute('data-theme', mode);
+      button.textContent = 'Theme: ' + mode;
+    }
+    button.addEventListener('click', function () {
+      mode = modes[(modes.indexOf(mode) + 1) % modes.length];
+      try { localStorage.setItem('drysua-dashboard-theme', mode); } catch (error) { /* Storage is optional. */ }
+      apply();
+    });
+    apply();
+  }
+
+  themes();
+  document.getElementById('source').textContent = report.source + ' · generated ' + data.generated +
+    (data.refresh ? ' · reloads every ' + data.refresh + ' s' : '') +
+    (data.starts.length && data.starts.length <= 20 ? ' · vertical hairlines mark trainer restarts' : '') +
+    (data.transitions.length ? ' · x-axis ticks mark environment transitions' : '');
+  tiles();
+  var sections = document.getElementById('sections');
+  data.sections.forEach(function (section) {
+    node('h2', {}, sections, section.title);
+    var container = node('div', { class: 'charts' + (section.grid ? ' grid' : '') }, sections);
+    section.charts.forEach(function (chart) { drawChart(chart, container, section.grid); });
+  });
+  if (!data.sections.length) node('p', { class: 'empty' }, sections, 'No committed updates in the logs yet.');
+  table('blocks', ['Updates', 'Games', 'W', 'L', 'D', 'Win rate'], report.blocks.map(function (block) {
+    return [block.first_update + '–' + block.last_update, block.games, block.wins, block.losses, block.draws, percent(block.win_rate)];
+  }));
+  table('latest', ['Series', 'Latest'], latestRows());
+}());
+</script>
+</body>
+</html>
