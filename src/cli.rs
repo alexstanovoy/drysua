@@ -160,6 +160,12 @@ enum KlGuardArg {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum PotentialArg {
+    Hand,
+    Learned,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum OpponentScheduleArg {
     Fixed,
     Pfsp,
@@ -258,6 +264,19 @@ struct TrainAnnealedArgs {
     /// Updates between league snapshots; the checkpoint persists the ones in play.
     #[arg(long, default_value_t = 20)]
     league_every: u64,
+    /// Shaping potential: `hand` (reward 8) or `learned` (reward 9, a win-probability
+    /// model the run refits on its own games; the hand potential until it has enough).
+    #[arg(long, value_enum, default_value_t = PotentialArg::Hand)]
+    potential: PotentialArg,
+    /// Updates between refits of the learned potential.
+    #[arg(long, default_value_t = 10)]
+    win_model_every: u64,
+    /// Most recent finished games a refit uses (at most 4096).
+    #[arg(long, default_value_t = 1024)]
+    win_model_games: usize,
+    /// Finished games before the first fit replaces the hand potential.
+    #[arg(long, default_value_t = 256)]
+    win_model_min_games: usize,
     /// Environment scale at the first update in exact decimals; 1 is full variance, at most 10.
     #[arg(long)]
     environment_scale_start: Option<crate::EnvironmentDecimal>,
@@ -646,6 +665,14 @@ impl TrainAnnealedArgs {
             },
             league_size: self.league_size,
             league_every: self.league_every,
+            potential: match self.potential {
+                PotentialArg::Hand => None,
+                PotentialArg::Learned => Some(crate::WinModelConfig {
+                    every: self.win_model_every,
+                    games: self.win_model_games,
+                    min_games: self.win_model_min_games,
+                }),
+            },
             ppo,
             guidance: self.optimizer.guidance(),
             checkpoint_cadence: crate::TrainingCheckpointCadence::WallTime(

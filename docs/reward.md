@@ -72,6 +72,32 @@ recorded in checkpoints, runtime weights and reward reports.
 - `drysua reward-observer` (`play.sh --reward-report`) writes the same components and
   counters for each seat of a human game ([human reward play](human-reward-play.md)).
 
+## Reward 9: learned potential (`--potential learned`)
+
+Reward 9 keeps the terminal ±1 and the fast-win bonus and replaces the hand
+potential with `Φ9(s) = P(win | s) − ½` (`src/ppo_arena/win_model.rs`). P is a
+logistic model over 17 features of both seats — the clock; the XP, level, last-hit,
+deny, bounty-gold and hand-potential leads; own and enemy deaths, weakest-tower HP,
+hero HP, mana and respawn — plus each lead times the clock. It may read what the
+policy seat cannot see because it only shapes training games: nothing reaches the
+policy's input, the runtime weights, `play` or evaluation.
+
+- Each finished training game contributes a sample every 30 s of game clock and its
+  score (win 1, draw or cap ½, loss 0). Every `--win-model-every` updates (10) the
+  learner refits on the last `--win-model-games` games (1024) with the seat-swapped
+  copy of every sample, 12 ridge-regularized Newton steps in f64: a pure function of
+  the run.
+- Games keep the model version they started with, so their shaping telescopes to
+  `Φ9(end) − Φ9(start)` with `Φ9 = 0` at the end. A refit after update `u` shapes the
+  games starting in update `u + 1` on. Until the window holds
+  `--win-model-min-games` games (256) new games use the hand potential.
+- The window, the live model versions and every in-flight game's version are part
+  of the collection checkpoint, so resume stays bit-exact.
+- `reward_learned` is the learned shaping; the hand components are zero in a
+  learned game. Each refit logs `event=win_model` with the held-out AUC of the
+  learned and the hand potential by game minute on the games since the previous
+  refit; the dashboard charts both.
+
 ## Policy inputs
 
 The global `MAP2_*` features carry the potential's inputs (own and enemy

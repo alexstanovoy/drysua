@@ -17,6 +17,7 @@ use super::super::league::LeagueStore;
 use super::super::opponents::{OutcomeWindow, log_pool, schedule_mixture};
 use super::super::pool::SimPool;
 use super::super::slot::{GameSchedule, OpponentKind, OpponentMixture, SlotSnapshot};
+use super::super::win_model::{WinModelConfig, WinModels, WinState};
 use super::super::{CollectionReport, TrainingSession};
 use super::*;
 use crate::CollectionCheckpoint;
@@ -33,6 +34,8 @@ pub(super) struct AnnealedSession {
     outcomes: OutcomeWindow,
     /// League snapshots the next publications or in-flight games need.
     league: LeagueStore,
+    /// The learned potential's refit settings, window and models, when the run learns one.
+    win: Option<(WinModelConfig, WinState, WinModels)>,
 }
 
 impl AnnealedSession {
@@ -74,6 +77,17 @@ impl AnnealedSession {
             Some(collection) => restore_league(settings, &state, directory, collection)?,
             None => LeagueStore::default(),
         };
+        let win = match settings.potential {
+            Some(config) => {
+                let window = restored
+                    .as_ref()
+                    .map_or_else(WinState::default, |state| state.win.clone());
+                let models = WinModels::default();
+                window.publish(&models)?;
+                Some((config, window, models))
+            }
+            None => None,
+        };
         Ok(Self {
             state,
             random_directory: random_directory.to_path_buf(),
@@ -82,6 +96,7 @@ impl AnnealedSession {
             restored,
             outcomes,
             league,
+            win,
         })
     }
 
@@ -111,6 +126,7 @@ impl AnnealedSession {
             decision_cap: harness.episode_decisions(),
             config,
             shadow: settings.guidance.shadow_labels(),
+            potentials: self.win.as_ref().map(|(_, _, models)| Arc::clone(models)),
         };
         let mut generations = GenerationCache::new(
             self.random_directory.clone(),
@@ -272,8 +288,10 @@ impl AnnealedSession {
         &self,
         pool: &OpponentPool,
         (update, version, actor): (u64, u64, Arc<Vec<f32>>),
-        (spec, mixture): (ModifierSpec, Option<OpponentMixture>),
+        (spec, mixture, potential): (ModifierSpec, Option<OpponentMixture>, Option<u64>),
     ) -> Result<PartConfig, PpoError> {
+        let potential = potential
+            .unwrap_or_else(|| self.win.as_ref().map_or(0, |(_, window, _)| window.current));
         let entries = pool.entries_for(update);
         let mixture = match mixture {
             Some(mixture) => mixture,
@@ -292,6 +310,7 @@ impl AnnealedSession {
             spec,
             mixture: Arc::new(mixture),
             league,
+            potential,
         })
     }
 
@@ -342,7 +361,7 @@ impl AnnealedSession {
                         state.actor_version,
                         Arc::new(checkpoint.actor.clone()),
                     ),
-                    (state.spec, Some(state.mixture)),
+                    (state.spec, Some(state.mixture), Some(state.potential)),
                 )?
             }
             _ => {
@@ -350,7 +369,7 @@ impl AnnealedSession {
                 self.part_config(
                     pool,
                     (completed, completed, Arc::clone(&current)),
-                    (spec, None),
+                    (spec, None, None),
                 )?
             }
         };
@@ -361,7 +380,7 @@ impl AnnealedSession {
             let config = self.part_config(
                 pool,
                 (update, completed, Arc::clone(&current)),
-                (spec, None),
+                (spec, None, None),
             )?;
             pipeline.publish(config)?;
         }
@@ -435,11 +454,52 @@ impl AnnealedSession {
         self.remember_milestone(pool, &actor);
         self.prune_league(pool, &snapshots, next);
         let spec = run_spec(settings, generations, next)?;
-        let published = self.part_config(pool, (next, completed, actor), (spec, None))?;
+        self.refit_potential(completed)?;
+        let published = self.part_config(pool, (next, completed, actor), (spec, None, None))?;
         log_pool(completed, &published.mixture, &self.outcomes);
         pipeline.publish(published)?;
+        self.retain_potentials(&snapshots, pipeline, completed)?;
         let opponents = (&self.outcomes, self.league.manifest(completed));
-        self.state.collection = Some(pipeline.checkpoint(completed, snapshots, opponents)?);
+        let win = self.win.as_ref().map(|(_, window, _)| window);
+        self.state.collection = Some(pipeline.checkpoint(completed, snapshots, opponents, win)?);
+        Ok(())
+    }
+
+    /// Refits the learned potential when due and shares the new model with the lanes.
+    fn refit_potential(&mut self, completed: u64) -> Result<(), PpoError> {
+        let Some((config, window, models)) = &mut self.win else {
+            return Ok(());
+        };
+        if let Some(line) = window.refit(*config, completed) {
+            crate::telemetry::log_line!("{line}");
+        }
+        window.publish(models)
+    }
+
+    /// Forgets learned potentials that no in-flight game, published
+    /// configuration or new game uses any more.
+    fn retain_potentials(
+        &mut self,
+        snapshots: &[SlotSnapshot],
+        pipeline: &Pipeline,
+        completed: u64,
+    ) -> Result<(), PpoError> {
+        let Some((_, window, models)) = &mut self.win else {
+            return Ok(());
+        };
+        let referenced = |version: u64| {
+            snapshots.iter().any(|slot| slot.plan.potential == version)
+                || pipeline
+                    .configs
+                    .range(completed..)
+                    .any(|(_, config)| config.potential == version)
+        };
+        window.retain(referenced);
+        let current = window.current;
+        models
+            .write()
+            .map_err(|_| PpoError::InvalidTransition("learned potential registry"))?
+            .retain(|&version, _| version == current || referenced(version));
         Ok(())
     }
 
@@ -453,6 +513,9 @@ impl AnnealedSession {
     ) -> Result<(), PpoError> {
         for episode in parts.iter().flat_map(|part| &part.episodes) {
             self.outcomes.record(episode.opponent, episode.outcome)?;
+            if let (Some((config, window, _)), Some(game)) = (&mut self.win, &episode.win) {
+                window.record(*config, game.clone());
+            }
         }
         let playing = pool.entries_for(update + 1 + PIPELINE_STALENESS);
         self.outcomes
@@ -531,6 +594,7 @@ impl Pipeline {
         update: u64,
         snapshots: Vec<SlotSnapshot>,
         (outcomes, league): (&OutcomeWindow, Vec<(u64, u64)>),
+        win: Option<&WinState>,
     ) -> Result<CollectionCheckpoint, PpoError> {
         self.configs.retain(|&published, _| published >= update);
         let config = self
@@ -545,6 +609,8 @@ impl Pipeline {
             outcomes: outcomes.clone(),
             league,
             slots: snapshots,
+            potential: config.potential,
+            win: win.cloned().unwrap_or_default(),
         };
         Ok(CollectionCheckpoint {
             actor: config.actor.as_ref().clone(),

@@ -182,7 +182,7 @@ fn simulation_thread_count_never_changes_training_bits() {
 }
 
 #[test]
-fn pfsp_league_mixtures_resume_in_flight_neural_games_exactly() {
+fn pfsp_league_mixtures_and_learned_potential_resume_in_flight_games_exactly() {
     let weights = test_directory("mixed-opponent-weights");
     let frozen = PolicyModel::fresh(0x0dd).expect("frozen opponent");
     TrainingArtifact::save_runtime_weights(&frozen, &weights).expect("frozen weights");
@@ -191,6 +191,11 @@ fn pfsp_league_mixtures_resume_in_flight_neural_games_exactly() {
     config.ppo.samples_per_update = 40;
     config.league_size = 4;
     config.league_every = 2;
+    config.potential = Some(crate::WinModelConfig {
+        every: 1,
+        games: 64,
+        min_games: 1,
+    });
     config.opponents = vec![
         (AnnealedOpponent::Teacher, one()),
         (AnnealedOpponent::HarassPush, one()),
@@ -223,6 +228,10 @@ fn pfsp_league_mixtures_resume_in_flight_neural_games_exactly() {
         .windows(2)
         .any(|pair| pair[0].1 != pair[1].1);
     assert!(reweighted, "PFSP reweighted the configured equal weights");
+    assert!(
+        state.potential > 0 && state.win.models.len() > 1,
+        "new games at the boundary use a learned potential; the previous one stays for their predecessors"
+    );
     let written: Vec<u64> = state.league.iter().map(|(update, _)| *update).collect();
     assert_eq!(
         written,
@@ -357,6 +366,7 @@ fn settings(seed: u64, updates: u64) -> AnnealedJobConfig {
         opponent_schedule: crate::OpponentSchedule::Pfsp,
         league_size: 4,
         league_every: 20,
+        potential: None,
         ppo: PpoConfig {
             decision_interval_ticks: MAP2_DECISION_INTERVAL_TICKS,
             samples_per_update: 6,

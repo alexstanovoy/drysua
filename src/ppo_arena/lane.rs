@@ -35,6 +35,8 @@ pub(super) struct PartConfig {
     pub(super) mixture: Arc<OpponentMixture>,
     /// League milestones this mixture may draw, with their weights.
     pub(super) league: LeagueWeights,
+    /// Learned-potential version of games starting in this update; 0 is the hand potential.
+    pub(super) potential: u64,
 }
 
 /// League milestone weights by completed update.
@@ -46,6 +48,7 @@ impl PartConfig {
             update: self.update,
             spec: self.spec,
             mixture: Arc::clone(&self.mixture),
+            potential: self.potential,
         }
     }
 }

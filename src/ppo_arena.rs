@@ -23,7 +23,9 @@ mod pool;
 mod reward;
 mod slot;
 pub(crate) mod topology;
+pub(crate) mod win_model;
 pub use reward::Map2TrainingReward;
+pub use win_model::WinModelConfig;
 #[cfg(test)]
 #[path = "tests/ppo_arena_test_support.rs"]
 mod test_support;

@@ -12,9 +12,10 @@ use super::opponents::{MAX_LEAGUE_SIZE, MAX_MIXTURE_ENTRIES, OutcomeWindow, PFSP
 use super::slot::{
     ActionLog, GamePlan, MAX_SLOTS, OpenInterval, OpponentKind, OpponentMixture, SlotSnapshot,
 };
+use super::win_model::{self, WinGame, WinModel, WinState};
 use crate::{MAP2_ACTOR_DECISIONS, MAX_COLLECTION_STATE_BYTES, PpoError, ScriptKind};
 
-const VERSION: u32 = 2;
+const VERSION: u32 = 3;
 /// League snapshots one checkpoint can keep: two publications' leagues and
 /// one evicted snapshot per in-flight game.
 const MAX_LEAGUE_ENTRIES: usize = 2 * MAX_LEAGUE_SIZE + MAX_SLOTS;
@@ -40,6 +41,10 @@ pub(crate) struct CollectorState {
     pub(crate) league: Vec<(u64, u64)>,
     /// Every slot, in global slot order.
     pub(crate) slots: Vec<SlotSnapshot>,
+    /// Learned-potential version of games starting in `update`; 0 is the hand potential.
+    pub(crate) potential: u64,
+    /// The learned potential's window and live models; empty without one.
+    pub(crate) win: WinState,
 }
 
 impl CollectorState {
@@ -69,6 +74,8 @@ impl CollectorState {
         for slot in &self.slots {
             put_slot(&mut bytes, slot);
         }
+        put_u64(&mut bytes, self.potential);
+        put_win(&mut bytes, &self.win);
         assert!(bytes.len() <= MAX_COLLECTION_STATE_BYTES);
         bytes
     }
@@ -95,7 +102,15 @@ impl CollectorState {
         for _ in 0..count {
             slots.push(reader.slot()?);
         }
-        if reader.offset != bytes.len() || actor_version > update {
+        let potential = reader.u64()?;
+        let win = reader.win()?;
+        let known =
+            |version: u64| version == 0 || win.models.iter().any(|model| model.version == version);
+        if reader.offset != bytes.len()
+            || actor_version > update
+            || !known(potential)
+            || slots.iter().any(|slot| !known(slot.plan.potential))
+        {
             return Err(invalid());
         }
         Ok(Self {
@@ -106,6 +121,8 @@ impl CollectorState {
             outcomes,
             league,
             slots,
+            potential,
+            win,
         })
     }
 }
@@ -158,6 +175,26 @@ fn put_opponent(bytes: &mut Vec<u8>, opponent: OpponentKind) {
     put_u64(bytes, value);
 }
 
+fn put_win(bytes: &mut Vec<u8>, state: &WinState) {
+    put_u64(bytes, state.current);
+    put_u32(bytes, state.fresh as u32);
+    put_u32(bytes, state.models.len() as u32);
+    for model in &state.models {
+        put_u64(bytes, model.version);
+        for weight in model.weights() {
+            put_u64(bytes, weight.to_bits());
+        }
+    }
+    put_u32(bytes, state.games.len() as u32);
+    for game in &state.games {
+        bytes.push(game.score);
+        bytes.push(game.samples.len() as u8);
+        for value in game.samples.iter().flatten() {
+            put_u32(bytes, value.to_bits());
+        }
+    }
+}
+
 fn put_slot(bytes: &mut Vec<u8>, slot: &SlotSnapshot) {
     let plan = slot.plan;
     put_u32(bytes, plan.slot as u32);
@@ -167,6 +204,7 @@ fn put_slot(bytes: &mut Vec<u8>, slot: &SlotSnapshot) {
     put_u32(bytes, plan.seat as u32);
     put_opponent(bytes, plan.opponent);
     put_u32(bytes, plan.decision_cap as u32);
+    put_u64(bytes, plan.potential);
     for (state, draws) in [slot.actor, slot.opponent] {
         put_u64(bytes, state);
         put_u64(bytes, draws);
@@ -315,6 +353,56 @@ impl Reader<'_> {
         Ok(window)
     }
 
+    fn win(&mut self) -> Result<WinState, PpoError> {
+        let current = self.u64()?;
+        let fresh = self.u32()? as usize;
+        let count = self.u32()? as usize;
+        if count > win_model::MAX_MODELS {
+            return Err(invalid());
+        }
+        let mut models = Vec::with_capacity(count);
+        for _ in 0..count {
+            let version = self.u64()?;
+            let mut weights = [0.0; win_model::DIM];
+            for weight in &mut weights {
+                *weight = f64::from_bits(self.u64()?);
+            }
+            models.push(WinModel::from_weights(version, weights).map_err(|_| invalid())?);
+        }
+        let count = self.u32()? as usize;
+        if count > win_model::MAX_WINDOW_GAMES || fresh > count {
+            return Err(invalid());
+        }
+        let mut games = VecDeque::with_capacity(count);
+        for _ in 0..count {
+            let [score, length] = self.take::<2>()?;
+            if score > 2 || usize::from(length) > win_model::MAX_GAME_SAMPLES {
+                return Err(invalid());
+            }
+            let mut samples = Vec::with_capacity(usize::from(length));
+            for _ in 0..length {
+                let mut sample = [0.0; win_model::BASE];
+                for value in &mut sample {
+                    *value = f32::from_bits(self.u32()?);
+                    if !value.is_finite() {
+                        return Err(invalid());
+                    }
+                }
+                samples.push(sample);
+            }
+            games.push_back(WinGame { samples, score });
+        }
+        if current != 0 && !models.iter().any(|model| model.version == current) {
+            return Err(invalid());
+        }
+        Ok(WinState {
+            games,
+            fresh,
+            current,
+            models,
+        })
+    }
+
     fn slot(&mut self) -> Result<SlotSnapshot, PpoError> {
         let slot = self.u32()? as usize;
         let game = self.u64()?;
@@ -323,6 +411,7 @@ impl Reader<'_> {
         let seat = self.u32()? as usize;
         let opponent = self.opponent()?;
         let decision_cap = self.u32()? as usize;
+        let potential = self.u64()?;
         if slot >= MAX_SLOTS || seat > 1 || !(1..=MAP2_ACTOR_DECISIONS).contains(&decision_cap) {
             return Err(invalid());
         }
@@ -350,6 +439,7 @@ impl Reader<'_> {
                 seat,
                 opponent,
                 decision_cap,
+                potential,
             },
             log,
             actor,

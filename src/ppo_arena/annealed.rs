@@ -87,6 +87,9 @@ pub struct AnnealedJobConfig {
     pub league_size: usize,
     /// Updates between league snapshots of the learner.
     pub league_every: u64,
+    /// Reward 9: shape with a learned win-probability potential refitted this way;
+    /// `None` keeps the hand potential (reward 8).
+    pub potential: Option<crate::WinModelConfig>,
     /// PPO dimensions and hyperparameters.
     pub ppo: PpoConfig,
     /// Fading imitation and critic warm-up.
@@ -588,6 +591,12 @@ fn annealed_run(
         ));
     }
     append_opponent_scope(settings, pool, &mut command_line)?;
+    if let Some(potential) = settings.potential {
+        command_line.push_str(&format!(
+            " --potential learned --win-model-every {} --win-model-games {} --win-model-min-games {}",
+            potential.every, potential.games, potential.min_games
+        ));
+    }
     let defaults = PpoConfig::default();
     if config.learning_rate != defaults.learning_rate {
         command_line.push_str(&format!(" --learning-rate {}", config.learning_rate));
@@ -746,6 +755,9 @@ fn validate_collection(settings: &AnnealedJobConfig) -> Result<(), PpoError> {
 }
 
 fn validate_opponents(settings: &AnnealedJobConfig) -> Result<(), PpoError> {
+    settings
+        .potential
+        .map_or(Ok(()), crate::WinModelConfig::validate)?;
     if settings.opponents.is_empty() || settings.opponents.len() > 16 {
         return Err(PpoError::InvalidConfig(
             "annealed opponent mixture needs 1..=16 entries",
