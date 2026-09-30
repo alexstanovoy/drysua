@@ -9,3 +9,4 @@ __pycache__/
 /artifacts/history/
 /artifacts/weights/
 /bench.lock
+/bench.gate
