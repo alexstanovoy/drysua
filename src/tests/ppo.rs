@@ -346,9 +346,12 @@ fn explained_variance_separates_exact_blind_and_undefined_critics() {
         };
         rollout.finish(config).expect("batch").explained_variance()
     };
-    assert!((batch(returns, returns) - 1.0).abs() < 1.0e-12);
-    assert!(batch([0.3; 4], returns).abs() < 1.0e-12);
-    assert!(batch([0.0, 1.0, 2.0, 3.0], [0.5; 4]).is_nan());
+    // Single terminal samples: the lambda and Monte Carlo returns are both the reward.
+    let exact = batch(returns, returns);
+    assert!((exact.lambda - 1.0).abs() < 1.0e-12);
+    assert_eq!(exact.lambda.to_bits(), exact.monte_carlo.to_bits());
+    assert!(batch([0.3; 4], returns).monte_carlo.abs() < 1.0e-12);
+    assert!(batch([0.0, 1.0, 2.0, 3.0], [0.5; 4]).lambda.is_nan());
 }
 
 #[test]

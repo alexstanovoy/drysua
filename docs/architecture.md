@@ -120,11 +120,20 @@ shape match and initializing the rest.
   forgetting between checkpoints. Training barely moves the policy: KL per update
   is about 1e-4 against a 0.02 target.
 - **Credit assignment.** The critic is a 256×256 MLP trained with the trunk and λ is
-  per tick (160 s horizon), yet explained variance plateaus near 0.08 after 60
-  updates (the old linear critic: 0.05–0.11), and GAE still truncates at update
-  boundaries (about 375 samples per slot per update). With lr 1e-5 the policy moves
-  about 0.009 KL per update (30× the old setting) without a significant win-rate
-  change against Teacher (+3 points, p = 0.38, 400 paired games).
+  per tick (160 s horizon); GAE truncates at update boundaries (about 375 samples,
+  115 s of game per slot per update) and bootstraps there from the stored value, so
+  nothing is cut off without a bootstrap. `ppo_update` logs two explained variances:
+  against the λ-returns the critic trains on, and (`explained_variance_mc`) against
+  the Monte Carlo return of the samples whose game ended in the batch. The outcome is
+  mostly unpredictable from a state: on 550 frozen u200v2 self-play games a
+  win-probability model fitted on 380 games explains only 0.11–0.13 of the held-out
+  return variance (0.06 with 100 games; opponent-private inputs add ≤ 0.01), and an
+  update sees about 18 outcomes, so an explained variance near 0.1 is the ceiling,
+  not a bug. The hand potential predicts the winner at chance in the first two game
+  minutes (AUC 0.47–0.57) where a logistic model over the global features reaches
+  0.64–0.73, so early decisions get little outcome credit from shaping or the critic.
+  With lr 1e-5 the policy moves about 0.009 KL per update; against the old, freezing
+  Teacher that changed the win rate by +3 points (p = 0.38, 400 paired games).
 - **Aiming.** Razes fire along the hero's facing and bota has no face order. Action
   schema 7 makes a raze one decision (`Cast` untargeted, at an entity, or toward a
   point candidate such as a cluster landing or a fog guess) expanded by `RazeAim`,

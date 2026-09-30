@@ -907,20 +907,21 @@ mod tests;
 
 fn log_ppo_update(
     report: &crate::PpoUpdateReport,
-    explained_variance: f64,
+    explained_variance: crate::ExplainedVariance,
     optimizer_steps: u64,
     samples: usize,
     learning_rate: f32,
 ) {
     crate::telemetry::log_line!(
-        "level=INFO event=ppo_update update={} policy_loss={:.6} value_loss={:.6} entropy={:.6} approx_kl={:.8} clip_fraction={:.6} explained_variance={:.6} kl_stop={} optimizer_steps={optimizer_steps} samples={samples} learning_rate={learning_rate:e}",
+        "level=INFO event=ppo_update update={} policy_loss={:.6} value_loss={:.6} entropy={:.6} approx_kl={:.8} clip_fraction={:.6} explained_variance={:.6} explained_variance_mc={:.6} kl_stop={} optimizer_steps={optimizer_steps} samples={samples} learning_rate={learning_rate:e}",
         report.update,
         report.policy_loss,
         report.value_loss,
         report.entropy,
         crate::ppo_arena::update_kl(*report),
         report.clip_fraction,
-        explained_variance,
+        explained_variance.lambda,
+        explained_variance.monte_carlo,
         report.stopped_for_kl,
     );
 }

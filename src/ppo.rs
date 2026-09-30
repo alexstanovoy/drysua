@@ -619,6 +619,18 @@ impl PpoPreparedSample {
 pub struct PpoBatch {
     samples: Vec<CompactPreparedSample>,
     frames: RaggedFeatureArena,
+    /// Monte Carlo return of each sample whose game ended in this batch.
+    outcome_returns: Vec<Option<f32>>,
+}
+
+/// How much return variance the rollout critic explained before an update.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ExplainedVariance {
+    /// Against the lambda returns it trains on, which bootstrap from itself.
+    pub lambda: f64,
+    /// Against the Monte Carlo return of the samples whose game ended in the
+    /// batch: the outcome it has to predict, never its own bootstrap.
+    pub monte_carlo: f64,
 }
 
 struct CompactPreparedSample {
@@ -905,26 +917,19 @@ impl PpoBatch {
         self.samples.is_empty()
     }
 
-    /// Fraction of lambda-return variance the rollout critic explained, before any update.
-    /// NaN when the returns are constant, where the ratio is undefined.
-    pub fn explained_variance(&self) -> f64 {
-        let count = self.samples.len() as f64;
-        assert!(count > 0.0);
-        let mean = |values: &dyn Fn(&CompactPreparedSample) -> f64| {
-            self.samples.iter().map(values).sum::<f64>() / count
-        };
-        let variance = |values: &dyn Fn(&CompactPreparedSample) -> f64| {
-            let center = mean(values);
-            mean(&|sample| (values(sample) - center).powi(2))
-        };
-        let returns = variance(&|sample| f64::from(sample.return_value));
-        let residuals = variance(&|sample| {
-            f64::from(sample.return_value) - f64::from(sample.transition.old_value)
-        });
-        if returns == 0.0 {
-            return f64::NAN;
+    /// Both explained variances; NaN where the returns are constant or absent.
+    pub fn explained_variance(&self) -> ExplainedVariance {
+        let value = |sample: &CompactPreparedSample| f64::from(sample.transition.old_value);
+        ExplainedVariance {
+            lambda: explained(
+                self.samples
+                    .iter()
+                    .map(|sample| (f64::from(sample.return_value), value(sample))),
+            ),
+            monte_carlo: explained(self.samples.iter().zip(&self.outcome_returns).filter_map(
+                |(sample, outcome)| outcome.map(|outcome| (f64::from(outcome), value(sample))),
+            )),
         }
-        1.0 - residuals / returns
     }
 
     pub fn sample(&self, index: usize) -> Result<PpoPreparedSample, PpoError> {
@@ -950,6 +955,21 @@ impl PpoBatch {
     }
 }
 
+/// `1 - Var(target - prediction) / Var(target)` over `(target, prediction)` pairs.
+fn explained(pairs: impl Iterator<Item = (f64, f64)> + Clone) -> f64 {
+    let count = pairs.clone().count() as f64;
+    let mean = |values: &dyn Fn((f64, f64)) -> f64| pairs.clone().map(values).sum::<f64>() / count;
+    let variance = |values: &dyn Fn((f64, f64)) -> f64| {
+        let center = mean(values);
+        mean(&|pair| (values(pair) - center).powi(2))
+    };
+    let targets = variance(&|(target, _)| target);
+    if count == 0.0 || targets == 0.0 {
+        return f64::NAN;
+    }
+    1.0 - variance(&|(target, prediction)| target - prediction) / targets
+}
+
 fn rollout_storage<T>(capacity: usize) -> Result<Vec<T>, PpoError> {
     assert!(std::mem::size_of::<T>() > 0);
     assert!(capacity <= PPO_MAX_SAMPLES);
@@ -967,8 +987,21 @@ fn prepare_batch(
 ) -> Result<PpoBatch, PpoError> {
     let mut next_advantage = [0.0f32; PPO_MAX_STREAMS];
     let mut next_return = [None; PPO_MAX_STREAMS];
+    let mut next_outcome: [Option<f64>; PPO_MAX_STREAMS] = [None; PPO_MAX_STREAMS];
     let mut prepared = rollout_storage(transitions.len())?;
+    let mut outcome_returns = Vec::with_capacity(transitions.len());
     for transition in transitions.into_iter().rev() {
+        let later = if transition.terminal {
+            Some(0.0)
+        } else {
+            next_outcome[transition.stream]
+        };
+        let outcome = later.map(|later| {
+            f64::from(transition.reward)
+                + f64::from(config.gamma_tick).powi(transition.ticks as i32) * later
+        });
+        next_outcome[transition.stream] = outcome;
+        outcome_returns.push(outcome.map(|outcome| outcome as f32));
         let discount = tick_discount(config.gamma_tick, transition.ticks)?;
         let trace = tick_discount(config.gae_lambda_tick, transition.ticks)?;
         let continuation = if transition.terminal { 0.0 } else { 1.0 };
@@ -993,10 +1026,12 @@ fn prepare_batch(
         });
     }
     prepared.reverse();
+    outcome_returns.reverse();
     normalize_advantages(&mut prepared)?;
     Ok(PpoBatch {
         samples: prepared,
         frames,
+        outcome_returns,
     })
 }
 
