@@ -42,16 +42,19 @@ enum Operation {
     Duel(crate::scripted::duel_cli::DuelArgs),
 }
 
-/// Options for a frozen-weights evaluation.
+/// Options for a frozen pool evaluation.
 #[derive(Args)]
 struct EvalArgs {
-    /// Candidate runtime weights directory.
+    /// Candidate: a rule policy, `weights:<dir>` or `average:<dir>,<dir>,...`.
     #[arg(long)]
-    weights: std::path::PathBuf,
-    /// `teacher`, `harass-push` or `weights:<runtime weights directory>`.
-    #[arg(long, default_value = "teacher", value_parser = parse_eval_opponent)]
-    opponent: EvalOpponentArg,
-    /// Seed range `<start>:<count>`; every seed is played once per side.
+    candidate: String,
+    /// Candidate name in the output; defaults to the weights directory or rule name.
+    #[arg(long)]
+    name: Option<String>,
+    /// Opponent pool JSON (`drysua-eval-pool/v1`), see docs/eval_pool.example.json.
+    #[arg(long)]
+    pool: std::path::PathBuf,
+    /// Seed range `<start>:<count>`; every seed is played once per side against every opponent.
     #[arg(long, value_parser = parse_seed_range)]
     seeds: (u64, u64),
     /// Worlds per pipeline group; also the inference batch size.
@@ -69,29 +72,9 @@ struct EvalArgs {
     /// CUDA device ordinal.
     #[arg(long, default_value_t = 0)]
     device_ordinal: usize,
-    /// New JSONL file: one line per game, then one summary line.
+    /// New JSONL file: a header line, then one line per game.
     #[arg(long)]
     output: std::path::PathBuf,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum EvalOpponentArg {
-    Teacher,
-    HarassPush,
-    Weights(std::path::PathBuf),
-}
-
-fn parse_eval_opponent(value: &str) -> Result<EvalOpponentArg, String> {
-    match value.split_once(':') {
-        None if value == "teacher" => Ok(EvalOpponentArg::Teacher),
-        None if value == "harass-push" => Ok(EvalOpponentArg::HarassPush),
-        Some(("weights", directory)) if !directory.is_empty() => {
-            Ok(EvalOpponentArg::Weights(directory.into()))
-        }
-        _ => Err(format!(
-            "opponent must be teacher, harass-push or weights:<directory>, got {value:?}"
-        )),
-    }
 }
 
 fn parse_seed_range(value: &str) -> Result<(u64, u64), String> {
@@ -947,15 +930,23 @@ fn cuda_policy_device(_: usize) -> std::io::Result<crate::PolicyDevice> {
 
 #[cfg(feature = "builtin")]
 fn run_eval(arguments: EvalArgs) -> std::io::Result<()> {
+    use crate::ppo_arena::PlayerSpec;
+    let candidate = PlayerSpec::parse(&arguments.candidate).map_err(std::io::Error::other)?;
+    let name = match (arguments.name, &candidate) {
+        (Some(name), _) => name,
+        (None, PlayerSpec::Weights(directory)) => directory
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .ok_or_else(|| std::io::Error::other("weights directory has no name; pass --name"))?,
+        (None, PlayerSpec::Script(kind)) => kind.label().to_owned(),
+        (None, PlayerSpec::Average(_)) => {
+            return Err(std::io::Error::other("an average candidate needs --name"));
+        }
+    };
     let settings = crate::ppo_arena::EvaluationSettings {
-        candidate: arguments.weights,
-        opponent: match arguments.opponent {
-            EvalOpponentArg::Teacher => crate::ppo_arena::EvaluationOpponent::Teacher,
-            EvalOpponentArg::HarassPush => crate::ppo_arena::EvaluationOpponent::HarassPush,
-            EvalOpponentArg::Weights(directory) => {
-                crate::ppo_arena::EvaluationOpponent::Weights(directory)
-            }
-        },
+        candidate_name: name,
+        candidate,
+        pool: crate::ppo_arena::read_pool(&arguments.pool).map_err(std::io::Error::other)?,
         first_seed: arguments.seeds.0,
         seeds: arguments.seeds.1,
         parallel: usize::from(arguments.parallel),

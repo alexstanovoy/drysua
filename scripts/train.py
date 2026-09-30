@@ -586,6 +586,51 @@ def detach(campaign_path, resume=False):
             os.close(writer)
 
 
+HISTORY_SNAPSHOT = re.compile(r"u\d{4,5}")
+DEFAULT_POOL = {"schema": "drysua-eval-pool/v1", "opponents": [
+    {"name": "teacher", "player": "teacher", "role": "train"},
+    {"name": "harass-push", "player": "harass-push", "role": "held-out"}]}
+
+
+def history_snapshots(directory):
+    """Exported `history/uNNNN` runtime weights in update order."""
+    snapshots = [path for path in (directory / "history").iterdir()
+                 if HISTORY_SNAPSHOT.fullmatch(path.name) and (path / RUNTIME_FILE).is_file()]
+    return sorted(snapshots, key=lambda path: int(path.name[1:]))[:MAX_CHECKPOINT_FILES]
+
+
+def evaluate(options):
+    """Rates every `--every`-th history snapshot (and the latest) against a frozen pool.
+
+    Evaluation runs on the host with the campaign's frozen binary, outside any session;
+    the store keeps every game, so a snapshot already rated is never played again.
+    """
+    import eval_pool  # imported here: not a frozen training source
+    directory, _, _ = load_campaign(options.campaign)
+    io.bounded_integer(options.every, "every", 1, MAX_CHECKPOINT_FILES)
+    io.bounded_integer(options.average, "average", 0, 16)
+    io.bounded_integer(options.chunk_seeds, "chunk seeds", 1, 10000)
+    io.bounded_integer(options.parallel, "parallel", 1, 64)
+    options.seeds = eval_pool.seed_range(options.seeds)
+    pool = eval_pool.read_pool(options.pool) if options.pool else eval_pool.parse_pool(DEFAULT_POOL, directory)
+    options.store = options.store or directory / "eval"
+    options.store.mkdir(mode=0o700, exist_ok=True)
+    options.drysua = (options.drysua or directory / "bin/trainer").resolve()
+    history = history_snapshots(directory)
+    selected = sorted(set(history[::options.every] + history[-1:]), key=history.index)
+    candidates = [(snapshot.name, f"weights:{snapshot}") for snapshot in selected]
+    if options.average > 1:
+        candidates += [(f"{snapshot.name}-avg{options.average}", "average:" + ",".join(
+            str(member) for member in history[index + 1 - options.average:index + 1]))
+            for snapshot in selected if (index := history.index(snapshot)) + 1 >= options.average]
+    store, new_runs, context = eval_pool.Store(options.store), 0, None
+    for name, player in candidates:
+        result = eval_pool.evaluate(options, store, eval_pool.candidate_entry(player, name), pool, *options.seeds)
+        new_runs, context = new_runs + result["new_runs"], result["context"]
+    return {"store": str(options.store), "context": context, "candidates": [name for name, _ in candidates],
+            "new_runs": new_runs}
+
+
 def main(arguments=None):
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="operation", required=True)
@@ -593,6 +638,19 @@ def main(arguments=None):
     command.add_argument("--config", required=True, type=Path)
     command.add_argument("campaign", type=Path)
     report.add_arguments(commands.add_parser("report", help="read-only statistics and HTML dashboard"))
+    command = commands.add_parser("eval", help="rate history snapshots against a frozen opponent pool")
+    command.add_argument("campaign", type=Path)
+    command.add_argument("--every", type=int, default=1, help="rate every Nth exported snapshot (and the latest)")
+    command.add_argument("--pool", type=Path, help="pool JSON; default teacher (train), harass-push (held-out)")
+    command.add_argument("--store", type=Path, help="result directory; default <campaign>/eval")
+    command.add_argument("--drysua", type=Path, help="eval binary; default the campaign's frozen trainer")
+    command.add_argument("--average", type=int, default=0,
+                         help="also rate the parameter mean of the last K snapshots ending at each one")
+    command.add_argument("--seeds", default="1000000:100", help="seed range <start>:<count>")
+    command.add_argument("--chunk-seeds", type=int, default=16, help="seeds per eval invocation")
+    command.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
+    command.add_argument("--parallel", type=int, default=16, help="worlds per pipeline group")
+    command.add_argument("--greedy", action="store_true")
     for name in ("status", "run", "resume", "pause", "stop", "recover"):
         command = commands.add_parser(name)
         command.add_argument("campaign", type=Path)
@@ -606,6 +664,9 @@ def main(arguments=None):
     options = parser.parse_args(arguments)
     if options.operation == "report":
         return report.main(options)
+    if options.operation == "eval":
+        print(json.dumps(evaluate(options), sort_keys=True))
+        return 0
     if options.operation == "create":
         result = create(options.config, options.campaign)
     elif options.operation == "status":

@@ -527,6 +527,90 @@ def dashboard_sections(records, window):
     return [{"title": title, "grid": grid, "charts": charts} for title, grid, charts in sections if charts]
 
 
+def evaluation_sections(target):
+    """Frozen pool evaluation of a campaign's `eval/` store, by snapshot update."""
+    store = Path(target) / "eval"
+    if not store.is_dir():
+        return []
+    import eval_pool  # not a frozen training source: only reports and `eval` read the store
+    value = eval_pool.report(eval_pool.Store(store))
+    snapshots, averages = {}, {}
+    for candidate in value["candidates"].values():
+        match = re.fullmatch(r"u(\d+)(?:-avg(\d+))?", candidate["name"])
+        if match:
+            rows = averages.setdefault(f"avg{match.group(2)}", {}) if match.group(2) else snapshots
+            rows[int(match.group(1))] = candidate
+    x = sorted(snapshots.keys() | {update for rows in averages.values() for update in rows})
+    if not x:
+        return []
+    charts = evaluation_charts(eval_pool, value, x, snapshots, averages)
+    return [{"title": f"Frozen pool evaluation ({value['context'][:16]}...)", "grid": True, "charts": charts}]
+
+
+def aligned(x, rows, pick):
+    """`pick(row)` at every snapshot update, `None` where the candidate was not rated."""
+    return [pick(rows[update]) if update in rows else None for update in x]
+
+
+def rate_series(name, records):
+    """Score percentages with Wilson bands of `record`s (`None` or empty where not played)."""
+    played = [record if record and record["games"] else None for record in records]
+    return series(name, [None if record is None else 100 * record["win_rate"] for record in played],
+                  low=[None if record is None else rounded(100 * record["ci95"][0]) for record in played],
+                  high=[None if record is None else rounded(100 * record["ci95"][1]) for record in played])
+
+
+def elo_series(name, ratings):
+    return series(name, [None if rating is None else rating["elo"] for rating in ratings],
+                  low=[None if rating is None else rounded(rating["elo"] - 1.96 * rating["se"]) for rating in ratings],
+                  high=[None if rating is None else rounded(rating["elo"] + 1.96 * rating["se"]) for rating in ratings])
+
+
+def side_rate(record, side):
+    games = record["all"]["sides"][side]["games"]
+    return 100 * record["all"]["sides"][side]["wins"] / games if games else None
+
+
+def evaluation_charts(eval_pool, value, x, snapshots, averages):
+    names = value["names"]
+    opponents = sorted({key for row in snapshots.values() for key in row["by_opponent"]},
+                       key=lambda key: names.get(key, key))
+    anchor = next((names.get(key, key) for key, rating in value["ratings"].items() if rating["anchor"]), "n/a")
+
+    def at(pick):
+        return aligned(x, snapshots, pick)
+
+    charts = [
+        chart(f"Pool Elo (anchor {anchor} = 0)", "lines",
+              [elo_series("snapshot", at(lambda row: row["rating"]))]
+              + [elo_series(name, aligned(x, rows, lambda row: row["rating"])) for name, rows in sorted(averages.items())],
+              unit="Elo", x=x, note="Bradley-Terry over every stored game of this context; band: 95% interval."),
+        chart("Robustness: worst case and held-out", "lines",
+              [rate_series("worst case", at(lambda row: row["worst"])),
+               rate_series("held-out", at(lambda row: row["held_out"])),
+               rate_series("train", at(lambda row: row["train"]))], unit="%", x=x, domain=[0, 100],
+              note="Score (draws half). Worst case: the lowest per-opponent score. Band: Wilson 95%."),
+        chart("Score per opponent", "lines",
+              [rate_series(names.get(key, key), at(lambda row, key=key: row["by_opponent"].get(key)))
+               for key in opponents], unit="%", x=x, domain=[0, 100]),
+        chart("Win rate per side", "lines", [series(side, at(lambda row, side=side: side_rate(row, side)))
+                                             for side in eval_pool.SIDES], unit="%", x=x, domain=[0, 100]),
+        chart("Raze hero-hit rate", "lines",
+              [series(hero, [None if rate is None else 100 * rate for rate in
+                             at(lambda row, hero=hero: row["raze_hero_hit_rate"][hero]["rate"])])
+               for hero in ("own", "enemy")], unit="%", x=x),
+        chart("Losses by reason", "bars",
+              [series(reason, at(lambda row, reason=reason: row["end_reasons"]["loss"][reason]))
+               for reason in eval_pool.END_REASONS], unit="games", x=x),
+    ]
+    for field in eval_pool.LEAD_FIELDS:
+        charts.append(chart(f"Early {field} lead", "lines",
+                            [series(minute, at(lambda row, minute=minute: row["leads"].get(minute, {}).get(field)))
+                             for minute in eval_pool.MINUTES], x=x,
+                            note="Own minus enemy at the game minute; mean over pool games."))
+    return charts
+
+
 def dashboard_data(report, model, window, refresh):
     records = model.records()
     return {"report": {key: report[key] for key in ("source", "campaign_id", "phase", "total_updates", "last_update",
@@ -572,7 +656,9 @@ def main(options):
     for _ in range(7 * 24 * 3600 // 5):
         report, model = build_report(options.target, options.block)
         if options.html is not None:
-            write_html(options.html, dashboard_data(report, model, options.window, options.refresh))
+            data = dashboard_data(report, model, options.window, options.refresh)
+            data["sections"] = evaluation_sections(options.target) + data["sections"]
+            write_html(options.html, data)
         if not options.follow or report["phase"] != "running":
             break
         time.sleep(options.refresh)

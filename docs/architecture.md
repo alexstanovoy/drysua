@@ -17,7 +17,7 @@ at compile time; they are recorded in every checkpoint.
 | --- | --- |
 | `drysua [play]` | Join a TCP server and play one match; Teacher by default, Neural with `--weights-directory`, `--policy harass-push` for HarassPush |
 | `drysua train-annealed` | PPO training against a per-game opponent mixture ([training](training.md)) |
-| `drysua eval` | Frozen-weights paired evaluation ([training](training.md#evaluation)) |
+| `drysua eval` | Frozen pool evaluation, both sides of each seed ([training](training.md#evaluation)) |
 | `drysua duel` | Rule policy against rule policy on paired seeds in the builtin arena ([local play](local-play.md)) |
 | `drysua checkpoint-inspect` | Read-only checkpoint JSON ([checkpoint inspection](checkpoint_inspection.md)) |
 | `drysua reward-observer` | Score copied frames of a human game ([human reward play](human-reward-play.md)) |
@@ -106,7 +106,7 @@ exception: it warm-starts from any runtime weights with the current parameter la
 | `src/checkpoint*.rs`, `src/training_history.rs` | Checkpoint format, inspection, milestone weights |
 | `src/telemetry/` | Buffered logs and timing |
 | `scripts/train*.py` | Campaign controller, report and dashboard |
-| `scripts/eval_compare.py` | Paired comparison of `eval` results |
+| `scripts/eval_pool.py`, `eval_stats.py` | Pool evaluation store, ratings, sequential test and reports |
 | `scripts/play*.py`, `scripts/play.sh` | Local human play and reward reports |
 
 ## Open problems

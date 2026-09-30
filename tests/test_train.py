@@ -4,9 +4,12 @@ The controller runs in-process; only the host cgroup and health probes are
 replaced, because a fake container has no cgroup of its own. The real probes
 are exercised by the documented smoke run.
 """
+import contextlib
+import io
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import stat
 import subprocess
@@ -103,6 +106,37 @@ class CampaignTests(unittest.TestCase):
         self.assertTrue(receipt["outcome"]["verified_limits"])
         self.assertEqual(json.loads((self.docker / "state" / "containers.json").read_text()), {})
         self.assertFalse((self.campaign / "owner.json").exists())
+
+    def test_eval_rates_each_snapshot_once_and_the_dashboard_shows_the_rating_curve(self):
+        self.create()
+        self.scenario(checkpoint_every=3)
+        train.run_campaign(self.campaign)
+        drysua = self.executable(self.root / "drysua", FIXTURES / "fake_eval.py")
+
+        def evaluate():
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output), contextlib.redirect_stderr(io.StringIO()):
+                train.main(["eval", str(self.campaign), "--drysua", str(drysua), "--seeds", "1:4", "--average", "2"])
+            return json.loads(output.getvalue())
+
+        first = evaluate()
+        self.assertEqual(first["candidates"], ["u0003", "u0005", "u0005-avg2"])
+        self.assertEqual((first["new_runs"], first["store"]), (3, str(self.campaign / "eval")))
+        self.assertEqual(evaluate()["new_runs"], 0)
+        html = self.root / "dashboard.html"
+        with contextlib.redirect_stdout(io.StringIO()):
+            train.main(["report", str(self.campaign), "--html", str(html)])
+        embedded = re.search(r'<script type="application/json" id="dashboard-data">(.*?)</script>',
+                             html.read_text(), re.S)
+        [section] = [section for section in json.loads(embedded.group(1))["sections"]
+                     if section["title"].startswith("Frozen pool evaluation")]
+        charts = {chart["title"]: chart for chart in section["charts"]}
+        rating = charts["Pool Elo (anchor teacher = 0)"]
+        self.assertEqual(rating["x"], [3, 5])
+        self.assertEqual([entry["name"] for entry in rating["series"]], ["snapshot", "avg2"])
+        self.assertIsNone(rating["series"][1]["values"][0])
+        robustness = [entry["name"] for entry in charts["Robustness: worst case and held-out"]["series"]]
+        self.assertEqual(robustness, ["worst case", "held-out", "train"])
 
     def test_pause_commits_the_in_flight_update_and_resume_continues_in_a_new_container(self):
         self.create()

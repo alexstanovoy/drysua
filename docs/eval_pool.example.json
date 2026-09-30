@@ -1,0 +1,8 @@
+{
+  "schema": "drysua-eval-pool/v1",
+  "opponents": [
+    {"name": "teacher", "player": "teacher", "role": "train"},
+    {"name": "harass-push", "player": "harass-push", "role": "held-out"},
+    {"name": "u200v2", "player": "weights:../artifacts/weights/u200v2", "role": "held-out"}
+  ]
+}
