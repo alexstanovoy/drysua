@@ -1,10 +1,10 @@
 use std::hash::Hasher;
 
 use super::*;
-use crate::{PpoBatch, PpoSampleBudget};
+use crate::PpoBatch;
 
 #[test]
-fn actor_value_reuse_preserves_b64_actions_rng_and_mixed_terminal_sample_order() {
+fn actor_value_reuse_preserves_b40_actions_rng_and_mixed_terminal_sample_order() {
     assert_reuse_collection(PolicyDevice::Cpu);
 }
 
@@ -77,7 +77,7 @@ fn actor_value_reuse_completion_failure_does_not_commit_sampled_rng_or_advance_a
 
 fn assert_reuse_collection(device: PolicyDevice) {
     let model = PolicyModel::fresh_on(9952200, device).expect("model");
-    for (count, rounds) in [(64, 16), (4, 24)] {
+    for (count, rounds) in [(40, 16), (4, 24)] {
         let source = trial(&model, count, rounds, false, None);
 
         let target = trial(&model, count, rounds, true, None);
@@ -111,11 +111,6 @@ fn trial(
     assert!(count <= MAX_ACTOR_ENVIRONMENTS);
     let mut config = parity_settings_for_test().ppo;
     config.environments = count;
-    config.sample_budget = match count {
-        1..=26 => PpoSampleBudget::Standard,
-        27..=40 => PpoSampleBudget::Annealed,
-        _ => PpoSampleBudget::WideAnnealed,
-    };
     let mut worlds: Vec<_> = (0..count)
         .map(|stream| {
             let opponent = opponent.map_or(OpponentSpec::Idle, |model| {

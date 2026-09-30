@@ -28,10 +28,7 @@ pub(in crate::ppo_arena) fn validate_neural_opponent_memory(
             "neural opponent active worlds must be within 1..=64",
         ));
     }
-    let base = match config.sample_budget {
-        crate::PpoSampleBudget::WideAnnealed => crate::PPO_WIDE_ANNEALED_PAYLOAD_BOUND_BYTES,
-        _ => crate::PPO_ANNEALED_STORAGE_PEAK_BYTES + NON_ROLLOUT_RESERVE,
-    };
+    let base = crate::PPO_STORAGE_PEAK_BYTES + NON_ROLLOUT_RESERVE;
     if base + live_worlds as u64 * NEURAL_HOST_ROW_BYTES as u64 > MEMORY_LIMIT {
         return Err(PpoError::InvalidConfig(
             "neural opponent batching exceeds 12 GiB admission budget",
@@ -64,7 +61,7 @@ pub(in crate::ppo_arena) fn validate_pipeline_memory(
         ));
     }
     if config.environments < width * groups
-        || config.environments > crate::PPO_WIDE_ANNEALED_MAX_GAMES
+        || config.environments > crate::PPO_MAX_GAMES
         || !config.environments.is_multiple_of(width * groups)
         || config.rollout_decisions != RETAINED_PER_EPISODE
     {
@@ -79,22 +76,16 @@ pub(in crate::ppo_arena) fn validate_pipeline_memory(
 }
 
 fn pipeline_payload_bytes(config: PpoConfig, width: usize) -> u64 {
-    assert!(config.environments <= crate::PPO_WIDE_ANNEALED_MAX_GAMES);
+    assert!(config.environments <= crate::PPO_MAX_GAMES);
     assert!(width <= MAX_ACTOR_ENVIRONMENTS);
-    let peak = crate::feature::wide_feature_arena_peak_bytes();
-    assert_eq!(peak % crate::PPO_WIDE_ANNEALED_MAX_GAMES as u64, 0);
+    let peak = crate::feature::FEATURE_ARENA_PEAK_BYTES;
+    assert_eq!(peak % crate::PPO_MAX_GAMES as u64, 0);
     let samples = config.environments as u64 * RETAINED_PER_EPISODE as u64;
-    // Standard arenas can grow past their used-row bound; capped annealed arenas cannot.
-    let growth = if config.sample_budget == crate::PpoSampleBudget::Standard {
-        2
-    } else {
-        1
-    };
-    let main_arena = peak / crate::PPO_WIDE_ANNEALED_MAX_GAMES as u64 * config.environments as u64;
-    // All groups share one arena. The existing compact/prepared/shuffle allowance
+    let main_arena = peak / crate::PPO_MAX_GAMES as u64 * config.environments as u64;
+    // All groups share one capped arena. The existing compact/prepared/shuffle allowance
     // covers compact records plus the temporary usize permutation; scratch is gone
     // before preparation. The non-rollout reserve remains an assumption, not an RSS proof.
-    main_arena * growth + samples * 8_192 + NON_ROLLOUT_RESERVE
+    main_arena + samples * 8_192 + NON_ROLLOUT_RESERVE
 }
 
 #[allow(clippy::too_many_arguments)]

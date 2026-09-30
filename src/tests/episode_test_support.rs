@@ -10,7 +10,7 @@ pub(super) fn sample_active(
     active: &[usize],
 ) -> Result<(Vec<PpoPolicyChoice>, Vec<ActionSpace>), PpoError> {
     validate_active(random, active)?;
-    if environments.len() > MAX_EPISODE_ENVIRONMENTS
+    if environments.len() > crate::PPO_MAX_GAMES
         || active.iter().any(|&stream| stream >= environments.len())
     {
         return Err(PpoError::InvalidConfig("parallel episode jobs"));

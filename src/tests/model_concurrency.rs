@@ -73,8 +73,8 @@ fn assert_folded_ppo(device: PolicyDevice) {
 #[test]
 fn folded_updates_preserve_shuffle_parameters_and_optimizer_state() {
     let config = PpoConfig {
-        environments: 1,
-        rollout_decisions: 3,
+        environments: 3,
+        rollout_decisions: 1,
         minibatch: 2,
         epochs: 2,
         target_kl: 1000.0,
@@ -119,8 +119,8 @@ fn learner_batch(model: &PolicyModel, config: PpoConfig) -> crate::PpoBatch {
 fn folded_updates_skip_unused_error_on_kl_stop_and_roll_back_consumed_error() {
     for reject in [false, true] {
         let config = PpoConfig {
-            environments: 1,
-            rollout_decisions: 3,
+            environments: 3,
+            rollout_decisions: 1,
             minibatch: 2,
             epochs: 2,
             target_kl: if reject { 0.02 } else { 1000.0 },

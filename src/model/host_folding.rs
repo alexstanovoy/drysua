@@ -9,7 +9,7 @@ const MIN_COORDINATES: usize = 32_768;
 const WORKER_STACK_BYTES: usize = 256 * 1024;
 const _: () = assert!(3 * MODEL_PARAMETER_COUNT * std::mem::size_of::<f32>() == 21_755_796);
 const _: () = assert!(
-    crate::PPO_ANNEALED_STORAGE_PEAK_BYTES
+    crate::PPO_STORAGE_PEAK_BYTES
         + ((3 * MODEL_PARAMETER_COUNT * std::mem::size_of::<f32>() + 32 * WORKER_STACK_BYTES)
             as u64)
         < 8 * 1024 * 1024 * 1024

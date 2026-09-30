@@ -1,27 +1,25 @@
 use super::*;
 
 pub(super) fn contract() -> Value {
-    let profiles = [PpoSampleBudget::Standard, PpoSampleBudget::Annealed, PpoSampleBudget::WideAnnealed]
-        .map(|profile| {
-            let (version, hash) = checkpoint_schema_identity(profile);
-            let (adaptive_version, adaptive_hash) = super::super::adaptive::schema_identity(profile);
-            json!({"sample_budget": budget(profile), "ppo": schema(profile.schema_version(), profile.schema_hash()),
-                "fixed_checkpoint": schema(version, hash), "adaptive_checkpoint": schema(adaptive_version, adaptive_hash),
-                "max_samples": profile.max_samples(), "max_games": profile.max_games()})
-        });
     json!({"schema": SCHEMA, "kind": "contract", "model": model(), "enabled_features": compiled_features(),
         "capabilities": {"inspection": cfg!(target_os = "linux"), "annealed_history": cfg!(feature = "builtin"),
             "read_only": true, "strict_build_features": true, "controller_run_kind": "train-annealed"},
         "limits": {"max_json_bytes": MAX_JSON_BYTES, "max_snapshots": MAX_SNAPSHOTS, "max_files": MAX_FILES,
             "manifest_bytes": MAX_META_BYTES, "training_tensor_bytes": MAX_TRAINING_TENSOR_BYTES,
-            "runtime_tensor_bytes": MAX_RUNTIME_TENSOR_BYTES, "snapshot_bytes": 4096},
+            "runtime_tensor_bytes": MAX_RUNTIME_TENSOR_BYTES, "snapshot_bytes": 4096,
+            "max_samples": crate::PPO_MAX_SAMPLES, "max_games": crate::PPO_MAX_GAMES},
         "schemas": {"action": schema(ACTION_SCHEMA_VERSION, ACTION_SCHEMA_HASH),
             "feature": schema(FEATURE_SCHEMA_VERSION, FEATURE_SCHEMA_HASH),
             "reward": schema(crate::MAP2_REWARD_SCHEMA_VERSION, crate::MAP2_REWARD_SCHEMA_HASH),
+            "ppo": schema(PPO_SCHEMA_VERSION, PPO_SCHEMA_HASH),
             "rules_audit_version": PPO_RULES_AUDIT_VERSION},
-        "profiles": profiles, "numeric_semantics": {"ppo_floats": "IEEE-754 binary32, JSON numbers widened exactly to binary64",
+        "checkpoint": checkpoint(), "numeric_semantics": {"ppo_floats": "IEEE-754 binary32, JSON numbers widened exactly to binary64",
             "adaptive_rate_units": 1_000_000, "schema_hash": "lowercase hexadecimal FNV-1a u64 (16 digits)",
             "file_hash": "lowercase SHA-256 (64 digits)"}})
+}
+
+pub(super) fn checkpoint() -> Value {
+    schema(CHECKPOINT_SCHEMA_VERSION, CHECKPOINT_SCHEMA_HASH)
 }
 
 fn schema(version: u32, hash: u64) -> Value {
@@ -30,15 +28,6 @@ fn schema(version: u32, hash: u64) -> Value {
 
 pub(super) fn model() -> Value {
     json!({"version": MODEL_SCHEMA_VERSION, "hash": format!("{MODEL_SCHEMA_HASH:016x}"), "parameters": MODEL_PARAMETER_COUNT})
-}
-
-fn budget(profile: PpoSampleBudget) -> Value {
-    let (name, code) = match profile {
-        PpoSampleBudget::Standard => ("standard", 0),
-        PpoSampleBudget::Annealed => ("annealed-v1", 1),
-        PpoSampleBudget::WideAnnealed => ("wide-annealed-v1", 2),
-    };
-    json!({"name": name, "code": code})
 }
 
 pub(super) fn run(run: &CheckpointRun) -> Value {
@@ -69,8 +58,7 @@ pub(super) fn progress(artifact: &TrainingArtifact, games: Option<u64>) -> Value
 }
 
 pub(super) fn ppo(config: PpoConfig) -> Value {
-    json!({"sample_budget": budget(config.sample_budget), "schema_version": config.sample_budget.schema_version(),
-        "schema_hash": format!("{:016x}", config.sample_budget.schema_hash()),
+    json!({"schema_version": PPO_SCHEMA_VERSION, "schema_hash": format!("{PPO_SCHEMA_HASH:016x}"),
         "decision_interval_ticks": config.decision_interval_ticks, "rollout_decisions": config.rollout_decisions,
         "environments": config.environments, "epochs": config.epochs, "minibatch": config.minibatch,
         "clip_epsilon": f64::from(config.clip_epsilon), "value_coefficient": f64::from(config.value_coefficient),

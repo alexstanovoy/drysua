@@ -23,8 +23,8 @@ use bota_server::game::{
 
 use super::episode::{self, ACTOR_DECISIONS};
 use super::{
-    OpponentSpec, TRAINING_MAX_ENVIRONMENTS, TrainingCheckpointSchedule, TrainingDirectoryLock,
-    TrainingEnvironment, TrainingSession, actor_stream_rngs, build_environment, device_name,
+    OpponentSpec, TrainingCheckpointSchedule, TrainingDirectoryLock, TrainingEnvironment,
+    TrainingSession, actor_stream_rngs, build_environment, device_name,
     reject_production_rejection, text_error, validate_checkpoint_cadence,
     validate_initial_weights_directory, validate_training_directory,
 };
@@ -39,15 +39,13 @@ use crate::telemetry::{
 use crate::{
     CheckpointDevice, CheckpointRun, CollectionReport, MAP2_DECISION_INTERVAL_TICKS,
     MAP2_RETAINED_DECISIONS, MAP2_REWARD_GAMMA_TICK, MAX_TRAINING_COUNTER,
-    MODEL_MAX_OPTIMIZER_STEP, PPO_ANNEALED_MAX_GAMES, PPO_ANNEALED_MAX_SAMPLES,
-    PPO_MAX_POLICY_SAMPLE_DRAWS, PPO_RULES_AUDIT_VERSION, PolicyDevice, PolicyModel,
-    PolicySnapshot, PpoConfig, PpoError, PpoRng, PpoRollout, PpoSampleBudget, PpoUpdateReport,
-    SHADOW_FIEND, TrainingArtifact, TrainingCheckpointReport, compiled_features,
+    MODEL_MAX_OPTIMIZER_STEP, PPO_MAX_GAMES, PPO_MAX_POLICY_SAMPLE_DRAWS, PPO_MAX_SAMPLES,
+    PPO_RULES_AUDIT_VERSION, PolicyDevice, PolicyModel, PolicySnapshot, PpoConfig, PpoError,
+    PpoRng, PpoRollout, PpoUpdateReport, SHADOW_FIEND, TrainingArtifact, TrainingCheckpointReport,
+    compiled_features,
 };
 
-// Sequential games share one rollout without raising the concurrent world cap.
-const _: () = assert!(TRAINING_MAX_ENVIRONMENTS < PPO_ANNEALED_MAX_GAMES);
-const _: () = assert!(PPO_ANNEALED_MAX_GAMES * MAP2_RETAINED_DECISIONS == PPO_ANNEALED_MAX_SAMPLES);
+const _: () = assert!(PPO_MAX_GAMES * MAP2_RETAINED_DECISIONS == PPO_MAX_SAMPLES);
 const _: () = assert!(ACTOR_DECISIONS as u64 * PPO_MAX_POLICY_SAMPLE_DRAWS <= MAX_TRAINING_COUNTER);
 
 /// Domain separating the per-update balanced side shuffle.
@@ -74,7 +72,7 @@ pub struct AnnealedJobConfig {
     pub execution: crate::TrainingExecutionOptions,
     /// Total updates in the run.
     pub updates: u64,
-    /// Games per update, even from 2 to 80 so sides split exactly.
+    /// Games per update, even from 2 to 40 so sides split exactly.
     pub games_per_update: usize,
     /// Worlds per batch, from 1 to 64; divides games and generation games.
     pub parallel_worlds: usize,
@@ -89,8 +87,7 @@ pub struct AnnealedJobConfig {
     /// Opponent, frozen for the whole run.
     pub opponent: AnnealedOpponent,
     /// PPO dimensions and hyperparameters; `environments` and `rollout_decisions`
-    /// are the loop's, not free choices. Select `Standard` through 26 games and
-    /// `Annealed` from 28 to 40, `WideAnnealed` above 40; never changed implicitly.
+    /// are the loop's, not free choices.
     pub ppo: PpoConfig,
     /// When to write a durable checkpoint.
     pub checkpoint_cadence: crate::TrainingCheckpointCadence,
@@ -527,7 +524,7 @@ impl AnnealedSession {
         }
         let group_count = settings.execution.actor_pipeline_groups;
         assert!(matches!(group_count, 2 | 4));
-        assert!(settings.parallel_worlds * group_count <= crate::PPO_ANNEALED_MAX_PARALLEL_WORLDS);
+        assert!(settings.parallel_worlds * group_count <= crate::PPO_MAX_PARALLEL_WORLDS);
         let mut groups = Vec::new();
         groups.try_reserve_exact(group_count).map_err(|error| {
             PpoError::Model(format!("actor pipeline groups allocation: {error}"))
@@ -681,7 +678,7 @@ fn batch_environments(
     draw: &GenerationDraw,
 ) -> Result<Vec<TrainingEnvironment>, PpoError> {
     assert_eq!(seats.len(), settings.parallel_worlds);
-    assert!(seats.len() <= crate::PPO_ANNEALED_MAX_PARALLEL_WORLDS);
+    assert!(seats.len() <= crate::PPO_MAX_PARALLEL_WORLDS);
     let rules = generation_rules(draw, global_game);
     let mut environments = Vec::with_capacity(seats.len());
     for (offset, seat) in seats.iter().copied().enumerate() {
@@ -867,7 +864,7 @@ impl GenerationCache {
 
 /// One balanced seat assignment per update: exactly half of the games per side.
 fn balanced_policy_seats(seed: u64, update: u64, games: usize) -> Result<Vec<usize>, PpoError> {
-    assert!((2..=crate::PPO_WIDE_ANNEALED_MAX_GAMES).contains(&games));
+    assert!((2..=PPO_MAX_GAMES).contains(&games));
     assert!(games.is_multiple_of(2), "sides need an even game count");
     let mut seats = (0..games).map(|index| index % 2).collect::<Vec<_>>();
     let mut rng = PpoRng::new(derive_training_seed(seed, update, SEAT_DOMAIN));
@@ -934,11 +931,6 @@ fn annealed_run(
         config.minibatch,
         settings.seed,
     );
-    if config.sample_budget == PpoSampleBudget::Annealed {
-        command_line.push_str(" --sample-budget annealed-v1");
-    } else if config.sample_budget == PpoSampleBudget::WideAnnealed {
-        command_line.push_str(" --sample-budget wide-annealed-v1");
-    }
     if harness.episode_decisions() != ACTOR_DECISIONS {
         command_line.push_str(&format!(
             " --episode-decisions {}",
@@ -983,14 +975,12 @@ fn annealed_run(
     })
 }
 
-/// Validates every annealed parameter without silently changing its PPO profile.
+/// Validates every annealed parameter.
 pub(crate) fn validate_annealed(
     settings: &AnnealedJobConfig,
     harness: AnnealedHarness,
 ) -> Result<PpoConfig, PpoError> {
-    settings
-        .execution
-        .validate_ppo_memory(settings.ppo.sample_budget)?;
+    settings.execution.validate()?;
     settings.scale.validate()?;
     if settings.updates == 0 || settings.updates > MAX_TRAINING_COUNTER {
         return Err(PpoError::InvalidConfig("annealed updates"));
@@ -1040,22 +1030,20 @@ pub(crate) fn validate_annealed(
 
 fn validate_annealed_batches(settings: &AnnealedJobConfig) -> Result<(), PpoError> {
     if settings.games_per_update < 2
-        || settings.games_per_update > crate::PPO_WIDE_ANNEALED_MAX_GAMES
+        || settings.games_per_update > PPO_MAX_GAMES
         || !settings.games_per_update.is_multiple_of(2)
     {
         return Err(PpoError::InvalidConfig(
-            "annealed games per update must be even and within 2..=80",
+            "annealed games per update must be even and within 2..=40",
         ));
     }
-    if settings.parallel_worlds == 0
-        || settings.parallel_worlds > crate::PPO_ANNEALED_MAX_PARALLEL_WORLDS
-    {
+    if settings.parallel_worlds == 0 || settings.parallel_worlds > crate::PPO_MAX_PARALLEL_WORLDS {
         return Err(PpoError::InvalidConfig("annealed parallel worlds"));
     }
     let wave_worlds = settings
         .parallel_worlds
         .checked_mul(settings.execution.actor_pipeline_groups)
-        .filter(|worlds| *worlds <= crate::PPO_ANNEALED_MAX_PARALLEL_WORLDS)
+        .filter(|worlds| *worlds <= crate::PPO_MAX_PARALLEL_WORLDS)
         .ok_or(PpoError::InvalidConfig(
             "annealed actor pipeline active worlds must not exceed 64",
         ))?;
@@ -1139,12 +1127,6 @@ fn validate_annealed_ppo(settings: &AnnealedJobConfig) -> Result<PpoConfig, PpoE
     if config.gamma_tick != MAP2_REWARD_GAMMA_TICK {
         return Err(PpoError::InvalidConfig(
             "annealed Map2 reward requires gamma per tick one",
-        ));
-    }
-    let expected = PpoSampleBudget::for_annealed_games(settings.games_per_update);
-    if config.sample_budget != expected {
-        return Err(PpoError::InvalidConfig(
-            "annealed PPO sample budget must match games per update",
         ));
     }
     config.validate()

@@ -1,7 +1,7 @@
 use super::*;
 
-const _: () = assert!(PPO_WIDE_ANNEALED_MAX_SAMPLES <= 93_040);
-const _: () = assert!(PPO_WIDE_ANNEALED_MAX_GAMES <= 80);
+const _: () = assert!(PPO_MAX_SAMPLES <= 46_520);
+const _: () = assert!(PPO_MAX_GAMES <= 40);
 
 impl PpoRollout {
     /// Restore sequential actor-batch order before GAE/normalization, without moving
@@ -12,11 +12,8 @@ impl PpoRollout {
         batch_width: usize,
     ) -> Result<(), PpoError> {
         let config = config.validate()?;
-        if self.sample_budget != config.sample_budget {
-            return Err(PpoError::InvalidConfig("rollout sample budget"));
-        }
-        if config.environments > PPO_WIDE_ANNEALED_MAX_GAMES
-            || !(1..=PPO_ANNEALED_MAX_PARALLEL_WORLDS).contains(&batch_width)
+        if config.environments > PPO_MAX_GAMES
+            || !(1..=PPO_MAX_PARALLEL_WORLDS).contains(&batch_width)
             || !config.environments.is_multiple_of(batch_width)
         {
             return Err(PpoError::InvalidConfig("actor rollout ordering dimensions"));
@@ -25,10 +22,7 @@ impl PpoRollout {
             .environments
             .checked_mul(config.rollout_decisions)
             .ok_or(PpoError::InvalidConfig("actor rollout ordering samples"))?;
-        if self.len() > maximum
-            || self.len() > self.capacity
-            || self.len() > PPO_WIDE_ANNEALED_MAX_SAMPLES
-        {
+        if self.len() > maximum || self.len() > self.capacity || self.len() > PPO_MAX_SAMPLES {
             return Err(PpoError::InvalidConfig("actor rollout ordering samples"));
         }
         // Both descriptor validation and the only allocation finish before any record moves.
@@ -44,9 +38,9 @@ fn actor_destinations(
     environments: usize,
     batch_width: usize,
 ) -> Result<Vec<usize>, PpoError> {
-    assert!((1..=PPO_WIDE_ANNEALED_MAX_GAMES).contains(&environments));
+    assert!((1..=PPO_MAX_GAMES).contains(&environments));
     assert!(batch_width > 0);
-    let mut next = [0usize; PPO_WIDE_ANNEALED_MAX_GAMES];
+    let mut next = [0usize; PPO_MAX_GAMES];
     for transition in transitions {
         if transition.stream >= environments {
             return Err(PpoError::StreamOutOfRange {
@@ -72,7 +66,7 @@ fn actor_destinations(
 }
 
 fn actor_order_indices(count: usize) -> Result<Vec<usize>, PpoError> {
-    if count > PPO_WIDE_ANNEALED_MAX_SAMPLES {
+    if count > PPO_MAX_SAMPLES {
         return Err(PpoError::InvalidConfig("actor rollout ordering samples"));
     }
     #[cfg(test)]
@@ -85,7 +79,7 @@ fn actor_order_indices(count: usize) -> Result<Vec<usize>, PpoError> {
     indices
         .try_reserve_exact(count)
         .map_err(|_| PpoError::InvalidTransition("actor rollout ordering allocation failed"))?;
-    if indices.capacity() > PPO_WIDE_ANNEALED_MAX_SAMPLES {
+    if indices.capacity() > PPO_MAX_SAMPLES {
         return Err(PpoError::InvalidTransition(
             "actor rollout ordering allocation exceeds capacity",
         ));
@@ -95,7 +89,7 @@ fn actor_order_indices(count: usize) -> Result<Vec<usize>, PpoError> {
 
 fn apply_actor_order(transitions: &mut [CompactPpoTransition], destinations: &mut [usize]) {
     assert_eq!(transitions.len(), destinations.len());
-    assert!(transitions.len() <= PPO_WIDE_ANNEALED_MAX_SAMPLES);
+    assert!(transitions.len() <= PPO_MAX_SAMPLES);
     let mut swaps_left = transitions.len();
     for index in 0..transitions.len() {
         // Every swap fixes its destination; a permutation needs fewer than N swaps in total.
@@ -137,7 +131,7 @@ mod tests {
             (2, 1),
             (1, 1),
         ];
-        let mut actual = rollout(&sample, config, &initial);
+        let mut actual = rollout(&sample, &initial);
         let frames = frames(&actual);
         let counters = actual.next_decision;
 
@@ -183,7 +177,7 @@ mod tests {
             (6, 0),
         ];
         assert_eq!(order(&actual), expected);
-        let reference = rollout(&sample, config, &expected)
+        let reference = rollout(&sample, &expected)
             .finish(config)
             .expect("reference");
         let actual = actual.finish(config).expect("canonical GAE");
@@ -193,24 +187,24 @@ mod tests {
     #[test]
     fn actor_order_handles_empty_buckets_last_stream_and_scratch_boundaries() {
         let sample = sample();
-        let config = config(80);
-        let mut actual = rollout(&sample, config, &[(79, 0), (0, 0), (79, 1)]);
+        let config = config(40);
+        let mut actual = rollout(&sample, &[(39, 0), (0, 0), (39, 1)]);
         actual
             .canonicalize_actor_order(config, 1)
-            .expect("eighty buckets");
-        assert_eq!(order(&actual), [(0, 0), (79, 0), (79, 1)]);
-        let mut empty = rollout(&sample, config, &[]);
+            .expect("forty buckets");
+        assert_eq!(order(&actual), [(0, 0), (39, 0), (39, 1)]);
+        let mut empty = rollout(&sample, &[]);
         empty
             .canonicalize_actor_order(config, 40)
             .expect("empty order");
         assert!(empty.is_empty());
-        for count in [0, 1, PPO_WIDE_ANNEALED_MAX_SAMPLES] {
+        for count in [0, 1, PPO_MAX_SAMPLES] {
             let scratch = actor_order_indices(count).expect("bounded scratch");
             assert!(scratch.is_empty());
             assert!(scratch.capacity() >= count);
-            assert!(scratch.capacity() <= PPO_WIDE_ANNEALED_MAX_SAMPLES);
+            assert!(scratch.capacity() <= PPO_MAX_SAMPLES);
         }
-        for count in [PPO_WIDE_ANNEALED_MAX_SAMPLES + 1, usize::MAX] {
+        for count in [PPO_MAX_SAMPLES + 1, usize::MAX] {
             assert_eq!(
                 actor_order_indices(count),
                 Err(PpoError::InvalidConfig("actor rollout ordering samples"))
@@ -222,7 +216,7 @@ mod tests {
     fn actor_order_invalid_dimensions_stream_and_allocation_leave_rows_unchanged() {
         let sample = sample();
         let config = config(4);
-        let mut actual = rollout(&sample, config, &[(3, 0), (0, 0), (2, 0), (1, 0)]);
+        let mut actual = rollout(&sample, &[(3, 0), (0, 0), (2, 0), (1, 0)]);
         let before = order(&actual);
         for width in [0, 3, 65, usize::MAX] {
             let error = actual
@@ -234,15 +228,6 @@ mod tests {
             );
             assert_eq!(order(&actual), before);
         }
-        let wrong_budget = PpoConfig {
-            sample_budget: PpoSampleBudget::Annealed,
-            ..config
-        };
-        assert_eq!(
-            actual.canonicalize_actor_order(wrong_budget, 2),
-            Err(PpoError::InvalidConfig("rollout sample budget"))
-        );
-        assert_eq!(order(&actual), before);
         actual.transitions.last_mut().expect("last row").stream = 4;
         let corrupt = order(&actual);
         assert_eq!(
@@ -267,15 +252,13 @@ mod tests {
         PpoConfig {
             environments: games,
             rollout_decisions: crate::MAP2_RETAINED_DECISIONS,
-            sample_budget: PpoSampleBudget::for_annealed_games(games),
             gamma_tick: 1.0,
             ..PpoConfig::default()
         }
     }
 
-    fn rollout(sample: &PpoTransition, config: PpoConfig, rows: &[(usize, u32)]) -> PpoRollout {
-        let mut rollout =
-            PpoRollout::with_budget(16, sample.policy, config.sample_budget).expect("rollout");
+    fn rollout(sample: &PpoTransition, rows: &[(usize, u32)]) -> PpoRollout {
+        let mut rollout = PpoRollout::new(16, sample.policy).expect("rollout");
         for &(stream, decision) in rows {
             rollout.push(row(sample, stream, decision)).expect("push");
         }

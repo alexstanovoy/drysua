@@ -142,7 +142,7 @@ struct TrainAnnealedArgs {
     /// Additional committed updates this invocation; leaves the total target and annealing unchanged.
     #[arg(long, value_parser = clap::builder::RangedU64ValueParser::<std::num::NonZeroU64>::new().range(1..=crate::MAX_TRAINING_COUNTER))]
     invocation_updates: Option<std::num::NonZeroU64>,
-    /// Games per update, even from 2 to 80; above 40 selects the wide annealed budget.
+    /// Games per update, even from 2 to 40.
     #[arg(long, default_value_t = 40)]
     games: usize,
     /// Worlds per actor group (1..=64); defaults to 20 independently of CPU count.
@@ -523,7 +523,6 @@ impl TrainAnnealedArgs {
             .unwrap_or_else(|| self.updates.div_ceil(5));
         let ppo = self.optimizer.ppo(crate::PpoConfig {
             environments: self.games,
-            sample_budget: crate::PpoSampleBudget::for_annealed_games(self.games),
             rollout_decisions: crate::MAP2_RETAINED_DECISIONS,
             gamma_tick: crate::MAP2_REWARD_GAMMA_TICK,
             ..crate::PpoConfig::default()

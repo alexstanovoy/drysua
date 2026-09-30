@@ -1,25 +1,10 @@
 use super::*;
 
 #[test]
-fn wide_capacity_arena_is_capped_and_preserves_the_old_constructor_bound() {
-    let arena = RaggedFeatureArena::new_wide_bounded(93_040).expect("wide maximum");
-    assert_eq!(arena_capacities(&arena), [0; 7]);
-    assert_eq!(
-        RaggedFeatureArena::new_wide_bounded(93_041).err(),
-        Some("wide ragged feature sample capacity is outside 1..=93040")
-    );
-    assert_eq!(
-        RaggedFeatureArena::new_bounded(46_521).err(),
-        Some("bounded ragged feature sample capacity is outside 1..=46520")
-    );
-    assert_eq!(wide_feature_arena_peak_bytes(), 9_074_377_280);
-}
-
-#[test]
 fn bounded_sparse_rows_roundtrip_through_exact_capacity_and_preserve_prior_headers() {
     let mut frame = FeatureFrame::new();
     frame.units[UNIT_FEATURE_TOKENS - 1][unit_feature::TOKEN_PRESENT] = 1.0;
-    let mut arena = RaggedFeatureArena::new_bounded(1).expect("bounded arena");
+    let mut arena = RaggedFeatureArena::new(1).expect("bounded arena");
     let first = arena.push(&frame).expect("first sparse frame");
     for _ in 1..UNIT_FEATURE_TOKENS {
         let header = arena.push(&frame).expect("remaining sparse row");
@@ -36,25 +21,21 @@ fn bounded_sparse_rows_roundtrip_through_exact_capacity_and_preserve_prior_heade
 
 #[test]
 fn bounded_feature_constructor_accepts_maximum_without_allocating_and_rejects_outside_profile() {
-    let arena = RaggedFeatureArena::new_bounded(crate::PPO_ANNEALED_MAX_SAMPLES)
-        .expect("maximum sample capacity");
+    let arena = RaggedFeatureArena::new(crate::PPO_MAX_SAMPLES).expect("maximum sample capacity");
 
     assert_eq!(arena_capacities(&arena), [0; 7]);
-    for capacity in [0, crate::PPO_ANNEALED_MAX_SAMPLES + 1, usize::MAX] {
-        let error = RaggedFeatureArena::new_bounded(capacity)
+    for capacity in [0, crate::PPO_MAX_SAMPLES + 1, usize::MAX] {
+        let error = RaggedFeatureArena::new(capacity)
             .err()
             .expect("invalid sample capacity");
-        assert_eq!(
-            error,
-            "bounded ragged feature sample capacity is outside 1..=46520"
-        );
+        assert_eq!(error, "ragged feature sample capacity is outside 1..=46520");
     }
 }
 
 #[test]
 fn bounded_feature_arena_caps_every_vector_and_roundtrips_dense_frame() {
     let frame = dense_frame();
-    let mut arena = RaggedFeatureArena::new_bounded(1).expect("one frame");
+    let mut arena = RaggedFeatureArena::new(1).expect("one frame");
 
     let header = arena.push(&frame).expect("full frame");
 
@@ -74,7 +55,7 @@ fn bounded_feature_arena_rejects_late_row_overflow_before_appending_any_rows() {
     for row in &mut frame.loot {
         row[loot_feature::TOKEN_PRESENT] = 1.0;
     }
-    let mut arena = RaggedFeatureArena::new_bounded(1).expect("one frame");
+    let mut arena = RaggedFeatureArena::new(1).expect("one frame");
     let header = arena.push(&frame).expect("loot rows");
     let mut overflow = frame.clone();
     overflow.units[0][unit_feature::TOKEN_PRESENT] = 1.0;
@@ -156,7 +137,7 @@ fn bounded_feature_reservation_reports_allocation_failure_without_allocating() {
 }
 
 #[test]
-fn annealed_feature_peak_counts_all_row_capacities_and_one_largest_reallocation() {
+fn feature_peak_counts_all_row_capacities_and_one_largest_reallocation() {
     let counts = [96u64, 32, 48, 14, 85, 32, 16];
     let sizes = [340u64, 340, 132, 100, 116, 84, 68];
     let mut total = 0;
@@ -171,8 +152,8 @@ fn annealed_feature_peak_counts_all_row_capacities_and_one_largest_reallocation(
 
     assert_eq!(total, 3_018_775_840);
     assert_eq!(largest, 1_518_412_800);
-    assert_eq!(ANNEALED_FEATURE_ARENA_PEAK_BYTES, total + largest);
-    assert_eq!(ANNEALED_FEATURE_ARENA_PEAK_BYTES, 4_537_188_640);
+    assert_eq!(FEATURE_ARENA_PEAK_BYTES, total + largest);
+    assert_eq!(FEATURE_ARENA_PEAK_BYTES, 4_537_188_640);
 }
 
 fn arena_capacities(arena: &RaggedFeatureArena) -> [usize; 7] {

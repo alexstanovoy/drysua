@@ -85,23 +85,11 @@ the 16 MiB reservation. This arithmetic is an admission bound, not a measured
 allocator or backend-workspace guarantee. Compiler and runtime checks must
 accompany changes to the bound.
 
-For standard/M40 profiles, admission adds that reservation (2 GiB at 128; 4 GiB at
-256) and a 2 GiB non-graph reserve to the existing M40 rollout/storage ledger. For
-the maximum-wide profile it adds only the extra rows above the existing 64-row
-allowance to the pre-existing wide payload bound. The maximum-wide ledger is already
-near 12 GiB, so larger microbatches are conservatively rejected for that profile.
-Wide profiles (M48/M64/M80, for example) must explicitly select microbatch 64
-instead of the new CLI default 256. To retain a legacy wide profile, also specify
-its original M/B, `--actor-pipeline-groups 1`, and `--reuse-actor-values=false`.
-Library-default or explicit 64 keeps existing admission behavior. The ceiling is
-still **12 GiB**; runtime RAM/VRAM guards remain authoritative and must not be raised. Admission is
-checked before checkpoint-directory or opponent setup and again when installing
-the trainer's execution options.
-
-The existing M40 storage assertion is strictly below 6 GiB, so adding 2 GiB and
-the maximum 4 GiB graph reservation stays below 12 GiB. The current wide ledger
-would reach 13,631,226,432 bytes at 128 or 15,778,710,080 bytes at 256, both above
-the unchanged 12,884,901,888-byte ceiling.
+Admission adds that reservation (2 GiB at 128; 4 GiB at 256) and a 2 GiB
+non-graph reserve to the M40 rollout/storage ledger. The M40 storage bound is
+strictly below 6 GiB, so every accepted microbatch mode stays below the
+**12 GiB** ceiling; a compile-time assertion enforces this. Runtime RAM/VRAM
+guards remain authoritative and must not be raised.
 
 ## Verification protocol
 

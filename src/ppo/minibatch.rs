@@ -1,16 +1,13 @@
-const _: () = assert!(super::PPO_WIDE_ANNEALED_MAX_SAMPLES >= super::PPO_ANNEALED_MAX_SAMPLES);
-const _: () = assert!(super::PPO_WIDE_ANNEALED_MAX_SAMPLES >= super::PPO_MAX_SAMPLES);
-
 pub(super) fn partition(
     order: &[usize],
     maximum: usize,
     balanced: bool,
 ) -> impl Iterator<Item = &[usize]> {
     assert!(
-        order.len() <= super::PPO_WIDE_ANNEALED_MAX_SAMPLES,
+        order.len() <= super::PPO_MAX_SAMPLES,
         "PPO partition row count {} exceeds maximum {}",
         order.len(),
-        super::PPO_WIDE_ANNEALED_MAX_SAMPLES
+        super::PPO_MAX_SAMPLES
     );
     assert!((1..=super::MODEL_MAX_BATCH).contains(&maximum));
     let chunks = order.chunks(maximum);
@@ -32,9 +29,9 @@ mod tests {
     use super::super::*;
 
     #[test]
-    fn partition_wide_capacity_preserves_every_row_and_order_in_both_modes() {
-        let order: Vec<_> = (0..PPO_WIDE_ANNEALED_MAX_SAMPLES).rev().collect();
-        assert_eq!(order.len(), 93_040);
+    fn partition_full_capacity_preserves_every_row_and_order_in_both_modes() {
+        let order: Vec<_> = (0..PPO_MAX_SAMPLES).rev().collect();
+        assert_eq!(order.len(), 46_520);
         for balanced in [false, true] {
             let chunks = minibatch::partition(&order, 2048, balanced).collect::<Vec<_>>();
             assert_eq!(chunks.len(), order.len().div_ceil(2048));
@@ -59,9 +56,9 @@ mod tests {
     }
 
     #[test]
-    fn partition_wide_capacity_rejects_maximum_plus_one_with_the_bound() {
-        let order = vec![0; PPO_WIDE_ANNEALED_MAX_SAMPLES + 1];
-        assert_eq!(order.len(), 93_041);
+    fn partition_full_capacity_rejects_maximum_plus_one_with_the_bound() {
+        let order = vec![0; PPO_MAX_SAMPLES + 1];
+        assert_eq!(order.len(), 46_521);
         for balanced in [false, true] {
             let panic =
                 std::panic::catch_unwind(|| minibatch::partition(&order, 2048, balanced).count())
@@ -72,7 +69,7 @@ mod tests {
                 .or_else(|| panic.downcast_ref::<&str>().copied());
             assert_eq!(
                 message,
-                Some("PPO partition row count 93041 exceeds maximum 93040")
+                Some("PPO partition row count 46521 exceeds maximum 46520")
             );
         }
     }

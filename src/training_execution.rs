@@ -1,5 +1,14 @@
 use crate::PpoError;
 
+// Rollout storage, the non-rollout reserve and the largest PPO tensor microbatch
+// fit the 12 GiB admission budget, so every accepted microbatch mode is admitted.
+const _: () = assert!(
+    crate::PPO_STORAGE_PEAK_BYTES
+        + 2 * 1024 * 1024 * 1024
+        + crate::MODEL_PPO_MAX_MICROBATCH as u64 * crate::MODEL_PPO_GRAPH_ROW_RESERVE_BYTES
+        <= 12 * 1024 * 1024 * 1024
+);
+
 /// Nondefault execution modes are bound by the canonical checkpoint run scope.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TrainingExecutionOptions {
@@ -50,33 +59,6 @@ impl TrainingExecutionOptions {
             ));
         }
         Ok(self)
-    }
-
-    pub(crate) fn validate_ppo_memory(
-        self,
-        budget: crate::PpoSampleBudget,
-    ) -> Result<(), PpoError> {
-        self.validate()?;
-        if self.training_microbatch == 64 {
-            return Ok(());
-        }
-        let graph = self.training_microbatch as u64 * crate::MODEL_PPO_GRAPH_ROW_RESERVE_BYTES;
-        let bound = match budget {
-            crate::PpoSampleBudget::Standard | crate::PpoSampleBudget::Annealed => {
-                crate::PPO_ANNEALED_STORAGE_PEAK_BYTES + 2 * 1024 * 1024 * 1024 + graph
-            }
-            crate::PpoSampleBudget::WideAnnealed => {
-                crate::PPO_WIDE_ANNEALED_PAYLOAD_BOUND_BYTES
-                    + (self.training_microbatch - 64) as u64
-                        * crate::MODEL_PPO_GRAPH_ROW_RESERVE_BYTES
-            }
-        };
-        if bound > 12 * 1024 * 1024 * 1024 {
-            return Err(PpoError::InvalidConfig(
-                "training microbatch exceeds 12 GiB admission budget",
-            ));
-        }
-        Ok(())
     }
 
     #[cfg(feature = "builtin")]

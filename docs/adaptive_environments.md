@@ -45,8 +45,7 @@ There is no automatic CPU-count or greatest-common-divisor choice for `--paralle
 When overriding dimensions, B must divide both game counts, and B times G must
 divide M and be at most 64. For example, M40/B10/G4 is valid; reducing M to 8 while
 leaving B20 is not. G2/G4 require a Teacher opponent; a weights opponent requires
-explicit `--actor-pipeline-groups 1`. Wide profiles above M40 require explicit
-`--training-microbatch 64` under the unchanged memory admission limit. See
+explicit `--actor-pipeline-groups 1`. See
 [training microbatches](training_microbatch.md) for numerical scope and library defaults.
 
 The adaptive environment tuning defaults remain:
@@ -198,9 +197,8 @@ not migrate either kind of run.
 
 ## Checkpoint and generation recovery
 
-Adaptive checkpoints use capacity-specific manifest identities15/16/17. Fixed
-checkpoints retain their exact12/13/14 identities and byte layout. Runtime weights,
-model/action/feature/PPO tensor contracts are unchanged. The adaptive fixed-size
+Fixed and adaptive runs share one checkpoint format: a presence byte after the
+tensor SHA-256 selects the optional adaptive block. The adaptive fixed-size
 metadata block stores typed configuration, controller counters and a committed
 generation-prefix SHA-256 together with model parameters, Adam and RNG state.
 

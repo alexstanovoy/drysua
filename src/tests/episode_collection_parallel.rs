@@ -45,8 +45,7 @@ fn flush_evaluator_preserves_submission_order_and_drains_after_frame_errors() {
         0,
         Err("PPO model error: model frame 0 contains a non-finite value".to_owned()),
     );
-    let (sender, receiver) =
-        std::sync::mpsc::sync_channel::<FlushRequest>(MAX_EPISODE_ENVIRONMENTS);
+    let (sender, receiver) = std::sync::mpsc::sync_channel::<FlushRequest>(crate::PPO_MAX_GAMES);
     let evaluator = FlushEvaluator {
         sender: std::sync::Mutex::new(Some(sender)),
     };

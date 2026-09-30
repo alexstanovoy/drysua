@@ -2,12 +2,6 @@
 #[path = "tests/map2_contract_test_support.rs"]
 mod test_support;
 
-/// Maximum complete-episode training streams; even counts up to this are valid.
-/// Twenty-six is the largest even count admitted by the retained-frame and
-/// rollout-capacity invariants; 28 exceeds the retained bound, and 30 exceeds
-/// the rollout capacity as well.
-pub const MAX_TRAINING_ENVIRONMENTS: usize = 26;
-
 /// Map used by every production training and evaluation entry point.
 pub const MAP2_ID: bota_proto::MapId = bota_proto::MapId(2);
 /// Simulation ticks per second in the Map2 duration contract.

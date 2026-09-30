@@ -45,17 +45,9 @@ const RETENTION_DOMAIN: u64 = 0x7265_7465_6e74_696f;
 const RETENTION_STREAM_DOMAIN: u64 = 0x7068_6173_655f_726e;
 const _: () = assert!(RETENTION_STRIDE.is_power_of_two());
 const RETAINED_PER_EPISODE: usize = crate::MAP2_RETAINED_DECISIONS;
-const MAX_EPISODE_ENVIRONMENTS: usize = super::TRAINING_MAX_ENVIRONMENTS;
-const MAX_ACTOR_ENVIRONMENTS: usize = crate::PPO_ANNEALED_MAX_PARALLEL_WORLDS;
-const _: () = assert!(MAX_EPISODE_ENVIRONMENTS <= MAX_ACTOR_ENVIRONMENTS);
+const MAX_ACTOR_ENVIRONMENTS: usize = crate::PPO_MAX_PARALLEL_WORLDS;
 const _: () = assert!(MAX_ACTOR_ENVIRONMENTS <= crate::MODEL_TRAINING_BATCH);
-const RETAINED_BYTES_PER_ENVIRONMENT: usize = 3
-    * RETAINED_PER_EPISODE
-    * (std::mem::size_of::<FeatureFrame>() + std::mem::size_of::<crate::BehavioralTarget>());
-const _: () = assert!(MAX_EPISODE_ENVIRONMENTS.is_multiple_of(2));
-const _: () =
-    assert!(MAX_EPISODE_ENVIRONMENTS * RETAINED_BYTES_PER_ENVIRONMENT < 6 * 1024 * 1024 * 1024);
-const _: () = assert!(MAX_EPISODE_ENVIRONMENTS * RETAINED_PER_EPISODE <= crate::PPO_MAX_SAMPLES);
+const _: () = assert!(crate::PPO_MAX_GAMES * RETAINED_PER_EPISODE <= crate::PPO_MAX_SAMPLES);
 
 fn opponent_name(opponent: &OpponentRuntime) -> &'static str {
     match opponent {
@@ -206,15 +198,9 @@ fn collect_with_workers(
 ) -> Result<(), PpoError> {
     assert_eq!(streams.len(), environments.len());
     assert_eq!(random.len(), environments.len());
-    // The paired production collector passes even counts; the annealed batch
-    // collector admits any world count from one to the ceiling.
+    // The annealed batch collector admits any world count from one to the ceiling.
     assert!(!environments.is_empty());
-    let maximum_worlds = match config.sample_budget {
-        crate::PpoSampleBudget::Standard => MAX_EPISODE_ENVIRONMENTS,
-        crate::PpoSampleBudget::Annealed => crate::PPO_ANNEALED_MAX_GAMES,
-        crate::PpoSampleBudget::WideAnnealed => MAX_ACTOR_ENVIRONMENTS,
-    };
-    if environments.len() > maximum_worlds
+    if environments.len() > crate::PPO_MAX_GAMES
         || stream_base
             .checked_add(environments.len())
             .is_none_or(|end| end > config.environments)
@@ -226,9 +212,8 @@ fn collect_with_workers(
     let (flush_evaluator, flush_receiver) = if reuse_actor_values {
         (None, None)
     } else {
-        // Preserve the queue size for existing batches; expanded batches need one slot per world.
-        let capacity = MAX_EPISODE_ENVIRONMENTS.max(environments.len());
-        let (sender, receiver) = std::sync::mpsc::sync_channel::<FlushRequest>(capacity);
+        // One slot per world: every worker has at most one flush in flight.
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<FlushRequest>(environments.len());
         (
             Some(FlushEvaluator {
                 sender: std::sync::Mutex::new(Some(sender)),
@@ -434,7 +419,7 @@ fn prepare_after_advance(
 }
 
 fn retention_phase(seed: u64, update: u64, stream: usize) -> Result<usize, PpoError> {
-    assert!(stream < MAX_EPISODE_ENVIRONMENTS);
+    assert!(stream < crate::PPO_MAX_GAMES);
     let episode = derive_training_seed(seed, update, RETENTION_DOMAIN);
     let seed = derive_training_seed(episode, stream as u64, RETENTION_STREAM_DOMAIN);
     // A dedicated stream and power-of-two mask avoid actor RNG consumption and modulo bias.

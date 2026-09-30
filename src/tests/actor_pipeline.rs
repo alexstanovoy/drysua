@@ -55,12 +55,12 @@ fn assert_all_groups_dispatched(group_count: usize) {
 }
 
 #[test]
-fn actor_pipeline_matches_sequential_b20_and_b32_rows_rng_rewards_and_order() {
+fn actor_pipeline_matches_sequential_b20_and_b16_rows_rng_rewards_and_order() {
     assert_parity(PolicyDevice::Cpu);
 }
 
 #[test]
-fn actor_pipeline_g4_matches_g1_and_g2_at_fixed_b10_and_b16() {
+fn actor_pipeline_g4_matches_g1_and_g2_at_fixed_b10_and_b8() {
     assert_four_group_parity(PolicyDevice::Cpu);
 }
 
@@ -200,17 +200,12 @@ fn actor_pipeline_rejects_misaligned_group_buckets_before_sampling() {
 
 #[test]
 fn actor_pipeline_memory_gate_keeps_existing_limits_and_rejects_gpu_opponents() {
-    for width in [20, 32] {
+    for width in [10, 20] {
         let (config, _) = inputs_config(width);
         assert_eq!(validate_pipeline_memory(config, width, 2), Ok(()));
         assert!(pipeline_payload_bytes(config, width) <= 12 * 1024 * 1024 * 1024);
     }
-    let (mut config, _) = inputs_config(20);
-    config.environments = 80;
-    config.sample_budget = crate::PpoSampleBudget::WideAnnealed;
-    assert_eq!(validate_pipeline_memory(config, 20, 2), Ok(()));
-    assert!(pipeline_payload_bytes(config, 20) <= crate::PPO_WIDE_ANNEALED_PAYLOAD_BOUND_BYTES);
-    let (config, _) = inputs_config(40);
+    let (config, _) = inputs_config(20);
     assert_eq!(
         validate_pipeline_memory(config, 40, 2),
         Err(PpoError::InvalidConfig(
@@ -251,7 +246,7 @@ fn actor_pipeline_memory_gate_keeps_existing_limits_and_rejects_gpu_opponents() 
 
 fn assert_parity(device: PolicyDevice) {
     let model = PolicyModel::fresh_on(9952600, device).expect("model");
-    for (width, rounds) in [(20, 16), (32, 16), (2, 24)] {
+    for (width, rounds) in [(20, 16), (16, 16), (2, 24)] {
         for reuse in [false, true] {
             let source = trial(&model, width, rounds, reuse, false);
             let target = trial(&model, width, rounds, reuse, true);
@@ -273,7 +268,7 @@ fn assert_parity(device: PolicyDevice) {
 
 fn assert_four_group_parity(device: PolicyDevice) {
     let model = PolicyModel::fresh_on(9952600, device).expect("model");
-    for width in [10, 16] {
+    for width in [10, 8] {
         for reuse in [false, true] {
             let source = trial_grouped(&model, width, 16, reuse, 1, 4);
             for groups in [2, 4] {
@@ -288,9 +283,7 @@ fn assert_four_group_parity(device: PolicyDevice) {
 }
 
 fn multiwave_trial(model: &PolicyModel, reuse: bool, pipeline: bool) -> Trial {
-    let (mut config, _) = inputs_config(20);
-    config.environments = 80;
-    config.sample_budget = crate::PpoSampleBudget::WideAnnealed;
+    let (config, _) = inputs_config(20);
     let mut rollout =
         PpoRollout::for_config(config, model.policy_identity().expect("policy")).expect("rollout");
     let mut report = CollectionReport::default();
@@ -298,10 +291,10 @@ fn multiwave_trial(model: &PolicyModel, reuse: bool, pipeline: bool) -> Trial {
     let mut random = Vec::new();
     let mut traces = Vec::new();
     for wave in 0..2 {
-        let (_, mut groups) = inputs(20);
+        let (_, mut groups) = inputs(10);
         for group in &mut groups {
-            group.stream_base += wave * 40;
-            group.random = actor_stream_rngs(&mut master, 20).expect("canonical seeds");
+            group.stream_base += wave * 20;
+            group.random = actor_stream_rngs(&mut master, 10).expect("canonical seeds");
         }
         if pipeline {
             collect_actor_pipeline(
@@ -342,7 +335,7 @@ fn multiwave_trial(model: &PolicyModel, reuse: bool, pipeline: bool) -> Trial {
     }
     let batch = rollout.finish(config).expect("canonical multiwave batch");
     let buckets: Vec<_> = (0..batch.len())
-        .map(|index| batch.sample(index).expect("row").transition.stream / 20)
+        .map(|index| batch.sample(index).expect("row").transition.stream / 10)
         .collect();
     assert!(buckets.windows(2).all(|pair| pair[0] <= pair[1]));
     assert_eq!(buckets.first(), Some(&0));
@@ -422,7 +415,6 @@ fn inputs_config(width: usize) -> (PpoConfig, usize) {
     let config = PpoConfig {
         environments: count,
         rollout_decisions: RETAINED_PER_EPISODE,
-        sample_budget: crate::PpoSampleBudget::for_annealed_games(count),
         decision_interval_ticks: 3,
         gamma_tick: 1.0,
         ..PpoConfig::default()
@@ -439,7 +431,6 @@ fn inputs_grouped(width: usize, group_count: usize) -> (PpoConfig, Vec<ActorGrou
     let (mut config, _) = inputs_config(width);
     let count = width * group_count;
     config.environments = count;
-    config.sample_budget = crate::PpoSampleBudget::for_annealed_games(count);
     assert!(count <= MAX_ACTOR_ENVIRONMENTS);
     let mut master = PpoRng::new(9952601);
     let groups = (0..group_count)

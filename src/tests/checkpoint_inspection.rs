@@ -24,7 +24,12 @@ fn inspection_contract_exposes_current_model_limits_and_build_capabilities() {
     assert_eq!(contract["limits"]["max_json_bytes"], 4_194_304);
     assert_eq!(contract["limits"]["max_snapshots"], 10_000);
     assert_eq!(contract["limits"]["max_files"], 10_004);
-    assert_eq!(contract["profiles"].as_array().expect("profiles").len(), 3);
+    assert_eq!(contract["limits"]["max_games"], crate::PPO_MAX_GAMES);
+    assert_eq!(
+        contract["checkpoint"],
+        serde_json::json!({"version": CHECKPOINT_SCHEMA_VERSION,
+            "hash": format!("{CHECKPOINT_SCHEMA_HASH:016x}")})
+    );
 }
 
 fn parse_json(bytes: &[u8]) -> Value {
@@ -89,11 +94,7 @@ mod files {
         for value in [1.0, 0.0] {
             let mut lagging = artifact.parameters.clone();
             lagging[0] = value;
-            fs::write(
-                &path,
-                serialize_runtime_tensor(&lagging, artifact.config.sample_budget).unwrap(),
-            )
-            .unwrap();
+            fs::write(&path, serialize_runtime_tensor(&lagging).unwrap()).unwrap();
             assert_runtime_mismatch(&fixture, &path);
         }
         let old = serialize_named_tensors(&[("model.parameters", &artifact.parameters)]).unwrap();
@@ -107,7 +108,7 @@ mod files {
         let fixture = Fixture::new(&mut artifact);
         fs::write(
             fixture.0.join(RUNTIME_TENSOR_FILE),
-            serialize_runtime_tensor(&[0.0], artifact.config.sample_budget).unwrap(),
+            serialize_runtime_tensor(&[0.0]).unwrap(),
         )
         .unwrap();
         assert_eq!(
@@ -627,9 +628,7 @@ mod files {
             )
             .unwrap();
             fs::write(self.0.join(CHECKPOINT_TENSOR_FILE), &tensors).unwrap();
-            let runtime =
-                serialize_runtime_tensor(&artifact.parameters, artifact.config.sample_budget)
-                    .unwrap();
+            let runtime = serialize_runtime_tensor(&artifact.parameters).unwrap();
             fs::write(self.0.join(RUNTIME_TENSOR_FILE), runtime).unwrap();
             self.manifest(artifact);
         }
@@ -710,18 +709,13 @@ mod files {
     }
 
     fn assert_current_identity(fixture: &Fixture, artifact: &TrainingArtifact, report: &Value) {
-        let budget = artifact.config.sample_budget;
         assert_eq!(report["model"]["version"], MODEL_SCHEMA_VERSION);
         assert_eq!(report["model"]["parameters"], MODEL_PARAMETER_COUNT);
         assert_eq!(report["model"]["hash"], format!("{MODEL_SCHEMA_HASH:016x}"));
-        assert_eq!(
-            report["ppo"]["sample_budget"],
-            json!({"name": "standard", "code": 0})
-        );
-        assert_eq!(report["ppo"]["schema_version"], budget.schema_version());
+        assert_eq!(report["ppo"]["schema_version"], PPO_SCHEMA_VERSION);
         assert_eq!(
             report["ppo"]["schema_hash"],
-            format!("{:016x}", budget.schema_hash())
+            format!("{PPO_SCHEMA_HASH:016x}")
         );
         assert_eq!(
             report["identity"]["manifest_sha256"],

@@ -312,8 +312,8 @@ fn current_runtime_metadata() -> std::collections::HashMap<String, String> {
 fn checkpoint_config() -> PpoConfig {
     PpoConfig {
         gamma_tick: crate::MAP2_REWARD_GAMMA_TICK,
-        rollout_decisions: 2,
-        environments: 2,
+        rollout_decisions: 1,
+        environments: 4,
         epochs: 1,
         minibatch: 4,
         ..PpoConfig::default()
@@ -342,7 +342,7 @@ fn progress_metadata(global_update: u64) -> CheckpointProgress {
         policy_version: global_update,
         scheduler_step: 3,
         curriculum_stage: 2,
-        rollout_samples: 1_024,
+        rollout_samples: global_update * 4,
         best_evaluation: Some(0.75),
         rng_states: vec![
             RngCheckpoint::new("actor", 11, 12).expect("actor RNG"),

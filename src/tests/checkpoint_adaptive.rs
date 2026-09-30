@@ -5,38 +5,31 @@ use crate::{
     EnvironmentDecimal,
 };
 
-const BUDGETS: [PpoSampleBudget; 3] = [
-    PpoSampleBudget::Standard,
-    PpoSampleBudget::Annealed,
-    PpoSampleBudget::WideAnnealed,
-];
 const BLOCK_BYTES: usize = 152;
 
 #[test]
-fn adaptive_profiles_roundtrip_fresh_active_transitioned_and_terminal_state() {
-    for (budget, version) in BUDGETS.into_iter().zip([15u32, 16, 17]) {
-        let mut artifact = fixture(budget);
-        for update in 0..=8 {
-            if update > 0 {
-                observe(&mut artifact, update, 2);
-            }
-            let encoded = encode_manifest(&artifact, artifact.tensor_hash).expect("encode");
-            let decoded = decode_manifest(&encoded).expect("decode");
-            assert_eq!(&encoded[8..12], &version.to_le_bytes());
-            assert_eq!(decoded.progress, artifact.progress);
-            assert_eq!(decoded.run, artifact.run);
-            assert_eq!(decoded.config, artifact.config);
-            assert_eq!(decoded.shuffle, artifact.shuffle);
-            assert_eq!(decoded.tensor_hash, artifact.tensor_hash);
-            let checkpoint = decoded.progress.adaptive_environment.expect("adaptive");
-            assert_eq!(checkpoint.snapshot_count, update.div_ceil(2));
+fn adaptive_manifest_roundtrips_fresh_active_transitioned_and_terminal_state() {
+    let mut artifact = fixture();
+    for update in 0..=8 {
+        if update > 0 {
+            observe(&mut artifact, update, 2);
         }
+        let encoded = encode_manifest(&artifact, artifact.tensor_hash).expect("encode");
+        let decoded = decode_manifest(&encoded).expect("decode");
+        assert_eq!(&encoded[8..12], &CHECKPOINT_SCHEMA_VERSION.to_le_bytes());
+        assert_eq!(decoded.progress, artifact.progress);
+        assert_eq!(decoded.run, artifact.run);
+        assert_eq!(decoded.config, artifact.config);
+        assert_eq!(decoded.shuffle, artifact.shuffle);
+        assert_eq!(decoded.tensor_hash, artifact.tensor_hash);
+        let checkpoint = decoded.progress.adaptive_environment.expect("adaptive");
+        assert_eq!(checkpoint.snapshot_count, update.div_ceil(2));
     }
 }
 
 #[test]
 fn adaptive_block_pins_exact_units_field_order_and_hash_bytes() {
-    let mut artifact = fixture(PpoSampleBudget::Standard);
+    let mut artifact = fixture();
     observe(&mut artifact, 1, 0);
     let encoded = encode_manifest(&artifact, artifact.tensor_hash).expect("encode");
     let block = &encoded[encoded.len() - BLOCK_BYTES..];
@@ -62,75 +55,69 @@ fn adaptive_block_pins_exact_units_field_order_and_hash_bytes() {
 
 #[test]
 fn adaptive_nondefault_six_decimal_config_roundtrips_without_float_conversion() {
-    for budget in BUDGETS {
-        let mut artifact = fixture(budget);
-        let checkpoint = artifact
+    let mut artifact = fixture();
+    let checkpoint = artifact
+        .progress
+        .adaptive_environment
+        .as_mut()
+        .expect("adaptive");
+    let previous_suffix = checkpoint.config.scope_suffix();
+    checkpoint.config = AdaptiveEnvironmentConfig {
+        success_updates: 7,
+        success_rate: EnvironmentDecimal::from_units(999_999),
+        poor_updates: 3,
+        poor_rate: EnvironmentDecimal::from_units(1),
+        extension: EnvironmentDecimal::from_units(1_234_567),
+    };
+    artifact.run.command_line = artifact
+        .run
+        .command_line
+        .replace(&previous_suffix, &checkpoint.config.scope_suffix());
+    let encoded = encode_manifest(&artifact, artifact.tensor_hash).expect("encode");
+    assert_eq!(
+        decode_manifest(&encoded)
+            .expect("decode")
             .progress
-            .adaptive_environment
-            .as_mut()
-            .expect("adaptive");
-        let previous_suffix = checkpoint.config.scope_suffix();
-        checkpoint.config = AdaptiveEnvironmentConfig {
-            success_updates: 7,
-            success_rate: EnvironmentDecimal::from_units(999_999),
-            poor_updates: 3,
-            poor_rate: EnvironmentDecimal::from_units(1),
-            extension: EnvironmentDecimal::from_units(1_234_567),
-        };
-        artifact.run.command_line = artifact
-            .run
-            .command_line
-            .replace(&previous_suffix, &checkpoint.config.scope_suffix());
-        let encoded = encode_manifest(&artifact, artifact.tensor_hash).expect("encode");
-        assert_eq!(
-            decode_manifest(&encoded)
-                .expect("decode")
-                .progress
-                .adaptive_environment,
-            artifact.progress.adaptive_environment
-        );
-    }
+            .adaptive_environment,
+        artifact.progress.adaptive_environment
+    );
 }
 
 #[test]
-fn adaptive_headers_reject_corruption_downgrade_missing_block_and_trailing_bytes() {
-    for budget in BUDGETS {
-        let artifact = fixture(budget);
-        let encoded = encode_manifest(&artifact, artifact.tensor_hash).expect("encode");
-        for end in encoded.len() - BLOCK_BYTES..encoded.len() {
-            assert_eq!(
-                decode_manifest(&encoded[..end]).expect_err("truncation"),
-                CheckpointError::ManifestTruncated
-            );
-        }
-        let mut trailing = encoded.clone();
-        trailing.push(0);
+fn adaptive_headers_reject_corruption_missing_block_and_trailing_bytes() {
+    let artifact = fixture();
+    let encoded = encode_manifest(&artifact, artifact.tensor_hash).expect("encode");
+    for end in encoded.len() - BLOCK_BYTES..encoded.len() {
         assert_eq!(
-            decode_manifest(&trailing).expect_err("trailing"),
-            CheckpointError::ManifestTrailingBytes
-        );
-        for offset in [8, 12, 56, 60] {
-            let mut corrupt = encoded.clone();
-            corrupt[offset] ^= 0x80;
-            assert_eq!(
-                decode_manifest(&corrupt).expect_err("header"),
-                CheckpointError::SchemaMismatch
-            );
-        }
-        let mut downgrade = encoded[..encoded.len() - BLOCK_BYTES].to_vec();
-        let (version, hash) = checkpoint_schema_identity(budget);
-        downgrade[8..12].copy_from_slice(&version.to_le_bytes());
-        downgrade[12..20].copy_from_slice(&hash.to_le_bytes());
-        assert_manifest_error(
-            &downgrade,
-            "adaptive environment configuration/state mismatch",
+            decode_manifest(&encoded[..end]).expect_err("truncation"),
+            CheckpointError::ManifestTruncated
         );
     }
+    let mut trailing = encoded.clone();
+    trailing.push(0);
+    assert_eq!(
+        decode_manifest(&trailing).expect_err("trailing"),
+        CheckpointError::ManifestTrailingBytes
+    );
+    for offset in [8, 12, 56, 60] {
+        let mut corrupt = encoded.clone();
+        corrupt[offset] ^= 0x80;
+        assert_eq!(
+            decode_manifest(&corrupt).expect_err("header"),
+            CheckpointError::SchemaMismatch
+        );
+    }
+    let mut missing = encoded[..encoded.len() - BLOCK_BYTES].to_vec();
+    *missing.last_mut().expect("presence byte") = 0;
+    assert_manifest_error(
+        &missing,
+        "adaptive environment configuration/state mismatch",
+    );
 }
 
 #[test]
 fn adaptive_config_and_limits_are_bound_to_all_canonical_scope_values() {
-    let artifact = fixture(PpoSampleBudget::Standard);
+    let artifact = fixture();
     let encoded = encode_manifest(&artifact, artifact.tensor_hash).expect("encode");
     for (word, value, field) in [
         (0, 3, "adaptive environment scope suffix"),
@@ -201,7 +188,7 @@ fn adaptive_scope_rejects_missing_duplicate_unbounded_or_noncanonical_tokens() {
             "adaptive environment scope suffix",
         ),
     ] {
-        let mut artifact = fixture(PpoSampleBudget::Standard);
+        let mut artifact = fixture();
         artifact.run.command_line = artifact.run.command_line.replace(source, replacement);
         let encoded = encode_manifest(&artifact, artifact.tensor_hash).expect("fixture");
         assert_manifest_error(&encoded, field);
@@ -216,7 +203,7 @@ fn adaptive_scope_requires_state_and_rejects_state_without_marker_or_league() {
         (2, "adaptive environment league"),
         (3, "adaptive environment scope suffix"),
     ] {
-        let mut artifact = fixture(PpoSampleBudget::Standard);
+        let mut artifact = fixture();
         match case {
             0 => artifact.progress.adaptive_environment = None,
             1 => artifact.run.command_line = "train-annealed --updates 8".to_owned(),
@@ -235,7 +222,7 @@ fn adaptive_scope_requires_state_and_rejects_state_without_marker_or_league() {
 #[test]
 fn adaptive_state_and_snapshot_invariants_reject_before_tensor_io() {
     let directory = test_directory("adaptive-invalid-metadata");
-    let mut artifact = fixture(PpoSampleBudget::Standard);
+    let mut artifact = fixture();
     observe(&mut artifact, 1, 0);
     let encoded = encode_manifest(&artifact, artifact.tensor_hash).expect("encode");
     for (word, value, field) in [
@@ -300,7 +287,7 @@ fn adaptive_state_and_snapshot_invariants_reject_before_tensor_io() {
 #[test]
 fn adaptive_snapshot_hash_is_zero_exactly_at_zero_count() {
     for update in [0, 1] {
-        let mut artifact = fixture(PpoSampleBudget::Standard);
+        let mut artifact = fixture();
         if update > 0 {
             observe(&mut artifact, update, 0);
         }
@@ -317,69 +304,67 @@ fn adaptive_snapshot_hash_is_zero_exactly_at_zero_count() {
 
 #[test]
 fn adaptive_capture_save_restore_carries_model_adam_rng_and_rejects_without_mutation() {
-    for budget in BUDGETS {
-        let directory = test_directory("adaptive-public-roundtrip");
-        let fixture = fixture(budget);
-        let source = PolicyModel::fresh(51_001).expect("source");
-        let trainer = PpoTrainer::new(&source, fixture.config, 91).expect("trainer");
-        let artifact = TrainingArtifact::capture(&source, &trainer, fixture.run, fixture.progress)
-            .expect("capture");
-        artifact.save(&directory).expect("save");
-        let loaded = TrainingArtifact::load_compatible(&directory, artifact.run()).expect("load");
-        let target = PolicyModel::fresh(51_002).expect("target");
-        let before = target.export_parameters().expect("before");
-        let identity = target.policy_identity().expect("identity");
-        for missing in [false, true] {
-            let mut invalid = loaded.clone();
-            let field = if missing {
-                invalid.progress.adaptive_environment = None;
-                "adaptive environment configuration/state mismatch"
-            } else {
-                invalid
-                    .progress
-                    .adaptive_environment
-                    .as_mut()
-                    .expect("adaptive")
-                    .snapshot_count = 1;
-                "adaptive environment snapshot count"
-            };
-            let error = invalid
-                .restore(&target, artifact.run())
-                .err()
-                .expect("reject");
-            assert_eq!(error, CheckpointError::InvalidManifest(field));
-            assert_eq!(target.export_parameters().expect("after"), before);
-            assert_eq!(target.policy_identity().expect("identity after"), identity);
-            assert_eq!(
-                TrainingArtifact::capture(&source, &trainer, invalid.run, invalid.progress)
-                    .expect_err("capture rejects"),
-                error
-            );
-        }
-        let restored = loaded.restore(&target, artifact.run()).expect("restore");
-        assert_eq!(restored.progress(), artifact.progress());
+    let directory = test_directory("adaptive-public-roundtrip");
+    let fixture = fixture();
+    let source = PolicyModel::fresh(51_001).expect("source");
+    let trainer = PpoTrainer::new(&source, fixture.config, 91).expect("trainer");
+    let artifact = TrainingArtifact::capture(&source, &trainer, fixture.run, fixture.progress)
+        .expect("capture");
+    artifact.save(&directory).expect("save");
+    let loaded = TrainingArtifact::load_compatible(&directory, artifact.run()).expect("load");
+    let target = PolicyModel::fresh(51_002).expect("target");
+    let before = target.export_parameters().expect("before");
+    let identity = target.policy_identity().expect("identity");
+    for missing in [false, true] {
+        let mut invalid = loaded.clone();
+        let field = if missing {
+            invalid.progress.adaptive_environment = None;
+            "adaptive environment configuration/state mismatch"
+        } else {
+            invalid
+                .progress
+                .adaptive_environment
+                .as_mut()
+                .expect("adaptive")
+                .snapshot_count = 1;
+            "adaptive environment snapshot count"
+        };
+        let error = invalid
+            .restore(&target, artifact.run())
+            .err()
+            .expect("reject");
+        assert_eq!(error, CheckpointError::InvalidManifest(field));
+        assert_eq!(target.export_parameters().expect("after"), before);
+        assert_eq!(target.policy_identity().expect("identity after"), identity);
         assert_eq!(
-            restored.trainer().rng_checkpoint(),
-            trainer.rng_checkpoint()
+            TrainingArtifact::capture(&source, &trainer, invalid.run, invalid.progress)
+                .expect_err("capture rejects"),
+            error
         );
-        assert_eq!(
-            restored.trainer().optimizer_step(),
-            trainer.optimizer_step()
-        );
-        let snapshot = restored
-            .trainer()
-            .checkpoint_snapshot(&target)
-            .expect("snapshot");
-        assert_eq!(snapshot.parameters, artifact.parameters);
-        assert_eq!(snapshot.adam.moments().0, artifact.optimizer.first_moment);
-        assert_eq!(snapshot.adam.moments().1, artifact.optimizer.second_moment);
-        fs::remove_dir_all(directory).expect("cleanup");
     }
+    let restored = loaded.restore(&target, artifact.run()).expect("restore");
+    assert_eq!(restored.progress(), artifact.progress());
+    assert_eq!(
+        restored.trainer().rng_checkpoint(),
+        trainer.rng_checkpoint()
+    );
+    assert_eq!(
+        restored.trainer().optimizer_step(),
+        trainer.optimizer_step()
+    );
+    let snapshot = restored
+        .trainer()
+        .checkpoint_snapshot(&target)
+        .expect("snapshot");
+    assert_eq!(snapshot.parameters, artifact.parameters);
+    assert_eq!(snapshot.adam.moments().0, artifact.optimizer.first_moment);
+    assert_eq!(snapshot.adam.moments().1, artifact.optimizer.second_moment);
+    fs::remove_dir_all(directory).expect("cleanup");
 }
 
 #[test]
 fn manifest_codec_rejects_global_metadata_over_64_kib() {
-    let mut artifact = fixture(PpoSampleBudget::Standard);
+    let mut artifact = fixture();
     artifact.progress.rng_states = (0..32)
         .map(|index| {
             RngCheckpoint::new(format!("{index:02}{}", "x".repeat(4094)), 0, 0).expect("RNG")
@@ -423,8 +408,9 @@ fn observe(artifact: &mut TrainingArtifact, update: u64, wins: u64) {
     artifact.trainer_updates = update;
 }
 
-fn fixture(budget: PpoSampleBudget) -> TrainingArtifact {
-    let mut artifact = capacity_tests::manifest_artifact(budget, 0, 0);
+fn fixture() -> TrainingArtifact {
+    let mut artifact = capacity_tests::manifest_artifact(0, 0);
+    artifact.config.environments = 2;
     let config = AdaptiveEnvironmentConfig::default();
     artifact.run.command_line = format!(
         "train-annealed --updates 8 --games {} --generation-games {} --zero-updates 2{}",

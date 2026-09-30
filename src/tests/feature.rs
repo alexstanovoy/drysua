@@ -216,13 +216,9 @@ fn representative_frames_match_frozen_goldens_and_resource_presence_boundaries()
             encoder.observe(&tracker).expect("feature observation");
             let frame = encode_with_encoder(&tracker, &mut encoder);
             assert_current_golden_suffix(&frame);
-            for mut arena in [
-                RaggedFeatureArena::new(1),
-                RaggedFeatureArena::new_bounded(1).expect("bounded golden frame"),
-            ] {
-                let header = arena.push(&frame).expect("store golden frame");
-                assert_eq!(arena.expand(&header).expect("expand golden frame"), frame);
-            }
+            let mut arena = RaggedFeatureArena::new(1).expect("golden frame arena");
+            let header = arena.push(&frame).expect("store golden frame");
+            assert_eq!(arena.expand(&header).expect("expand golden frame"), frame);
             if tick == 1 {
                 assert_canonical_golden(&frame, count);
             }
@@ -345,7 +341,7 @@ fn feature_observation_history_has_an_exact_fixed_capacity() {
 #[test]
 fn ragged_feature_arena_rejects_corrupt_offsets() {
     let frame = encoded_frame(Team::Radiant, world_view(Team::Radiant, 1));
-    let mut arena = RaggedFeatureArena::new(1);
+    let mut arena = RaggedFeatureArena::new(1).expect("arena");
     let mut malformed = arena.push(&frame).expect("frame");
     malformed.corrupt_unit_offset_for_test();
     assert_eq!(

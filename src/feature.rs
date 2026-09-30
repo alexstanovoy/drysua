@@ -719,25 +719,25 @@ struct IndexedFeatureRow<const FEATURES: usize> {
     values: [f32; FEATURES],
 }
 
-const ANNEALED_FEATURE_ARENA_BYTES: [u64; 7] = [
-    annealed_feature_row_bytes::<UNIT_FEATURE_TOKENS, UNIT_FEATURES>(),
-    annealed_feature_row_bytes::<REMEMBERED_UNIT_FEATURE_TOKENS, UNIT_FEATURES>(),
-    annealed_feature_row_bytes::<POINT_FEATURE_TOKENS, POINT_FEATURES>(),
-    annealed_feature_row_bytes::<ABILITY_FEATURE_TOKENS, ABILITY_FEATURES>(),
-    annealed_feature_row_bytes::<ITEM_FEATURE_TOKENS, ITEM_FEATURES>(),
-    annealed_feature_row_bytes::<PROJECTILE_FEATURE_TOKENS, PROJECTILE_FEATURES>(),
-    annealed_feature_row_bytes::<LOOT_FEATURE_TOKENS, LOOT_FEATURES>(),
+const FEATURE_ARENA_BYTES: [u64; 7] = [
+    feature_row_bytes::<UNIT_FEATURE_TOKENS, UNIT_FEATURES>(),
+    feature_row_bytes::<REMEMBERED_UNIT_FEATURE_TOKENS, UNIT_FEATURES>(),
+    feature_row_bytes::<POINT_FEATURE_TOKENS, POINT_FEATURES>(),
+    feature_row_bytes::<ABILITY_FEATURE_TOKENS, ABILITY_FEATURES>(),
+    feature_row_bytes::<ITEM_FEATURE_TOKENS, ITEM_FEATURES>(),
+    feature_row_bytes::<PROJECTILE_FEATURE_TOKENS, PROJECTILE_FEATURES>(),
+    feature_row_bytes::<LOOT_FEATURE_TOKENS, LOOT_FEATURES>(),
 ];
 
 /// Capped row-vector bytes plus one largest arena's moving-reallocation overlap.
 /// Excludes headers, transitions, materialized minibatches, and allocator overhead;
 /// this is not a bound on the process's total memory consumption.
-pub(crate) const ANNEALED_FEATURE_ARENA_PEAK_BYTES: u64 = {
+pub(crate) const FEATURE_ARENA_PEAK_BYTES: u64 = {
     let mut total = 0;
     let mut largest = 0;
     let mut index = 0;
-    while index < ANNEALED_FEATURE_ARENA_BYTES.len() {
-        let bytes = ANNEALED_FEATURE_ARENA_BYTES[index];
+    while index < FEATURE_ARENA_BYTES.len() {
+        let bytes = FEATURE_ARENA_BYTES[index];
         total += bytes;
         if bytes > largest {
             largest = bytes;
@@ -747,23 +747,11 @@ pub(crate) const ANNEALED_FEATURE_ARENA_PEAK_BYTES: u64 = {
     total + largest
 };
 
-pub(crate) const fn wide_feature_arena_peak_bytes() -> u64 {
-    const {
-        assert!(
-            ANNEALED_FEATURE_ARENA_PEAK_BYTES
-                .is_multiple_of(crate::PPO_ANNEALED_MAX_SAMPLES as u64)
-        );
-    }
-    ANNEALED_FEATURE_ARENA_PEAK_BYTES / crate::PPO_ANNEALED_MAX_SAMPLES as u64
-        * crate::PPO_WIDE_ANNEALED_MAX_SAMPLES as u64
-}
-
-const fn annealed_feature_row_bytes<const TOKENS: usize, const FEATURES: usize>() -> u64 {
+const fn feature_row_bytes<const TOKENS: usize, const FEATURES: usize>() -> u64 {
     assert!(TOKENS > 0);
     assert!(TOKENS <= u16::MAX as usize);
-    let rows = crate::PPO_ANNEALED_MAX_SAMPLES as u64 * TOKENS as u64;
+    let rows = crate::PPO_MAX_SAMPLES as u64 * TOKENS as u64;
     assert!(rows <= u32::MAX as u64);
-    assert!(crate::PPO_WIDE_ANNEALED_MAX_SAMPLES as u64 * TOKENS as u64 <= u32::MAX as u64);
     rows * std::mem::size_of::<IndexedFeatureRow<FEATURES>>() as u64
 }
 
@@ -792,7 +780,6 @@ pub(crate) struct RaggedFeatureHeader {
 
 pub(crate) struct RaggedFeatureArena {
     sample_capacity: usize,
-    bounded_growth: bool,
     units: Vec<IndexedFeatureRow<UNIT_FEATURES>>,
     remembered_units: Vec<IndexedFeatureRow<UNIT_FEATURES>>,
     points: Vec<IndexedFeatureRow<POINT_FEATURES>>,
@@ -803,10 +790,13 @@ pub(crate) struct RaggedFeatureArena {
 }
 
 impl RaggedFeatureArena {
-    pub(crate) fn new(sample_capacity: usize) -> Self {
-        Self {
+    /// Every row vector grows fallibly within its row cap.
+    pub(crate) fn new(sample_capacity: usize) -> Result<Self, &'static str> {
+        if !(1..=crate::PPO_MAX_SAMPLES).contains(&sample_capacity) {
+            return Err("ragged feature sample capacity is outside 1..=46520");
+        }
+        Ok(Self {
             sample_capacity,
-            bounded_growth: false,
             units: Vec::new(),
             remembered_units: Vec::new(),
             points: Vec::new(),
@@ -814,27 +804,6 @@ impl RaggedFeatureArena {
             items: Vec::new(),
             projectiles: Vec::new(),
             loot: Vec::new(),
-        }
-    }
-
-    /// Opt-in Annealed storage; every row vector grows fallibly within its row cap.
-    pub(crate) fn new_bounded(sample_capacity: usize) -> Result<Self, &'static str> {
-        if !(1..=crate::PPO_ANNEALED_MAX_SAMPLES).contains(&sample_capacity) {
-            return Err("bounded ragged feature sample capacity is outside 1..=46520");
-        }
-        Ok(Self {
-            bounded_growth: true,
-            ..Self::new(sample_capacity)
-        })
-    }
-
-    pub(crate) fn new_wide_bounded(sample_capacity: usize) -> Result<Self, &'static str> {
-        if !(1..=crate::PPO_WIDE_ANNEALED_MAX_SAMPLES).contains(&sample_capacity) {
-            return Err("wide ragged feature sample capacity is outside 1..=93040");
-        }
-        Ok(Self {
-            bounded_growth: true,
-            ..Self::new(sample_capacity)
         })
     }
 
@@ -842,9 +811,7 @@ impl RaggedFeatureArena {
         &mut self,
         frame: &FeatureFrame,
     ) -> Result<RaggedFeatureHeader, &'static str> {
-        if self.bounded_growth {
-            self.reserve_frame(frame)?;
-        }
+        self.reserve_frame(frame)?;
         let units = append_feature_rows(
             &mut self.units,
             &frame.units,
@@ -905,8 +872,7 @@ impl RaggedFeatureArena {
     }
 
     fn reserve_frame(&mut self, frame: &FeatureFrame) -> Result<(), &'static str> {
-        assert!(self.bounded_growth);
-        assert!(self.sample_capacity <= crate::PPO_WIDE_ANNEALED_MAX_SAMPLES);
+        assert!(self.sample_capacity <= crate::PPO_MAX_SAMPLES);
         // Reserve all seven arenas first so an allocation failure cannot append partial rows.
         reserve_feature_rows(
             &mut self.units,

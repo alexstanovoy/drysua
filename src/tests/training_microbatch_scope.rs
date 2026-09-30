@@ -46,31 +46,14 @@ fn training_microbatch_cli_is_closed_and_only_modes_above_legacy_64_change_scope
 }
 
 #[test]
-fn training_microbatch_memory_admission_keeps_the_twelve_gib_ceiling() {
+fn training_microbatch_library_modes_are_closed() {
     for microbatch in [64, 128, 256] {
-        let execution = crate::TrainingExecutionOptions {
+        crate::TrainingExecutionOptions {
             training_microbatch: microbatch,
             ..Default::default()
-        };
-        execution
-            .validate_ppo_memory(PpoSampleBudget::Standard)
-            .expect("standard admission");
-        execution
-            .validate_ppo_memory(PpoSampleBudget::Annealed)
-            .expect("M40 admission");
-        if microbatch == 64 {
-            execution
-                .validate_ppo_memory(PpoSampleBudget::WideAnnealed)
-                .expect("default wide");
-        } else {
-            assert_eq!(
-                execution
-                    .validate_ppo_memory(PpoSampleBudget::WideAnnealed)
-                    .expect_err("wide capacity reservation")
-                    .to_string(),
-                "invalid PPO config field: training microbatch exceeds 12 GiB admission budget"
-            );
         }
+        .validate()
+        .expect("admitted mode");
     }
     for value in [0, 65, 512] {
         assert_eq!(
@@ -82,27 +65,6 @@ fn training_microbatch_memory_admission_keeps_the_twelve_gib_ceiling() {
             .expect_err("library closed modes")
             .to_string(),
             "invalid PPO config field: training microbatch must be 64, 128 or 256"
-        );
-    }
-}
-
-#[test]
-fn wide_training_microbatch_is_rejected_before_directory_or_opponent_setup() {
-    let mut options = settings(9001, 2);
-    options.games_per_update = 80;
-    options.ppo.environments = 80;
-    options.ppo.sample_budget = PpoSampleBudget::WideAnnealed;
-    assert_eq!(
-        validate_annealed(&options, harness()).expect("default wide"),
-        options.ppo
-    );
-    for microbatch in [128, 256] {
-        options.execution.training_microbatch = microbatch;
-        assert_eq!(
-            validate_annealed(&options, harness()),
-            Err(PpoError::InvalidConfig(
-                "training microbatch exceeds 12 GiB admission budget"
-            ))
         );
     }
 }

@@ -27,21 +27,17 @@ Both modes return `schema: "drysua-checkpoint-inspection/v1"`.
   `read_only: true`, `strict_build_features: true`, and
   `controller_run_kind: "train-annealed"`;
 - `limits`: `max_json_bytes=4194304`, `max_snapshots=10000`, `max_files=10004`,
-  native manifest/training/runtime byte limits, and `snapshot_bytes=4096`;
-- `schemas`: action, feature and reward version/hash pairs plus rules audit version;
-- `profiles`: three objects, each containing `sample_budget`, native `ppo`
-  version/hash, `fixed_checkpoint` version/hash, `adaptive_checkpoint` version/hash,
+  native manifest/training/runtime byte limits, `snapshot_bytes=4096`,
   `max_samples` and `max_games`;
+- `schemas`: action, feature, reward and PPO version/hash pairs plus rules audit version;
+- `checkpoint`: the single native checkpoint version/hash;
 - `numeric_semantics`, documenting float, hash and adaptive-unit representations.
 
 Schema hashes are **16-digit lowercase hexadecimal strings**, not JSON floating
-numbers. SHA-256 hashes are 64-digit lowercase hexadecimal strings. Sample budget
-objects are `{name, code}` with this JSON protocol's stable mapping:
-`standard/0`, `annealed-v1/1`, `wide-annealed-v1/2`. These codes do not expose binary
-manifest offsets or imply an on-disk enum representation.
+numbers. SHA-256 hashes are 64-digit lowercase hexadecimal strings.
 
 Use a binary with the checkpoint's exact enabled features and model/schema
-identities. Model24/model25 and incompatible profiles are not migrated or guessed.
+identities. Checkpoints from other builds are rejected, never migrated or guessed.
 A CUDA-enabled inspection binary does not construct a CUDA device. Removing its
 CUDA build feature is not a substitute for matching checkpoint provenance.
 
@@ -70,7 +66,7 @@ Fields:
 - `run`: `git_commit`, `simulator_commit`, `enabled_features`, `command_line`,
   `run_seed`, `map`, `hero`, `device: {kind,ordinal}`, `batch_size`,
   and `rules_audit_version`. CPU ordinal is null.
-- `ppo`: `sample_budget`, `schema_version`, `schema_hash`,
+- `ppo`: `schema_version`, `schema_hash`,
   `decision_interval_ticks`, `rollout_decisions`, `environments`, `epochs`,
   `minibatch`, and all eleven floating hyperparameters: `clip_epsilon`,
   `value_coefficient`, `entropy_coefficient`, `learning_rate`, `adam_beta1`,

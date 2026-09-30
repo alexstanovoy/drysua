@@ -70,12 +70,11 @@ fn inspect_manifest(
     let (artifact, tensor_path, alias_matches) = load_payload(root, artifact, &mut files)?;
     let runtime = inspect_runtime(root, &artifact, &mut files)?;
     let history = history::verify(root, &artifact, &plan, &mut files)?;
-    let (version, hash) = artifact_identity(&artifact);
     Ok(json!({
         "schema": SCHEMA, "kind": plan.kind,
         "identity": {"manifest_sha256": hex(&sha256(manifest)), "tensor_sha256": hex(&artifact.tensor_hash),
             "runtime_sha256": runtime.hash, "scope_sha256": scope_hash(&artifact)?},
-        "model": projection::model(), "checkpoint": {"version": version, "hash": format!("{hash:016x}")},
+        "model": projection::model(), "checkpoint": projection::checkpoint(),
         "progress": projection::progress(&artifact, plan.games), "run": projection::run(&artifact.run),
         "ppo": projection::ppo(artifact.config), "adaptive": projection::adaptive(&artifact.progress),
         "history": history, "runtime_status": runtime.status, "runtime_matches_model": runtime.matches,
@@ -141,19 +140,17 @@ fn inspect_runtime(
         });
     };
     let hash = Some(hex(&sha256(&bytes)));
-    let expected = runtime_tensor_metadata_map(artifact.config.sample_budget);
-    let parameters =
-        match decode_runtime_tensor_with_metadata(&bytes, std::slice::from_ref(&expected)) {
-            Ok(parameters) => parameters,
-            Err(CheckpointError::SchemaMismatch) => {
-                return Ok(RuntimeInspection {
-                    status: "mismatch",
-                    matches: false,
-                    hash,
-                });
-            }
-            Err(error) => return Err(error),
-        };
+    let parameters = match decode_runtime_tensor(&bytes) {
+        Ok(parameters) => parameters,
+        Err(CheckpointError::SchemaMismatch) => {
+            return Ok(RuntimeInspection {
+                status: "mismatch",
+                matches: false,
+                hash,
+            });
+        }
+        Err(error) => return Err(error),
+    };
     let matches = parameters.len() == artifact.parameters.len()
         && parameters
             .iter()
@@ -184,23 +181,14 @@ fn read_recoverable_file(
     Ok((previous, bytes))
 }
 
-fn artifact_identity(artifact: &TrainingArtifact) -> (u32, u64) {
-    if artifact.progress.adaptive_environment.is_some() {
-        adaptive::schema_identity(artifact.config.sample_budget)
-    } else {
-        checkpoint_schema_identity(artifact.config.sample_budget)
-    }
-}
-
 fn scope_hash(artifact: &TrainingArtifact) -> Result<String, CheckpointError> {
     let mut writer = ManifestWriter::default();
     writer
         .bytes
         .extend_from_slice(b"drysua-checkpoint-inspection-scope/v1\0");
-    let (version, hash) = artifact_identity(artifact);
-    writer.u32(version);
-    writer.u64(hash);
-    encode_schema(&mut writer, artifact.config.sample_budget);
+    writer.u32(CHECKPOINT_SCHEMA_VERSION);
+    writer.u64(CHECKPOINT_SCHEMA_HASH);
+    encode_schema(&mut writer);
     encode_run(&mut writer, &artifact.run)?;
     encode_config(&mut writer, artifact.config)?;
     assert!(writer.bytes.len() <= MAX_META_BYTES as usize);

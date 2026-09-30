@@ -47,8 +47,8 @@ fn candidate_kl_preserves_trainer_reports_shuffle_and_optimizer_bits() {
         let model = PolicyModel::fresh(9101).expect("model");
         let reference = PolicyModel::fresh(9101).expect("reference");
         let config = PpoConfig {
-            environments: 1,
-            rollout_decisions: 3,
+            environments: 3,
+            rollout_decisions: 1,
             minibatch: 2,
             epochs: 2,
             target_kl,

@@ -1,115 +1,33 @@
-//! Capacity is proved by real M40/B40 updates plus bounded failure oracles.
+//! Capacity is proved by real M40 updates plus bounded failure oracles.
 
 use super::*;
 use crate::{CompletedTrainingEpisodes, TrainingGameOutcome};
 
 #[test]
-fn wide_capacity_m64_b64_and_m80_b40_collect_one_ppo_step_and_resume_exactly() {
-    for (games, parallel) in [(64, 64), (80, 40)] {
-        let baseline = test_directory("wide-baseline");
-        let resumed = test_directory("wide-resumed");
-        let config = wide_settings(games, parallel);
-        let expected = run(config.clone(), &baseline, false).expect("wide collection");
-        assert_eq!(expected.games, 2 * games as u64);
+fn partitions_admit_forty_games_and_reject_overflow() {
+    for parallel in [40, 8, 20] {
+        let mut config = expanded_settings(2);
+        config.parallel_worlds = parallel;
+        let validated = validate_annealed(&config, harness()).expect("candidate");
         assert_eq!(
-            expected.optimizer_step, 2,
-            "one full minibatch per shortened update"
-        );
-        let first = run_with(
-            config.clone(),
-            AnnealedHarness {
-                stop_after: Some(1),
-                ..harness()
-            },
-            &resumed,
-            false,
-        )
-        .expect("first committed update");
-        assert_eq!(first.games, games as u64);
-        assert_eq!(first.optimizer_step, 1);
-        let actual = run(config, &resumed, true).expect("wide resume");
-        assert_eq!(actual.rollout_samples, expected.rollout_samples);
-        assert_eq!(actual.optimizer_step, expected.optimizer_step);
-        assert_trajectory_equal(&baseline, &resumed);
-        std::fs::remove_dir_all(baseline).expect("cleanup baseline");
-        std::fs::remove_dir_all(resumed).expect("cleanup resumed");
-    }
-}
-
-fn wide_settings(games: usize, parallel: usize) -> AnnealedJobConfig {
-    let mut config = crate::cli::legacy_fixed_annealed_settings_for_test(&[
-        "--updates",
-        "2",
-        "--games",
-        &games.to_string(),
-        "--parallel",
-        &parallel.to_string(),
-        "--actor-pipeline-groups",
-        "1",
-        "--training-microbatch",
-        "64",
-        "--reuse-actor-values=false",
-        "--generation-games",
-        &(games * 5).to_string(),
-        "--epochs",
-        "1",
-        "--minibatch",
-        "160",
-        "--zero-updates",
-        "0",
-        "--seed",
-        "9001",
-    ])
-    .expect("wide CLI settings");
-    config.checkpoint_cadence = crate::TrainingCheckpointCadence::Updates(1);
-    config
-}
-
-#[test]
-fn wide_capacity_profiles_and_partitions_admit_candidates_and_reject_overflow() {
-    for (games, worlds, budget) in [
-        (40, 40, crate::PpoSampleBudget::Annealed),
-        (48, 48, crate::PpoSampleBudget::WideAnnealed),
-        (64, 64, crate::PpoSampleBudget::WideAnnealed),
-        (80, 40, crate::PpoSampleBudget::WideAnnealed),
-    ] {
-        let config = wide_settings(games, worlds);
-        assert_eq!(
-            validate_annealed(&config, harness())
-                .expect("candidate")
-                .sample_budget,
-            budget
-        );
-        assert_eq!(
-            config.ppo.environments * config.ppo.rollout_decisions,
-            games * 1163
+            validated.environments * validated.rollout_decisions,
+            40 * 1163
         );
     }
-    let mut invalid = wide_settings(80, 40);
+    let mut invalid = expanded_settings(2);
     invalid.parallel_worlds = 65;
     assert_eq!(
         validate_annealed(&invalid, harness()),
         Err(PpoError::InvalidConfig("annealed parallel worlds"))
     );
     invalid.parallel_worlds = 40;
-    invalid.games_per_update = 81;
+    invalid.games_per_update = 42;
     assert_eq!(
         validate_annealed(&invalid, harness()),
         Err(PpoError::InvalidConfig(
-            "annealed games per update must be even and within 2..=80"
+            "annealed games per update must be even and within 2..=40"
         ))
     );
-    let mut completed = CompletedTrainingEpisodes::default();
-    completed
-        .record(1, 79, TrainingGameOutcome::Win)
-        .expect("last wide game");
-    assert_eq!(
-        completed.record(1, 80, TrainingGameOutcome::Win),
-        Err(PpoError::InvalidTransition(
-            "completed episode tick or stream"
-        ))
-    );
-    assert_eq!(completed.ordered_outcomes(), [TrainingGameOutcome::Win]);
 }
 
 #[test]
@@ -172,14 +90,13 @@ fn expanded_jobs_enforce_capacity_and_partition_boundaries() {
     maximum.parallel_worlds = 40;
     let validated = validate_annealed(&maximum, AnnealedHarness::default()).expect("M40 B40");
     assert_eq!(validated.environments * validated.rollout_decisions, 46_520);
-    assert_eq!(validated.sample_budget, crate::PpoSampleBudget::Annealed);
     let directory = test_directory("invalid-capacity");
     for (games, parallel, generation, message) in [
         (
-            82,
+            42,
             40,
             200,
-            "annealed games per update must be even and within 2..=80",
+            "annealed games per update must be even and within 2..=40",
         ),
         (40, 65, 200, "annealed parallel worlds"),
         (
@@ -206,13 +123,6 @@ fn expanded_jobs_enforce_capacity_and_partition_boundaries() {
         );
         assert_eq!(std::fs::read_dir(&directory).expect("directory").count(), 0);
     }
-    maximum.ppo.sample_budget = crate::PpoSampleBudget::Standard;
-    assert_eq!(
-        validate_annealed(&maximum, harness()),
-        Err(PpoError::InvalidConfig(
-            "annealed PPO sample budget must match games per update"
-        ))
-    );
     std::fs::remove_dir_all(directory).expect("cleanup");
 }
 
@@ -222,18 +132,10 @@ fn shuffle_sample_and_optimizer_preflight_accept_max_updates_and_reject_max_plus
         (40, 4, 80, 4 * (46_520 - 1), "annealed shuffle RNG counter"),
         (40, 1, 80, 46_520, "annealed sample counter"),
         (40, 2, 1, 2 * 46_520, "annealed optimizer counter"),
-        (
-            80,
-            4,
-            2048,
-            4 * (93_040 - 1),
-            "annealed shuffle RNG counter",
-        ),
     ] {
         let mut config = expanded_settings(MAX_TRAINING_COUNTER / per_update);
         config.games_per_update = games;
         config.ppo.environments = games;
-        config.ppo.sample_budget = crate::PpoSampleBudget::for_annealed_games(games);
         config.ppo.epochs = epochs;
         config.ppo.minibatch = minibatch;
         assert_eq!(
@@ -253,14 +155,15 @@ fn shuffle_sample_and_optimizer_preflight_accept_max_updates_and_reject_max_plus
 }
 
 #[test]
-fn completed_episode_capacity_rejects_overflow_and_duplicate_merge_atomically() {
+fn completed_episode_capacity_rejects_overflow_atomically() {
     let mut completed = CompletedTrainingEpisodes::default();
     completed
-        .record(crate::MAP2_TICK_CAP, 79, TrainingGameOutcome::TimeCap)
+        .record(crate::MAP2_TICK_CAP, 39, TrainingGameOutcome::TimeCap)
         .expect("last valid tick and stream");
     let before = completed;
+    assert_eq!(completed.ordered_outcomes(), [TrainingGameOutcome::TimeCap]);
     assert_eq!(
-        completed.record(1, 80, TrainingGameOutcome::Win),
+        completed.record(1, 40, TrainingGameOutcome::Win),
         Err(PpoError::InvalidTransition(
             "completed episode tick or stream"
         ))

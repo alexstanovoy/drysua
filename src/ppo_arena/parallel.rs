@@ -30,7 +30,7 @@ impl<'scope, T: Send + 'scope, R: Send + 'scope, O: Send + 'scope> StreamWorkers
         name_prefix: &str,
         operation: impl Fn(usize, &mut T, R) -> Result<O, PpoError> + Send + Sync + Copy + 'scope,
     ) -> Result<Self, PpoError> {
-        if worlds.is_empty() || worlds.len() > crate::PPO_ANNEALED_MAX_PARALLEL_WORLDS {
+        if worlds.is_empty() || worlds.len() > crate::PPO_MAX_PARALLEL_WORLDS {
             return Err(PpoError::InvalidConfig("stream worker environments"));
         }
         assert!(!name_prefix.is_empty());

@@ -91,7 +91,7 @@ fn actor_pipeline_cli_real_defaults_validate_m40_b20_g2_and_keep_exact_adaptive_
         concat!(
             "train-annealed --updates 200 --games 40 --parallel 20 --generation-games 160",
             " --zero-updates 40 --epochs 4 --minibatch 2048 --seed 9001 --map 2 --device cpu",
-            " --sample-budget annealed-v1 --opponent teacher --reuse-actor-values",
+            " --opponent teacher --reuse-actor-values",
             " --actor-pipeline-groups 2 --training-microbatch 256",
             " --environment-schedule adaptive --environment-success-updates 2",
             " --environment-success-rate 0.8 --environment-poor-updates 1",
@@ -175,13 +175,12 @@ fn actor_pipeline_cli_explicit_g4_b10_validates_with_other_real_defaults() {
 
 #[test]
 fn actor_pipeline_rejects_invalid_groups_partial_waves_and_eighty_active_worlds() {
-    for (groups, games, parallel) in [(2, 4, 2), (4, 40, 10), (4, 64, 16)] {
+    for (groups, games, parallel) in [(2, 4, 2), (4, 40, 10), (4, 32, 8)] {
         let mut options = pipeline_settings(groups);
         options.games_per_update = games;
         options.parallel_worlds = parallel;
         options.games_per_generation = parallel as u64;
         options.ppo.environments = games;
-        options.ppo.sample_budget = PpoSampleBudget::for_annealed_games(games);
         assert_eq!(options.execution.training_microbatch, 64);
         assert_eq!(
             validate_annealed(&options, harness()).expect("teacher groups"),
@@ -217,7 +216,6 @@ fn actor_pipeline_rejects_invalid_groups_partial_waves_and_eighty_active_worlds(
         options.parallel_worlds = parallel;
         options.games_per_generation = parallel as u64;
         options.ppo.environments = games;
-        options.ppo.sample_budget = PpoSampleBudget::for_annealed_games(games);
         assert_eq!(
             validate_annealed(&options, harness()),
             Err(PpoError::InvalidConfig(message))

@@ -70,7 +70,6 @@ fn annealed_cli_resolves_hardware_independent_m40_b20_profile_without_changing_p
         crate::PpoConfig {
             environments: 40,
             rollout_decisions: crate::MAP2_RETAINED_DECISIONS,
-            sample_budget: crate::PpoSampleBudget::Annealed,
             decision_interval_ticks: 3,
             gamma_tick: 1.0,
             ..Default::default()
@@ -160,7 +159,7 @@ fn annealed_cli_rejects_small_games_with_default_parallel_before_directory_acces
 
 #[cfg(feature = "builtin")]
 #[test]
-fn annealed_cli_requires_group_one_or_batched_inference_for_weights_and_micro64_for_wide_budget() {
+fn annealed_cli_requires_group_one_or_batched_inference_for_weights_and_rejects_eighty_games() {
     let settings = |extra: &[&str]| {
         arguments(extra)
             .annealed_settings("drysua".into(), "bota".into())
@@ -202,18 +201,8 @@ fn annealed_cli_requires_group_one_or_batched_inference_for_weights_and_micro64_
         crate::ppo_arena::validate_annealed(&wide, Default::default())
             .unwrap_err()
             .to_string(),
-        "invalid PPO config field: training microbatch exceeds 12 GiB admission budget"
+        "invalid PPO config field: annealed games per update must be even and within 2..=40"
     );
-    let wide = settings(&[
-        "--games",
-        "80",
-        "--actor-pipeline-groups",
-        "1",
-        "--training-microbatch",
-        "64",
-        "--reuse-actor-values=false",
-    ]);
-    crate::ppo_arena::validate_annealed(&wide, Default::default()).unwrap();
 }
 
 #[test]

@@ -42,7 +42,6 @@ use crate::{
 };
 use crate::{MAP2_REWARD_GAMMA_TICK, Map2RewardBreakdown, Map2RewardEnd};
 
-pub(crate) use crate::map2_contract::MAX_TRAINING_ENVIRONMENTS as TRAINING_MAX_ENVIRONMENTS;
 const READINESS_ORDER_HISTORY: usize = 32;
 const _: () = assert!(PPO_MAX_ROLLOUT_DECISIONS <= crate::PPO_MAX_SAMPLES);
 
@@ -327,12 +326,7 @@ impl TrainingSession {
             TrainingArtifact::capture(&self.model, &self.trainer, self.run.clone(), progress)
                 .map_err(text_error)?;
         let outcome = artifact.save(directory).map_err(text_error)?;
-        TrainingArtifact::save_runtime_weights_with_budget(
-            &self.model,
-            directory,
-            self.trainer.config().sample_budget,
-        )
-        .map_err(text_error)?;
+        TrainingArtifact::save_runtime_weights(&self.model, directory).map_err(text_error)?;
         let cleanup_warning = match outcome {
             CheckpointSaveOutcome::Committed => None,
             CheckpointSaveOutcome::CommittedWithCleanupError(message) => Some(message),
@@ -666,7 +660,7 @@ fn setup_seat(index: usize, messages: &[ServerMsg]) -> Result<ArenaSeatPolicy, P
 }
 
 fn actor_stream_rngs(master: &mut PpoRng, count: usize) -> Result<Vec<PpoRng>, PpoError> {
-    if count == 0 || count > crate::PPO_ANNEALED_MAX_PARALLEL_WORLDS {
+    if count == 0 || count > crate::PPO_MAX_PARALLEL_WORLDS {
         return Err(PpoError::InvalidConfig("actor RNG streams"));
     }
     (0..count)

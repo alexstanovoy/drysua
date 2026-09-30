@@ -25,25 +25,12 @@ pub(crate) use test_support::*;
 
 /// Maximum concurrently interleaved environment-seat rollout streams.
 pub const PPO_MAX_STREAMS: usize = 1_280;
-/// Maximum transitions retained for a standard policy update.
-pub const PPO_MAX_SAMPLES: usize = 32_768;
-/// Maximum complete episodes retained by an annealed sequential update.
-pub const PPO_ANNEALED_MAX_GAMES: usize = 40;
-/// Annealed capacity does not increase concurrent worlds or optimizer minibatches.
-pub const PPO_ANNEALED_MAX_SAMPLES: usize = PPO_ANNEALED_MAX_GAMES * crate::MAP2_RETAINED_DECISIONS;
-/// Wide full-episode profile; episodes and simultaneously active worlds are independent.
-pub const PPO_WIDE_ANNEALED_MAX_GAMES: usize = 80;
-pub const PPO_ANNEALED_MAX_PARALLEL_WORLDS: usize = 64;
-pub const PPO_WIDE_ANNEALED_MAX_SAMPLES: usize =
-    PPO_WIDE_ANNEALED_MAX_GAMES * crate::MAP2_RETAINED_DECISIONS;
-/// Admission ledger: capped arena peak, compact/prepared/shuffle rows, one dense minibatch,
-/// and 2 GiB reserved for native worlds, actor buffers/stacks, model state and allocator overhead.
-/// The runtime guard still enforces total RSS; optional learning-side storage shares the reserve.
-pub const PPO_WIDE_ANNEALED_PAYLOAD_BOUND_BYTES: u64 =
-    crate::feature::wide_feature_arena_peak_bytes()
-        + PPO_WIDE_ANNEALED_MAX_SAMPLES as u64 * 8_192
-        + MODEL_MAX_BATCH as u64 * 70_000
-        + 2 * 1024 * 1024 * 1024;
+/// Maximum complete episodes in one policy update.
+pub const PPO_MAX_GAMES: usize = 40;
+/// Maximum transitions retained for one policy update.
+pub const PPO_MAX_SAMPLES: usize = PPO_MAX_GAMES * crate::MAP2_RETAINED_DECISIONS;
+/// Maximum simultaneously active worlds, independent of games per update.
+pub const PPO_MAX_PARALLEL_WORLDS: usize = 64;
 const _: () = assert!(
     std::mem::size_of::<CompactPpoTransition>()
         + std::mem::size_of::<CompactPreparedSample>()
@@ -51,21 +38,19 @@ const _: () = assert!(
         <= 8_192
 );
 const _: () = assert!(std::mem::size_of::<PpoPreparedSample>() <= 70_000);
-const _: () = assert!(PPO_WIDE_ANNEALED_PAYLOAD_BOUND_BYTES <= 12 * 1024 * 1024 * 1024);
-const _: () = assert!(PPO_WIDE_ANNEALED_MAX_GAMES <= PPO_MAX_STREAMS);
-const _: () = assert!(PPO_ANNEALED_MAX_PARALLEL_WORLDS <= crate::MODEL_TRAINING_BATCH);
+const _: () = assert!(PPO_MAX_GAMES <= PPO_MAX_STREAMS);
+const _: () = assert!(PPO_MAX_PARALLEL_WORLDS <= crate::MODEL_TRAINING_BATCH);
 /// Conservative rollout storage plus one fully materialized effective minibatch.
 /// Includes arena reallocation overlap, both preparation vectors and shuffle order;
 /// excludes allocator overhead, model/optimizer tensors and native simulator worlds.
-pub const PPO_ANNEALED_STORAGE_PEAK_BYTES: u64 = crate::feature::ANNEALED_FEATURE_ARENA_PEAK_BYTES
-    + PPO_ANNEALED_MAX_SAMPLES as u64
+pub const PPO_STORAGE_PEAK_BYTES: u64 = crate::feature::FEATURE_ARENA_PEAK_BYTES
+    + PPO_MAX_SAMPLES as u64
         * (std::mem::size_of::<CompactPpoTransition>()
             + std::mem::size_of::<CompactPreparedSample>()
             + std::mem::size_of::<usize>()) as u64
     + MODEL_MAX_BATCH as u64 * std::mem::size_of::<PpoPreparedSample>() as u64;
-const _: () = assert!(PPO_ANNEALED_MAX_GAMES <= PPO_MAX_STREAMS);
-const _: () = assert!(PPO_ANNEALED_MAX_SAMPLES == 46_520);
-const _: () = assert!(PPO_ANNEALED_STORAGE_PEAK_BYTES < 6 * 1024 * 1024 * 1024);
+const _: () = assert!(PPO_MAX_SAMPLES == 46_520);
+const _: () = assert!(PPO_STORAGE_PEAK_BYTES < 6 * 1024 * 1024 * 1024);
 /// Maximum decisions retained from each environment in one policy update.
 pub const PPO_MAX_ROLLOUT_DECISIONS: usize = 16_384;
 /// Maximum random draws made by one autoregressive policy sample.
@@ -77,43 +62,32 @@ pub const PPO_SHAPING_BUDGET: f32 = 100.0 / PPO_REWARD_SCALE;
 pub const PPO_TERMINAL_REWARD: f32 = 1.0;
 const _: () = assert!(PPO_TERMINAL_REWARD > PPO_SHAPING_BUDGET);
 /// Version of rollout, GAE, objective, optimizer, and reward semantics.
-pub const PPO_SCHEMA_VERSION: u32 = 37;
-/// Audited simulator and learner rules required by stage-nine rollouts.
+pub const PPO_SCHEMA_VERSION: u32 = 40;
+/// Audited simulator and learner rules required by rollouts.
 pub const PPO_RULES_AUDIT_VERSION: u32 = 32;
-/// Canonical stage-nine learner contract covered by [`PPO_SCHEMA_HASH`].
-macro_rules! ppo_schema_descriptor {
-    ($contract:literal, $initialization:literal) => { concat!(
-    "bota-drysua-ppo/v37;",
+/// Canonical learner contract covered by [`PPO_SCHEMA_HASH`].
+pub const PPO_SCHEMA_DESCRIPTOR: &str = concat!(
+    "bota-drysua-ppo/v40;",
     "linked_schemas=action,feature,model,map2_reward;linked_hash=fnv1a_descriptor_then_ordered_version_le32_hash_le64_then_map2_reward_descriptor_utf8;rules_audit=32;",
     "scope=map2_mid_only_dota_geometry_mid_waves_second_hero_death_or_first_tower_loss_simultaneous_draw_cap27900_including900_pregame_cap_tick_draw;",
-    "candidate_order=feature19_live_neural_ppo_learner_and_current_m21_policy_sharedpolicy_opponents_including_current_accepted_new_run_historical_snapshots_and_restart,frozen_weights_not_legacy_execution;observer=explicit_from_trajectory_start,effective_directive_ledger_follows_all_actual_sends_complete_snapshot_events_lifecycle_rejections_even_without_retained_rows,never_deduplicates_transport,never_sends_labels_or_claims_successful_execution;teacher=original_strategy_no_learner_override;prediction=observer_only_never_execution_opt_in,no_role_bit_in_tensors;reconstruction=explicit_role_observations_actual_sends_rejections_bounded_ledgers,late_enable_after_actual_send_rejected,no_enriched_history;",
-    $initialization,
-    "warmup=map2_raw_neural_greedy_actions,no_learner_teacher_override_or_send_sync,independent_scheduled_opponent,frozen_policy_opponents_raw_neural_sampling;",
-    "bounds=rollout32768,streams1280,environments128,decisions16384,epochs16,minibatch8192,microbatch64;",
-    "complete_episodes=map2_paired_sides,retain_original_action_logprob_exact_elapsed_ticks_and_all_intervening_reward,terminal_zero_bootstrap_partial_flush,no_synthetic_zero_tick_samples,empty_optimizer_batch_rejected,natural_episode_checkpoint_boundary;lambda1=full_monte_carlo_f64_return_recurrence;",
-    "terminal=win.2_loss-.2_draw0_timecap-.2,victory_time=win_only_native_ticks_full.2_to9000_linear_to0_at21600,draw_and_timecap_are_nonwins_distinct_labels,infrastructure_failure_invalidates_not_fabricated_outcome;legacy_reward_profiles=not_map2_comprehensive_reward;",
+    "collection=annealed_complete_episodes,games_even2to40,retained1163_per_game,samples46520_max,parallel_worlds1to64,one_frozen_policy_one_PPO_update_all_retained_samples;",
+    "candidate_order=live_neural_ppo_learner_and_frozen_sharedpolicy_opponents,effective_directive_ledger_follows_all_actual_sends;teacher=original_strategy_no_learner_override;",
+    "bounds=streams1280,environments128,decisions16384,epochs16,minibatch8192,microbatch64_128_256;",
+    "complete_episodes=map2_balanced_sides,retain_original_action_logprob_exact_elapsed_ticks_and_all_intervening_reward,terminal_zero_bootstrap_partial_flush,no_synthetic_zero_tick_samples,empty_optimizer_batch_rejected;lambda1=full_monte_carlo_f64_return_recurrence;",
+    "terminal=win.2_loss-.2_draw0_timecap-.2,victory_time=win_only_native_ticks_full.2_to9000_linear_to0_at21600,draw_and_timecap_are_nonwins_distinct_labels,infrastructure_failure_invalidates_not_fabricated_outcome;",
     "wire_rebase=bota78427bb_missed_event_ignored_without_damage_or_healing_cheat_order_never_issued_or_honoured_NoCheats_rejected_without_reward,attack_time_ms_converted_to_ticks,bound_combat_and_collision_clearance_no_terminal_or_shaping_change;",
-    "actor=frozen_exact_policy_identity,batch_max64_single_shared_trunk_forward,independent_per_environment_rng_seeded_from_checkpointed_master,transactional_batch_rng,legal_masked_gumbel_max_open_f64_uniform,exact_autoregressive_log_probability_and_entropy;",
+    "actor=frozen_exact_policy_identity,batch_max64_single_shared_trunk_forward,side_selected_radiant_dire_actor_heads,independent_per_environment_rng_seeded_from_checkpointed_master,transactional_batch_rng,legal_masked_gumbel_max_open_f64_uniform,exact_autoregressive_log_probability_and_entropy;",
     "gae=map2_gamma_tick1_required,lambda0.98,terminal_reset,bootstrap_collector_truncation_not_task_terminal,normalized_advantages;",
     "objective=clipped_surrogate0.2,value_mse0.5,entropy0.01,target_kl0.02;",
-    "critic=ppo_only_detached_value_head_input,value_head_only_regression,bc_and_public_training_forward_unchanged;",
+    "critic=ppo_only_detached_value_head_input,value_head_only_regression;",
     "optimizer=adam_lr3e-6_beta1_0.9_beta2_0.999_epsilon1e-5_global_clip0.5,weighted_host_microbatch_accumulation,transactional_parameters_moments_shuffle;",
     "kl_guard=pre_step_rejection,post_step_sample_weighted_complete_effective_minibatch_rollout_policy_kl,candidate_exceeds_target_or_evaluation_error_restores_exact_parameters_adam_moments_step_policy_revision_under_exclusive_parameter_lock,applied_report_post_step_kl,rejected_report_candidate_kl;",
-    "reward=linked_map2_reward6_schema_version_hash_and_full_descriptor,seat_only_full_contiguous_snapshot_events_before_retention_or_tracker_journal,exclusive_incoming_tower_channel_and_one_shot_first_wave_position_cost;wait_and_progress=unchanged_debt0_inactive_add1_including_death_cap2700_activity_refresh30_current_consumed_active_repay3_base.02_once_then_inactive_cap.000002_rearm_only_zero_no_stagnation_refund,no_clipping;activity=unchanged_counter_deltas_and_original_events_direct_own_effect3_positive_ticks_even_full_or_lingering_purchase_partial_lease_only;accounting_state=feature20_global92_all_indices_preserved_tower_remaining90_opening_pending91;dominance=none_even_full_native_initial_tower_and_lane_phi0_negative1.0488_positive.445_sum1.4938_exceeds_win_draw_gap.2_and_win_loss_gap.4;general_primed_negative1.4488_positive.845_no_unconditional_dominance;simple_wait=unchanged_v2_any_movement_or_resource_break_resets_any_own_purchase_full_open_period_refund_no_price_intent_antiabuse_conditions;no_action_or_Teacher_override;",
-    "arena=one_learner_seat_against_independent_opponent,snapshot_then_explicit_events_including_empty_complete_every_visible_tick,decision_after_tick_complete,decision_interval3,default_all_policy_decision_ticks1_plus3n,pregame_enabled,batched_bootstrap,restart_on_terminal,complete_frozen_side_pairs_require_even_production_environments,paired_side_seed_and_warmup_phase,on_policy_greedy_burn_in,eight_phase_blocks_alternate_weak_teacher,clear_hero_and_courier_warmup_orders,hero_identity_change_invalidates_local_body_order,hero_active_order_feature_ignores_courier_orders;",
-    "navigation=existing_walkable_building_landing_points_allow_MovePoint_only,AttackMovePoint_source_veto_unchanged,tp_tree_collision_provenance_unchanged,no_goal_features_or_forced_retreat,seat_visible_channel_masks_cast_and_use,seat_visible_item_mute_masks_use,put_point_underfoot_only;",
-    "deployment=raw_map2_mid_neural_policy_no_teacher_override_or_strategic_masks,action5_mango_public_readiness_unchanged,feature19_anonymous_raze_effect15_guarded13_inspired14_manual_hp_mana_reports_wait_progress_tower_and_opening_accounting,raw_ppo_sampling_remains_on_policy;",
+    "reward=linked_map2_reward_schema_version_hash_and_full_descriptor,seat_only_full_contiguous_snapshot_events_before_retention_or_tracker_journal;no_action_or_Teacher_override;",
+    "arena=one_learner_seat_against_independent_frozen_opponent,snapshot_then_explicit_events_including_empty_complete_every_visible_tick,decision_after_tick_complete,decision_interval3,pregame_enabled,batched_bootstrap,hero_identity_change_invalidates_local_body_order,hero_active_order_feature_ignores_courier_orders;",
+    "navigation=existing_walkable_building_landing_points_allow_MovePoint_only,AttackMovePoint_source_veto_unchanged,no_goal_features_or_forced_retreat,seat_visible_channel_masks_cast_and_use,seat_visible_item_mute_masks_use,put_point_underfoot_only;",
+    "deployment=raw_map2_mid_neural_policy_no_teacher_override_or_strategic_masks;",
     "teacher_economy=custom_bota_wraith_band_tango_boots_optional_stick_gloves_belt_once_only;",
-    "historical_evidence=map0_map1_weights_binaries_results_unchanged_not_map2_qualification,no_old_corpus_relabel;",
-    "pipeline=bounded_cpu_worker_endpoints,smoke_and_league_persistent_actor_thread,production_actor_uses_same_identity_learner_device_model_then_serial_learner_update,immutable_identity_bound_actor_lease,exactly_two_fixed_capacity_buffer_permits,one_generation_lag_allowed,two_generation_lag_rejected,live_generation_read_guard_held_through_optimizer_update,ragged_feature_arenas,bit_packed_behavioral_masks,padding_only_per_minibatch,explicit_cpu_cuda_metal_learner_selection;",
-    $contract,
-    "mastery_v1=opt_in_weak_then_teacher_same_opponent_full_batch,ordered_completed_training_games_by_terminal_tick_then_stream,last_window_default50_max1024_min_full_window,integer_100wins_ge_percent_times_window_default80_per_opponent_overrides1to100,evict_oldest_no_alltime_or_streak,draw_loss_taskcap_nonwins_errors_not_games;promotion=once_after_successful_PPO_batch_next_stage_window_empty,completed_retains_qualifying_teacher_window_forced_coherent_checkpoint_and_normal_stop,update_and_resource_budgets_remain,no_separate_eval_gate,no_stage_feature;checkpoint9=unchanged_mastery_codec_typed_config_current_stage_entire_ordered_window_with_parameters_Adam_RNG_progress;teacher_default_and_weak_warmup_v1_selection_unchanged;"
-    ) };
-}
-
-pub const PPO_SCHEMA_DESCRIPTOR: &str = ppo_schema_descriptor!(
-    "current_contract=feature22_model25_reward7;actors=side_selected_radiant_dire_shared_trunk_critic;initialization=current_runtime_weights_parameters_only_fresh_optimizer_progress_rng;",
-    "artifacts=strict_model25_runtime_and_resume;"
+    "initialization=current_runtime_weights_parameters_only_fresh_optimizer_progress_rng;"
 );
 
 /// FNV-1a of the descriptor, ordered linked identities, and reward descriptor.
@@ -135,97 +109,9 @@ const _: () = assert!(FEATURE_SCHEMA_VERSION == 22);
 const _: () = assert!(MODEL_SCHEMA_VERSION == 25);
 const _: () = assert!(PPO_RULES_AUDIT_VERSION == 32);
 
-/// Explicit capacity extension; the standard PPO identity is never redefined.
-pub const PPO_ANNEALED_SCHEMA_VERSION: u32 = 38;
-pub const PPO_ANNEALED_SCHEMA_DESCRIPTOR: &str = concat!(
-    "bota-drysua-ppo/v38;linked_schemas=ppo37;",
-    "extension=annealed_full_episode_capacity_v1;",
-    "bounds=rollout46520,episodes_even2to40,retained_per_episode1163,parallel_worlds1to26;",
-    "dimensions=map2_decision_interval3_gamma_tick1;",
-    "collection=sequential_batches_one_frozen_policy_one_PPO_update_all_retained_samples;",
-    "standard_profile=ppo37_unchanged_rollout32768;pipeline=standard_only;",
-    "unchanged=model_feature_action_reward_retention_GAE_normalization_optimizer_minibatch_microbatch;",
-    "runtime=exact_ppo37_or_ppo38_metadata_tuple_inference_compatible_no_parameter_conversion;",
-    "checkpoint=explicit_profile_no_cross_profile_resume;"
-);
-pub const PPO_ANNEALED_SCHEMA_HASH: u64 = crate::model::linked_schema_hash(
-    PPO_ANNEALED_SCHEMA_DESCRIPTOR,
-    &[(PPO_SCHEMA_VERSION, PPO_SCHEMA_HASH)],
-);
-
-/// Separate capacity identity: existing PPO37/38 descriptors and hashes stay immutable.
-pub const PPO_WIDE_ANNEALED_SCHEMA_VERSION: u32 = 39;
-pub const PPO_WIDE_ANNEALED_SCHEMA_DESCRIPTOR: &str = concat!(
-    "bota-drysua-ppo/v39;linked_schemas=ppo38;extension=wide_annealed_full_episode_capacity_v1;",
-    "bounds=rollout93040,episodes_even2to80,retained_per_episode1163,parallel_worlds1to64,actor_batch64;",
-    "collection=sequential_batches_one_frozen_policy_one_PPO_update_all_retained_samples;",
-    "storage=capped_fallible_arenas,conservative_payload_ledger_le12GiB_including2GiB_nonrollout_reserve;",
-    "unchanged=tensors_inference_feature_action_reward_retention_GAE_optimizer_minibatch_microbatch;",
-    "runtime=exact_ppo37_or_ppo38_or_ppo39_tuple;checkpoint=explicit_profile_no_cross_profile_resume;"
-);
-pub const PPO_WIDE_ANNEALED_SCHEMA_HASH: u64 = crate::model::linked_schema_hash(
-    PPO_WIDE_ANNEALED_SCHEMA_DESCRIPTOR,
-    &[(PPO_ANNEALED_SCHEMA_VERSION, PPO_ANNEALED_SCHEMA_HASH)],
-);
-
-/// Closed set of audited rollout capacities, not an arbitrary allocation limit.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum PpoSampleBudget {
-    #[default]
-    Standard,
-    Annealed,
-    WideAnnealed,
-}
-
-impl PpoSampleBudget {
-    pub const fn max_samples(self) -> usize {
-        match self {
-            Self::Standard => PPO_MAX_SAMPLES,
-            Self::Annealed => PPO_ANNEALED_MAX_SAMPLES,
-            Self::WideAnnealed => PPO_WIDE_ANNEALED_MAX_SAMPLES,
-        }
-    }
-
-    pub const fn max_games(self) -> usize {
-        match self {
-            Self::Standard => 128,
-            Self::Annealed => PPO_ANNEALED_MAX_GAMES,
-            Self::WideAnnealed => PPO_WIDE_ANNEALED_MAX_GAMES,
-        }
-    }
-
-    /// Canonical annealed selection; callers still validate game counts and dimensions.
-    pub const fn for_annealed_games(games: usize) -> Self {
-        if games > PPO_ANNEALED_MAX_GAMES {
-            Self::WideAnnealed
-        } else if games > crate::MAX_TRAINING_ENVIRONMENTS {
-            Self::Annealed
-        } else {
-            Self::Standard
-        }
-    }
-
-    pub const fn schema_version(self) -> u32 {
-        match self {
-            Self::Standard => PPO_SCHEMA_VERSION,
-            Self::Annealed => PPO_ANNEALED_SCHEMA_VERSION,
-            Self::WideAnnealed => PPO_WIDE_ANNEALED_SCHEMA_VERSION,
-        }
-    }
-
-    pub const fn schema_hash(self) -> u64 {
-        match self {
-            Self::Standard => PPO_SCHEMA_HASH,
-            Self::Annealed => PPO_ANNEALED_SCHEMA_HASH,
-            Self::WideAnnealed => PPO_WIDE_ANNEALED_SCHEMA_HASH,
-        }
-    }
-}
-
-/// Stage-nine PPO hyperparameters and bounded rollout dimensions.
+/// PPO hyperparameters and bounded rollout dimensions.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PpoConfig {
-    pub sample_budget: PpoSampleBudget,
     pub decision_interval_ticks: u32,
     pub rollout_decisions: usize,
     pub environments: usize,
@@ -247,7 +133,6 @@ pub struct PpoConfig {
 impl Default for PpoConfig {
     fn default() -> Self {
         Self {
-            sample_budget: PpoSampleBudget::Standard,
             decision_interval_ticks: 3,
             rollout_decisions: 256,
             environments: 32,
@@ -271,7 +156,6 @@ impl Default for PpoConfig {
 impl PpoConfig {
     /// Validates every finite range and fixed upper bound.
     pub fn validate(self) -> Result<Self, PpoError> {
-        self.validate_sample_budget()?;
         if self.decision_interval_ticks == 0 {
             return Err(PpoError::InvalidConfig("decision interval"));
         }
@@ -285,7 +169,7 @@ impl PpoConfig {
             .rollout_decisions
             .checked_mul(self.environments)
             .ok_or(PpoError::InvalidConfig("samples per update"))?;
-        if samples > self.sample_budget.max_samples() {
+        if samples > PPO_MAX_SAMPLES {
             return Err(PpoError::InvalidConfig("samples per update"));
         }
         if self.minibatch == 0 || self.minibatch > samples || self.minibatch > MODEL_MAX_BATCH {
@@ -296,19 +180,6 @@ impl PpoConfig {
         }
         validate_probabilities(self)?;
         Ok(self)
-    }
-
-    fn validate_sample_budget(self) -> Result<(), PpoError> {
-        if self.sample_budget != PpoSampleBudget::Standard
-            && (!(2..=self.sample_budget.max_games()).contains(&self.environments)
-                || !self.environments.is_multiple_of(2)
-                || self.rollout_decisions != crate::MAP2_RETAINED_DECISIONS
-                || self.decision_interval_ticks != crate::MAP2_DECISION_INTERVAL_TICKS
-                || self.gamma_tick != crate::MAP2_REWARD_GAMMA_TICK)
-        {
-            return Err(PpoError::InvalidConfig("annealed full-episode dimensions"));
-        }
-        Ok(())
     }
 
     pub(crate) fn adam(self) -> AdamConfig {
@@ -359,12 +230,6 @@ pub enum PpoError {
     Capacity {
         capacity: usize,
     },
-    AnnealedCapacity {
-        capacity: usize,
-    },
-    WideAnnealedCapacity {
-        capacity: usize,
-    },
     RolloutFull {
         capacity: usize,
     },
@@ -402,14 +267,6 @@ impl fmt::Display for PpoError {
             Self::Capacity { capacity } => write!(
                 formatter,
                 "PPO rollout capacity {capacity} is outside 1..={PPO_MAX_SAMPLES}"
-            ),
-            Self::AnnealedCapacity { capacity } => write!(
-                formatter,
-                "PPO annealed rollout capacity {capacity} is outside 1..={PPO_ANNEALED_MAX_SAMPLES}"
-            ),
-            Self::WideAnnealedCapacity { capacity } => write!(
-                formatter,
-                "PPO wide annealed rollout capacity {capacity} is outside 1..={PPO_WIDE_ANNEALED_MAX_SAMPLES}"
             ),
             Self::RolloutFull { capacity } => {
                 write!(formatter, "PPO rollout reached capacity {capacity}")
@@ -648,7 +505,6 @@ fn validate_transition(transition: &PpoTransition) -> Result<(), PpoError> {
 /// Fixed-capacity rollout tied to one immutable actor policy version.
 pub struct PpoRollout {
     policy: PolicyIdentity,
-    sample_budget: PpoSampleBudget,
     capacity: usize,
     transitions: Vec<CompactPpoTransition>,
     frames: RaggedFeatureArena,
@@ -671,47 +527,24 @@ struct CompactPpoTransition {
 }
 
 impl PpoRollout {
+    /// A smaller test/collector buffer may retain fewer than a full update.
     pub fn new(capacity: usize, policy: PolicyIdentity) -> Result<Self, PpoError> {
-        Self::with_budget(capacity, policy, PpoSampleBudget::Standard)
+        if !(1..=PPO_MAX_SAMPLES).contains(&capacity) {
+            return Err(PpoError::Capacity { capacity });
+        }
+        Ok(Self {
+            policy,
+            capacity,
+            transitions: rollout_storage(capacity)?,
+            frames: RaggedFeatureArena::new(capacity).map_err(PpoError::InvalidTransition)?,
+            next_decision: [None; PPO_MAX_STREAMS],
+        })
     }
 
     /// Reserves the complete validated update without coupling games to worlds.
     pub fn for_config(config: PpoConfig, policy: PolicyIdentity) -> Result<Self, PpoError> {
         let config = config.validate()?;
-        Self::with_budget(
-            config.environments * config.rollout_decisions,
-            policy,
-            config.sample_budget,
-        )
-    }
-
-    /// A smaller test/collector buffer may retain fewer than the profile maximum.
-    pub fn with_budget(
-        capacity: usize,
-        policy: PolicyIdentity,
-        sample_budget: PpoSampleBudget,
-    ) -> Result<Self, PpoError> {
-        if !(1..=sample_budget.max_samples()).contains(&capacity) {
-            return Err(match sample_budget {
-                PpoSampleBudget::Standard => PpoError::Capacity { capacity },
-                PpoSampleBudget::Annealed => PpoError::AnnealedCapacity { capacity },
-                PpoSampleBudget::WideAnnealed => PpoError::WideAnnealedCapacity { capacity },
-            });
-        }
-        Ok(Self {
-            policy,
-            sample_budget,
-            capacity,
-            transitions: rollout_storage(capacity, sample_budget)?,
-            frames: match sample_budget {
-                PpoSampleBudget::Standard => RaggedFeatureArena::new(capacity),
-                PpoSampleBudget::Annealed => RaggedFeatureArena::new_bounded(capacity)
-                    .map_err(PpoError::InvalidTransition)?,
-                PpoSampleBudget::WideAnnealed => RaggedFeatureArena::new_wide_bounded(capacity)
-                    .map_err(PpoError::InvalidTransition)?,
-            },
-            next_decision: [None; PPO_MAX_STREAMS],
-        })
+        Self::new(config.environments * config.rollout_decisions, policy)
     }
 
     pub fn push(&mut self, transition: PpoTransition) -> Result<(), PpoError> {
@@ -724,13 +557,7 @@ impl PpoRollout {
                 capacity: self.capacity,
             });
         }
-        self.validate_episode_transition(&transition)?;
-        let first = if self.sample_budget != PpoSampleBudget::Standard {
-            0
-        } else {
-            transition.decision
-        };
-        let expected = self.next_decision[transition.stream].unwrap_or(first);
+        let expected = self.next_decision[transition.stream].unwrap_or(transition.decision);
         if transition.decision != expected {
             return Err(PpoError::DecisionSequence {
                 stream: transition.stream,
@@ -764,20 +591,6 @@ impl PpoRollout {
         Ok(())
     }
 
-    fn validate_episode_transition(&self, transition: &PpoTransition) -> Result<(), PpoError> {
-        if self.sample_budget != PpoSampleBudget::Standard {
-            if transition.stream >= self.sample_budget.max_games() {
-                return Err(PpoError::StreamOutOfRange {
-                    stream: transition.stream,
-                });
-            }
-            if transition.decision as usize >= crate::MAP2_RETAINED_DECISIONS {
-                return Err(PpoError::InvalidTransition("annealed retained decisions"));
-            }
-        }
-        Ok(())
-    }
-
     pub fn len(&self) -> usize {
         self.transitions.len()
     }
@@ -795,16 +608,12 @@ impl PpoRollout {
             return Err(PpoError::EmptyRollout);
         }
         let config = config.validate()?;
-        if self.sample_budget != config.sample_budget {
-            return Err(PpoError::InvalidConfig("rollout sample budget"));
-        }
-        if self.sample_budget != PpoSampleBudget::Standard
-            && (self.len() > config.environments * config.rollout_decisions
-                || self.next_decision[config.environments..]
-                    .iter()
-                    .any(Option::is_some))
+        if self.len() > config.environments * config.rollout_decisions
+            || self.next_decision[config.environments..]
+                .iter()
+                .any(Option::is_some)
         {
-            return Err(PpoError::InvalidConfig("annealed rollout dimensions"));
+            return Err(PpoError::InvalidConfig("rollout dimensions"));
         }
         prepare_batch(self.policy, self.transitions, self.frames, config)
     }
@@ -833,7 +642,6 @@ impl PpoPreparedSample {
 /// Immutable normalized update batch from one actor policy revision.
 pub struct PpoBatch {
     policy: PolicyIdentity,
-    sample_budget: PpoSampleBudget,
     environments: usize,
     samples: Vec<CompactPreparedSample>,
     frames: RaggedFeatureArena,
@@ -927,7 +735,6 @@ impl PpoTrainer {
                 "neural opponent batching requires the annealed collector",
             ));
         }
-        execution.validate_ppo_memory(self.config.sample_budget)?;
         self.execution = execution.validate()?;
         Ok(())
     }
@@ -999,7 +806,7 @@ impl PpoTrainer {
         model: &PolicyModel,
         batch: &PpoBatch,
     ) -> Result<PpoUpdateReport, PpoError> {
-        self.validate_batch_budget(batch)?;
+        self.validate_batch_dimensions(batch)?;
         let snapshot = model
             .coherent_snapshot(&self.adam)
             .map_err(|error| PpoError::Model(error.to_string()))?;
@@ -1024,17 +831,11 @@ impl PpoTrainer {
         }
     }
 
-    fn validate_batch_budget(&self, batch: &PpoBatch) -> Result<(), PpoError> {
-        if batch.sample_budget != self.config.sample_budget
-            || batch.len() > self.config.sample_budget.max_samples()
+    fn validate_batch_dimensions(&self, batch: &PpoBatch) -> Result<(), PpoError> {
+        if batch.environments != self.config.environments
+            || batch.len() > self.config.environments * self.config.rollout_decisions
         {
-            return Err(PpoError::InvalidConfig("batch sample budget"));
-        }
-        if batch.sample_budget != PpoSampleBudget::Standard
-            && (batch.environments != self.config.environments
-                || batch.len() > self.config.environments * self.config.rollout_decisions)
-        {
-            return Err(PpoError::InvalidConfig("annealed batch dimensions"));
+            return Err(PpoError::InvalidConfig("batch dimensions"));
         }
         Ok(())
     }
@@ -1171,21 +972,13 @@ impl PpoBatch {
     }
 }
 
-fn rollout_storage<T>(capacity: usize, budget: PpoSampleBudget) -> Result<Vec<T>, PpoError> {
+fn rollout_storage<T>(capacity: usize) -> Result<Vec<T>, PpoError> {
     assert!(std::mem::size_of::<T>() > 0);
-    assert!(capacity <= budget.max_samples());
-    if budget != PpoSampleBudget::WideAnnealed {
-        return Ok(Vec::with_capacity(capacity));
-    }
+    assert!(capacity <= PPO_MAX_SAMPLES);
     let mut storage = Vec::new();
     storage
         .try_reserve_exact(capacity)
-        .map_err(|_| PpoError::InvalidTransition("wide rollout allocation failed"))?;
-    if storage.capacity() > capacity {
-        return Err(PpoError::InvalidTransition(
-            "wide rollout allocation exceeds capacity",
-        ));
-    }
+        .map_err(|_| PpoError::InvalidTransition("rollout allocation failed"))?;
     Ok(storage)
 }
 
@@ -1197,7 +990,7 @@ fn prepare_batch(
 ) -> Result<PpoBatch, PpoError> {
     let mut next_advantage = [0.0f32; PPO_MAX_STREAMS];
     let mut next_return = [None; PPO_MAX_STREAMS];
-    let mut prepared = rollout_storage(transitions.len(), config.sample_budget)?;
+    let mut prepared = rollout_storage(transitions.len())?;
     for transition in transitions.into_iter().rev() {
         let discount = tick_discount(config.gamma_tick, transition.ticks)?;
         let continuation = if transition.terminal { 0.0 } else { 1.0 };
@@ -1224,7 +1017,6 @@ fn prepare_batch(
     prepared.reverse();
     normalize_advantages(&mut prepared)?;
     Ok(PpoBatch {
-        sample_budget: config.sample_budget,
         environments: config.environments,
         policy,
         samples: prepared,

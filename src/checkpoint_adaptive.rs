@@ -1,50 +1,13 @@
 use super::{
-    CHECKPOINT_ANNEALED_SCHEMA_HASH, CHECKPOINT_SCHEMA_HASH, CHECKPOINT_WIDE_ANNEALED_SCHEMA_HASH,
     CheckpointError, CheckpointProgress, CheckpointRun, MAX_TEXT_BYTES, ManifestReader,
-    ManifestWriter, checkpoint_profile_hash,
+    ManifestWriter,
 };
 use crate::{
     AdaptiveEnvironmentConfig, AdaptiveEnvironmentLimits, AdaptiveEnvironmentState,
-    EnvironmentDecimal, MAX_TRAINING_COUNTER, PpoConfig, PpoError, PpoSampleBudget,
+    EnvironmentDecimal, MAX_TRAINING_COUNTER, PpoConfig, PpoError,
 };
 
 const BLOCK_BYTES: usize = 152;
-const SCHEMA_DESCRIPTOR: &str = concat!(
-    "bota-drysua-checkpoint/adaptive-v1;versions=15_standard_16_annealed_17_wide_annealed;",
-    "linked=action_feature_model_capacity_ppo_map2_reward_matching_fixed_checkpoint12or13or14;",
-    "base=exact_fixed_manifest_and_tensor_contract_except_checkpoint_identity;runtime_unchanged;",
-    "manifest=append_after_tensor_sha256_required152bytes_no_presence_tag_no_padding_no_trailing;",
-    "block=le64_success_updates_success_rate_millionths_poor_updates_poor_rate_millionths_extension_millionths_base_updates_total_updates_zero_updates_generation_start_update_updates_in_generation_success_streak_poor_streak_extension_awards_snapshot_count_then_snapshot_sha256_raw32;",
-    "scope=train-annealed_only_no_mastery_or_league_exact_config_scope_suffix_last_once;limits=canonical_bounded_updates_zero_updates_generation_games_equals_base_updates_times_ppo_environments_games_equals_ppo_environments;",
-    "state=adaptive_environment_validate_config_limits_global_update;count=generation_plus_spent_nonzero;hash_zero_iff_count_zero;hash_owned_by_generation_runtime_no_snapshot_io;",
-    "defaults=2_800000_1_200000_750000;metadata_max65536;validate_before_tensor_io_capture_or_restore_mutation;commit=model_adam_rng_and_adaptive_state_manifest_last;"
-);
-const IDENTITIES: [(u32, u64); 3] = [
-    (
-        15,
-        checkpoint_profile_hash(
-            PpoSampleBudget::Standard,
-            SCHEMA_DESCRIPTOR,
-            (12, CHECKPOINT_SCHEMA_HASH),
-        ),
-    ),
-    (
-        16,
-        checkpoint_profile_hash(
-            PpoSampleBudget::Annealed,
-            SCHEMA_DESCRIPTOR,
-            (13, CHECKPOINT_ANNEALED_SCHEMA_HASH),
-        ),
-    ),
-    (
-        17,
-        checkpoint_profile_hash(
-            PpoSampleBudget::WideAnnealed,
-            SCHEMA_DESCRIPTOR,
-            (14, CHECKPOINT_WIDE_ANNEALED_SCHEMA_HASH),
-        ),
-    ),
-];
 const _: () = assert!(BLOCK_BYTES == 15 * 8 + 32);
 const _: () = assert!(BLOCK_BYTES < super::MAX_META_BYTES as usize);
 
@@ -125,14 +88,6 @@ pub(super) fn validate_scope(
     Ok(())
 }
 
-pub(super) fn schema_identity(budget: PpoSampleBudget) -> (u32, u64) {
-    match budget {
-        PpoSampleBudget::Standard => IDENTITIES[0],
-        PpoSampleBudget::Annealed => IDENTITIES[1],
-        PpoSampleBudget::WideAnnealed => IDENTITIES[2],
-    }
-}
-
 pub(super) fn encode(writer: &mut ManifestWriter, checkpoint: &AdaptiveEnvironmentCheckpoint) {
     let start = writer.bytes.len();
     for value in [
@@ -208,10 +163,10 @@ fn validate_limits_scope(
     }
     if prefix
         .split_ascii_whitespace()
-        .any(|token| token.starts_with("--mastery") || token.starts_with("--league"))
+        .any(|token| token.starts_with("--league"))
     {
         return Err(CheckpointError::InvalidManifest(
-            "adaptive environment mastery or league",
+            "adaptive environment league",
         ));
     }
     let generation_games = limits.base_updates.checked_mul(environments as u64).ok_or(
