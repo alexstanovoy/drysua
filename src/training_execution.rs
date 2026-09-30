@@ -19,7 +19,7 @@ impl Default for TrainingExecutionOptions {
     }
 }
 
-pub(crate) const DEFAULT_TRAINING_MICROBATCH: usize = 512;
+pub(crate) const DEFAULT_TRAINING_MICROBATCH: usize = 2048;
 const MICROBATCH_ERROR: &str = "training microbatch must be 256, 512, 1024 or 2048";
 
 impl TrainingExecutionOptions {

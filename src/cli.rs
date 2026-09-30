@@ -190,7 +190,8 @@ struct TrainAnnealedArgs {
     /// (more when the slots need them).
     #[arg(long)]
     lanes: Option<usize>,
-    /// Simulation worker threads; defaults to the available cores and never changes results.
+    /// Simulation worker threads; defaults to the available physical cores (SMT
+    /// siblings count once) and never changes results.
     #[arg(long)]
     simulation_threads: Option<usize>,
     /// Lane groups with their own simulation workers; defaults to the host's
@@ -577,7 +578,9 @@ impl TrainAnnealedArgs {
             ..crate::PpoConfig::default()
         });
         let cores = std::thread::available_parallelism()?.get();
-        let simulation_threads = self.simulation_threads.unwrap_or(cores);
+        let simulation_threads = self
+            .simulation_threads
+            .unwrap_or_else(crate::ppo_arena::topology::physical_cores);
         let seed = self.resolved_seed()?;
         let (slots, lanes, simulation_groups) =
             self.resolved_collection_shape(cores, simulation_threads)?;
