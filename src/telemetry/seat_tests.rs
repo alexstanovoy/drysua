@@ -66,7 +66,10 @@ fn fixture(mode: TickMode) -> RecordingWire {
 fn seat_reports_completed_work_and_preserves_terminal_outcomes_with_debug_enabled_or_disabled() {
     let model = PolicyModel::fresh(70_102).unwrap();
     for mode in [TickMode::Lockstep, TickMode::Realtime] {
-        for controller in [LiveController::Teacher, LiveController::Neural(&model)] {
+        for controller in [
+            LiveController::Script(crate::ScriptKind::Teacher),
+            LiveController::Neural(&model),
+        ] {
             for (limit, disconnected, updates, reason) in [
                 (None, false, 4, "match_over"),
                 (Some(4), false, 3, "limit"),

@@ -95,7 +95,7 @@ def start_observers(supervisor, binary, root, arguments):
             raise
         finally:
             target.close()
-        label = "human" if relay.role == "human" else arguments.opponent
+        label = {"human": "human", "watched": arguments.watch}.get(relay.role, arguments.opponent)
         pipe = RewardPipe(source, prefix, label)
         supervisor.reward_pipes.append((pipe, child, relay))
         relay.observer = pipe.offer

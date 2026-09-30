@@ -173,7 +173,8 @@ fn teacher_game(seed: u64, macro_seat: usize) -> [[u64; 4]; 2] {
     let mut environment =
         build_environment(seed, MapId(2), 0, OpponentRuntime::Teacher, Vec::new())
             .expect("teacher arena");
-    environment.seats[macro_seat].teacher = Teacher::with_macro_hero_aim();
+    environment.seats[macro_seat].script =
+        crate::ScriptedPolicy::Teacher(Box::new(Teacher::with_macro_hero_aim()));
     let mut hero_aimed = [false; 2];
     let mut hero_casts = [0u64; 2];
     let mut winner = None;
@@ -182,7 +183,7 @@ fn teacher_game(seed: u64, macro_seat: usize) -> [[u64; 4]; 2] {
         let mut requests = Vec::with_capacity(2);
         for (index, seat) in environment.seats.iter_mut().enumerate() {
             let (action, space) = seat
-                .teacher
+                .script
                 .decide(&seat.tracker, &seat.persistence, &seat.readiness)
                 .expect("teacher decision");
             seat.local

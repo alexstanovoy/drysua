@@ -20,7 +20,9 @@ pub(crate) struct DefaultDeployment {
 
 const _: () = {
     match DEFAULT_DEPLOYMENT.policy {
-        PlayPolicy::Teacher => assert!(DEFAULT_DEPLOYMENT.weights_directory.is_none()),
+        PlayPolicy::Teacher | PlayPolicy::HarassPush => {
+            assert!(DEFAULT_DEPLOYMENT.weights_directory.is_none());
+        }
         PlayPolicy::Neural => {
             assert!(DEFAULT_DEPLOYMENT.weights_directory.is_some());
         }
@@ -34,7 +36,7 @@ const _: () = {
 impl DefaultDeployment {
     pub fn resolve(self) -> io::Result<(PlayPolicy, Option<PathBuf>)> {
         match (self.policy, self.weights_directory) {
-            (PlayPolicy::Teacher, None) => Ok((self.policy, None)),
+            (PlayPolicy::Teacher | PlayPolicy::HarassPush, None) => Ok((self.policy, None)),
             (PlayPolicy::Neural, Some(directory)) => {
                 let mut components = Path::new(directory).components();
                 if directory.len() > 256
@@ -54,7 +56,7 @@ impl DefaultDeployment {
             }
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "default Teacher must be weights-free; default neural policies must specify weights",
+                "default rule policies must be weights-free; default neural policies must specify weights",
             )),
         }
     }

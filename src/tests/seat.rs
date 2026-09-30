@@ -158,7 +158,7 @@ fn all_controllers_require_complete_ticks_with_or_without_a_live_hero() {
             wire.messages.push_back(ServerMsg::Snapshot { view });
             let seat = seated(TickMode::Lockstep);
             let error = match controller {
-                0 => crate::play_teacher_on(&mut wire, seat, None),
+                0 => crate::play_script_on(&mut wire, seat, None, crate::ScriptKind::Teacher),
                 _ => crate::play_neural_on(&mut wire, seat, None, &model),
             }
             .expect_err("tick completion is mandatory");
@@ -198,7 +198,12 @@ fn controllers_keep_cadence_and_teacher_learning_but_neural_continue_never_buys_
                     info.pregame_ticks = 0;
                 }
                 let outcome = match controller {
-                    0 => crate::play_teacher_on(&mut wire, seated(mode), Some(limit)),
+                    0 => crate::play_script_on(
+                        &mut wire,
+                        seated(mode),
+                        Some(limit),
+                        crate::ScriptKind::Teacher,
+                    ),
                     _ => crate::play_neural_on(
                         &mut wire,
                         seated(mode),

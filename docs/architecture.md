@@ -15,9 +15,10 @@ at compile time; they are recorded in every checkpoint.
 
 | Command | Purpose |
 | --- | --- |
-| `drysua [play]` | Join a TCP server and play one match; Teacher by default, Neural with `--weights-directory` |
+| `drysua [play]` | Join a TCP server and play one match; Teacher by default, Neural with `--weights-directory`, `--policy harass-push` for HarassPush |
 | `drysua train-annealed` | PPO training against a per-game opponent mixture ([training](training.md)) |
 | `drysua eval` | Frozen-weights paired evaluation ([training](training.md#evaluation)) |
+| `drysua duel` | Rule policy against rule policy on paired seeds in the builtin arena ([local play](local-play.md)) |
 | `drysua checkpoint-inspect` | Read-only checkpoint JSON ([checkpoint inspection](checkpoint_inspection.md)) |
 | `drysua reward-observer` | Score copied frames of a human game ([human reward play](human-reward-play.md)) |
 
@@ -59,7 +60,7 @@ These rules keep the policy from winning through simulator leaks rather than pla
 [continuous collection](continuous_collection.md)):
 
 - `--slots` worlds (default 64) each always hold a live game against an opponent
-  drawn per game from `--opponent` (`teacher`, `self`, frozen `weights:`).
+  drawn per game from `--opponent` (`teacher`, `harass-push`, `self`, frozen `weights:`).
 - `--lanes` inference threads (default 2) batch their slots through a weight replica;
   a shared pool steps the simulations.
 - One decision in `MAP2_RETENTION_STRIDE = 8` is retained as a PPO sample (about one
@@ -96,6 +97,7 @@ exception: it warm-starts from any runtime weights with the current parameter la
 | `src/feature.rs` | Feature encoder |
 | `src/action.rs`, `src/raze_aim.rs`, `src/persistence.rs`, `src/readiness.rs` | Action space, masks, aimed razes, order and item bookkeeping |
 | `src/teacher.rs`, `src/teacher_economy.rs` | Scripted Teacher controller |
+| `src/scripted/` | Rule-policy seat (`ScriptedPolicy`), HarassPush, shared tactics, `duel` runner |
 | `src/model.rs`, `src/model/` | Policy/value network, sampling, side actors |
 | `src/ppo.rs`, `src/ppo/` | PPO, GAE, Adam |
 | `src/ppo_arena.rs`, `src/ppo_arena/` | Collection (slots, lanes, pool), annealed session, eval |
@@ -120,9 +122,12 @@ exception: it warm-starts from any runtime weights with the current parameter la
   schema 6 makes an aimed raze one decision (`Cast` at an entity) expanded by
   `RazeAim`, instead of a turn and a cast that were rarely retained together.
 - **Teacher weaknesses** the policy has not found: it retreats at 40% HP without
-  hysteresis and never pushes into tower range while the enemy hero is within 1,200.
+  hysteresis, never pushes into tower range while the enemy hero is within 1,200,
+  spends its mana on creep and tower razes, and can freeze behind a building it walks
+  toward. HarassPush (`src/scripted/harass_push.rs`) exploits these and beats it in
+  195 of 200 `drysua duel` games (seeds 1–100, both sides).
 
 In flight: reward 8 and aimed razes in campaigns; critic capacity and trunk
-gradient, λ, retention of non-Continue decisions and a PFSP opponent mixture; a
-scripted HarassPush opponent that exploits Teacher's retreat to seed the push
-strategy; collection and learner performance (the learner is host-bound).
+gradient, λ, retention of non-Continue decisions and a PFSP opponent mixture;
+HarassPush as an opponent and imitation target to seed the push strategy;
+collection and learner performance (the learner is host-bound).

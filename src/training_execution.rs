@@ -86,6 +86,8 @@ pub(crate) fn parse_training_microbatch(value: &str) -> Result<usize, &'static s
 pub enum AnnealedOpponent {
     /// The original scripted teacher.
     Teacher,
+    /// The HarassPush rule policy.
+    HarassPush,
     /// A strict runtime weights directory, loaded once and never updated.
     Weights(std::path::PathBuf),
     /// The actor weights the learner's own seat samples from.

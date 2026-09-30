@@ -193,11 +193,12 @@ fn mixed_opponents_resume_in_flight_neural_games_exactly() {
     let weights = test_directory("mixed-opponent-weights");
     let frozen = PolicyModel::fresh(0x0dd).expect("frozen opponent");
     TrainingArtifact::save_runtime_weights(&frozen, &weights).expect("frozen weights");
-    let mut config = settings(23_073, 2);
+    let mut config = settings(23_076, 2);
     config.slots = 4;
     config.ppo.samples_per_update = 10;
     config.opponents = vec![
         (AnnealedOpponent::Teacher, one()),
+        (AnnealedOpponent::HarassPush, one()),
         (AnnealedOpponent::SelfPlay, one()),
         (AnnealedOpponent::Weights(weights.clone()), one()),
     ];
@@ -217,6 +218,18 @@ fn mixed_opponents_resume_in_flight_neural_games_exactly() {
         state.slots.iter().any(|slot| !slot.log.opponent.is_empty()),
         "a neural opponent game is in flight at the boundary"
     );
+    let in_flight = |kind| state.slots.iter().any(|slot| slot.plan.opponent == kind);
+    for kind in [
+        OpponentKind::Teacher,
+        OpponentKind::HarassPush,
+        OpponentKind::SelfPlay,
+        OpponentKind::Snapshot(0),
+    ] {
+        assert!(
+            in_flight(kind),
+            "{kind:?} game is in flight at the boundary"
+        );
+    }
     run(config, &resumed, true).expect("resume");
     assert_trajectory_equal(&uninterrupted, &resumed);
     for directory in [weights, uninterrupted, resumed] {

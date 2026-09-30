@@ -220,7 +220,7 @@ fn input_cap_is_an_error_not_synthetic_eof_and_teacher_rejects_weights() {
     assert!(
         error
             .to_string()
-            .contains("teacher forbids --weights-directory")
+            .contains("rule policies forbid --weights-directory")
     );
 }
 

@@ -8,9 +8,9 @@ use crate::telemetry::{
 };
 use crate::{
     ActionSpace, ActiveOrderUpdate, ActivePolicyOrder, FeatureEncoder, FeatureFrame, ItemReadiness,
-    Link, LocalPolicyState, OrderPersistence, PolicyModel, SHADOW_FIEND, Seated, StateTracker,
-    StructuredAction, Teacher, TrainingArtifact, Wire, active_order_update_for_sent,
-    record_sent_for_policy,
+    Link, LocalPolicyState, OrderPersistence, PolicyModel, SHADOW_FIEND, ScriptKind,
+    ScriptedPolicy, Seated, StateTracker, StructuredAction, TrainingArtifact, Wire,
+    active_order_update_for_sent, record_sent_for_policy,
 };
 
 const MAX_MATCH_MESSAGES: usize = 16_777_216;
@@ -45,7 +45,7 @@ struct LivePolicy {
     neural_persistence: Option<OrderPersistence>,
     aim: crate::RazeAim,
     readiness: ItemReadiness,
-    teacher: Option<Teacher>,
+    script: Option<ScriptedPolicy>,
     last_decision_tick: Option<u32>,
     pending_snapshot_tick: Option<u32>,
     pending_active: Option<(u32, Option<ActivePolicyOrder>)>,
@@ -55,34 +55,40 @@ struct LivePolicy {
 #[derive(Clone, Copy)]
 enum LiveController<'model> {
     Neural(&'model PolicyModel),
-    Teacher,
+    Script(ScriptKind),
 }
 
 impl LiveController<'_> {
     fn label(self) -> &'static str {
         match self {
             Self::Neural(_) => "neural",
-            Self::Teacher => "teacher",
+            Self::Script(kind) => kind.label(),
         }
     }
 }
 
-/// Connects and runs the deterministic Teacher on any supported map without weights.
-pub fn play_teacher(address: &str, name: &str, limit: Option<u32>) -> std::io::Result<Outcome> {
+/// Connects and runs a deterministic rule policy on any supported map without weights.
+pub fn play_script(
+    kind: ScriptKind,
+    address: &str,
+    name: &str,
+    limit: Option<u32>,
+) -> std::io::Result<Outcome> {
     let (mut link, seated) = Link::join(address, name)?;
-    play_teacher_on(&mut link, seated, limit)
+    play_script_on(&mut link, seated, limit, kind)
 }
 
-/// Runs the deterministic Teacher on an assigned match connection without a model.
-pub fn play_teacher_on(
+/// Runs a deterministic rule policy on an assigned match connection without a model.
+pub fn play_script_on(
     wire: &mut impl Wire,
     seated: Seated,
     limit: Option<u32>,
+    kind: ScriptKind,
 ) -> std::io::Result<Outcome> {
-    play_controller_on(wire, seated, limit, LiveController::Teacher)
+    play_controller_on(wire, seated, limit, LiveController::Script(kind))
 }
 
-/// Loads required runtime weights before connecting; never constructs or invokes Teacher.
+/// Loads required runtime weights before connecting; never constructs or invokes a rule policy.
 pub fn play_neural(
     address: &str,
     name: &str,
@@ -455,10 +461,9 @@ impl LivePolicy {
                 .then(OrderPersistence::default),
             aim: crate::RazeAim::default(),
             readiness: ItemReadiness::new(),
-            teacher: if matches!(controller, LiveController::Neural(_)) {
-                None
-            } else {
-                Some(Teacher::new())
+            script: match controller {
+                LiveController::Neural(_) => None,
+                LiveController::Script(kind) => Some(ScriptedPolicy::new(kind)),
             },
             last_decision_tick: None,
             pending_snapshot_tick: None,
@@ -597,8 +602,8 @@ impl LivePolicy {
         )
         .map_err(std::io::Error::other)?;
         self.readiness.note_sent(sequence, issued, &space);
-        if let Some(teacher) = &mut self.teacher {
-            teacher.note_sent(sequence, issued, space.tick());
+        if let Some(script) = &mut self.script {
+            script.note_sent(sequence, issued, space.tick());
         }
         let persistence = self
             .neural_persistence
@@ -638,14 +643,14 @@ impl LivePolicy {
     ) -> std::io::Result<(StructuredAction, ActionSpace)> {
         let model = match controller {
             LiveController::Neural(model) => {
-                assert!(self.teacher.is_none());
+                assert!(self.script.is_none());
                 model
             }
-            LiveController::Teacher => {
+            LiveController::Script(_) => {
                 return self
-                    .teacher
+                    .script
                     .as_mut()
-                    .expect("historical controller has Teacher")
+                    .expect("rule controller has a rule policy")
                     .decide(&self.tracker, &self.persistence, &self.readiness)
                     .map_err(std::io::Error::other);
             }
@@ -675,8 +680,8 @@ impl LivePolicy {
             neural.observe_rejection(sequence);
         }
         self.readiness.note_rejected(sequence);
-        if let Some(teacher) = &mut self.teacher {
-            teacher.note_rejected(sequence);
+        if let Some(script) = &mut self.script {
+            script.note_rejected(sequence);
         }
         if let Some((pending, previous)) = self.pending_active
             && pending == sequence

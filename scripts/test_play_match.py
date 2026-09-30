@@ -33,7 +33,7 @@ SUMMARY = re.compile(r"played (\d+) ticks as Some\((Radiant|Dire)\); winner "
                      r"\d+ decisions, \d+ orders, (\d+) rejected orders\n?")
 CLIENT_OUTPUT_LIMIT = 1024 * 1024
 TELEMETRY_LINE_LIMIT = 4096
-POLICY_FIELD = r"policy=(?:teacher|neural)"
+POLICY_FIELD = r"policy=(?:teacher|harass-push|neural)"
 RECEIVE_FIELD = (r"receive_wait_scope=(?:socket_read|wire_hear_including_decode"
                  r"|mixed_socket_read_and_wire_hear|unavailable)")
 SEAT_FIELDS = rf"slot=(?P<slot>[01]) {POLICY_FIELD} mode=(?:lockstep|realtime)"

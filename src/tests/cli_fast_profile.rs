@@ -56,6 +56,8 @@ fn annealed_cli_parses_an_ordered_opponent_mixture_with_colon_paths() {
         "weights:/runs/a:b/u100:0.25",
         "--opponent",
         "self",
+        "--opponent",
+        "harass-push:0.25",
     ]);
     let decimal = crate::EnvironmentDecimal::from_units;
     assert_eq!(
@@ -67,6 +69,7 @@ fn annealed_cli_parses_an_ordered_opponent_mixture_with_colon_paths() {
                 decimal(250_000)
             ),
             (crate::AnnealedOpponent::SelfPlay, decimal(1_000_000)),
+            (crate::AnnealedOpponent::HarassPush, decimal(250_000)),
         ]
     );
     for invalid in [

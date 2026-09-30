@@ -36,8 +36,8 @@ use crate::{
     CollectionCheckpoint, ControlledUnit, EntityIndex, FeatureEncoder, FeatureFrame, ItemReadiness,
     LocalPolicyState, LootIndex, OrderPersistence, PointIndex, PolicyDevice, PolicyModel,
     PpoConfig, PpoError, PpoRng, PpoTerminalOutcome, PpoTrainer, PpoTransition, PpoUpdateReport,
-    PutPointTarget, Request, ShopIndex, StateTracker, StructuredAction, Teacher, TrainingArtifact,
-    tick_discount,
+    PutPointTarget, Request, ScriptKind, ScriptedPolicy, ShopIndex, StateTracker, StructuredAction,
+    TrainingArtifact, tick_discount,
 };
 use crate::{MAP2_REWARD_GAMMA_TICK, Map2RewardBreakdown, Map2RewardEnd};
 
@@ -91,7 +91,7 @@ struct ArenaSeatPolicy {
     order_bookkeeping: PolicyOrderBookkeeping,
     aim: crate::RazeAim,
     readiness: ItemReadiness,
-    teacher: Teacher,
+    script: ScriptedPolicy,
     combat: game_summary::SeatCombat,
     sequence: u32,
     rejections: u64,
@@ -115,6 +115,7 @@ enum OpponentRuntime {
     /// A policy whose actions the caller supplies each decision.
     Neural,
     Teacher,
+    HarassPush,
     /// Test fixture that always continues, keeping native worlds deterministic.
     #[cfg(test)]
     Idle,
@@ -533,7 +534,10 @@ fn build_environment(
         Arena::new_with_spawn_modifiers(config, spawn_modifiers)
     }
     .map_err(|error| PpoError::Model(error.to_string()))?;
-    let seats = setup_seats(start)?;
+    let mut seats = setup_seats(start)?;
+    if opponent == OpponentRuntime::HarassPush {
+        seats[1 - policy_seat].script = ScriptedPolicy::new(ScriptKind::HarassPush);
+    }
     Ok(TrainingEnvironment {
         arena,
         seats,
@@ -604,7 +608,7 @@ fn setup_seat(index: usize, messages: &[ServerMsg]) -> Result<ArenaSeatPolicy, P
         order_bookkeeping: PolicyOrderBookkeeping::Legacy,
         aim: crate::RazeAim::default(),
         readiness: ItemReadiness::new(),
-        teacher: Teacher::new(),
+        script: ScriptedPolicy::new(ScriptKind::Teacher),
         combat: game_summary::SeatCombat::default(),
         sequence: 0,
         rejections: 0,
@@ -737,7 +741,7 @@ fn scripted_request(
     runtime: OpponentRuntime,
 ) -> Result<Option<Request>, PpoError> {
     match runtime {
-        OpponentRuntime::Teacher => teacher_request(seat),
+        OpponentRuntime::Teacher | OpponentRuntime::HarassPush => teacher_request(seat),
         OpponentRuntime::Neural => Err(PpoError::InvalidTransition(
             "neural opponent without a decision",
         )),
@@ -764,7 +768,7 @@ fn teacher_request_with_action(
     seat: &mut ArenaSeatPolicy,
 ) -> Result<(ActionKind, Option<Request>), PpoError> {
     let (action, space) = seat
-        .teacher
+        .script
         .decide(&seat.tracker, &seat.persistence, &seat.readiness)
         .map_err(|error| PpoError::Model(error.to_string()))?;
     let action_kind = action.kind();
@@ -837,7 +841,7 @@ fn issue_request(
         }
     };
     if synchronize_teacher {
-        seat.teacher.note_sent(seat.sequence, issued, space.tick());
+        seat.script.note_sent(seat.sequence, issued, space.tick());
     }
     seat.last_issued = Some((seat.sequence, issued, action_kind));
     Ok(Some(Request {
@@ -936,7 +940,7 @@ fn observe_messages_owned(
                 seat.persistence.observe_rejection(seq);
                 seat.order_bookkeeping.observe_rejection(seq);
                 seat.readiness.note_rejected(seq);
-                seat.teacher.note_rejected(seq);
+                seat.script.note_rejected(seq);
                 if let Some((pending, previous)) = seat.pending_active
                     && pending == seq
                 {

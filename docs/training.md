@@ -196,7 +196,7 @@ drysua eval --weights artifacts/weights/u200v2-v18 --opponent teacher \
 python3 scripts/eval_compare.py temp/eval-u200v2.jsonl temp/eval-other.jsonl
 ```
 
-`--opponent` is `teacher` or `weights:<dir>`; `--greedy` takes the legal argmax
+`--opponent` is `teacher`, `harass-push` or `weights:<dir>`; `--greedy` takes the legal argmax
 instead of sampling; `--parallel` (default 16) and `--actor-pipeline-groups`
 (default 2) change only speed, never results. Each game's arena seed and actor RNG
 depend only on `(seed, seat)`, so results are identical across batch shapes and
