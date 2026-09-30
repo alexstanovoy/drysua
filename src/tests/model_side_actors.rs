@@ -865,4 +865,19 @@ fn assert_ppo_rollback(device: PolicyDevice) {
             assert_eq!(after.adam.config, before.adam.config);
         }
     }
+    // Early stopping keeps the step the post-step guard rejected above: only
+    // the KL before the step (from the gradient pass) is held to the target.
+    let before = model.coherent_snapshot(&adam).expect("before early stop");
+    let config = PpoConfig {
+        target_kl: 1.0e-12,
+        ..config
+    };
+    let report = model
+        .ppo_update_early_stop_for_test(&samples.iter().collect::<Vec<_>>(), &mut adam, config)
+        .expect("early-stop step");
+    assert!(report.applied);
+    assert!(report.approximate_kl <= f64::from(config.target_kl));
+    let after = model.coherent_snapshot(&adam).expect("after early stop");
+    assert_eq!(after.adam.step, 2);
+    assert_ne!(after.parameters, before.parameters);
 }

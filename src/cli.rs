@@ -154,6 +154,12 @@ enum ShadowArg {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum KlGuardArg {
+    PostStep,
+    EarlyStop,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum OpponentScheduleArg {
     Fixed,
     Pfsp,
@@ -178,6 +184,11 @@ struct TrainAnnealedArgs {
     /// Spread all rollout rows across nearly equal minibatches; recorded in checkpoint scope.
     #[arg(long)]
     balanced_minibatches: bool,
+    /// How --target-kl is enforced: post-step also re-evaluates each step and
+    /// rolls it back when its KL overshoots; early-stop only checks the
+    /// gradient pass's KL. Recorded in checkpoint scope.
+    #[arg(long, value_enum, default_value_t = KlGuardArg::PostStep)]
+    kl_guard: KlGuardArg,
     /// Total PPO updates; each may perform multiple Adam minibatch steps.
     #[arg(long)]
     updates: u64,
@@ -610,6 +621,10 @@ impl TrainAnnealedArgs {
             environment_schedule,
             execution: crate::TrainingExecutionOptions {
                 balanced_minibatches: self.balanced_minibatches,
+                kl_guard: match self.kl_guard {
+                    KlGuardArg::PostStep => crate::KlGuard::PostStep,
+                    KlGuardArg::EarlyStop => crate::KlGuard::EarlyStop,
+                },
                 training_microbatch: self.training_microbatch,
             },
             updates: self.updates,

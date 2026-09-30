@@ -11,6 +11,7 @@ use super::ppo_objective::{
 };
 use super::rows::{ENCODER_PARTS, PART_LENGTHS};
 use super::*;
+use crate::training_execution::KlGuard;
 
 /// Largest microbatch the device learner runs in one forward and backward pass.
 pub const MODEL_PPO_MAX_MICROBATCH: usize = 2_048;
@@ -249,8 +250,11 @@ impl PolicyModel {
         indices: &[usize],
         adam: &mut AdamState,
         objective: (PpoConfig, crate::UpdateObjective),
-        microbatch: usize,
+        (microbatch, guard): (usize, KlGuard),
     ) -> Result<PpoMinibatchReport, ModelError> {
+        if guard == KlGuard::EarlyStop {
+            return self.ppo_step_early_stop(staged, indices, adam, objective, microbatch);
+        }
         self.ppo_step_staged(
             staged,
             indices,
@@ -262,15 +266,39 @@ impl PolicyModel {
         )
     }
 
-    fn ppo_step_staged(
+    /// One Adam step unless the minibatch's KL before it exceeds the target;
+    /// the KL comes from the gradient's own forward pass.
+    fn ppo_step_early_stop(
         &self,
         staged: &StagedPpoBatch,
         indices: &[usize],
         adam: &mut AdamState,
-        (config, objective): (PpoConfig, crate::UpdateObjective),
+        objective: (PpoConfig, crate::UpdateObjective),
         microbatch: usize,
-        #[cfg(test)] faults: PpoTestFaults,
     ) -> Result<PpoMinibatchReport, ModelError> {
+        let _guard = self.write_parameter_lock()?;
+        let (_, gradients, mut report) =
+            self.staged_step_gradients(staged, indices, adam, objective, microbatch)?;
+        if report.approximate_kl > f64::from(objective.0.target_kl) {
+            return Ok(report);
+        }
+        let original = self.device_parameter_copy()?;
+        let diagnostics = self.apply_adam_device(adam, &gradients, &original)?;
+        report.gradient_norm = diagnostics.unclipped_norm;
+        report.applied_scale = diagnostics.applied_scale;
+        report.applied = true;
+        Ok(report)
+    }
+
+    /// Validates a staged step and returns its rows, summed gradients and report.
+    fn staged_step_gradients(
+        &self,
+        staged: &StagedPpoBatch,
+        indices: &[usize],
+        adam: &AdamState,
+        objective: (PpoConfig, crate::UpdateObjective),
+        microbatch: usize,
+    ) -> Result<(Tensor, Vec<Option<Tensor>>, PpoMinibatchReport), ModelError> {
         if indices.is_empty() || indices.len() > MODEL_MAX_BATCH {
             return Err(ModelError::InvalidModelState("PPO minibatch count"));
         }
@@ -280,15 +308,28 @@ impl PolicyModel {
         if indices.iter().any(|&index| index >= staged.rows) {
             return Err(ModelError::InvalidModelState("PPO staged row index"));
         }
-        let _guard = self.write_parameter_lock()?;
         self.validate_optimizer_binding_locked(adam.binding)?;
         let rows = indices
             .iter()
             .map(|&index| index as u32)
             .collect::<Vec<_>>();
         let rows = Tensor::from_vec(rows, indices.len(), self.tensor_device())?;
-        let (gradients, mut report) =
-            self.staged_gradients(staged, &rows, (config, objective), microbatch)?;
+        let (gradients, report) = self.staged_gradients(staged, &rows, objective, microbatch)?;
+        Ok((rows, gradients, report))
+    }
+
+    fn ppo_step_staged(
+        &self,
+        staged: &StagedPpoBatch,
+        indices: &[usize],
+        adam: &mut AdamState,
+        (config, objective): (PpoConfig, crate::UpdateObjective),
+        microbatch: usize,
+        #[cfg(test)] faults: PpoTestFaults,
+    ) -> Result<PpoMinibatchReport, ModelError> {
+        let _guard = self.write_parameter_lock()?;
+        let (rows, gradients, mut report) =
+            self.staged_step_gradients(staged, indices, adam, (config, objective), microbatch)?;
         if report.approximate_kl > f64::from(config.target_kl) {
             return Ok(report);
         }

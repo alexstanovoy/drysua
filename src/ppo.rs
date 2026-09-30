@@ -889,7 +889,7 @@ impl PpoTrainer {
                         indices,
                         &mut self.adam,
                         (self.config, objective),
-                        self.execution.training_microbatch,
+                        (self.execution.training_microbatch, self.execution.kl_guard),
                     )
                     .map_err(|error| PpoError::Model(error.to_string()))?;
                 if !report.applied {
