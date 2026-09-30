@@ -190,7 +190,8 @@ struct TrainAnnealedArgs {
     /// (more when the slots need them).
     #[arg(long)]
     lanes: Option<usize>,
-    /// Simulation worker threads; defaults to the available cores and never changes results.
+    /// Simulation worker threads; defaults to the available physical cores (SMT
+    /// siblings count once) and never changes results.
     #[arg(long)]
     simulation_threads: Option<usize>,
     /// Lane groups with their own simulation workers; defaults to the host's
@@ -577,18 +578,12 @@ impl TrainAnnealedArgs {
             ..crate::PpoConfig::default()
         });
         let cores = std::thread::available_parallelism()?.get();
-        let simulation_threads = self.simulation_threads.unwrap_or(cores);
-        let domains = crate::ppo_arena::topology::cache_domains().len();
-        let explicit_groups = self.simulation_groups.map(usize::from);
+        let simulation_threads = self
+            .simulation_threads
+            .unwrap_or_else(crate::ppo_arena::topology::physical_cores);
         let seed = self.resolved_seed()?;
-        let (slots, lanes) = self.collection_shape(cores, explicit_groups.unwrap_or(domains))?;
-        // By default the most cache domains that evenly split the lanes and threads.
-        let simulation_groups = explicit_groups.unwrap_or_else(|| {
-            (1..=domains.min(simulation_threads))
-                .rev()
-                .find(|groups| lanes.is_multiple_of(*groups))
-                .unwrap_or(1)
-        });
+        let (slots, lanes, simulation_groups) =
+            self.resolved_collection_shape(cores, simulation_threads)?;
         Ok(crate::AnnealedJobConfig {
             environment_schedule,
             execution: crate::TrainingExecutionOptions {
@@ -623,9 +618,13 @@ impl TrainAnnealedArgs {
         })
     }
 
-    /// Slots and lanes: explicit, adopted from the recorded resume scope, or
-    /// sized to the host (16 slots per core, two lanes per group, 64 slots per lane).
-    fn collection_shape(&self, cores: usize, groups: usize) -> std::io::Result<(usize, usize)> {
+    /// Slots, lanes and simulation groups: explicit, adopted from the recorded
+    /// resume scope, or sized to the host by [`collection_shape`].
+    fn resolved_collection_shape(
+        &self,
+        cores: usize,
+        threads: usize,
+    ) -> std::io::Result<(usize, usize, usize)> {
         let recorded = |name| -> std::io::Result<Option<usize>> {
             if !self.checkpoint.resume {
                 return Ok(None);
@@ -648,15 +647,14 @@ impl TrainAnnealedArgs {
             Some(lanes) => Some(lanes),
             None => recorded("--lanes")?,
         };
-        let slots = slots.unwrap_or((16 * cores).clamp(1, crate::PPO_MAX_SLOTS));
-        let lanes = lanes.unwrap_or_else(|| {
-            let needed = slots.div_ceil(64).max(2 * groups);
-            // The smallest multiple of the groups that divides the slots.
-            (needed..=slots)
-                .find(|lanes| lanes.is_multiple_of(groups) && slots.is_multiple_of(*lanes))
-                .unwrap_or(1)
-        });
-        Ok((slots, lanes))
+        let domains = crate::ppo_arena::topology::cache_domains().len();
+        let groups = self.simulation_groups.map(usize::from);
+        Ok(collection_shape(
+            (slots, lanes, groups),
+            cores,
+            domains,
+            threads,
+        ))
     }
 
     /// The resolved run seed: explicit, adopted from the recorded resume scope,
@@ -853,6 +851,10 @@ fn annealed_settings_from_arguments(
 ) -> std::io::Result<crate::AnnealedJobConfig> {
     let mut full = vec!["drysua", "train-annealed"];
     full.extend_from_slice(arguments);
+    if !arguments.contains(&"--simulation-groups") {
+        // Tests must not depend on the host's cache topology.
+        full.extend(["--simulation-groups", "1"]);
+    }
     let cli = Cli::try_parse_from(full).map_err(std::io::Error::other)?;
     let Some(Operation::TrainAnnealed(train)) = cli.operation else {
         unreachable!("train-annealed arguments");
@@ -1002,6 +1004,39 @@ fn run_train_annealed(_: TrainAnnealedArgs) -> std::io::Result<()> {
     Err(std::io::Error::other(
         "annealed training requires cargo feature `builtin`",
     ))
+}
+
+/// Slots, lanes and simulation groups from the requested values and the host:
+/// 16 slots per core, a group per cache domain the shape can feed, and the
+/// fewest lanes (at least two per group, at most 64 slots each) that split the
+/// slots evenly across the groups. Explicit values are kept as given.
+#[cfg(feature = "builtin")]
+pub(crate) fn collection_shape(
+    (slots, lanes, groups): (Option<usize>, Option<usize>, Option<usize>),
+    cores: usize,
+    domains: usize,
+    threads: usize,
+) -> (usize, usize, usize) {
+    let slots = slots.unwrap_or_else(|| {
+        let slots = (16 * cores).clamp(1, crate::PPO_MAX_SLOTS);
+        // Explicit lanes cap the default at 64 slots each, split evenly.
+        lanes.map_or(slots, |lanes| {
+            let lanes = lanes.max(1);
+            (slots.min(64 * lanes) / lanes).max(1) * lanes
+        })
+    });
+    let shape = |groups: usize| match lanes {
+        Some(lanes) => lanes.is_multiple_of(groups).then_some(lanes),
+        None => (slots.div_ceil(64).max(2 * groups)..=slots)
+            .find(|lanes| lanes.is_multiple_of(groups) && slots.is_multiple_of(*lanes)),
+    };
+    let groups = groups.unwrap_or_else(|| {
+        (1..=domains.min(threads))
+            .rev()
+            .find(|&groups| shape(groups).is_some())
+            .unwrap_or(1)
+    });
+    (slots, shape(groups).or(lanes).unwrap_or(1), groups)
 }
 
 /// The numeric value of `name` in a recorded command line.

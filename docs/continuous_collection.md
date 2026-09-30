@@ -11,8 +11,9 @@ lanes (--lanes)               one thread, CUDA stream and actor weight replica p
                               lane l owns slots l, l+lanes, ...; at most 64 slots per lane;
                               default two per simulation group, more if the slots need them
 simulation groups             --simulation-groups (default: last-level cache domains, i.e.
-                              CCDs, or fewer so they divide the lanes) split consecutive lanes and --simulation-threads workers
-                              (default: available cores) into pools, so a lane's round never
+                              CCDs, that the slots and lanes can feed) split consecutive lanes
+                              and --simulation-threads workers (default: physical cores; SMT
+                              siblings would slow the lanes and learner) into pools, so a lane's round never
                               waits on another CCD; --pin-threads pins each group to its
                               domain (opt-in). Neither changes results
 learner                       the session thread; trains update u while lanes collect u+1
@@ -99,12 +100,14 @@ is the checkpoint model. Episode logs carry `slot=`, `game=` and `opponent=`.
 The learner is device resident (`src/model/device_learner.rs`). An update's
 samples are packed into encoder rows and uploaded once, in 256-row chunks, into
 preallocated device columns. Each Adam step gathers its minibatch on the device,
-runs `--training-microbatch` rows (256/512/1024/2048, default 512) per
+runs `--training-microbatch` rows (256/512/1024/2048, default 2048) per
 forward/backward, sums the microbatch gradients on the device and applies a
-clipped f32 Adam there. Per step the host reads back the loss sums with a
-finiteness probe, the gradient norm, the new Adam moments and the candidate KL;
-a rejected candidate is restored from device copies of the parameters. The loss
-definitions live only in `src/model/ppo_objective.rs`.
+clipped f32 Adam there. The Adam moments stay on the device (read back only
+for checkpoints). Per step the host reads back the loss sums with a finiteness
+probe, the gradient norm, one moment/parameter finiteness check and the
+candidate KL; a rejected candidate is restored from device copies of the
+parameters and the previous moment tensors. The loss definitions live only in
+`src/model/ppo_objective.rs`.
 
 ## What changed numerically
 

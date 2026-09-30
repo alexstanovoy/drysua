@@ -565,7 +565,7 @@ fn rollback_fixture(
         .expect("warm moments");
     assert!(report.applied);
     assert_eq!(adam.step(), 1);
-    assert!(adam.moments().0.iter().any(|value| *value != 0.0));
+    assert!(adam.moments().unwrap().0.iter().any(|value| *value != 0.0));
     (model, adam, samples, config)
 }
 

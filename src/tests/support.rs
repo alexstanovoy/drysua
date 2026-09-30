@@ -52,7 +52,8 @@ pub(crate) fn assert_fresh_state(model: &PolicyModel, trainer: &crate::PpoTraine
     let snapshot = trainer
         .checkpoint_snapshot(model)
         .expect("bound fresh optimizer");
-    for moments in [snapshot.adam.moments().0, snapshot.adam.moments().1] {
+    let (first, second) = snapshot.adam.moments().expect("fresh moments");
+    for moments in [first, second] {
         assert_eq!(moments.len(), crate::MODEL_PARAMETER_COUNT);
         assert!(moments.iter().all(|value| value.to_bits() == 0));
     }

@@ -83,7 +83,7 @@ impl PpoStaging {
 }
 
 /// Updated parameters and the new first and second moments of one Adam step.
-type AdamUpdate = (Vec<Tensor>, Vec<f32>, Vec<f32>);
+type AdamUpdate = (Vec<Tensor>, Tensor, Tensor);
 
 /// Upper bound on the rows one update stages.
 pub(crate) const MODEL_MAX_STAGED_ROWS: usize = crate::PPO_MAX_SAMPLES;
@@ -441,7 +441,7 @@ impl PolicyModel {
         Ok(())
     }
 
-    /// Clipped Adam on the device; the host keeps the committed moments.
+    /// Clipped Adam on the device.
     fn apply_adam_device(
         &self,
         adam: &mut AdamState,
@@ -460,6 +460,10 @@ impl PolicyModel {
         let (updated, first, second) =
             self.adam_update_parameters(adam, gradients, scale, corrections)?;
         apply_parameter_tensors(&self.parameters(), &updated, original, None)?;
+        // A tracked moment would chain every step's autograd graph (and its
+        // activations) to the optimizer.
+        assert!(!first.track_op());
+        assert!(!second.track_op());
         adam.first_moment = first;
         adam.second_moment = second;
         adam.step = step;
@@ -481,9 +485,7 @@ impl PolicyModel {
         corrections: (f64, f64),
     ) -> Result<AdamUpdate, ModelError> {
         let config = adam.config;
-        let device = self.tensor_device();
-        let first = Tensor::from_slice(&adam.first_moment, MODEL_PARAMETER_COUNT, device)?;
-        let second = Tensor::from_slice(&adam.second_moment, MODEL_PARAMETER_COUNT, device)?;
+        let (first, second) = (&adam.first_moment, &adam.second_moment);
         let parameters = self.parameters();
         let mut updated = Vec::with_capacity(parameters.len());
         let mut moments = (
@@ -510,24 +512,34 @@ impl PolicyModel {
             offset += count;
         }
         assert_eq!(offset, MODEL_PARAMETER_COUNT);
-        let first = Tensor::cat(&moments.0, 0)?.to_vec1::<f32>()?;
-        let second = Tensor::cat(&moments.1, 0)?.to_vec1::<f32>()?;
-        if let Some(index) = first
-            .iter()
-            .zip(&second)
-            .position(|(first, second)| !first.is_finite() || !second.is_finite() || *second < 0.0)
-        {
-            return Err(ModelError::NonFiniteOptimizerUpdate { index });
-        }
+        let first = Tensor::cat(&moments.0, 0)?.detach();
+        let second = Tensor::cat(&moments.1, 0)?.detach();
         let check = updated
             .iter()
             .map(|tensor| tensor.sum_all())
             .collect::<Result<Vec<_>, _>>()?;
-        if !Tensor::stack(&check, 0)?
-            .sum_all()?
-            .to_scalar::<f32>()?
-            .is_finite()
-        {
+        // One readback: the moment flags, then the updated parameters' sum.
+        let flags = Tensor::cat(
+            &[
+                super::moment_flags(&first, &second)?,
+                Tensor::stack(&check, 0)?.sum_all()?.reshape(1)?,
+            ],
+            0,
+        )?
+        .to_vec1::<f32>()?;
+        if !super::moments_pass(&flags[..3]) {
+            let (host_first, host_second) = (first.to_vec1::<f32>()?, second.to_vec1::<f32>()?);
+            if let Some(index) = host_first
+                .iter()
+                .zip(&host_second)
+                .position(|(first, second)| {
+                    !first.is_finite() || !second.is_finite() || *second < 0.0
+                })
+            {
+                return Err(ModelError::NonFiniteOptimizerUpdate { index });
+            }
+        }
+        if !flags[3].is_finite() {
             return Err(ModelError::NonFiniteOptimizerUpdate { index: 0 });
         }
         Ok((updated, first, second))

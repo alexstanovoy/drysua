@@ -37,6 +37,36 @@ pub(crate) fn cache_domains() -> Vec<Vec<usize>> {
     domains
 }
 
+/// Available cores counting SMT siblings once: simulation workers beyond one
+/// per physical core slow the lanes and the learner that share those cores.
+///
+/// Falls back to every available CPU when the host does not describe its
+/// SMT siblings.
+pub(crate) fn physical_cores() -> usize {
+    let available = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    let mut cores = Vec::new();
+    let mut logical = 0_usize;
+    for cpu in 0..MAX_CPUS {
+        let path = format!("/sys/devices/system/cpu/cpu{cpu}/topology/thread_siblings_list");
+        let Ok(text) = std::fs::read_to_string(path) else {
+            if cpu == 0 {
+                break;
+            }
+            continue;
+        };
+        logical += 1;
+        if let Some(siblings) = parse_cpu_list(text.trim())
+            && !cores.contains(&siblings)
+        {
+            cores.push(siblings);
+        }
+    }
+    if cores.is_empty() {
+        return available;
+    }
+    (available / logical.div_ceil(cores.len())).max(1)
+}
+
 /// Parses a sysfs CPU list such as `0-7,16-23`.
 fn parse_cpu_list(text: &str) -> Option<Vec<usize>> {
     let mut cpus = Vec::new();
@@ -111,5 +141,7 @@ mod tests {
             assert_eq!(parse_cpu_list(text), None, "{text}");
         }
         assert!(!cache_domains().is_empty());
+        let available = std::thread::available_parallelism().unwrap().get();
+        assert!((1..=available).contains(&physical_cores()));
     }
 }

@@ -155,9 +155,22 @@ pub(super) fn fill_raze_coverage(
     targets: &[RazeTarget],
     points: &mut [PointCandidate],
 ) {
+    // Only targets in a raze's reach window can be under any of its landings.
+    let reachable = SHADOWRAZES.map(|(_, reach)| {
+        targets
+            .iter()
+            .copied()
+            .filter(|target| within_reach_window(origin, target.position, reach))
+            .collect::<Vec<_>>()
+    });
     for point in points.iter_mut().filter(|point| point.position != origin) {
         let heading = facing_towards(origin, point.position);
-        for (coverage, (_, reach)) in point.raze_coverage.iter_mut().zip(SHADOWRAZES) {
+        for ((coverage, (_, reach)), targets) in point
+            .raze_coverage
+            .iter_mut()
+            .zip(SHADOWRAZES)
+            .zip(&reachable)
+        {
             *coverage = coverage_at(raze_center(origin, heading, reach), targets);
         }
     }

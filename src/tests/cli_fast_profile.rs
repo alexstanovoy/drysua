@@ -51,6 +51,51 @@ fn annealed_cli_resolves_the_continuous_profile_and_validates() {
     crate::ppo_arena::validate_annealed(&settings, Default::default()).unwrap();
 }
 
+/// Host-sized defaults must form a configuration the validator accepts on
+/// any topology; the test host has only one, so the topology is varied here.
+#[cfg(feature = "builtin")]
+#[test]
+fn default_collection_shapes_are_valid_on_every_topology() {
+    for cores in [1, 2, 3, 8, 32, 64] {
+        for domains in [1, 2, 3, 4] {
+            for threads in [1, 2, cores] {
+                for requested in [
+                    (None, None),
+                    (Some(1), None),
+                    (Some(2), None),
+                    (Some(7), None),
+                    (Some(130), None),
+                    (None, Some(1)),
+                    (Some(6), Some(3)),
+                ] {
+                    let (slots, lanes, groups) = crate::cli::collection_shape(
+                        (requested.0, requested.1, None),
+                        cores,
+                        domains,
+                        threads,
+                    );
+                    let case = format!(
+                        "{cores} cores, {domains} domains, {threads} threads, {requested:?}"
+                    );
+                    assert!((1..=domains.min(threads)).contains(&groups), "{case}");
+                    assert!(lanes.is_multiple_of(groups), "{case}");
+                    assert!(slots.is_multiple_of(lanes), "{case}");
+                    assert!(slots / lanes <= 64, "{case}");
+                    if requested == (None, None) {
+                        assert_eq!(slots, (16 * cores).min(256), "{case}");
+                        assert!(lanes >= 2 * groups, "{case}");
+                    }
+                }
+            }
+        }
+    }
+    // A host with two cache domains gets two groups of two lanes by default.
+    assert_eq!(
+        crate::cli::collection_shape((None, None, None), 16, 2, 32),
+        (256, 4, 2)
+    );
+}
+
 #[cfg(feature = "builtin")]
 #[test]
 fn annealed_cli_parses_an_ordered_opponent_mixture_with_colon_paths() {

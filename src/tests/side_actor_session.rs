@@ -46,7 +46,7 @@ fn fresh_session_imports_only_initial_parameters_and_resets_all_training_state()
     assert_eq!(session.trainer.rng_checkpoint(), (9001 ^ 0x51a9, 0));
     assert!(session.adaptive_environment.is_none());
     let snapshot = session.trainer.checkpoint_snapshot(&session.model).unwrap();
-    let (first, second) = snapshot.adam.moments();
+    let (first, second) = snapshot.adam.moments().unwrap();
     assert!(first.iter().all(|value| value.to_bits() == 0));
     assert!(second.iter().all(|value| value.to_bits() == 0));
     assert_eq!(

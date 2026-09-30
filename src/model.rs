@@ -651,53 +651,73 @@ impl Default for AdamConfig {
 }
 
 /// One optimizer owner with exact moments, checked step, and bound policy revision.
-#[derive(Clone, Debug, PartialEq)]
+///
+/// The moments live on the model's device as immutable flat tensors, so a
+/// clone (the rollback point of every Adam step) copies no data and a step
+/// never round-trips them through the host.
+#[derive(Clone, Debug)]
 pub struct AdamState {
     binding: OptimizerBinding,
     config: AdamConfig,
-    first_moment: Vec<f32>,
-    second_moment: Vec<f32>,
+    first_moment: Tensor,
+    second_moment: Tensor,
     step: u64,
 }
 
-/// Coherent host snapshot captured under one model parameter guard.
-#[derive(Clone, Debug, PartialEq)]
+#[cfg(test)]
+impl PartialEq for AdamState {
+    fn eq(&self, other: &Self) -> bool {
+        self.binding == other.binding
+            && self.config == other.config
+            && self.step == other.step
+            && self.moments() == other.moments()
+    }
+}
+
+/// Coherent snapshot captured under one model parameter guard.
+#[derive(Clone, Debug)]
+#[cfg_attr(test, derive(PartialEq))]
 pub(crate) struct ModelAdamSnapshot {
     pub parameters: Vec<f32>,
     pub adam: AdamState,
 }
 
 impl AdamState {
-    pub(crate) fn new(config: AdamConfig, binding: OptimizerBinding) -> Result<Self, ModelError> {
+    fn new(
+        config: AdamConfig,
+        binding: OptimizerBinding,
+        device: &Device,
+    ) -> Result<Self, ModelError> {
         validate_adam_config(config)?;
+        let zeros = Tensor::zeros(MODEL_PARAMETER_COUNT, DType::F32, device)?;
         Ok(Self {
             binding,
             config,
-            first_moment: vec![0.0; MODEL_PARAMETER_COUNT],
-            second_moment: vec![0.0; MODEL_PARAMETER_COUNT],
+            first_moment: zeros.clone(),
+            second_moment: zeros,
             step: 0,
         })
     }
 
-    pub(crate) fn from_parts(
+    fn from_parts(
         config: AdamConfig,
-        first_moment: Vec<f32>,
-        second_moment: Vec<f32>,
+        (first_moment, second_moment): (&[f32], &[f32]),
         step: u64,
         binding: OptimizerBinding,
+        device: &Device,
     ) -> Result<Self, ModelError> {
         validate_adam_parts(
             config,
-            &first_moment,
-            &second_moment,
+            first_moment,
+            second_moment,
             step,
             MODEL_PARAMETER_COUNT,
         )?;
         Ok(Self {
             binding,
             config,
-            first_moment,
-            second_moment,
+            first_moment: Tensor::from_slice(first_moment, MODEL_PARAMETER_COUNT, device)?,
+            second_moment: Tensor::from_slice(second_moment, MODEL_PARAMETER_COUNT, device)?,
             step,
         })
     }
@@ -714,9 +734,49 @@ impl AdamState {
     pub(crate) const fn binding(&self) -> OptimizerBinding {
         self.binding
     }
-    pub fn moments(&self) -> (&[f32], &[f32]) {
-        (&self.first_moment, &self.second_moment)
+    /// Host copies of the first and second moments.
+    pub fn moments(&self) -> Result<(Vec<f32>, Vec<f32>), ModelError> {
+        Ok((
+            self.first_moment.to_vec1::<f32>()?,
+            self.second_moment.to_vec1::<f32>()?,
+        ))
     }
+
+    /// Checks the config, step and moments; reads the moments back only to
+    /// locate a value the device check rejects.
+    fn validate(&self) -> Result<(), ModelError> {
+        validate_adam_config(self.config)?;
+        if self.step > MODEL_MAX_OPTIMIZER_STEP {
+            return Err(ModelError::OptimizerStepOverflow);
+        }
+        for (field, moment) in [
+            ("first moment", &self.first_moment),
+            ("second moment", &self.second_moment),
+        ] {
+            validate_optimizer_length(field, moment.elem_count(), MODEL_PARAMETER_COUNT)?;
+        }
+        let flags = moment_flags(&self.first_moment, &self.second_moment)?.to_vec1::<f32>()?;
+        if moments_pass(&flags) {
+            return Ok(());
+        }
+        let (first, second) = self.moments()?;
+        validate_moments("first", &first, false)?;
+        validate_moments("second", &second, true)
+    }
+}
+
+/// Device reductions whose values are all finite and nonnegative exactly when
+/// both moments are finite and the second moment is nonnegative (up to a sum
+/// overflow, which [`moments_pass`] callers resolve on the host).
+fn moment_flags(first: &Tensor, second: &Tensor) -> Result<Tensor, ModelError> {
+    Ok(Tensor::stack(
+        &[first.sum_all()?, second.sum_all()?, second.min(0)?],
+        0,
+    )?)
+}
+
+fn moments_pass(flags: &[f32]) -> bool {
+    flags.iter().all(|value| value.is_finite()) && flags[2] >= 0.0
 }
 
 /// Pre-update behavioral loss and optimizer diagnostics for one effective batch.
@@ -1253,9 +1313,27 @@ impl PolicyDevice {
         match self {
             Self::Cpu => Ok(Device::Cpu),
             #[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
-            Self::Cuda { ordinal } => Device::new_cuda(ordinal).map_err(ModelError::from),
+            Self::Cuda { ordinal } => cuda_device(ordinal),
         }
     }
+}
+
+/// A CUDA device on the calling thread's per-thread stream, without cudarc's
+/// per-allocation event pairs.
+///
+/// With event tracking on, cudarc creates and destroys two events for every
+/// allocation but consults them only in multi-stream mode, which a context
+/// that only uses candle's per-thread stream never enters. The events were
+/// about half of every learner and lane thread's CUDA API time.
+#[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
+fn cuda_device(ordinal: usize) -> Result<Device, ModelError> {
+    let device = Device::new_cuda(ordinal)?;
+    let cuda = device.as_cuda_device()?;
+    // SAFETY: the context is fresh and never gets a second stream (drysua
+    // creates none; candle uses the per-thread stream), so cudarc records and
+    // waits on no event either way.
+    unsafe { cuda.disable_event_tracking() };
+    Ok(device)
 }
 
 /// F32 DeepSets policy with an autoregressive masked decoder.
@@ -1445,7 +1523,7 @@ impl PolicyModel {
             lineage,
             policy: self.policy_identity_locked(),
         };
-        let adam = AdamState::new(config, binding)?;
+        let adam = AdamState::new(config, binding, self.tensor_device())?;
         self.optimizer_lineage
             .store(lineage.get(), Ordering::Relaxed);
         Ok(adam)
@@ -1478,10 +1556,10 @@ impl PolicyModel {
         )?;
         let adam = AdamState::from_parts(
             config,
-            first_moment,
-            second_moment,
+            (&first_moment, &second_moment),
             step,
             OptimizerBinding { lineage, policy },
+            self.tensor_device(),
         )?;
         self.import_parameters_locked(parameters, None)?;
         self.parameter_revision
@@ -1854,13 +1932,7 @@ impl PolicyModel {
     ) -> Result<ModelAdamSnapshot, ModelError> {
         let _guard = self.read_parameter_lock()?;
         self.validate_optimizer_binding_locked(adam.binding)?;
-        validate_adam_parts(
-            adam.config,
-            &adam.first_moment,
-            &adam.second_moment,
-            adam.step,
-            MODEL_PARAMETER_COUNT,
-        )?;
+        adam.validate()?;
         Ok(ModelAdamSnapshot {
             parameters: self.export_parameters_locked()?,
             adam: adam.clone(),
@@ -1884,13 +1956,7 @@ impl PolicyModel {
         fail_after: Option<usize>,
     ) -> Result<OptimizerBinding, ModelError> {
         validate_parameter_values(&snapshot.parameters)?;
-        validate_adam_parts(
-            snapshot.adam.config,
-            &snapshot.adam.first_moment,
-            &snapshot.adam.second_moment,
-            snapshot.adam.step,
-            MODEL_PARAMETER_COUNT,
-        )?;
+        snapshot.adam.validate()?;
         let _guard = self.write_parameter_lock()?;
         self.validate_optimizer_binding_locked(expected)?;
         let next = self.next_policy_identity_locked()?;
