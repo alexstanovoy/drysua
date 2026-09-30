@@ -230,7 +230,7 @@ def ready_port(data, requested):
     return port
 
 
-@dataclass
+@dataclass(eq=False)
 class Child:
     name: str
     process: subprocess.Popen
