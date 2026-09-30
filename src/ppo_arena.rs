@@ -8,8 +8,10 @@ pub use annealed::{
 mod collector;
 pub(crate) mod collector_state;
 pub(crate) mod episode;
+mod eval_players;
 mod evaluation;
-pub(crate) use evaluation::{EvaluationOpponent, EvaluationSettings, run_evaluation};
+pub(crate) use eval_players::{PlayerSpec, read_pool};
+pub(crate) use evaluation::{EvaluationSettings, run_evaluation};
 mod game_summary;
 mod lane;
 mod pool;

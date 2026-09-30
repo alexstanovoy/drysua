@@ -1,19 +1,47 @@
+use std::path::PathBuf;
+
+use super::super::eval_players::{Role, load_player};
 use super::*;
 
 const FIRST_SEED: u64 = 11;
-const WEIGHTS_SEED: u64 = 5;
+const CANDIDATE_SEED: u64 = 5;
+const OPPONENT_SEED: u64 = 6;
 
-fn fresh_weights() -> PathBuf {
+fn fresh_weights(seed: u64) -> PathBuf {
     let directory = crate::test_directory("evaluation-weights");
-    let model = PolicyModel::fresh(WEIGHTS_SEED).expect("model");
-    TrainingArtifact::save_runtime_weights(&model, &directory).expect("runtime weights");
+    let model = PolicyModel::fresh(seed).expect("model");
+    crate::TrainingArtifact::save_runtime_weights(&model, &directory).expect("runtime weights");
     directory
 }
 
-fn settings(candidate: PathBuf, parallel: usize, groups: usize) -> EvaluationSettings {
+fn entry(name: &str, player: PlayerSpec, role: Role) -> PoolEntry {
+    PoolEntry {
+        name: name.to_owned(),
+        player,
+        role,
+    }
+}
+
+/// A neural candidate against a rule opponent and a neural opponent.
+fn settings(parallel: usize, groups: usize) -> EvaluationSettings {
+    static WEIGHTS: std::sync::OnceLock<(PathBuf, PathBuf)> = std::sync::OnceLock::new();
+    let (candidate, opponent) =
+        WEIGHTS.get_or_init(|| (fresh_weights(CANDIDATE_SEED), fresh_weights(OPPONENT_SEED)));
     EvaluationSettings {
-        candidate,
-        opponent: EvaluationOpponent::Teacher,
+        candidate_name: "fresh".to_owned(),
+        candidate: PlayerSpec::Weights(candidate.clone()),
+        pool: vec![
+            entry(
+                "teacher",
+                PlayerSpec::Script(ScriptKind::Teacher),
+                Role::Train,
+            ),
+            entry(
+                "other",
+                PlayerSpec::Weights(opponent.clone()),
+                Role::HeldOut,
+            ),
+        ],
         first_seed: FIRST_SEED,
         seeds: 1,
         parallel,
@@ -24,38 +52,50 @@ fn settings(candidate: PathBuf, parallel: usize, groups: usize) -> EvaluationSet
 }
 
 fn play(parallel: usize, groups: usize) -> Vec<(PlannedGame, GameSummary)> {
-    let settings = settings(fresh_weights(), parallel, groups);
+    let settings = settings(parallel, groups);
+    let load = |spec| load_player(spec, settings.device).expect("player");
     let models = Models {
-        learner: load_model(&settings.candidate, settings.device).expect("model"),
-        opponent: None,
+        candidate: load(&settings.candidate),
+        pool: settings
+            .pool
+            .iter()
+            .map(|entry| load(&entry.player))
+            .collect(),
     };
     let mut games = play_all(&settings, &models).expect("games");
-    games.sort_by_key(|(game, _)| (game.seed, game.seat));
+    games.sort_by_key(|(game, _)| *game);
     games
 }
 
-/// Full games are the expensive part, so the contract tests share one batched run.
+/// Full games are the expensive part, so the contract tests share one batched run
+/// whose single inference batch mixes both models' rows.
 fn batched_games() -> &'static [(PlannedGame, GameSummary)] {
     static GAMES: std::sync::OnceLock<Vec<(PlannedGame, GameSummary)>> = std::sync::OnceLock::new();
-    GAMES.get_or_init(|| play(2, 1))
+    GAMES.get_or_init(|| play(4, 1))
 }
 
 #[test]
-fn evaluation_games_depend_on_weights_and_seeds_but_not_batching() {
+fn pool_games_depend_on_players_and_seeds_but_not_batching() {
     let pipelined = play(1, 2);
     assert_eq!(batched_games(), pipelined.as_slice());
 }
 
 #[test]
-fn evaluation_plays_each_seed_once_per_side() {
-    let sides: Vec<(u64, &str)> = batched_games()
+fn pool_evaluation_plays_each_seed_once_per_side_and_opponent() {
+    let games: Vec<(usize, u64, &str)> = batched_games()
         .iter()
-        .map(|(game, summary)| (game.seed, summary.side_label()))
+        .map(|(game, summary)| (game.opponent, game.seed, summary.side_label()))
         .collect();
-    assert_eq!(sides.len(), 2);
-    assert_eq!(sides[0].0, FIRST_SEED);
-    assert_eq!(sides[1].0, FIRST_SEED);
-    assert_ne!(sides[0].1, sides[1].1);
+    assert_eq!(games.len(), 4);
+    for opponent in 0..2 {
+        let sides: Vec<&str> = games
+            .iter()
+            .filter(|game| game.0 == opponent && game.1 == FIRST_SEED)
+            .map(|game| game.2)
+            .collect();
+        assert_eq!(sides.len(), 2, "opponent {opponent}");
+        assert_ne!(sides[0], sides[1], "opponent {opponent}");
+    }
 }
 
 #[test]
@@ -67,14 +107,19 @@ fn evaluation_end_reasons_agree_with_final_state() {
             _ => {
                 assert!(matches!(
                     summary.end_reason,
-                    EndReason::Draw | EndReason::TimeCap
+                    super::super::game_summary::EndReason::Draw
+                        | super::super::game_summary::EndReason::TimeCap
                 ));
                 continue;
             }
         };
         match summary.end_reason {
-            EndReason::Tower => assert_eq!(loser.tower_hp, 0.0, "seat {}", game.seat),
-            EndReason::Deaths => assert!(loser.deaths > winner.deaths, "seat {}", game.seat),
+            super::super::game_summary::EndReason::Tower => {
+                assert_eq!(loser.tower_hp, 0.0, "{game:?}");
+            }
+            super::super::game_summary::EndReason::Deaths => {
+                assert!(loser.deaths > winner.deaths, "{game:?}");
+            }
             other => panic!("decided game ended by {other:?}"),
         }
     }
@@ -122,13 +167,61 @@ fn episode_summary_log_carries_every_evaluation_field() {
         }
         let mut leads = 0;
         for (minute, lead) in json["leads"].as_object().expect("leads") {
-            for (key, value) in lead.as_object().into_iter().flatten() {
+            let Some(lead) = lead.as_object() else {
+                continue;
+            };
+            for (key, value) in lead {
                 let field = format!("lead_{minute}_{key}");
                 assert_eq!(fields[field.as_str()], value.to_string(), "{field}");
                 leads += 1;
             }
         }
+        assert!(leads > 0, "every game lasts past the first milestone");
         assert_eq!(fields.len(), 4 + 2 * 14 + leads);
+    }
+}
+
+/// The header and game lines are the contract `scripts/eval_pool.py` reads.
+#[test]
+fn evaluation_writes_a_header_then_every_game_in_plan_order() {
+    let directory = crate::test_directory("evaluation-output");
+    let output = directory.join("result.jsonl");
+    let settings = EvaluationSettings {
+        candidate_name: "teacher".to_owned(),
+        candidate: PlayerSpec::Script(ScriptKind::Teacher),
+        pool: vec![entry(
+            "harass",
+            PlayerSpec::Script(ScriptKind::HarassPush),
+            Role::HeldOut,
+        )],
+        first_seed: FIRST_SEED,
+        seeds: 1,
+        parallel: 2,
+        groups: 1,
+        greedy: false,
+        device: PolicyDevice::Cpu,
+    };
+    run_evaluation(&settings, &output).expect("evaluation");
+    let text = std::fs::read_to_string(&output).expect("output");
+    let lines: Vec<Value> = text
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("json line"))
+        .collect();
+    assert_eq!(lines.len(), 3);
+    let header = &lines[0];
+    assert_eq!(header["kind"], "header");
+    assert_eq!(header["candidate"]["key"], "script:teacher");
+    assert_eq!(header["pool"][0]["name"], "harass");
+    assert_eq!(header["pool"][0]["role"], "held-out");
+    assert_eq!(header["pool"][0]["key"], "script:harass-push");
+    assert_eq!(header["seeds"]["count"], 1);
+    let context = header["context"].as_str().expect("context");
+    assert!(context.starts_with("exe:") && context.ends_with("/sampled"));
+    for (line, side) in lines[1..].iter().zip(["radiant", "dire"]) {
+        assert_eq!(line["kind"], "game");
+        assert_eq!(line["opponent"], "harass");
+        assert_eq!(line["seed"], FIRST_SEED);
+        assert_eq!(line["side"], side);
     }
 }
 
@@ -136,12 +229,35 @@ fn episode_summary_log_carries_every_evaluation_field() {
 fn evaluation_never_replaces_an_existing_result() {
     let output = crate::test_directory("evaluation-existing").join("result.jsonl");
     std::fs::write(&output, b"earlier").expect("earlier result");
-    let error = run_evaluation(&settings(PathBuf::from("/nonexistent"), 1, 1), &output)
-        .expect_err("existing output");
+    let error = run_evaluation(&settings(1, 1), &output).expect_err("existing output");
     assert!(
         error
             .to_string()
             .contains("already exists; evaluation never replaces a result")
     );
     assert_eq!(std::fs::read(&output).expect("kept"), b"earlier");
+}
+
+/// An average candidate is the element-wise mean of its members, in parameter order.
+#[test]
+#[allow(clippy::float_arithmetic, reason = "expected parameter means")]
+fn average_player_is_the_parameter_mean_of_its_members() {
+    let first = fresh_weights(CANDIDATE_SEED);
+    let second = fresh_weights(OPPONENT_SEED);
+    let parameters = |spec: &PlayerSpec| {
+        load_player(spec, PolicyDevice::Cpu)
+            .expect("player")
+            .model()
+            .expect("neural")
+            .export_parameters()
+            .expect("parameters")
+    };
+    let a = parameters(&PlayerSpec::Weights(first.clone()));
+    let b = parameters(&PlayerSpec::Weights(second.clone()));
+    let mean = parameters(&PlayerSpec::Average(vec![first, second]));
+    assert_ne!(a, b);
+    for ((a, b), mean) in a.iter().zip(&b).zip(&mean) {
+        let expected = ((f64::from(*a) + f64::from(*b)) / 2.0) as f32;
+        assert_eq!(expected.to_bits(), mean.to_bits());
+    }
 }

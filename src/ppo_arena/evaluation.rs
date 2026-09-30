@@ -1,18 +1,22 @@
-//! Frozen-weights evaluation: no optimizer, no rollout, both sides of every seed.
+//! Frozen evaluation: one candidate against every pool opponent on both sides of
+//! every seed; no optimizer, no rollout.
 //!
 //! Each game owns its arena seed and its actor RNG streams, both pure functions
-//! of `(seed, seat)`. Games are statically assigned to pipeline groups and to
-//! batch slots, so one argument set always forms the same inference batches and
-//! writes byte-identical output.
+//! of `(seed, seat)`, so every candidate and every opponent meets the same worlds.
+//! Games are statically assigned to pipeline groups and to batch slots, and each
+//! policy row samples with its own RNG, so one argument set always writes
+//! byte-identical output whatever the batch shape.
 
 use std::collections::VecDeque;
 use std::io::Write;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::path::Path;
 
 use serde_json::{Value, json};
 
-use super::game_summary::{EndReason, GameSummary};
+use super::eval_players::{
+    Player, PlayerSpec, Policy, PoolEntry, evaluation_context, load_player, validate_name,
+};
+use super::game_summary::GameSummary;
 use super::{
     OpponentRuntime, TrainingEnvironment, advance_interval, build_environment,
     derive_training_seed, neural_policy_request_in_space, prepare_neural_seat_policy_sample,
@@ -23,30 +27,21 @@ use crate::randomization::{ARENA_DOMAIN, OPPONENT_DOMAIN};
 use crate::{
     ActionSpace, FeatureFrame, MAP2_ACTOR_DECISIONS, MAP2_DECISION_INTERVAL_TICKS, MAP2_TICK_CAP,
     PPO_MAX_PARALLEL_WORLDS, PolicyDevice, PolicyModel, PpoError, PpoRng, PpoTerminalOutcome,
-    Request, StructuredAction, TrainingArtifact,
+    Request, ScriptKind, ScriptedPolicy, StructuredAction,
 };
 
-const SCHEMA: &str = "drysua-eval/v1";
+const SCHEMA: &str = "drysua-eval/v3";
 const ACTOR_DOMAIN: u64 = 0x6576_616c_5f61_6374;
 /// Bounds one evaluation to a few hours of simulation and a small JSONL file.
 pub(crate) const MAX_EVALUATION_SEEDS: u64 = 10_000;
-const RUNTIME_FILE: &str = "drysua.weights.safetensors";
-const MAX_RUNTIME_BYTES: u64 = 16 * 1024 * 1024;
-const WILSON_Z: f64 = 1.959_963_984_540_054;
-
-/// The frozen opponent every candidate game faces.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum EvaluationOpponent {
-    Teacher,
-    HarassPush,
-    Weights(PathBuf),
-}
+const MAX_EVALUATION_GAMES: u64 = 20_000;
 
 /// One validated evaluation request.
 #[derive(Clone, Debug)]
 pub(crate) struct EvaluationSettings {
-    pub candidate: PathBuf,
-    pub opponent: EvaluationOpponent,
+    pub candidate_name: String,
+    pub candidate: PlayerSpec,
+    pub pool: Vec<PoolEntry>,
     pub first_seed: u64,
     pub seeds: u64,
     /// Worlds per pipeline group, which is also the inference batch.
@@ -64,6 +59,15 @@ impl EvaluationSettings {
         if self.first_seed.checked_add(self.seeds).is_none() {
             return Err(PpoError::InvalidConfig("evaluation seed range"));
         }
+        if self.pool.is_empty() || self.pool.len() > super::eval_players::MAX_POOL_ENTRIES {
+            return Err(PpoError::InvalidConfig("evaluation pool size"));
+        }
+        if self.games() > MAX_EVALUATION_GAMES {
+            return Err(PpoError::InvalidConfig(
+                "evaluation games (seeds x pool x 2)",
+            ));
+        }
+        validate_name(&self.candidate_name).map_err(PpoError::Model)?;
         if !matches!(self.groups, 1 | 2 | 4) {
             return Err(PpoError::InvalidConfig("evaluation pipeline groups"));
         }
@@ -72,23 +76,31 @@ impl EvaluationSettings {
         }
         Ok(())
     }
+
+    fn games(&self) -> u64 {
+        self.seeds * 2 * self.pool.len() as u64
+    }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct PlannedGame {
     seed: u64,
+    /// Index into the pool.
+    opponent: usize,
+    /// The candidate's seat.
     seat: usize,
-    /// Who plays the opponent seat when no opponent weights are loaded.
-    script: OpponentRuntime,
 }
+
+/// Samples of the seats whose policy is neural; rule seats decide while stepping.
+type Samples = (Option<Prepared>, Option<Prepared>);
 
 /// One live world; `prepared` is taken for inference and refilled after each step.
 struct LiveWorld {
     game: PlannedGame,
     environment: TrainingEnvironment,
-    learner_rng: PpoRng,
+    candidate_rng: PpoRng,
     opponent_rng: PpoRng,
-    prepared: Option<(Prepared, Option<Prepared>)>,
+    prepared: Option<Samples>,
     decisions: usize,
 }
 
@@ -101,18 +113,15 @@ struct Group {
 /// One chosen action with the action space it was chosen in.
 type Chosen = (StructuredAction, ActionSpace);
 
-/// Chosen actions, aligned with a group's live worlds.
-struct GroupActions {
-    learner: Vec<Chosen>,
-    opponent: Option<Vec<Chosen>>,
-}
+/// The neural choices of one world: candidate seat, opponent seat.
+type WorldActions = (Option<Chosen>, Option<Chosen>);
 
 struct Models {
-    learner: PolicyModel,
-    opponent: Option<Arc<PolicyModel>>,
+    candidate: Player,
+    pool: Vec<Player>,
 }
 
-/// Plays every planned game and writes one JSON line per game plus a summary.
+/// Plays every planned game and writes a header line plus one JSON line per game.
 pub(crate) fn run_evaluation(settings: &EvaluationSettings, output: &Path) -> Result<(), PpoError> {
     settings.validate()?;
     if std::fs::symlink_metadata(output).is_ok() {
@@ -121,38 +130,30 @@ pub(crate) fn run_evaluation(settings: &EvaluationSettings, output: &Path) -> Re
             output.display()
         )));
     }
-    let candidate_sha = weights_sha256(&settings.candidate)?;
-    let opponent_sha = match &settings.opponent {
-        EvaluationOpponent::Teacher | EvaluationOpponent::HarassPush => None,
-        EvaluationOpponent::Weights(directory) => Some(weights_sha256(directory)?),
-    };
+    let context = evaluation_context(settings.greedy)?;
     let models = Models {
-        learner: load_model(&settings.candidate, settings.device)?,
-        opponent: match &settings.opponent {
-            EvaluationOpponent::Teacher | EvaluationOpponent::HarassPush => None,
-            EvaluationOpponent::Weights(directory) => {
-                Some(Arc::new(load_model(directory, settings.device)?))
-            }
-        },
+        candidate: load_player(&settings.candidate, settings.device)?,
+        pool: settings
+            .pool
+            .iter()
+            .map(|entry| load_player(&entry.player, settings.device))
+            .collect::<Result<_, _>>()?,
     };
     let started = std::time::Instant::now();
     let mut results = play_all(settings, &models)?;
-    results.sort_by_key(|(game, _)| (game.seed, game.seat));
+    results.sort_by_key(|(game, _)| *game);
     let mut lines = Vec::with_capacity(results.len() + 1);
+    lines.push(header_json(settings, &models, &context));
     for (game, summary) in &results {
         let mut line = summary.json();
         line["schema"] = json!(SCHEMA);
+        line["kind"] = json!("game");
+        line["opponent"] = json!(settings.pool[game.opponent].name);
         line["seed"] = json!(game.seed);
         lines.push(line);
     }
-    let summaries: Vec<GameSummary> = results.iter().map(|(_, summary)| *summary).collect();
-    lines.push(summary_json(
-        settings,
-        &candidate_sha,
-        opponent_sha.as_deref(),
-        &summaries,
-    ));
     write_lines(output, &lines)?;
+    log_results(settings, &results);
     eprintln!(
         "level=INFO event=evaluation_complete games={} seconds={:.1} output={}",
         results.len(),
@@ -162,53 +163,65 @@ pub(crate) fn run_evaluation(settings: &EvaluationSettings, output: &Path) -> Re
     Ok(())
 }
 
-fn load_model(directory: &Path, device: PolicyDevice) -> Result<PolicyModel, PpoError> {
-    let model = PolicyModel::fresh_on(0, device).map_err(text_error)?;
-    TrainingArtifact::load_runtime_weights(&model, directory).map_err(|error| {
-        PpoError::Model(format!(
-            "{}: {error}",
-            directory.join(RUNTIME_FILE).display()
-        ))
-    })?;
-    Ok(model)
+fn header_json(settings: &EvaluationSettings, models: &Models, context: &str) -> Value {
+    json!({
+        "schema": SCHEMA,
+        "kind": "header",
+        "context": context,
+        "drysua_commit": option_env!("DRYSUA_GIT_COMMIT"),
+        "bota_commit": option_env!("BOTA_GIT_COMMIT"),
+        "greedy": settings.greedy,
+        "seeds": {"first": settings.first_seed, "count": settings.seeds},
+        "candidate": {
+            "name": settings.candidate_name,
+            "player": settings.candidate.label(),
+            "key": models.candidate.key,
+        },
+        "pool": settings
+            .pool
+            .iter()
+            .zip(&models.pool)
+            .map(|(entry, player)| entry.json(&player.key))
+            .collect::<Vec<_>>(),
+    })
 }
 
-fn weights_sha256(directory: &Path) -> Result<String, PpoError> {
-    use sha2::{Digest, Sha256};
-    use std::io::Read;
-    let path = directory.join(RUNTIME_FILE);
-    let describe = |error: std::io::Error| PpoError::Model(format!("{}: {error}", path.display()));
-    let mut bytes = Vec::new();
-    std::fs::File::open(&path)
-        .map_err(describe)?
-        .take(MAX_RUNTIME_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(describe)?;
-    if bytes.len() as u64 > MAX_RUNTIME_BYTES {
-        return Err(PpoError::Model(format!(
-            "{} exceeds {MAX_RUNTIME_BYTES} bytes",
-            path.display()
-        )));
+/// One `key=value` line per opponent and side for a quick look; statistics
+/// belong to `scripts/eval_pool.py`.
+fn log_results(settings: &EvaluationSettings, results: &[(PlannedGame, GameSummary)]) {
+    for (index, entry) in settings.pool.iter().enumerate() {
+        let mut line = format!(
+            "level=INFO event=evaluation_opponent opponent={}",
+            entry.name
+        );
+        for side in [bota_proto::Team::Radiant, bota_proto::Team::Dire] {
+            let games = results
+                .iter()
+                .filter(|(game, summary)| game.opponent == index && summary.side == side);
+            let (mut wins, mut losses, mut draws) = (0u64, 0u64, 0u64);
+            for (_, summary) in games {
+                match summary.outcome {
+                    Some(PpoTerminalOutcome::Win) => wins += 1,
+                    Some(PpoTerminalOutcome::Loss) => losses += 1,
+                    Some(PpoTerminalOutcome::Draw) | None => draws += 1,
+                }
+            }
+            let label = super::game_summary::side_label(side);
+            line.push_str(&format!(" {label}={wins}-{losses}-{draws}"));
+        }
+        eprintln!("{line}");
     }
-    Ok(Sha256::digest(bytes)
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect())
 }
 
 /// Game `index` goes to group `index % groups`, so assignment never depends on timing.
 fn plan_groups(settings: &EvaluationSettings) -> Vec<VecDeque<PlannedGame>> {
     let mut groups = vec![VecDeque::new(); settings.groups];
-    for index in 0..settings.seeds * 2 {
+    let per_seed = 2 * settings.pool.len() as u64;
+    for index in 0..settings.games() {
         groups[(index % settings.groups as u64) as usize].push_back(PlannedGame {
-            seed: settings.first_seed + index / 2,
+            seed: settings.first_seed + index / per_seed,
+            opponent: (index % per_seed / 2) as usize,
             seat: (index % 2) as usize,
-            script: match settings.opponent {
-                EvaluationOpponent::HarassPush => OpponentRuntime::HarassPush,
-                EvaluationOpponent::Teacher | EvaluationOpponent::Weights(_) => {
-                    OpponentRuntime::Teacher
-                }
-            },
         });
     }
     groups
@@ -226,7 +239,7 @@ fn play_all(
             live: Vec::with_capacity(settings.parallel),
             finished: Vec::new(),
         };
-        fill(&mut group, settings.parallel, models.opponent.as_ref())?;
+        fill(&mut group, settings.parallel, models)?;
         groups.push(Some(group));
     }
     std::thread::scope(|scope| {
@@ -250,10 +263,8 @@ fn play_all(
                 active = true;
                 let actions = infer(&mut group, models, settings.greedy)?;
                 let parallel = settings.parallel;
-                let opponent = models.opponent.clone();
-                stepping[index] = Some(
-                    scope.spawn(move || step_group(group, actions, parallel, opponent.as_ref())),
-                );
+                stepping[index] =
+                    Some(scope.spawn(move || step_group(group, actions, parallel, models)));
             }
             if !active {
                 return Ok::<(), PpoError>(());
@@ -264,53 +275,62 @@ fn play_all(
     for group in groups.into_iter().flatten() {
         results.extend(group.finished);
     }
-    if results.len() as u64 != settings.seeds * 2 {
+    if results.len() as u64 != settings.games() {
         return Err(PpoError::InvalidTransition("evaluation game count"));
     }
     Ok(results)
 }
 
 /// Starts pending games in plan order until the group holds `parallel` live worlds.
-fn fill(
-    group: &mut Group,
-    parallel: usize,
-    opponent: Option<&Arc<PolicyModel>>,
-) -> Result<(), PpoError> {
+fn fill(group: &mut Group, parallel: usize, models: &Models) -> Result<(), PpoError> {
     while group.live.len() < parallel {
         let Some(game) = group.pending.pop_front() else {
             break;
         };
-        group.live.push(start_game(game, opponent)?);
+        group.live.push(start_game(game, models)?);
     }
     Ok(())
 }
 
-fn start_game(
-    game: PlannedGame,
-    opponent: Option<&Arc<PolicyModel>>,
-) -> Result<LiveWorld, PpoError> {
-    let runtime = match opponent {
-        Some(_) => OpponentRuntime::Neural,
-        None => game.script,
-    };
-    let opponent_seed = derive_training_seed(game.seed, game.seat as u64, OPPONENT_DOMAIN);
+/// The runtime the environment builder expects for the opponent seat.
+const fn opponent_runtime(policy: &Policy) -> OpponentRuntime {
+    match policy {
+        Policy::Neural(_) => OpponentRuntime::Neural,
+        Policy::Script(ScriptKind::Teacher) => OpponentRuntime::Teacher,
+        Policy::Script(ScriptKind::HarassPush) => OpponentRuntime::HarassPush,
+    }
+}
+
+fn start_game(game: PlannedGame, models: &Models) -> Result<LiveWorld, PpoError> {
+    let opponent = &models.pool[game.opponent].policy;
     let mut environment = build_environment(
         derive_training_seed(game.seed, 0, ARENA_DOMAIN),
         crate::MAP2_ID,
         game.seat,
-        runtime,
+        opponent_runtime(opponent),
         Vec::new(),
     )?;
-    let prepared = prepare(&mut environment, opponent.is_some())?;
+    if let Policy::Script(kind) = models.candidate.policy {
+        environment.seats[game.seat].script = ScriptedPolicy::new(kind);
+    }
+    let neural = (
+        models.candidate.model().is_some(),
+        matches!(opponent, Policy::Neural(_)),
+    );
+    let prepared = prepare(&mut environment, neural)?;
     Ok(LiveWorld {
         game,
         environment,
-        learner_rng: PpoRng::new(derive_training_seed(
+        candidate_rng: PpoRng::new(derive_training_seed(
             game.seed,
             game.seat as u64,
             ACTOR_DOMAIN,
         )),
-        opponent_rng: PpoRng::new(opponent_seed),
+        opponent_rng: PpoRng::new(derive_training_seed(
+            game.seed,
+            game.seat as u64,
+            OPPONENT_DOMAIN,
+        )),
         prepared: Some(prepared),
         decisions: 0,
     })
@@ -318,12 +338,17 @@ fn start_game(
 
 type Prepared = (FeatureFrame, ActionSpace);
 
+/// Encodes the neural seats, `(candidate, opponent)`.
 fn prepare(
     environment: &mut TrainingEnvironment,
-    neural_opponent: bool,
-) -> Result<(Prepared, Option<Prepared>), PpoError> {
-    let learner = prepare_policy_sample(environment)?;
-    let opponent = if neural_opponent {
+    (candidate, opponent): (bool, bool),
+) -> Result<Samples, PpoError> {
+    let candidate = if candidate {
+        Some(prepare_policy_sample(environment)?)
+    } else {
+        None
+    };
+    let opponent = if opponent {
         let seat = 1 - environment.policy_seat;
         Some(prepare_neural_seat_policy_sample(
             &mut environment.seats[seat],
@@ -331,41 +356,63 @@ fn prepare(
     } else {
         None
     };
-    Ok((learner, opponent))
+    Ok((candidate, opponent))
 }
 
-fn infer(group: &mut Group, models: &Models, greedy: bool) -> Result<GroupActions, PpoError> {
-    let mut learner = Vec::with_capacity(group.live.len());
-    let mut opponent = Vec::with_capacity(group.live.len());
-    for world in &mut group.live {
-        let (own, other) = world
+/// Batches the candidate rows through its model and each opponent model's rows through it.
+fn infer(group: &mut Group, models: &Models, greedy: bool) -> Result<Vec<WorldActions>, PpoError> {
+    let worlds = group.live.len();
+    let mut candidate_rows = Vec::new();
+    let mut opponent_rows: Vec<Vec<(usize, Prepared, &mut PpoRng)>> =
+        (0..models.pool.len()).map(|_| Vec::new()).collect();
+    for (index, world) in group.live.iter_mut().enumerate() {
+        let (candidate, opponent) = world
             .prepared
             .take()
             .ok_or(PpoError::InvalidTransition("evaluation prepared sample"))?;
-        learner.push((own, &mut world.learner_rng));
-        if let Some(other) = other {
-            opponent.push((other, &mut world.opponent_rng));
+        if let Some(sample) = candidate {
+            candidate_rows.push((index, sample, &mut world.candidate_rng));
+        }
+        if let Some(sample) = opponent {
+            opponent_rows[world.game.opponent].push((index, sample, &mut world.opponent_rng));
         }
     }
-    let learner = choose(&models.learner, learner, greedy)?;
-    let opponent = match &models.opponent {
-        Some(model) if opponent.len() == learner.len() => Some(choose(model, opponent, greedy)?),
-        None if opponent.is_empty() => None,
-        _ => return Err(PpoError::InvalidTransition("evaluation opponent samples")),
-    };
-    Ok(GroupActions { learner, opponent })
+    let mut actions: Vec<WorldActions> = (0..worlds).map(|_| (None, None)).collect();
+    if !candidate_rows.is_empty() {
+        let model = models
+            .candidate
+            .model()
+            .ok_or(PpoError::InvalidTransition("evaluation candidate samples"))?;
+        for (index, chosen) in choose(model, candidate_rows, greedy)? {
+            actions[index].0 = Some(chosen);
+        }
+    }
+    for (player, rows) in models.pool.iter().zip(opponent_rows) {
+        if rows.is_empty() {
+            continue;
+        }
+        let model = player
+            .model()
+            .ok_or(PpoError::InvalidTransition("evaluation opponent samples"))?;
+        for (index, chosen) in choose(model, rows, greedy)? {
+            actions[index].1 = Some(chosen);
+        }
+    }
+    Ok(actions)
 }
 
-/// Samples with one RNG per row, or takes the legal argmax when greedy.
+/// Samples with one RNG per row, or takes the legal argmax when greedy; keeps row indices.
 fn choose(
     model: &PolicyModel,
-    rows: Vec<(Prepared, &mut PpoRng)>,
+    rows: Vec<(usize, Prepared, &mut PpoRng)>,
     greedy: bool,
-) -> Result<Vec<Chosen>, PpoError> {
+) -> Result<Vec<(usize, Chosen)>, PpoError> {
+    let mut indices = Vec::with_capacity(rows.len());
     let mut frames = Vec::with_capacity(rows.len());
     let mut spaces = Vec::with_capacity(rows.len());
     let mut rngs = Vec::with_capacity(rows.len());
-    for ((frame, space), rng) in rows {
+    for (index, (frame, space), rng) in rows {
+        indices.push(index);
         frames.push(frame);
         spaces.push(space);
         rngs.push(rng);
@@ -387,29 +434,25 @@ fn choose(
         }
         choices.iter().map(|choice| choice.action()).collect()
     };
-    Ok(actions.into_iter().zip(spaces).collect())
+    assert_eq!(actions.len(), indices.len());
+    Ok(indices
+        .into_iter()
+        .zip(actions.into_iter().zip(spaces))
+        .collect())
 }
 
 /// Advances every live world one decision, in parallel, then refills finished slots.
 fn step_group(
     mut group: Group,
-    actions: GroupActions,
+    actions: Vec<WorldActions>,
     parallel: usize,
-    opponent: Option<&Arc<PolicyModel>>,
+    models: &Models,
 ) -> Result<Group, PpoError> {
-    assert_eq!(actions.learner.len(), group.live.len());
+    assert_eq!(actions.len(), group.live.len());
     let threads = std::thread::available_parallelism().map_or(1, usize::from);
     let chunk = group.live.len().div_ceil(threads);
-    let mut opponent_actions = actions.opponent.map(Vec::into_iter);
-    let mut rows: Vec<(&mut LiveWorld, Chosen, Option<Chosen>)> = group
-        .live
-        .iter_mut()
-        .zip(actions.learner)
-        .map(|(world, learner)| {
-            let opponent = opponent_actions.as_mut().and_then(Iterator::next);
-            (world, learner, opponent)
-        })
-        .collect();
+    let mut rows: Vec<(&mut LiveWorld, WorldActions)> =
+        group.live.iter_mut().zip(actions).collect();
     let outcomes = std::thread::scope(|scope| {
         let handles: Vec<_> = rows
             .chunks_mut(chunk)
@@ -417,9 +460,7 @@ fn step_group(
                 scope.spawn(move || -> Result<Vec<Option<GameSummary>>, PpoError> {
                     chunk
                         .iter_mut()
-                        .map(|(world, learner, opponent)| {
-                            step_world(world, learner, opponent.as_ref())
-                        })
+                        .map(|(world, actions)| step_world(world, actions))
                         .collect()
                 })
             })
@@ -435,7 +476,7 @@ fn step_group(
         Ok::<_, PpoError>(outcomes)
     })?;
     drop(rows);
-    replace_finished(&mut group, outcomes, parallel, opponent)?;
+    replace_finished(&mut group, outcomes, parallel, models)?;
     Ok(group)
 }
 
@@ -443,7 +484,7 @@ fn replace_finished(
     group: &mut Group,
     outcomes: Vec<Option<GameSummary>>,
     parallel: usize,
-    opponent: Option<&Arc<PolicyModel>>,
+    models: &Models,
 ) -> Result<(), PpoError> {
     assert_eq!(outcomes.len(), group.live.len());
     let mut kept = Vec::with_capacity(parallel);
@@ -451,8 +492,8 @@ fn replace_finished(
         match outcome {
             Some(summary) => {
                 eprintln!(
-                    "level=INFO event=evaluation_game seed={} {summary}",
-                    world.game.seed
+                    "level=INFO event=evaluation_game seed={} opponent_index={} {summary}",
+                    world.game.seed, world.game.opponent
                 );
                 group.finished.push((world.game, summary));
             }
@@ -460,20 +501,19 @@ fn replace_finished(
         }
     }
     group.live = kept;
-    fill(group, parallel, opponent)
+    fill(group, parallel, models)
 }
 
 fn step_world(
     world: &mut LiveWorld,
-    learner: &Chosen,
-    opponent: Option<&Chosen>,
+    (candidate, opponent): &WorldActions,
 ) -> Result<Option<GameSummary>, PpoError> {
     if world.decisions >= MAP2_ACTOR_DECISIONS {
         return Err(PpoError::InvalidTransition("evaluation decision bound"));
     }
     world.decisions += 1;
     let environment = &mut world.environment;
-    let requests = requests(environment, learner, opponent)?;
+    let requests = requests(environment, candidate.as_ref(), opponent.as_ref())?;
     let before = environment.arena.tick();
     let remaining = MAP2_TICK_CAP
         .checked_sub(before)
@@ -490,107 +530,34 @@ fn step_world(
     if outcome.is_some() || end >= MAP2_TICK_CAP {
         return Ok(Some(GameSummary::capture(environment, outcome, end)));
     }
-    world.prepared = Some(prepare(environment, opponent.is_some())?);
+    world.prepared = Some(prepare(
+        environment,
+        (candidate.is_some(), opponent.is_some()),
+    )?);
     Ok(None)
 }
 
+/// Neural seats send their chosen action; rule seats decide now.
 fn requests(
     environment: &mut TrainingEnvironment,
-    learner: &Chosen,
+    candidate: Option<&Chosen>,
     opponent: Option<&Chosen>,
 ) -> Result<Vec<Option<Request>>, PpoError> {
     let policy_seat = environment.policy_seat;
     let mut requests = Vec::with_capacity(environment.seats.len());
     for (index, seat) in environment.seats.iter_mut().enumerate() {
-        let request = if index == policy_seat {
-            neural_policy_request_in_space(seat, learner.0, &learner.1)?.1
+        let chosen = if index == policy_seat {
+            candidate
         } else {
-            match opponent {
-                Some((action, space)) => neural_policy_request_in_space(seat, *action, space)?.1,
-                None => teacher_request(seat)?,
-            }
+            opponent
+        };
+        let request = match chosen {
+            Some((action, space)) => neural_policy_request_in_space(seat, *action, space)?.1,
+            None => teacher_request(seat)?,
         };
         requests.push(request);
     }
     Ok(requests)
-}
-
-/// Wilson score interval for `wins` successes in `games` trials at 95%.
-#[allow(clippy::float_arithmetic, reason = "report statistics only")]
-pub(crate) fn wilson_interval(wins: u64, games: u64) -> (f64, f64) {
-    assert!(wins <= games);
-    if games == 0 {
-        return (0.0, 1.0);
-    }
-    let n = games as f64;
-    let p = wins as f64 / n;
-    let z2 = WILSON_Z * WILSON_Z;
-    let denominator = 1.0 + z2 / n;
-    let center = (p + z2 / (2.0 * n)) / denominator;
-    let half = WILSON_Z / denominator * (p * (1.0 - p) / n + z2 / (4.0 * n * n)).sqrt();
-    ((center - half).max(0.0), (center + half).min(1.0))
-}
-
-#[allow(clippy::float_arithmetic, reason = "report statistics only")]
-fn summary_json(
-    settings: &EvaluationSettings,
-    candidate_sha: &str,
-    opponent_sha: Option<&str>,
-    games: &[GameSummary],
-) -> Value {
-    let count = |predicate: &dyn Fn(&GameSummary) -> bool| {
-        games.iter().filter(|game| predicate(game)).count() as u64
-    };
-    let wins = count(&|game| game.outcome == Some(PpoTerminalOutcome::Win));
-    let losses = count(&|game| game.outcome == Some(PpoTerminalOutcome::Loss));
-    let (low, high) = wilson_interval(wins, games.len() as u64);
-    let mut sides = serde_json::Map::new();
-    for side in [bota_proto::Team::Radiant, bota_proto::Team::Dire] {
-        let played = count(&|game| game.side == side);
-        let won = count(&|game| game.side == side && game.outcome == Some(PpoTerminalOutcome::Win));
-        sides.insert(
-            super::game_summary::side_label(side).to_owned(),
-            json!({"games": played, "wins": won}),
-        );
-    }
-    let mut end_reasons = serde_json::Map::new();
-    for outcome in ["win", "loss", "draw"] {
-        let mut reasons = serde_json::Map::new();
-        for reason in [
-            EndReason::Tower,
-            EndReason::Deaths,
-            EndReason::TimeCap,
-            EndReason::Draw,
-        ] {
-            let matched =
-                count(&|game| game.outcome_label() == outcome && game.end_reason == reason);
-            reasons.insert(reason.label().to_owned(), json!(matched));
-        }
-        end_reasons.insert(outcome.to_owned(), Value::Object(reasons));
-    }
-    let opponent = match &settings.opponent {
-        EvaluationOpponent::Teacher => "teacher".to_owned(),
-        EvaluationOpponent::HarassPush => "harass-push".to_owned(),
-        EvaluationOpponent::Weights(directory) => format!("weights:{}", directory.display()),
-    };
-    json!({
-        "schema": SCHEMA,
-        "summary": true,
-        "candidate": settings.candidate.display().to_string(),
-        "candidate_sha256": candidate_sha,
-        "opponent": opponent,
-        "opponent_sha256": opponent_sha,
-        "seeds": format!("{}:{}", settings.first_seed, settings.seeds),
-        "greedy": settings.greedy,
-        "games": games.len(),
-        "wins": wins,
-        "losses": losses,
-        "draws": games.len() as u64 - wins - losses,
-        "win_rate": wins as f64 / games.len() as f64,
-        "win_rate_ci95": [low, high],
-        "sides": sides,
-        "end_reasons": end_reasons,
-    })
 }
 
 /// Writes a new file and syncs it; never replaces an earlier result.
