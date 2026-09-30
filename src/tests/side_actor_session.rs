@@ -2,9 +2,7 @@ use super::*;
 
 #[test]
 fn fresh_session_imports_only_initial_parameters_and_resets_all_training_state() {
-    let directory =
-        std::env::temp_dir().join(format!("side-actors-fresh-session-{}", std::process::id()));
-    std::fs::create_dir(&directory).unwrap();
+    let directory = crate::ppo::test_directory("side-actors-fresh-session");
     let source_directory = directory.join("source");
     let target_directory = directory.join("new-checkpoint");
     std::fs::create_dir(&source_directory).unwrap();
@@ -33,7 +31,7 @@ fn fresh_session_imports_only_initial_parameters_and_resets_all_training_state()
     )
     .unwrap();
     let actual = session.model.export_parameters().unwrap();
-    assert_eq!(actual.len(), 1_812_983);
+    assert_eq!(actual.len(), 1_878_775);
     assert!(
         actual
             .iter()
@@ -60,7 +58,6 @@ fn fresh_session_imports_only_initial_parameters_and_resets_all_training_state()
         b"old Adam must not be read"
     );
     assert_eq!(std::fs::read_dir(target_directory).unwrap().count(), 0);
-    std::fs::remove_dir_all(directory).unwrap();
 }
 
 fn initialization_run(config: PpoConfig) -> CheckpointRun {

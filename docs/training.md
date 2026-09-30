@@ -95,8 +95,8 @@ controller owns the campaign.
 | `schema` | required | `2` |
 | `trainer` | required | `drysua` ELF built with `builtin` (and `cuda` for GPU) |
 | `inspector` | `trainer` | binary providing `checkpoint-inspect` |
-| `initial_weights` | none | runtime weights with the current parameter layout; fresh start only |
-| `opponent_weights` | none | frozen weights opponent (`--opponent weights:...:1`); Teacher otherwise |
+| `initial_weights` | none | runtime weights; tensors with the current name and shape are reused; fresh start only |
+| `opponents` | Teacher | 1..16 `{"kind", "weight"[, "path"]}`: `teacher`, `harass-push`, `self`, `league` or `weights` with a `path` (frozen into `inputs/opponent-<i>/`); weights are decimal strings |
 | `total_updates` | required | 1..10000 |
 | `history_every` | 20 | milestone spacing for `history/uNNNN/` runtime weights; exported only at checkpoints |
 | `checkpoint_seconds` | 600 | 60..86400, wall time between checkpoints (`--checkpoint-interval-seconds`) |
@@ -192,7 +192,8 @@ environment transitions and timing with an ETA; `--json` prints schema
 `drysua-training-report/v2`. `--html FILE` writes one self-contained page (no
 network): outcomes per update, rolling win rate with a Wilson 95% band per opponent,
 action-kind shares, phase timing and samples/s, PPO statistics (losses, entropy,
-KL, clip fraction, explained variance), environment generation, reward components,
+KL, clip fraction, explained variance), the PFSP win rate and sampling probability
+per opponent (league snapshots as one series), environment generation, reward components,
 and every other numeric field as a small multiple, so new log fields appear without
 code changes. `--refresh S` adds an auto-reload; `--follow` regenerates the file
 every `S` seconds while the campaign runs.

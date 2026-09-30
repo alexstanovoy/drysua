@@ -1,40 +1,32 @@
 //! Shared filesystem and runtime fixtures; behavior lives in the public checkpoint tests.
 
 use std::collections::HashMap;
-use std::fs;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use safetensors::tensor::{Dtype, TensorView, serialize};
 
-pub(super) struct Directory(pub PathBuf);
-
-impl Directory {
-    pub(super) fn new() -> Self {
-        static NEXT_DIRECTORY: AtomicU64 = AtomicU64::new(0);
-        let path = std::env::temp_dir().join(format!(
-            "drysua-map2-checkpoint-{}-{}",
-            std::process::id(),
-            NEXT_DIRECTORY.fetch_add(1, Ordering::Relaxed)
-        ));
-        fs::create_dir(&path).expect("unique fixture directory");
-        Self(path)
-    }
-}
-
-impl Drop for Directory {
-    fn drop(&mut self) {
-        fs::remove_dir_all(&self.0).expect("fixture cleanup");
-    }
-}
-
+/// Runtime weights of `values`: named tensors in the current layout when the
+/// count matches it, otherwise one flat `model.parameters` tensor.
 pub(super) fn runtime_bytes(values: &[f32], metadata: HashMap<String, String>) -> Vec<u8> {
     let data: Vec<_> = values
         .iter()
         .flat_map(|value| value.to_le_bytes())
         .collect();
-    let tensor = TensorView::new(Dtype::F32, vec![values.len()], &data).expect("tensor");
-    serialize([("model.parameters", tensor)], Some(metadata)).expect("fixture")
+    if values.len() != crate::MODEL_PARAMETER_COUNT {
+        let tensor = TensorView::new(Dtype::F32, vec![values.len()], &data).expect("tensor");
+        return serialize([("model.parameters", tensor)], Some(metadata)).expect("fixture");
+    }
+    let schema = crate::PolicyModel::fresh(0)
+        .and_then(|model| model.parameter_schema())
+        .expect("schema");
+    let mut offset = 0;
+    let mut tensors = Vec::with_capacity(schema.len());
+    for (name, shape) in schema {
+        let bytes = shape.iter().product::<usize>() * 4;
+        let view = TensorView::new(Dtype::F32, shape, &data[offset..offset + bytes]);
+        tensors.push((name, view.expect("tensor")));
+        offset += bytes;
+    }
+    serialize(tensors, Some(metadata)).expect("fixture")
 }
 
 pub(super) fn config() -> crate::PpoConfig {

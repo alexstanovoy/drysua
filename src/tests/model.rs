@@ -375,7 +375,7 @@ fn adam_clipping_and_nonzero_moments_match_an_independent_scalar_reference() {
 }
 
 #[test]
-fn critic_update_reduces_value_loss_without_changing_actor_parameters() {
+fn critic_update_reduces_value_loss_and_trains_the_trunk_but_no_actor_head() {
     assert_critic(PolicyDevice::Cpu);
 }
 
@@ -405,17 +405,28 @@ fn assert_critic(device: PolicyDevice) {
     assert!(after.approximate_kl.abs() < 1.0e-6);
     let parameters = model.export_parameters().expect("after");
     let mut offset = 0;
+    let mut trunk_changed = false;
     for (name, shape) in model.parameter_schema().expect("schema") {
         let end = offset + shape.iter().product::<usize>();
-        if !name.starts_with("value.") {
-            assert_eq!(
-                &before[offset..end],
-                &parameters[offset..end],
-                "critic changed {name}"
-            );
+        let changed = before[offset..end] != parameters[offset..end];
+        let encoder = [
+            "unit.",
+            "ability.",
+            "item.",
+            "point.",
+            "projectile.",
+            "loot.",
+            "trunk.",
+        ]
+        .iter()
+        .any(|prefix| name.starts_with(prefix));
+        trunk_changed |= name.starts_with("trunk.") && changed;
+        if !encoder && !name.starts_with("value.") {
+            assert!(!changed, "critic changed actor parameter {name}");
         }
         offset = end;
     }
+    assert!(trunk_changed, "the value loss trains the shared trunk");
 }
 
 #[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
@@ -515,6 +526,18 @@ fn rollback_fixture(
 ) {
     assert!([65, 81].contains(&count));
     let model = PolicyModel::fresh(9_101).expect("model");
+    // A zero read-out keeps the critic warm-up below away from the shared trunk,
+    // so only the candidate actor step can move the policy.
+    let mut parameters = model.export_parameters().expect("parameters");
+    let mut offset = 0;
+    for (name, shape) in model.parameter_schema().expect("schema") {
+        let end = offset + shape.iter().product::<usize>();
+        if name == "value.1.weight" {
+            parameters[offset..end].fill(0.0);
+        }
+        offset = end;
+    }
+    model.import_parameters(&parameters).expect("zero read-out");
     let base = sampled_examples(&model, MODEL_TRAINING_BATCH);
     let samples = (0..count)
         .map(|index| base[index % base.len()].clone())

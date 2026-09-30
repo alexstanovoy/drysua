@@ -71,14 +71,15 @@ decisions per mode (`raze_mode_*`) and razes that struck any hostile unit
 
 ## Network
 
-`PolicyModel` (`src/model.rs`, schema 25) has 1,812,983 f32 parameters in 86 named
+`PolicyModel` (`src/model.rs`, schema 26) has 1,878,775 f32 parameters in 88 named
 tensors:
 
 - Unit encoder 84 → 64 → 128 → 128, shared by all unit tokens; token encoders
   → 64 → 64 per token family; pooled per group into the trunk input (2,596).
 - Trunk 2,596 → 512 → 256 → 256.
-- Value head `Linear(256, 1)`. PPO feeds it a detached trunk, so value loss trains
-  only this head.
+- Value head 256 → 256 (ReLU) → 1, its read-out multiplied by a fixed 16 (a
+  critic-only learning-rate multiplier under Adam). The value loss trains the shared
+  trunk and encoders too.
 - Kind head from the trunk; conditional heads (unit, ability, item, swap, learn,
   shop, loot, target mode, put mode, entity and point pointer queries) read a
   336-wide context: trunk + kind (32) + unit (32) + slot (16) embeddings. Pointer
@@ -87,7 +88,7 @@ tensors:
 ### Side actors
 
 Radiant and Dire have independent actor heads: the kind head and the eleven
-conditional linears are duplicated (24 `dire.*` tensors after the 62 shared ones);
+conditional linears are duplicated (24 `dire.*` tensors after the 64 shared ones);
 encoder, trunk, value head and embeddings are shared. Routing reads the observed
 `SIDE_RADIANT`/`SIDE_DIRE` global features; anything but exactly one set fails
 before evaluation. Both branches run on the full batch and a per-row select picks
@@ -99,8 +100,8 @@ CUDA contract test (ignored by default):
 
 ## Runtime weights and neural play
 
-Training writes `drysua.weights.safetensors` (parameters plus schema metadata) into
-the checkpoint directory and each `history/u<update>/`. Play it with:
+Training writes `drysua.weights.safetensors` (one named tensor per parameter plus
+schema metadata) into the checkpoint directory and each `history/u<update>/`. Play it with:
 
 ```sh
 cargo run --release --bin drysua -- play --policy neural \
@@ -111,8 +112,9 @@ Neural play has no Teacher fallback: the model chooses every action, including
 pregame buys and skill points. Weights whose action, feature, model, PPO or reward
 identity differs from this build fail to load before connecting; play such weights
 from the commit that produced them. `play`, `eval` and frozen training opponents all
-use this strict loader; only `--initial-weights` accepts other linked schemas with
-the same parameter layout.
+use this strict loader (metadata, names and shapes). `--initial-weights` accepts other
+linked schemas: it reuses each tensor with the same name and shape, keeps the seeded
+initialization for the rest and logs both in `event=initial_weights_loaded`.
 
 The zero-argument default (`src/default_deployment.rs`) is Teacher. A neural default
 must name a directory below `artifacts/`.

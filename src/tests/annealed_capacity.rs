@@ -101,5 +101,4 @@ fn resume_rejects_changed_collection_dimensions_without_committing() {
             .completed_updates,
         2
     );
-    std::fs::remove_dir_all(directory).expect("cleanup");
 }

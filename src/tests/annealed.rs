@@ -43,7 +43,6 @@ fn resume_requires_intact_generation_history_without_mutating_checkpoint() {
         let error = run(config, &directory, true).expect_err("damaged history");
         assert!(error.to_string().contains(message), "{error}");
         assert_eq!(checkpoint_digests(&directory), before);
-        std::fs::remove_dir_all(directory).expect("cleanup");
     }
 }
 
@@ -58,12 +57,11 @@ fn cached_generation_rules_turn_off_at_the_zero_window_boundary() {
     assert!(draw.scale_bp > 0);
     assert_eq!(draw.applied_games, 1);
     let directory = test_directory("zero-window-rules");
-    let mut cache = GenerationCache::new(directory.clone(), 3, 2, 1, schedule, 0);
+    let mut cache = GenerationCache::new(directory.to_path_buf(), 3, 2, 1, schedule, 0);
     for (update, applied) in [(2, true), (3, false)] {
         let spec = cache.spec_for_update(update).expect("spec");
         assert_eq!(!spawn_modifiers_for(spec).is_empty(), applied);
     }
-    std::fs::remove_dir_all(directory).expect("cleanup");
 }
 
 #[test]
@@ -73,7 +71,7 @@ fn resume_rejects_swapped_opponent_weights() {
     let first = PolicyModel::fresh(0x1111).expect("first opponent");
     TrainingArtifact::save_runtime_weights(&first, &weights).expect("first weights");
     let mut config = settings(0x1a2c, 1);
-    config.opponents = vec![(AnnealedOpponent::Weights(weights.clone()), one())];
+    config.opponents = vec![(AnnealedOpponent::Weights(weights.to_path_buf()), one())];
     run(config.clone(), &directory, false).expect("frozen opponent update");
     let before = checkpoint_digests(&directory);
     let second = PolicyModel::fresh(0x2222).expect("second opponent");
@@ -84,8 +82,6 @@ fn resume_rejects_swapped_opponent_weights() {
         "{error}"
     );
     assert_eq!(checkpoint_digests(&directory), before);
-    std::fs::remove_dir_all(directory).expect("cleanup run");
-    std::fs::remove_dir_all(weights).expect("cleanup weights");
 }
 
 #[test]
@@ -153,9 +149,6 @@ fn initial_weights_then_resume_matches_uninterrupted_parameters_optimizer_and_rn
         exported.export_parameters().expect("exported parameters"),
         checkpoint.parameters
     );
-    for directory in [weights, uninterrupted, resumed] {
-        std::fs::remove_dir_all(directory).expect("cleanup");
-    }
 }
 
 /// Logged decisions of the games in flight at the committed boundary.
@@ -183,33 +176,33 @@ fn simulation_thread_count_never_changes_training_bits() {
         })
         .collect();
     assert_trajectory_equal(&directories[0], &directories[1]);
-    for directory in directories {
-        std::fs::remove_dir_all(directory).expect("cleanup");
-    }
 }
 
 #[test]
-fn mixed_opponents_resume_in_flight_neural_games_exactly() {
+fn pfsp_league_mixtures_resume_in_flight_neural_games_exactly() {
     let weights = test_directory("mixed-opponent-weights");
     let frozen = PolicyModel::fresh(0x0dd).expect("frozen opponent");
     TrainingArtifact::save_runtime_weights(&frozen, &weights).expect("frozen weights");
-    let mut config = settings(23_076, 2);
+    let mut config = settings(23_074, 6);
     config.slots = 4;
-    config.ppo.samples_per_update = 10;
+    config.ppo.samples_per_update = 40;
+    config.league_size = 4;
+    config.league_every = 2;
     config.opponents = vec![
         (AnnealedOpponent::Teacher, one()),
         (AnnealedOpponent::HarassPush, one()),
         (AnnealedOpponent::SelfPlay, one()),
-        (AnnealedOpponent::Weights(weights.clone()), one()),
+        (AnnealedOpponent::Weights(weights.to_path_buf()), one()),
+        (AnnealedOpponent::League, one()),
     ];
     let uninterrupted = test_directory("mixed-uninterrupted");
     let resumed = test_directory("mixed-resumed");
     run(config.clone(), &uninterrupted, false).expect("uninterrupted mixture");
     let stopped = AnnealedHarness {
-        stop_after: Some(1),
+        stop_after: Some(4),
         ..harness()
     };
-    run_with(config.clone(), stopped, &resumed, false).expect("first update");
+    run_with(config.clone(), stopped, &resumed, false).expect("first updates");
     let artifact = TrainingArtifact::load(&resumed).expect("checkpoint");
     let state =
         crate::ppo_arena::collector_state::CollectorState::decode(&artifact.collection().state)
@@ -218,23 +211,47 @@ fn mixed_opponents_resume_in_flight_neural_games_exactly() {
         state.slots.iter().any(|slot| !slot.log.opponent.is_empty()),
         "a neural opponent game is in flight at the boundary"
     );
-    let in_flight = |kind| state.slots.iter().any(|slot| slot.plan.opponent == kind);
-    for kind in [
-        OpponentKind::Teacher,
-        OpponentKind::HarassPush,
-        OpponentKind::SelfPlay,
-        OpponentKind::Snapshot(0),
-    ] {
-        assert!(
-            in_flight(kind),
-            "{kind:?} game is in flight at the boundary"
-        );
-    }
+    let league = |kind: &OpponentKind| matches!(kind, OpponentKind::League(_));
+    assert!(state.mixture.entries().iter().any(|(kind, _)| league(kind)));
+    assert!(state.outcomes.entries.iter().any(|(kind, _)| league(kind)));
+    let reweighted = state
+        .mixture
+        .entries()
+        .windows(2)
+        .any(|pair| pair[0].1 != pair[1].1);
+    assert!(reweighted, "PFSP reweighted the configured equal weights");
+    let written: Vec<u64> = state.league.iter().map(|(update, _)| *update).collect();
+    assert_eq!(
+        written,
+        [0, 2],
+        "the checkpoint's own update 4 is its model"
+    );
     run(config, &resumed, true).expect("resume");
     assert_trajectory_equal(&uninterrupted, &resumed);
-    for directory in [weights, uninterrupted, resumed] {
-        std::fs::remove_dir_all(directory).expect("cleanup");
-    }
+    let artifact = TrainingArtifact::load(&resumed).expect("final checkpoint");
+    let recorded =
+        crate::ppo_arena::collector_state::CollectorState::decode(&artifact.collection().state)
+            .expect("final collection state")
+            .league;
+    let mut kept: Vec<String> = std::fs::read_dir(resumed.join("league"))
+        .expect("league")
+        .map(|entry| {
+            entry
+                .expect("entry")
+                .file_name()
+                .into_string()
+                .expect("name")
+        })
+        .collect();
+    kept.sort();
+    let expected: Vec<String> = recorded
+        .iter()
+        .map(|(update, _)| format!("u{update:04}"))
+        .collect();
+    assert_eq!(
+        kept, expected,
+        "only the snapshots the final checkpoint records"
+    );
 }
 
 /// Two lanes of one slot each; with 16-decision games an update of four
@@ -256,6 +273,9 @@ fn settings(seed: u64, updates: u64) -> AnnealedJobConfig {
         scale: crate::randomization::AnnealScale::FULL,
         seed,
         opponents: vec![(AnnealedOpponent::Teacher, one())],
+        opponent_schedule: crate::OpponentSchedule::Pfsp,
+        league_size: 4,
+        league_every: 20,
         ppo: PpoConfig {
             decision_interval_ticks: MAP2_DECISION_INTERVAL_TICKS,
             samples_per_update: 6,
@@ -431,7 +451,6 @@ fn resume_rejects_a_changed_environment_scale_without_committing() {
             .completed_updates,
         2
     );
-    std::fs::remove_dir_all(directory).expect("remove own checkpoint");
 }
 
 fn assert_artifact_bits(source: &std::path::Path, target: &std::path::Path, device: PolicyDevice) {

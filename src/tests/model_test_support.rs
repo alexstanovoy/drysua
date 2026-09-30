@@ -68,7 +68,7 @@ impl PolicyModel {
         let _guard = self.read_parameter_lock()?;
         let rows = Tensor::arange(0u32, examples.len() as u32, self.tensor_device())?;
         let inputs = staged.gather(&rows)?;
-        let output = self.training_forward_inputs(&inputs, false)?;
+        let output = self.training_forward_inputs(&inputs)?;
         validate_training_tensors_finite(&output)?;
         let log_probability = ppo_objective::log_probability(&output, &inputs.targets)?;
         let terms = ppo_objective::ppo_loss(

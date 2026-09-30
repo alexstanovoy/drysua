@@ -11,7 +11,7 @@ lanes (--lanes)               one thread, CUDA stream and actor weight replica p
                               lane l owns slots l, l+lanes, ...; at most 64 slots per lane;
                               default two per simulation group, more if the slots need them
 simulation groups             --simulation-groups (default: last-level cache domains, i.e.
-                              CCDs) split consecutive lanes and --simulation-threads workers
+                              CCDs, or fewer so they divide the lanes) split consecutive lanes and --simulation-threads workers
                               (default: available cores) into pools, so a lane's round never
                               waits on another CCD; --pin-threads pins each group to its
                               domain (opt-in). Neither changes results
@@ -25,15 +25,20 @@ A lane runs rounds: one batched inference over its slots (self-play opponent row
 share the call; each frozen snapshot gets its own call on the lane's replica), then
 one advance job per slot on the pool. Lanes never wait for each other inside an
 update. A lane's share of update `u` ends after the first round in which it has
-closed `--samples-per-update / --lanes` retained intervals (default 8,000 in total),
+closed `--samples-per-update / --lanes` retained intervals (default 24,000 in total),
 so an update holds at least the target and at most two more intervals per slot.
+A retained interval begins at the first decision, at every non-Continue decision and
+at a Continue that finds the open interval eight decisions long; it closes at the next
+retained decision (bootstrapped from that decision's value) or at the game's end.
+Lanes therefore compute behaviour statistics for every policy row.
 
 ## Determinism
 
 Every decision depends on round indices and seeds, never on thread timing:
 
 - Game `n` of slot `s` has seeds, seat (`(s + n) % 2`) and opponent drawn from
-  `(seed, s, n)`; its spawn modifiers come from the update it started in.
+  `(seed, s, n)` and the mixture of the update it started in, as are its spawn
+  modifiers.
 - A lane's rounds, batch composition and part boundaries are its own sequence.
 - Update `u` is collected with the actor weights of update `u - 1`
   (`PIPELINE_STALENESS = 1`); lanes switch weights exactly at their part boundary
@@ -46,7 +51,8 @@ and four threads produce identical checkpoints.
 ## Resume
 
 Checkpoint `u` stores, besides model, Adam and shuffle RNG: the actor weights that
-collect `u`, its spawn modifiers, and every slot's in-flight game as its plan, the
+collect `u`, its spawn modifiers and opponent mixture, the PFSP outcome window, the
+league snapshots it wrote, and every slot's in-flight game as its plan, the
 actions both seats have taken, both RNG states and the behaviour statistics of the
 open retained interval. A resumed run replays each game's logged actions (in
 parallel on the pool) to the exact state it had at the boundary and continues;
@@ -68,10 +74,25 @@ interval, which the resume recomputes bit-exactly.
 `--opponent` is repeatable and forms a per-game mixture: `teacher[:w]`,
 `harass-push[:w]` (the HarassPush rule policy in `src/scripted/`), `self[:w]` (the
 lane's current actor weights) and `weights:<dir>:<w>` (frozen snapshots,
-fingerprinted in the run scope). The default is `teacher:1`.
-`draw_opponent` in `src/ppo_arena/slot.rs` is the single pluggable schedule;
-adaptive schedules may only use reports of updates every lane has finished.
-Episode logs carry `slot=`, `game=` and `opponent=`.
+fingerprinted in the run scope) and `league:<w>`: each of the `--league-size`
+(default 4) latest snapshots of the learner, taken every `--league-every` (default
+20) updates. The default is `teacher:1`.
+
+Every published update gets its own mixture (`src/ppo_arena/opponents.rs`). With
+`--opponent-schedule pfsp` (the default) each configured weight is multiplied by
+`(1 - p)^2`, where `p` is the Laplace-smoothed score (win 1, draw 1/2) of the last
+100 games against that opponent; `fixed` keeps the weights. Weights are exact
+integers computed after update `u` from the games of updates up to `u` and apply
+to update `u + 2`, so they are a pure function of the run. After each update the
+trainer logs `event=opponent_pool update=… scope=<opponent> games= score= win_rate=
+probability=`; the dashboard charts win rate and probability per opponent, with
+league snapshots (`u0040`) folded into one `league` series.
+
+League snapshots live in memory. A checkpoint writes each snapshot the next two
+publications or any in-flight game still need once, as runtime weights under
+`checkpoint/league/u<update>/` with its fingerprint in the collection state, and
+deletes the ones it no longer records after the commit; its own update's snapshot
+is the checkpoint model. Episode logs carry `slot=`, `game=` and `opponent=`.
 
 ## Learner
 

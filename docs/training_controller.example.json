@@ -2,7 +2,12 @@
   "schema": 2,
   "trainer": "/absolute/path/to/drysua-built-with-builtin-cuda",
   "initial_weights": "/home/alexstanovoy/Workspace/bots/drysua/artifacts/weights/u100-v18",
-  "opponent_weights": "/home/alexstanovoy/Workspace/bots/drysua/artifacts/weights/u100-v18",
+  "opponents": [
+    {"kind": "teacher", "weight": "2"},
+    {"kind": "weights", "path": "/home/alexstanovoy/Workspace/bots/drysua/artifacts/weights/u100-v18", "weight": "1"},
+    {"kind": "league", "weight": "1"},
+    {"kind": "self", "weight": "1"}
+  ],
   "total_updates": 200,
   "history_every": 20,
   "max_seconds": 86400,

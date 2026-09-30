@@ -1,4 +1,4 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
@@ -22,6 +22,8 @@ mod adaptive_tests;
 #[cfg(test)]
 #[path = "tests/checkpoint_capacity.rs"]
 mod capacity_tests;
+#[path = "runtime_weights.rs"]
+mod runtime;
 use crate::{
     ACTION_SCHEMA_HASH, ACTION_SCHEMA_VERSION, FEATURE_SCHEMA_HASH, FEATURE_SCHEMA_VERSION,
     MAP2_REWARD_VERSION, MAX_TRAINING_COUNTER, MODEL_MAX_OPTIMIZER_STEP, MODEL_PARAMETER_COUNT,
@@ -37,10 +39,10 @@ pub const CHECKPOINT_SCHEMA_VERSION: u32 = 21;
 /// Canonical strict checkpoint contract descriptor.
 pub const CHECKPOINT_SCHEMA_DESCRIPTOR: &str = concat!(
     "bota-drysua-checkpoint/v21;linked_schemas=action,feature,model,ppo;linked_hash=fnv1a_descriptor_then_ordered_version_le32_hash_le64_then_map2_reward_version_le32;files=checkpoint.meta,drysua.weights.safetensors,immutable_sha256_tensor_generation;",
-    "tensors=model.parameters,adam.first_moment,adam.second_moment,actor.parameters_f32,collection.state_u8_bounded;dtype=f32_except_collection_state;runtime_metadata=action_feature_model_ppo_schema_hashes,ppo_schema_version,ppo_rules_audit_version,map2_reward_version;load=exact_names_shapes_dtype_finite_schema_sha256;",
-    "initialization=current_runtime_weights_parameters_only,optimizer_progress_rng=fresh;",
+    "tensors=model.parameters,adam.first_moment,adam.second_moment,actor.parameters_f32,collection.state_u8_bounded;dtype=f32_except_collection_state;runtime=one_named_f32_tensor_per_model_parameter_in_export_order;runtime_metadata=action_feature_model_ppo_schema_hashes,ppo_schema_version,ppo_rules_audit_version,map2_reward_version;load=exact_names_shapes_dtype_finite_schema_sha256;",
+    "initialization=runtime_weights_same_name_and_shape_tensors_reused_others_fresh,optimizer_progress_rng=fresh;",
     "manifest=magic_version_hash_linked_schemas_then_git_simulator_features_command_seed_map_hero_device_batch_rules32_then_progress_rng_curriculum_league_then_ppo_config_trainer_updates_optimizer_step_shuffle_rng_tensor_sha256_then_adaptive_presence_u8_and_optional152_byte_block,no_trailing_bytes,max65536;",
-    "progress=committed_rollout_samples_le_updates_times_samples_per_update_plus_two_per_max_slot;collection=next_update_actor_version_spec_and_replayable_in_flight_slot_games;",
+    "progress=committed_rollout_samples_le_updates_times_samples_per_update_plus_two_per_max_slot;collection_v2=next_update_actor_version_spec_opponent_mixture_pfsp_outcome_window_league_snapshot_fingerprints_and_replayable_in_flight_slot_games;league=runtime_weights_under_league_u_update_written_once_pruned_after_commit;",
     "adaptive_block=le64_success_updates_success_rate_millionths_poor_updates_poor_rate_millionths_extension_millionths_base_updates_total_updates_zero_updates_generation_start_update_updates_in_generation_success_streak_poor_streak_extension_awards_snapshot_count_then_snapshot_sha256_raw32;adaptive_scope=train-annealed_only_no_league_exact_config_scope_suffix_last_once;",
     "save=immutable_generation_then_runtime_then_manifest_rename,one_fsync_per_file_then_one_directory_fsync;"
 );
@@ -58,12 +60,16 @@ pub const CHECKPOINT_SCHEMA_HASH: u64 =
 const CHECKPOINT_META_FILE: &str = "checkpoint.meta";
 const RUNTIME_TENSOR_FILE: &str = "drysua.weights.safetensors";
 const MAX_META_BYTES: u64 = 64 * 1024;
-/// Largest encoded collection state: every slot with two full action logs.
-pub(crate) const MAX_COLLECTION_STATE_BYTES: usize =
-    64 + crate::PPO_MAX_SLOTS * (160 + 2 * 4 * crate::MAP2_ACTOR_DECISIONS);
+/// Largest encoded collection state: every slot with two full action logs,
+/// plus the opponent mixture and outcome window.
+pub(crate) const MAX_COLLECTION_STATE_BYTES: usize = 64
+    + MAX_OPPONENT_STATE_BYTES
+    + crate::PPO_MAX_SLOTS * (160 + 2 * 4 * crate::MAP2_ACTOR_DECISIONS);
+/// Bound of the collection state's opponent mixture and outcome window.
+pub(crate) const MAX_OPPONENT_STATE_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_TRAINING_TENSOR_BYTES: u64 =
     MODEL_PARAMETER_COUNT as u64 * 16 + MAX_COLLECTION_STATE_BYTES as u64 + 64 * 1024;
-const MAX_RUNTIME_TENSOR_BYTES: u64 = MODEL_PARAMETER_COUNT as u64 * 4 + 16 * 1024;
+const MAX_RUNTIME_TENSOR_BYTES: u64 = MODEL_PARAMETER_COUNT as u64 * 4 + 64 * 1024;
 const MAX_TEXT_BYTES: usize = 4_096;
 const MAX_RNG_STATES: usize = 32;
 const MAX_LEAGUE_REFERENCES: usize = 32;
@@ -469,21 +475,38 @@ impl TrainingArtifact {
         model: &PolicyModel,
         directory: &Path,
     ) -> Result<(), CheckpointError> {
-        validate_directory(directory)?;
         let parameters = model
             .export_parameters()
             .map_err(|error| CheckpointError::Model(error.to_string()))?;
-        validate_tensor_values("model.parameters", &parameters)?;
-        let bytes = serialize_runtime_tensor(&parameters)?;
-        replace_file(&directory.join(RUNTIME_TENSOR_FILE), &bytes)?;
-        sync_directory(directory)
+        save_runtime(&parameter_schema(model)?, &parameters, directory)
     }
 
-    /// Constructs a fresh current model from architecture-compatible runtime weights.
+    /// Saves exported parameters as deployment weights of this build.
+    #[cfg(feature = "builtin")]
+    pub(crate) fn save_runtime_parameters(
+        parameters: &[f32],
+        directory: &Path,
+    ) -> Result<(), CheckpointError> {
+        save_runtime(&current_parameter_schema()?, parameters, directory)
+    }
+
+    /// Parameters of runtime weights whose metadata, names and shapes match this build.
+    #[cfg(feature = "builtin")]
+    pub(crate) fn load_runtime_parameters(directory: &Path) -> Result<Vec<f32>, CheckpointError> {
+        validate_directory(directory)?;
+        let bytes = read_bounded(
+            &directory.join(RUNTIME_TENSOR_FILE),
+            MAX_RUNTIME_TENSOR_BYTES,
+        )?;
+        decode_runtime_parameters(&bytes)
+    }
+
+    /// Constructs a fresh current model, reusing every runtime-weights tensor
+    /// whose name and shape it still has.
     ///
     /// Unlike deployment loading, the linked action, feature, reward and PPO
-    /// schemas may differ: a warm start only needs the parameters. The flat M25
-    /// layout is fixed by its element count, so every tensor is reused.
+    /// schemas may differ: a warm start only needs parameters. Tensors the file
+    /// lacks keep their seeded initialization; the load is logged tensor by tensor.
     #[cfg(feature = "builtin")]
     pub(crate) fn initialize_from_weights(
         directory: &Path,
@@ -497,25 +520,39 @@ impl TrainingArtifact {
             &directory.join(RUNTIME_TENSOR_FILE),
             MAX_RUNTIME_TENSOR_BYTES,
         )?;
-        let (parameters, differences) = decode_warm_start_tensor(&bytes)?;
-        model
-            .import_parameters(&parameters)
+        let fresh = model
+            .export_parameters()
             .map_err(|error| CheckpointError::Model(error.to_string()))?;
-        crate::telemetry::log_line!(
-            "level=INFO event=initial_weights_loaded path={} reused_tensors={} reused_parameters={} reinitialized_tensors=0 differing_metadata={}",
-            directory.display(),
-            crate::model::MODEL_PARAMETER_TENSORS,
-            MODEL_PARAMETER_COUNT,
-            if differences.is_empty() {
+        let warm = runtime::decode_warm_start(&bytes, &parameter_schema(&model)?, &fresh)?;
+        model
+            .import_parameters(&warm.parameters)
+            .map_err(|error| CheckpointError::Model(error.to_string()))?;
+        let listed = |names: Vec<String>| {
+            if names.is_empty() {
                 "none".to_owned()
             } else {
-                differences.join(",")
+                names.join(",")
             }
+        };
+        crate::telemetry::log_line!(
+            "level=INFO event=initial_weights_loaded path={} reused_tensors={} reused_parameters={} reinitialized_tensors={} reinitialized={} dropped_tensors={} differing_metadata={}",
+            directory.display(),
+            warm.reused_tensors,
+            warm.reused_parameters,
+            warm.reinitialized.len(),
+            listed(
+                warm.reinitialized
+                    .iter()
+                    .map(|name| (*name).to_owned())
+                    .collect()
+            ),
+            warm.dropped_tensors,
+            listed(warm.differing_metadata),
         );
         Ok(model)
     }
 
-    /// Loads runtime weights whose metadata matches this build exactly.
+    /// Loads runtime weights whose metadata, names and shapes match this build exactly.
     pub fn load_runtime_weights(
         model: &PolicyModel,
         directory: &Path,
@@ -525,7 +562,7 @@ impl TrainingArtifact {
             &directory.join(RUNTIME_TENSOR_FILE),
             MAX_RUNTIME_TENSOR_BYTES,
         )?;
-        let parameters = decode_runtime_tensor(&bytes)?;
+        let parameters = runtime::decode_strict(&bytes, &parameter_schema(model)?)?;
         model
             .import_parameters(&parameters)
             .map_err(|error| CheckpointError::Model(error.to_string()))
@@ -690,6 +727,42 @@ fn validate_text(field: &'static str, value: &str) -> Result<(), CheckpointError
     Ok(())
 }
 
+fn save_runtime(
+    schema: &[(&'static str, Vec<usize>)],
+    parameters: &[f32],
+    directory: &Path,
+) -> Result<(), CheckpointError> {
+    validate_directory(directory)?;
+    validate_tensor_values("model.parameters", parameters)?;
+    let bytes = runtime::serialize(schema, parameters)?;
+    replace_file(&directory.join(RUNTIME_TENSOR_FILE), &bytes)?;
+    sync_directory(directory)
+}
+
+/// Strictly decoded runtime weights, for readers without a live model.
+fn decode_runtime_parameters(bytes: &[u8]) -> Result<Vec<f32>, CheckpointError> {
+    runtime::decode_strict(bytes, &current_parameter_schema()?)
+}
+
+fn current_parameter_schema() -> Result<Vec<(&'static str, Vec<usize>)>, CheckpointError> {
+    PolicyModel::fresh(0)
+        .and_then(|model| model.parameter_schema())
+        .map_err(|error| CheckpointError::Model(error.to_string()))
+}
+
+/// Runtime weights bytes of `parameters` in this build's layout.
+fn serialize_runtime_tensor(parameters: &[f32]) -> Result<Vec<u8>, CheckpointError> {
+    runtime::serialize(&current_parameter_schema()?, parameters)
+}
+
+fn parameter_schema(
+    model: &PolicyModel,
+) -> Result<Vec<(&'static str, Vec<usize>)>, CheckpointError> {
+    model
+        .parameter_schema()
+        .map_err(|error| CheckpointError::Model(error.to_string()))
+}
+
 fn validate_tensor_values(name: &'static str, values: &[f32]) -> Result<(), CheckpointError> {
     if let Some((index, _)) = values
         .iter()
@@ -713,44 +786,6 @@ fn serialize_training_tensors(artifact: &TrainingArtifact) -> Result<Vec<u8>, Ch
     )
 }
 
-/// Serializes the runtime weights with metadata in canonical key order.
-///
-/// The safetensors writer takes a `HashMap` and emits its iteration order,
-/// which is randomized per process, so two identical runs wrote different
-/// `drysua.weights.safetensors` bytes. This writer emits the same header with
-/// sorted metadata keys, making the whole file byte-identical; the reader
-/// compares metadata maps and stays order-insensitive, so older files load.
-fn serialize_runtime_tensor(parameters: &[f32]) -> Result<Vec<u8>, CheckpointError> {
-    let metadata = runtime_tensor_metadata();
-    debug_assert!(
-        metadata.windows(2).all(|pair| pair[0].0 < pair[1].0),
-        "runtime metadata keys are canonical"
-    );
-    let mut header = String::with_capacity(1024);
-    header.push_str("{\"__metadata__\":{");
-    for (index, (key, value)) in metadata.iter().enumerate() {
-        if index > 0 {
-            header.push(',');
-        }
-        push_json_string(&mut header, key);
-        header.push(':');
-        push_json_string(&mut header, value);
-    }
-    header.push_str("},\"model.parameters\":{\"dtype\":\"F32\",\"shape\":[");
-    header.push_str(&parameters.len().to_string());
-    header.push_str("],\"data_offsets\":[0,");
-    header.push_str(&(parameters.len() * 4).to_string());
-    header.push_str("]}}");
-    let mut header = header.into_bytes();
-    let aligned = header.len().next_multiple_of(8);
-    header.resize(aligned, b' ');
-    let mut bytes = Vec::with_capacity(8 + aligned + parameters.len() * 4);
-    bytes.extend_from_slice(&(aligned as u64).to_le_bytes());
-    bytes.extend_from_slice(&header);
-    bytes.extend_from_slice(&encode_f32(parameters));
-    Ok(bytes)
-}
-
 /// Appends one JSON string, escaping what the format requires.
 fn push_json_string(out: &mut String, value: &str) {
     out.push('"');
@@ -768,30 +803,6 @@ fn push_json_string(out: &mut String, value: &str) {
         }
     }
     out.push('"');
-}
-
-/// The runtime weights metadata, sorted by key.
-fn runtime_tensor_metadata() -> Vec<(&'static str, String)> {
-    vec![
-        ("action_schema_hash", ACTION_SCHEMA_HASH.to_string()),
-        ("feature_schema_hash", FEATURE_SCHEMA_HASH.to_string()),
-        ("map2_reward_version", MAP2_REWARD_VERSION.to_string()),
-        ("model_schema_hash", MODEL_SCHEMA_HASH.to_string()),
-        (
-            "ppo_rules_audit_version",
-            PPO_RULES_AUDIT_VERSION.to_string(),
-        ),
-        ("ppo_schema_hash", PPO_SCHEMA_HASH.to_string()),
-        ("ppo_schema_version", PPO_SCHEMA_VERSION.to_string()),
-    ]
-}
-
-/// The same metadata as an order-insensitive map, for loading.
-fn runtime_tensor_metadata_map() -> HashMap<String, String> {
-    runtime_tensor_metadata()
-        .into_iter()
-        .map(|(key, value)| (key.to_owned(), value))
-        .collect()
 }
 
 fn serialize_named_tensors(
@@ -853,45 +864,6 @@ fn decode_training_tensors(bytes: &[u8]) -> Result<DecodedTensors, CheckpointErr
             state: state.data().to_vec(),
         },
     })
-}
-
-fn decode_runtime_tensor(bytes: &[u8]) -> Result<Vec<f32>, CheckpointError> {
-    let (_, metadata) = SafeTensors::read_metadata(bytes)
-        .map_err(|error| CheckpointError::Backend(error.to_string()))?;
-    if metadata.metadata().as_ref() != Some(&runtime_tensor_metadata_map()) {
-        return Err(CheckpointError::SchemaMismatch);
-    }
-    let tensors = SafeTensors::deserialize(bytes)
-        .map_err(|error| CheckpointError::Backend(error.to_string()))?;
-    validate_names(&tensors, &["model.parameters"])?;
-    decode_tensor(&tensors, "model.parameters")
-}
-
-/// Parameters plus this build's metadata keys whose stored values differ.
-///
-/// Keys only the file carries are counted, never echoed, so the log line stays well formed.
-#[cfg(feature = "builtin")]
-fn decode_warm_start_tensor(bytes: &[u8]) -> Result<(Vec<f32>, Vec<String>), CheckpointError> {
-    let (_, metadata) = SafeTensors::read_metadata(bytes)
-        .map_err(|error| CheckpointError::Backend(error.to_string()))?;
-    let stored = metadata.metadata().clone().unwrap_or_default();
-    let mut differences = runtime_tensor_metadata()
-        .into_iter()
-        .filter(|(key, value)| stored.get(*key) != Some(value))
-        .map(|(key, _)| key.to_owned())
-        .collect::<Vec<_>>();
-    let current = runtime_tensor_metadata_map();
-    let unknown = stored
-        .keys()
-        .filter(|key| !current.contains_key(*key))
-        .count();
-    if unknown > 0 {
-        differences.push(format!("unknown_keys:{unknown}"));
-    }
-    let tensors = SafeTensors::deserialize(bytes)
-        .map_err(|error| CheckpointError::Backend(error.to_string()))?;
-    validate_names(&tensors, &["model.parameters"])?;
-    Ok((decode_tensor(&tensors, "model.parameters")?, differences))
 }
 
 fn validate_names(tensors: &SafeTensors<'_>, expected: &[&str]) -> Result<(), CheckpointError> {
@@ -1172,7 +1144,7 @@ fn decode_config(reader: &mut ManifestReader<'_>) -> Result<PpoConfig, Checkpoin
         adam_epsilon: reader.f32()?,
         gradient_clip: reader.f32()?,
         gamma_tick: reader.f32()?,
-        gae_lambda: reader.f32()?,
+        gae_lambda_tick: reader.f32()?,
         target_kl: reader.f32()?,
     }
     .validate()
@@ -1190,7 +1162,7 @@ fn config_floats(config: PpoConfig) -> [f32; 11] {
         config.adam_epsilon,
         config.gradient_clip,
         config.gamma_tick,
-        config.gae_lambda,
+        config.gae_lambda_tick,
         config.target_kl,
     ]
 }

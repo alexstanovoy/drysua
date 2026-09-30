@@ -5,10 +5,12 @@
 
 //! One game's retained intervals, rewards and terminal report.
 //!
-//! Every eighth decision (from a per-game phase) begins a retained interval:
-//! its behaviour statistics are kept until the interval's eight decisions, or
-//! the game, end. The interval then closes into one PPO transition whose
-//! reward is the discounted sum of the interval's per-decision rewards.
+//! The first decision, every non-Continue decision and every Continue decision
+//! that finds the open interval [`CONTINUE_STRIDE`] decisions long begin a
+//! retained interval: its behaviour statistics are kept until the next retained
+//! decision, or the game's end. The interval then closes into one PPO
+//! transition whose reward is the discounted sum of its per-decision rewards,
+//! bootstrapped from the value of the decision that closed it.
 
 use super::game_summary::GameSummary;
 use super::*;
@@ -23,9 +25,7 @@ mod raze_aim_tests;
 
 pub(super) const TICK_CAP: u32 = crate::MAP2_TICK_CAP;
 pub(super) const ACTOR_DECISIONS: usize = crate::MAP2_ACTOR_DECISIONS;
-pub(super) const RETENTION_STRIDE: usize = crate::MAP2_RETENTION_STRIDE;
-const RETAINED_PER_EPISODE: usize = crate::MAP2_RETAINED_DECISIONS;
-const _: () = assert!(RETENTION_STRIDE.is_power_of_two());
+pub(super) const CONTINUE_STRIDE: usize = crate::MAP2_CONTINUE_STRIDE;
 
 /// Behaviour statistics of the decision that began the open retained interval.
 pub(super) struct RetainedChoice {
@@ -40,7 +40,6 @@ pub(super) struct RetainedChoice {
 
 /// Running state of one game from the policy seat's view.
 pub(super) struct EpisodeStream {
-    retention_phase: usize,
     map2_reward: Map2TrainingReward,
     elapsed_ticks: u32,
     raw_return: f64,
@@ -56,10 +55,8 @@ pub(super) struct EpisodeStream {
 }
 
 impl EpisodeStream {
-    pub(super) fn new(retention_phase: usize) -> Self {
-        assert!(retention_phase < RETENTION_STRIDE);
+    pub(super) fn new() -> Self {
         Self {
-            retention_phase,
             map2_reward: Map2TrainingReward::default(),
             elapsed_ticks: 0,
             raw_return: 0.0,
@@ -75,15 +72,19 @@ impl EpisodeStream {
         }
     }
 
-    /// Whether the next decision begins a retained interval.
-    pub(super) fn begins_interval(&self) -> bool {
-        self.decisions >= self.retention_phase
-            && (self.decisions - self.retention_phase).is_multiple_of(RETENTION_STRIDE)
+    /// Whether a next decision of `kind` begins a retained interval.
+    pub(super) fn retains(&self, kind: ActionKind) -> bool {
+        assert!(!self.done);
+        assert!(self.interval.steps <= CONTINUE_STRIDE);
+        self.choice.is_none()
+            || kind != ActionKind::Continue
+            || self.interval.steps == CONTINUE_STRIDE
     }
 
-    /// A full interval waits for the next decision's value as its bootstrap.
-    pub(super) fn awaits_value(&self) -> bool {
-        !self.done && self.choice.is_some() && self.interval.steps == RETENTION_STRIDE
+    /// Whether a next decision of `kind` closes the open interval; its value
+    /// then bootstraps the interval.
+    pub(super) fn closes_interval(&self, kind: ActionKind) -> bool {
+        self.choice.is_some() && self.retains(kind)
     }
 
     #[cfg(test)]
@@ -94,10 +95,6 @@ impl EpisodeStream {
     #[cfg(test)]
     pub(super) const fn raw_return(&self) -> f64 {
         self.raw_return
-    }
-
-    pub(super) const fn retention_phase(&self) -> usize {
-        self.retention_phase
     }
 
     pub(super) const fn decisions(&self) -> usize {
@@ -112,9 +109,10 @@ impl EpisodeStream {
         self.choice.as_ref()
     }
 
-    /// Opens a retained interval at a decision for which `begins_interval` holds.
+    /// Opens a retained interval at a decision for which `retains` holds,
+    /// after any open one was flushed.
     pub(super) fn retain(&mut self, choice: RetainedChoice) {
-        assert!(self.begins_interval());
+        assert!(self.retains(choice.action.kind()));
         assert!(self.choice.is_none());
         assert_eq!(self.interval.steps, 0);
         self.choice = Some(choice);
@@ -168,7 +166,7 @@ impl EpisodeStream {
     /// Closes the open interval: terminal at the game's end, otherwise
     /// bootstrapped from the next decision's value.
     pub(super) fn flush(&mut self, next_value: Option<f32>) -> Result<PpoTransition, PpoError> {
-        assert!(self.retained < RETAINED_PER_EPISODE as u32);
+        assert!(self.retained < ACTOR_DECISIONS as u32);
         assert_eq!(next_value.is_none(), self.done);
         let choice = self
             .choice
@@ -176,7 +174,7 @@ impl EpisodeStream {
             .ok_or(PpoError::InvalidTransition("episode retained action"))?;
         let interval = std::mem::take(&mut self.interval);
         assert!(interval.steps > 0);
-        assert!(interval.steps == RETENTION_STRIDE || self.done);
+        assert!(interval.steps <= CONTINUE_STRIDE);
         let transition = PpoTransition {
             frame: choice.frame,
             target: choice.target,
@@ -202,12 +200,13 @@ impl EpisodeStream {
         slot: usize,
         game: u64,
         advanced: &CompletedAdvance,
-        opponent: &str,
+        opponent: super::slot::OpponentKind,
         summary: &GameSummary,
     ) -> EpisodeRecord {
+        let label = opponent.label();
         assert!(self.done);
         assert!(self.choice.is_none());
-        let label = match advanced.outcome {
+        let outcome = match advanced.outcome {
             Some(PpoTerminalOutcome::Win) => "Win",
             Some(PpoTerminalOutcome::Loss) => "Loss",
             Some(PpoTerminalOutcome::Draw) => "Draw",
@@ -215,7 +214,7 @@ impl EpisodeStream {
         };
         let tick = advanced.end_tick;
         let episode = format!(
-            "episode: slot={slot} game={game} map=2 opponent={opponent} tick={tick} outcome={label} actor_decisions={} retained={} terminal_sample={} raw_return={:.9} discounted_return={:.9} terminal_reward={} shaping_return={:.9} actions={:?} noncontinue={} retention_phase={}",
+            "episode: slot={slot} game={game} map=2 opponent={label} tick={tick} outcome={outcome} actor_decisions={} retained={} terminal_sample={} raw_return={:.9} discounted_return={:.9} terminal_reward={} shaping_return={:.9} actions={:?} noncontinue={}",
             self.decisions,
             self.retained,
             self.retained > 0,
@@ -225,16 +224,16 @@ impl EpisodeStream {
             self.shaping_return,
             self.actions,
             self.decisions - self.actions[ActionKind::Continue.index()] as usize,
-            self.retention_phase
         );
         let reward = format!(
-            "level=INFO event=map2_episode_reward slot={slot} game={game} tick={tick} outcome={label} opponent={opponent} {}",
+            "level=INFO event=map2_episode_reward slot={slot} game={game} tick={tick} outcome={outcome} opponent={label} {}",
             self.map2_reward
         );
         let summary = format!(
-            "level=INFO event=episode_summary slot={slot} game={game} opponent={opponent} {summary}"
+            "level=INFO event=episode_summary slot={slot} game={game} opponent={label} {summary}"
         );
         EpisodeRecord {
+            opponent,
             outcome: advanced.outcome,
             elapsed_ticks: u64::from(self.elapsed_ticks),
             map2_reward: self.map2_reward,
@@ -256,7 +255,7 @@ impl DiscountedInterval {
             return Err(PpoError::NonFinite("episode reward"));
         }
         let _ = tick_discount(gamma, ticks)?;
-        assert!(self.steps < RETENTION_STRIDE);
+        assert!(self.steps < CONTINUE_STRIDE);
         let discount = if self.ticks == 0 {
             1.0
         } else {
@@ -285,7 +284,8 @@ pub(super) struct CompletedAdvance {
 
 /// One finished game: counters for the update report and deferred log lines.
 pub(super) struct EpisodeRecord {
-    outcome: Option<PpoTerminalOutcome>,
+    pub(super) opponent: super::slot::OpponentKind,
+    pub(super) outcome: Option<PpoTerminalOutcome>,
     elapsed_ticks: u64,
     map2_reward: Map2TrainingReward,
     lines: [String; 3],

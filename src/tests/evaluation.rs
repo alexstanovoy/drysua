@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::Path;
 
 use super::super::eval_players::{Role, load_player};
 use super::*;
@@ -7,7 +7,7 @@ const FIRST_SEED: u64 = 11;
 const CANDIDATE_SEED: u64 = 5;
 const OPPONENT_SEED: u64 = 6;
 
-fn fresh_weights(seed: u64) -> PathBuf {
+fn fresh_weights(seed: u64) -> crate::TestDirectory {
     let directory = crate::test_directory("evaluation-weights");
     let model = PolicyModel::fresh(seed).expect("model");
     crate::TrainingArtifact::save_runtime_weights(&model, &directory).expect("runtime weights");
@@ -23,13 +23,15 @@ fn entry(name: &str, player: PlayerSpec, role: Role) -> PoolEntry {
 }
 
 /// A neural candidate against a rule opponent and a neural opponent.
-fn settings(parallel: usize, groups: usize) -> EvaluationSettings {
-    static WEIGHTS: std::sync::OnceLock<(PathBuf, PathBuf)> = std::sync::OnceLock::new();
-    let (candidate, opponent) =
-        WEIGHTS.get_or_init(|| (fresh_weights(CANDIDATE_SEED), fresh_weights(OPPONENT_SEED)));
+fn settings(
+    candidate: &Path,
+    opponent: &Path,
+    parallel: usize,
+    groups: usize,
+) -> EvaluationSettings {
     EvaluationSettings {
         candidate_name: "fresh".to_owned(),
-        candidate: PlayerSpec::Weights(candidate.clone()),
+        candidate: PlayerSpec::Weights(candidate.to_path_buf()),
         pool: vec![
             entry(
                 "teacher",
@@ -38,7 +40,7 @@ fn settings(parallel: usize, groups: usize) -> EvaluationSettings {
             ),
             entry(
                 "other",
-                PlayerSpec::Weights(opponent.clone()),
+                PlayerSpec::Weights(opponent.to_path_buf()),
                 Role::HeldOut,
             ),
         ],
@@ -52,7 +54,8 @@ fn settings(parallel: usize, groups: usize) -> EvaluationSettings {
 }
 
 fn play(parallel: usize, groups: usize) -> Vec<(PlannedGame, GameSummary)> {
-    let settings = settings(parallel, groups);
+    let (candidate, opponent) = (fresh_weights(CANDIDATE_SEED), fresh_weights(OPPONENT_SEED));
+    let settings = settings(&candidate, &opponent, parallel, groups);
     let load = |spec| load_player(spec, settings.device).expect("player");
     let models = Models {
         candidate: load(&settings.candidate),
@@ -227,9 +230,12 @@ fn evaluation_writes_a_header_then_every_game_in_plan_order() {
 
 #[test]
 fn evaluation_never_replaces_an_existing_result() {
-    let output = crate::test_directory("evaluation-existing").join("result.jsonl");
+    let directory = crate::test_directory("evaluation-existing");
+    let output = directory.join("result.jsonl");
     std::fs::write(&output, b"earlier").expect("earlier result");
-    let error = run_evaluation(&settings(1, 1), &output).expect_err("existing output");
+    let missing = Path::new("/nonexistent");
+    let error =
+        run_evaluation(&settings(missing, missing, 1, 1), &output).expect_err("existing output");
     assert!(
         error
             .to_string()
@@ -252,9 +258,12 @@ fn average_player_is_the_parameter_mean_of_its_members() {
             .export_parameters()
             .expect("parameters")
     };
-    let a = parameters(&PlayerSpec::Weights(first.clone()));
-    let b = parameters(&PlayerSpec::Weights(second.clone()));
-    let mean = parameters(&PlayerSpec::Average(vec![first, second]));
+    let a = parameters(&PlayerSpec::Weights(first.to_path_buf()));
+    let b = parameters(&PlayerSpec::Weights(second.to_path_buf()));
+    let mean = parameters(&PlayerSpec::Average(vec![
+        first.to_path_buf(),
+        second.to_path_buf(),
+    ]));
     assert_ne!(a, b);
     for ((a, b), mean) in a.iter().zip(&b).zip(&mean) {
         let expected = ((f64::from(*a) + f64::from(*b)) / 2.0) as f32;

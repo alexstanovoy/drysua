@@ -9,7 +9,7 @@
 use bota_proto::ModifierSpec;
 
 use super::episode::{
-    ACTOR_DECISIONS, CompletedAdvance, EpisodeRecord, EpisodeStream, RETENTION_STRIDE,
+    ACTOR_DECISIONS, CONTINUE_STRIDE, CompletedAdvance, EpisodeRecord, EpisodeStream,
     RetainedChoice, TICK_CAP,
 };
 use super::game_summary::GameSummary;
@@ -19,7 +19,6 @@ use crate::{EncoderRow, SampledStatistics};
 /// Upper bound on slots of one run; also the slot factor of per-game seeds.
 pub(crate) const MAX_SLOTS: usize = crate::PPO_MAX_SLOTS;
 const ACTOR_DOMAIN: u64 = 0x736c_6f74_5f61_6374;
-const RETENTION_DOMAIN: u64 = 0x736c_6f74_5f72_6574;
 const MIXTURE_DOMAIN: u64 = 0x736c_6f74_5f6d_6978;
 
 /// Who plays the opponent seat of one game.
@@ -33,6 +32,8 @@ pub(crate) enum OpponentKind {
     Snapshot(usize),
     /// The actor weights the policy seat samples from.
     SelfPlay,
+    /// This run's runtime-history milestone after `update` completed updates.
+    League(u64),
 }
 
 impl OpponentKind {
@@ -42,6 +43,7 @@ impl OpponentKind {
             Self::HarassPush => "harass-push".to_owned(),
             Self::Snapshot(index) => format!("weights{index}"),
             Self::SelfPlay => "self".to_owned(),
+            Self::League(update) => format!("u{update:04}"),
         }
     }
 }
@@ -55,9 +57,9 @@ pub(crate) struct OpponentMixture {
 
 impl OpponentMixture {
     pub(crate) fn new(entries: Vec<(OpponentKind, u64)>) -> Result<Self, PpoError> {
-        if entries.is_empty() || entries.len() > 16 {
+        if entries.is_empty() || entries.len() > super::opponents::MAX_MIXTURE_ENTRIES {
             return Err(PpoError::InvalidConfig(
-                "opponent mixture needs 1..=16 entries",
+                "opponent mixture needs 1..=32 entries",
             ));
         }
         let mut total = 0u64;
@@ -71,6 +73,14 @@ impl OpponentMixture {
             total += weight;
         }
         Ok(Self { entries, total })
+    }
+
+    pub(crate) fn entries(&self) -> &[(OpponentKind, u64)] {
+        &self.entries
+    }
+
+    pub(crate) const fn total(&self) -> u64 {
+        self.total
     }
 }
 
@@ -123,22 +133,40 @@ pub(crate) struct GamePlan {
 }
 
 impl GamePlan {
+    /// The plan of a new game, drawing its opponent from the start update's mixture.
     pub(crate) fn new(
         schedule: &GameSchedule,
         slot: usize,
         game: u64,
-        start_update: u64,
-        spec: ModifierSpec,
+        next: &NextGame,
     ) -> Result<Self, PpoError> {
-        Ok(Self {
+        let opponent = draw_opponent(&next.mixture, schedule.seed, slot, game, next.update)?;
+        Ok(Self::with_opponent(
+            schedule,
+            slot,
+            game,
+            (next.update, next.spec),
+            opponent,
+        ))
+    }
+
+    /// The plan of a game whose opponent is already known.
+    pub(crate) fn with_opponent(
+        schedule: &GameSchedule,
+        slot: usize,
+        game: u64,
+        (start_update, spec): (u64, ModifierSpec),
+        opponent: OpponentKind,
+    ) -> Self {
+        Self {
             slot,
             game,
             start_update,
             spec,
             seat: (slot + game as usize % 2) % 2,
-            opponent: draw_opponent(&schedule.mixture, schedule.seed, slot, game, start_update)?,
+            opponent,
             decision_cap: schedule.decision_cap,
-        })
+        }
     }
 
     fn seed(&self, seed: u64, domain: u64) -> Result<u64, PpoError> {
@@ -154,7 +182,6 @@ impl GamePlan {
 #[derive(Clone, Debug)]
 pub(crate) struct GameSchedule {
     pub(crate) seed: u64,
-    pub(crate) mixture: OpponentMixture,
     pub(crate) decision_cap: usize,
     pub(crate) config: PpoConfig,
 }
@@ -215,18 +242,19 @@ impl PreparedSeat {
     }
 }
 
-/// The update and spawn modifiers a slot's next game starts under.
-#[derive(Clone, Copy, Debug)]
-pub(super) struct NextGame {
-    pub(super) update: u64,
-    pub(super) spec: ModifierSpec,
+/// The update, spawn modifiers and opponent mixture a slot's next game starts under.
+#[derive(Clone, Debug)]
+pub(crate) struct NextGame {
+    pub(crate) update: u64,
+    pub(crate) spec: ModifierSpec,
+    pub(crate) mixture: std::sync::Arc<OpponentMixture>,
 }
 
 /// The sampled decision a lane hands back to its slot.
 pub(super) struct Decision {
     pub(super) action: StructuredAction,
     /// Present exactly when the decision begins a retained interval: statistics,
-    /// value and behaviour version. Boxed because seven decisions in eight have none.
+    /// value and behaviour version. Boxed because most decisions have none.
     pub(super) retained: Option<Box<(SampledStatistics, f32, u64)>>,
     pub(super) opponent: Option<StructuredAction>,
 }
@@ -258,7 +286,9 @@ impl Slot {
         let runtime = match plan.opponent {
             OpponentKind::Teacher => OpponentRuntime::Teacher,
             OpponentKind::HarassPush => OpponentRuntime::HarassPush,
-            OpponentKind::Snapshot(_) | OpponentKind::SelfPlay => OpponentRuntime::Neural,
+            OpponentKind::Snapshot(_) | OpponentKind::SelfPlay | OpponentKind::League(_) => {
+                OpponentRuntime::Neural
+            }
         };
         let mut environment = build_environment(
             plan.seed(seed, crate::randomization::ARENA_DOMAIN)?,
@@ -275,12 +305,10 @@ impl Slot {
             )?),
             _ => None,
         };
-        let mut phase = PpoRng::new(plan.seed(seed, RETENTION_DOMAIN)?);
-        let retention_phase = (phase.next_word()? & (RETENTION_STRIDE as u64 - 1)) as usize;
         Ok(Box::new(Self {
             plan,
             environment,
-            stream: EpisodeStream::new(retention_phase),
+            stream: EpisodeStream::new(),
             policy,
             opponent,
             actor_random: PpoRng::new(plan.seed(seed, ACTOR_DOMAIN)?),
@@ -311,7 +339,7 @@ impl Slot {
             self.plan.slot,
             self.plan.game,
             &advanced,
-            &self.plan.opponent.label(),
+            self.plan.opponent,
             &summary,
         );
         let game = self
@@ -319,7 +347,7 @@ impl Slot {
             .game
             .checked_add(1)
             .ok_or(PpoError::CounterOverflow)?;
-        let plan = GamePlan::new(schedule, self.plan.slot, game, next.update, next.spec)?;
+        let plan = GamePlan::new(schedule, self.plan.slot, game, &next)?;
         let replacement = Self::start(plan, schedule)?;
         let finished = FinishedGame {
             slot: self.plan.slot,
@@ -332,7 +360,8 @@ impl Slot {
 
     fn step(&mut self, decision: Decision, gamma: f32) -> Result<CompletedAdvance, PpoError> {
         assert!(!self.stream.done());
-        if self.stream.begins_interval() {
+        assert!(!self.stream.closes_interval(decision.action.kind()));
+        if self.stream.retains(decision.action.kind()) {
             let (statistics, value, behaviour) = *decision
                 .retained
                 .ok_or(PpoError::InvalidTransition("retained decision statistics"))?;
@@ -439,7 +468,15 @@ impl Slot {
         schedule: &GameSchedule,
     ) -> Result<Box<Self>, PpoError> {
         let plan = snapshot.plan;
-        if GamePlan::new(schedule, plan.slot, plan.game, plan.start_update, plan.spec)? != plan {
+        // The mixture that drew the opponent may be gone; everything else is rederived.
+        let rederived = GamePlan::with_opponent(
+            schedule,
+            plan.slot,
+            plan.game,
+            (plan.start_update, plan.spec),
+            plan.opponent,
+        );
+        if rederived != plan {
             return Err(PpoError::InvalidConfig("collector snapshot game plan"));
         }
         let mut slot = Self::start(plan, schedule)?;
@@ -450,7 +487,7 @@ impl Slot {
         {
             return Err(PpoError::InvalidConfig("collector snapshot action log"));
         }
-        let last_start = last_interval_start(slot.stream.retention_phase(), decisions);
+        let last_start = last_interval_start(&snapshot.log.policy)?;
         if last_start.is_some() != snapshot.open.is_some() {
             return Err(PpoError::InvalidConfig("collector snapshot open interval"));
         }
@@ -474,11 +511,11 @@ impl Slot {
         last_start: Option<usize>,
         gamma: f32,
     ) -> Result<(), PpoError> {
-        if self.stream.awaits_value() {
+        let action = decode_action(snapshot.log.policy[index])?;
+        if self.stream.closes_interval(action.kind()) {
             // The flushed sample belonged to an already trained update.
             self.stream.flush(Some(0.0))?;
         }
-        let action = decode_action(snapshot.log.policy[index])?;
         let opponent = snapshot
             .log
             .opponent
@@ -486,7 +523,7 @@ impl Slot {
             .copied()
             .map(decode_action)
             .transpose()?;
-        let retained = if self.stream.begins_interval() {
+        let retained = if self.stream.retains(action.kind()) {
             let target = BehavioralTarget::from_sampled_action(&self.policy.space, action)
                 .map_err(text_error)?;
             let open = snapshot.open.filter(|_| Some(index) == last_start);
@@ -519,10 +556,19 @@ impl Slot {
     }
 }
 
-/// The decision that began the interval still open after `decisions` decisions.
-fn last_interval_start(phase: usize, decisions: usize) -> Option<usize> {
-    (decisions > phase)
-        .then(|| phase + (decisions - 1 - phase) / RETENTION_STRIDE * RETENTION_STRIDE)
+/// The decision that began the interval still open after the logged decisions.
+fn last_interval_start(log: &[u32]) -> Result<Option<usize>, PpoError> {
+    let mut start = None;
+    for (index, &word) in log.iter().enumerate() {
+        let continued = start.map_or(0, |start| index - start);
+        if start.is_none()
+            || decode_action(word)?.kind() != ActionKind::Continue
+            || continued == CONTINUE_STRIDE
+        {
+            start = Some(index);
+        }
+    }
+    Ok(start)
 }
 
 /// Packs one structured action into one checked word.

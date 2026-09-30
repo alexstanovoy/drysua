@@ -88,7 +88,11 @@ class CampaignTests(unittest.TestCase):
         return json.loads((self.campaign / "sessions" / f"{session:04d}" / "receipt.json").read_text())
 
     def test_run_trains_every_update_in_one_container_with_history_and_a_receipt(self):
-        self.create()
+        snapshot = self.root / "snapshot"
+        snapshot.mkdir()
+        (snapshot / train.RUNTIME_FILE).write_bytes(b"frozen opponent")
+        self.create(opponents=[{"kind": "teacher", "weight": "2"}, {"kind": "weights", "path": str(snapshot),
+                                                                     "weight": "0.5"}, {"kind": "league"}])
         self.scenario(checkpoint_every=3)
         result = train.run_campaign(self.campaign)
         self.assertEqual((result["phase"], result["updates"], result["sessions"]), ("completed", 5, 1))
@@ -97,6 +101,9 @@ class CampaignTests(unittest.TestCase):
         self.assertEqual(command[:2], [str(self.campaign / "bin/trainer"), "train-annealed"])
         self.assertNotIn("--resume", command)
         self.assertEqual(command[command.index("--checkpoint-interval-seconds") + 1], "600")
+        opponents = [command[index + 1] for index, token in enumerate(command) if token == "--opponent"]
+        self.assertEqual(opponents, ["teacher:2", f"weights:{self.campaign / 'inputs/opponent-1'}:0.5", "league:1"])
+        self.assertEqual((self.campaign / "inputs/opponent-1" / train.RUNTIME_FILE).read_bytes(), b"frozen opponent")
         self.assertIn(f"CUDA_CACHE_PATH={self.campaign / 'cuda-cache'}", create)
         self.assertIn(f"type=bind,src={self.campaign / 'bin'},dst={self.campaign / 'bin'},readonly", create)
         self.assertEqual(sorted(path.name for path in (self.campaign / "history").iterdir()),
@@ -277,7 +284,9 @@ class CampaignTests(unittest.TestCase):
                 ({"stop_seconds": 1}, "stop_seconds must be an integer in 5..3600"),
                 ({"checkpoint_seconds": 59}, "checkpoint_seconds must be an integer in 60..86400"),
                 ({"training_args": ["--checkpoint-interval-seconds", "60"]},
-                 "controller-owned or unreviewed argument: --checkpoint-interval-seconds")):
+                 "controller-owned or unreviewed argument: --checkpoint-interval-seconds"),
+                ({"opponents": [{"kind": "weights", "weight": "1"}]}, "opponent fields must be"),
+                ({"opponents": [{"kind": "teacher", "weight": 1}]}, "opponent weight must be a decimal string")):
             with self.subTest(overrides=overrides), self.assertRaisesRegex(ValueError, message):
                 self.create(**overrides)
             self.assertFalse(self.campaign.exists())

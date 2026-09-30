@@ -31,7 +31,7 @@ mod tests {
     #[test]
     fn partition_full_capacity_preserves_every_row_and_order_in_both_modes() {
         let order: Vec<_> = (0..PPO_MAX_SAMPLES).rev().collect();
-        assert_eq!(order.len(), 46_520);
+        assert_eq!(order.len(), 33_280);
         for balanced in [false, true] {
             let chunks = minibatch::partition(&order, 2048, balanced).collect::<Vec<_>>();
             assert_eq!(chunks.len(), order.len().div_ceil(2048));
@@ -58,7 +58,7 @@ mod tests {
     #[test]
     fn partition_full_capacity_rejects_maximum_plus_one_with_the_bound() {
         let order = vec![0; PPO_MAX_SAMPLES + 1];
-        assert_eq!(order.len(), 46_521);
+        assert_eq!(order.len(), 33_281);
         for balanced in [false, true] {
             let panic =
                 std::panic::catch_unwind(|| minibatch::partition(&order, 2048, balanced).count())
@@ -69,7 +69,7 @@ mod tests {
                 .or_else(|| panic.downcast_ref::<&str>().copied());
             assert_eq!(
                 message,
-                Some("PPO partition row count 46521 exceeds maximum 46520")
+                Some("PPO partition row count 33281 exceeds maximum 33280")
             );
         }
     }

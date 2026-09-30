@@ -1,5 +1,5 @@
 //! Retained intervals on a real slot: which decisions they cover, what they
-//! earn and how they close, independently of the policy's retention phase.
+//! earn and how they close.
 #![allow(
     clippy::float_arithmetic,
     reason = "Interval rewards are compared against summed per-decision rewards"
@@ -10,7 +10,6 @@ use super::*;
 fn schedule(decision_cap: usize) -> GameSchedule {
     GameSchedule {
         seed: 9_971_001,
-        mixture: OpponentMixture::new(vec![(OpponentKind::Teacher, 1)]).expect("mixture"),
         decision_cap,
         config: PpoConfig {
             gamma_tick: MAP2_REWARD_GAMMA_TICK,
@@ -19,57 +18,78 @@ fn schedule(decision_cap: usize) -> GameSchedule {
     }
 }
 
+fn next_game() -> NextGame {
+    NextGame {
+        update: 0,
+        spec: ModifierSpec::NOMINAL,
+        mixture: std::sync::Arc::new(
+            OpponentMixture::new(vec![(OpponentKind::Teacher, 1)]).expect("mixture"),
+        ),
+    }
+}
+
 struct Played {
     actions: Vec<StructuredAction>,
-    random: PpoRng,
     rewards: Vec<f64>,
     samples: Vec<PpoTransition>,
     finished: Option<FinishedGame>,
 }
 
-/// Plays `decisions` decisions of slot zero's first game with a fixed phase.
-fn play(model: &PolicyModel, phase: usize, decisions: usize, cap: usize) -> Played {
+/// Plays `decisions` decisions of slot zero's first game like a lane does,
+/// replacing each sampled action with `choose(decision, sampled)`.
+fn play(
+    model: &PolicyModel,
+    decisions: usize,
+    cap: usize,
+    choose: impl Fn(usize, StructuredAction) -> StructuredAction,
+) -> Played {
     let schedule = schedule(cap);
-    let plan = GamePlan::new(&schedule, 0, 0, 0, ModifierSpec::NOMINAL).expect("plan");
+    let plan = GamePlan::new(&schedule, 0, 0, &next_game()).expect("plan");
     let mut slot = Slot::start(plan, &schedule).expect("slot");
-    slot.stream = EpisodeStream::new(phase);
     let mut played = Played {
         actions: Vec::new(),
-        random: PpoRng::new(0),
         rewards: Vec::new(),
         samples: Vec::new(),
         finished: None,
     };
-    for _ in 0..decisions {
+    for index in 0..decisions {
         let sampled = model
             .sample_rows(
                 &[&slot.policy.row],
                 &[&slot.policy.space],
                 std::slice::from_mut(&mut slot.actor_random),
-                &[slot.stream.begins_interval()],
+                &[true],
             )
             .expect("sample")
             .pop()
             .expect("one row");
-        if slot.stream.awaits_value() {
+        let action = choose(index, sampled.action);
+        let statistics = if action == sampled.action {
+            sampled.statistics.expect("statistics")
+        } else {
+            SampledStatistics {
+                target: BehavioralTarget::from_sampled_action(&slot.policy.space, action)
+                    .expect("target"),
+                log_probability: -1.0,
+                entropy: 0.0,
+            }
+        };
+        if slot.stream.closes_interval(action.kind()) {
             played
                 .samples
                 .push(slot.stream.flush(Some(sampled.value)).expect("flush"));
         }
-        played.actions.push(sampled.action);
+        played.actions.push(action);
         let before = slot.stream.raw_return();
         let decision = Decision {
-            action: sampled.action,
-            retained: sampled
-                .statistics
-                .map(|statistics| Box::new((statistics, sampled.value, 0))),
+            action,
+            retained: slot
+                .stream
+                .retains(action.kind())
+                .then(|| Box::new((statistics, sampled.value, 0))),
             opponent: None,
         };
-        let next = NextGame {
-            update: 0,
-            spec: ModifierSpec::NOMINAL,
-        };
-        played.random = slot.actor_random.clone();
+        let next = next_game();
         let (next, finished) = slot.advance(decision, &schedule, next).expect("advance");
         if let Some(finished) = finished {
             played.rewards.push(finished.record.total_reward() - before);
@@ -83,46 +103,48 @@ fn play(model: &PolicyModel, phase: usize, decisions: usize, cap: usize) -> Play
     played
 }
 
+/// The sampled action at decisions 3 and 20, Continue everywhere else.
+fn two_orders(index: usize, sampled: StructuredAction) -> StructuredAction {
+    if [3, 20].contains(&index) {
+        sampled
+    } else {
+        StructuredAction::Continue
+    }
+}
+
 #[test]
-fn retention_phase_changes_neither_actions_nor_rewards_and_intervals_sum_their_rewards() {
+fn intervals_begin_at_the_first_every_order_and_each_eighth_continue_and_sum_their_rewards() {
     let model = PolicyModel::fresh(23_077).expect("model");
-    let reference = play(&model, 0, 20, crate::MAP2_ACTOR_DECISIONS);
-    for phase in 0..RETENTION_STRIDE {
-        let played = play(&model, phase, 20, crate::MAP2_ACTOR_DECISIONS);
-        assert_eq!(played.actions, reference.actions, "phase {phase}");
-        assert_eq!(played.random, reference.random, "phase {phase}");
-        assert_eq!(played.rewards, reference.rewards, "phase {phase}");
-        // Decisions phase..phase+8 closed when decision phase+8 was sampled.
-        let closed = (19 - phase) / RETENTION_STRIDE;
-        assert_eq!(played.samples.len(), closed, "phase {phase}");
-        for (index, sample) in played.samples.iter().enumerate() {
-            let start = phase + index * RETENTION_STRIDE;
-            let reward: f64 = played.rewards[start..start + RETENTION_STRIDE].iter().sum();
-            assert_eq!(sample.ticks, 24);
-            assert!(!sample.terminal);
-            assert_eq!(sample.action, played.actions[start]);
-            assert!((f64::from(sample.reward) - reward).abs() < 1e-6);
-        }
+    let played = play(&model, 30, crate::MAP2_ACTOR_DECISIONS, two_orders);
+    assert_ne!(played.actions[3], StructuredAction::Continue);
+    assert_ne!(played.actions[20], StructuredAction::Continue);
+    // Starts: 0 first, 3 order, 11 and 19 eighth Continue, 20 order, 28 eighth Continue.
+    let intervals = [(0, 3), (3, 11), (11, 19), (19, 20), (20, 28)];
+    assert_eq!(played.samples.len(), intervals.len());
+    for (sample, (start, end)) in played.samples.iter().zip(intervals) {
+        let reward: f64 = played.rewards[start..end].iter().sum();
+        assert_eq!(sample.ticks, 3 * (end - start) as u32);
+        assert!(!sample.terminal);
+        assert_eq!(sample.action, played.actions[start]);
+        assert!((f64::from(sample.reward) - reward).abs() < 1e-6);
     }
 }
 
 #[test]
 fn a_game_ending_inside_an_interval_closes_it_terminal_without_a_bootstrap() {
     let model = PolicyModel::fresh(23_078).expect("model");
-    let played = play(&model, 2, 64, 5);
+    let played = play(&model, 64, 5, |_, _| StructuredAction::Continue);
     let finished = played.finished.expect("decision cap ends the game");
     let terminal = finished.terminal.expect("open interval at the end");
+    assert!(played.samples.len() == 1, "only the terminal interval");
     assert!(terminal.terminal);
     assert_eq!(terminal.next_value, 0.0);
-    assert_eq!(terminal.ticks, 9);
-    assert_eq!(terminal.action, played.actions[2]);
-    let reward: f64 = played.rewards[2..5].iter().sum();
+    assert_eq!(terminal.ticks, 15);
+    assert_eq!(terminal.action, played.actions[0]);
+    let reward: f64 = played.rewards.iter().sum();
     assert!((f64::from(terminal.reward) - reward).abs() < 1e-6);
     let mut report = CollectionReport::default();
     finished.record.accumulate(&mut report).expect("report");
     assert_eq!(report.episode_timeouts, 1);
     assert_eq!(report.elapsed_ticks, 15);
-    let unsampled = play(&model, 7, 64, 5);
-    assert!(unsampled.samples.is_empty(), "no fabricated sample");
-    assert!(unsampled.finished.expect("ended").terminal.is_none());
 }

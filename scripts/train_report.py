@@ -45,6 +45,8 @@ IGNORED_FIELDS = {"stream", "map", "update", "update_index", "completed_updates"
                   "start_game", "previous_generation", "start_update", "optimizer_step", "samples_total"}
 IGNORED_EVENTS = {"map2_training_reward"}
 CATEGORY_EXCLUDED = {"outcome", "opponent", "actions"}
+# League snapshots of the learner (`u0040`) come and go; they share one series.
+LEAGUE_LABEL = re.compile(r"u[0-9]{4,}")
 MAX_CATEGORIES = 8
 
 
@@ -197,10 +199,31 @@ def mean_fields(lines, prefix):
     return {key: sums[key] / counts[key] for key in sums}
 
 
+def opponent_group(label):
+    return "league" if LEAGUE_LABEL.fullmatch(label) else label
+
+
+def pool_metrics(lines):
+    """Per-opponent PFSP window win rate and sampling probability of the last published mixture."""
+    games, score, probability = defaultdict(float), defaultdict(float), defaultdict(float)
+    last = max((fields.get("update", 0.0) for fields in lines), default=0.0)
+    for fields in lines:
+        if fields.get("update", 0.0) != last or not isinstance(fields.get("scope"), str):
+            continue
+        group = opponent_group(fields["scope"])
+        games[group] += fields.get("games", 0.0)
+        score[group] += fields.get("score", 0.0)
+        probability[group] += fields.get("probability", 0.0)
+    metrics = {f"opponent_pool.{group}.probability": value for group, value in probability.items()}
+    metrics.update({f"opponent_pool.{group}.win_rate": score[group] / count
+                    for group, count in games.items() if count})
+    return metrics
+
+
 def event_metrics(events):
     metrics = {}
     for name, lines in events.items():
-        metrics.update(mean_fields(lines, name))
+        metrics.update(pool_metrics(lines) if name == "opponent_pool" else mean_fields(lines, name))
     return metrics
 
 
@@ -214,7 +237,7 @@ def episode_record(episodes):
         if outcome not in outcomes:
             continue
         outcomes[outcome] += 1
-        by_opponent[str(fields.get("opponent", "all"))][outcome] += 1
+        by_opponent[opponent_group(str(fields.get("opponent", "all")))][outcome] += 1
         for key, value in fields.items():
             if isinstance(value, str) and key not in CATEGORY_EXCLUDED:
                 categories[key][value] += 1
@@ -418,7 +441,7 @@ def outcome_charts(records, window):
         groups += [(name, lambda record, name=name: record["by_opponent"].get(name, dict.fromkeys(OUTCOMES, 0)))
                    for name in opponents]
     lines = []
-    for name, outcomes in groups[:4]:
+    for name, outcomes in groups[:8]:
         rates, lows, highs = [], [], []
         for index in range(len(records)):
             window_records = records[max(0, index - window + 1):index + 1]
@@ -489,6 +512,20 @@ def metric(records, key):
     return [record["metrics"].get(key) for record in records]
 
 
+def pool_charts(records, keys, used):
+    """PFSP window win rate and sampling probability per opponent, as the trainer published them."""
+    charts = []
+    for field, title, scale in (("win_rate", "Opponent win rate (last 100 games each)", 100),
+                                ("probability", "Opponent sampling probability", 100)):
+        selected = [key for key in keys if key.startswith("opponent_pool.") and key.endswith("." + field)]
+        used.update(selected)
+        if selected:
+            entries = [series(key.split(".")[1], [None if value is None else scale * value
+                                                  for value in metric(records, key)]) for key in selected]
+            charts.append(chart(title, "lines", entries, unit="%", domain=[0, 100]))
+    return charts
+
+
 def dashboard_sections(records, window):
     """Chart sections; every numeric series appears exactly once, known ones in curated charts."""
     keys = sorted({key for record in records for key in record["metrics"]})[:MAX_SERIES]
@@ -516,6 +553,7 @@ def dashboard_sections(records, window):
                                                   note="Band: shortest to longest.")]
                          + category_charts(records) + singles(others)))
     sections.append(("PPO", True, singles([key for key in keys if PPO_PATTERN.search(key)])))
+    sections.append(("Opponents", True, pool_charts(records, keys, used)))
     environment = [key for key in ENVIRONMENT_KEYS if key in keys]
     used.update(environment)
     sections.append(("Environment", True, [chart(key, "lines", [series(key, held(metric(records, key)))],

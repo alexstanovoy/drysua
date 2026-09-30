@@ -38,7 +38,7 @@ fn signal_stop_scenario() {
     config.checkpoint_cadence =
         crate::TrainingCheckpointCadence::WallTime(std::time::Duration::from_secs(86_400));
     config.history = Some(crate::RuntimeHistory {
-        directory: history.clone(),
+        directory: history.to_path_buf(),
         every: NonZeroU64::new(2).expect("nonzero"),
     });
     crate::training_signals::install().expect("stop handlers");
@@ -83,9 +83,6 @@ fn signal_stop_scenario() {
     let report = run(config, &checkpoint, true).expect("completed resume");
     assert_eq!(report.completed_updates, 3);
     assert_eq!(history_entries(&history), ["u0002", "u0003"]);
-    for directory in [checkpoint, history] {
-        std::fs::remove_dir_all(directory).expect("cleanup");
-    }
 }
 
 fn history_entries(directory: &std::path::Path) -> Vec<String> {

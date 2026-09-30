@@ -61,7 +61,6 @@ fn resume_without_a_seed_adopts_the_recorded_scope_seed() {
             .completed_updates,
         2
     );
-    std::fs::remove_dir_all(directory).expect("remove own checkpoint");
 }
 
 #[test]
@@ -72,7 +71,6 @@ fn resume_without_a_seed_requires_a_readable_run_scope() {
     let text = error.to_string();
     assert!(text.contains("run scope"), "{text}");
     assert!(text.contains("--seed"), "{text}");
-    std::fs::remove_dir_all(directory).expect("remove own directory");
 }
 
 #[test]
@@ -106,5 +104,4 @@ fn resume_with_a_different_explicit_seed_rejects_the_scope() {
             .completed_updates,
         2
     );
-    std::fs::remove_dir_all(directory).expect("remove own checkpoint");
 }

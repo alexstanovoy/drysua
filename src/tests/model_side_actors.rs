@@ -4,7 +4,7 @@ use super::*;
 fn dire_actor_heads_mirror_radiant_heads_after_the_shared_parameters() {
     let model = PolicyModel::fresh(9001).expect("model");
     let schema = model.parameter_schema().expect("schema");
-    assert_eq!(schema.len(), 86);
+    assert_eq!(schema.len(), 88);
     let heads = [
         "kind",
         "controlled",
@@ -19,17 +19,18 @@ fn dire_actor_heads_mirror_radiant_heads_after_the_shared_parameters() {
         "entity_query",
         "point_query",
     ];
-    for (index, original) in (34..36).chain(40..62).enumerate() {
+    for (index, original) in (36..38).chain(42..64).enumerate() {
         let suffix = if index % 2 == 0 { "weight" } else { "bias" };
         assert_eq!(schema[original].0, format!("{}.{suffix}", heads[index / 2]));
         assert_eq!(
-            schema[62 + index].0,
+            schema[64 + index].0,
             format!("dire.{}.{suffix}", heads[index / 2])
         );
-        assert_eq!(schema[62 + index].1, schema[original].1);
+        assert_eq!(schema[64 + index].1, schema[original].1);
     }
-    assert_eq!(schema[32].0, "value.weight");
-    for (entry, name) in schema[36..40].iter().zip([
+    assert_eq!(schema[32].0, "value.0.weight");
+    assert_eq!(schema[34].0, "value.1.weight");
+    for (entry, name) in schema[38..42].iter().zip([
         "kind_embedding.weight",
         "unit_embedding.weight",
         "ability_embedding.weight",
@@ -214,7 +215,7 @@ fn assert_bits(actual: &[f32], expected: &[f32]) {
 }
 
 fn gradient_values(named: &[NamedPolicyGradient], name: &str) -> Vec<f32> {
-    assert_eq!(named.len(), 86);
+    assert_eq!(named.len(), 88);
     let gradient = named
         .iter()
         .find(|entry| entry.name == name)
@@ -273,7 +274,7 @@ fn assert_gradients(device: PolicyDevice) {
                 .all(|value| *value == 0.0)
         );
         assert!(
-            gradient_values(&named, "value.weight")
+            gradient_values(&named, "value.1.weight")
                 .iter()
                 .all(|value| *value == 0.0)
         );
@@ -283,23 +284,29 @@ fn assert_gradients(device: PolicyDevice) {
                 .any(|value| *value > 0.0)
         );
     }
-    assert_critic_isolation(&model);
+    assert_critic_trains_the_shared_trunk_only(device);
 }
 
-fn assert_critic_isolation(model: &PolicyModel) {
+fn assert_critic_trains_the_shared_trunk_only(device: PolicyDevice) {
+    let model = PolicyModel::fresh_on(9002, device).expect("model");
     let _guard = model.read_parameter_lock().expect("critic read guard");
     let output = model
-        .training_forward_value_gradient_locked(
+        .training_forward_locked(
             &[side_frame(false), side_frame(true)],
             &[TrainingPrefix::new(ActionKind::Continue, None, None); 2],
-            false,
         )
-        .expect("isolated PPO critic");
+        .expect("PPO critic");
     let named = model
         .backward_named_locked(&output.value.sum_all().expect("value loss"))
         .expect("critic backward");
-    assert_eq!(gradient_values(&named, "value.bias"), vec![2.0]);
-    for name in ["trunk.2.bias", "kind.bias", "dire.kind.bias"] {
+    // Two rows through the fixed read-out scale of sixteen.
+    assert_eq!(gradient_values(&named, "value.1.bias"), vec![32.0]);
+    assert!(
+        gradient_values(&named, "trunk.2.weight")
+            .iter()
+            .any(|value| *value != 0.0)
+    );
+    for name in ["kind.bias", "dire.kind.bias"] {
         assert!(
             gradient_values(&named, name)
                 .iter()
@@ -454,7 +461,7 @@ fn assert_mixed_gradient_activity(named: &[NamedPolicyGradient], head: &str, slo
         }
     }
     assert!(
-        gradient_values(named, "value.weight")
+        gradient_values(named, "value.1.weight")
             .iter()
             .all(|value| *value == 0.0)
     );
@@ -691,7 +698,7 @@ fn assert_scalar_value_rejection(device: PolicyDevice) {
     edit(&model, |name, values| match name {
         "trunk.2.weight" => values.fill(0.0),
         "trunk.2.bias" => values.fill(2.0),
-        "value.weight" => values.fill(f32::MAX),
+        "value.1.weight" => values.fill(f32::MAX),
         _ => {}
     });
     let mut random = PpoRng::new(19);
@@ -837,12 +844,12 @@ fn assert_ppo_rollback(device: PolicyDevice) {
         assert_eq!(after.adam.step, 1);
         for moments in [&after.adam.first_moment, &after.adam.second_moment] {
             assert!(
-                moments[1_586_113..1_590_225]
+                moments[1_651_905..1_656_017]
                     .iter()
                     .any(|value| *value != 0.0)
             );
             assert!(
-                moments[1_700_020..1_704_132]
+                moments[1_765_812..1_769_924]
                     .iter()
                     .any(|value| *value != 0.0)
             );

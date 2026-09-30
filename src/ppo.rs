@@ -23,10 +23,9 @@ pub(crate) use test_support::*;
 
 /// Maximum concurrently interleaved environment-seat rollout streams.
 pub const PPO_MAX_STREAMS: usize = 1_280;
-/// Maximum complete episodes in one policy update.
-pub const PPO_MAX_GAMES: usize = 40;
-/// Maximum transitions retained for one policy update.
-pub const PPO_MAX_SAMPLES: usize = PPO_MAX_GAMES * crate::MAP2_RETAINED_DECISIONS;
+/// Maximum transitions retained for one policy update: the largest target plus
+/// the two intervals each slot may close in the round that reaches it.
+pub const PPO_MAX_SAMPLES: usize = PPO_MAX_UPDATE_SAMPLES + 2 * PPO_MAX_SLOTS;
 /// Maximum simultaneously active worlds of one evaluation batch.
 pub const PPO_MAX_PARALLEL_WORLDS: usize = 64;
 /// Maximum concurrent training world slots.
@@ -41,7 +40,6 @@ const _: () = assert!(
         <= 8_192
 );
 const _: () = assert!(std::mem::size_of::<PpoPreparedSample>() <= 70_000);
-const _: () = assert!(PPO_MAX_GAMES <= PPO_MAX_STREAMS);
 const _: () = assert!(PPO_MAX_PARALLEL_WORLDS <= crate::MODEL_TRAINING_BATCH);
 /// Conservative rollout storage plus one fully materialized effective minibatch.
 /// Includes arena reallocation overlap, both preparation vectors and shuffle order;
@@ -52,7 +50,7 @@ pub const PPO_STORAGE_PEAK_BYTES: u64 = crate::feature::FEATURE_ARENA_PEAK_BYTES
             + std::mem::size_of::<CompactPreparedSample>()
             + std::mem::size_of::<usize>()) as u64
     + MODEL_MAX_BATCH as u64 * std::mem::size_of::<PpoPreparedSample>() as u64;
-const _: () = assert!(PPO_MAX_SAMPLES == 46_520);
+const _: () = assert!(PPO_MAX_SAMPLES == 33_280);
 const _: () = assert!(PPO_STORAGE_PEAK_BYTES < 6 * 1024 * 1024 * 1024);
 /// Maximum decisions retained from each environment in one policy update.
 /// Maximum updates between a sample's behaviour weights and the learner: one
@@ -67,32 +65,32 @@ pub const PPO_SHAPING_BUDGET: f32 = 100.0 / PPO_REWARD_SCALE;
 pub const PPO_TERMINAL_REWARD: f32 = 1.0;
 const _: () = assert!(PPO_TERMINAL_REWARD > PPO_SHAPING_BUDGET);
 /// Version of rollout, GAE, objective, optimizer, and reward semantics.
-pub const PPO_SCHEMA_VERSION: u32 = 41;
+pub const PPO_SCHEMA_VERSION: u32 = 42;
 /// Audited simulator and learner rules required by rollouts.
 pub const PPO_RULES_AUDIT_VERSION: u32 = 32;
 /// Canonical learner contract covered by [`PPO_SCHEMA_HASH`].
 pub const PPO_SCHEMA_DESCRIPTOR: &str = concat!(
-    "bota-drysua-ppo/v41;",
+    "bota-drysua-ppo/v42;",
     "linked_schemas=action,feature,model,map2_reward;linked_hash=fnv1a_descriptor_then_ordered_version_le32_hash_le64_then_map2_reward_descriptor_utf8;rules_audit=32;",
     "scope=map2_mid_only_dota_geometry_mid_waves_second_hero_death_or_first_tower_loss_simultaneous_draw_cap27900_including900_pregame_cap_tick_draw;",
-    "collection=continuous_slots1to256_back_to_back_games,lanes_divide_slots_max64_slots_per_lane,update_due_after_whole_lane_rounds_reaching_samples_per_update_over_lanes,in_flight_intervals_continue_under_next_weights,actor_weights_lag_learner_by_pipeline_staleness_at_most2_with_boundary_intervals,per_game_opponent_mixture_teacher_frozen_weights_selfplay;",
+    "collection=continuous_slots1to256_back_to_back_games,lanes_divide_slots_max64_slots_per_lane,update_due_after_whole_lane_rounds_reaching_samples_per_update_over_lanes,in_flight_intervals_continue_under_next_weights,actor_weights_lag_learner_by_pipeline_staleness_at_most2_with_boundary_intervals,per_update_opponent_mixture_teacher_frozen_weights_selfplay_league_snapshots_every_n_updates_pfsp_weight_times_one_minus_laplace_score_over_last100_games_squared_integer_from_outcomes_of_updates_every_lane_finished;",
     "candidate_order=live_neural_ppo_learner_and_neural_opponents_by_prepared_action,effective_directive_ledger_follows_all_actual_sends;teacher=original_strategy_no_learner_override;",
-    "bounds=streams1280,samples_per_update32768,slots256,epochs16,minibatch8192,microbatch64_128_256;",
-    "complete_episodes=map2_balanced_sides,retain_original_action_logprob_exact_elapsed_ticks_and_all_intervening_reward,terminal_zero_bootstrap_partial_flush,no_synthetic_zero_tick_samples,empty_optimizer_batch_rejected;lambda1=full_monte_carlo_f64_return_recurrence;",
+    "bounds=streams1280,samples_per_update32768,max_samples33280,slots256,epochs16,minibatch8192,microbatch64_128_256;",
+    "complete_episodes=map2_balanced_sides,retain_first_every_noncontinue_and_continue_after8_decision_interval,retain_original_action_logprob_exact_elapsed_ticks_and_all_intervening_reward,terminal_zero_bootstrap_partial_flush,no_synthetic_zero_tick_samples,empty_optimizer_batch_rejected;lambda1=full_monte_carlo_f64_return_recurrence;",
     "terminal=win.2_loss-.2_draw0_timecap-.2,victory_time=win_only_native_ticks_full.2_to9000_linear_to0_at21600,draw_and_timecap_are_nonwins_distinct_labels,infrastructure_failure_invalidates_not_fabricated_outcome;",
     "wire_rebase=bota78427bb_missed_event_ignored_without_damage_or_healing_cheat_order_never_issued_or_honoured_NoCheats_rejected_without_reward,attack_time_ms_converted_to_ticks,bound_combat_and_collision_clearance_no_terminal_or_shaping_change;",
     "actor=per_lane_weight_replica_recorded_behaviour_version,batch_max128_single_shared_trunk_forward_policy_and_selfplay_rows,side_selected_radiant_dire_actor_heads,per_game_rng_from_seed_slot_game,transactional_batch_rng,legal_masked_gumbel_max_open_f64_uniform,exact_autoregressive_log_probability_and_entropy_for_retained_rows;",
-    "gae=map2_gamma_tick1_required,lambda0.98,terminal_reset,bootstrap_collector_truncation_not_task_terminal,normalized_advantages;",
-    "objective=clipped_surrogate0.2,value_mse0.5,entropy0.01,target_kl0.02;",
-    "critic=ppo_only_detached_value_head_input,value_head_only_regression;",
-    "optimizer=adam_lr3e-6_beta1_0.9_beta2_0.999_epsilon1e-5_global_clip0.5,weighted_host_microbatch_accumulation,transactional_parameters_moments_shuffle;",
+    "gae=map2_gamma_tick1_required,lambda_per_elapsed_tick0.9997912,terminal_reset,bootstrap_collector_truncation_not_task_terminal,normalized_advantages;",
+    "objective=clipped_surrogate0.2,value_mse0.5,entropy0.004,target_kl0.02;",
+    "critic=value_mlp_on_shared_trunk,value_loss_trains_trunk;",
+    "optimizer=adam_lr1e-5_beta1_0.9_beta2_0.999_epsilon1e-5_global_clip0.5,weighted_host_microbatch_accumulation,transactional_parameters_moments_shuffle;",
     "kl_guard=pre_step_rejection,post_step_sample_weighted_complete_effective_minibatch_rollout_policy_kl,candidate_exceeds_target_or_evaluation_error_restores_exact_parameters_adam_moments_step_policy_revision_under_exclusive_parameter_lock,applied_report_post_step_kl,rejected_report_candidate_kl;",
     "reward=linked_map2_reward_schema_version_hash_and_full_descriptor,seat_only_full_contiguous_snapshot_events_before_retention_or_tracker_journal;no_action_or_Teacher_override;",
     "arena=one_learner_seat_against_independent_frozen_opponent,snapshot_then_explicit_events_including_empty_complete_every_visible_tick,decision_after_tick_complete,decision_interval3,pregame_enabled,batched_bootstrap,hero_identity_change_invalidates_local_body_order,hero_active_order_feature_ignores_courier_orders;",
     "navigation=existing_walkable_building_landing_points_allow_MovePoint_only,AttackMovePoint_source_veto_unchanged,no_goal_features_or_forced_retreat,seat_visible_channel_masks_cast_and_use,seat_visible_item_mute_masks_use,put_point_underfoot_only;",
     "deployment=raw_map2_mid_neural_policy_no_teacher_override_or_strategic_masks;",
     "teacher_economy=custom_bota_wraith_band_tango_boots_optional_stick_gloves_belt_once_only;",
-    "initialization=runtime_weights_with_equal_element_count_any_linked_schema_metadata_parameters_only_fresh_optimizer_progress_rng;"
+    "initialization=runtime_weights_named_tensors_equal_name_and_shape_reused_others_fresh_any_linked_schema_metadata_parameters_only_fresh_optimizer_progress_rng;"
 );
 
 /// FNV-1a of the descriptor, ordered linked identities, and reward version.
@@ -107,7 +105,7 @@ pub const PPO_SCHEMA_HASH: u64 = crate::model::linked_schema_hash(
 
 const _: () = assert!(ACTION_SCHEMA_VERSION == 8);
 const _: () = assert!(FEATURE_SCHEMA_VERSION == 25);
-const _: () = assert!(MODEL_SCHEMA_VERSION == 25);
+const _: () = assert!(MODEL_SCHEMA_VERSION == 26);
 const _: () = assert!(PPO_RULES_AUDIT_VERSION == 32);
 
 /// PPO hyperparameters and bounded rollout dimensions.
@@ -127,7 +125,9 @@ pub struct PpoConfig {
     pub adam_epsilon: f32,
     pub gradient_clip: f32,
     pub gamma_tick: f32,
-    pub gae_lambda: f32,
+    /// GAE trace decay per simulation tick, so the credit horizon is fixed in
+    /// game time however densely decisions are retained.
+    pub gae_lambda_tick: f32,
     pub target_kl: f32,
 }
 
@@ -135,19 +135,21 @@ impl Default for PpoConfig {
     fn default() -> Self {
         Self {
             decision_interval_ticks: 3,
-            samples_per_update: 8_000,
+            // About sixteen games when every order and each eighth Continue is retained.
+            samples_per_update: 24_000,
             epochs: 4,
             minibatch: 2_048,
             clip_epsilon: 0.2,
             value_coefficient: 0.5,
-            entropy_coefficient: 0.01,
-            learning_rate: 3.0e-6,
+            entropy_coefficient: 0.004,
+            learning_rate: 1.0e-5,
             adam_beta1: 0.9,
             adam_beta2: 0.999,
             adam_epsilon: 1.0e-5,
             gradient_clip: 0.5,
             gamma_tick: 0.996_655_5,
-            gae_lambda: 0.98,
+            // 0.995 per 24-tick interval: a 4,800-tick (160 s) credit horizon.
+            gae_lambda_tick: 0.999_791_2,
             target_kl: 0.02,
         }
     }
@@ -197,8 +199,8 @@ fn validate_probabilities(config: PpoConfig) -> Result<(), PpoError> {
     let inside_unit = |value: f32| value.is_finite() && (0.0..1.0).contains(&value);
     if !config.gamma_tick.is_finite()
         || !(0.0..=1.0).contains(&config.gamma_tick)
-        || !config.gae_lambda.is_finite()
-        || !(0.0..=1.0).contains(&config.gae_lambda)
+        || !config.gae_lambda_tick.is_finite()
+        || !(0.0..=1.0).contains(&config.gae_lambda_tick)
     {
         return Err(PpoError::InvalidConfig("discount"));
     }
@@ -364,11 +366,6 @@ impl PpoRng {
                 return Ok((value % u128::from(bound)) as u64);
             }
         }
-    }
-
-    #[cfg(feature = "builtin")]
-    pub(crate) fn next_word(&mut self) -> Result<u64, PpoError> {
-        self.next_u64()
     }
 
     pub(crate) fn shuffle(&mut self, order: &mut [usize]) -> Result<(), PpoError> {
@@ -622,6 +619,18 @@ impl PpoPreparedSample {
 pub struct PpoBatch {
     samples: Vec<CompactPreparedSample>,
     frames: RaggedFeatureArena,
+    /// Monte Carlo return of each sample whose game ended in this batch.
+    outcome_returns: Vec<Option<f32>>,
+}
+
+/// How much return variance the rollout critic explained before an update.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ExplainedVariance {
+    /// Against the lambda returns it trains on, which bootstrap from itself.
+    pub lambda: f64,
+    /// Against the Monte Carlo return of the samples whose game ended in the
+    /// batch: the outcome it has to predict, never its own bootstrap.
+    pub monte_carlo: f64,
 }
 
 struct CompactPreparedSample {
@@ -908,26 +917,19 @@ impl PpoBatch {
         self.samples.is_empty()
     }
 
-    /// Fraction of lambda-return variance the rollout critic explained, before any update.
-    /// NaN when the returns are constant, where the ratio is undefined.
-    pub fn explained_variance(&self) -> f64 {
-        let count = self.samples.len() as f64;
-        assert!(count > 0.0);
-        let mean = |values: &dyn Fn(&CompactPreparedSample) -> f64| {
-            self.samples.iter().map(values).sum::<f64>() / count
-        };
-        let variance = |values: &dyn Fn(&CompactPreparedSample) -> f64| {
-            let center = mean(values);
-            mean(&|sample| (values(sample) - center).powi(2))
-        };
-        let returns = variance(&|sample| f64::from(sample.return_value));
-        let residuals = variance(&|sample| {
-            f64::from(sample.return_value) - f64::from(sample.transition.old_value)
-        });
-        if returns == 0.0 {
-            return f64::NAN;
+    /// Both explained variances; NaN where the returns are constant or absent.
+    pub fn explained_variance(&self) -> ExplainedVariance {
+        let value = |sample: &CompactPreparedSample| f64::from(sample.transition.old_value);
+        ExplainedVariance {
+            lambda: explained(
+                self.samples
+                    .iter()
+                    .map(|sample| (f64::from(sample.return_value), value(sample))),
+            ),
+            monte_carlo: explained(self.samples.iter().zip(&self.outcome_returns).filter_map(
+                |(sample, outcome)| outcome.map(|outcome| (f64::from(outcome), value(sample))),
+            )),
         }
-        1.0 - residuals / returns
     }
 
     pub fn sample(&self, index: usize) -> Result<PpoPreparedSample, PpoError> {
@@ -953,6 +955,21 @@ impl PpoBatch {
     }
 }
 
+/// `1 - Var(target - prediction) / Var(target)` over `(target, prediction)` pairs.
+fn explained(pairs: impl Iterator<Item = (f64, f64)> + Clone) -> f64 {
+    let count = pairs.clone().count() as f64;
+    let mean = |values: &dyn Fn((f64, f64)) -> f64| pairs.clone().map(values).sum::<f64>() / count;
+    let variance = |values: &dyn Fn((f64, f64)) -> f64| {
+        let center = mean(values);
+        mean(&|pair| (values(pair) - center).powi(2))
+    };
+    let targets = variance(&|(target, _)| target);
+    if count == 0.0 || targets == 0.0 {
+        return f64::NAN;
+    }
+    1.0 - variance(&|(target, prediction)| target - prediction) / targets
+}
+
 fn rollout_storage<T>(capacity: usize) -> Result<Vec<T>, PpoError> {
     assert!(std::mem::size_of::<T>() > 0);
     assert!(capacity <= PPO_MAX_SAMPLES);
@@ -970,16 +987,30 @@ fn prepare_batch(
 ) -> Result<PpoBatch, PpoError> {
     let mut next_advantage = [0.0f32; PPO_MAX_STREAMS];
     let mut next_return = [None; PPO_MAX_STREAMS];
+    let mut next_outcome: [Option<f64>; PPO_MAX_STREAMS] = [None; PPO_MAX_STREAMS];
     let mut prepared = rollout_storage(transitions.len())?;
+    let mut outcome_returns = Vec::with_capacity(transitions.len());
     for transition in transitions.into_iter().rev() {
+        let later = if transition.terminal {
+            Some(0.0)
+        } else {
+            next_outcome[transition.stream]
+        };
+        let outcome = later.map(|later| {
+            f64::from(transition.reward)
+                + f64::from(config.gamma_tick).powi(transition.ticks as i32) * later
+        });
+        next_outcome[transition.stream] = outcome;
+        outcome_returns.push(outcome.map(|outcome| outcome as f32));
         let discount = tick_discount(config.gamma_tick, transition.ticks)?;
+        let trace = tick_discount(config.gae_lambda_tick, transition.ticks)?;
         let continuation = if transition.terminal { 0.0 } else { 1.0 };
         let delta = transition.reward + discount * transition.next_value * continuation
             - transition.old_value;
         let mut advantage =
-            delta + discount * config.gae_lambda * next_advantage[transition.stream] * continuation;
+            delta + discount * trace * next_advantage[transition.stream] * continuation;
         let mut return_value = transition.old_value + advantage;
-        if config.gae_lambda == 1.0 {
+        if config.gae_lambda_tick == 1.0 {
             let value = monte_carlo_return(&transition, config.gamma_tick, &mut next_return)?;
             return_value = value as f32;
             advantage = (value - f64::from(transition.old_value)) as f32;
@@ -995,10 +1026,12 @@ fn prepare_batch(
         });
     }
     prepared.reverse();
+    outcome_returns.reverse();
     normalize_advantages(&mut prepared)?;
     Ok(PpoBatch {
         samples: prepared,
         frames,
+        outcome_returns,
     })
 }
 

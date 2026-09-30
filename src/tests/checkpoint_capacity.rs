@@ -82,7 +82,6 @@ fn invalid_config_rejects_before_tensor_io() {
             format!("checkpoint manifest has invalid {field}")
         );
     }
-    fs::remove_dir_all(directory).expect("cleanup");
 }
 
 #[test]
@@ -155,7 +154,6 @@ fn public_checkpoint_preserves_state_and_rejects_invalid_capture_restore() {
     assert_eq!(snapshot.parameters, artifact.parameters);
     drop(state);
     assert_invalid_capture_restore(&source, &trainer, &target, &loaded);
-    fs::remove_dir_all(directory).expect("cleanup");
 }
 
 fn assert_invalid_capture_restore(
@@ -221,12 +219,15 @@ fn runtime_weights_roundtrip_and_reject_foreign_schema_without_mutation() {
             foreign.insert(key.to_owned(), value);
         }
         let data = encode_f32(&parameters);
-        let tensor = TensorView::new(Dtype::F32, vec![parameters.len()], &data).expect("tensor");
-        fs::write(
-            &path,
-            serialize([("model.parameters", tensor)], Some(foreign)).expect("fixture"),
-        )
-        .expect("write");
+        let mut offset = 0;
+        let mut tensors = Vec::new();
+        for (name, shape) in model.parameter_schema().expect("schema") {
+            let size = shape.iter().product::<usize>() * 4;
+            let view = TensorView::new(Dtype::F32, shape, &data[offset..offset + size]);
+            tensors.push((name, view.expect("tensor")));
+            offset += size;
+        }
+        fs::write(&path, serialize(tensors, Some(foreign)).expect("fixture")).expect("write");
         let identity = model.policy_identity().expect("identity");
         let result = TrainingArtifact::load_runtime_weights(&model, &directory);
         if !invalid {
@@ -242,7 +243,6 @@ fn runtime_weights_roundtrip_and_reject_foreign_schema_without_mutation() {
         }
         assert_eq!(model.export_parameters().expect("parameters"), parameters);
     }
-    fs::remove_dir_all(directory).expect("cleanup");
 }
 
 #[test]
@@ -279,7 +279,6 @@ fn public_loaders_reject_empty_and_oversized_files_before_decoding() {
             );
         }
     }
-    fs::remove_dir_all(directory).expect("cleanup");
 }
 
 pub(super) fn manifest_artifact(updates: u64, samples: u64) -> TrainingArtifact {

@@ -102,9 +102,11 @@ mod files {
     fn malformed_runtime_is_an_error_not_a_lagging_export() {
         let mut artifact = fixture_artifact("other-command", 0);
         let fixture = Fixture::new(&mut artifact);
+        let mut schema = current_parameter_schema().unwrap();
+        schema[0].1.reverse();
         fs::write(
             fixture.0.join(RUNTIME_TENSOR_FILE),
-            serialize_runtime_tensor(&[0.0]).unwrap(),
+            runtime::serialize(&schema, &artifact.parameters).unwrap(),
         )
         .unwrap();
         assert_eq!(
@@ -547,7 +549,7 @@ mod files {
             },
             config: PpoConfig {
                 gamma_tick: 1.0,
-                samples_per_update: 2 * crate::MAP2_RETAINED_DECISIONS,
+                samples_per_update: 2_326,
                 minibatch: 2,
                 epochs: 1,
                 ..PpoConfig::default()
@@ -568,7 +570,7 @@ mod files {
         }
     }
 
-    struct Fixture(PathBuf);
+    struct Fixture(crate::ppo::TestDirectory);
 
     struct RootSwap<'a> {
         original: &'a Path,
@@ -610,12 +612,6 @@ mod files {
         fn manifest(&self, artifact: &TrainingArtifact) {
             let bytes = encode_manifest(artifact, artifact.tensor_hash).expect("native manifest");
             fs::write(self.0.join(CHECKPOINT_META_FILE), bytes).expect("own manifest");
-        }
-    }
-
-    impl Drop for Fixture {
-        fn drop(&mut self) {
-            fs::remove_dir_all(&self.0).expect("remove own inspection fixture");
         }
     }
 
@@ -729,7 +725,7 @@ mod files {
             ("adam_epsilon", config.adam_epsilon),
             ("gradient_clip", config.gradient_clip),
             ("gamma_tick", config.gamma_tick),
-            ("gae_lambda", config.gae_lambda),
+            ("gae_lambda_tick", config.gae_lambda_tick),
             ("target_kl", config.target_kl),
         ] {
             assert_eq!(

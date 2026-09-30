@@ -74,4 +74,6 @@ pub enum AnnealedOpponent {
     Weights(std::path::PathBuf),
     /// The actor weights the learner's own seat samples from.
     SelfPlay,
+    /// Each of the latest `--league-size` runtime-history milestones of this run.
+    League,
 }
