@@ -945,6 +945,28 @@ impl PpoBatch {
         self.samples.is_empty()
     }
 
+    /// Fraction of lambda-return variance the rollout critic explained, before any update.
+    /// NaN when the returns are constant, where the ratio is undefined.
+    pub fn explained_variance(&self) -> f64 {
+        let count = self.samples.len() as f64;
+        assert!(count > 0.0);
+        let mean = |values: &dyn Fn(&CompactPreparedSample) -> f64| {
+            self.samples.iter().map(values).sum::<f64>() / count
+        };
+        let variance = |values: &dyn Fn(&CompactPreparedSample) -> f64| {
+            let center = mean(values);
+            mean(&|sample| (values(sample) - center).powi(2))
+        };
+        let returns = variance(&|sample| f64::from(sample.return_value));
+        let residuals = variance(&|sample| {
+            f64::from(sample.return_value) - f64::from(sample.transition.old_value)
+        });
+        if returns == 0.0 {
+            return f64::NAN;
+        }
+        1.0 - residuals / returns
+    }
+
     pub fn sample(&self, index: usize) -> Result<PpoPreparedSample, PpoError> {
         self.materialize(std::slice::from_ref(&index))?
             .pop()

@@ -259,6 +259,14 @@ fn assert_unsampled_terminal(choice: &PpoPolicyChoice) {
     };
     short.decisions = 1;
     short.done = true;
+    short.summary = Some(crate::ppo_arena::game_summary::GameSummary {
+        side: bota_proto::Team::Radiant,
+        outcome: Some(PpoTerminalOutcome::Win),
+        end_reason: crate::ppo_arena::game_summary::EndReason::Tower,
+        ticks: 4,
+        own: Default::default(),
+        enemy: Default::default(),
+    });
     assert!(!short.should_flush());
     assert!(short.choice.is_none());
     assert_eq!(short.interval.steps, 0);
