@@ -251,11 +251,6 @@ impl AdaptiveEnvironmentState {
             ));
         }
         self.validate(config, limits, completed_update - 1)?;
-        if games == 0 {
-            return Err(PpoError::InvalidTransition(
-                "environment observation requires at least one game",
-            ));
-        }
         if wins > games {
             return Err(PpoError::InvalidTransition(
                 "environment wins must not exceed games",
@@ -269,15 +264,16 @@ impl AdaptiveEnvironmentState {
                     "environment spent updates addition overflow",
                 ))?;
         let scaled_wins = u128::from(wins) * u128::from(EnvironmentDecimal::SCALE);
+        // An update that finished no game carries no signal and breaks both streaks.
         next.success_streak = capped_streak(
             self.success_streak,
             config.success_updates,
-            scaled_wins >= u128::from(config.success_rate.units()) * u128::from(games),
+            games > 0 && scaled_wins >= u128::from(config.success_rate.units()) * u128::from(games),
         );
         next.poor_streak = capped_streak(
             self.poor_streak,
             config.poor_updates,
-            scaled_wins <= u128::from(config.poor_rate.units()) * u128::from(games),
+            games > 0 && scaled_wins <= u128::from(config.poor_rate.units()) * u128::from(games),
         );
         let success = next.success_streak == config.success_updates;
         let boundary = limits.total_updates - limits.zero_updates;

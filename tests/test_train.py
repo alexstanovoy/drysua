@@ -72,7 +72,7 @@ class CampaignTests(unittest.TestCase):
     def create(self, **overrides):
         config = {"schema": 2, "trainer": str(self.trainer), "inspector": str(self.inspector), "total_updates": 5,
                   "history_every": 2, "image": IMAGE, "lock_paths": [str(self.lock)],
-                  "training_args": ["--games", "2", "--parallel", "2"]}
+                  "training_args": ["--slots", "2", "--samples-per-update", "64"]}
         config.update(overrides)
         path = self.root / "config.json"
         path.write_text(json.dumps(config))

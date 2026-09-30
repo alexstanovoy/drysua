@@ -47,8 +47,7 @@ fn candidate_kl_preserves_trainer_reports_shuffle_and_optimizer_bits() {
         let model = PolicyModel::fresh(9101).expect("model");
         let reference = PolicyModel::fresh(9101).expect("reference");
         let config = PpoConfig {
-            environments: 3,
-            rollout_decisions: 1,
+            samples_per_update: 3,
             minibatch: 2,
             epochs: 2,
             target_kl,
@@ -107,7 +106,7 @@ fn candidate(model: &PolicyModel, samples: &[PpoPreparedSample]) -> Result<f64, 
 
 fn assert_chunk_parity(device: PolicyDevice) {
     let model = PolicyModel::fresh_on(9101, device).expect("model");
-    let base = transfer_ppo_samples(&model);
+    let base = transfer_ppo_samples();
     for count in [1, 64, 65, 81] {
         let mut samples = (0..count)
             .map(|index| base[index % base.len()].clone())
@@ -127,7 +126,7 @@ fn assert_chunk_parity(device: PolicyDevice) {
 
 fn assert_candidate_errors(device: PolicyDevice) {
     let model = PolicyModel::fresh_on(9101, device).expect("model");
-    let mut samples = transfer_ppo_samples(&model);
+    let mut samples = transfer_ppo_samples();
     samples.truncate(1);
     samples[0].transition.target.kind.selected = MODEL_KIND_HEAD;
     assert_candidate_error(
@@ -166,7 +165,7 @@ fn assert_update_parity(device: PolicyDevice) {
     let config = transfer_ppo_config();
     let mut actual = model.claim_optimizer(config.adam()).expect("Adam");
     let mut expected = reference.claim_optimizer(config.adam()).expect("Adam");
-    let base = transfer_ppo_samples(&model);
+    let base = transfer_ppo_samples();
     let mut samples = (0..65)
         .map(|index| base[index % base.len()].clone())
         .collect::<Vec<_>>();
@@ -233,10 +232,9 @@ fn refresh(model: &PolicyModel, samples: &mut [PpoPreparedSample]) {
 }
 
 fn trainer_batch(model: &PolicyModel, config: PpoConfig) -> crate::PpoBatch {
-    let mut samples = transfer_ppo_samples(model);
+    let mut samples = transfer_ppo_samples();
     refresh_old_probabilities(model, &mut samples);
-    let mut rollout =
-        crate::PpoRollout::new(3, model.policy_identity().expect("identity")).expect("rollout");
+    let mut rollout = crate::PpoRollout::new(3).expect("rollout");
     for (index, mut sample) in samples.into_iter().enumerate() {
         sample.transition.reward = if index == 0 { 1.0 } else { -0.5 };
         rollout.push(sample.transition).expect("transition");

@@ -122,7 +122,7 @@ fn transfer_ppo_config() -> PpoConfig {
     }
 }
 
-fn transfer_ppo_samples(model: &PolicyModel) -> Vec<PpoPreparedSample> {
+fn transfer_ppo_samples() -> Vec<PpoPreparedSample> {
     let tracker = transfer_tracker();
     let space = ActionSpace::from_tracker(&tracker).expect("action space");
     let mut encoder = crate::FeatureEncoder::new(&tracker);
@@ -148,7 +148,7 @@ fn transfer_ppo_samples(model: &PolicyModel) -> Vec<PpoPreparedSample> {
                 frame: frame.clone(),
                 target: target.clone(),
                 action: StructuredAction::Continue,
-                policy: model.policy_identity().expect("policy"),
+                behaviour: 0,
                 stream,
                 decision: 0,
                 ticks: 3,

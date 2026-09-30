@@ -33,7 +33,7 @@ const CHANGED: &str = "checkpoint changed during inspection";
 #[cfg(target_os = "linux")]
 const SIZE: &str = "inspection file size";
 #[cfg(target_os = "linux")]
-const MAXIMUM_FILE_BYTES: u64 = crate::MODEL_PARAMETER_COUNT as u64 * 12 + 64 * 1024;
+const MAXIMUM_FILE_BYTES: u64 = crate::checkpoint::MAX_TRAINING_TENSOR_BYTES;
 
 #[cfg(target_os = "linux")]
 impl Directory {

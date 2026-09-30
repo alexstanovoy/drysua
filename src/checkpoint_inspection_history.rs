@@ -56,15 +56,15 @@ pub(super) fn plan(artifact: &TrainingArtifact) -> Result<HistoryPlan, Checkpoin
         plan.scale_end_bp = scale.end_bp;
     }
     plan.updates = counter(command, "--updates")?;
-    plan.games_per_update = counter(command, "--games")?;
-    plan.generation_games = counter(command, "--generation-games")?;
+    // Generations count updates: one virtual game per update.
+    plan.games_per_update = 1;
+    plan.generation_games = counter(command, "--generation-updates")?;
     plan.zero_updates = counter(command, "--zero-updates")?;
     if plan.updates == 0
         || plan.games_per_update == 0
         || plan.generation_games == 0
         || plan.zero_updates > plan.updates
         || artifact.progress.global_update > plan.updates
-        || plan.games_per_update != artifact.config.environments as u64
     {
         return Err(CheckpointError::InvalidManifest(
             "inspection annealed scope counters",

@@ -159,19 +159,6 @@ enum LearnerDevice {
     Cuda,
 }
 
-/// Which frozen opponent the annealed run plays against.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-enum AnnealedOpponentArg {
-    Teacher,
-    Weights,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-enum OpponentInferenceArg {
-    Batched,
-    Scalar,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum EnvironmentScheduleArg {
     Adaptive,
@@ -194,28 +181,27 @@ struct TrainAnnealedArgs {
     /// Spread all rollout rows across nearly equal minibatches; recorded in checkpoint scope.
     #[arg(long)]
     balanced_minibatches: bool,
-    /// Reuse next-actor bootstrap values; may change PPO numerics, recorded in checkpoint scope.
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
-    reuse_actor_values: bool,
-    /// Actor groups per wave (1/2/4); multiple groups require Teacher or batched weights, at most 64 live worlds, and whole waves per update.
-    #[arg(long, default_value_t = 2, value_parser = crate::training_execution::parse_actor_pipeline_groups)]
-    actor_pipeline_groups: u8,
     /// Total PPO updates; each may perform multiple Adam minibatch steps.
     #[arg(long)]
     updates: u64,
     /// Additional committed updates this invocation; leaves the total target and annealing unchanged.
     #[arg(long, value_parser = clap::builder::RangedU64ValueParser::<std::num::NonZeroU64>::new().range(1..=crate::MAX_TRAINING_COUNTER))]
     invocation_updates: Option<std::num::NonZeroU64>,
-    /// Games per update, even from 2 to 40.
-    #[arg(long, default_value_t = 40)]
-    games: usize,
-    /// Worlds per actor group (1..=64); defaults to 20 independently of CPU count.
-    /// Must divide games and generation games; incompatible overrides are rejected.
-    #[arg(long, default_value_t = 20)]
-    parallel: usize,
-    /// Games per generation; adaptive requires a positive whole multiple of --games.
+    /// Retained intervals that make one update due; a multiple of --lanes.
+    #[arg(long, default_value_t = crate::PpoConfig::default().samples_per_update)]
+    samples_per_update: usize,
+    /// Concurrent world slots (1..=256); each always holds a live game.
+    #[arg(long, default_value_t = 64)]
+    slots: usize,
+    /// Inference lanes; each owns a thread, a weight replica and at most 64 slots.
+    #[arg(long, default_value_t = 2)]
+    lanes: usize,
+    /// Simulation worker threads; defaults to the available cores and never changes results.
     #[arg(long)]
-    generation_games: u64,
+    simulation_threads: Option<usize>,
+    /// Updates per environment generation.
+    #[arg(long)]
+    generation_updates: u64,
     /// Environment transitions; legacy checkpoint resume requires explicit fixed.
     #[arg(long, value_enum, default_value_t = EnvironmentScheduleArg::Adaptive)]
     environment_schedule: EnvironmentScheduleArg,
@@ -237,15 +223,10 @@ struct TrainAnnealedArgs {
     /// Final updates with no modifiers; defaults to one fifth of the update budget.
     #[arg(long)]
     zero_updates: Option<u64>,
-    /// Frozen opponent: teacher or a strict runtime weights directory.
-    #[arg(long, value_enum, default_value_t = AnnealedOpponentArg::Teacher)]
-    opponent: AnnealedOpponentArg,
-    /// Strict runtime weights directory for a frozen weights opponent.
-    #[arg(long)]
-    opponent_weights: Option<std::path::PathBuf>,
-    /// Weights-opponent sampling mode; batched changes numerics and checkpoint scope. Ignored for Teacher.
-    #[arg(long, value_enum, default_value_t = OpponentInferenceArg::Batched)]
-    opponent_inference: OpponentInferenceArg,
+    /// Per-game opponent mixture entry, repeatable: `teacher[:weight]`, `self[:weight]`
+    /// or `weights:<runtime weights directory>:<weight>`; weights are exact decimals.
+    #[arg(long = "opponent", default_value = "teacher:1", value_parser = parse_annealed_opponent)]
+    opponents: Vec<(crate::AnnealedOpponent, crate::EnvironmentDecimal)>,
     /// Environment scale at the first update in exact decimals; 1 is full variance, at most 10.
     #[arg(long)]
     environment_scale_start: Option<crate::EnvironmentDecimal>,
@@ -426,14 +407,16 @@ fn run_train_annealed_with_settings(
         );
     }
     eprintln!(
-        "annealed: updates={} games={} parallel={} generation_games={} zero_updates={} seed={} opponent={:?}",
+        "annealed: updates={} samples_per_update={} slots={} lanes={} simulation_threads={} generation_updates={} zero_updates={} seed={} opponents={:?}",
         settings.updates,
-        settings.games_per_update,
-        settings.parallel_worlds,
-        settings.games_per_generation,
+        settings.ppo.samples_per_update,
+        settings.slots,
+        settings.lanes,
+        settings.simulation_threads,
+        settings.generation_updates,
         settings.zero_updates,
         settings.seed,
-        settings.opponent,
+        settings.opponents,
     );
     let report = crate::run_annealed_job_on_with_initial_weights(
         settings,
@@ -535,17 +518,8 @@ impl TrainAnnealedArgs {
     }
 
     fn validate_environment_limits(&self) -> std::io::Result<()> {
-        if self.games == 0
-            || self.generation_games == 0
-            || !self.generation_games.is_multiple_of(self.games as u64)
-        {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "adaptive environment generation games must be a positive whole multiple of games per update",
-            ));
-        }
         crate::AdaptiveEnvironmentLimits {
-            base_updates: self.generation_games / self.games as u64,
+            base_updates: self.generation_updates,
             total_updates: self.updates,
             zero_updates: self
                 .zero_updates
@@ -571,50 +545,43 @@ impl TrainAnnealedArgs {
                 "annealed updates must be positive",
             ));
         }
-        if !self.games.is_multiple_of(2) {
+        if self.generation_updates == 0 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "annealed games per update must be even so sides split exactly",
+                "annealed generation updates must be positive",
             ));
         }
-        if self.generation_games == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "annealed generation games must be positive",
-            ));
-        }
-        let opponent = self.frozen_opponent()?;
         let scale = self.environment_scale()?;
         let zero_updates = self
             .zero_updates
             .unwrap_or_else(|| self.updates.div_ceil(5));
         let ppo = self.optimizer.ppo(crate::PpoConfig {
-            environments: self.games,
-            rollout_decisions: crate::MAP2_RETAINED_DECISIONS,
+            samples_per_update: self.samples_per_update,
             gamma_tick: crate::MAP2_REWARD_GAMMA_TICK,
             ..crate::PpoConfig::default()
         });
+        let simulation_threads = match self.simulation_threads {
+            Some(threads) => threads,
+            None => std::thread::available_parallelism()?.get(),
+        };
         Ok(crate::AnnealedJobConfig {
             environment_schedule,
             execution: crate::TrainingExecutionOptions {
-                actor_pipeline_groups: usize::from(self.actor_pipeline_groups),
                 balanced_minibatches: self.balanced_minibatches,
                 host_math_workers: usize::from(self.host_math_workers),
-                neural_opponent_batching: self.opponent == AnnealedOpponentArg::Weights
-                    && self.opponent_inference == OpponentInferenceArg::Batched,
                 training_microbatch: self.training_microbatch,
-                reuse_actor_values: self.reuse_actor_values,
             },
             updates: self.updates,
             invocation_updates: self.invocation_updates,
             history: self.checkpoint.history()?,
-            games_per_update: self.games,
-            parallel_worlds: self.parallel,
-            games_per_generation: self.generation_games,
+            slots: self.slots,
+            lanes: self.lanes,
+            simulation_threads,
+            generation_updates: self.generation_updates,
             zero_updates,
             seed: self.resolved_seed()?,
             scale,
-            opponent,
+            opponents: self.opponents.clone(),
             ppo,
             // Every update commits: a stop or crash loses at most the in-flight update.
             checkpoint_cadence: crate::TrainingCheckpointCadence::Updates(1),
@@ -668,22 +635,38 @@ impl TrainAnnealedArgs {
                 std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
             })
     }
+}
 
-    fn frozen_opponent(&self) -> std::io::Result<crate::AnnealedOpponent> {
-        match (self.opponent, &self.opponent_weights) {
-            (AnnealedOpponentArg::Teacher, None) => Ok(crate::AnnealedOpponent::Teacher),
-            (AnnealedOpponentArg::Weights, Some(directory)) => {
-                Ok(crate::AnnealedOpponent::Weights(directory.clone()))
+/// Parses one `--opponent` mixture entry; a weights path may itself contain colons.
+fn parse_annealed_opponent(
+    value: &str,
+) -> Result<(crate::AnnealedOpponent, crate::EnvironmentDecimal), String> {
+    let weight = |text: &str| {
+        text.parse::<crate::EnvironmentDecimal>()
+            .map_err(|error| error.to_string())
+    };
+    let one = crate::EnvironmentDecimal::from_units(crate::EnvironmentDecimal::SCALE);
+    match value.split_once(':') {
+        None if value == "teacher" => Ok((crate::AnnealedOpponent::Teacher, one)),
+        None if value == "self" => Ok((crate::AnnealedOpponent::SelfPlay, one)),
+        Some(("teacher", rest)) => Ok((crate::AnnealedOpponent::Teacher, weight(rest)?)),
+        Some(("self", rest)) => Ok((crate::AnnealedOpponent::SelfPlay, weight(rest)?)),
+        Some(("weights", rest)) => {
+            let (directory, share) = rest
+                .rsplit_once(':')
+                .ok_or("weights opponents need `weights:<directory>:<weight>`")?;
+            if directory.is_empty() {
+                return Err("weights opponents need a directory".to_owned());
             }
-            (AnnealedOpponentArg::Weights, None) => Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "weights opponent requires --opponent-weights",
-            )),
-            (AnnealedOpponentArg::Teacher, Some(_)) => Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "teacher opponent forbids --opponent-weights",
-            )),
+            Ok((
+                crate::AnnealedOpponent::Weights(directory.into()),
+                weight(share)?,
+            ))
         }
+        _ => Err(
+            "opponent must be teacher[:weight], self[:weight] or weights:<directory>:<weight>"
+                .to_owned(),
+        ),
     }
 }
 

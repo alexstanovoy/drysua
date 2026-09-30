@@ -102,7 +102,7 @@ fn internal_training_checks_finite_frames_and_all_unused_output_heads() {
 fn samples(model: &PolicyModel, count: usize, microbatch: usize) -> Vec<PpoPreparedSample> {
     assert!((1..=2049).contains(&count));
     assert!((1..=MODEL_PPO_MAX_MICROBATCH).contains(&microbatch));
-    let base = transfer_ppo_samples(model);
+    let base = transfer_ppo_samples();
     let mut samples = (0..count)
         .map(|index| base[index % base.len()].clone())
         .collect::<Vec<_>>();

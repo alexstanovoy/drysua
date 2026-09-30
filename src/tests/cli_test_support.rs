@@ -14,10 +14,8 @@ fn adaptive_environment_cli_accepts_explicit_schedules_and_exact_credit() {
             "train-annealed",
             "--updates",
             "20",
-            "--games",
-            "8",
-            "--generation-games",
-            "32",
+            "--generation-updates",
+            "4",
             "--checkpoint-directory",
             ".",
             "--environment-schedule",
@@ -43,30 +41,10 @@ fn adaptive_environment_cli_accepts_explicit_schedules_and_exact_credit() {
 }
 
 #[cfg(feature = "builtin")]
-pub(crate) fn legacy_fixed_annealed_settings_for_test(
+pub(crate) fn fixed_annealed_settings_for_test(
     overrides: &[&str],
 ) -> std::io::Result<crate::AnnealedJobConfig> {
     let mut arguments = vec!["--environment-schedule", "fixed"];
-    for (flag, value) in [
-        ("--games", "8"),
-        ("--parallel", "8"),
-        ("--actor-pipeline-groups", "1"),
-        ("--training-microbatch", "64"),
-        ("--reuse-actor-values", "false"),
-    ] {
-        if !overrides.iter().any(|argument| {
-            *argument == flag
-                || argument
-                    .strip_prefix(flag)
-                    .is_some_and(|suffix| suffix.starts_with('='))
-        }) {
-            if flag == "--reuse-actor-values" {
-                arguments.push("--reuse-actor-values=false");
-            } else {
-                arguments.extend([flag, value]);
-            }
-        }
-    }
     arguments.extend_from_slice(overrides);
     annealed_settings_for_test(&arguments)
 }

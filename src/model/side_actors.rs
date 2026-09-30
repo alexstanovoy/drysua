@@ -245,14 +245,29 @@ impl ActorRouting {
         assert!(!frames.is_empty());
         assert!(frames.len() <= MODEL_PPO_MAX_MICROBATCH);
         validate_sides(frames)?;
-        let rows = frames
+        let sides = frames
             .iter()
             .enumerate()
             .map(|(index, frame)| side_row(frame, index))
             .collect::<Result<Vec<_>, _>>()?;
+        Self::with_sides(sides, device, training)
+    }
+
+    /// Inference routing of packed rows, whose sides were validated when packed.
+    pub(super) fn from_rows(rows: &[&EncoderRow], device: &Device) -> Result<Self, ModelError> {
+        assert!(!rows.is_empty());
+        assert!(rows.len() <= MODEL_PPO_MAX_MICROBATCH);
+        Self::with_sides(
+            rows.iter().map(|row| u8::from(row.radiant())).collect(),
+            device,
+            false,
+        )
+    }
+
+    fn with_sides(sides: Vec<u8>, device: &Device, training: bool) -> Result<Self, ModelError> {
         Ok(Self {
-            mask: Tensor::from_slice(&rows, (frames.len(), 1), device)?,
-            sides: rows,
+            mask: Tensor::from_slice(&sides, (sides.len(), 1), device)?,
+            sides,
             training,
             raw: RefCell::new(std::array::from_fn(|_| None)),
         })
@@ -382,7 +397,7 @@ pub(super) fn validate_sides(frames: &[FeatureFrame]) -> Result<(), ModelError> 
     Ok(())
 }
 
-fn side_row(frame: &FeatureFrame, index: usize) -> Result<u8, ModelError> {
+pub(super) fn side_row(frame: &FeatureFrame, index: usize) -> Result<u8, ModelError> {
     let radiant = frame.global[crate::global_feature::SIDE_RADIANT];
     let dire = frame.global[crate::global_feature::SIDE_DIRE];
     if radiant.to_bits() == 1.0f32.to_bits() && dire.to_bits() & 0x7fff_ffff == 0 {

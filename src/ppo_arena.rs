@@ -3,29 +3,27 @@ mod annealed;
 pub(crate) use annealed::preflight_annealed_resume;
 pub(crate) use annealed::validate_annealed;
 pub use annealed::{
-    AnnealedJobConfig, AnnealedJobReport, AnnealedOpponent,
-    run_annealed_job_on_with_initial_weights,
+    AnnealedJobConfig, AnnealedJobReport, run_annealed_job_on_with_initial_weights,
 };
+mod collector;
+pub(crate) mod collector_state;
 pub(crate) mod episode;
 mod evaluation;
 pub(crate) use evaluation::{EvaluationOpponent, EvaluationSettings, run_evaluation};
 mod game_summary;
-mod neural_opponent;
-mod parallel;
+mod lane;
+mod pool;
 mod reward;
+mod slot;
 pub use reward::Map2TrainingReward;
 #[cfg(test)]
 #[path = "tests/ppo_arena_test_support.rs"]
 mod test_support;
-#[cfg(test)]
-pub(crate) use test_support::*;
-#[cfg(test)]
-#[path = "tests/training_order_contract.rs"]
-pub(crate) mod training_order_contract;
 use std::fs::{File, OpenOptions};
 use std::path::Path;
-use std::sync::Arc;
 use std::time::Duration;
+#[cfg(test)]
+pub(crate) use test_support::*;
 
 use bota_proto::{EventKind, MapId, RejectReason, ServerMsg, SlotId, Team};
 use bota_server::game::SpawnModifier;
@@ -33,22 +31,21 @@ use bota_server::game::SpawnModifier;
 use crate::persistence::training::PolicyOrderBookkeeping;
 
 use crate::{
-    ActionKind, ActionSpace, ActivePolicyOrder, Arena, ArenaConfig, ArenaStart, CheckpointProgress,
-    CheckpointRun, CheckpointSaveOutcome, FeatureEncoder, FeatureFrame, ItemReadiness,
-    LocalPolicyState, OrderPersistence, PPO_MAX_ROLLOUT_DECISIONS, PolicyDevice, PolicyModel,
-    PpoConfig, PpoError, PpoOutcome, PpoPolicyChoice, PpoRng, PpoRollout, PpoTerminalOutcome,
-    PpoTrainer, PpoUpdateReport, Request, RngCheckpoint, StateTracker, Teacher, TrainingArtifact,
+    ActionKind, ActionSpace, ActionTarget, ActivePolicyOrder, Arena, ArenaConfig, ArenaStart,
+    BehavioralTarget, CheckpointProgress, CheckpointRun, CheckpointSaveOutcome,
+    CollectionCheckpoint, ControlledUnit, EntityIndex, FeatureEncoder, FeatureFrame, ItemReadiness,
+    LocalPolicyState, LootIndex, OrderPersistence, PointIndex, PolicyDevice, PolicyModel,
+    PpoConfig, PpoError, PpoRng, PpoTerminalOutcome, PpoTrainer, PpoTransition, PpoUpdateReport,
+    PutPointTarget, Request, ShopIndex, StateTracker, StructuredAction, Teacher, TrainingArtifact,
     tick_discount,
 };
 use crate::{MAP2_REWARD_GAMMA_TICK, Map2RewardBreakdown, Map2RewardEnd};
 
 const READINESS_ORDER_HISTORY: usize = 32;
-const _: () = assert!(PPO_MAX_ROLLOUT_DECISIONS <= crate::PPO_MAX_SAMPLES);
 
 /// Gameplay counters of one collected update batch.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct CollectionReport {
-    pub completed_episodes: crate::CompletedTrainingEpisodes,
     pub map2_reward: Map2TrainingReward,
     pub episode_timeouts: u64,
     pub rejected_orders: u64,
@@ -112,21 +109,13 @@ struct TrainingEnvironment {
     opponent: OpponentRuntime,
 }
 
-#[derive(Clone)]
-enum OpponentSpec {
-    SharedPolicy(Arc<PolicyModel>),
+/// Who decides the opponent seat's orders.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OpponentRuntime {
+    /// A policy whose actions the caller supplies each decision.
+    Neural,
     Teacher,
     /// Test fixture that always continues, keeping native worlds deterministic.
-    #[cfg(test)]
-    Idle,
-}
-
-enum OpponentRuntime {
-    Policy {
-        model: Arc<PolicyModel>,
-        rng: PpoRng,
-    },
-    Teacher,
     #[cfg(test)]
     Idle,
 }
@@ -243,13 +232,14 @@ pub(crate) fn device_name(device: PolicyDevice) -> &'static str {
     }
 }
 
-/// Checkpoint-owned state shared by both orchestrators; collectors remain mode-specific.
+/// Checkpoint-owned learner state: model, optimizer, progress and collection.
 struct TrainingSession {
     adaptive_environment: Option<crate::AdaptiveEnvironmentCheckpoint>,
     counters: SessionCounters,
     model: PolicyModel,
     trainer: PpoTrainer,
-    sampling: PpoRng,
+    /// Collection state the next update starts from; required by every save.
+    collection: Option<CollectionCheckpoint>,
     run: CheckpointRun,
     completed_updates: u64,
     rollout_samples: u64,
@@ -280,7 +270,7 @@ impl TrainingSession {
             RestoredTrainingSession {
                 adaptive_environment: None,
                 trainer,
-                sampling: PpoRng::new(run.run_seed ^ 0xa17e),
+                collection: None,
                 completed_updates: 0,
                 rollout_samples: 0,
             }
@@ -291,7 +281,7 @@ impl TrainingSession {
             model,
             trainer: restored.trainer,
             counters: SessionCounters::default(),
-            sampling: restored.sampling,
+            collection: restored.collection,
             run,
             completed_updates: restored.completed_updates,
             rollout_samples: restored.rollout_samples,
@@ -305,7 +295,10 @@ impl TrainingSession {
         directory: &Path,
         report: TrainingCheckpointReport,
     ) -> Result<TrainingCheckpointReport, PpoError> {
-        let (state, draws) = self.sampling.checkpoint();
+        let collection = self
+            .collection
+            .clone()
+            .ok_or(PpoError::InvalidTransition("checkpoint collection state"))?;
         let progress = CheckpointProgress {
             adaptive_environment: self.adaptive_environment,
             global_update: self.completed_updates,
@@ -314,14 +307,17 @@ impl TrainingSession {
             curriculum_stage: 0,
             rollout_samples: self.rollout_samples,
             best_evaluation: None,
-            rng_states: vec![
-                RngCheckpoint::new("ppo_actor_sampling", state, draws).map_err(text_error)?,
-            ],
+            rng_states: Vec::new(),
             league_references: Vec::new(),
         };
-        let artifact =
-            TrainingArtifact::capture(&self.model, &self.trainer, self.run.clone(), progress)
-                .map_err(text_error)?;
+        let artifact = TrainingArtifact::capture(
+            &self.model,
+            &self.trainer,
+            self.run.clone(),
+            progress,
+            collection,
+        )
+        .map_err(text_error)?;
         let outcome = artifact.save(directory).map_err(text_error)?;
         TrainingArtifact::save_runtime_weights(&self.model, directory).map_err(text_error)?;
         let cleanup_warning = match outcome {
@@ -491,13 +487,12 @@ fn restore_training_session(
             "training checkpoint policy version",
         ));
     }
-    let sampling = restore_sampling_rng(&progress.rng_states)?;
     let progress = progress.clone();
     let (trainer, _, _) = restored.into_parts();
     Ok(RestoredTrainingSession {
         adaptive_environment: progress.adaptive_environment,
         trainer,
-        sampling,
+        collection: Some(artifact.collection().clone()),
         completed_updates: progress.global_update,
         rollout_samples: progress.rollout_samples,
     })
@@ -506,24 +501,9 @@ fn restore_training_session(
 struct RestoredTrainingSession {
     adaptive_environment: Option<crate::AdaptiveEnvironmentCheckpoint>,
     trainer: PpoTrainer,
-    sampling: PpoRng,
+    collection: Option<CollectionCheckpoint>,
     completed_updates: u64,
     rollout_samples: u64,
-}
-
-fn restore_sampling_rng(states: &[RngCheckpoint]) -> Result<PpoRng, PpoError> {
-    let mut matching = states
-        .iter()
-        .filter(|checkpoint| checkpoint.name() == "ppo_actor_sampling");
-    let checkpoint = matching
-        .next()
-        .ok_or(PpoError::InvalidConfig("training checkpoint actor RNG"))?;
-    if matching.next().is_some() {
-        return Err(PpoError::InvalidConfig(
-            "training checkpoint duplicate actor RNG",
-        ));
-    }
-    PpoRng::from_checkpoint(checkpoint.state(), checkpoint.draws())
 }
 
 pub(crate) use crate::randomization::derive_training_seed;
@@ -534,10 +514,9 @@ pub(crate) use crate::randomization::derive_training_seed;
 /// name at world construction and on every later spawn.
 fn build_environment(
     seed: u64,
-    opponent_seed: u64,
     map: MapId,
     policy_seat: usize,
-    opponent_spec: OpponentSpec,
+    opponent: OpponentRuntime,
     spawn_modifiers: Vec<SpawnModifier>,
 ) -> Result<TrainingEnvironment, PpoError> {
     if policy_seat >= 2 {
@@ -555,7 +534,6 @@ fn build_environment(
     }
     .map_err(|error| PpoError::Model(error.to_string()))?;
     let seats = setup_seats(start)?;
-    let opponent = build_opponent(&opponent_spec, opponent_seed)?;
     Ok(TrainingEnvironment {
         arena,
         seats,
@@ -563,18 +541,6 @@ fn build_environment(
         map,
         opponent,
     })
-}
-
-fn build_opponent(spec: &OpponentSpec, seed: u64) -> Result<OpponentRuntime, PpoError> {
-    match spec {
-        OpponentSpec::SharedPolicy(model) => Ok(OpponentRuntime::Policy {
-            model: Arc::clone(model),
-            rng: PpoRng::new(seed),
-        }),
-        OpponentSpec::Teacher => Ok(OpponentRuntime::Teacher),
-        #[cfg(test)]
-        OpponentSpec::Idle => Ok(OpponentRuntime::Idle),
-    }
 }
 
 fn setup_seats(start: ArenaStart) -> Result<Vec<ArenaSeatPolicy>, PpoError> {
@@ -647,28 +613,6 @@ fn setup_seat(index: usize, messages: &[ServerMsg]) -> Result<ArenaSeatPolicy, P
         last_issued: None,
         last_rejection: None,
     })
-}
-
-fn actor_stream_rngs(master: &mut PpoRng, count: usize) -> Result<Vec<PpoRng>, PpoError> {
-    if count == 0 || count > crate::PPO_MAX_PARALLEL_WORLDS {
-        return Err(PpoError::InvalidConfig("actor RNG streams"));
-    }
-    (0..count)
-        .map(|_| master.next_word().map(PpoRng::new))
-        .collect()
-}
-
-#[cfg(test)]
-fn environment_rejections(environments: &[TrainingEnvironment]) -> Result<u64, PpoError> {
-    let mut total = 0u64;
-    for environment in environments {
-        for seat in &environment.seats {
-            total = total
-                .checked_add(seat.rejections)
-                .ok_or(PpoError::CounterOverflow)?;
-        }
-    }
-    Ok(total)
 }
 
 fn prepare_policy_sample(
@@ -770,113 +714,6 @@ fn take_map2_reward(
     candidate.ok_or(PpoError::InvalidTransition("Map2 reward candidate seat"))
 }
 
-#[cfg(test)]
-fn sample_policy(
-    model: &PolicyModel,
-    sampling: &mut PpoRng,
-    environment: &mut TrainingEnvironment,
-) -> Result<PpoPolicyChoice, PpoError> {
-    let (frame, space) = prepare_policy_sample(environment)?;
-    model.sample(&frame, &space, sampling).map_err(text_error)
-}
-
-#[cfg(test)]
-fn encode_next_frame(environment: &mut TrainingEnvironment) -> Result<FeatureFrame, PpoError> {
-    let seat = &mut environment.seats[environment.policy_seat];
-    let space = ActionSpace::from_tracker_with_readiness(&seat.tracker, &seat.readiness)
-        .map_err(|error| PpoError::Model(error.to_string()))?;
-    let mut frame = FeatureFrame::new();
-    seat.encoder
-        .encode(
-            &seat.tracker,
-            &space,
-            &seat.readiness,
-            &seat.local,
-            &mut frame,
-        )
-        .map_err(text_error)?;
-    Ok(frame)
-}
-
-fn requests_for_prepared_opponent(
-    environment: &mut TrainingEnvironment,
-    choice: &PpoPolicyChoice,
-    space: &ActionSpace,
-    opponent: neural_opponent::OpponentChoice,
-) -> Result<Vec<Option<Request>>, PpoError> {
-    if environment.seats.len() != 2 || environment.policy_seat > 1 {
-        return Err(PpoError::InvalidTransition(
-            "prepared opponent requires two valid seats",
-        ));
-    }
-    let OpponentRuntime::Policy { model, rng } = &mut environment.opponent else {
-        return Err(PpoError::InvalidTransition(
-            "prepared opponent requires neural policy",
-        ));
-    };
-    if !Arc::ptr_eq(model, &opponent.model) {
-        return Err(PpoError::InvalidTransition(
-            "prepared opponent model allocation mismatch",
-        ));
-    }
-    if *rng != opponent.before {
-        return Err(PpoError::InvalidTransition("prepared opponent RNG changed"));
-    }
-    if !choice.frame.matches_action_space(space) {
-        return Err(PpoError::InvalidTransition("prepared actor action space"));
-    }
-    if !opponent.choice.frame.matches_action_space(&opponent.space) {
-        return Err(PpoError::InvalidTransition(
-            "prepared opponent action space mismatch",
-        ));
-    }
-    for (index, seat) in environment.seats.iter().enumerate() {
-        let prepared = if index == environment.policy_seat {
-            space
-        } else {
-            &opponent.space
-        };
-        if !prepared.matches_tracker(&seat.tracker) || !prepared.matches_readiness(&seat.readiness)
-        {
-            return Err(PpoError::InvalidTransition(
-                "prepared neural decision seat changed",
-            ));
-        }
-    }
-    let mut requests = Vec::with_capacity(2);
-    for index in 0..environment.seats.len() {
-        let (choice, space) = if index == environment.policy_seat {
-            (choice, space)
-        } else {
-            (&opponent.choice, &opponent.space)
-        };
-        requests.push(policy_request_in_space(
-            &mut environment.seats[index],
-            choice,
-            space,
-        )?);
-    }
-    *rng = opponent.after;
-    Ok(requests)
-}
-
-fn requests_for_decision_in_space(
-    environment: &mut TrainingEnvironment,
-    choice: &PpoPolicyChoice,
-    space: &ActionSpace,
-) -> Result<Vec<Option<Request>>, PpoError> {
-    let mut requests = Vec::with_capacity(environment.seats.len());
-    for index in 0..environment.seats.len() {
-        let request = if index == environment.policy_seat {
-            policy_request_in_space(&mut environment.seats[index], choice, space)?
-        } else {
-            opponent_request(&mut environment.seats[index], &mut environment.opponent)?
-        };
-        requests.push(request);
-    }
-    Ok(requests)
-}
-
 fn neural_policy_request_in_space(
     seat: &mut ArenaSeatPolicy,
     proposed: crate::StructuredAction,
@@ -894,17 +731,16 @@ fn neural_policy_request_in_space(
     Ok((action, request))
 }
 
-fn opponent_request(
+/// The request of a scripted opponent seat; neural seats supply their actions.
+fn scripted_request(
     seat: &mut ArenaSeatPolicy,
-    opponent: &mut OpponentRuntime,
+    runtime: OpponentRuntime,
 ) -> Result<Option<Request>, PpoError> {
-    match opponent {
-        OpponentRuntime::Policy { model, rng } => {
-            let (frame, space) = prepare_neural_seat_policy_sample(seat)?;
-            let choice = model.sample(&frame, &space, rng).map_err(text_error)?;
-            policy_request(seat, &choice)
-        }
+    match runtime {
         OpponentRuntime::Teacher => teacher_request(seat),
+        OpponentRuntime::Neural => Err(PpoError::InvalidTransition(
+            "neural opponent without a decision",
+        )),
         #[cfg(test)]
         OpponentRuntime::Idle => {
             let tick = seat
@@ -918,32 +754,6 @@ fn opponent_request(
             Ok(None)
         }
     }
-}
-
-fn policy_request(
-    seat: &mut ArenaSeatPolicy,
-    choice: &PpoPolicyChoice,
-) -> Result<Option<Request>, PpoError> {
-    let space = ActionSpace::from_tracker_with_readiness(&seat.tracker, &seat.readiness)
-        .map_err(|error| PpoError::Model(error.to_string()))?;
-    policy_request_in_space(seat, choice, &space)
-}
-
-fn policy_request_in_space(
-    seat: &mut ArenaSeatPolicy,
-    choice: &PpoPolicyChoice,
-    space: &ActionSpace,
-) -> Result<Option<Request>, PpoError> {
-    if !choice.frame.matches_action_space(space) {
-        return Err(PpoError::InvalidTransition("prepared actor action space"));
-    }
-    seat.local
-        .note_decision(space.tick(), choice.action.kind())
-        .map_err(|error| PpoError::Model(error.to_string()))?;
-    let issued = space
-        .decode(choice.action)
-        .map_err(|error| PpoError::Model(error.to_string()))?;
-    issue_request(seat, issued, space, choice.action.kind(), false)
 }
 
 fn teacher_request(seat: &mut ArenaSeatPolicy) -> Result<Option<Request>, PpoError> {

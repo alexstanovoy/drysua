@@ -25,11 +25,11 @@ fn invocation_limits_reject_zero_overflow_and_values_above_the_counter_bound() {
             "number too large to fit in target type".to_owned(),
         ),
     ] {
-        let error = crate::cli::legacy_fixed_annealed_settings_for_test(&[
+        let error = crate::cli::fixed_annealed_settings_for_test(&[
             "--updates",
             "3",
-            "--generation-games",
-            "2",
+            "--generation-updates",
+            "1",
             "--invocation-updates",
             &value,
         ])
@@ -83,16 +83,18 @@ fn relative_resumes_match_uninterrupted_boundaries_clamp_at_target_and_then_do_n
     for (update, limit) in [(1, 1), (2, 1), (3, MAX_TRAINING_COUNTER)] {
         let report = run_limited_invocation(&resumed, update, limit);
         let (checkpoint, digests, generations) = received.try_recv().expect("baseline boundary");
-        let count = usize::try_from(update).expect("bounded update");
+        // Committing an update has drawn every pipelined update's generation.
+        let count = usize::try_from(update + PIPELINE_STALENESS + 1)
+            .expect("bounded update")
+            .min(3);
         assert_eq!(generations.len(), count);
         assert!(generations[0].1.contains("\"scale_bp\":10000,"));
         assert_eq!(
             generations[count - 1].1.contains("\"scale_bp\":0,"),
-            update == 3
+            count == 3
         );
         assert_eq!(report.completed_updates, update);
-        assert_eq!(report.games, update * 2);
-        assert_eq!(report.generations, update);
+        assert_eq!(report.generations, count as u64);
         assert_eq!(report.rollout_samples, checkpoint.rollout_samples);
         assert_eq!(report.optimizer_step, checkpoint.optimizer_step);
         assert_eq!(report.latest.policy_loss, checkpoint.policy_loss);
@@ -179,7 +181,7 @@ fn assert_completed_resume_is_unchanged(directory: &Path) {
     )
     .expect("already-completed resume");
     assert_eq!(report.completed_updates, 3);
-    assert_eq!(report.games, 6);
+    assert_eq!(report.games, 0);
     assert_eq!(report.generations, 3);
     assert_eq!(report.rollout_samples, artifact.progress().rollout_samples);
     assert_eq!(report.optimizer_step, artifact_runtime_state(&artifact).1);

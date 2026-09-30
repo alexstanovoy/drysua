@@ -740,7 +740,7 @@ fn assert_single(
 }
 
 #[cfg(feature = "builtin")]
-fn ppo_samples(model: &PolicyModel) -> Vec<PpoPreparedSample> {
+fn ppo_samples() -> Vec<PpoPreparedSample> {
     let (frames, spaces) = native_inputs();
     frames
         .into_iter()
@@ -754,7 +754,7 @@ fn ppo_samples(model: &PolicyModel) -> Vec<PpoPreparedSample> {
                     frame,
                     target,
                     action: StructuredAction::Continue,
-                    policy: model.policy_identity().expect("identity"),
+                    behaviour: 0,
                     stream,
                     decision: 0,
                     ticks: 3,
@@ -794,7 +794,7 @@ fn ppo_model(device: PolicyDevice) -> (PolicyModel, PpoConfig) {
 fn assert_ppo_rollback(device: PolicyDevice) {
     let (model, config) = ppo_model(device);
     let mut adam = model.claim_optimizer(config.adam()).expect("Adam");
-    let mut samples = ppo_samples(&model);
+    let mut samples = ppo_samples();
     for scenario in 0..3 {
         let (probabilities, _) = model
             .ppo_likelihood_for_test(&samples.iter().collect::<Vec<_>>())

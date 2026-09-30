@@ -1,4 +1,6 @@
+use super::super::{CollectionReport, TrainingSession};
 use super::*;
+use crate::randomization::verify_generation_snapshots;
 use crate::{AdaptiveEnvironmentCheckpoint, AdaptiveEnvironmentLimits, EnvironmentSchedule};
 
 pub(super) fn initial_checkpoint(
@@ -7,17 +9,8 @@ pub(super) fn initial_checkpoint(
     let EnvironmentSchedule::Adaptive(config) = settings.environment_schedule else {
         return Ok(None);
     };
-    if settings.games_per_update == 0
-        || !settings
-            .games_per_generation
-            .is_multiple_of(settings.games_per_update as u64)
-    {
-        return Err(PpoError::InvalidConfig(
-            "adaptive generation must contain whole updates",
-        ));
-    }
     let limits = AdaptiveEnvironmentLimits {
-        base_updates: settings.games_per_generation / settings.games_per_update as u64,
+        base_updates: settings.generation_updates,
         total_updates: settings.updates,
         zero_updates: settings.zero_updates,
     }
@@ -44,9 +37,7 @@ pub(super) fn validate(
         ) || _harness.episode_decisions.is_none()
             || wins.len() > 256
             || wins.len() as u64 != settings.updates
-            || wins
-                .iter()
-                .any(|wins| *wins > settings.games_per_update as u64))
+            || wins.iter().any(|wins| *wins > settings.slots as u64))
     {
         return Err(PpoError::InvalidConfig("adaptive outcomes fixture scope"));
     }
@@ -99,7 +90,7 @@ pub(super) fn preflight_resume(
             crate::adaptive_randomization::verify_adaptive_snapshots(
                 &directory.join(RANDOMIZATION_DIRECTORY),
                 settings.seed,
-                settings.games_per_update as u64,
+                1,
                 &actual,
                 settings.scale,
             )
@@ -114,13 +105,12 @@ pub(super) fn verified_generation_count(
     settings: &AnnealedJobConfig,
     directory: &Path,
     state: &TrainingSession,
-    games: u64,
 ) -> Result<u64, PpoError> {
     if let Some(checkpoint) = state.adaptive_environment {
         crate::adaptive_randomization::verify_adaptive_snapshots(
             directory,
             settings.seed,
-            settings.games_per_update as u64,
+            1,
             &checkpoint,
             settings.scale,
         )?;
@@ -129,10 +119,15 @@ pub(super) fn verified_generation_count(
         verify_generation_snapshots(
             directory,
             settings.seed,
-            settings.games_per_generation,
-            settings.games_per_update as u64,
+            settings.generation_updates,
+            1,
             anneal_schedule(settings),
-            games,
+            // Collection had already drawn every pipelined update's generation.
+            state
+                .completed_updates
+                .checked_add(PIPELINE_STALENESS + 1)
+                .ok_or(PpoError::CounterOverflow)?
+                .min(settings.updates),
         )
     }
 }
@@ -158,8 +153,8 @@ impl GenerationCache {
             )?);
         }
         let draw = self.last.expect("adaptive draw materialized");
+        // Collection lags the controller, so an update may pass the draw's nominal end.
         assert!(game >= draw.start_game);
-        assert!(game < draw.end_game);
         Ok(draw)
     }
 
@@ -173,13 +168,13 @@ impl GenerationCache {
         let Some(mut checkpoint) = self.adaptive else {
             return Ok(None);
         };
-        let wins = adaptive_wins(settings, harness, update, report)?;
+        let (wins, games) = adaptive_wins(settings, harness, update, report)?;
         checkpoint.state = checkpoint.state.observe(
             checkpoint.config,
             checkpoint.limits,
             update.checked_add(1).ok_or(PpoError::CounterOverflow)?,
             wins,
-            settings.games_per_update as u64,
+            games,
         )?;
         Ok(Some(checkpoint))
     }
@@ -209,33 +204,36 @@ impl GenerationCache {
     }
 }
 
+/// Wins and finished games of one update.
 fn adaptive_wins(
-    settings: &AnnealedJobConfig,
+    _settings: &AnnealedJobConfig,
     _harness: AnnealedHarness,
     _update: u64,
     report: &CollectionReport,
-) -> Result<u64, PpoError> {
+) -> Result<(u64, u64), PpoError> {
+    let games = [
+        report.terminal_wins,
+        report.terminal_losses,
+        report.terminal_draws,
+        report.episode_timeouts,
+    ]
+    .into_iter()
+    .try_fold(0u64, u64::checked_add)
+    .ok_or(PpoError::CounterOverflow)?;
     #[cfg(test)]
     if let Some(wins) = _harness.adaptive_wins {
-        return wins
+        let wins = wins
             .get(_update as usize)
             .copied()
             .ok_or(PpoError::InvalidTransition(
                 "adaptive outcomes fixture exhausted",
-            ));
+            ))?;
+        return Ok((wins, _settings.slots as u64));
     }
-    let outcomes = report.completed_episodes.ordered_outcomes();
-    let wins = outcomes
-        .iter()
-        .filter(|outcome| matches!(outcome, crate::TrainingGameOutcome::Win))
-        .count();
-    if outcomes.len() != settings.games_per_update
-        || wins as u64 != report.terminal_wins
-        || report.rejected_orders != 0
-    {
+    if report.rejected_orders != 0 {
         return Err(PpoError::InvalidTransition(
-            "adaptive outcomes require a complete unrejected update",
+            "adaptive outcomes require an unrejected update",
         ));
     }
-    Ok(report.terminal_wins)
+    Ok((report.terminal_wins, games))
 }

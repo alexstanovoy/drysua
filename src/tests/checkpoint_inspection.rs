@@ -24,7 +24,7 @@ fn inspection_contract_exposes_current_model_limits_and_build_capabilities() {
     assert_eq!(contract["limits"]["max_json_bytes"], 4_194_304);
     assert_eq!(contract["limits"]["max_snapshots"], 10_000);
     assert_eq!(contract["limits"]["max_files"], 10_004);
-    assert_eq!(contract["limits"]["max_games"], crate::PPO_MAX_GAMES);
+    assert_eq!(contract["limits"]["max_slots"], crate::PPO_MAX_SLOTS);
     assert_eq!(
         contract["checkpoint"],
         serde_json::json!({"version": CHECKPOINT_SCHEMA_VERSION,
@@ -45,8 +45,7 @@ mod files {
     use std::collections::{BTreeMap, BTreeSet};
     use std::os::unix::fs::symlink;
 
-    const FIXED: &str =
-        "train-annealed --updates 8 --games 2 --generation-games 4 --zero-updates 0";
+    const FIXED: &str = "train-annealed --updates 8 --generation-updates 2 --zero-updates 0";
 
     #[test]
     fn generic_inspection_is_read_only_and_never_restores_the_recorded_cuda_device() {
@@ -97,7 +96,8 @@ mod files {
             fs::write(&path, serialize_runtime_tensor(&lagging).unwrap()).unwrap();
             assert_runtime_mismatch(&fixture, &path);
         }
-        let old = serialize_named_tensors(&[("model.parameters", &artifact.parameters)]).unwrap();
+        let old =
+            serialize_named_tensors(&[("model.parameters", &artifact.parameters)], None).unwrap();
         fs::write(&path, old).expect("runtime without current metadata");
         assert_runtime_mismatch(&fixture, &path);
     }
@@ -409,7 +409,7 @@ mod files {
         };
         for generation in 0..2 {
             let draw =
-                crate::randomization::draw_generation(9001, generation, 4, 2, schedule).unwrap();
+                crate::randomization::draw_generation(9001, generation, 2, 1, schedule).unwrap();
             crate::randomization::write_generation_snapshot(&directory, &draw).unwrap();
         }
         fs::write(
@@ -425,7 +425,7 @@ mod files {
             report["history"],
             json!({"kind": "fixed", "verified": true, "snapshot_count": 2})
         );
-        assert_eq!(report["progress"]["games"], 6);
+        assert_eq!(report["progress"]["games"], 3);
         assert!(listed(
             &report,
             "domain-randomization/generation-000000000001.json"
@@ -488,8 +488,7 @@ mod files {
     #[cfg(feature = "builtin")]
     #[test]
     fn inspection_caps_history_before_attempting_any_snapshot_read() {
-        let command =
-            "train-annealed --updates 10002 --games 2 --generation-games 2 --zero-updates 0";
+        let command = "train-annealed --updates 10002 --generation-updates 1 --zero-updates 0";
         for adaptive in [false, true] {
             let mut artifact = fixture_artifact(command, 10_001);
             if adaptive {
@@ -519,8 +518,7 @@ mod files {
         let fixture = Fixture::new(&mut artifact);
         for suffix in [
             " --updates 8",
-            " --games 2",
-            " --generation-games 4",
+            " --generation-updates 2",
             " --zero-updates 0",
         ] {
             artifact.run.command_line = format!("{FIXED}{suffix}");
@@ -575,8 +573,7 @@ mod files {
             },
             config: PpoConfig {
                 gamma_tick: 1.0,
-                environments: 2,
-                rollout_decisions: crate::MAP2_RETAINED_DECISIONS,
+                samples_per_update: 2 * crate::MAP2_RETAINED_DECISIONS,
                 minibatch: 2,
                 epochs: 1,
                 ..PpoConfig::default()
@@ -588,6 +585,10 @@ mod files {
                 first_moment: vec![0.0; MODEL_PARAMETER_COUNT],
                 second_moment: vec![0.0; MODEL_PARAMETER_COUNT],
                 step: 0,
+            },
+            collection: crate::CollectionCheckpoint {
+                actor: vec![0.0; MODEL_PARAMETER_COUNT],
+                state: vec![1],
             },
             tensor_hash: [0; 32],
         }
@@ -739,8 +740,7 @@ mod files {
                 "decision_interval_ticks",
                 u64::from(config.decision_interval_ticks),
             ),
-            ("rollout_decisions", config.rollout_decisions as u64),
-            ("environments", config.environments as u64),
+            ("samples_per_update", config.samples_per_update as u64),
             ("epochs", config.epochs as u64),
             ("minibatch", config.minibatch as u64),
         ] {
@@ -845,7 +845,7 @@ mod files {
                 zero_updates: 0,
                 scale: crate::randomization::AnnealScale::FULL,
             };
-            let draw = crate::randomization::draw_generation(9001, 0, 4, 2, schedule).unwrap();
+            let draw = crate::randomization::draw_generation(9001, 0, 2, 1, schedule).unwrap();
             crate::randomization::write_generation_snapshot(&directory, &draw).unwrap();
             (
                 "generation-000000000000.json",
@@ -861,7 +861,7 @@ mod files {
         crate::adaptive_randomization::draw_adaptive_generation(
             directory,
             9001,
-            2,
+            1,
             checkpoint,
             crate::randomization::AnnealScale::FULL,
         )
@@ -876,7 +876,7 @@ mod files {
         crate::adaptive_randomization::draw_adaptive_generation(
             directory,
             9001,
-            2,
+            1,
             &mut orphan,
             crate::randomization::AnnealScale::FULL,
         )

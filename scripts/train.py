@@ -37,14 +37,13 @@ STATUS_FIELDS = {"schema", "campaign_id", "manifest_sha256", "phase", "updates",
 CAMPAIGN_DIRECTORIES = ("bin", "inputs", "frozen", "checkpoint", "history", "cuda-cache", "sessions")
 # An allowlist also blocks future output options unknown to this controller.
 ARGUMENTS = frozenset({
-    "--games", "--parallel", "--generation-games", "--seed", "--map",
-    "--host-math-workers", "--training-microbatch", "--actor-pipeline-groups",
-    "--balanced-minibatches", "--reuse-actor-values", "--environment-schedule",
+    "--samples-per-update", "--slots", "--lanes", "--simulation-threads", "--generation-updates",
+    "--seed", "--map", "--host-math-workers", "--training-microbatch",
+    "--balanced-minibatches", "--environment-schedule",
     "--environment-success-updates", "--environment-success-rate",
     "--environment-poor-updates", "--environment-poor-rate", "--environment-extension",
     "--zero-updates", "--learning-rate", "--epochs", "--minibatch", "--gae-lambda",
-    "--entropy-coefficient", "--opponent-inference",
-    "--environment-scale-start", "--environment-scale-end",
+    "--entropy-coefficient", "--environment-scale-start", "--environment-scale-end",
 })
 CONFIG_FIELDS = {"schema", "trainer", "inspector", "initial_weights", "opponent_weights", "total_updates",
                  "history_every", "max_seconds", "stop_seconds", "training_args", "mode", "docker_context",
@@ -358,7 +357,7 @@ def trainer_command(directory, config, resume):
     elif "initial_weights" in config:
         command += ["--initial-weights", str(directory / config["initial_weights"])]
     if "opponent_weights" in config:
-        command += ["--opponent", "weights", "--opponent-weights", str(directory / config["opponent_weights"])]
+        command += ["--opponent", f"weights:{directory / config['opponent_weights']}:1"]
     return command
 
 

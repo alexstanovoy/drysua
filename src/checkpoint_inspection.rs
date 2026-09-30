@@ -107,6 +107,7 @@ fn load_payload(
     artifact.parameters = decoded.parameters;
     artifact.optimizer.first_moment = decoded.first_moment;
     artifact.optimizer.second_moment = decoded.second_moment;
+    artifact.collection = decoded.collection;
     artifact.validate()?;
     add_file(files, &path, &tensors)?;
     let mut alias_matches = path == CHECKPOINT_TENSOR_FILE;

@@ -40,8 +40,7 @@ pub(super) fn runtime_bytes(values: &[f32], metadata: HashMap<String, String>) -
 pub(super) fn config() -> crate::PpoConfig {
     crate::PpoConfig {
         gamma_tick: crate::MAP2_REWARD_GAMMA_TICK,
-        rollout_decisions: 2,
-        environments: 2,
+        samples_per_update: 4,
         minibatch: 2,
         ..crate::PpoConfig::default()
     }

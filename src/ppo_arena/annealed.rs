@@ -1,19 +1,20 @@
-//! The annealed domain-randomization training loop.
+//! The annealed domain-randomization training loop with continuous collection.
 //!
-//! One update plays `games_per_update` complete Map2 episodes in batches of
-//! `parallel_worlds` worlds, applies one generation's trusted spawn modifiers
-//! per `games_per_generation` global games, and runs one PPO update
-//! over every episode's samples. The opponent is frozen for the whole run.
-//!
-//! Every random choice is a pure function of `(seed, update, game index)`
-//! through dedicated streams, so a stopped run resumed from its last
-//! committed update replays the interrupted update byte for byte.
+//! Slots play games back to back on a fixed simulation pool while inference
+//! lanes sample their decisions; an update is due once every lane has closed
+//! its share of `samples_per_update` retained intervals. Games in flight at an
+//! update boundary continue under the next update's actor weights, which lag
+//! the learner by [`PIPELINE_STALENESS`] updates so collection never waits for
+//! optimization. Each update's spawn modifiers follow the annealing schedule
+//! per update. Every random choice is a pure function of the run seed, slot,
+//! game ordinal and round sequence, so a stopped run resumed from its last
+//! committed update replays in-flight games and continues byte for byte.
 
 use std::path::{Path, PathBuf};
 #[path = "annealed_adaptive.rs"]
 mod adaptive;
-use std::sync::Arc;
-use std::time::Instant;
+#[path = "annealed_session.rs"]
+mod session;
 
 use bota_proto::{MapId, ModifierSpec};
 use bota_server::game::{
@@ -21,80 +22,66 @@ use bota_server::game::{
     check_spawn_modifier,
 };
 
-use super::episode::{self, ACTOR_DECISIONS};
+use super::episode::ACTOR_DECISIONS;
+use super::slot::{MAX_SLOTS, OpponentKind, OpponentMixture};
 use super::{
-    OpponentSpec, TrainingCheckpointSchedule, TrainingDirectoryLock, TrainingEnvironment,
-    TrainingSession, actor_stream_rngs, build_environment, device_name,
-    reject_production_rejection, text_error, validate_checkpoint_cadence,
-    validate_initial_weights_directory, validate_training_directory,
+    TrainingCheckpointReport, TrainingDirectoryLock, device_name, text_error,
+    validate_checkpoint_cadence, validate_initial_weights_directory, validate_training_directory,
 };
 use crate::randomization::{
-    AnnealSchedule, GenerationDraw, RANDOMIZATION_DIRECTORY, derive_training_seed, draw_generation,
-    verify_generation_snapshots, write_generation_snapshot,
+    AnnealSchedule, GenerationDraw, RANDOMIZATION_DIRECTORY, draw_generation,
+    write_generation_snapshot,
 };
-use crate::telemetry::{
-    FlushPerformanceLogs, TrainingStage, TrainingTimingScope, TrainingUpdateMode,
-    TrainingUpdateTimer, time_training_scope,
-};
+use crate::telemetry::{FlushPerformanceLogs, TrainingTimingScope, time_training_scope};
 use crate::{
-    CheckpointDevice, CheckpointRun, CollectionReport, MAP2_DECISION_INTERVAL_TICKS,
-    MAP2_RETAINED_DECISIONS, MAP2_REWARD_GAMMA_TICK, MAX_TRAINING_COUNTER,
-    MODEL_MAX_OPTIMIZER_STEP, PPO_MAX_GAMES, PPO_MAX_POLICY_SAMPLE_DRAWS, PPO_MAX_SAMPLES,
-    PPO_RULES_AUDIT_VERSION, PolicyDevice, PolicyModel, PpoConfig, PpoError, PpoRng, PpoRollout,
-    PpoUpdateReport, SHADOW_FIEND, TrainingArtifact, TrainingCheckpointReport, compiled_features,
+    AnnealedOpponent, CheckpointDevice, CheckpointRun, EnvironmentDecimal,
+    MAP2_DECISION_INTERVAL_TICKS, MAP2_REWARD_GAMMA_TICK, MAX_TRAINING_COUNTER,
+    MODEL_MAX_OPTIMIZER_STEP, PPO_MAX_POLICY_SAMPLE_DRAWS, PPO_RULES_AUDIT_VERSION, PolicyDevice,
+    PolicyModel, PpoConfig, PpoError, PpoUpdateReport, SHADOW_FIEND, TrainingArtifact,
+    compiled_features,
 };
 
-const _: () = assert!(PPO_MAX_GAMES * MAP2_RETAINED_DECISIONS == PPO_MAX_SAMPLES);
-const _: () = assert!(ACTOR_DECISIONS as u64 * PPO_MAX_POLICY_SAMPLE_DRAWS <= MAX_TRAINING_COUNTER);
-
-/// Domain separating the per-update balanced side shuffle.
-const SEAT_DOMAIN: u64 = 0x7365_6174_5f62_616c;
-
+/// Updates the actor weights of a collected update lag the learner.
+pub(crate) const PIPELINE_STALENESS: u64 = 1;
 /// Decisions one production annealed episode runs: the full Map2 ceiling.
 pub(crate) const ANNEALED_EPISODE_DECISIONS: usize = ACTOR_DECISIONS;
-
-/// The opponent frozen for the whole annealed run.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum AnnealedOpponent {
-    /// The original scripted teacher.
-    Teacher,
-    /// A strict runtime weights directory, loaded once and never updated.
-    Weights(PathBuf),
-}
+/// Largest retained-interval target of one update.
+pub const MAX_SAMPLES_PER_UPDATE: usize = 32_768;
+const _: () = assert!(MAX_SAMPLES_PER_UPDATE + 2 * MAX_SLOTS <= crate::PPO_MAX_SAMPLES);
+const _: () = assert!(ACTOR_DECISIONS as u64 * PPO_MAX_POLICY_SAMPLE_DRAWS <= MAX_TRAINING_COUNTER);
 
 /// Bounded, resumable annealed-loop settings.
 #[derive(Clone, Debug, PartialEq)]
 pub struct AnnealedJobConfig {
-    /// Adaptive transitions or the byte-compatible historical fixed schedule.
+    /// Adaptive transitions or the fixed per-generation schedule.
     pub environment_schedule: crate::EnvironmentSchedule,
-    /// Experimental execution choices, bound to command scope rather than PPO codecs.
+    /// Learner execution choices, bound to the run scope.
     pub execution: crate::TrainingExecutionOptions,
     /// Total updates in the run.
     pub updates: u64,
-    /// Games per update, even from 2 to 40 so sides split exactly.
-    pub games_per_update: usize,
-    /// Worlds per batch, from 1 to 64; divides games and generation games.
-    pub parallel_worlds: usize,
-    /// Games per environment generation, on the global game counter.
-    pub games_per_generation: u64,
+    /// Concurrent world slots; each always holds a live game.
+    pub slots: usize,
+    /// Inference lanes; each owns `slots / lanes` slots, a thread and a weight replica.
+    pub lanes: usize,
+    /// Simulation worker threads; never changes results, so excluded from the run scope.
+    pub simulation_threads: usize,
+    /// Updates per environment generation.
+    pub generation_updates: u64,
     /// Final updates played with no modifiers.
     pub zero_updates: u64,
     /// Deterministic run seed.
     pub seed: u64,
     /// Environment scale ramp endpoints; `AnnealScale::FULL` is the default ramp.
     pub scale: crate::randomization::AnnealScale,
-    /// Opponent, frozen for the whole run.
-    pub opponent: AnnealedOpponent,
-    /// PPO dimensions and hyperparameters; `environments` and `rollout_decisions`
-    /// are the loop's, not free choices.
+    /// Per-game opponent mixture with positive weights, in configured order.
+    pub opponents: Vec<(AnnealedOpponent, EnvironmentDecimal)>,
+    /// PPO dimensions and hyperparameters.
     pub ppo: PpoConfig,
     /// When to write a durable checkpoint.
     pub checkpoint_cadence: crate::TrainingCheckpointCadence,
     /// Additional committed updates in this invocation, capped by `updates`.
-    /// The limit must not exceed `MAX_TRAINING_COUNTER`.
-    /// `None` runs to the total target. Like checkpoint cadence, this is excluded
-    /// from the run scope and does not change the annealing schedule. Finishing
-    /// at this boundary forces a durable checkpoint and runtime export.
+    /// Excluded from the run scope; finishing at this boundary forces a
+    /// durable checkpoint and runtime export.
     pub invocation_updates: Option<std::num::NonZeroU64>,
     /// Milestone runtime-weight snapshots; excluded from the run scope.
     pub history: Option<crate::RuntimeHistory>,
@@ -106,11 +93,9 @@ pub struct AnnealedJobConfig {
 
 /// Invocation-only bounds the test harness may set.
 ///
-/// Production never sets any: the CLI always runs the full episode ceiling and
-/// uses only the config's update limits. The harness is crate-private, so it cannot
-/// appear on the command line, and none of its fields shape the run scope
-/// except the effective episode ceiling, which is recorded only when a test
-/// shortens it.
+/// Production never sets any. The harness is crate-private, so it cannot
+/// appear on the command line; only a shortened episode ceiling is recorded
+/// in the run scope.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct AnnealedHarness {
     /// Explicit controller-only outcome fixture; never exposed by production entry points.
@@ -120,8 +105,6 @@ pub(crate) struct AnnealedHarness {
     pub(crate) episode_decisions: Option<usize>,
     /// Stop after this many completed updates in one invocation.
     pub(crate) stop_after: Option<u64>,
-    /// Stop inside an update after this many games, before any optimizer step.
-    pub(crate) stop_after_games: Option<usize>,
 }
 
 impl AnnealedHarness {
@@ -138,8 +121,7 @@ pub struct AnnealedJobReport {
     pub completed_updates: u64,
     pub optimizer_step: u64,
     pub rollout_samples: u64,
-    /// Games collected up to the completed update, resumed runs included;
-    /// `updates * games_per_update` over a completed run.
+    /// Games finished during this invocation's committed updates.
     pub games: u64,
     pub generations: u64,
     pub map2_reward: crate::Map2TrainingReward,
@@ -151,25 +133,11 @@ pub struct AnnealedJobReport {
     pub latest: PpoUpdateReport,
 }
 
-/// The frozen opponent runtime.
-enum AnnealedOpponentRuntime {
-    Teacher,
-    Weights(Arc<PolicyModel>),
-}
-
-impl AnnealedOpponentRuntime {
-    fn spec(&self) -> OpponentSpec {
-        match self {
-            Self::Teacher => OpponentSpec::Teacher,
-            Self::Weights(model) => OpponentSpec::SharedPolicy(Arc::clone(model)),
-        }
-    }
-}
-
-/// One loaded opponent and the fingerprint of the weights it was loaded from.
-struct LoadedOpponent {
-    runtime: AnnealedOpponentRuntime,
-    fingerprint: Option<u64>,
+/// Frozen opponent snapshots, host parameters and fingerprints in mixture order.
+pub(crate) struct OpponentPool {
+    pub(crate) mixture: OpponentMixture,
+    pub(crate) snapshots: Vec<std::sync::Arc<Vec<f32>>>,
+    fingerprints: Vec<u64>,
 }
 
 /// Runs the annealed loop, optionally loading deployment weights first.
@@ -239,8 +207,8 @@ pub(crate) fn preflight_annealed_resume(
     let harness = AnnealedHarness::default();
     let config = validate_annealed(settings, harness)?;
     validate_training_directory(directory, true)?;
-    let opponent = load_opponent(&settings.opponent, device)?;
-    let run = annealed_run(settings, device, config, harness, opponent.fingerprint)?;
+    let pool = load_opponents(settings)?;
+    let run = annealed_run(settings, device, config, harness, &pool)?;
     check_resume_scope(settings, &run, directory)
 }
 
@@ -270,16 +238,18 @@ where
 {
     let config = validate_annealed(&settings, harness)?;
     validate_initial_weights_directory(directory, resume, initial_weights_directory)?;
-    if let AnnealedOpponent::Weights(weights) = &settings.opponent
-        && weights == directory
+    if settings
+        .opponents
+        .iter()
+        .any(|(opponent, _)| *opponent == AnnealedOpponent::Weights(directory.to_path_buf()))
     {
         return Err(PpoError::InvalidConfig(
             "annealed opponent weights must not be the checkpoint directory",
         ));
     }
     validate_training_directory(directory, resume)?;
-    let opponent = load_opponent(&settings.opponent, device)?;
-    let run = annealed_run(&settings, device, config, harness, opponent.fingerprint)?;
+    let pool = load_opponents(&settings)?;
+    let run = annealed_run(&settings, device, config, harness, &pool)?;
     if resume {
         check_resume_scope(&settings, &run, directory)?;
     }
@@ -291,7 +261,7 @@ where
     }
     let mut session =
         time_training_scope(TrainingTimingScope::SessionInitialization, None, || {
-            AnnealedSession::initialize(
+            session::AnnealedSession::initialize(
                 &settings,
                 device,
                 directory,
@@ -300,441 +270,17 @@ where
                 config,
                 run,
                 &random_directory,
-                opponent.runtime,
             )
         })?;
-    session.run_updates(&settings, harness, config, directory, &mut checkpointed)?;
+    session.run_updates(
+        &settings,
+        harness,
+        config,
+        directory,
+        &pool,
+        &mut checkpointed,
+    )?;
     Ok(session.report())
-}
-
-struct AnnealedSession {
-    state: TrainingSession,
-    opponent: AnnealedOpponentRuntime,
-    random_directory: PathBuf,
-    generations: u64,
-    games: u64,
-}
-
-impl AnnealedSession {
-    #[allow(clippy::too_many_arguments)]
-    fn initialize(
-        settings: &AnnealedJobConfig,
-        device: PolicyDevice,
-        directory: &Path,
-        resume: bool,
-        initial_weights_directory: Option<&Path>,
-        config: PpoConfig,
-        run: CheckpointRun,
-        random_directory: &Path,
-        opponent: AnnealedOpponentRuntime,
-    ) -> Result<Self, PpoError> {
-        let mut state = TrainingSession::initialize(
-            device,
-            directory,
-            resume,
-            initial_weights_directory,
-            config,
-            run,
-        )?;
-        let games = state
-            .completed_updates
-            .checked_mul(settings.games_per_update as u64)
-            .ok_or(PpoError::CounterOverflow)?;
-        let generations = if resume {
-            std::fs::metadata(random_directory).map_err(|_| {
-                PpoError::InvalidConfig("domain randomization snapshots are missing on resume")
-            })?;
-            adaptive::verified_generation_count(settings, random_directory, &state, games)?
-        } else {
-            state.adaptive_environment = adaptive::initial_checkpoint(settings)?;
-            0
-        };
-        state
-            .trainer
-            .set_execution(crate::TrainingExecutionOptions {
-                // Actor and opponent inference modes belong to collection, not optimization.
-                actor_pipeline_groups: 1,
-                neural_opponent_batching: false,
-                reuse_actor_values: false,
-                ..settings.execution
-            })?;
-        Ok(Self {
-            state,
-            opponent,
-            random_directory: random_directory.to_path_buf(),
-            generations,
-            games,
-        })
-    }
-
-    fn run_updates(
-        &mut self,
-        settings: &AnnealedJobConfig,
-        harness: AnnealedHarness,
-        config: PpoConfig,
-        directory: &Path,
-        checkpointed: &mut impl FnMut(TrainingCheckpointReport),
-    ) -> Result<(), PpoError> {
-        let invocation_target = match settings.invocation_updates {
-            Some(limit) => self
-                .state
-                .completed_updates
-                .checked_add(limit.get())
-                .ok_or(PpoError::CounterOverflow)?
-                .min(settings.updates),
-            None => settings.updates,
-        };
-        let started = Instant::now();
-        let mut schedule = TrainingCheckpointSchedule::new(settings.checkpoint_cadence)?;
-        let anneal = anneal_schedule(settings);
-        let mut generations = GenerationCache::new(
-            self.random_directory.clone(),
-            settings.seed,
-            settings.games_per_generation,
-            settings.games_per_update as u64,
-            anneal,
-            self.generations,
-        );
-        generations.adaptive = self.state.adaptive_environment;
-        // A crash between a committed milestone and its export is repaired here.
-        self.export_history(settings)?;
-        while self.state.completed_updates < invocation_target {
-            self.train_update(settings, harness, config, &mut generations)?;
-            let stop = crate::training_signals::stop_requested();
-            let final_update = self.state.completed_updates == invocation_target || stop;
-            if schedule.is_due(self.state.completed_updates, started.elapsed()) || final_update {
-                let report = self.state.checkpoint_report(None);
-                let durable = crate::telemetry::time_training_checkpoint(
-                    self.state.completed_updates,
-                    || self.state.save(directory, report),
-                )?;
-                checkpointed(durable);
-                schedule.mark_committed(started.elapsed())?;
-            }
-            self.export_history(settings)?;
-            if stop
-                || harness
-                    .stop_after
-                    .is_some_and(|stop| self.state.completed_updates >= stop)
-            {
-                break;
-            }
-        }
-        self.generations = generations.counted_through();
-        Ok(())
-    }
-
-    fn export_history(&self, settings: &AnnealedJobConfig) -> Result<(), PpoError> {
-        match &settings.history {
-            Some(history) => history.export(
-                &self.state.model,
-                self.state.completed_updates,
-                settings.updates,
-            ),
-            None => Ok(()),
-        }
-    }
-
-    fn train_update(
-        &mut self,
-        settings: &AnnealedJobConfig,
-        harness: AnnealedHarness,
-        config: PpoConfig,
-        generations: &mut GenerationCache,
-    ) -> Result<(), PpoError> {
-        let mut timing = TrainingUpdateTimer::new(
-            self.state.completed_updates,
-            TrainingUpdateMode::Annealed,
-            self.state.trainer.optimizer_step(),
-        );
-        let result = self.train_update_timed(settings, harness, config, generations, &mut timing);
-        timing.observe_result(result)?;
-        timing.complete();
-        Ok(())
-    }
-
-    fn train_update_timed(
-        &mut self,
-        settings: &AnnealedJobConfig,
-        harness: AnnealedHarness,
-        config: PpoConfig,
-        generations: &mut GenerationCache,
-        timing: &mut TrainingUpdateTimer,
-    ) -> Result<(), PpoError> {
-        let update = self.state.completed_updates;
-        let games = settings.games_per_update;
-        let policy_identity = self.state.model.policy_identity().map_err(text_error)?;
-        let mut rollout = PpoRollout::for_config(config, policy_identity)?;
-        let mut report = CollectionReport::default();
-        let seats = balanced_policy_seats(settings.seed, update, games)?;
-        let wave_worlds = settings.parallel_worlds * settings.execution.actor_pipeline_groups;
-        timing.enter(TrainingStage::Collection);
-        for local in (0..games).step_by(wave_worlds) {
-            self.collect_update_wave(
-                settings,
-                harness,
-                config,
-                generations,
-                local,
-                &seats,
-                &mut rollout,
-                &mut report,
-            )?;
-            self.games = self
-                .games
-                .checked_add(wave_worlds as u64)
-                .ok_or(PpoError::CounterOverflow)?;
-            if harness
-                .stop_after_games
-                .is_some_and(|stop| local + wave_worlds >= stop)
-            {
-                return Err(PpoError::InvalidTransition(
-                    "annealed invocation stopped mid-update",
-                ));
-            }
-        }
-        let samples = rollout.len();
-        let next_adaptive = generations.next_adaptive(settings, harness, update, &report)?;
-        timing.set_samples(samples);
-        timing.enter(TrainingStage::BatchPreparation);
-        let batch = rollout.finish(config)?;
-        let explained_variance = batch.explained_variance();
-        let optimizer_step = self.state.trainer.optimizer_step();
-        timing.enter(TrainingStage::Optimization);
-        let optimized = self.state.trainer.train_update(&self.state.model, &batch);
-        timing.set_optimizer_step(self.state.trainer.optimizer_step());
-        self.state.latest = optimized?;
-        log_ppo_update(
-            &self.state.latest,
-            explained_variance,
-            self.state.trainer.optimizer_step() - optimizer_step,
-            samples,
-            config.learning_rate,
-        );
-        timing.enter(TrainingStage::Finalization);
-        self.state.completed_updates = self.state.trainer.updates();
-        self.state.rollout_samples = self
-            .state
-            .rollout_samples
-            .checked_add(samples as u64)
-            .ok_or(PpoError::CounterOverflow)?;
-        self.state.counters.merge(&report)?;
-        generations.commit_adaptive(next_adaptive, self.state.completed_updates);
-        self.state.adaptive_environment = next_adaptive;
-        Ok(())
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn collect_update_wave(
-        &mut self,
-        settings: &AnnealedJobConfig,
-        harness: AnnealedHarness,
-        config: PpoConfig,
-        generations: &mut GenerationCache,
-        local: usize,
-        seats: &[usize],
-        rollout: &mut PpoRollout,
-        report: &mut CollectionReport,
-    ) -> Result<(), PpoError> {
-        if settings.execution.actor_pipeline_groups == 1 {
-            return self.collect_update_batch(
-                settings,
-                harness,
-                config,
-                generations,
-                local,
-                seats,
-                rollout,
-                report,
-            );
-        }
-        let group_count = settings.execution.actor_pipeline_groups;
-        assert!(matches!(group_count, 2 | 4));
-        assert!(settings.parallel_worlds * group_count <= crate::PPO_MAX_PARALLEL_WORLDS);
-        let mut groups = Vec::new();
-        groups.try_reserve_exact(group_count).map_err(|error| {
-            PpoError::Model(format!("actor pipeline groups allocation: {error}"))
-        })?;
-        for group in 0..group_count {
-            groups.push(self.build_actor_group(
-                settings,
-                generations,
-                local + group * settings.parallel_worlds,
-                seats,
-            )?);
-        }
-        episode::collect_actor_pipeline_with_opponent_batching(
-            &self.state.model,
-            config,
-            &mut groups,
-            harness.episode_decisions(),
-            rollout,
-            report,
-            settings.execution.reuse_actor_values,
-            settings.execution.neural_opponent_batching,
-        )?;
-        for group in &groups {
-            for environment in &group.environments {
-                reject_production_rejection(environment, "annealed collection")?;
-            }
-        }
-        Ok(())
-    }
-
-    fn build_actor_group(
-        &mut self,
-        settings: &AnnealedJobConfig,
-        generations: &mut GenerationCache,
-        local: usize,
-        seats: &[usize],
-    ) -> Result<episode::ActorGroup, PpoError> {
-        let global_game = self
-            .state
-            .completed_updates
-            .checked_mul(settings.games_per_update as u64)
-            .and_then(|base| base.checked_add(local as u64))
-            .ok_or(PpoError::CounterOverflow)?;
-        let draw = generations.draw_for_game(global_game)?;
-        let batch_len = settings.parallel_worlds;
-        assert!(local + batch_len <= settings.games_per_update);
-        assert!(global_game + batch_len as u64 <= draw.end_game);
-        let environments = batch_environments(
-            settings,
-            global_game,
-            &seats[local..local + batch_len],
-            &self.opponent,
-            &draw,
-        )?;
-        let streams = (0..batch_len)
-            .map(|offset| episode::game_stream(settings.seed, global_game + offset as u64))
-            .collect::<Result<Vec<_>, _>>()?;
-        let random = actor_stream_rngs(&mut self.state.sampling, batch_len)?;
-        Ok(episode::ActorGroup {
-            stream_base: local,
-            environments,
-            streams,
-            random,
-        })
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn collect_update_batch(
-        &mut self,
-        settings: &AnnealedJobConfig,
-        harness: AnnealedHarness,
-        config: PpoConfig,
-        generations: &mut GenerationCache,
-        local: usize,
-        seats: &[usize],
-        rollout: &mut PpoRollout,
-        report: &mut CollectionReport,
-    ) -> Result<(), PpoError> {
-        let global_game = self
-            .state
-            .completed_updates
-            .checked_mul(settings.games_per_update as u64)
-            .and_then(|base| base.checked_add(local as u64))
-            .ok_or(PpoError::CounterOverflow)?;
-        let draw = generations.draw_for_game(global_game)?;
-        let batch_len = settings.parallel_worlds;
-        assert!(
-            local + batch_len <= settings.games_per_update,
-            "batch stays inside the update"
-        );
-        assert!(
-            global_game + batch_len as u64 <= draw.end_game,
-            "batch stays inside one generation"
-        );
-        let mut environments = batch_environments(
-            settings,
-            global_game,
-            &seats[local..local + batch_len],
-            &self.opponent,
-            &draw,
-        )?;
-        let mut streams = (0..batch_len)
-            .map(|offset| episode::game_stream(settings.seed, global_game + offset as u64))
-            .collect::<Result<Vec<_>, _>>()?;
-        let mut random = actor_stream_rngs(&mut self.state.sampling, batch_len)?;
-        episode::collect_batch_with_opponent_batching(
-            &self.state.model,
-            config,
-            local,
-            "annealed",
-            &mut environments,
-            &mut streams,
-            &mut random,
-            harness.episode_decisions(),
-            rollout,
-            report,
-            settings.execution.reuse_actor_values,
-            settings.execution.neural_opponent_batching,
-        )?;
-        for environment in &environments {
-            reject_production_rejection(environment, "annealed collection")?;
-        }
-        Ok(())
-    }
-
-    fn report(&self) -> AnnealedJobReport {
-        let state = &self.state;
-        AnnealedJobReport {
-            starting_policy_fingerprint: state.starting_policy_fingerprint,
-            completed_updates: state.completed_updates,
-            optimizer_step: state.trainer.optimizer_step(),
-            rollout_samples: state.rollout_samples,
-            games: self.games,
-            generations: self.generations,
-            map2_reward: state.counters.map2_reward,
-            episode_timeouts: state.counters.episode_timeouts,
-            terminal_wins: state.counters.terminal_wins,
-            terminal_losses: state.counters.terminal_losses,
-            terminal_draws: state.counters.terminal_draws,
-            elapsed_ticks: state.counters.elapsed_ticks,
-            latest: state.latest,
-        }
-    }
-}
-
-fn batch_environments(
-    settings: &AnnealedJobConfig,
-    global_game: u64,
-    seats: &[usize],
-    opponent: &AnnealedOpponentRuntime,
-    draw: &GenerationDraw,
-) -> Result<Vec<TrainingEnvironment>, PpoError> {
-    assert_eq!(seats.len(), settings.parallel_worlds);
-    assert!(seats.len() <= crate::PPO_MAX_PARALLEL_WORLDS);
-    let rules = generation_rules(draw, global_game);
-    let mut environments = Vec::with_capacity(seats.len());
-    for (offset, seat) in seats.iter().copied().enumerate() {
-        let game = global_game + offset as u64;
-        let seed = derive_training_seed(settings.seed, game, crate::randomization::ARENA_DOMAIN);
-        let opponent_seed =
-            derive_training_seed(settings.seed, game, crate::randomization::OPPONENT_DOMAIN);
-        environments.push(build_environment(
-            seed,
-            opponent_seed,
-            MapId(2),
-            seat,
-            opponent.spec(),
-            rules.clone(),
-        )?);
-    }
-    Ok(environments)
-}
-
-/// The rules one generation's draw puts on a batch starting at `global_game`.
-///
-/// A generation that crosses the zero window carries rules only for the games
-/// it still covers; a fully truncated generation carries none.
-fn generation_rules(draw: &GenerationDraw, global_game: u64) -> Vec<SpawnModifier> {
-    let applied_through = draw.start_game.saturating_add(draw.applied_games);
-    if draw.applies() && global_game < applied_through {
-        spawn_modifiers_for(draw.spec)
-    } else {
-        Vec::new()
-    }
 }
 
 /// The trusted spawn rules one generation's spec turns into.
@@ -750,7 +296,7 @@ fn generation_rules(draw: &GenerationDraw, global_game: u64) -> Vec<SpawnModifie
 ///
 /// A rule whose fields are all neutral is left out, so a nominal spec yields
 /// no rules at all and a zero-temperature update never touches a world.
-fn spawn_modifiers_for(spec: ModifierSpec) -> Vec<SpawnModifier> {
+pub(super) fn spawn_modifiers_for(spec: ModifierSpec) -> Vec<SpawnModifier> {
     if spec.is_nominal() {
         return Vec::new();
     }
@@ -853,6 +399,20 @@ impl GenerationCache {
         }
     }
 
+    /// The spawn modifiers of games that start while `update` is collected.
+    ///
+    /// A generation crossing into the zero window applies only to the updates
+    /// it still covers; a fully truncated generation applies to none.
+    fn spec_for_update(&mut self, update: u64) -> Result<ModifierSpec, PpoError> {
+        let draw = self.draw_for_game(update)?;
+        let applied_through = draw.start_game.saturating_add(draw.applied_games);
+        Ok(if draw.applies() && update < applied_through {
+            draw.spec
+        } else {
+            ModifierSpec::NOMINAL
+        })
+    }
+
     /// The draw for one generation, written and verified on first use.
     fn draw(&mut self, generation: u64) -> Result<GenerationDraw, PpoError> {
         if self
@@ -888,18 +448,6 @@ impl GenerationCache {
     }
 }
 
-/// One balanced seat assignment per update: exactly half of the games per side.
-fn balanced_policy_seats(seed: u64, update: u64, games: usize) -> Result<Vec<usize>, PpoError> {
-    assert!((2..=PPO_MAX_GAMES).contains(&games));
-    assert!(games.is_multiple_of(2), "sides need an even game count");
-    let mut seats = (0..games).map(|index| index % 2).collect::<Vec<_>>();
-    let mut rng = PpoRng::new(derive_training_seed(seed, update, SEAT_DOMAIN));
-    rng.shuffle(&mut seats)?;
-    assert_eq!(seats.iter().filter(|seat| **seat == 0).count(), games / 2);
-    assert_eq!(seats.iter().filter(|seat| **seat == 1).count(), games / 2);
-    Ok(seats)
-}
-
 fn anneal_schedule(settings: &AnnealedJobConfig) -> AnnealSchedule {
     AnnealSchedule {
         updates: settings.updates,
@@ -908,48 +456,55 @@ fn anneal_schedule(settings: &AnnealedJobConfig) -> AnnealSchedule {
     }
 }
 
-fn load_opponent(
-    opponent: &AnnealedOpponent,
-    device: PolicyDevice,
-) -> Result<LoadedOpponent, PpoError> {
-    match opponent {
-        AnnealedOpponent::Teacher => Ok(LoadedOpponent {
-            runtime: AnnealedOpponentRuntime::Teacher,
-            fingerprint: None,
-        }),
-        AnnealedOpponent::Weights(directory) => {
-            let model = PolicyModel::fresh_on(0, device).map_err(text_error)?;
-            TrainingArtifact::load_runtime_weights(&model, directory).map_err(text_error)?;
-            let fingerprint = model.parameter_fingerprint().map_err(text_error)?;
-            Ok(LoadedOpponent {
-                runtime: AnnealedOpponentRuntime::Weights(Arc::new(model)),
-                fingerprint: Some(fingerprint),
-            })
-        }
+/// Loads every frozen snapshot of the mixture once, on the host.
+fn load_opponents(settings: &AnnealedJobConfig) -> Result<OpponentPool, PpoError> {
+    let mut entries = Vec::with_capacity(settings.opponents.len());
+    let mut snapshots = Vec::new();
+    let mut fingerprints = Vec::new();
+    for (opponent, weight) in &settings.opponents {
+        let kind = match opponent {
+            AnnealedOpponent::Teacher => OpponentKind::Teacher,
+            AnnealedOpponent::SelfPlay => OpponentKind::SelfPlay,
+            AnnealedOpponent::Weights(directory) => {
+                let model = PolicyModel::fresh_on(0, PolicyDevice::Cpu).map_err(text_error)?;
+                TrainingArtifact::load_runtime_weights(&model, directory).map_err(text_error)?;
+                fingerprints.push(model.parameter_fingerprint().map_err(text_error)?);
+                snapshots.push(std::sync::Arc::new(
+                    model.export_parameters().map_err(text_error)?,
+                ));
+                OpponentKind::Snapshot(snapshots.len() - 1)
+            }
+        };
+        entries.push((kind, weight.units()));
     }
+    Ok(OpponentPool {
+        mixture: OpponentMixture::new(entries)?,
+        snapshots,
+        fingerprints,
+    })
 }
 
 /// The canonical command line recorded as the run scope.
 ///
 /// Resume compares it byte for byte, so every loop parameter that shapes the
-/// run is part of it and a mismatched parameter rejects before any game. The
-/// frozen weights fingerprint pins the tensors, not only the directory path.
+/// run is part of it and a mismatched parameter rejects before any game.
+/// Frozen weights fingerprints pin the tensors, not only the directory paths.
 fn annealed_run(
     settings: &AnnealedJobConfig,
     device: PolicyDevice,
     config: PpoConfig,
     harness: AnnealedHarness,
-    opponent_fingerprint: Option<u64>,
+    pool: &OpponentPool,
 ) -> Result<CheckpointRun, PpoError> {
     settings.execution.validate()?;
-    validate_opponent_inference(settings)?;
     let device_name = device_name(device);
     let mut command_line = format!(
-        "train-annealed --updates {} --games {} --parallel {} --generation-games {} --zero-updates {} --epochs {} --minibatch {} --seed {} --map 2 --device {device_name}",
+        "train-annealed --updates {} --samples-per-update {} --slots {} --lanes {} --generation-updates {} --zero-updates {} --epochs {} --minibatch {} --seed {} --map 2 --device {device_name} --pipeline-staleness {PIPELINE_STALENESS}",
         settings.updates,
-        settings.games_per_update,
-        settings.parallel_worlds,
-        settings.games_per_generation,
+        config.samples_per_update,
+        settings.slots,
+        settings.lanes,
+        settings.generation_updates,
         settings.zero_updates,
         config.epochs,
         config.minibatch,
@@ -961,15 +516,7 @@ fn annealed_run(
             harness.episode_decisions()
         ));
     }
-    match &settings.opponent {
-        AnnealedOpponent::Teacher => command_line.push_str(" --opponent teacher"),
-        AnnealedOpponent::Weights(directory) => {
-            command_line.push_str(&format!(" --opponent-weights {}", directory.display()));
-            let fingerprint = opponent_fingerprint
-                .ok_or(PpoError::InvalidConfig("annealed opponent fingerprint"))?;
-            command_line.push_str(&format!(" --opponent-fingerprint {fingerprint:016x}"));
-        }
-    }
+    append_opponent_scope(settings, pool, &mut command_line)?;
     let defaults = PpoConfig::default();
     if config.learning_rate != defaults.learning_rate {
         command_line.push_str(&format!(" --learning-rate {}", config.learning_rate));
@@ -999,6 +546,35 @@ fn annealed_run(
     })
 }
 
+/// Records the opponent mixture in order, pinning frozen snapshots by fingerprint.
+fn append_opponent_scope(
+    settings: &AnnealedJobConfig,
+    pool: &OpponentPool,
+    command_line: &mut String,
+) -> Result<(), PpoError> {
+    let mut fingerprints = pool.fingerprints.iter();
+    for (opponent, weight) in &settings.opponents {
+        match opponent {
+            AnnealedOpponent::Teacher => {
+                command_line.push_str(&format!(" --opponent teacher:{weight}"))
+            }
+            AnnealedOpponent::SelfPlay => {
+                command_line.push_str(&format!(" --opponent self:{weight}"))
+            }
+            AnnealedOpponent::Weights(directory) => {
+                let fingerprint = fingerprints
+                    .next()
+                    .ok_or(PpoError::InvalidConfig("annealed opponent fingerprint"))?;
+                command_line.push_str(&format!(
+                    " --opponent weights:{}:{weight} --opponent-fingerprint {fingerprint:016x}",
+                    directory.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Validates every annealed parameter.
 pub(crate) fn validate_annealed(
     settings: &AnnealedJobConfig,
@@ -1017,7 +593,7 @@ pub(crate) fn validate_annealed(
             "annealed invocation updates exceed MAX_TRAINING_COUNTER",
         ));
     }
-    validate_annealed_batches(settings)?;
+    validate_collection(settings)?;
     adaptive::validate(settings, harness)?;
     if settings.zero_updates > settings.updates {
         return Err(PpoError::InvalidConfig(
@@ -1034,113 +610,64 @@ pub(crate) fn validate_annealed(
         return Err(PpoError::InvalidConfig("annealed simulator commit"));
     }
     validate_checkpoint_cadence(settings.checkpoint_cadence)?;
-    if let AnnealedOpponent::Weights(directory) = &settings.opponent
-        && directory.as_os_str().is_empty()
-    {
-        return Err(PpoError::InvalidConfig("annealed opponent weights"));
-    }
+    validate_opponents(settings)?;
     let config = validate_annealed_ppo(settings)?;
-    validate_opponent_inference(settings)?;
-    if settings.execution.neural_opponent_batching {
-        episode::validate_neural_opponent_memory(
-            config,
-            settings.parallel_worlds * settings.execution.actor_pipeline_groups,
-        )?;
-    }
-    validate_actor_pipeline(settings, config)?;
     validate_annealed_counters(settings, config)?;
     Ok(config)
 }
 
-fn validate_annealed_batches(settings: &AnnealedJobConfig) -> Result<(), PpoError> {
-    if settings.games_per_update < 2
-        || settings.games_per_update > PPO_MAX_GAMES
-        || !settings.games_per_update.is_multiple_of(2)
-    {
+fn validate_collection(settings: &AnnealedJobConfig) -> Result<(), PpoError> {
+    if !(1..=MAX_SLOTS).contains(&settings.slots) {
         return Err(PpoError::InvalidConfig(
-            "annealed games per update must be even and within 2..=40",
+            "annealed slots must be within 1..=256",
         ));
     }
-    if settings.parallel_worlds == 0 || settings.parallel_worlds > crate::PPO_MAX_PARALLEL_WORLDS {
-        return Err(PpoError::InvalidConfig("annealed parallel worlds"));
+    if settings.lanes == 0 || !settings.slots.is_multiple_of(settings.lanes) {
+        return Err(PpoError::InvalidConfig("annealed lanes must divide slots"));
     }
-    let wave_worlds = settings
-        .parallel_worlds
-        .checked_mul(settings.execution.actor_pipeline_groups)
-        .filter(|worlds| *worlds <= crate::PPO_MAX_PARALLEL_WORLDS)
-        .ok_or(PpoError::InvalidConfig(
-            "annealed actor pipeline active worlds must not exceed 64",
-        ))?;
-    if !settings
-        .games_per_update
-        .is_multiple_of(settings.parallel_worlds)
-    {
+    // A lane batches its slots plus any self-play opponent rows in one call.
+    if 2 * (settings.slots / settings.lanes) > crate::MODEL_SAMPLING_BATCH {
         return Err(PpoError::InvalidConfig(
-            "annealed parallel worlds must divide games per update",
+            "annealed lanes hold at most 64 slots each",
         ));
     }
-    if !settings.games_per_update.is_multiple_of(wave_worlds) {
-        return Err(PpoError::InvalidConfig(
-            "annealed actor pipeline wave must divide games per update",
-        ));
+    if !(1..=256).contains(&settings.simulation_threads) {
+        return Err(PpoError::InvalidConfig("annealed simulation threads"));
     }
-    if settings.games_per_generation == 0
-        || settings.games_per_generation > MAX_TRAINING_COUNTER
-        || !settings
-            .games_per_generation
-            .is_multiple_of(settings.parallel_worlds as u64)
-    {
-        return Err(PpoError::InvalidConfig(
-            "annealed games per generation must be positive and divisible by parallel worlds",
-        ));
+    if settings.generation_updates == 0 || settings.generation_updates > MAX_TRAINING_COUNTER {
+        return Err(PpoError::InvalidConfig("annealed generation updates"));
     }
     Ok(())
 }
 
-fn validate_opponent_inference(settings: &AnnealedJobConfig) -> Result<(), PpoError> {
-    let weights = matches!(settings.opponent, AnnealedOpponent::Weights(_));
-    if settings.execution.neural_opponent_batching && !weights {
+fn validate_opponents(settings: &AnnealedJobConfig) -> Result<(), PpoError> {
+    if settings.opponents.is_empty() || settings.opponents.len() > 16 {
         return Err(PpoError::InvalidConfig(
-            "neural opponent batching requires a weights opponent",
+            "annealed opponent mixture needs 1..=16 entries",
         ));
     }
-    if weights
-        && settings.execution.actor_pipeline_groups > 1
-        && !settings.execution.neural_opponent_batching
-    {
-        return Err(PpoError::InvalidConfig(
-            "annealed actor pipeline weights opponent requires batched inference",
-        ));
+    for (opponent, weight) in &settings.opponents {
+        if weight.units() == 0 || weight.units() > 1_000 * EnvironmentDecimal::SCALE {
+            return Err(PpoError::InvalidConfig("annealed opponent weight"));
+        }
+        if let AnnealedOpponent::Weights(directory) = opponent
+            && directory.as_os_str().is_empty()
+        {
+            return Err(PpoError::InvalidConfig("annealed opponent weights"));
+        }
     }
     Ok(())
-}
-
-fn validate_actor_pipeline(
-    settings: &AnnealedJobConfig,
-    config: PpoConfig,
-) -> Result<(), PpoError> {
-    if settings.execution.actor_pipeline_groups == 1 {
-        return Ok(());
-    }
-    assert!(matches!(settings.execution.actor_pipeline_groups, 2 | 4));
-    assert_eq!(settings.ppo, config);
-    episode::validate_pipeline_memory(
-        config,
-        settings.parallel_worlds,
-        settings.execution.actor_pipeline_groups,
-    )
 }
 
 fn validate_annealed_ppo(settings: &AnnealedJobConfig) -> Result<PpoConfig, PpoError> {
     let config = settings.ppo;
-    if config.environments != settings.games_per_update {
+    if !(1..=MAX_SAMPLES_PER_UPDATE).contains(&config.samples_per_update)
+        || !config
+            .samples_per_update
+            .is_multiple_of(settings.lanes.max(1))
+    {
         return Err(PpoError::InvalidConfig(
-            "annealed PPO environments must equal games per update",
-        ));
-    }
-    if config.rollout_decisions != MAP2_RETAINED_DECISIONS {
-        return Err(PpoError::InvalidConfig(
-            "annealed PPO rollout must be the retained decision count",
+            "annealed samples per update must be a multiple of lanes within 1..=32768",
         ));
     }
     if config.decision_interval_ticks != MAP2_DECISION_INTERVAL_TICKS {
@@ -1160,11 +687,7 @@ fn validate_annealed_counters(
     settings: &AnnealedJobConfig,
     config: PpoConfig,
 ) -> Result<(), PpoError> {
-    assert_eq!(config.environments, settings.games_per_update);
-    assert_eq!(config.rollout_decisions, MAP2_RETAINED_DECISIONS);
-    let samples = (config.environments as u64)
-        .checked_mul(config.rollout_decisions as u64)
-        .ok_or(PpoError::InvalidConfig("annealed sample counter"))?;
+    let samples = config.rollout_capacity(settings.slots) as u64;
     let optimizer_steps = samples
         .div_ceil(config.minibatch as u64)
         .checked_mul(config.epochs as u64)
@@ -1181,14 +704,7 @@ fn validate_annealed_counters(
         MAX_TRAINING_COUNTER,
         "annealed sample counter",
     )?;
-    validate_counter_budget(
-        settings.updates,
-        settings.games_per_update as u64,
-        MAX_TRAINING_COUNTER,
-        "annealed actor RNG counter",
-    )?;
-    // All games share one shuffle per epoch; multiplying by games again would
-    // incorrectly reject the expanded profile's normal production budgets.
+    // All samples share one shuffle per epoch.
     let shuffle_draws = samples
         .saturating_sub(1)
         .checked_mul(config.epochs as u64)

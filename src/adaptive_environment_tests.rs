@@ -670,18 +670,35 @@ fn rate_endpoints_are_inclusive_and_large_game_counts_use_exact_products() {
 }
 
 #[test]
+fn an_update_without_finished_games_spends_budget_but_breaks_both_streaks() {
+    let config = AdaptiveEnvironmentConfig {
+        success_updates: 2,
+        poor_updates: 2,
+        ..AdaptiveEnvironmentConfig::default()
+    };
+    let limits = limits(10, 20, 0);
+    let winning = run(config, limits, &[10]);
+    assert_eq!(winning.success_streak, 1);
+    let empty = winning
+        .observe(config, limits, 2, 0, 0)
+        .expect("no finished game");
+    assert_eq!(empty.updates_in_generation, 2);
+    assert_eq!((empty.success_streak, empty.poor_streak), (0, 0));
+    let losing = run(config, limits, &[0]);
+    assert_eq!(losing.poor_streak, 1);
+    let empty = losing
+        .observe(config, limits, 2, 0, 0)
+        .expect("no finished game");
+    assert_eq!((empty.success_streak, empty.poor_streak), (0, 0));
+}
+
+#[test]
 fn invalid_results_and_update_sequences_leave_the_original_state_unchanged() {
     let config = AdaptiveEnvironmentConfig::default();
     let limits = limits(10, 20, 0);
     let state = run(config, limits, &[0]);
     let saved = state;
     for (completed, wins, games, message) in [
-        (
-            2,
-            0,
-            0,
-            "environment observation requires at least one game",
-        ),
         (2, 11, 10, "environment wins must not exceed games"),
         (
             0,

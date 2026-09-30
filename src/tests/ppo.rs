@@ -85,7 +85,7 @@ fn invalid_sampling_batches_do_not_consume_rng() {
     let model = PolicyModel::fresh(9_102).expect("model");
     let (frame, space) = frame_and_space();
     let (_, stale) = frame_and_space();
-    let frames = vec![frame; MODEL_TRAINING_BATCH + 1];
+    let frames = vec![frame; crate::MODEL_SAMPLING_BATCH + 1];
     let spaces = [space, stale];
     for (count, range, random_count, message) in [
         (
@@ -95,12 +95,13 @@ fn invalid_sampling_batches_do_not_consume_rng() {
             "model batch must contain at least one frame".to_owned(),
         ),
         (
-            MODEL_TRAINING_BATCH + 1,
+            crate::MODEL_SAMPLING_BATCH + 1,
             0..0,
             1,
             format!(
-                "model batch count {} exceeds maximum {MODEL_TRAINING_BATCH}",
-                MODEL_TRAINING_BATCH + 1
+                "model batch count {} exceeds maximum {}",
+                crate::MODEL_SAMPLING_BATCH + 1,
+                crate::MODEL_SAMPLING_BATCH
             ),
         ),
         (
@@ -169,7 +170,7 @@ fn failing_a_head_after_sampling_restores_rng() {
 }
 
 #[test]
-fn trainer_retry_learns_rewarded_action_and_rejects_stale_rollout_transactionally() {
+fn trainer_retry_learns_rewarded_action_and_rejects_overly_stale_rollout_transactionally() {
     let (frame, space) = frame_and_space();
     let model = PolicyModel::fresh(101).expect("model");
     let reference = PolicyModel::fresh(101).expect("reference");
@@ -221,6 +222,14 @@ fn trainer_retry_learns_rewarded_action_and_rejects_stale_rollout_transactionall
     assert_eq!(actual.parameters, expected_state.parameters);
     assert_eq!(actual.adam.moments(), expected_state.adam.moments());
     assert_eq!(trainer.rng_checkpoint(), expected.rng_checkpoint());
+    // Behaviour weights one and two updates old are within the pipeline bound.
+    for update in [2, 3] {
+        let report = trainer
+            .train_update(&model, &batch)
+            .expect("bounded staleness");
+        assert_eq!(report.update, update);
+    }
+    let actual = trainer.checkpoint_snapshot(&model).expect("third snapshot");
     let random = trainer.rng_checkpoint();
     assert_eq!(
         trainer
@@ -273,30 +282,31 @@ fn uneven_microbatch_partitions_produce_the_same_effective_update() {
 fn gae_discounts_elapsed_ticks_and_stops_bootstrapping_at_terminal() {
     let (frame, space) = frame_and_space();
     let model = PolicyModel::fresh(93).expect("model");
-    let mut rollout =
-        PpoRollout::new(2, model.policy_identity().expect("policy")).expect("rollout");
+    let mut rollout = PpoRollout::new(2).expect("rollout");
     for (decision, reward, terminal) in [(0, 1.0, false), (1, 2.0, true)] {
         let mut sampled = choice(&model, &frame, &space, StructuredAction::Continue);
         sampled.value = 0.0;
         rollout
             .push(
                 sampled
-                    .finish(PpoOutcome {
-                        stream: 0,
-                        decision,
-                        ticks: 1,
-                        next_value: 0.0,
-                        reward,
-                        terminal,
-                    })
+                    .finish(
+                        0,
+                        PpoOutcome {
+                            stream: 0,
+                            decision,
+                            ticks: 1,
+                            next_value: 0.0,
+                            reward,
+                            terminal,
+                        },
+                    )
                     .expect("transition"),
             )
             .expect("push");
     }
     let batch = rollout
         .finish(PpoConfig {
-            rollout_decisions: 2,
-            environments: 1,
+            samples_per_update: 2,
             minibatch: 1,
             gamma_tick: 0.9,
             gae_lambda: 0.8,
@@ -313,8 +323,7 @@ fn explained_variance_separates_exact_blind_and_undefined_critics() {
     let model = PolicyModel::fresh(94).expect("model");
     let returns = [1.0f32, -1.0, 0.5, 0.25];
     let batch = |values: [f32; 4], rewards: [f32; 4]| {
-        let mut rollout =
-            PpoRollout::new(4, model.policy_identity().expect("policy")).expect("rollout");
+        let mut rollout = PpoRollout::new(4).expect("rollout");
         for (stream, (value, reward)) in values.into_iter().zip(rewards).enumerate() {
             let mut sampled = choice(&model, &frame, &space, StructuredAction::Continue);
             sampled.value = value;
@@ -327,12 +336,11 @@ fn explained_variance_separates_exact_blind_and_undefined_critics() {
                 terminal: true,
             };
             rollout
-                .push(sampled.finish(outcome).expect("transition"))
+                .push(sampled.finish(0, outcome).expect("transition"))
                 .expect("push");
         }
         let config = PpoConfig {
-            rollout_decisions: 1,
-            environments: 4,
+            samples_per_update: 4,
             minibatch: 4,
             ..PpoConfig::default()
         };
@@ -362,18 +370,21 @@ fn compact_rollout_storage_preserves_frame_target_and_behavior_statistics() {
     let target = sampled.target.clone();
     let packed = target.pack();
     let log_probability = sampled.log_probability;
-    let mut rollout = PpoRollout::new(1, sampled.policy).expect("rollout");
+    let mut rollout = PpoRollout::new(1).expect("rollout");
     rollout
         .push(
             sampled
-                .finish(PpoOutcome {
-                    stream: 0,
-                    decision: 0,
-                    ticks: 3,
-                    next_value: 0.0,
-                    reward: 1.0,
-                    terminal: true,
-                })
+                .finish(
+                    0,
+                    PpoOutcome {
+                        stream: 0,
+                        decision: 0,
+                        ticks: 3,
+                        next_value: 0.0,
+                        reward: 1.0,
+                        terminal: true,
+                    },
+                )
                 .expect("transition"),
         )
         .expect("push");
@@ -421,14 +432,17 @@ pub(super) fn prepared_choice(stream: usize, choice: PpoPolicyChoice) -> crate::
         return_value: choice.value(),
         advantage: 1.0,
         transition: choice
-            .finish(PpoOutcome {
-                stream,
-                decision: 0,
-                ticks: 3,
-                next_value: 0.0,
-                reward: 0.0,
-                terminal: true,
-            })
+            .finish(
+                0,
+                PpoOutcome {
+                    stream,
+                    decision: 0,
+                    ticks: 3,
+                    next_value: 0.0,
+                    reward: 0.0,
+                    terminal: true,
+                },
+            )
             .expect("transition"),
     }
 }
@@ -455,8 +469,7 @@ fn choice(
 
 fn smoke_config() -> PpoConfig {
     PpoConfig {
-        rollout_decisions: 1,
-        environments: 2,
+        samples_per_update: 2,
         epochs: 1,
         minibatch: 2,
         entropy_coefficient: 1.0e-4,
@@ -471,8 +484,7 @@ fn bandit_batch(
     space: &ActionSpace,
     config: PpoConfig,
 ) -> crate::PpoBatch {
-    let mut rollout =
-        PpoRollout::new(2, model.policy_identity().expect("policy")).expect("rollout");
+    let mut rollout = PpoRollout::new(2).expect("rollout");
     for (stream, action, reward) in [
         (0, StructuredAction::Continue, 1.0),
         (
@@ -486,14 +498,17 @@ fn bandit_batch(
         rollout
             .push(
                 choice(model, frame, space, action)
-                    .finish(PpoOutcome {
-                        stream,
-                        decision: 0,
-                        ticks: 3,
-                        next_value: 0.0,
-                        reward,
-                        terminal: true,
-                    })
+                    .finish(
+                        0,
+                        PpoOutcome {
+                            stream,
+                            decision: 0,
+                            ticks: 3,
+                            next_value: 0.0,
+                            reward,
+                            terminal: true,
+                        },
+                    )
                     .expect("transition"),
             )
             .expect("push");
@@ -522,15 +537,70 @@ fn set_parameter_range(
     panic!("missing parameter {target}");
 }
 
-#[cfg(feature = "builtin")]
 #[test]
-fn episode_retention_preserves_actor_rng_delayed_credit_and_timeout_bootstrap() {
-    let model = PolicyModel::fresh(23_077).expect("model");
-    let mut parameters = vec![0.0; model.parameter_count()];
-    let kind = crate::ActionKind::Stop.index();
-    set_parameter_range(&model, &mut parameters, "kind.bias", kind..kind + 1, 10.0);
-    model.import_parameters(&parameters).expect("stop policy");
-    crate::ppo_arena::episode::assert_retention_actor_parity_for_test(&model);
-    crate::ppo_arena::episode::assert_retention_boundaries_for_test(&model);
-    crate::ppo_arena::episode::assert_full_mc_for_test();
+fn full_monte_carlo_returns_ignore_intermediate_bootstraps_but_not_truncation() {
+    let (frame, space) = frame_and_space();
+    let model = PolicyModel::fresh(9921000).expect("model");
+    let sampled = choice(&model, &frame, &space, StructuredAction::Continue);
+    let config = PpoConfig {
+        samples_per_update: 2 * crate::MAP2_RETAINED_DECISIONS,
+        minibatch: 512,
+        gae_lambda: 1.0,
+        gamma_tick: crate::MAP2_REWARD_GAMMA_TICK,
+        ..PpoConfig::default()
+    };
+    let retained = crate::MAP2_RETAINED_DECISIONS;
+    let mut rollout = PpoRollout::new(2 * retained).expect("rollout");
+    for decision in 0..retained {
+        let terminal = decision + 1 == retained;
+        let stride = crate::MAP2_RETENTION_STRIDE;
+        let ticks = (crate::MAP2_ACTOR_DECISIONS - decision * stride).min(stride) as u32 * 3
+            - u32::from(terminal);
+        for stream in 0..2 {
+            let reward = match (terminal, stream) {
+                (true, 0) => 1.0,
+                (true, _) => -1.0,
+                (false, _) => 0.0,
+            };
+            let outcome = PpoOutcome {
+                stream,
+                decision: decision as u32,
+                ticks,
+                reward,
+                terminal,
+                next_value: if terminal { 0.0 } else { 99.0 },
+            };
+            rollout
+                .push(sampled.clone().finish(0, outcome).expect("transition"))
+                .expect("push");
+        }
+    }
+    let batch = rollout.finish(config).expect("MC batch");
+    for index in 0..batch.len() {
+        let sample = batch.sample(index).expect("sample");
+        let expected = if index.is_multiple_of(2) { 1.0 } else { -1.0 };
+        assert!((sample.return_value() - expected).abs() < 1e-5);
+        let terminal = index / 2 + 1 == retained;
+        assert_eq!(sample.transition.terminal, terminal);
+        assert_eq!(sample.transition.ticks, if terminal { 11 } else { 24 });
+    }
+    let mut truncated = PpoRollout::new(1).expect("truncated");
+    let outcome = PpoOutcome {
+        stream: 0,
+        decision: 0,
+        ticks: 11,
+        next_value: 0.7,
+        reward: 0.0,
+        terminal: false,
+    };
+    truncated
+        .push(sampled.finish(0, outcome).expect("timeout"))
+        .expect("push");
+    let sample = truncated
+        .finish(config)
+        .expect("timeout MC")
+        .sample(0)
+        .expect("sample");
+    assert!(!sample.transition.terminal);
+    assert!((sample.return_value() - 0.7).abs() < 1e-5);
 }

@@ -20,7 +20,7 @@ fn assert_folded_ppo(device: PolicyDevice) {
     let mut expected_adam = reference
         .claim_optimizer(config.adam())
         .expect("reference Adam");
-    let mut samples = transfer_ppo_samples(&model);
+    let mut samples = transfer_ppo_samples();
     for target_kl in [1000.0, 1000.0, 1000.0, 1.0e-12] {
         refresh_old_probabilities(&model, &mut samples);
         if target_kl < 1000.0 {
@@ -73,8 +73,7 @@ fn assert_folded_ppo(device: PolicyDevice) {
 #[test]
 fn folded_updates_preserve_shuffle_parameters_and_optimizer_state() {
     let config = PpoConfig {
-        environments: 3,
-        rollout_decisions: 1,
+        samples_per_update: 3,
         minibatch: 2,
         epochs: 2,
         target_kl: 1000.0,
@@ -105,10 +104,9 @@ fn folded_updates_preserve_shuffle_parameters_and_optimizer_state() {
 }
 
 fn learner_batch(model: &PolicyModel, config: PpoConfig) -> crate::PpoBatch {
-    let mut samples = transfer_ppo_samples(model);
+    let mut samples = transfer_ppo_samples();
     refresh_old_probabilities(model, &mut samples);
-    let mut rollout =
-        crate::PpoRollout::new(3, model.policy_identity().expect("identity")).expect("rollout");
+    let mut rollout = crate::PpoRollout::new(3).expect("rollout");
     for sample in samples {
         rollout.push(sample.transition).expect("transition");
     }
@@ -119,8 +117,7 @@ fn learner_batch(model: &PolicyModel, config: PpoConfig) -> crate::PpoBatch {
 fn folded_updates_skip_unused_error_on_kl_stop_and_roll_back_consumed_error() {
     for reject in [false, true] {
         let config = PpoConfig {
-            environments: 3,
-            rollout_decisions: 1,
+            samples_per_update: 3,
             minibatch: 2,
             epochs: 2,
             target_kl: if reject { 0.02 } else { 1000.0 },
@@ -185,7 +182,7 @@ fn previous_fold_error_outranks_a_later_microbatch_frame_error() {
     let config = transfer_ppo_config();
     let mut first = model.claim_optimizer(config.adam()).expect("Adam");
     let mut second = reference.claim_optimizer(config.adam()).expect("Adam");
-    let mut samples = transfer_ppo_samples(&model);
+    let mut samples = transfer_ppo_samples();
     samples[0].advantage = f32::NAN;
     samples[2].transition.frame.global[0] = f32::NAN;
     let examples = samples.iter().collect::<Vec<_>>();

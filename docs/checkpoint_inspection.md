@@ -120,8 +120,8 @@ Normal job acceptance must require `runtime_matches_model=true`; only an explici
 controller recovery policy may proceed without that export. Inspection never writes
 a replacement export.
 
-Fixed annealed scope reads exactly one canonical `--updates`, `--games`,
-`--generation-games`, and `--zero-updates`. Missing/duplicate/noncanonical counters
+Fixed annealed scope reads exactly one canonical `--updates`,
+`--generation-updates`, and `--zero-updates`. Missing/duplicate/noncanonical counters
 are rejected. Only the committed prefix is read, using bounded no-follow reads and
 the existing native draw/canonical-render functions. Adaptive inspection verifies
 the existing native snapshot contract and binds the inventoried bytes to the stored

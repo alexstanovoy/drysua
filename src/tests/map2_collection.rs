@@ -35,7 +35,7 @@ fn reward_rejection_preserves_accumulated_credit_and_allows_recovery() {
 
 #[test]
 fn both_seats_consume_untruncated_events_once_and_reject_reordered_terminal_messages() {
-    let mut environment = configured_environment(TICK_CAP - 2, 0, OpponentSpec::Idle, |_| {});
+    let mut environment = configured_environment(TICK_CAP - 2, 0, OpponentRuntime::Idle, |_| {});
     let heroes: Vec<_> = environment.seats[0]
         .tracker
         .current()
@@ -77,7 +77,7 @@ fn both_seats_consume_untruncated_events_once_and_reject_reordered_terminal_mess
             0
         );
     }
-    let mut environment = configured_environment(TICK_CAP - 1, 0, OpponentSpec::Idle, |_| {});
+    let mut environment = configured_environment(TICK_CAP - 1, 0, OpponentRuntime::Idle, |_| {});
     let mut messages = environment
         .arena
         .step(&[None, None])
@@ -96,10 +96,55 @@ fn both_seats_consume_untruncated_events_once_and_reject_reordered_terminal_mess
     assert_eq!(seat.tracker.map2_reward_state(), before);
 }
 
+/// One policy decision against an idle opponent, booked like a slot does.
+fn step_policy(
+    environment: &mut TrainingEnvironment,
+    stream: &mut EpisodeStream,
+    model: &PolicyModel,
+    done: bool,
+) -> CompletedAdvance {
+    let (frame, space) = prepare_policy_sample(environment).expect("frame");
+    let choice = model
+        .sample(&frame, &space, &mut PpoRng::new(982_004))
+        .expect("action");
+    if stream.begins_interval() {
+        stream.retain(RetainedChoice {
+            frame,
+            target: choice.target.clone(),
+            action: choice.action(),
+            behaviour: 0,
+            log_probability: choice.log_probability(),
+            value: choice.value(),
+        });
+    }
+    let seat = environment.policy_seat;
+    let mut requests = vec![None, None];
+    requests[seat] =
+        neural_policy_request_in_space(&mut environment.seats[seat], choice.action(), &space)
+            .expect("policy request")
+            .1;
+    requests[1 - seat] =
+        scripted_request(&mut environment.seats[1 - seat], OpponentRuntime::Idle).expect("idle");
+    let tick = environment.arena.tick();
+    let stepped = advance_interval(environment, requests, 3.min(TICK_CAP - tick)).expect("ticks");
+    let outcome = terminal_outcome(environment, stepped.winner);
+    let end_tick = tick + stepped.ticks;
+    let advanced = CompletedAdvance {
+        end_tick,
+        ticks: stepped.ticks,
+        outcome,
+        done: done || outcome.is_some() || end_tick >= TICK_CAP,
+    };
+    stream
+        .record_decision(environment, choice.action().kind(), &advanced, 1.0)
+        .expect("booked decision");
+    advanced
+}
+
 #[test]
 fn final_native_damage_is_rewarded_before_draw_finalization() {
     let model = stop_model();
-    let mut environment = configured_environment(TICK_CAP - 1, 0, OpponentSpec::Idle, |_| {});
+    let mut environment = configured_environment(TICK_CAP - 1, 0, OpponentRuntime::Idle, |_| {});
     environment.arena.configure_for_test(|world| {
         world.push_hit(
             world.seats[0].unit,
@@ -108,26 +153,15 @@ fn final_native_damage_is_rewarded_before_draw_finalization() {
             DamageKind::Pure,
         );
     });
-    let config = PpoConfig {
-        environments: 1,
-        rollout_decisions: 1,
-        minibatch: 1,
-        gamma_tick: 1.0,
-        ..PpoConfig::default()
-    };
-    let (frame, space) = prepare_policy_sample(&mut environment).expect("final frame");
-    let choice = model
-        .sample(&frame, &space, &mut PpoRng::new(982_004))
-        .expect("final action");
-    let mut state = EpisodeStream::default();
-    let completed =
-        advance_cpu(&mut environment, &mut state, choice, space, config).expect("final round");
+    let mut stream = EpisodeStream::new(1);
+    let completed = step_policy(&mut environment, &mut stream, &model, false);
     assert_eq!(completed.ticks, 1);
     assert_eq!(completed.outcome, Some(PpoTerminalOutcome::Draw));
-    assert!(state.done);
-    assert_eq!(state.map2_reward.components[5], 0.0);
-    assert!(state.map2_reward.components[2] > 0.0);
-    assert_eq!(state.map2_reward.observations.hero_damage_dealt, 100);
+    assert!(stream.done());
+    let reward = stream.map2_reward();
+    assert_eq!(reward.components[5], 0.0);
+    assert!(reward.components[2] > 0.0);
+    assert_eq!(reward.observations.hero_damage_dealt, 100);
     assert_eq!(
         environment.seats[0]
             .tracker
@@ -141,72 +175,29 @@ fn final_native_damage_is_rewarded_before_draw_finalization() {
 #[test]
 fn learner_deadline_zero_bootstraps_without_inventing_match_over() {
     let model = stop_model();
-    let mut environment = configured_environment(1, 0, OpponentSpec::Idle, |_| {});
-    let choice =
-        sample_policy(&model, &mut PpoRng::new(982_010), &mut environment).expect("action");
-    let mut state = EpisodeStream {
-        choice: Some(choice.clone()),
-        done: true,
-        decisions: 1,
-        summary: Some(crate::ppo_arena::game_summary::GameSummary::capture(
-            &environment,
-            None,
-            4,
-        )),
-        ..EpisodeStream::default()
-    };
-    assert_eq!(
-        advance_interval(&mut environment, vec![None, None], 3)
-            .expect("live ticks")
-            .winner,
-        None
-    );
-    let reward = observe_reward(&mut environment, &mut state, None, 3, 1.0).expect("deadline");
-    state
-        .append_retained_reward(reward, 3, 1.0)
-        .expect("pending interval");
-    let mut rollout = PpoRollout::new(1, choice.policy()).expect("rollout");
+    let mut environment = configured_environment(1, 0, OpponentRuntime::Idle, |_| {});
+    let mut stream = EpisodeStream::new(0);
+    let completed = step_policy(&mut environment, &mut stream, &model, true);
+    assert_eq!(completed.outcome, None);
+    assert_eq!((completed.end_tick, completed.ticks), (4, 3));
+    let transition = stream.flush(None).expect("terminal deadline");
+    assert!(transition.terminal);
+    assert_eq!(transition.next_value, 0.0);
+    assert_eq!(transition.ticks, 3);
+    assert_eq!(stream.map2_reward().components[5], 0.0);
+    let summary = crate::ppo_arena::game_summary::GameSummary::capture(&environment, None, 4);
+    let record = stream.record(0, 0, &completed, "idle", &summary);
     let mut report = CollectionReport::default();
-    finish_advance(
-        &model,
-        &mut environment,
-        &mut state,
-        0,
-        CompletedAdvance {
-            end_tick: 4,
-            ticks: 3,
-            outcome: None,
-        },
-        &mut rollout,
-        &mut report,
-    )
-    .expect("terminal deadline");
+    record.accumulate(&mut report).expect("report");
     assert_eq!(report.episode_timeouts, 1);
     assert_eq!(report.terminal_draws, 0);
-    assert_eq!(state.map2_reward.components[5], 0.0);
-    assert_eq!(rollout.len(), 1);
-    let config = PpoConfig {
-        environments: 1,
-        rollout_decisions: 1,
-        minibatch: 1,
-        gamma_tick: 1.0,
-        ..PpoConfig::default()
-    };
-    let sample = rollout
-        .finish(config)
-        .expect("batch")
-        .sample(0)
-        .expect("sample");
-    assert!(sample.transition.terminal);
-    assert_eq!(sample.transition.next_value, 0.0);
-    assert_eq!(sample.transition.ticks, 3);
 }
 
 #[test]
 fn native_mango_then_aimed_raze_is_legal_for_both_neural_seats() {
     use crate::{ActionTarget, ControlledUnit, StructuredAction};
     use bota_proto::{AbilitySlot, Fixed, ItemId, ItemSlot};
-    let mut environment = configured_environment(1, 0, OpponentSpec::Idle, |world| {
+    let mut environment = configured_environment(1, 0, OpponentRuntime::Idle, |world| {
         for (index, seat) in world.seats.iter().enumerate() {
             let hero = seat.unit.expect("hero");
             world.inventory.get_mut(hero).expect("inventory").slots[0] =
@@ -265,15 +256,12 @@ fn native_mango_then_aimed_raze_is_legal_for_both_neural_seats() {
             }
         }
     }
-    assert_eq!(
-        environment_rejections(&[environment]).expect("both seats"),
-        0
-    );
+    assert!(environment.seats.iter().all(|seat| seat.rejections == 0));
 }
 
 #[test]
 fn victim_only_damage_preserves_seat_credit() {
-    let mut environment = configured_environment(1, 1, OpponentSpec::Idle, |world| {
+    let mut environment = configured_environment(1, 1, OpponentRuntime::Idle, |world| {
         let source = world.seats[0].unit.expect("source");
         let target = world.seats[1].unit.expect("target");
         world
@@ -310,7 +298,7 @@ fn victim_only_damage_preserves_seat_credit() {
 pub(super) fn configured_environment(
     tick: u32,
     policy_seat: usize,
-    opponent_spec: OpponentSpec,
+    opponent_spec: OpponentRuntime,
     configure: impl FnOnce(&mut bota_server::game::World),
 ) -> TrainingEnvironment {
     assert!(tick > 0);
@@ -341,7 +329,7 @@ pub(super) fn configured_environment(
         seats: setup_seats(start).expect("full baseline"),
         policy_seat,
         map: MapId(2),
-        opponent: build_opponent(&opponent_spec, 982_007).expect("opponent"),
+        opponent: opponent_spec,
     }
 }
 
