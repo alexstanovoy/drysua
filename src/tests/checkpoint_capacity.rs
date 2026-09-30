@@ -249,9 +249,15 @@ fn runtime_weights_roundtrip_and_reject_foreign_schema_without_mutation() {
 fn public_loaders_reject_empty_and_oversized_files_before_decoding() {
     let directory = test_directory("file-bounds");
     let model = PolicyModel::fresh(40_013).expect("model");
+    let manifest = encoded_manifest(0, 0);
+    let generation = tensor_generation_path(
+        Path::new(""),
+        decode_manifest(&manifest).expect("manifest").tensor_hash,
+    );
+    let generation = generation.to_str().expect("generation name");
     for (name, maximum) in [
         (CHECKPOINT_META_FILE, MAX_META_BYTES),
-        (CHECKPOINT_TENSOR_FILE, MAX_TRAINING_TENSOR_BYTES),
+        (generation, MAX_TRAINING_TENSOR_BYTES),
         (RUNTIME_TENSOR_FILE, MAX_RUNTIME_TENSOR_BYTES),
     ] {
         fs::write(directory.join(CHECKPOINT_META_FILE), encoded_manifest(0, 0)).expect("manifest");

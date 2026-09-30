@@ -86,16 +86,18 @@ class CampaignTests(unittest.TestCase):
 
     def test_run_trains_every_update_in_one_container_with_history_and_a_receipt(self):
         self.create()
+        self.scenario(checkpoint_every=3)
         result = train.run_campaign(self.campaign)
         self.assertEqual((result["phase"], result["updates"], result["sessions"]), ("completed", 5, 1))
         [create] = self.creates()
         command = create[create.index("--") + 1:]
         self.assertEqual(command[:2], [str(self.campaign / "bin/trainer"), "train-annealed"])
         self.assertNotIn("--resume", command)
+        self.assertEqual(command[command.index("--checkpoint-interval-seconds") + 1], "600")
         self.assertIn(f"CUDA_CACHE_PATH={self.campaign / 'cuda-cache'}", create)
         self.assertIn(f"type=bind,src={self.campaign / 'bin'},dst={self.campaign / 'bin'},readonly", create)
         self.assertEqual(sorted(path.name for path in (self.campaign / "history").iterdir()),
-                         ["u0002", "u0004", "u0005"])
+                         ["u0003", "u0005"])  # Milestones exist only at checkpoints.
         receipt = self.receipt(1)
         self.assertEqual((receipt["start_updates"], receipt["end_updates"]), (0, 5))
         self.assertTrue(receipt["outcome"]["verified_limits"])
@@ -130,16 +132,21 @@ class CampaignTests(unittest.TestCase):
         self.assertEqual((result["phase"], result["updates"]), ("paused", 1))
 
     def test_trainer_crash_fails_the_session_without_retry_and_resume_is_explicit(self):
-        self.create()
-        self.scenario(crash_at=3)
+        self.create(checkpoint_seconds=60)
+        self.scenario(crash_at=5, checkpoint_every=3)
         failed = train.run_campaign(self.campaign)
-        self.assertEqual((failed["phase"], failed["updates"]), ("failed", 2))
+        self.assertEqual((failed["phase"], failed["updates"]), ("failed", 3))
+        command = self.creates()[0]
+        self.assertEqual(command[command.index("--checkpoint-interval-seconds") + 1], "60")
         self.assertEqual(failed["last_error"], "trainer exited with code 3 (oom_killed=False)")
         self.assertEqual(len(self.creates()), 1)
         with self.assertRaisesRegex(ValueError, r"run requires phase \['prepared'\], campaign is failed"):
             train.run_campaign(self.campaign)
         self.scenario()
         self.assertEqual(train.run_campaign(self.campaign, resume=True)["phase"], "completed")
+        # Updates 4 and 5 of the crashed process were never durable; the resume replays them once.
+        report, _ = train_report.build_report(self.campaign)
+        self.assertEqual((report["last_update"], report["games"], report["updates"]), (5, 10, 5))
 
     def test_host_health_violation_stops_gracefully_with_the_reason(self):
         self.create()
@@ -233,7 +240,10 @@ class CampaignTests(unittest.TestCase):
                 ({"training_args": ["--updates", "9"]}, "controller-owned or unreviewed argument: --updates"),
                 ({"training_args": ["--resume"]}, "controller-owned or unreviewed argument: --resume"),
                 ({"mode": "gpu"}, "gpu_uuid must be a full GPU UUID"),
-                ({"stop_seconds": 1}, "stop_seconds must be an integer in 5..3600")):
+                ({"stop_seconds": 1}, "stop_seconds must be an integer in 5..3600"),
+                ({"checkpoint_seconds": 59}, "checkpoint_seconds must be an integer in 60..86400"),
+                ({"training_args": ["--checkpoint-interval-seconds", "60"]},
+                 "controller-owned or unreviewed argument: --checkpoint-interval-seconds")):
             with self.subTest(overrides=overrides), self.assertRaisesRegex(ValueError, message):
                 self.create(**overrides)
             self.assertFalse(self.campaign.exists())

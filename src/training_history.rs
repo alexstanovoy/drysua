@@ -19,17 +19,22 @@ pub struct RuntimeHistory {
 }
 
 impl RuntimeHistory {
-    /// Exports the weights of `update` when it is a milestone without a snapshot.
+    /// Exports the weights of checkpoint `update` when the run crossed a
+    /// milestone since the `previous` checkpoint, or finished.
     ///
-    /// The snapshot is staged in a hidden sibling and renamed into place, so an
+    /// Exports happen only at checkpoints, so a milestone directory carries the
+    /// checkpoint's update, the first one at or after the milestone. The
+    /// snapshot is staged in a hidden sibling and renamed into place, so an
     /// existing `u<update>` directory is always complete and is never rewritten.
     pub(crate) fn export(
         &self,
         model: &PolicyModel,
         update: u64,
+        previous: u64,
         total_updates: u64,
     ) -> Result<(), PpoError> {
-        let milestone = update.is_multiple_of(self.every.get()) || update == total_updates;
+        let every = self.every.get();
+        let milestone = update / every > previous / every || update == total_updates;
         if update == 0 || !milestone {
             return Ok(());
         }
@@ -46,7 +51,7 @@ impl RuntimeHistory {
             .map_err(|error| PpoError::Model(format!("runtime history export: {error}")))?;
         std::fs::rename(&staging, &target).map_err(|error| history_error(&target, error))?;
         sync_directory(&self.directory)?;
-        println!(
+        crate::telemetry::log_line!(
             "level=INFO event=runtime_history_export update={update} path={}",
             target.display()
         );

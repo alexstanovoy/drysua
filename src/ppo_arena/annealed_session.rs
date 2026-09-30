@@ -90,8 +90,6 @@ impl AnnealedSession {
                 .min(settings.updates),
             None => settings.updates,
         };
-        // A crash between a committed milestone and its export is repaired here.
-        self.export_history(settings)?;
         if self.state.completed_updates >= target {
             return Ok(());
         }
@@ -111,14 +109,27 @@ impl AnnealedSession {
         );
         generations.adaptive = self.state.adaptive_environment;
         let lanes = self.lane_plan(settings, pool)?;
+        let cpus = crate::ppo_arena::topology::group_cpus(
+            settings.simulation_groups,
+            settings.pin_threads,
+        )?;
         let result = std::thread::scope(|scope| {
-            let simulation = SimPool::spawn(
-                scope,
-                settings.simulation_threads,
-                settings.slots,
-                &schedule,
-            )?;
-            let collector = Collector::spawn(scope, lanes, simulation, &schedule)?;
+            let groups = settings.simulation_groups;
+            let mut pools = Vec::with_capacity(groups);
+            for (group, cpus) in cpus.into_iter().enumerate() {
+                // Threads split as evenly as possible; the first groups take the remainder.
+                let threads = settings.simulation_threads / groups
+                    + usize::from(group < settings.simulation_threads % groups);
+                let pool = SimPool::spawn(
+                    scope,
+                    (group, threads),
+                    settings.slots / groups,
+                    &schedule,
+                    cpus.as_deref(),
+                )?;
+                pools.push((pool, cpus));
+            }
+            let collector = Collector::spawn(scope, lanes, pools, &schedule)?;
             let mut pipeline = Pipeline {
                 collector,
                 configs: BTreeMap::new(),
@@ -150,36 +161,38 @@ impl AnnealedSession {
         let started = std::time::Instant::now();
         let mut schedule =
             super::super::TrainingCheckpointSchedule::new(settings.checkpoint_cadence)?;
+        let mut committed = self.state.completed_updates;
         while self.state.completed_updates < target {
             self.train_update(settings, harness, pipeline, generations)?;
-            let stop = crate::training_signals::stop_requested();
-            let final_update = self.state.completed_updates == target || stop;
-            if schedule.is_due(self.state.completed_updates, started.elapsed()) || final_update {
-                let report = self.state.checkpoint_report(None);
-                let durable = crate::telemetry::time_training_checkpoint(
-                    self.state.completed_updates,
-                    || self.state.save(directory, report),
-                )?;
+            let report = self.state.checkpoint_report(None);
+            report.log_progress();
+            let completed = self.state.completed_updates;
+            let stop = crate::training_signals::stop_requested()
+                || harness.stop_after.is_some_and(|stop| completed >= stop);
+            if schedule.is_due(completed, started.elapsed()) || completed == target || stop {
+                // Snapshots and milestones precede the manifest, so a commit implies them.
+                generations.write_pending()?;
+                self.export_history(settings, committed)?;
+                let durable = crate::telemetry::time_training_checkpoint(completed, || {
+                    self.state.save(directory, report)
+                })?;
                 checkpointed(durable);
                 schedule.mark_committed(started.elapsed())?;
+                committed = completed;
             }
-            self.export_history(settings)?;
-            if stop
-                || harness
-                    .stop_after
-                    .is_some_and(|stop| self.state.completed_updates >= stop)
-            {
+            if stop {
                 break;
             }
         }
         Ok(())
     }
 
-    fn export_history(&self, settings: &AnnealedJobConfig) -> Result<(), PpoError> {
+    fn export_history(&self, settings: &AnnealedJobConfig, previous: u64) -> Result<(), PpoError> {
         match &settings.history {
             Some(history) => history.export(
                 &self.state.model,
                 self.state.completed_updates,
+                previous,
                 settings.updates,
             ),
             None => Ok(()),
@@ -450,7 +463,7 @@ fn assemble(
         for snapshot in &part.snapshot {
             snapshots[snapshot.plan.slot] = Some(snapshot.clone());
         }
-        eprintln!(
+        crate::telemetry::log_line!(
             "level=INFO event=collection_part update={} lane={} rounds={} samples={} games={} inference_s={:.3} simulation_s={:.3}",
             part.update,
             part.lane,

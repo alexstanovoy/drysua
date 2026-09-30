@@ -62,13 +62,17 @@ shrink the job.
 
 ## Stopping and crash safety
 
-The trainer commits a checkpoint after every update (model, Adam, RNG, in-flight
-slot games and progress; the manifest is written last with file and directory
-fsync), so a crash loses at most the in-flight update.
+The trainer commits a checkpoint (model, Adam, RNG, in-flight slot games and
+progress; the manifest is written last with file and directory fsync) only every
+`checkpoint_seconds` of wall time, on a graceful stop and at the last update of the
+invocation, to keep SSD writes low. A crash loses up to one interval of updates,
+which the resume recomputes bit-exactly. `status` `updates` is the last durable
+checkpoint. The trainer logs `progress: update N, ...` (the statistics) after every
+update and `checkpoint: update N` after every durable commit.
 
 - `pause`, the session deadline (`max_seconds`), a health violation, or the first
-  SIGINT/SIGTERM to the controller send SIGTERM to the trainer. It commits the
-  in-flight update, logs `event=training_stopped` and exits 0; after
+  SIGINT/SIGTERM to the controller send SIGTERM to the trainer. It finishes the
+  in-flight update, checkpoints it, logs `event=training_stopped` and exits 0; after
   `stop_seconds` it is killed.
 - `stop` or a second controller signal kills the container at once.
 - A trainer crash fails the session; the committed checkpoint is still verified
@@ -77,8 +81,8 @@ fsync), so a crash loses at most the in-flight update.
   which requires the recorded controller to be dead, kills and removes the recorded
   container (matched by full ID and labels), accepts the committed checkpoint and
   leaves the campaign paused.
-- A kill during a checkpoint save can leave the previous manifest selected
-  (`recovery_required`) or a stale runtime export; the next resume repairs both.
+- A kill during a checkpoint save leaves the previous commit selected, possibly
+  with the newer runtime export (`recovery_required`); the next commit replaces it.
 
 `pause`/`stop` write an owner-token-scoped request; they fail when no live
 controller owns the campaign.
@@ -93,9 +97,10 @@ controller owns the campaign.
 | `initial_weights` | none | runtime weights with the current parameter layout; fresh start only |
 | `opponent_weights` | none | frozen weights opponent (`--opponent weights:...:1`); Teacher otherwise |
 | `total_updates` | required | 1..10000 |
-| `history_every` | 20 | milestone spacing for `history/uNNNN/` runtime weights |
+| `history_every` | 20 | milestone spacing for `history/uNNNN/` runtime weights; exported only at checkpoints |
+| `checkpoint_seconds` | 600 | 60..86400, wall time between checkpoints (`--checkpoint-interval-seconds`) |
 | `max_seconds` | 86400 | 1..604800, session deadline, then a graceful pause |
-| `stop_seconds` | 300 | 5..3600, graceful stop budget before a kill |
+| `stop_seconds` | 300 | 5..3600, graceful stop budget (one update plus a checkpoint) before a kill |
 | `memory_gib` | 12 | 1..48, container memory limit, swap 0 |
 | `training_args` | `[]` | allowlisted `train-annealed` options only |
 | `mode` | `cpu` | `cpu` or `gpu` |
@@ -107,8 +112,11 @@ controller owns the campaign.
 
 Unknown fields, duplicate keys, nonfinite numbers and non-allowlisted trainer flags
 are rejected. The controller owns `--updates`, `--checkpoint-directory`,
-`--history-directory`, `--history-every`, `--device`, `--device-ordinal`,
-`--resume`, `--initial-weights` and `--opponent`. Without `--seed` the first session
+`--history-directory`, `--history-every`, `--checkpoint-interval-seconds`, `--device`, `--device-ordinal`,
+`--resume`, `--initial-weights` and `--opponent`. At a checkpoint of update N the
+trainer exports `history/uNNNN` when a multiple of `history_every` was crossed since
+the previous checkpoint, and always at the final update, so directory names need not
+be multiples of `history_every`. Without `--seed` the first session
 draws a random seed, recorded in the run scope and adopted by later sessions.
 
 A campaign directory (mode 0700) holds `manifest.json`, `status.json`,
@@ -171,9 +179,11 @@ It parses:
 - `level=<LEVEL> event=<name> key=value ...` as an event (`scope=` becomes part of the
   series name, `*_ns` fields are shown in seconds), e.g. `ppo_update`,
   `episode_summary`, `map2_episode_reward`;
-- `checkpoint: update N, ...` as the commit of update N. A process restart (`### `
-  separator, new file, `annealed: updates=` header) drops the uncommitted tail, as
-  the trainer does.
+- `progress: update N, ...` as the statistics of update N (shown as
+  `checkpoint.<field>` series) and `checkpoint: update N` as its durability marker. A
+  process restart (`### ` separator, new file, `annealed: updates=` header) drops the
+  unattributed tail and every update after the last durable checkpoint, which the
+  trainer replays and logs again.
 
 The text report shows W-L-D blocks, recent windows, per-opponent records,
 environment transitions and timing with an ETA; `--json` prints schema
@@ -219,7 +229,7 @@ Detecting +10 points at 35% needs about 370 games per arm; +5 points about 1,500
   (above); do not run training outside it.
 - SSD: keep scratch output under the worktree's gitignored `temp/`, delete finished
   runs and copied checkpoints, and do not add per-update files; weight history is
-  written only at `history_every` milestones.
+  written only at checkpoints that cross a `history_every` milestone.
 - Never pass `-j1`, `--test-threads=1` or hard-coded thread counts; defaults derive
   from `available_parallelism`.
 

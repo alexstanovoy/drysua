@@ -249,6 +249,8 @@ fn settings(seed: u64, updates: u64) -> AnnealedJobConfig {
         slots: 2,
         lanes: 2,
         simulation_threads: 2,
+        simulation_groups: 1,
+        pin_threads: false,
         generation_updates: 1,
         zero_updates: 0,
         scale: crate::randomization::AnnealScale::FULL,
@@ -330,9 +332,22 @@ fn run_with(
 
 fn checkpoint_digests(directory: &std::path::Path) -> Vec<(String, String)> {
     use sha2::{Digest, Sha256};
+    // The one tensor generation the manifest references survives pruning.
+    let generation = std::fs::read_dir(directory)
+        .expect("checkpoint directory")
+        .map(|entry| {
+            entry
+                .expect("entry")
+                .file_name()
+                .into_string()
+                .expect("name")
+        })
+        .filter(|name| name.starts_with("checkpoint.") && name.ends_with(".safetensors"))
+        .collect::<Vec<_>>();
+    assert_eq!(generation.len(), 1, "{generation:?}");
     [
         "checkpoint.meta",
-        "checkpoint.safetensors",
+        &generation[0],
         "drysua.weights.safetensors",
     ]
     .into_iter()

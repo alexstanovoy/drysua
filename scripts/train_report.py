@@ -6,11 +6,15 @@ are parsed generically, so new numeric fields show up without code changes:
 
 * `episode: key=value ...` - one terminal episode;
 * `level=INFO event=<name> key=value ...` - structured events;
-* `checkpoint: update N, key value, ...` - the commit marker of update N.
+* `progress: update N, key value, ...` - the statistics of update N, logged
+  every update; they are exposed as `checkpoint.<field>` metrics;
+* `checkpoint: update N` - the durable commit of update N; the trainer commits
+  only periodically, so it trails the progress lines.
 
-Episodes and events accumulate until the next commit marker; a process
-restart (`### ` separator, file boundary, or `annealed: updates=` header)
-discards the uncommitted tail, exactly like the trainer does.
+Episodes and events accumulate until the next progress line. A process restart
+(`### ` separator, file boundary, or `annealed: updates=` header) discards the
+unattributed tail and every update after the last durable checkpoint: the
+trainer recomputes those and logs them again.
 """
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -67,7 +71,7 @@ def key_value_fields(text):
 
 
 def prose_fields(text):
-    """`checkpoint: update 3, policy loss -0.1, KL stop false` -> {update: 3, policy_loss: -0.1, ...}."""
+    """`progress: update 3, policy loss -0.1, KL stop false` -> {update: 3, policy_loss: -0.1, ...}."""
     fields = {}
     for part in text.split(", "):
         words = part.split()
@@ -89,8 +93,8 @@ def classify(line):
     name, rest = match.group(1).replace(" ", "_"), match.group(2)
     if name == "episode":
         return ("episode", name, key_value_fields(rest))
-    if name == "checkpoint":
-        return ("commit", name, prose_fields(rest))
+    if name in ("progress", "checkpoint"):
+        return (name, name, prose_fields(rest))
     if name == "annealed":
         fields = key_value_fields(rest)
         return ("restart", name, fields) if "games" in fields and "parallel" in fields else ("event", name, fields)
@@ -114,11 +118,11 @@ class Pending:
 
 
 class LogModel:
-    """Per-update aggregates of committed updates, in log order."""
+    """Per-update aggregates, keeping only updates the trainer will not recompute."""
 
     def __init__(self):
         self.updates, self.pending = {}, Pending()
-        self.process_starts, self.last_committed = [], 0
+        self.process_starts, self.last_progress, self.durable = [], 0, 0
 
     def feed(self, line):
         parsed = classify(line)
@@ -130,23 +134,27 @@ class LogModel:
             return
         if kind == "episode":
             self.pending.episodes.append(fields)
-        elif kind == "commit":
-            self.commit(fields)
+        elif kind == "progress":
+            self.record_progress(fields)
+        elif kind == "checkpoint":
+            self.durable = max(self.durable, int(fields.get("update", 0)))
         elif name not in IGNORED_EVENTS:
             update = explicit_update(fields)
-            if update is not None and update <= self.last_committed and update in self.updates:
+            if update is not None and update <= self.last_progress and update in self.updates:
                 merge(self.updates[update]["metrics"], event_metrics({name: [fields]}), overwrite=False)
             else:
                 self.pending.events[name].append(fields)
 
     def restart(self):
-        """A new trainer process: the uncommitted tail of the previous one never committed."""
+        """A new trainer process resumes from the last durable checkpoint and replays everything after it."""
         self.pending = Pending()
-        start = self.last_committed + 1
+        self.updates = {update: record for update, record in self.updates.items() if update <= self.durable}
+        self.last_progress = self.durable
+        start = self.durable + 1
         if not self.process_starts or self.process_starts[-1] != start:
             self.process_starts.append(start)
 
-    def commit(self, fields):
+    def record_progress(self, fields):
         update = fields.get("update")
         if update is None or not 1 <= update <= MAX_UPDATES:
             return
@@ -157,7 +165,7 @@ class LogModel:
         record = episode_record(self.pending.episodes)
         record.update(update=update, process=len(self.process_starts), metrics=merge(record.pop("metrics"), metrics))
         self.updates[update] = record
-        self.last_committed = update
+        self.last_progress = update
         self.pending = Pending()
         if len(self.updates) > MAX_UPDATES:
             raise ValueError(f"log exceeds {MAX_UPDATES} updates")
@@ -300,7 +308,7 @@ def campaign_info(target):
 
 
 def build_report(target, block=10):
-    """Read-only statistics of committed updates in the logs under `target`."""
+    """Read-only statistics of the logged updates in the logs under `target`."""
     target = io.private_path(target)
     io.bounded_integer(block, "report block", 1, MAX_UPDATES)
     model = read_logs(log_sources(target))

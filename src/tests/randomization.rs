@@ -244,11 +244,12 @@ fn a_written_snapshot_is_verified_and_a_changed_file_is_rejected() {
     let directory = test_directory("snapshots");
     let schedule = schedule(20, 4);
     let draw = draw_generation(5, 1, 4, 8, schedule).expect("draw");
-    write_generation_snapshot(&directory, &draw).expect("first write");
-    write_generation_snapshot(&directory, &draw).expect("rewrite matches");
+    write_generation_snapshots(&directory, std::slice::from_ref(&draw)).expect("first write");
+    write_generation_snapshots(&directory, std::slice::from_ref(&draw)).expect("rewrite matches");
     let path = generation_path(&directory, 1);
     std::fs::write(&path, "{\"schema\":\"tampered\"}\n").expect("tamper");
-    let error = write_generation_snapshot(&directory, &draw).expect_err("tampered snapshot");
+    let error = write_generation_snapshots(&directory, std::slice::from_ref(&draw))
+        .expect_err("tampered snapshot");
     assert_eq!(
         error.to_string(),
         "invalid PPO config field: domain randomization snapshot mismatch"
@@ -261,7 +262,7 @@ fn an_oversized_snapshot_is_rejected() {
     let directory = test_directory("oversized");
     let schedule = schedule(20, 4);
     let draw = draw_generation(6, 0, 4, 8, schedule).expect("draw");
-    write_generation_snapshot(&directory, &draw).expect("write");
+    write_generation_snapshots(&directory, std::slice::from_ref(&draw)).expect("write");
     let path = generation_path(&directory, 0);
     std::fs::write(&path, "x".repeat(5 * 1024)).expect("oversize");
     let error = verify_generation_snapshots(&directory, 6, 4, 8, schedule, 4)
@@ -279,7 +280,7 @@ fn resume_verification_covers_every_started_generation() {
     let schedule = schedule(40, 8);
     for generation in 0..3 {
         let draw = draw_generation(21, generation, 4, 8, schedule).expect("draw");
-        write_generation_snapshot(&directory, &draw).expect("write");
+        write_generation_snapshots(&directory, std::slice::from_ref(&draw)).expect("write");
     }
     assert_eq!(
         verify_generation_snapshots(&directory, 21, 4, 8, schedule, 8).expect("covered"),
@@ -496,7 +497,7 @@ fn a_snapshot_chain_is_verified_only_under_its_own_scale() {
     let directory = test_directory("scale-snapshots");
     let schedule = schedule(20, 4);
     let draw = draw_generation(7, 0, 4, 8, schedule).expect("draw");
-    write_generation_snapshot(&directory, &draw).expect("write");
+    write_generation_snapshots(&directory, std::slice::from_ref(&draw)).expect("write");
     assert_eq!(
         verify_generation_snapshots(&directory, 7, 4, 8, schedule, 4).expect("own scale"),
         1

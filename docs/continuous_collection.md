@@ -5,13 +5,21 @@
 ## Shape
 
 ```
-slots (--slots, default 64)   one live game each; a finished game is replaced in the same job
-lanes (--lanes, default 2)    one thread, CUDA stream and actor weight replica per lane;
-                              lane l owns slots l, l+lanes, ...; at most 64 slots per lane
-simulation pool               --simulation-threads workers (default: available cores) that
-                              step any lane's slots; never changes results
+slots (--slots)               one live game each; a finished game is replaced in the same job;
+                              default 16 per available core (max 256)
+lanes (--lanes)               one thread, CUDA stream and actor weight replica per lane;
+                              lane l owns slots l, l+lanes, ...; at most 64 slots per lane;
+                              default two per simulation group, more if the slots need them
+simulation groups             --simulation-groups (default: last-level cache domains, i.e.
+                              CCDs) split consecutive lanes and --simulation-threads workers
+                              (default: available cores) into pools, so a lane's round never
+                              waits on another CCD; --pin-threads pins each group to its
+                              domain (opt-in). Neither changes results
 learner                       the session thread; trains update u while lanes collect u+1
 ```
+
+On resume, omitted `--slots`/`--lanes` adopt the recorded values, so a run survives
+a change of core count.
 
 A lane runs rounds: one batched inference over its slots (self-play opponent rows
 share the call; each frozen snapshot gets its own call on the lane's replica), then
@@ -44,6 +52,16 @@ open retained interval. A resumed run replays each game's logged actions (in
 parallel on the pool) to the exact state it had at the boundary and continues;
 the replay verifies the plan and rejects any divergence. Stop/resume therefore
 equals an uninterrupted run bit for bit, including games against neural opponents.
+
+## Disk writes
+
+A checkpoint is written every `--checkpoint-interval-seconds` (default 600, at
+least 60), on a graceful stop and at the invocation's last update: the tensor file,
+the runtime weights and the manifest, each synced once, then one directory sync;
+generation snapshots drawn since the previous checkpoint are written just before
+it. History milestones are exported only at checkpoints. Logs go through one
+buffered stream flushed every two seconds and at exit. A crash loses at most one
+interval, which the resume recomputes bit-exactly.
 
 ## Opponents
 

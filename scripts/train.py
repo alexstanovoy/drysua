@@ -37,7 +37,8 @@ STATUS_FIELDS = {"schema", "campaign_id", "manifest_sha256", "phase", "updates",
 CAMPAIGN_DIRECTORIES = ("bin", "inputs", "frozen", "checkpoint", "history", "cuda-cache", "sessions")
 # An allowlist also blocks future output options unknown to this controller.
 ARGUMENTS = frozenset({
-    "--samples-per-update", "--slots", "--lanes", "--simulation-threads", "--generation-updates",
+    "--samples-per-update", "--slots", "--lanes", "--simulation-threads", "--simulation-groups", "--pin-threads",
+    "--generation-updates",
     "--seed", "--training-microbatch",
     "--balanced-minibatches", "--environment-schedule",
     "--environment-success-updates", "--environment-success-rate",
@@ -46,7 +47,8 @@ ARGUMENTS = frozenset({
     "--entropy-coefficient", "--environment-scale-start", "--environment-scale-end",
 })
 CONFIG_FIELDS = {"schema", "trainer", "inspector", "initial_weights", "opponent_weights", "total_updates",
-                 "history_every", "max_seconds", "stop_seconds", "training_args", "mode", "docker_context",
+                 "history_every", "checkpoint_seconds", "max_seconds", "stop_seconds",
+                 "training_args", "mode", "docker_context",
                  "image", "gpu_uuid", "lock_paths", "memory_gib", "cuda_directory"}
 
 
@@ -77,6 +79,7 @@ def validate_config(value):
         raise ValueError("unsupported configuration schema; expected 2")
     result = {"schema": 2}
     for name, default, lower, upper in (("total_updates", None, 1, 10000), ("history_every", 20, 1, 10000),
+                                        ("checkpoint_seconds", 600, 60, 86400),
                                         ("max_seconds", 86400, 1, 604800), ("stop_seconds", 300, 5, 3600),
                                         ("memory_gib", 12, 1, 48)):
         result[name] = io.bounded_integer(value.get(name, default), name, lower, upper)
@@ -349,6 +352,7 @@ def trainer_command(directory, config, resume):
                "--updates", str(config["total_updates"]),
                "--checkpoint-directory", str(directory / "checkpoint"),
                "--history-directory", str(directory / "history"), "--history-every", str(config["history_every"]),
+               "--checkpoint-interval-seconds", str(config["checkpoint_seconds"]),
                "--device", "cuda" if config["mode"] == "gpu" else "cpu"]
     if config["mode"] == "gpu":
         command += ["--device-ordinal", "0"]

@@ -30,7 +30,7 @@ use super::{
 };
 use crate::randomization::{
     AnnealSchedule, GenerationDraw, RANDOMIZATION_DIRECTORY, draw_generation,
-    write_generation_snapshot,
+    write_generation_snapshots,
 };
 use crate::telemetry::{FlushPerformanceLogs, TrainingTimingScope, time_training_scope};
 use crate::{
@@ -65,6 +65,11 @@ pub struct AnnealedJobConfig {
     pub lanes: usize,
     /// Simulation worker threads; never changes results, so excluded from the run scope.
     pub simulation_threads: usize,
+    /// Groups of consecutive lanes with their own share of the simulation
+    /// workers, one per cache domain; never changes results.
+    pub simulation_groups: usize,
+    /// Pins each group's threads to its cache domain; never changes results.
+    pub pin_threads: bool,
     /// Updates per environment generation.
     pub generation_updates: u64,
     /// Final updates played with no modifiers.
@@ -374,9 +379,14 @@ struct GenerationCache {
     games_per_update: u64,
     schedule: AnnealSchedule,
     last: Option<GenerationDraw>,
+    /// Draws whose snapshots are written with the next checkpoint.
+    pending: Vec<GenerationDraw>,
     /// One past the highest generation whose snapshot is recorded.
     counted_through: u64,
 }
+
+/// Pending snapshots written early, bounding memory under very long checkpoint intervals.
+const MAX_PENDING_GENERATIONS: usize = 1024;
 
 impl GenerationCache {
     fn new(
@@ -395,6 +405,7 @@ impl GenerationCache {
             games_per_update,
             schedule,
             last: None,
+            pending: Vec::new(),
             counted_through: verified,
         }
     }
@@ -427,10 +438,13 @@ impl GenerationCache {
                 self.games_per_update,
                 self.schedule,
             )?;
-            write_generation_snapshot(&self.directory, &draw)?;
+            self.pending.push(draw);
+            if self.pending.len() >= MAX_PENDING_GENERATIONS {
+                self.write_pending()?;
+            }
             let next = generation.checked_add(1).ok_or(PpoError::CounterOverflow)?;
             self.counted_through = self.counted_through.max(next);
-            eprintln!(
+            crate::telemetry::log_line!(
                 "annealed: generation={generation} scale_bp={} start_game={} applied_games={} rules={}",
                 draw.scale_bp,
                 draw.start_game,
@@ -440,6 +454,16 @@ impl GenerationCache {
             self.last = Some(draw);
         }
         Ok(self.last.expect("drawn above"))
+    }
+
+    /// Writes the snapshots of every generation drawn since the last call; a
+    /// checkpoint calls it before committing so its generations are on disk.
+    fn write_pending(&mut self) -> Result<(), PpoError> {
+        if !self.pending.is_empty() {
+            write_generation_snapshots(&self.directory, &self.pending)?;
+            self.pending.clear();
+        }
+        Ok(())
     }
 
     fn counted_through(&self) -> u64 {
@@ -638,6 +662,13 @@ fn validate_collection(settings: &AnnealedJobConfig) -> Result<(), PpoError> {
     if !(1..=256).contains(&settings.simulation_threads) {
         return Err(PpoError::InvalidConfig("annealed simulation threads"));
     }
+    let groups = settings.simulation_groups;
+    if groups == 0 || !settings.lanes.is_multiple_of(groups) || settings.simulation_threads < groups
+    {
+        return Err(PpoError::InvalidConfig(
+            "annealed simulation groups must divide lanes and have a thread each",
+        ));
+    }
     if settings.generation_updates == 0 || settings.generation_updates > MAX_TRAINING_COUNTER {
         return Err(PpoError::InvalidConfig("annealed generation updates"));
     }
@@ -809,7 +840,7 @@ fn log_ppo_update(
     samples: usize,
     learning_rate: f32,
 ) {
-    eprintln!(
+    crate::telemetry::log_line!(
         "level=INFO event=ppo_update update={} policy_loss={:.6} value_loss={:.6} entropy={:.6} approx_kl={:.8} clip_fraction={:.6} explained_variance={:.6} kl_stop={} optimizer_steps={optimizer_steps} samples={samples} learning_rate={learning_rate:e}",
         report.update,
         report.policy_loss,

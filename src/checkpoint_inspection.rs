@@ -43,31 +43,24 @@ fn inspect_with_hook(
     after_inventory: impl FnOnce(),
 ) -> Result<Vec<u8>, CheckpointError> {
     let root = Directory::open(directory)?;
-    let (manifest_path, manifest) =
-        read_recoverable_file(&root, CHECKPOINT_META_FILE, MAX_META_BYTES)?;
-    let inspected = inspect_manifest(&root, &manifest_path, &manifest);
+    let manifest = read_manifest(&root)?;
+    let inspected = inspect_manifest(&root, &manifest);
     after_inventory();
     // Re-read even after a payload error: a new commit is not a corrupt old commit.
-    let (current_path, current) =
-        read_recoverable_file(&root, CHECKPOINT_META_FILE, MAX_META_BYTES)
-            .map_err(|_| CheckpointError::InvalidManifest(CHANGED))?;
-    if current_path != manifest_path || current != manifest {
+    let current = read_manifest(&root).map_err(|_| CheckpointError::InvalidManifest(CHANGED))?;
+    if current != manifest {
         return Err(CheckpointError::InvalidManifest(CHANGED));
     }
     root.check_path(directory)?;
     json_bytes(inspected?)
 }
 
-fn inspect_manifest(
-    root: &Directory,
-    manifest_path: &str,
-    manifest: &[u8],
-) -> Result<Value, CheckpointError> {
+fn inspect_manifest(root: &Directory, manifest: &[u8]) -> Result<Value, CheckpointError> {
     let artifact = decode_manifest(manifest)?;
     let plan = history::plan(&artifact)?;
     let mut files = Vec::with_capacity(plan.snapshot_count as usize + 4);
-    add_file(&mut files, manifest_path, manifest)?;
-    let (artifact, tensor_path, alias_matches) = load_payload(root, artifact, &mut files)?;
+    add_file(&mut files, CHECKPOINT_META_FILE, manifest)?;
+    let (artifact, tensor_path) = load_payload(root, artifact, &mut files)?;
     let runtime = inspect_runtime(root, &artifact, &mut files)?;
     let history = history::verify(root, &artifact, &plan, &mut files)?;
     Ok(json!({
@@ -78,9 +71,9 @@ fn inspect_manifest(
         "progress": projection::progress(&artifact, plan.games), "run": projection::run(&artifact.run),
         "ppo": projection::ppo(artifact.config), "adaptive": projection::adaptive(&artifact.progress),
         "history": history, "runtime_status": runtime.status, "runtime_matches_model": runtime.matches,
-        "recovery_required": manifest_path != CHECKPOINT_META_FILE || tensor_path.ends_with(".previous") || !runtime.matches,
-        "sources": {"manifest": manifest_path, "tensor": tensor_path,
-            "runtime": runtime.hash.as_ref().map(|_| RUNTIME_TENSOR_FILE), "canonical_tensor_matches": alias_matches},
+        "recovery_required": !runtime.matches,
+        "sources": {"manifest": CHECKPOINT_META_FILE, "tensor": tensor_path,
+            "runtime": runtime.hash.as_ref().map(|_| RUNTIME_TENSOR_FILE)},
         "files": files,
     }))
 }
@@ -89,15 +82,15 @@ fn load_payload(
     root: &Directory,
     mut artifact: TrainingArtifact,
     files: &mut Vec<Value>,
-) -> Result<(TrainingArtifact, String, bool), CheckpointError> {
+) -> Result<(TrainingArtifact, String), CheckpointError> {
     let generation = tensor_generation_path(Path::new(""), artifact.tensor_hash);
     let generation = generation
         .to_str()
         .ok_or(CheckpointError::InvalidManifest("inspection tensor name"))?;
-    let (path, tensors) = match root.read(generation, MAX_TRAINING_TENSOR_BYTES)? {
-        Some(bytes) => (generation.to_owned(), bytes),
-        None => read_recoverable_file(root, CHECKPOINT_TENSOR_FILE, MAX_TRAINING_TENSOR_BYTES)?,
-    };
+    let tensors = root
+        .read(generation, MAX_TRAINING_TENSOR_BYTES)?
+        .ok_or_else(|| CheckpointError::Io(format!("missing checkpoint artifact: {generation}")))?;
+    let path = generation.to_owned();
     if sha256(&tensors) != artifact.tensor_hash {
         return Err(CheckpointError::TensorHashMismatch);
     }
@@ -110,16 +103,7 @@ fn load_payload(
     artifact.collection = decoded.collection;
     artifact.validate()?;
     add_file(files, &path, &tensors)?;
-    let mut alias_matches = path == CHECKPOINT_TENSOR_FILE;
-    if !alias_matches
-        && let Some(alias) = root.read(CHECKPOINT_TENSOR_FILE, MAX_TRAINING_TENSOR_BYTES)?
-    {
-        alias_matches = sha256(&alias) == artifact.tensor_hash;
-        if alias_matches {
-            add_file(files, CHECKPOINT_TENSOR_FILE, &alias)?;
-        }
-    }
-    Ok((artifact, path, alias_matches))
+    Ok((artifact, path))
 }
 
 struct RuntimeInspection {
@@ -167,19 +151,13 @@ fn inspect_runtime(
     })
 }
 
-fn read_recoverable_file(
-    root: &Directory,
-    name: &str,
-    maximum: u64,
-) -> Result<(String, Vec<u8>), CheckpointError> {
-    if let Some(bytes) = root.read(name, maximum)? {
-        return Ok((name.to_owned(), bytes));
-    }
-    let previous = format!("{name}.previous");
-    let bytes = root
-        .read(&previous, maximum)?
-        .ok_or_else(|| CheckpointError::Io(format!("missing checkpoint artifact: {name}")))?;
-    Ok((previous, bytes))
+fn read_manifest(root: &Directory) -> Result<Vec<u8>, CheckpointError> {
+    root.read(CHECKPOINT_META_FILE, MAX_META_BYTES)?
+        .ok_or_else(|| {
+            CheckpointError::Io(format!(
+                "missing checkpoint artifact: {CHECKPOINT_META_FILE}"
+            ))
+        })
 }
 
 fn scope_hash(artifact: &TrainingArtifact) -> Result<String, CheckpointError> {

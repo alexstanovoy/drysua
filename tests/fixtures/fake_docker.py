@@ -113,7 +113,8 @@ def start(identifier):
 
 
 class FakeTrainer:
-    """Mirrors the native lifecycle: fresh-vs-resume checks, one commit per update, graceful SIGTERM."""
+    """Mirrors the native lifecycle: fresh-vs-resume checks, a progress line per update, a durable checkpoint
+    every `checkpoint_every` updates (the stand-in for the wall-clock interval), on stop and at the end."""
 
     def __init__(self, command, scenario):
         self.scenario, self.stopping = scenario, False
@@ -121,6 +122,7 @@ class FakeTrainer:
         self.checkpoint = Path(self.option("--checkpoint-directory"))
         self.history = Path(self.option("--history-directory"))
         self.total, self.every = int(self.option("--updates")), int(self.option("--history-every"))
+        self.checkpoint_every = scenario.get("checkpoint_every", 2)
         signal.signal(signal.SIGTERM, self.request_stop)
 
     def option(self, name):
@@ -137,7 +139,7 @@ class FakeTrainer:
         if "--resume" not in self.command and any(self.checkpoint.iterdir()):
             print("fresh checkpoint directory must be empty", flush=True)
             return 2
-        updates = json.loads(meta.read_text())["updates"] if meta.exists() else 0
+        updates = self.durable = json.loads(meta.read_text())["updates"] if meta.exists() else 0
         # Training starts once the controller has read the container cgroup, as a real
         # trainer is still initializing CUDA then; a fake one would otherwise win the race.
         deadline = time.monotonic() + 30
@@ -149,8 +151,10 @@ class FakeTrainer:
             update = updates + 1
             if not self.play(update):
                 return 3
-            self.commit(update)
+            self.progress(update)
             updates = update
+            if self.stopping or update == self.total or update % self.checkpoint_every == 0:
+                self.commit(update)
             if self.stopping:
                 print(f"level=INFO event=training_stopped reason=signal completed_updates={update}", flush=True)
                 break
@@ -179,18 +183,22 @@ class FakeTrainer:
         while not self.stopping and time.monotonic() < deadline:
             time.sleep(0.01)
 
-    def commit(self, update):
+    def progress(self, update):
         print(f"level=INFO event=training_update_timing update_index={update - 1} elapsed_ns=2000000000 "
               f"collection_ns=1500000000 optimization_ns=500000000 samples=100", flush=True)
+        print(f"progress: update {update}, samples {100 * update}, optimizer step {update}, "
+              f"policy loss -0.01, value loss 0.02, entropy 0.5, KL 0.001, KL stop false", flush=True)
+
+    def commit(self, update):
         temporary = self.checkpoint / "checkpoint.meta.tmp"
         temporary.write_text(json.dumps({"updates": update}))
         os.replace(temporary, self.checkpoint / "checkpoint.meta")
-        if update % self.every == 0 or update == self.total:
+        if update // self.every > self.durable // self.every or update == self.total:
             milestone = self.history / f"u{update:04d}"
             milestone.mkdir()
             (milestone / "drysua.weights.safetensors").write_text(str(update))
-        print(f"checkpoint: update {update}, samples {100 * update}, optimizer step {update}, "
-              f"policy loss -0.01, value loss 0.02, entropy 0.5, KL 0.001, KL stop false", flush=True)
+        self.durable = update
+        print(f"checkpoint: update {update}", flush=True)
 
 
 if __name__ == "__main__":

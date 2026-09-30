@@ -213,9 +213,13 @@ fn strict_checkpoint_restores_adam_rng_and_identical_next_update() {
         .expect("next restored update");
     assert_eq!(source_actions, target_actions);
     assert_snapshot_equal(&source, &trainer, &target, state.trainer());
-    for name in ["checkpoint.meta.tmp", "checkpoint.safetensors.tmp"] {
-        assert!(!directory.0.join(name).exists());
-    }
+    assert!(fs::read_dir(&directory.0).expect("directory").all(|entry| {
+        !entry
+            .expect("entry")
+            .file_name()
+            .to_string_lossy()
+            .contains(".tmp")
+    }));
 }
 
 fn assert_snapshot_equal(
@@ -241,24 +245,36 @@ fn assert_snapshot_equal(
 }
 
 #[test]
-fn checkpoint_storage_recovers_backups_and_portable_copies_but_rejects_corruption() {
+fn checkpoint_storage_rejects_corrupt_payload_and_truncated_manifest() {
     let directory = Directory::new();
     fresh_artifact().save(&directory.0).expect("save");
     let manifest = directory.0.join("checkpoint.meta");
-    let backup = directory.0.join("checkpoint.meta.previous");
-    fs::rename(&manifest, &backup).expect("interrupted replacement");
-    let recovered = TrainingArtifact::load(&directory.0).expect("backup recovery");
-    assert_eq!(recovered.run(), &run_metadata());
-    fs::rename(backup, &manifest).expect("restore canonical manifest");
-    let generation = fs::read_dir(&directory.0)
+    let files = fs::read_dir(&directory.0)
         .expect("directory")
-        .map(|entry| entry.expect("entry").path())
-        .find(|path| {
-            path.extension()
-                .is_some_and(|extension| extension == "safetensors")
-                && path.file_name().expect("name") != "checkpoint.safetensors"
+        .map(|entry| {
+            entry
+                .expect("entry")
+                .file_name()
+                .into_string()
+                .expect("name")
         })
+        .collect::<std::collections::BTreeSet<_>>();
+    let generation = files
+        .iter()
+        .find(|name| name.starts_with("checkpoint.") && name.ends_with(".safetensors"))
         .expect("immutable generation");
+    assert_eq!(
+        files,
+        [
+            generation.as_str(),
+            "checkpoint.meta",
+            "drysua.weights.safetensors"
+        ]
+        .map(str::to_owned)
+        .into(),
+        "one commit leaves exactly its three files"
+    );
+    let generation = directory.0.join(generation);
     let mut bytes = fs::read(&generation).expect("tensor bytes");
     let last = bytes.len() - 1;
     bytes[last] ^= 1;
@@ -269,9 +285,6 @@ fn checkpoint_storage_recovers_backups_and_portable_copies_but_rejects_corruptio
         error.to_string(),
         "checkpoint tensor SHA-256 does not match manifest"
     );
-    fs::remove_file(generation).expect("remove immutable generation");
-    let portable = TrainingArtifact::load(&directory.0).expect("portable two-file checkpoint");
-    assert_eq!(portable.run(), &run_metadata());
     fs::write(manifest, b"DRYSUA").expect("truncate manifest");
     let error = TrainingArtifact::load(&directory.0).expect_err("truncated manifest");
     assert_eq!(error, CheckpointError::ManifestTruncated);

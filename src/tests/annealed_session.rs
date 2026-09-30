@@ -34,6 +34,9 @@ fn signal_stop_scenario() {
     let checkpoint = test_directory("signal-stop-checkpoint");
     let history = test_directory("signal-stop-history");
     let mut config = settings(0x5eed, 3);
+    // A day-long interval: every commit below comes from the stop or the final update.
+    config.checkpoint_cadence =
+        crate::TrainingCheckpointCadence::WallTime(std::time::Duration::from_secs(86_400));
     config.history = Some(crate::RuntimeHistory {
         directory: history.clone(),
         every: NonZeroU64::new(2).expect("nonzero"),
@@ -43,10 +46,26 @@ fn signal_stop_scenario() {
     assert_eq!(unsafe { libc::raise(libc::SIGTERM) }, 0);
     assert!(crate::training_signals::stop_requested());
     for (update, resume) in [(1, false), (2, true), (3, true)] {
-        let report = run(config.clone(), &checkpoint, resume).expect("stopped session");
+        let commits = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorder = commits.clone();
+        let report = run_annealed_job_harnessed(
+            config.clone(),
+            harness(),
+            PolicyDevice::Cpu,
+            &checkpoint,
+            resume,
+            None,
+            move |committed| recorder.lock().unwrap().push(committed.completed_updates),
+        )
+        .expect("stopped session");
         assert_eq!(
             report.completed_updates, update,
             "one committed update per session"
+        );
+        assert_eq!(
+            *commits.lock().unwrap(),
+            [update],
+            "the stop is the session's only checkpoint"
         );
         let artifact = TrainingArtifact::load(&checkpoint).expect("committed checkpoint");
         assert_eq!(artifact.progress().global_update, update);
@@ -61,14 +80,9 @@ fn signal_stop_scenario() {
         milestone.export_parameters().expect("milestone parameters"),
         committed.export_parameters().expect("committed parameters")
     );
-    std::fs::remove_dir_all(history.join("u0003")).expect("simulate a lost export");
     let report = run(config, &checkpoint, true).expect("completed resume");
     assert_eq!(report.completed_updates, 3);
-    assert_eq!(
-        history_entries(&history),
-        ["u0002", "u0003"],
-        "lost milestone restored"
-    );
+    assert_eq!(history_entries(&history), ["u0002", "u0003"]);
     for directory in [checkpoint, history] {
         std::fs::remove_dir_all(directory).expect("cleanup");
     }
