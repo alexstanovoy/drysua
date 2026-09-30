@@ -498,10 +498,19 @@ impl AnnealedSession {
         timing.set_samples(samples);
         timing.enter(TrainingStage::BatchPreparation);
         let batch = rollout.finish(config)?;
+        let explained_variance = batch.explained_variance();
+        let optimizer_step = self.state.trainer.optimizer_step();
         timing.enter(TrainingStage::Optimization);
         let optimized = self.state.trainer.train_update(&self.state.model, &batch);
         timing.set_optimizer_step(self.state.trainer.optimizer_step());
         self.state.latest = optimized?;
+        log_ppo_update(
+            &self.state.latest,
+            explained_variance,
+            self.state.trainer.optimizer_step() - optimizer_step,
+            samples,
+            config.learning_rate,
+        );
         timing.enter(TrainingStage::Finalization);
         self.state.completed_updates = self.state.trainer.updates();
         self.state.rollout_samples = self
@@ -1272,3 +1281,23 @@ fn command_line_option_value<'a>(tokens: &[&'a str], index: usize) -> &'a str {
 #[cfg(test)]
 #[path = "../tests/annealed.rs"]
 mod tests;
+
+fn log_ppo_update(
+    report: &crate::PpoUpdateReport,
+    explained_variance: f64,
+    optimizer_steps: u64,
+    samples: usize,
+    learning_rate: f32,
+) {
+    eprintln!(
+        "level=INFO event=ppo_update update={} policy_loss={:.6} value_loss={:.6} entropy={:.6} approx_kl={:.8} clip_fraction={:.6} explained_variance={:.6} kl_stop={} optimizer_steps={optimizer_steps} samples={samples} learning_rate={learning_rate:e}",
+        report.update,
+        report.policy_loss,
+        report.value_loss,
+        report.entropy,
+        crate::ppo_arena::update_kl(*report),
+        report.clip_fraction,
+        explained_variance,
+        report.stopped_for_kl,
+    );
+}

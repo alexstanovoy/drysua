@@ -36,6 +36,71 @@ enum Operation {
     Play(PlayArgs),
     /// Run the annealed domain-randomization loop with a frozen opponent.
     TrainAnnealed(TrainAnnealedArgs),
+    /// Evaluate frozen runtime weights on both sides of paired seeds; never trains.
+    Eval(EvalArgs),
+}
+
+/// Options for a frozen-weights evaluation.
+#[derive(Args)]
+struct EvalArgs {
+    /// Candidate runtime weights directory.
+    #[arg(long)]
+    weights: std::path::PathBuf,
+    /// `teacher` or `weights:<runtime weights directory>`.
+    #[arg(long, default_value = "teacher", value_parser = parse_eval_opponent)]
+    opponent: EvalOpponentArg,
+    /// Seed range `<start>:<count>`; every seed is played once per side.
+    #[arg(long, value_parser = parse_seed_range)]
+    seeds: (u64, u64),
+    /// Worlds per pipeline group; also the inference batch size.
+    #[arg(long, default_value_t = 16, value_parser = clap::value_parser!(u16).range(1..=64))]
+    parallel: u16,
+    /// Pipeline groups (1/2/4): one group infers while the others step.
+    #[arg(long, default_value_t = 2, value_parser = crate::training_execution::parse_actor_pipeline_groups)]
+    actor_pipeline_groups: u8,
+    /// Take the legal argmax instead of sampling from the policy.
+    #[arg(long)]
+    greedy: bool,
+    /// Inference tensor backend; simulation stays on CPU.
+    #[arg(long, value_enum, default_value_t = LearnerDevice::Cpu)]
+    device: LearnerDevice,
+    /// CUDA device ordinal.
+    #[arg(long, default_value_t = 0)]
+    device_ordinal: usize,
+    /// New JSONL file: one line per game, then one summary line.
+    #[arg(long)]
+    output: std::path::PathBuf,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum EvalOpponentArg {
+    Teacher,
+    Weights(std::path::PathBuf),
+}
+
+fn parse_eval_opponent(value: &str) -> Result<EvalOpponentArg, String> {
+    match value.split_once(':') {
+        None if value == "teacher" => Ok(EvalOpponentArg::Teacher),
+        Some(("weights", directory)) if !directory.is_empty() => {
+            Ok(EvalOpponentArg::Weights(directory.into()))
+        }
+        _ => Err(format!(
+            "opponent must be teacher or weights:<directory>, got {value:?}"
+        )),
+    }
+}
+
+fn parse_seed_range(value: &str) -> Result<(u64, u64), String> {
+    let invalid = || format!("seeds must be <start>:<count>, got {value:?}");
+    let (start, count) = value.split_once(':').ok_or_else(invalid)?;
+    let start = start.parse::<u64>().map_err(|_| invalid())?;
+    let count = count.parse::<u64>().map_err(|_| invalid())?;
+    if count == 0 || start.checked_add(count).is_none() {
+        return Err(format!(
+            "seed count must be positive and the range must not overflow, got {value:?}"
+        ));
+    }
+    Ok((start, count))
 }
 
 #[derive(Args)]
@@ -251,6 +316,7 @@ fn run(arguments: Cli) -> std::io::Result<()> {
         }
         Some(Operation::Play(play)) => play,
         Some(Operation::TrainAnnealed(train)) => return run_train_annealed(train),
+        Some(Operation::Eval(evaluation)) => return run_eval(evaluation),
         None => arguments.play,
     };
     let (policy, weights_directory) = resolve_play_deployment(&play)?;
@@ -834,6 +900,33 @@ fn cuda_policy_device(ordinal: usize) -> std::io::Result<crate::PolicyDevice> {
 fn cuda_policy_device(_: usize) -> std::io::Result<crate::PolicyDevice> {
     Err(std::io::Error::other(
         "CUDA learner requires cargo feature `cuda` on Linux or Windows",
+    ))
+}
+
+#[cfg(feature = "builtin")]
+fn run_eval(arguments: EvalArgs) -> std::io::Result<()> {
+    let settings = crate::ppo_arena::EvaluationSettings {
+        candidate: arguments.weights,
+        opponent: match arguments.opponent {
+            EvalOpponentArg::Teacher => crate::ppo_arena::EvaluationOpponent::Teacher,
+            EvalOpponentArg::Weights(directory) => {
+                crate::ppo_arena::EvaluationOpponent::Weights(directory)
+            }
+        },
+        first_seed: arguments.seeds.0,
+        seeds: arguments.seeds.1,
+        parallel: usize::from(arguments.parallel),
+        groups: usize::from(arguments.actor_pipeline_groups),
+        greedy: arguments.greedy,
+        device: arguments.device.policy_device(arguments.device_ordinal)?,
+    };
+    crate::ppo_arena::run_evaluation(&settings, &arguments.output).map_err(std::io::Error::other)
+}
+
+#[cfg(not(feature = "builtin"))]
+fn run_eval(_: EvalArgs) -> std::io::Result<()> {
+    Err(std::io::Error::other(
+        "eval requires cargo feature `builtin`",
     ))
 }
 

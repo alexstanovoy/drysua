@@ -308,6 +308,42 @@ fn gae_discounts_elapsed_ticks_and_stops_bootstrapping_at_terminal() {
 }
 
 #[test]
+fn explained_variance_separates_exact_blind_and_undefined_critics() {
+    let (frame, space) = frame_and_space();
+    let model = PolicyModel::fresh(94).expect("model");
+    let returns = [1.0f32, -1.0, 0.5, 0.25];
+    let batch = |values: [f32; 4], rewards: [f32; 4]| {
+        let mut rollout =
+            PpoRollout::new(4, model.policy_identity().expect("policy")).expect("rollout");
+        for (stream, (value, reward)) in values.into_iter().zip(rewards).enumerate() {
+            let mut sampled = choice(&model, &frame, &space, StructuredAction::Continue);
+            sampled.value = value;
+            let outcome = PpoOutcome {
+                stream,
+                decision: 0,
+                ticks: 3,
+                next_value: 0.0,
+                reward,
+                terminal: true,
+            };
+            rollout
+                .push(sampled.finish(outcome).expect("transition"))
+                .expect("push");
+        }
+        let config = PpoConfig {
+            rollout_decisions: 1,
+            environments: 4,
+            minibatch: 4,
+            ..PpoConfig::default()
+        };
+        rollout.finish(config).expect("batch").explained_variance()
+    };
+    assert!((batch(returns, returns) - 1.0).abs() < 1.0e-12);
+    assert!(batch([0.3; 4], returns).abs() < 1.0e-12);
+    assert!(batch([0.0, 1.0, 2.0, 3.0], [0.5; 4]).is_nan());
+}
+
+#[test]
 fn sampling_and_surrogate_boundaries_match_independent_references() {
     let (minimum, maximum) = crate::ppo::open_unit_bounds_for_test();
     assert!(minimum > 0.0);

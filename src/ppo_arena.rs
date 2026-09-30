@@ -7,6 +7,9 @@ pub use annealed::{
     run_annealed_job_on_with_initial_weights,
 };
 pub(crate) mod episode;
+mod evaluation;
+pub(crate) use evaluation::{EvaluationOpponent, EvaluationSettings, run_evaluation};
+mod game_summary;
 mod neural_opponent;
 mod parallel;
 mod reward;
@@ -16,9 +19,6 @@ pub use reward::Map2TrainingReward;
 mod test_support;
 #[cfg(test)]
 pub(crate) use test_support::*;
-#[cfg(test)]
-#[path = "tests/m25_evaluation.rs"]
-mod m25_evaluation_tests;
 #[cfg(test)]
 #[path = "tests/training_order_contract.rs"]
 pub(crate) mod training_order_contract;
@@ -94,6 +94,7 @@ struct ArenaSeatPolicy {
     order_bookkeeping: PolicyOrderBookkeeping,
     readiness: ItemReadiness,
     teacher: Teacher,
+    combat: game_summary::SeatCombat,
     sequence: u32,
     rejections: u64,
     pending_active: Option<(u32, Option<ActivePolicyOrder>)>,
@@ -636,6 +637,7 @@ fn setup_seat(index: usize, messages: &[ServerMsg]) -> Result<ArenaSeatPolicy, P
         order_bookkeeping: PolicyOrderBookkeeping::Legacy,
         readiness: ItemReadiness::new(),
         teacher: Teacher::new(),
+        combat: game_summary::SeatCombat::default(),
         sequence: 0,
         rejections: 0,
         pending_active: None,
@@ -873,7 +875,6 @@ fn requests_for_decision_in_space(
     Ok(requests)
 }
 
-#[cfg(test)]
 fn neural_policy_request_in_space(
     seat: &mut ArenaSeatPolicy,
     proposed: crate::StructuredAction,
@@ -889,24 +890,6 @@ fn neural_policy_request_in_space(
         .map_err(|error| PpoError::Model(error.to_string()))?;
     let request = issue_request(seat, issued, space, action, false)?;
     Ok((action, request))
-}
-
-#[cfg(test)]
-fn requests_with_candidate(
-    environment: &mut TrainingEnvironment,
-    mut candidate_request: Option<Request>,
-) -> Result<Vec<Option<Request>>, PpoError> {
-    let policy_seat = environment.policy_seat;
-    let mut requests = Vec::with_capacity(environment.seats.len());
-    for index in 0..environment.seats.len() {
-        let request = if index == policy_seat {
-            candidate_request.take()
-        } else {
-            opponent_request(&mut environment.seats[index], &mut environment.opponent)?
-        };
-        requests.push(request);
-    }
-    Ok(requests)
 }
 
 fn opponent_request(
@@ -1208,7 +1191,9 @@ fn observe_arena_events(
 ) -> Result<(), PpoError> {
     seat.tracker
         .observe_events(tick, events)
-        .map_err(|error| PpoError::Model(error.to_string()))
+        .map_err(|error| PpoError::Model(error.to_string()))?;
+    seat.combat.observe(&seat.tracker, events);
+    Ok(())
 }
 
 /// Owned variant: moves the snapshot into the tracker and keeps its tick for

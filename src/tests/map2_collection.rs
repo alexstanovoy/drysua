@@ -148,6 +148,11 @@ fn learner_deadline_zero_bootstraps_without_inventing_match_over() {
         choice: Some(choice.clone()),
         done: true,
         decisions: 1,
+        summary: Some(crate::ppo_arena::game_summary::GameSummary::capture(
+            &environment,
+            None,
+            4,
+        )),
         ..EpisodeStream::default()
     };
     assert_eq!(

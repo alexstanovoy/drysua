@@ -633,6 +633,7 @@ pub(super) struct EpisodeStream {
     decisions: usize,
     retained: u32,
     done: bool,
+    summary: Option<super::game_summary::GameSummary>,
 }
 
 impl EpisodeStream {
@@ -788,6 +789,13 @@ fn advance_cpu_with_opponent(
     reject_production_rejection(environment, "complete episode rollout")?;
     let outcome = terminal_outcome(environment, advanced.winner);
     state.done = outcome.is_some() || tick + advanced.ticks >= TICK_CAP;
+    if state.done {
+        state.summary = Some(super::game_summary::GameSummary::capture(
+            environment,
+            outcome,
+            tick + advanced.ticks,
+        ));
+    }
     let reward = observe_reward(
         environment,
         state,
@@ -962,12 +970,19 @@ fn record_episode(
         state.decisions - state.actions[ActionKind::Continue.index()] as usize,
         state.retention_phase
     );
-    crate::telemetry::PerformanceOutput::new(crate::telemetry::AsyncLogWriter::default()).emit(
-        &format_args!(
-            "level=INFO event=map2_episode_reward stream={stream} tick={tick} outcome={label} opponent={opponent} {}",
-            state.map2_reward
-        ),
-    );
+    let mut output =
+        crate::telemetry::PerformanceOutput::new(crate::telemetry::AsyncLogWriter::default());
+    output.emit(&format_args!(
+        "level=INFO event=map2_episode_reward stream={stream} tick={tick} outcome={label} opponent={opponent} {}",
+        state.map2_reward
+    ));
+    let summary = state
+        .summary
+        .as_ref()
+        .ok_or(PpoError::InvalidTransition("episode summary"))?;
+    output.emit(&format_args!(
+        "level=INFO event=episode_summary stream={stream} opponent={opponent} {summary}"
+    ));
     Ok(())
 }
 
