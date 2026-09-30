@@ -163,7 +163,7 @@ impl Teacher {
     }
 
     /// A teacher whose hero razes are single aimed decisions resolved by [`crate::RazeAim`].
-    #[cfg(all(test, feature = "builtin"))]
+    #[cfg(feature = "builtin")]
     pub(crate) const fn with_macro_hero_aim() -> Self {
         let mut teacher = Self::new();
         teacher.macro_hero_aim = true;
@@ -178,21 +178,33 @@ impl Teacher {
         readiness: &ItemReadiness,
     ) -> Result<(StructuredAction, ActionSpace), ActionError> {
         let space = ActionSpace::from_tracker_with_readiness(tracker, readiness)?;
+        let action = self.decide_in(tracker, persistence, &space)?;
+        Ok((action, space))
+    }
+
+    /// Selects an action in `space`, the space this seat's tracker and readiness build.
+    pub fn decide_in(
+        &mut self,
+        tracker: &StateTracker,
+        persistence: &OrderPersistence,
+        space: &ActionSpace,
+    ) -> Result<StructuredAction, ActionError> {
         self.prepare_decision(tracker);
         let pursuit = self.pursuit(persistence, space.tick());
         self.progress.observe(tracker, pursuit);
-        let choice = self.priority_action(tracker, persistence, &space);
-        let selected = self.stage_choice(tracker, &space, choice)?;
+        let choice = self.priority_action(tracker, persistence, space);
+        let selected = self.stage_choice(tracker, space, choice)?;
         let decoded = space.decode(selected)?;
-        let action = if decoded.is_some() && persistence.should_send(decoded).is_none() {
-            if matches!(selected, StructuredAction::Stop { .. }) {
-                self.combat.plan = None;
-            }
-            StructuredAction::Continue
-        } else {
-            selected
-        };
-        Ok((action, space))
+        Ok(
+            if decoded.is_some() && persistence.should_send(decoded).is_none() {
+                if matches!(selected, StructuredAction::Stop { .. }) {
+                    self.combat.plan = None;
+                }
+                StructuredAction::Continue
+            } else {
+                selected
+            },
+        )
     }
 
     /// Selects channel, sustain, bounded finishing, navigation cancellation, or retreat work.

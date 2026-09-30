@@ -31,6 +31,8 @@ pub(super) const CONTINUE_STRIDE: usize = crate::MAP2_CONTINUE_STRIDE;
 pub(super) struct RetainedChoice {
     pub(super) frame: FeatureFrame,
     pub(super) target: BehavioralTarget,
+    /// The shadow rule policy's label of the same decision, when this game has one.
+    pub(super) shadow: Option<BehavioralTarget>,
     pub(super) action: StructuredAction,
     /// Policy version (completed updates) of the actor weights that sampled it.
     pub(super) behaviour: u64,
@@ -178,6 +180,7 @@ impl EpisodeStream {
         let transition = PpoTransition {
             frame: choice.frame,
             target: choice.target,
+            shadow: choice.shadow,
             action: choice.action,
             behaviour: choice.behaviour,
             stream: 0,

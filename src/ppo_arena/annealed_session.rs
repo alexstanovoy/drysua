@@ -112,6 +112,7 @@ impl AnnealedSession {
             seed: settings.seed,
             decision_cap: harness.episode_decisions(),
             config,
+            shadow: settings.guidance.shadow_labels(),
         };
         let mut generations = GenerationCache::new(
             self.random_directory.clone(),
@@ -403,7 +404,11 @@ impl AnnealedSession {
         let explained_variance = batch.explained_variance();
         let optimizer_step = self.state.trainer.optimizer_step();
         timing.enter(TrainingStage::Optimization);
-        let optimized = self.state.trainer.train_update(&self.state.model, &batch);
+        let objective = settings.guidance.objective(update);
+        let optimized = self
+            .state
+            .trainer
+            .train_update(&self.state.model, &batch, objective);
         timing.set_optimizer_step(self.state.trainer.optimizer_step());
         self.state.latest = optimized?;
         log_ppo_update(

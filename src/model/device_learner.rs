@@ -20,6 +20,8 @@ pub(crate) struct StagedPpoBatch {
     parts: Vec<Tensor>,
     sides: Tensor,
     prefixes: PrefixUpload,
+    /// Prefixes of the shadow labels, staged only for an update that imitates.
+    shadow_prefixes: Option<PrefixUpload>,
     targets: ObjectiveTargets,
     rows: usize,
 }
@@ -35,6 +37,7 @@ pub(crate) struct PpoStaging {
     chunk_rows: usize,
     sides: Vec<u8>,
     prefixes: Vec<TrainingPrefix>,
+    shadow_prefixes: Option<Vec<TrainingPrefix>>,
     targets: HostTargets,
     row: EncoderRow,
     capacity: usize,
@@ -59,6 +62,11 @@ impl PpoStaging {
         }
         self.sides.push(u8::from(self.row.radiant()));
         self.prefixes.push(sample.transition.target.prefix());
+        if let Some(prefixes) = &mut self.shadow_prefixes {
+            // An unlabeled row's shadow heads are inactive; any valid prefix serves.
+            let label = sample.transition.shadow.as_ref();
+            prefixes.push(label.unwrap_or(&sample.transition.target).prefix());
+        }
         self.chunk_rows += 1;
         if self.chunk_rows == STAGING_CHUNK_ROWS {
             self.flush()?;
@@ -93,6 +101,7 @@ pub(super) struct StagedInputs {
     pub(super) encoder: EncoderInputs,
     pub(super) sides: Tensor,
     pub(super) prefixes: PrefixUpload,
+    pub(super) shadow_prefixes: Option<PrefixUpload>,
     pub(super) targets: ObjectiveTargets,
 }
 
@@ -108,14 +117,24 @@ impl StagedPpoBatch {
             encoder: EncoderInputs::from_parts(parts, rows)?,
             sides: self.sides.index_select(indices, 0)?,
             prefixes: self.prefixes.gather(indices)?,
+            shadow_prefixes: self
+                .shadow_prefixes
+                .as_ref()
+                .map(|prefixes| prefixes.gather(indices))
+                .transpose()?,
             targets: self.targets.gather(indices)?,
         })
     }
 }
 
 impl PolicyModel {
-    /// Empty staging for at most `capacity` rows, allocated on the learner device.
-    pub(crate) fn ppo_staging(&self, capacity: usize) -> Result<PpoStaging, ModelError> {
+    /// Empty staging for at most `capacity` rows, allocated on the learner device;
+    /// with `imitation` it also stages every row's shadow label.
+    pub(crate) fn ppo_staging(
+        &self,
+        capacity: usize,
+        imitation: bool,
+    ) -> Result<PpoStaging, ModelError> {
         if capacity == 0 || capacity > MODEL_MAX_STAGED_ROWS {
             return Err(ModelError::InvalidModelState("PPO staging capacity"));
         }
@@ -132,7 +151,8 @@ impl PolicyModel {
             chunk_rows: 0,
             sides: Vec::with_capacity(capacity),
             prefixes: Vec::with_capacity(capacity),
-            targets: HostTargets::with_capacity(capacity),
+            shadow_prefixes: imitation.then(|| Vec::with_capacity(capacity)),
+            targets: HostTargets::with_capacity(capacity, imitation),
             row: EncoderRow::new(),
             capacity,
         })
@@ -158,6 +178,10 @@ impl PolicyModel {
                 .collect::<Result<_, ModelError>>()?,
             sides: Tensor::from_vec(staging.sides, (rows, 1), device)?,
             prefixes: PrefixUpload::new(&staging.prefixes, device)?,
+            shadow_prefixes: staging
+                .shadow_prefixes
+                .map(|prefixes| PrefixUpload::new(&prefixes, device))
+                .transpose()?,
             targets: staging.targets.upload(device)?,
             rows,
         })
@@ -169,7 +193,7 @@ impl PolicyModel {
         &self,
         examples: &[&PpoPreparedSample],
     ) -> Result<StagedPpoBatch, ModelError> {
-        let mut staging = self.ppo_staging(examples.len().max(1))?;
+        let mut staging = self.ppo_staging(examples.len().max(1), false)?;
         for sample in examples {
             staging.push(sample)?;
         }
@@ -211,7 +235,7 @@ impl PolicyModel {
             &staged,
             &indices,
             adam,
-            config,
+            (config, crate::UpdateObjective::default()),
             microbatch,
             #[cfg(test)]
             faults,
@@ -224,14 +248,14 @@ impl PolicyModel {
         staged: &StagedPpoBatch,
         indices: &[usize],
         adam: &mut AdamState,
-        config: PpoConfig,
+        objective: (PpoConfig, crate::UpdateObjective),
         microbatch: usize,
     ) -> Result<PpoMinibatchReport, ModelError> {
         self.ppo_step_staged(
             staged,
             indices,
             adam,
-            config,
+            objective,
             microbatch,
             #[cfg(test)]
             PpoTestFaults::default(),
@@ -243,7 +267,7 @@ impl PolicyModel {
         staged: &StagedPpoBatch,
         indices: &[usize],
         adam: &mut AdamState,
-        config: PpoConfig,
+        (config, objective): (PpoConfig, crate::UpdateObjective),
         microbatch: usize,
         #[cfg(test)] faults: PpoTestFaults,
     ) -> Result<PpoMinibatchReport, ModelError> {
@@ -263,7 +287,8 @@ impl PolicyModel {
             .map(|&index| index as u32)
             .collect::<Vec<_>>();
         let rows = Tensor::from_vec(rows, indices.len(), self.tensor_device())?;
-        let (gradients, mut report) = self.staged_gradients(staged, &rows, config, microbatch)?;
+        let (gradients, mut report) =
+            self.staged_gradients(staged, &rows, (config, objective), microbatch)?;
         if report.approximate_kl > f64::from(config.target_kl) {
             return Ok(report);
         }
@@ -307,7 +332,7 @@ impl PolicyModel {
         &self,
         staged: &StagedPpoBatch,
         rows: &Tensor,
-        config: PpoConfig,
+        objective: (PpoConfig, crate::UpdateObjective),
         microbatch: usize,
     ) -> Result<(Vec<Option<Tensor>>, PpoMinibatchReport), ModelError> {
         let total = rows.elem_count();
@@ -317,9 +342,9 @@ impl PolicyModel {
         for start in (0..total).step_by(microbatch) {
             let length = microbatch.min(total - start);
             let inputs = staged.gather(&rows.narrow(0, start, length)?)?;
-            let output = self.training_forward_inputs(&inputs)?;
+            let (output, shadow) = self.training_forward_objective(&inputs, objective.1)?;
             let probe = side_actors::training_finite_probe(&output)?;
-            let terms = ppo_loss(&output, &inputs.targets, config, total)?;
+            let terms = ppo_loss(&output, shadow.as_ref(), &inputs.targets, objective, total)?;
             let store = terms.loss.backward()?;
             for (total, parameter) in gradients.iter_mut().zip(&parameters) {
                 if let Some(gradient) = store.get(parameter.value.as_tensor()) {

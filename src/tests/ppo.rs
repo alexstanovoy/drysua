@@ -191,7 +191,7 @@ fn trainer_retry_learns_rewarded_action_and_rejects_overly_stale_rollout_transac
     let before_probability = probability();
     let advantage = batch.replace_advantage_for_test(0, f32::NAN);
     let error = trainer
-        .train_update(&model, &batch)
+        .train_update(&model, &batch, crate::UpdateObjective::default())
         .expect_err("nonfinite advantage");
     assert!(error.to_string().contains("non-finite"), "{error}");
     assert_eq!(
@@ -203,14 +203,20 @@ fn trainer_retry_learns_rewarded_action_and_rejects_overly_stale_rollout_transac
     assert_eq!(trainer.rng_checkpoint(), random);
     assert_eq!(model.policy_identity().expect("failed identity"), identity);
     batch.replace_advantage_for_test(0, advantage);
-    let report = trainer.train_update(&model, &batch).expect("retry");
+    let report = trainer
+        .train_update(&model, &batch, crate::UpdateObjective::default())
+        .expect("retry");
     assert!(probability() > before_probability);
     assert_eq!(report.optimizer_step, 1);
     assert_eq!(report.samples_optimized, 2);
     assert_eq!(
         report,
         expected
-            .train_update(&reference, &reference_batch)
+            .train_update(
+                &reference,
+                &reference_batch,
+                crate::UpdateObjective::default()
+            )
             .expect("clean update")
     );
     let actual = trainer
@@ -225,7 +231,7 @@ fn trainer_retry_learns_rewarded_action_and_rejects_overly_stale_rollout_transac
     // Behaviour weights one and two updates old are within the pipeline bound.
     for update in [2, 3] {
         let report = trainer
-            .train_update(&model, &batch)
+            .train_update(&model, &batch, crate::UpdateObjective::default())
             .expect("bounded staleness");
         assert_eq!(report.update, update);
     }
@@ -233,7 +239,7 @@ fn trainer_retry_learns_rewarded_action_and_rejects_overly_stale_rollout_transac
     let random = trainer.rng_checkpoint();
     assert_eq!(
         trainer
-            .train_update(&model, &batch)
+            .train_update(&model, &batch, crate::UpdateObjective::default())
             .expect_err("stale rollout")
             .to_string(),
         "PPO rollout policy identity is stale"

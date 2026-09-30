@@ -13,6 +13,8 @@ mod evaluation;
 pub(crate) use eval_players::{PlayerSpec, read_pool};
 pub(crate) use evaluation::{EvaluationSettings, run_evaluation};
 mod game_summary;
+mod guidance;
+pub use guidance::{ImitationSchedule, TrainingGuidance};
 mod lane;
 mod league;
 mod opponents;
@@ -122,6 +124,9 @@ struct ArenaSeatPolicy {
     aim: crate::RazeAim,
     readiness: ItemReadiness,
     script: ScriptedPolicy,
+    /// `script` shadows this neural seat: it decides at every decision and notes
+    /// every order the seat sends, so its labels follow the seat's own play.
+    shadow: bool,
     combat: game_summary::SeatCombat,
     sequence: u32,
     rejections: u64,
@@ -638,6 +643,7 @@ fn setup_seat(index: usize, messages: &[ServerMsg]) -> Result<ArenaSeatPolicy, P
         aim: crate::RazeAim::default(),
         readiness: ItemReadiness::new(),
         script: ScriptedPolicy::new(ScriptKind::Teacher),
+        shadow: false,
         combat: game_summary::SeatCombat::default(),
         sequence: 0,
         rejections: 0,
@@ -811,6 +817,27 @@ fn teacher_request_with_action(
     Ok((action_kind, request))
 }
 
+/// Makes `kind` shadow the neural seat from its first decision on.
+fn enable_shadow(seat: &mut ArenaSeatPolicy, kind: ScriptKind) {
+    assert!(!seat.shadow);
+    assert_eq!(seat.sequence, 0, "a shadow sees every sent order");
+    seat.script = ScriptedPolicy::shadow(kind);
+    seat.shadow = true;
+}
+
+/// The shadow's action at the seat's prepared decision, from the seat's own
+/// tracker and the order ledger its sends go through: seat-observable only.
+fn shadow_action(
+    seat: &mut ArenaSeatPolicy,
+    space: &ActionSpace,
+) -> Result<crate::StructuredAction, PpoError> {
+    assert!(seat.shadow);
+    let persistence = seat.order_bookkeeping.effective(&seat.persistence);
+    seat.script
+        .decide_in(&seat.tracker, persistence, space)
+        .map_err(|error| PpoError::Model(format!("shadow decision: {error}")))
+}
+
 fn issue_request(
     seat: &mut ArenaSeatPolicy,
     issued: Option<crate::IssuedOrder>,
@@ -870,7 +897,7 @@ fn issue_request(
             Some((seat.sequence, previous))
         }
     };
-    if synchronize_teacher {
+    if synchronize_teacher || seat.shadow {
         seat.script.note_sent(seat.sequence, issued, space.tick());
     }
     seat.last_issued = Some((seat.sequence, issued, action_kind));

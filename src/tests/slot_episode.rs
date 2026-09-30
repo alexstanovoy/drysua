@@ -15,6 +15,7 @@ fn schedule(decision_cap: usize) -> GameSchedule {
             gamma_tick: MAP2_REWARD_GAMMA_TICK,
             ..PpoConfig::default()
         },
+        shadow: None,
     }
 }
 

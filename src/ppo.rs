@@ -39,7 +39,7 @@ const _: () = assert!(
         + std::mem::size_of::<usize>()
         <= 8_192
 );
-const _: () = assert!(std::mem::size_of::<PpoPreparedSample>() <= 70_000);
+const _: () = assert!(std::mem::size_of::<PpoPreparedSample>() <= 71_000);
 const _: () = assert!(PPO_MAX_PARALLEL_WORLDS <= crate::MODEL_TRAINING_BATCH);
 /// Conservative rollout storage plus one fully materialized effective minibatch.
 /// Includes arena reallocation overlap, both preparation vectors and shuffle order;
@@ -391,6 +391,8 @@ fn open_unit_from_bits(bits: u64) -> f64 {
 pub struct PpoTransition {
     pub(crate) frame: FeatureFrame,
     pub(crate) target: BehavioralTarget,
+    /// A shadow rule policy's label of the same decision, for the imitation term.
+    pub(crate) shadow: Option<BehavioralTarget>,
     pub(crate) action: StructuredAction,
     /// Completed updates of the actor weights that sampled `action`.
     pub(crate) behaviour: u64,
@@ -453,6 +455,7 @@ impl PpoPolicyChoice {
         let transition = PpoTransition {
             frame: self.frame,
             target: self.target,
+            shadow: None,
             action: self.action,
             behaviour,
             stream: outcome.stream,
@@ -494,10 +497,12 @@ pub(crate) fn validate_transition(transition: &PpoTransition) -> Result<(), PpoE
     if transition.old_log_probability > 1.0e-5 || !transition.frame.is_finite() {
         return Err(PpoError::InvalidTransition("policy statistics or frame"));
     }
-    transition
-        .target
-        .validate()
-        .map_err(|error| PpoError::Model(error.to_string()))
+    let invalid = |error: crate::ImitationError| PpoError::Model(error.to_string());
+    transition.target.validate().map_err(invalid)?;
+    if let Some(shadow) = &transition.shadow {
+        shadow.validate().map_err(invalid)?;
+    }
+    Ok(())
 }
 
 /// Fixed-capacity rollout of one update; samples carry their behaviour versions.
@@ -511,6 +516,7 @@ pub struct PpoRollout {
 struct CompactPpoTransition {
     frame: RaggedFeatureHeader,
     target: PackedBehavioralTarget,
+    shadow: Option<PackedBehavioralTarget>,
     action: StructuredAction,
     behaviour: u64,
     stream: usize,
@@ -564,6 +570,7 @@ impl PpoRollout {
         self.transitions.push(CompactPpoTransition {
             frame,
             target: transition.target.pack(),
+            shadow: transition.shadow.as_ref().map(BehavioralTarget::pack),
             action: transition.action,
             behaviour: transition.behaviour,
             stream: transition.stream,
@@ -639,6 +646,43 @@ struct CompactPreparedSample {
     return_value: f32,
 }
 
+/// Auxiliary terms of one update: a pure function of the update index and the
+/// run scope, so a resumed run recomputes them exactly.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct UpdateObjective {
+    /// Weight of the cross entropy to the shadow labels; zero leaves PPO unchanged.
+    pub imitation: f32,
+    /// Trains only the critic head; every other parameter keeps its bits.
+    pub critic_only: bool,
+}
+
+/// Imitation statistics summed over optimized rows, in shadow-label head order.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct ImitationReport {
+    /// Summed cross entropy of every labeled head.
+    pub cross_entropy: f64,
+    /// Rows with a shadow label.
+    pub labeled: f64,
+    /// Labeled rows whose legal argmax matches the label on every labeled head.
+    pub action_agreements: f64,
+    /// Per head: labeled rows whose legal argmax matches the label.
+    pub head_agreements: [f64; crate::MODEL_BEHAVIORAL_HEADS],
+    /// Per head: rows the label defines.
+    pub head_labels: [f64; crate::MODEL_BEHAVIORAL_HEADS],
+}
+
+impl ImitationReport {
+    fn add(&mut self, other: &Self) {
+        self.cross_entropy += other.cross_entropy;
+        self.labeled += other.labeled;
+        self.action_agreements += other.action_agreements;
+        for head in 0..crate::MODEL_BEHAVIORAL_HEADS {
+            self.head_agreements[head] += other.head_agreements[head];
+            self.head_labels[head] += other.head_labels[head];
+        }
+    }
+}
+
 /// One model minibatch result before trainer-level aggregation.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct PpoMinibatchReport {
@@ -651,6 +695,7 @@ pub(crate) struct PpoMinibatchReport {
     pub applied_scale: f64,
     pub samples: usize,
     pub applied: bool,
+    pub imitation: ImitationReport,
 }
 
 /// One complete PPO update report across epochs and minibatches.
@@ -671,6 +716,9 @@ pub struct PpoUpdateReport {
     pub stopped_for_kl: bool,
     pub optimizer_step: u64,
     pub update: u64,
+    /// The auxiliary terms this update trained with.
+    pub objective: UpdateObjective,
+    pub imitation: ImitationReport,
 }
 
 /// Exclusive PPO optimizer owner with deterministic bounded shuffling.
@@ -759,6 +807,7 @@ impl PpoTrainer {
         &mut self,
         model: &PolicyModel,
         batch: &PpoBatch,
+        objective: UpdateObjective,
     ) -> Result<PpoUpdateReport, PpoError> {
         let current = model
             .policy_identity()
@@ -771,13 +820,17 @@ impl PpoTrainer {
         {
             return Err(PpoError::PolicyMismatch);
         }
-        self.train_accepted_update(model, batch)
+        if !objective.imitation.is_finite() || objective.imitation < 0.0 {
+            return Err(PpoError::InvalidConfig("imitation coefficient"));
+        }
+        self.train_accepted_update(model, batch, objective)
     }
 
     fn train_accepted_update(
         &mut self,
         model: &PolicyModel,
         batch: &PpoBatch,
+        objective: UpdateObjective,
     ) -> Result<PpoUpdateReport, PpoError> {
         self.validate_batch_dimensions(batch)?;
         let snapshot = model
@@ -785,7 +838,7 @@ impl PpoTrainer {
             .map_err(|error| PpoError::Model(error.to_string()))?;
         let shuffle = self.shuffle.clone();
         let optimizer_step = self.adam.step();
-        match self.train_update_inner(model, batch) {
+        match self.train_update_inner(model, batch, objective) {
             Ok(report) => Ok(report),
             Err(error) => {
                 self.shuffle = shuffle;
@@ -815,9 +868,13 @@ impl PpoTrainer {
         &mut self,
         model: &PolicyModel,
         batch: &PpoBatch,
+        objective: UpdateObjective,
     ) -> Result<PpoUpdateReport, PpoError> {
-        let mut aggregate = PpoUpdateReport::default();
-        let staged = batch.stage(model)?;
+        let mut aggregate = PpoUpdateReport {
+            objective,
+            ..PpoUpdateReport::default()
+        };
+        let staged = batch.stage(model, imitates(objective))?;
         let mut order = (0..batch.samples.len()).collect::<Vec<_>>();
         'epochs: for epoch in 0..self.config.epochs {
             self.shuffle.shuffle(&mut order)?;
@@ -831,7 +888,7 @@ impl PpoTrainer {
                         &staged,
                         indices,
                         &mut self.adam,
-                        self.config,
+                        (self.config, objective),
                         self.execution.training_microbatch,
                     )
                     .map_err(|error| PpoError::Model(error.to_string()))?;
@@ -854,6 +911,11 @@ impl PpoTrainer {
     }
 }
 
+/// Whether an update with `objective` trains the imitation term.
+pub(crate) fn imitates(objective: UpdateObjective) -> bool {
+    objective.imitation > 0.0 && !objective.critic_only
+}
+
 fn aggregate_minibatch(
     aggregate: &mut PpoUpdateReport,
     report: PpoMinibatchReport,
@@ -865,6 +927,7 @@ fn aggregate_minibatch(
     aggregate.clip_fraction += report.clip_fraction * report.samples as f64;
     aggregate.gradient_norm += report.gradient_norm;
     aggregate.applied_scale += report.applied_scale;
+    aggregate.imitation.add(&report.imitation);
     aggregate.samples_optimized = aggregate
         .samples_optimized
         .checked_add(report.samples)
@@ -944,10 +1007,13 @@ impl PpoBatch {
         })
     }
 
-    /// Uploads every sample once, in batch order, to the learner device.
-    fn stage(&self, model: &PolicyModel) -> Result<StagedPpoBatch, PpoError> {
+    /// Uploads every sample once, in batch order, to the learner device, with
+    /// the shadow labels when the update imitates.
+    fn stage(&self, model: &PolicyModel, imitation: bool) -> Result<StagedPpoBatch, PpoError> {
         let error = |error: crate::ModelError| PpoError::Model(error.to_string());
-        let mut staging = model.ppo_staging(self.samples.len()).map_err(error)?;
+        let mut staging = model
+            .ppo_staging(self.samples.len(), imitation)
+            .map_err(error)?;
         for index in 0..self.samples.len() {
             staging.push(&self.sample(index)?).map_err(error)?;
         }
@@ -1091,6 +1157,7 @@ fn expand_transition(
             .expand(&compact.frame)
             .map_err(PpoError::InvalidTransition)?,
         target: compact.target.unpack(),
+        shadow: compact.shadow.as_ref().map(PackedBehavioralTarget::unpack),
         action: compact.action,
         behaviour: compact.behaviour,
         stream: compact.stream,

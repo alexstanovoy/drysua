@@ -61,7 +61,7 @@ fn stale_behaviour_cannot_mutate_trainer_state() {
     let before = trainer.checkpoint_snapshot(&model).expect("before");
     let random = trainer.rng_checkpoint();
     assert_eq!(
-        trainer.train_update(&model, &batch),
+        trainer.train_update(&model, &batch, crate::UpdateObjective::default()),
         Err(PpoError::PolicyMismatch),
         "behaviour weights from the learner's future"
     );
