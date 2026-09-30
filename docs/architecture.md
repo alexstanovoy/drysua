@@ -97,7 +97,7 @@ exception: it warm-starts from any runtime weights with the current parameter la
 | `src/feature.rs` | Feature encoder |
 | `src/action.rs`, `src/raze_aim.rs`, `src/persistence.rs`, `src/readiness.rs` | Action space, masks, aimed razes, order and item bookkeeping |
 | `src/teacher.rs`, `src/teacher_economy.rs` | Scripted Teacher controller |
-| `src/scripted/` | Rule-policy seat (`ScriptedPolicy`), HarassPush, shared tactics, `duel` runner |
+| `src/scripted/` | Rule-policy seat (`ScriptedPolicy`), HarassPush, shared tactics, progress watchdog, `duel` runner |
 | `src/model.rs`, `src/model/` | Policy/value network, sampling, side actors |
 | `src/ppo.rs`, `src/ppo/` | PPO, GAE, Adam |
 | `src/ppo_arena.rs`, `src/ppo_arena/` | Collection (slots, lanes, pool), annealed session, eval |
@@ -124,9 +124,11 @@ exception: it warm-starts from any runtime weights with the current parameter la
   instead of a turn and a cast that were rarely retained together.
 - **Teacher weaknesses** the policy has not found: it retreats at 40% HP without
   hysteresis, never pushes into tower range while the enemy hero is within 1,200,
-  spends its mana on creep and tower razes, and can freeze behind a building it walks
-  toward. HarassPush (`src/scripted/harass_push.rs`) exploits these and beats it in
-  195 of 200 `drysua duel` games (seeds 1–100, both sides).
+  spends its mana on creep and tower razes. HarassPush (`src/scripted/harass_push.rs`)
+  wins 83 of 200 `drysua duel` games against it (seeds 1–100, both sides). Before
+  Teacher abandoned unreachable walks and Tango trees (`src/scripted/progress.rs`) it
+  froze in most of those games and HarassPush won 195; E0 and every other number
+  measured against Teacher before that fix are against the freezing Teacher.
 
 In flight: reward 8 and aimed razes in campaigns; critic capacity and trunk
 gradient, λ, retention of non-Continue decisions and a PFSP opponent mixture;
