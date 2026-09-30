@@ -10,9 +10,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use rustc_hash::FxHashMap;
-
-use super::super::collector::Collector;
+use super::super::collector::{Collector, Prepared};
 use super::super::collector_state::CollectorState;
 use super::super::lane::{LaneSettings, LaneStart, PartConfig, PartDone};
 use super::super::league::LeagueStore;
@@ -21,8 +19,8 @@ use super::super::pool::SimPool;
 use super::super::slot::{GameSchedule, OpponentKind, OpponentMixture, SlotSnapshot};
 use super::super::{CollectionReport, TrainingSession};
 use super::*;
+use crate::CollectionCheckpoint;
 use crate::telemetry::{TrainingStage, TrainingUpdateMode, TrainingUpdateTimer};
-use crate::{CollectionCheckpoint, PPO_MAX_STREAMS, PpoRollout};
 
 pub(super) struct AnnealedSession {
     state: TrainingSession,
@@ -144,7 +142,13 @@ impl AnnealedSession {
                 )?;
                 pools.push((pool, cpus));
             }
-            let collector = Collector::spawn(scope, lanes, pools, &schedule)?;
+            let collector = Collector::spawn(
+                scope,
+                lanes,
+                pools,
+                &schedule,
+                (self.state.completed_updates, settings.slots, settings.ppo),
+            )?;
             let mut pipeline = Pipeline {
                 collector,
                 configs: BTreeMap::new(),
@@ -393,14 +397,19 @@ impl AnnealedSession {
         let update = self.state.completed_updates;
         let config = settings.ppo;
         timing.enter(TrainingStage::Collection);
-        let mut parts = pipeline.collector.take(update)?;
+        let prepared = pipeline.collector.take(update)?;
         timing.enter(TrainingStage::BatchPreparation);
-        let (rollout, report, snapshots) = assemble(&mut parts, settings.slots, config)?;
-        self.record_outcomes(&parts, pool, update)?;
-        let samples = rollout.len();
+        log_parts(&prepared);
+        self.record_outcomes(&prepared.parts, pool, update)?;
+        let Prepared {
+            samples,
+            batch,
+            report,
+            snapshots,
+            ..
+        } = prepared;
         timing.set_samples(samples);
         let next_adaptive = generations.next_adaptive(settings, harness, update, &report)?;
-        let batch = rollout.finish(config)?;
         let explained_variance = batch.explained_variance();
         let optimizer_step = self.state.trainer.optimizer_step();
         timing.enter(TrainingStage::Optimization);
@@ -544,37 +553,12 @@ impl Pipeline {
     }
 }
 
-/// One update's batch, report and next-update snapshots from its lane parts;
-/// the samples move into the rollout (a clone would copy every frame).
-fn assemble(
-    parts: &mut [PartDone],
-    slots: usize,
-    config: PpoConfig,
-) -> Result<(PpoRollout, CollectionReport, Vec<SlotSnapshot>), PpoError> {
-    let mut rollout = PpoRollout::new(config.rollout_capacity(slots))?;
-    let mut streams: FxHashMap<(usize, u64), usize> = FxHashMap::default();
-    let mut report = CollectionReport::default();
-    let mut snapshots: Vec<Option<SlotSnapshot>> = (0..slots).map(|_| None).collect();
-    for part in parts {
-        let samples = part.samples.len();
-        for sample in std::mem::take(&mut part.samples) {
-            let next = streams.len();
-            let stream = *streams.entry((sample.slot, sample.game)).or_insert(next);
-            if stream >= PPO_MAX_STREAMS {
-                return Err(PpoError::InvalidConfig(
-                    "update exceeds its game stream bound",
-                ));
-            }
-            let mut transition = sample.transition;
-            transition.stream = stream;
-            rollout.push(transition)?;
-        }
+/// Logs the update's finished games and lane parts on the learner thread, so
+/// they stay between the previous and this update's progress lines.
+fn log_parts(prepared: &Prepared) {
+    for (part, samples) in prepared.parts.iter().zip(&prepared.part_samples) {
         for episode in &part.episodes {
             episode.log();
-            episode.accumulate(&mut report)?;
-        }
-        for snapshot in &part.snapshot {
-            snapshots[snapshot.plan.slot] = Some(snapshot.clone());
         }
         crate::telemetry::log_line!(
             "level=INFO event=collection_part update={} lane={} rounds={} samples={} games={} inference_s={:.3} simulation_s={:.3}",
@@ -587,11 +571,6 @@ fn assemble(
             part.simulation.as_secs_f64(),
         );
     }
-    let snapshots = snapshots
-        .into_iter()
-        .collect::<Option<Vec<_>>>()
-        .ok_or(PpoError::InvalidTransition("collection snapshot slots"))?;
-    Ok((rollout, report, snapshots))
 }
 
 /// The spawn modifiers of `update`; collection past the final update only

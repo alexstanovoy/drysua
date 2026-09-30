@@ -97,6 +97,11 @@ is the checkpoint model. Episode logs carry `slot=`, `game=` and `opponent=`.
 
 ## Learner
 
+A preparer thread (`src/ppo_arena/collector.rs`) takes each update's lane parts
+and builds its batch (rollout, GAE, report, snapshots) while the learner still
+trains the previous update; the learner logs the parts' games and takes the
+batches in update order.
+
 The learner is device resident (`src/model/device_learner.rs`). An update's
 samples are packed into encoder rows and uploaded once, in 256-row chunks, into
 preallocated device columns. Each Adam step gathers its minibatch on the device,
@@ -106,8 +111,13 @@ clipped f32 Adam there. The Adam moments stay on the device (read back only
 for checkpoints). Per step the host reads back the loss sums with a finiteness
 probe, the gradient norm, one moment/parameter finiteness check and the
 candidate KL; a rejected candidate is restored from device copies of the
-parameters and the previous moment tensors. The loss definitions live only in
-`src/model/ppo_objective.rs`.
+parameters and the previous moment tensors. `--target-kl` is the threshold of
+both guards; `--kl-guard early-stop` (recorded in the run scope; default
+`post-step`) skips that candidate pass and rollback: an update stops at the
+first minibatch whose KL before its step, from the gradient's own forward pass,
+exceeds `--target-kl`, and taken steps are kept. Imitation and critic warm-up
+change only the loss, so they work the same under either guard. The
+loss definitions live only in `src/model/ppo_objective.rs`.
 
 ## What changed numerically
 

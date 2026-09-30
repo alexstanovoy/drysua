@@ -34,6 +34,24 @@ impl PolicyModel {
         )
     }
 
+    #[cfg(feature = "builtin")]
+    pub(crate) fn ppo_update_early_stop_for_test(
+        &self,
+        examples: &[&PpoPreparedSample],
+        adam: &mut AdamState,
+        config: PpoConfig,
+    ) -> Result<PpoMinibatchReport, ModelError> {
+        let staged = self.stage_ppo_examples(examples)?;
+        let indices = (0..examples.len()).collect::<Vec<_>>();
+        self.ppo_update_staged(
+            &staged,
+            &indices,
+            adam,
+            (config, crate::UpdateObjective::default()),
+            (2, crate::KlGuard::EarlyStop),
+        )
+    }
+
     pub(crate) fn ppo_update_with_faults_for_test(
         &self,
         examples: &[&PpoPreparedSample],

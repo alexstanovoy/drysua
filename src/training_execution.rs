@@ -8,6 +8,21 @@ pub struct TrainingExecutionOptions {
     /// Rows per device forward/backward and candidate-KL pass; gradients of a minibatch's
     /// microbatches are summed, so the choice only regroups floating-point reductions.
     pub training_microbatch: usize,
+    /// How an Adam step is held to the KL target.
+    pub kl_guard: KlGuard,
+}
+
+/// How an Adam step is held to the PPO KL target; both stop the update at the
+/// first minibatch whose KL before the step already exceeds the target.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum KlGuard {
+    /// Also re-evaluates each stepped minibatch and rolls a step back
+    /// (parameters and Adam state) when its KL after the step exceeds the target.
+    #[default]
+    PostStep,
+    /// Standard PPO early stopping: only the KL of the forward pass the
+    /// gradient already needs is checked; a taken step is kept.
+    EarlyStop,
 }
 
 impl Default for TrainingExecutionOptions {
@@ -15,6 +30,7 @@ impl Default for TrainingExecutionOptions {
         Self {
             balanced_minibatches: false,
             training_microbatch: DEFAULT_TRAINING_MICROBATCH,
+            kl_guard: KlGuard::PostStep,
         }
     }
 }
@@ -40,6 +56,9 @@ impl TrainingExecutionOptions {
                 " --training-microbatch {}",
                 self.training_microbatch
             ));
+        }
+        if self.kl_guard == KlGuard::EarlyStop {
+            command.push_str(" --kl-guard early-stop");
         }
     }
 }
