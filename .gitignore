@@ -6,3 +6,6 @@
 __pycache__/
 *.py[cod]
 /temp/
+/artifacts/history/
+/artifacts/weights/
+/bench.lock
