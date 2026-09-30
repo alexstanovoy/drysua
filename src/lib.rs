@@ -23,6 +23,7 @@ mod randomization;
 mod raze_aim;
 mod readiness;
 mod reward_observer;
+mod scripted;
 mod seat;
 mod teacher;
 mod teacher_economy;
