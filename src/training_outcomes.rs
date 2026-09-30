@@ -1,6 +1,14 @@
-#[cfg(any(feature = "builtin", test))]
+#[cfg(feature = "builtin")]
 use crate::PpoError;
-use crate::TrainingGameOutcome;
+
+/// Completed training task result; infrastructure failures have no variant.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TrainingGameOutcome {
+    Win,
+    Loss,
+    Draw,
+    TimeCap,
+}
 
 /// At most one completed outcome per update stream, sorted by tick then stream.
 /// Sequential annealed batches can finish more games than the concurrent world cap.
@@ -18,7 +26,7 @@ impl Default for CompletedTrainingEpisodes {
 }
 
 impl CompletedTrainingEpisodes {
-    #[cfg(any(feature = "builtin", test))]
+    #[cfg(feature = "builtin")]
     pub(crate) fn record(
         &mut self,
         tick: u32,
@@ -36,29 +44,6 @@ impl CompletedTrainingEpisodes {
             ));
         }
         self.entries[stream] = Some((tick, stream, outcome));
-        Ok(())
-    }
-
-    /// Copies every stream entry of `other`, rejecting duplicate streams.
-    ///
-    /// Pipeline groups own disjoint streams, so disjoint merges cover exactly
-    /// the same stream set as one global batch; ordering inside the ordered
-    /// outcome view is derived from the recorded ticks and streams.
-    #[cfg(any(feature = "builtin", test))]
-    #[cfg(feature = "builtin")]
-    pub(crate) fn merge(&mut self, other: &Self) -> Result<(), PpoError> {
-        for (stream, entry) in other.entries.iter().enumerate() {
-            let Some((tick, recorded_stream, outcome)) = entry else {
-                continue;
-            };
-            assert_eq!(*recorded_stream, stream);
-            if self.entries[stream].is_some() {
-                return Err(PpoError::InvalidTransition(
-                    "duplicate completed episode stream",
-                ));
-            }
-            self.entries[stream] = Some((*tick, *recorded_stream, *outcome));
-        }
         Ok(())
     }
 

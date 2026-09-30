@@ -45,11 +45,11 @@ mod files {
 
     #[test]
     fn generic_inspection_is_read_only_and_never_restores_the_recorded_cuda_device() {
-        let mut artifact = fixture_artifact("train-full --updates 8", 0);
+        let mut artifact = fixture_artifact("other-command --updates 8", 0);
         let fixture = Fixture::new(&mut artifact);
         let report = inspect(&fixture).expect("inspection without a device");
         assert_eq!(report["schema"], "drysua-checkpoint-inspection/v1");
-        assert_eq!(report["kind"], "train-full");
+        assert_eq!(report["kind"], "other");
         assert_eq!(
             report["run"]["device"],
             json!({"kind": "cuda", "ordinal": u32::MAX})
@@ -73,23 +73,11 @@ mod files {
         ] {
             assert!(listed(&report, name), "matched inventory contains {name}");
         }
-        for (command, kind) in [
-            ("train --updates 8", "train"),
-            ("unrecognized-command", "other"),
-        ] {
-            artifact.run.command_line = command.to_owned();
-            fixture.manifest(&artifact);
-            let report = inspect(&fixture).expect("generic kind");
-            assert_eq!(report["kind"], kind);
-            assert_eq!(report["history"]["kind"], "unsupported");
-            assert_eq!(report["history"]["verified"], false);
-            assert!(report["progress"]["games"].is_null());
-        }
     }
 
     #[test]
     fn runtime_missing_lagging_and_old_schema_are_classified_without_mutation() {
-        let mut artifact = fixture_artifact("train-full", 0);
+        let mut artifact = fixture_artifact("other-command", 0);
         let fixture = Fixture::new(&mut artifact);
         let path = fixture.0.join(RUNTIME_TENSOR_FILE);
         fs::remove_file(&path).expect("own missing export");
@@ -115,7 +103,7 @@ mod files {
 
     #[test]
     fn malformed_runtime_is_an_error_not_a_lagging_export() {
-        let mut artifact = fixture_artifact("train-full", 0);
+        let mut artifact = fixture_artifact("other-command", 0);
         let fixture = Fixture::new(&mut artifact);
         fs::write(
             fixture.0.join(RUNTIME_TENSOR_FILE),
@@ -130,7 +118,7 @@ mod files {
 
     #[test]
     fn immutable_payload_is_authoritative_and_stale_alias_is_not_inventory() {
-        let mut artifact = fixture_artifact("train-full", 0);
+        let mut artifact = fixture_artifact("other-command", 0);
         let fixture = Fixture::new(&mut artifact);
         let mut stale = serialize_training_tensors(&artifact).unwrap();
         *stale.last_mut().unwrap() ^= 1;
@@ -151,7 +139,7 @@ mod files {
 
     #[test]
     fn unknown_checkpoint_identity_is_rejected_without_migration() {
-        let mut artifact = fixture_artifact("train-full", 0);
+        let mut artifact = fixture_artifact("other-command", 0);
         let fixture = Fixture::new(&mut artifact);
         let mut writer = ManifestWriter::default();
         writer.bytes.extend(CHECKPOINT_MAGIC);
@@ -166,7 +154,7 @@ mod files {
 
     #[test]
     fn unsafe_or_oversized_runtime_is_rejected_before_runtime_classification() {
-        let mut artifact = fixture_artifact("train-full", 0);
+        let mut artifact = fixture_artifact("other-command", 0);
         let fixture = Fixture::new(&mut artifact);
         let path = fixture.0.join(RUNTIME_TENSOR_FILE);
         fs::remove_file(&path).unwrap();
@@ -194,7 +182,7 @@ mod files {
 
     #[test]
     fn manifest_change_after_inventory_is_rejected_deterministically() {
-        let mut artifact = fixture_artifact("train-full", 0);
+        let mut artifact = fixture_artifact("other-command", 0);
         let fixture = Fixture::new(&mut artifact);
         artifact.run.git_commit = "next-inspection-fixture".to_owned();
         let changed = encode_manifest(&artifact, artifact.tensor_hash).unwrap();
@@ -224,7 +212,7 @@ mod files {
 
     #[test]
     fn checkpoint_directory_rejects_symlinked_ancestors_and_parent_components() {
-        let mut artifact = fixture_artifact("train-full", 0);
+        let mut artifact = fixture_artifact("other-command", 0);
         let fixture = Fixture::new(&mut artifact);
         let direct = fixture.0.join("checkpoint-link");
         symlink(&fixture.0, &direct).unwrap();
@@ -250,7 +238,7 @@ mod files {
 
     #[test]
     fn replacing_checkpoint_root_after_inventory_is_detected_and_fixture_is_restored() {
-        let mut artifact = fixture_artifact("train-full", 0);
+        let mut artifact = fixture_artifact("other-command", 0);
         let fixture = Fixture::new(&mut artifact);
         let holding = Fixture(crate::ppo::test_directory("inspection-root-holding"));
         let swap = RootSwap {
@@ -273,7 +261,7 @@ mod files {
 
     #[test]
     fn previous_files_report_actual_sources_and_never_hide_an_unsafe_primary() {
-        let mut artifact = fixture_artifact("train-full", 0);
+        let mut artifact = fixture_artifact("other-command", 0);
         let fixture = Fixture::new(&mut artifact);
         let generation = tensor_generation_path(Path::new(""), artifact.tensor_hash);
         fs::remove_file(fixture.0.join(&generation)).unwrap();
@@ -315,7 +303,7 @@ mod files {
 
     #[test]
     fn scope_hash_ignores_progress_and_tensor_updates_but_binds_optimizer_configuration() {
-        let mut artifact = fixture_artifact("train-full --updates 8", 0);
+        let mut artifact = fixture_artifact("other-command --updates 8", 0);
         let fixture = Fixture::new(&mut artifact);
         let initial = inspect(&fixture).expect("initial identity");
         artifact.progress.global_update = 1;
@@ -562,7 +550,6 @@ mod files {
         parameters[0] = -0.0;
         TrainingArtifact {
             run: CheckpointRun {
-                mastery_config: None,
                 git_commit: "inspection-fixture".to_owned(),
                 simulator_commit: "inspection-simulator".to_owned(),
                 enabled_features: compiled_features(),
@@ -576,7 +563,6 @@ mod files {
             },
             progress: CheckpointProgress {
                 adaptive_environment: None,
-                mastery: None,
                 global_update: updates,
                 policy_version: 0,
                 scheduler_step: 0,

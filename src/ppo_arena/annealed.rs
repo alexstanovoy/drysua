@@ -23,10 +23,10 @@ use bota_server::game::{
 
 use super::episode::{self, ACTOR_DECISIONS};
 use super::{
-    OpponentSpec, ResumeProvenance, TRAINING_MAX_ENVIRONMENTS, TrainingCheckpointSchedule,
-    TrainingDirectoryLock, TrainingEnvironment, TrainingSession, actor_stream_rngs,
-    build_environment_with_spawn_modifiers, device_name, reject_production_rejection, text_error,
-    validate_checkpoint_cadence, validate_initial_weights_directory, validate_training_directory,
+    OpponentSpec, TRAINING_MAX_ENVIRONMENTS, TrainingCheckpointSchedule, TrainingDirectoryLock,
+    TrainingEnvironment, TrainingSession, actor_stream_rngs, build_environment, device_name,
+    reject_production_rejection, text_error, validate_checkpoint_cadence,
+    validate_initial_weights_directory, validate_training_directory,
 };
 use crate::randomization::{
     AnnealSchedule, GenerationDraw, RANDOMIZATION_DIRECTORY, derive_training_seed, draw_generation,
@@ -38,12 +38,12 @@ use crate::telemetry::{
     TrainingUpdateTimer, time_training_scope,
 };
 use crate::{
-    CheckpointDevice, CheckpointRun, MAP2_DECISION_INTERVAL_TICKS, MAP2_RETAINED_DECISIONS,
-    MAP2_REWARD_GAMMA_TICK, MAX_TRAINING_COUNTER, MODEL_MAX_OPTIMIZER_STEP, PPO_ANNEALED_MAX_GAMES,
-    PPO_ANNEALED_MAX_SAMPLES, PPO_MAX_POLICY_SAMPLE_DRAWS, PPO_RULES_AUDIT_VERSION, PolicyDevice,
-    PolicyModel, PolicySnapshot, PpoConfig, PpoError, PpoRng, PpoRollout, PpoSampleBudget,
-    PpoSmokeReport, PpoUpdateReport, SHADOW_FIEND, TrainingArtifact, TrainingCheckpointReport,
-    compiled_features,
+    CheckpointDevice, CheckpointRun, CollectionReport, MAP2_DECISION_INTERVAL_TICKS,
+    MAP2_RETAINED_DECISIONS, MAP2_REWARD_GAMMA_TICK, MAX_TRAINING_COUNTER,
+    MODEL_MAX_OPTIMIZER_STEP, PPO_ANNEALED_MAX_GAMES, PPO_ANNEALED_MAX_SAMPLES,
+    PPO_MAX_POLICY_SAMPLE_DRAWS, PPO_RULES_AUDIT_VERSION, PolicyDevice, PolicyModel,
+    PolicySnapshot, PpoConfig, PpoError, PpoRng, PpoRollout, PpoSampleBudget, PpoUpdateReport,
+    SHADOW_FIEND, TrainingArtifact, TrainingCheckpointReport, compiled_features,
 };
 
 // Sequential games share one rollout without raising the concurrent world cap.
@@ -345,7 +345,6 @@ impl AnnealedSession {
             initial_weights_directory,
             config,
             run,
-            ResumeProvenance::Strict,
         )?;
         let games = state
             .completed_updates
@@ -463,7 +462,7 @@ impl AnnealedSession {
         let games = settings.games_per_update;
         let policy_identity = self.state.model.policy_identity().map_err(text_error)?;
         let mut rollout = PpoRollout::for_config(config, policy_identity)?;
-        let mut report = PpoSmokeReport::default();
+        let mut report = CollectionReport::default();
         let seats = balanced_policy_seats(settings.seed, update, games)?;
         let wave_worlds = settings.parallel_worlds * settings.execution.actor_pipeline_groups;
         timing.enter(TrainingStage::Collection);
@@ -523,7 +522,7 @@ impl AnnealedSession {
         local: usize,
         seats: &[usize],
         rollout: &mut PpoRollout,
-        report: &mut PpoSmokeReport,
+        report: &mut CollectionReport,
     ) -> Result<(), PpoError> {
         if settings.execution.actor_pipeline_groups == 1 {
             return self.collect_update_batch(
@@ -618,7 +617,7 @@ impl AnnealedSession {
         local: usize,
         seats: &[usize],
         rollout: &mut PpoRollout,
-        report: &mut PpoSmokeReport,
+        report: &mut CollectionReport,
     ) -> Result<(), PpoError> {
         let global_game = self
             .state
@@ -705,12 +704,11 @@ fn batch_environments(
         let seed = derive_training_seed(settings.seed, game, crate::randomization::ARENA_DOMAIN);
         let opponent_seed =
             derive_training_seed(settings.seed, game, crate::randomization::OPPONENT_DOMAIN);
-        environments.push(build_environment_with_spawn_modifiers(
+        environments.push(build_environment(
             seed,
             opponent_seed,
             MapId(2),
             seat,
-            0,
             opponent.spec(),
             rules.clone(),
         )?);
@@ -1000,7 +998,6 @@ fn annealed_run(
     settings.execution.append_scope(&mut command_line);
     adaptive::append_scope(settings, harness, &mut command_line);
     Ok(CheckpointRun {
-        mastery_config: None,
         git_commit: settings.git_commit.clone(),
         simulator_commit: settings.simulator_commit.clone(),
         enabled_features: compiled_features(),
@@ -1302,10 +1299,6 @@ fn command_line_option_value<'a>(tokens: &[&'a str], index: usize) -> &'a str {
         .filter(|token| !token.starts_with("--"))
         .unwrap_or("<present>")
 }
-
-#[cfg(all(test, unix))]
-#[path = "../tests/metrics_training_integration.rs"]
-mod metrics_integration_tests;
 
 #[cfg(test)]
 #[path = "../tests/annealed.rs"]

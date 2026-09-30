@@ -22,6 +22,10 @@ struct Cli {
 }
 
 /// Drysua operations.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "parsed once at startup; boxing would only complicate clap derives"
+)]
 #[derive(Subcommand)]
 enum Operation {
     /// Inspect a validated checkpoint or this build's contract as bounded read-only JSON.
@@ -32,10 +36,6 @@ enum Operation {
     RewardObserver(RewardObserverArgs),
     /// Connect to a server and play one match.
     Play(PlayArgs),
-    /// Run a bounded stage-nine PPO actor-to-learner smoke training.
-    Train(TrainArgs),
-    /// Run resumable PPO training with periodic strict checkpoints.
-    TrainFull(TrainFullArgs),
     /// Run the annealed domain-randomization loop with a frozen opponent.
     TrainAnnealed(TrainAnnealedArgs),
 }
@@ -99,101 +99,6 @@ pub(crate) enum PlayPolicy {
     Hybrid,
     Neural,
     Teacher,
-}
-
-/// Options for a short builtin PPO verification run.
-#[derive(Args)]
-struct TrainArgs {
-    /// PPO updates, bounded to ten for this smoke command.
-    #[arg(long, default_value_t = 1)]
-    updates: u32,
-    /// Independent CPU arenas, bounded to sixteen for desktop headroom.
-    #[arg(long, default_value_t = 2)]
-    environments: usize,
-    /// Decisions collected from each arena per update.
-    #[arg(long, default_value_t = 8)]
-    rollout: usize,
-    /// PPO passes over one rollout.
-    #[arg(long, default_value_t = 1)]
-    epochs: usize,
-    /// Effective Adam minibatch.
-    #[arg(long, default_value_t = 16)]
-    minibatch: usize,
-    /// Deterministic training seed.
-    #[arg(long, default_value_t = 9_001)]
-    seed: u64,
-    /// Simulator map id, restricted to Map2 (mid-only Dota).
-    #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u16).range(2..=2))]
-    map: u16,
-    /// Learner tensor backend; actors and simulation remain on CPU.
-    #[arg(long, value_enum, default_value_t = LearnerDevice::Cpu)]
-    device: LearnerDevice,
-    /// CUDA device ordinal.
-    #[arg(long, default_value_t = 0)]
-    device_ordinal: usize,
-}
-
-/// Options for bounded resumable PPO training.
-#[derive(Args)]
-struct TrainFullArgs {
-    #[command(flatten)]
-    metrics: crate::telemetry::prometheus::MetricsOptions,
-    #[command(flatten)]
-    optimizer: OptimizerArgs,
-    #[command(flatten)]
-    checkpoint: CheckpointArgs,
-    /// Separate episode time cost; Map2 comprehensive reward requires zero.
-    #[arg(long, default_value_t = 0.0)]
-    episode_time_cost: f32,
-    /// Legacy terminal-only reward; rejected because Map2 requires comprehensive reward.
-    #[arg(long)]
-    terminal_only: bool,
-    /// Collect paired Map2 episodes; retain one of eight actions. Use =false for windows.
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
-    complete_episodes: bool,
-    /// Fixed collection groups (1, 2 or 4), each with its own decision barrier.
-    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=4))]
-    pipeline_groups: u8,
-    /// Full-episode opponents; nondefault schedules are versioned and checked on resume.
-    #[arg(long, value_enum, default_value_t = crate::TrainingOpponentSchedule::Teacher)]
-    opponent_schedule: crate::TrainingOpponentSchedule,
-    /// Recent completed training games per mastery stage (default 50, at most 1024).
-    #[arg(long, value_parser = clap::value_parser!(u16).range(1..=1024))]
-    mastery_window: Option<u16>,
-    /// Default win percentage for all mastery opponents (default 80).
-    #[arg(long, value_parser = clap::value_parser!(u8).range(1..=100))]
-    mastery_win_percent: Option<u8>,
-    /// Per-opponent mastery override, e.g. weak=90 or teacher=80; no duplicates.
-    #[arg(long)]
-    opponent_win_percent: Vec<crate::OpponentWinPercent>,
-    /// Discount per simulator tick; Map2 comprehensive reward requires exactly one.
-    #[arg(long, default_value_t = crate::MAP2_REWARD_GAMMA_TICK)]
-    gamma_per_tick: f32,
-    /// Total PPO update target, including updates restored from a checkpoint.
-    #[arg(long)]
-    updates: u64,
-    /// Independent CPU arenas: even counts up to 26 for complete episodes; at most 16 for windows.
-    #[arg(long, default_value_t = 4)]
-    environments: usize,
-    /// Window decisions or per-episode retained capacity.
-    #[arg(long, default_value_t = 2_048,
-        help = format!("Window decisions or per-episode retained capacity (at least {}), at most {}", crate::MAP2_RETAINED_DECISIONS, crate::PPO_MAX_ROLLOUT_DECISIONS))]
-    rollout: usize,
-    /// Rebind an otherwise identical checkpoint to this build's Git provenance once.
-    #[arg(long, default_value_t = false, requires = "resume")]
-    migrate_provenance: bool,
-    /// Deterministic training seed.
-    #[arg(long, default_value_t = 9_001)]
-    seed: u64,
-    /// Simulator map id, restricted to Map2 (mid-only Dota).
-    #[arg(long, default_value_t = 2, value_parser = clap::value_parser!(u16).range(2..=2))]
-    map: u16,
-    /// Learner tensor backend; actors and simulation remain on CPU.
-    #[arg(long, value_enum, default_value_t = LearnerDevice::Cpu)]
-    device: LearnerDevice,
-    /// CUDA device ordinal.
-    #[arg(long, default_value_t = 0)]
-    device_ordinal: usize,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -308,7 +213,7 @@ struct TrainAnnealedArgs {
     device_ordinal: usize,
 }
 
-/// Shared optimizer controls for resumable training commands.
+/// Optimizer controls for resumable training.
 #[derive(Args)]
 struct OptimizerArgs {
     /// Adam learning rate; must be finite and positive.
@@ -328,7 +233,7 @@ struct OptimizerArgs {
     entropy_coefficient: f32,
 }
 
-/// Shared persistence controls; neither command can initialize and resume together.
+/// Persistence controls; a run cannot initialize and resume together.
 #[derive(Args)]
 struct CheckpointArgs {
     /// Monotonic wall-clock seconds between durable checkpoints.
@@ -363,8 +268,6 @@ fn run(arguments: Cli) -> std::io::Result<()> {
             return crate::reward_observer::run(&observer.output, observer.interval_ticks);
         }
         Some(Operation::Play(play)) => play,
-        Some(Operation::Train(train)) => return run_train(train),
-        Some(Operation::TrainFull(train)) => return run_train_full(train),
         Some(Operation::TrainAnnealed(train)) => return run_train_annealed(train),
         None => arguments.play,
     };
@@ -439,90 +342,6 @@ fn resolve_play_deployment(
         return Ok((PlayPolicy::Hybrid, play.weights_directory.clone()));
     }
     crate::default_deployment::DEFAULT_DEPLOYMENT.resolve()
-}
-
-#[cfg(feature = "builtin")]
-fn run_train(arguments: TrainArgs) -> std::io::Result<()> {
-    let device = arguments.device.policy_device(arguments.device_ordinal)?;
-    let report = crate::run_ppo_smoke_on(
-        crate::PpoSmokeConfig {
-            updates: arguments.updates,
-            environments: arguments.environments,
-            rollout_decisions: arguments.rollout,
-            epochs: arguments.epochs,
-            minibatch: arguments.minibatch,
-            seed: arguments.seed,
-            map: bota_proto::MapId(arguments.map),
-        },
-        device,
-    )
-    .map_err(std::io::Error::other)?;
-    println!(
-        "PPO smoke: {} updates, {} transitions, optimizer step {}, policy loss {:.6}, value loss {:.6}, entropy {:.6}, KL {:.6}, terminal wins {}, terminal losses {}, terminal draws {}, {} rejected orders, {} arena ticks",
-        report.updates,
-        report.transitions,
-        report.optimizer_step,
-        report.final_policy_loss,
-        report.final_value_loss,
-        report.final_entropy,
-        report.final_kl,
-        report.terminal_wins,
-        report.terminal_losses,
-        report.terminal_draws,
-        report.rejected_orders,
-        report.elapsed_ticks,
-    );
-    report
-        .map2_reward
-        .log("ppo_smoke", u64::from(report.updates));
-    Ok(())
-}
-
-#[cfg(feature = "builtin")]
-fn run_train_full(arguments: TrainFullArgs) -> std::io::Result<()> {
-    arguments.validate_map2_reward()?;
-    let settings = arguments.training_settings(
-        embedded_commit("DRYSUA_GIT_COMMIT", option_env!("DRYSUA_GIT_COMMIT"))?,
-        embedded_commit("BOTA_GIT_COMMIT", option_env!("BOTA_GIT_COMMIT"))?,
-    )?;
-    let device = arguments.device.policy_device(arguments.device_ordinal)?;
-    arguments.checkpoint.validate(&arguments.metrics)?;
-    let metrics = arguments.metrics.start()?;
-    let report = crate::run_training_job_on_with_initial_weights(
-        settings,
-        device,
-        &arguments.checkpoint.checkpoint_directory,
-        arguments.checkpoint.resume,
-        arguments.checkpoint.initial_weights.as_deref(),
-        report_training_checkpoint,
-    )
-    .map_err(std::io::Error::other)?;
-    println!(
-        "training complete: starting fingerprint {:016x}, {} updates, {} samples, optimizer step {}, policy loss {:.6}, value loss {:.6}, entropy {:.6}, KL {:.6}, session terminal wins {}, session terminal losses {}, session terminal draws {}, session rejected {}, session ticks {}, session episode timeouts {}",
-        report.starting_policy_fingerprint,
-        report.completed_updates,
-        report.rollout_samples,
-        report.optimizer_step,
-        report.final_policy_loss,
-        report.final_value_loss,
-        report.final_entropy,
-        report.final_kl,
-        report.terminal_wins,
-        report.terminal_losses,
-        report.terminal_draws,
-        report.rejected_orders,
-        report.elapsed_ticks,
-        report.episode_timeouts,
-    );
-    report
-        .map2_reward
-        .log("invocation", report.completed_updates);
-    if report.mastery_completed {
-        println!(
-            "training mastery complete: rolling training windows qualified through Teacher; not evaluation qualification"
-        );
-    }
-    metrics.finish()
 }
 
 #[cfg(feature = "builtin")]
@@ -627,118 +446,6 @@ fn report_training_checkpoint(checkpoint: crate::TrainingCheckpointReport) {
     if let Some(warning) = checkpoint.cleanup_warning {
         eprintln!("checkpoint cleanup warning: {warning}");
     }
-}
-
-#[cfg(feature = "builtin")]
-impl TrainFullArgs {
-    fn mastery_config(&self) -> std::io::Result<Option<crate::MasteryConfig>> {
-        if self.opponent_schedule != crate::TrainingOpponentSchedule::MasteryV1 {
-            if self.mastery_window.is_some()
-                || self.mastery_win_percent.is_some()
-                || !self.opponent_win_percent.is_empty()
-            {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "mastery options require --opponent-schedule mastery-v1",
-                ));
-            }
-            return Ok(None);
-        }
-        crate::MasteryConfig::new(
-            self.mastery_window
-                .map_or(crate::MASTERY_DEFAULT_WINDOW, usize::from),
-            self.mastery_win_percent
-                .unwrap_or(crate::MASTERY_DEFAULT_WIN_PERCENT),
-            &self.opponent_win_percent,
-        )
-        .map(Some)
-        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))
-    }
-
-    fn training_settings(
-        &self,
-        git_commit: String,
-        simulator_commit: String,
-    ) -> std::io::Result<crate::TrainingJobConfig> {
-        let ppo = self
-            .optimizer
-            .ppo(crate::PpoConfig {
-                environments: self.environments,
-                rollout_decisions: self.rollout,
-                gamma_tick: self.gamma_per_tick,
-                ..crate::PpoConfig::default()
-            })
-            .validate()
-            .map_err(std::io::Error::other)?;
-        self.validate_map2_reward()?;
-        let settings = crate::TrainingJobConfig {
-            mastery_config: self.mastery_config()?,
-            opponent_schedule: self.opponent_schedule,
-            episode_time_cost: self.episode_time_cost,
-            terminal_only: self.terminal_only,
-            complete_episodes: self.complete_episodes,
-            pipeline_groups: usize::from(self.pipeline_groups),
-            updates: self.updates,
-            ppo,
-            checkpoint_cadence: self.checkpoint.cadence(),
-            resume_provenance: if self.migrate_provenance {
-                crate::ResumeProvenance::MigrateGitCommit
-            } else {
-                crate::ResumeProvenance::Strict
-            },
-            seed: self.seed,
-            map: bota_proto::MapId(self.map),
-            git_commit,
-            simulator_commit,
-        };
-        crate::ppo_arena::episode::validate(&settings).map_err(std::io::Error::other)?;
-        Ok(settings)
-    }
-
-    fn validate_map2_reward(&self) -> std::io::Result<()> {
-        if self.terminal_only {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Map2 comprehensive reward forbids --terminal-only",
-            ));
-        }
-        if self.episode_time_cost != 0.0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Map2 comprehensive reward requires --episode-time-cost 0",
-            ));
-        }
-        if self.gamma_per_tick != crate::MAP2_REWARD_GAMMA_TICK {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "Map2 comprehensive reward requires --gamma-per-tick 1",
-            ));
-        }
-        Ok(())
-    }
-}
-
-#[cfg(all(test, feature = "builtin"))]
-pub(crate) fn training_settings_for_test(
-    overrides: &[&str],
-) -> std::io::Result<crate::TrainingJobConfig> {
-    let mut arguments = vec![
-        "drysua",
-        "train-full",
-        "--updates",
-        "1",
-        "--checkpoint-directory",
-        ".",
-    ];
-    arguments.extend_from_slice(overrides);
-    let cli = Cli::try_parse_from(arguments).map_err(std::io::Error::other)?;
-    let Some(Operation::TrainFull(train)) = cli.operation else {
-        unreachable!("train-full arguments");
-    };
-    train.training_settings(
-        "test-drysua-commit".to_owned(),
-        "test-bota-commit".to_owned(),
-    )
 }
 
 #[cfg(any(feature = "builtin", test))]
@@ -1134,20 +841,6 @@ fn cuda_policy_device(ordinal: usize) -> std::io::Result<crate::PolicyDevice> {
 fn cuda_policy_device(_: usize) -> std::io::Result<crate::PolicyDevice> {
     Err(std::io::Error::other(
         "CUDA learner requires cargo feature `cuda` on Linux or Windows",
-    ))
-}
-
-#[cfg(not(feature = "builtin"))]
-fn run_train(_: TrainArgs) -> std::io::Result<()> {
-    Err(std::io::Error::other(
-        "PPO train requires cargo feature `builtin`",
-    ))
-}
-
-#[cfg(not(feature = "builtin"))]
-fn run_train_full(_: TrainFullArgs) -> std::io::Result<()> {
-    Err(std::io::Error::other(
-        "PPO train requires cargo feature `builtin`",
     ))
 }
 

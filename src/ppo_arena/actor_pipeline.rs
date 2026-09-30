@@ -105,7 +105,7 @@ pub(in crate::ppo_arena) fn collect_actor_pipeline(
     groups: &mut [ActorGroup],
     rounds: usize,
     rollout: &mut PpoRollout,
-    report: &mut PpoSmokeReport,
+    report: &mut CollectionReport,
     reuse_actor_values: bool,
 ) -> Result<(), PpoError> {
     collect_with_operation(
@@ -116,7 +116,7 @@ pub(in crate::ppo_arena) fn collect_actor_pipeline(
         rollout,
         report,
         reuse_actor_values,
-        move |_, world, job| run_stream_job(world, job, config, None, None),
+        move |_, world, job| run_stream_job(world, job, config, None),
     )
 }
 
@@ -127,7 +127,7 @@ pub(in crate::ppo_arena) fn collect_actor_pipeline_with_opponent_batching(
     groups: &mut [ActorGroup],
     rounds: usize,
     rollout: &mut PpoRollout,
-    report: &mut PpoSmokeReport,
+    report: &mut CollectionReport,
     reuse_actor_values: bool,
     neural_opponent_batching: bool,
 ) -> Result<(), PpoError> {
@@ -151,7 +151,7 @@ pub(in crate::ppo_arena) fn collect_actor_pipeline_with_opponent_batching(
         report,
         reuse_actor_values,
         true,
-        move |_, world, job| run_stream_job(world, job, config, None, None),
+        move |_, world, job| run_stream_job(world, job, config, None),
     )
 }
 
@@ -165,7 +165,7 @@ pub(super) fn collect_single_neural(
     random: &mut [PpoRng],
     rounds: usize,
     rollout: &mut PpoRollout,
-    report: &mut PpoSmokeReport,
+    report: &mut CollectionReport,
     reuse: bool,
 ) -> Result<(), PpoError> {
     validate_neural_opponent_memory(config, environments.len())?;
@@ -190,7 +190,7 @@ pub(super) fn collect_single_neural(
             streams,
             random,
             Some(opponent),
-            move |_, world, job| run_stream_job(world, job, config, None, None),
+            move |_, world, job| run_stream_job(world, job, config, None),
         )?;
         let collected = (|| {
             for round in 0..=rounds {
@@ -212,7 +212,7 @@ fn collect_with_operation(
     groups: &mut [ActorGroup],
     rounds: usize,
     rollout: &mut PpoRollout,
-    report: &mut PpoSmokeReport,
+    report: &mut CollectionReport,
     reuse_actor_values: bool,
     operation: impl Fn(usize, &mut TrainingEnvironment, StreamJob) -> Result<StreamReply, PpoError>
     + Send
@@ -239,7 +239,7 @@ pub(super) fn collect_with_operation_mode(
     groups: &mut [ActorGroup],
     rounds: usize,
     rollout: &mut PpoRollout,
-    report: &mut PpoSmokeReport,
+    report: &mut CollectionReport,
     reuse_actor_values: bool,
     neural_opponent_batching: bool,
     operation: impl Fn(usize, &mut TrainingEnvironment, StreamJob) -> Result<StreamReply, PpoError>
@@ -392,7 +392,7 @@ struct GroupState<'scope> {
     active: Vec<usize>,
     pending: actor_values::PendingRound,
     terminals: Vec<(usize, CompletedAdvance)>,
-    report: PpoSmokeReport,
+    report: CollectionReport,
     stream_base: usize,
     bootstrap: bool,
     in_flight: bool,
@@ -469,7 +469,7 @@ impl<'scope> GroupState<'scope> {
             active,
             pending: actor_values::PendingRound::new(width),
             terminals: bounded_vec(width)?,
-            report: PpoSmokeReport::default(),
+            report: CollectionReport::default(),
             stream_base,
             bootstrap: true,
             in_flight: true,
@@ -605,7 +605,7 @@ impl<'scope> GroupState<'scope> {
         Ok(Some(choices))
     }
 
-    fn merge_report(&self, target: &mut PpoSmokeReport) -> Result<(), PpoError> {
+    fn merge_report(&self, target: &mut CollectionReport) -> Result<(), PpoError> {
         assert!(!self.in_flight);
         assert!(self.terminals.len() <= self.streams.len());
         target.elapsed_ticks = target

@@ -51,7 +51,7 @@ fn flush_evaluator_preserves_submission_order_and_drains_after_frame_errors() {
         sender: std::sync::Mutex::new(Some(sender)),
     };
     std::thread::scope(|scope| {
-        scope.spawn(move || flush_evaluator_loop(&model, &receiver, None));
+        scope.spawn(move || flush_evaluator_loop(&model, &receiver));
         let replies: Vec<_> = frames
             .into_iter()
             .map(|frame| {
@@ -74,7 +74,7 @@ fn flush_evaluator_preserves_submission_order_and_drains_after_frame_errors() {
 
 fn comparison_collection(
     model: &PolicyModel,
-    settings: &TrainingJobConfig,
+    settings: &ParitySettings,
     parallel: bool,
 ) -> CollectionResult {
     let mut arenas = environments(settings, 0).expect("worlds");
@@ -86,26 +86,22 @@ fn comparison_collection(
         model.policy_identity().expect("identity"),
     )
     .expect("rollout");
-    let mut report = PpoSmokeReport::default();
+    let mut report = CollectionReport::default();
     if parallel {
-        assert!(
-            collect_with_workers(
-                model,
-                settings.ppo,
-                0,
-                "ppo",
-                &mut arenas,
-                &mut streams,
-                &mut random,
-                64,
-                None,
-                None,
-                &mut rollout,
-                &mut report,
-                false,
-            )
-            .expect("production persistent collector")
-        );
+        collect_with_workers(
+            model,
+            settings.ppo,
+            0,
+            "ppo",
+            &mut arenas,
+            &mut streams,
+            &mut random,
+            64,
+            &mut rollout,
+            &mut report,
+            false,
+        )
+        .expect("production persistent collector");
     } else {
         for _ in 0..64 {
             let active: Vec<_> = (0..streams.len())

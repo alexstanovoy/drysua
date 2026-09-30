@@ -60,7 +60,6 @@ pub(crate) fn initialization_run(
     assert!(!command_line.is_empty());
     assert_ne!(provenance.source, provenance.simulator);
     CheckpointRun {
-        mastery_config: None,
         git_commit: std::env::var(provenance.source).expect("frozen source revision"),
         simulator_commit: std::env::var(provenance.simulator).expect("frozen simulator revision"),
         enabled_features: crate::compiled_features(),
@@ -72,22 +71,6 @@ pub(crate) fn initialization_run(
         batch_size,
         rules_audit_version: crate::PPO_RULES_AUDIT_VERSION,
     }
-}
-
-/// Asserts the current frozen schema versions and rule audits in one place.
-pub(crate) fn assert_frozen_schema_versions() {
-    assert_eq!(crate::ACTION_SCHEMA_VERSION, 5);
-    assert_eq!(crate::FEATURE_SCHEMA_VERSION, 22);
-    assert_eq!(
-        crate::MODEL_SCHEMA_VERSION,
-        if cfg!(feature = "side-actors") {
-            25
-        } else {
-            24
-        }
-    );
-    assert_eq!(crate::PPO_SCHEMA_VERSION, 37);
-    assert_eq!(crate::PPO_RULES_AUDIT_VERSION, 32);
 }
 
 /// Bit-exact F32 comparison used by pinned-initializer reload checks.

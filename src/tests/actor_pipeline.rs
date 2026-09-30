@@ -10,7 +10,7 @@ type Trial = (
     crate::PpoBatch,
     Vec<PpoRng>,
     Vec<(u64, Map2TrainingReward)>,
-    PpoSmokeReport,
+    CollectionReport,
 );
 
 #[test]
@@ -27,7 +27,7 @@ fn assert_all_groups_dispatched(group_count: usize) {
     let owner = std::thread::current().id();
     let mut rollout =
         PpoRollout::for_config(config, model.policy_identity().expect("policy")).expect("rollout");
-    let mut report = PpoSmokeReport::default();
+    let mut report = CollectionReport::default();
 
     collect_with_operation(
         &model,
@@ -43,7 +43,7 @@ fn assert_all_groups_dispatched(group_count: usize) {
                 // No group's first advance can finish until every group has dispatched.
                 gate.wait();
             }
-            run_stream_job(world, job, config, None, None)
+            run_stream_job(world, job, config, None)
         },
     )
     .expect("overlapped native collection");
@@ -110,7 +110,7 @@ fn assert_worker_failure(group_count: usize) {
     let completed = AtomicUsize::new(0);
     let mut rollout =
         PpoRollout::for_config(config, model.policy_identity().expect("policy")).expect("rollout");
-    let mut report = PpoSmokeReport::default();
+    let mut report = CollectionReport::default();
 
     let result = collect_with_operation(
         &model,
@@ -126,7 +126,7 @@ fn assert_worker_failure(group_count: usize) {
                 return Err(PpoError::InvalidTransition("pipeline worker failure"));
             }
             let advancing = matches!(&job, StreamJob::Advance { .. });
-            let reply = run_stream_job(world, job, config, None, None)?;
+            let reply = run_stream_job(world, job, config, None)?;
             completed.fetch_add(usize::from(advancing), Ordering::Relaxed);
             Ok(reply)
         },
@@ -152,7 +152,7 @@ fn two_round_random(model: &PolicyModel, group_count: usize) -> Vec<PpoRng> {
     let (config, mut groups) = inputs_grouped(1, group_count);
     let mut rollout =
         PpoRollout::for_config(config, model.policy_identity().expect("policy")).expect("rollout");
-    let mut report = PpoSmokeReport::default();
+    let mut report = CollectionReport::default();
     for group in &mut groups {
         collect_batch_with_actor_values(
             model,
@@ -232,7 +232,7 @@ fn actor_pipeline_memory_gate_keeps_existing_limits_and_rejects_gpu_opponents() 
         &mut groups,
         1,
         &mut rollout,
-        &mut PpoSmokeReport::default(),
+        &mut CollectionReport::default(),
         true,
     );
     assert_eq!(
@@ -293,7 +293,7 @@ fn multiwave_trial(model: &PolicyModel, reuse: bool, pipeline: bool) -> Trial {
     config.sample_budget = crate::PpoSampleBudget::WideAnnealed;
     let mut rollout =
         PpoRollout::for_config(config, model.policy_identity().expect("policy")).expect("rollout");
-    let mut report = PpoSmokeReport::default();
+    let mut report = CollectionReport::default();
     let mut master = PpoRng::new(9952701);
     let mut random = Vec::new();
     let mut traces = Vec::new();
@@ -365,7 +365,7 @@ fn trial_grouped(
     let (config, mut groups) = inputs_grouped(width, total_groups);
     let mut rollout =
         PpoRollout::for_config(config, model.policy_identity().expect("policy")).expect("rollout");
-    let mut report = PpoSmokeReport::default();
+    let mut report = CollectionReport::default();
     for wave in groups.chunks_mut(wave_groups) {
         if wave_groups > 1 {
             collect_actor_pipeline(
@@ -452,7 +452,7 @@ fn inputs_grouped(width: usize, group_count: usize) -> (PpoConfig, Vec<ActorGrou
                         super::super::map2_tests::configured_environment(
                             TICK_CAP - [72, 24, 48][(stream_base + stream) % 3],
                             stream % 2,
-                            OpponentSpec::Weak,
+                            OpponentSpec::Idle,
                             |_| {},
                         )
                     })

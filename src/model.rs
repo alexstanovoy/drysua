@@ -418,7 +418,6 @@ pub enum ModelError {
     FrameActionSpaceMismatch,
     TrainingOutputModelMismatch,
     OptimizerAlreadyOwned,
-    ActorOptimizerForbidden,
     OptimizerOwnershipMismatch,
     ModelLineageUnavailable,
     OptimizerLineageUnavailable,
@@ -602,9 +601,6 @@ impl ModelError {
             }
             Self::OptimizerAlreadyOwned => {
                 formatter.write_str("model already has a behavioral optimizer owner")
-            }
-            Self::ActorOptimizerForbidden => {
-                formatter.write_str("immutable actor model cannot own an optimizer")
             }
             Self::OptimizerOwnershipMismatch => {
                 formatter.write_str("model optimizer owner or parameter revision does not match")
@@ -1303,7 +1299,6 @@ pub struct PolicyModel {
     lineage: NonZeroU64,
     parameter_revision: AtomicU64,
     optimizer_lineage: AtomicU64,
-    optimizer_permitted: bool,
     device_kind: PolicyDevice,
     tensor_device: Device,
     unit: Mlp,
@@ -1420,7 +1415,6 @@ impl PolicyModel {
             lineage,
             parameter_revision: AtomicU64::new(0),
             optimizer_lineage: AtomicU64::new(0),
-            optimizer_permitted: true,
             device_kind,
             tensor_device: tensor_device.clone(),
             unit: encoders.unit,
@@ -1472,27 +1466,8 @@ impl PolicyModel {
         Ok(self.policy_identity_locked())
     }
 
-    /// Captures coherent CPU inference weights with the same process-local identity.
-    pub(crate) fn actor_snapshot(&self) -> Result<Self, ModelError> {
-        let mut snapshot = Self::fresh_on(0, PolicyDevice::Cpu)?;
-        let _guard = self.read_parameter_lock()?;
-        let parameters = self.export_parameters_locked()?;
-        let identity = self.policy_identity_locked();
-        snapshot.import_parameters(&parameters)?;
-        snapshot.lineage = identity.lineage;
-        snapshot
-            .parameter_revision
-            .store(identity.revision, Ordering::Relaxed);
-        snapshot.optimizer_lineage.store(0, Ordering::Relaxed);
-        snapshot.optimizer_permitted = false;
-        Ok(snapshot)
-    }
-
     pub(crate) fn claim_optimizer(&self, config: AdamConfig) -> Result<AdamState, ModelError> {
         validate_adam_config(config)?;
-        if !self.optimizer_permitted {
-            return Err(ModelError::ActorOptimizerForbidden);
-        }
         let _guard = self.write_parameter_lock()?;
         if self.optimizer_lineage.load(Ordering::Relaxed) != 0 {
             return Err(ModelError::OptimizerAlreadyOwned);
@@ -1527,9 +1502,6 @@ impl PolicyModel {
             step,
             MODEL_PARAMETER_COUNT,
         )?;
-        if !self.optimizer_permitted {
-            return Err(ModelError::ActorOptimizerForbidden);
-        }
         let _guard = self.write_parameter_lock()?;
         if self.optimizer_lineage.load(Ordering::Relaxed) != 0 {
             return Err(ModelError::OptimizerAlreadyOwned);

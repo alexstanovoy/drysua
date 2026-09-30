@@ -268,16 +268,12 @@ impl Display for TrainingStage {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TrainingUpdateMode {
     Annealed,
-    CompleteEpisodes,
-    ResetWindow,
 }
 
 impl Display for TrainingUpdateMode {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::Annealed => "annealed",
-            Self::CompleteEpisodes => "complete_episodes",
-            Self::ResetWindow => "reset_window",
         })
     }
 }
@@ -351,7 +347,6 @@ impl TrainingScopeTiming {
         let index = match self.scope {
             TrainingTimingScope::SessionInitialization => 0,
             TrainingTimingScope::CheckpointCaptureSaveRuntimeExport => 1,
-            TrainingTimingScope::ResumeRuntimeExport => 2,
         };
         observe(
             index,
@@ -379,7 +374,6 @@ impl Display for TrainingScopeTiming {
 pub(crate) enum TrainingTimingScope {
     SessionInitialization,
     CheckpointCaptureSaveRuntimeExport,
-    ResumeRuntimeExport,
 }
 
 impl Display for TrainingTimingScope {
@@ -387,7 +381,6 @@ impl Display for TrainingTimingScope {
         formatter.write_str(match self {
             Self::SessionInitialization => "session_initialization",
             Self::CheckpointCaptureSaveRuntimeExport => "checkpoint_capture_save_runtime_export",
-            Self::ResumeRuntimeExport => "resume_runtime_export",
         })
     }
 }

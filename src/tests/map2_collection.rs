@@ -1,7 +1,7 @@
 //! Native collection and concrete reward/accounting regressions, not helper layouts.
 
 use super::*;
-use crate::{Map2RewardEnd, PpoBatch};
+use crate::Map2RewardEnd;
 use bota_proto::{DamageKind, Vec2};
 
 #[test]
@@ -34,118 +34,8 @@ fn reward_rejection_preserves_accumulated_credit_and_allows_recovery() {
 }
 
 #[test]
-fn native_batches_preserve_curriculum_mastery_and_terminal_retention() {
-    for (count, groups, schedule, update) in [
-        (6, 1, "weak-warmup-v1", 0),
-        (6, 1, "weak-warmup-v1", 2),
-        (26, 1, "mastery-v1", 0),
-        (26, 4, "mastery-v1", 0),
-    ] {
-        let count_text = count.to_string();
-        let groups_text = groups.to_string();
-        let rollout_text = crate::MAP2_RETAINED_DECISIONS.to_string();
-        let mut arguments = vec![
-            "--opponent-schedule",
-            schedule,
-            "--environments",
-            &count_text,
-            "--pipeline-groups",
-            &groups_text,
-            "--rollout",
-            &rollout_text,
-            "--minibatch",
-            "512",
-        ];
-        if schedule == "mastery-v1" {
-            arguments.extend(["--mastery-window", "3"]);
-        }
-        let settings =
-            crate::cli::training_settings_for_test(&arguments).expect("complete episode settings");
-        let model = stop_model();
-        let batch = native_batch(&model, &settings, update);
-        assert_eq!(batch.len(), count);
-        let phases = streams_for_collection(&settings, update).expect("retention phases");
-        let mut negative = false;
-        for index in 0..count {
-            let sample = batch.sample(index).expect("sample");
-            assert!(sample.transition.terminal);
-            assert_eq!(sample.transition.next_value, 0.0);
-            assert_eq!(
-                sample.transition.ticks,
-                (8 - phases[sample.transition.stream].retention_phase) as u32 * 3
-            );
-            assert!(sample.return_value().is_finite());
-            assert!(sample.return_value() <= 0.0);
-            negative |= sample.return_value() < 0.0;
-        }
-        assert!(negative, "native all-draw batch retains real dense cost");
-    }
-}
-
-fn native_batch(model: &PolicyModel, settings: &TrainingJobConfig, update: u64) -> PpoBatch {
-    let count = settings.ppo.environments;
-    let mut arenas: Vec<_> = (0..count)
-        .map(|stream| {
-            let opponent = if settings.mastery_config.is_some() {
-                OpponentSpec::Weak
-            } else {
-                scheduled_opponent(settings, update, stream)
-            };
-            configured_environment(TICK_CAP - 24, stream % 2, opponent, |_| {})
-        })
-        .collect();
-    let opponents = if update == 2 {
-        ("Mixed", 4, 2)
-    } else {
-        ("Weak", count, 0)
-    };
-    assert_eq!(collection_opponents(&arenas), opponents);
-    let mut random = PpoRng::new(9140300);
-    let mut rollout = PpoRollout::new(
-        count * RETAINED_PER_EPISODE,
-        model.policy_identity().expect("identity"),
-    )
-    .expect("rollout");
-    let mut report = PpoSmokeReport::default();
-    collect_groups_bounded(
-        model,
-        &mut random,
-        &mut arenas,
-        settings,
-        update,
-        settings.pipeline_groups,
-        ACTOR_DECISIONS,
-        true,
-        None,
-        &mut rollout,
-        &mut report,
-    )
-    .expect("native terminal batch");
-    assert_eq!(report.terminal_draws, count as u64);
-    assert_eq!(report.terminal_losses, 0);
-    assert_eq!(report.terminal_wins, 0);
-    assert_eq!(report.episode_timeouts, 0);
-    assert_eq!(report.rejected_orders, 0);
-    assert_eq!(report.elapsed_ticks, (count * 24) as u64);
-    assert_eq!(report.map2_reward.ticks, report.elapsed_ticks);
-    assert_eq!(report.map2_reward.terminal, 0.0);
-    if let Some(config) = settings.mastery_config {
-        let mut mastery = crate::MasteryProgress::default();
-        assert!(
-            !mastery
-                .record_batch(config, &report.completed_episodes.ordered_outcomes())
-                .expect("outcomes")
-        );
-        assert_eq!(mastery.games(), count as u64);
-        assert_eq!(mastery.wins(), 0);
-        assert_eq!(mastery.stage(), crate::MasteryStage::Weak);
-    }
-    rollout.finish(settings.ppo).expect("usable PPO batch")
-}
-
-#[test]
 fn progress_debt_and_purchase_refund_survive_reward_drains() {
-    let environment = configured_environment(1, 0, OpponentSpec::Weak, |_| {});
+    let environment = configured_environment(1, 0, OpponentSpec::Idle, |_| {});
     let mut tracker = environment.seats[0].tracker.clone();
     let mut view = tracker.current().expect("snapshot").clone();
     let own = tracker.own_hero().expect("hero").id;
@@ -211,7 +101,7 @@ fn progress_debt_and_purchase_refund_survive_reward_drains() {
 
 #[test]
 fn both_seats_consume_untruncated_events_once_and_reject_reordered_terminal_messages() {
-    let mut environment = configured_environment(TICK_CAP - 2, 0, OpponentSpec::Weak, |_| {});
+    let mut environment = configured_environment(TICK_CAP - 2, 0, OpponentSpec::Idle, |_| {});
     let heroes: Vec<_> = environment.seats[0]
         .tracker
         .current()
@@ -253,7 +143,7 @@ fn both_seats_consume_untruncated_events_once_and_reject_reordered_terminal_mess
             0
         );
     }
-    let mut environment = configured_environment(TICK_CAP - 1, 0, OpponentSpec::Weak, |_| {});
+    let mut environment = configured_environment(TICK_CAP - 1, 0, OpponentSpec::Idle, |_| {});
     let mut messages = environment
         .arena
         .step(&[None, None])
@@ -275,7 +165,7 @@ fn both_seats_consume_untruncated_events_once_and_reject_reordered_terminal_mess
 #[test]
 fn final_native_damage_is_rewarded_before_draw_finalization() {
     let model = stop_model();
-    let mut environment = configured_environment(TICK_CAP - 1, 0, OpponentSpec::Weak, |_| {});
+    let mut environment = configured_environment(TICK_CAP - 1, 0, OpponentSpec::Idle, |_| {});
     environment.arena.configure_for_test(|world| {
         world.push_hit(
             world.seats[0].unit,
@@ -291,21 +181,21 @@ fn final_native_damage_is_rewarded_before_draw_finalization() {
         gamma_tick: 1.0,
         ..PpoConfig::default()
     };
-    let mut arenas = vec![environment];
-    let mut pending = collect_round(&model, &mut [PpoRng::new(982_004)], &mut arenas, config)
-        .expect("final round");
-    assert_eq!(pending.len(), 1);
-    let final_row = pending.remove(0);
-    assert_eq!(final_row.ticks, 1);
-    assert_eq!(final_row.terminal_outcome, Some(PpoTerminalOutcome::Draw));
-    let reward = final_row.map2_reward.expect("Map2 reward");
-    assert_eq!(reward.terminal, 0.0);
-    assert!(reward.hero_damage > 0.0);
-    assert!(final_row.reward > 0.0);
-    assert!(final_row.terminal);
-    assert!(final_row.next_frame.is_none());
+    let (frame, space) = prepare_policy_sample(&mut environment).expect("final frame");
+    let choice = model
+        .sample(&frame, &space, &mut PpoRng::new(982_004))
+        .expect("final action");
+    let mut state = EpisodeStream::default();
+    let completed =
+        advance_cpu(&mut environment, &mut state, choice, space, config).expect("final round");
+    assert_eq!(completed.ticks, 1);
+    assert_eq!(completed.outcome, Some(PpoTerminalOutcome::Draw));
+    assert!(state.done);
+    assert_eq!(state.map2_reward.terminal, 0.0);
+    assert!(state.map2_reward.hero_damage > 0.0);
+    assert!(state.raw_return > 0.0);
     assert_eq!(
-        arenas[0].seats[0]
+        environment.seats[0]
             .tracker
             .finish_map2_reward(Map2RewardEnd::Draw)
             .expect_err("already finalized")
@@ -317,7 +207,7 @@ fn final_native_damage_is_rewarded_before_draw_finalization() {
 #[test]
 fn learner_deadline_zero_bootstraps_without_inventing_match_over() {
     let model = stop_model();
-    let mut environment = configured_environment(1, 0, OpponentSpec::Weak, |_| {});
+    let mut environment = configured_environment(1, 0, OpponentSpec::Idle, |_| {});
     let choice =
         sample_policy(&model, &mut PpoRng::new(982_010), &mut environment).expect("action");
     let mut state = EpisodeStream {
@@ -337,7 +227,7 @@ fn learner_deadline_zero_bootstraps_without_inventing_match_over() {
         .append_retained_reward(reward, 3, 1.0)
         .expect("pending interval");
     let mut rollout = PpoRollout::new(1, choice.policy()).expect("rollout");
-    let mut report = PpoSmokeReport::default();
+    let mut report = CollectionReport::default();
     finish_advance(
         &model,
         &mut environment,
@@ -352,7 +242,6 @@ fn learner_deadline_zero_bootstraps_without_inventing_match_over() {
         &mut report,
     )
     .expect("terminal deadline");
-    validate_episode_batch(&rollout, &report).expect("usable deadline batch");
     assert_eq!(report.episode_timeouts, 1);
     assert_eq!(report.terminal_draws, 0);
     assert_eq!(state.map2_reward.terminal, -0.2);
@@ -378,7 +267,7 @@ fn learner_deadline_zero_bootstraps_without_inventing_match_over() {
 fn native_mango_then_cast_is_legal_for_both_neural_seats() {
     use crate::{ActionTarget, ControlledUnit, StructuredAction};
     use bota_proto::{AbilitySlot, Fixed, ItemId, ItemSlot};
-    let mut environment = configured_environment(1, 0, OpponentSpec::Weak, |world| {
+    let mut environment = configured_environment(1, 0, OpponentSpec::Idle, |world| {
         for seat in &world.seats {
             let hero = seat.unit.expect("hero");
             world.inventory.get_mut(hero).expect("inventory").slots[0] =
@@ -437,8 +326,8 @@ fn native_mango_then_cast_is_legal_for_both_neural_seats() {
 }
 
 #[test]
-fn victim_only_damage_and_warmup_drains_preserve_seat_credit_and_lifetime_budgets() {
-    let mut environment = configured_environment(1, 1, OpponentSpec::Weak, |world| {
+fn victim_only_damage_preserves_seat_credit() {
+    let mut environment = configured_environment(1, 1, OpponentSpec::Idle, |world| {
         let source = world.seats[0].unit.expect("source");
         let target = world.seats[1].unit.expect("target");
         world
@@ -470,26 +359,6 @@ fn victim_only_damage_and_warmup_drains_preserve_seat_credit_and_lifetime_budget
     assert_eq!(attacker.observations.hero_damage_dealt, 0);
     assert_eq!(victim.observations.hero_damage_taken, 39);
     assert_eq!(attacker.ticks, victim.ticks);
-    let before = environment.seats[1]
-        .tracker
-        .map2_reward_state()
-        .expect("reward");
-    assert!(before.remaining[5] < 1.0);
-    finish_warmup_environment(&mut environment, 3).expect("discard warmup rewards");
-    let after = environment.seats[1]
-        .tracker
-        .map2_reward_state()
-        .expect("preserved reward");
-    assert_eq!(after.remaining, before.remaining);
-    assert_eq!(after.completed_tick, Some(8));
-    for seat in &mut environment.seats {
-        assert_eq!(
-            seat.tracker
-                .take_map2_reward_interval()
-                .expect("drained credit"),
-            crate::Map2RewardBreakdown::default()
-        );
-    }
 }
 
 pub(super) fn configured_environment(
@@ -525,14 +394,8 @@ pub(super) fn configured_environment(
         arena,
         seats: setup_seats(start).expect("full baseline"),
         policy_seat,
-        reward: RewardTracker::default(),
-        decision: 0,
         map: MapId(2),
-        next_seed: 982_005,
-        next_opponent_seed: 982_006,
         opponent: build_opponent(&opponent_spec, 982_007).expect("opponent"),
-        opponent_spec,
-        retired_rejections: 0,
     }
 }
 

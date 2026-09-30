@@ -266,13 +266,6 @@ fn completed_episode_capacity_rejects_overflow_and_duplicate_merge_atomically() 
         ))
     );
     assert_eq!(completed, before);
-    assert_eq!(
-        completed.merge(&before),
-        Err(PpoError::InvalidTransition(
-            "duplicate completed episode stream"
-        ))
-    );
-    assert_eq!(completed, before);
 }
 
 fn expanded_settings(updates: u64) -> AnnealedJobConfig {

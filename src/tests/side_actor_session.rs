@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn fresh_side_actor_session_imports_only_parameters_and_resets_all_training_state() {
+fn fresh_session_imports_only_initial_parameters_and_resets_all_training_state() {
     let directory =
         std::env::temp_dir().join(format!("side-actors-fresh-session-{}", std::process::id()));
     std::fs::create_dir(&directory).unwrap();
@@ -30,7 +30,6 @@ fn fresh_side_actor_session_imports_only_parameters_and_resets_all_training_stat
         Some(&source_directory),
         config,
         initialization_run(config),
-        ResumeProvenance::Strict,
     )
     .unwrap();
     let actual = session.model.export_parameters().unwrap();
@@ -47,7 +46,6 @@ fn fresh_side_actor_session_imports_only_parameters_and_resets_all_training_stat
     assert_eq!(session.rollout_samples, 0);
     assert_eq!(session.sampling.checkpoint(), (9001 ^ 0xa17e, 0));
     assert_eq!(session.trainer.rng_checkpoint(), (9001 ^ 0x51a9, 0));
-    assert!(session.mastery.is_none());
     assert!(session.adaptive_environment.is_none());
     let snapshot = session.trainer.checkpoint_snapshot(&session.model).unwrap();
     let (first, second) = snapshot.adam.moments();
@@ -67,16 +65,15 @@ fn fresh_side_actor_session_imports_only_parameters_and_resets_all_training_stat
 
 fn initialization_run(config: PpoConfig) -> CheckpointRun {
     CheckpointRun {
-        mastery_config: None,
         git_commit: "side-actor-test".into(),
         simulator_commit: "side-actor-simulator".into(),
-        enabled_features: compiled_features(),
+        enabled_features: crate::compiled_features(),
         command_line: "side-actor-initialization-test".into(),
         run_seed: 9001,
         map: MapId(2),
-        hero: SHADOW_FIEND,
-        device: CheckpointDevice::Cpu,
+        hero: crate::SHADOW_FIEND,
+        device: crate::CheckpointDevice::Cpu,
         batch_size: config.minibatch,
-        rules_audit_version: PPO_RULES_AUDIT_VERSION,
+        rules_audit_version: crate::PPO_RULES_AUDIT_VERSION,
     }
 }

@@ -1,28 +1,17 @@
 use super::*;
 
-#[cfg(feature = "builtin")]
-#[test]
-fn train_full_metrics_options_leave_training_scope_config_and_seed_unchanged() {
-    let flags = "--metrics-directory unused-metrics --metrics-listen 127.0.0.1:9464";
-    assert_eq!(
-        training_settings_for_test(&[]).unwrap(),
-        training_settings_for_test(&flags.split_ascii_whitespace().collect::<Vec<_>>()).unwrap()
-    );
-}
-
 fn training_arguments(operation: &str) -> Vec<&str> {
     let mut arguments = vec!["drysua", operation];
-    arguments
-        .extend("--updates 8 --checkpoint-directory unused-checkpoints".split_ascii_whitespace());
-    if operation == "train-annealed" {
-        arguments.extend(["--generation-games", "160"]);
-    }
+    arguments.extend(
+        "--updates 8 --checkpoint-directory unused-checkpoints --generation-games 160"
+            .split_ascii_whitespace(),
+    );
     arguments
 }
 
 #[test]
 fn training_metrics_directory_and_listener_are_independent_options() {
-    for operation in ["train-full", "train-annealed"] {
+    for operation in ["train-annealed"] {
         for (directory, listener) in [(false, false), (true, false), (false, true), (true, true)] {
             let mut arguments = training_arguments(operation);
             if directory {
@@ -34,7 +23,6 @@ fn training_metrics_directory_and_listener_are_independent_options() {
 
             let cli = Cli::try_parse_from(arguments).expect("metrics training CLI");
             let metrics = match cli.operation {
-                Some(Operation::TrainFull(train)) => train.metrics,
                 Some(Operation::TrainAnnealed(train)) => train.metrics,
                 _ => panic!("expected training arguments"),
             };
@@ -84,7 +72,7 @@ fn metrics_serve_requires_a_directory_and_defaults_to_loopback_without_builtin_r
 
 #[test]
 fn metrics_listener_rejects_invalid_socket_addresses_before_execution() {
-    for operation in ["train-full", "train-annealed", "metrics-serve"] {
+    for operation in ["train-annealed", "metrics-serve"] {
         let mut arguments = if operation == "metrics-serve" {
             vec!["drysua", operation, "--metrics-directory", "unused-metrics"]
         } else {
@@ -104,8 +92,8 @@ fn metrics_listener_rejects_invalid_socket_addresses_before_execution() {
 }
 
 #[test]
-fn metrics_flags_do_not_leak_into_play_smoke_or_reward_observer() {
-    for operation in [None, Some("play"), Some("train"), Some("reward-observer")] {
+fn metrics_flags_do_not_leak_into_play_or_reward_observer() {
+    for operation in [None, Some("play"), Some("reward-observer")] {
         for (flag, value) in [
             ("--metrics-directory", "unused-metrics"),
             ("--metrics-listen", "127.0.0.1:9464"),

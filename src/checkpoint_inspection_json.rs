@@ -49,7 +49,7 @@ pub(super) fn run(run: &CheckpointRun) -> Value {
     json!({"git_commit": run.git_commit, "simulator_commit": run.simulator_commit,
         "enabled_features": run.enabled_features, "command_line": run.command_line, "run_seed": run.run_seed,
         "map": run.map.0, "hero": run.hero.0, "device": device, "batch_size": run.batch_size,
-        "rules_audit_version": run.rules_audit_version, "mastery_config_present": run.mastery_config.is_some()})
+        "rules_audit_version": run.rules_audit_version})
 }
 
 pub(super) fn progress(artifact: &TrainingArtifact, games: Option<u64>) -> Value {
@@ -65,7 +65,7 @@ pub(super) fn progress(artifact: &TrainingArtifact, games: Option<u64>) -> Value
         "scheduler_step": progress.scheduler_step, "curriculum_stage": progress.curriculum_stage,
         "best_evaluation": progress.best_evaluation, "rng_states": random,
         "shuffle_rng": {"state": artifact.shuffle.0, "draws": artifact.shuffle.1},
-        "league_references": progress.league_references, "mastery_present": progress.mastery.is_some()})
+        "league_references": progress.league_references})
 }
 
 pub(super) fn ppo(config: PpoConfig) -> Value {

@@ -52,8 +52,7 @@ but an annealed history request fails explicitly—even for an empty history.
 
 ## Inspection document
 
-`kind` is the exact recognized operation `train-annealed`, `train-full`, or `train`;
-unrecognized operations are `other`. Controllers for annealed campaigns must reject
+`kind` is `train-annealed` for the recognized operation; anything else is `other`. Controllers for annealed campaigns must reject
 other kinds rather than treating absent history as verified.
 
 Fields:
@@ -65,12 +64,12 @@ Fields:
 - `progress`: `updates`, `optimizer_steps`, `rollout_samples`, `games`,
   `policy_version`, `scheduler_step`, `curriculum_stage`, `best_evaluation`,
   `rng_states: [{name,state,draws}]`, `shuffle_rng: {state,draws}`,
-  `league_references`, and `mastery_present`.
+  and `league_references`.
   `games` is exactly `updates * games_per_update` for verified annealed scope and
   **null** for other operations; no generic episode count is invented.
 - `run`: `git_commit`, `simulator_commit`, `enabled_features`, `command_line`,
   `run_seed`, `map`, `hero`, `device: {kind,ordinal}`, `batch_size`,
-  `rules_audit_version`, and `mastery_config_present`. CPU ordinal is null.
+  and `rules_audit_version`. CPU ordinal is null.
 - `ppo`: `sample_budget`, `schema_version`, `schema_hash`,
   `decision_interval_ticks`, `rollout_decisions`, `environments`, `epochs`,
   `minibatch`, and all eleven floating hyperparameters: `clip_epsilon`,

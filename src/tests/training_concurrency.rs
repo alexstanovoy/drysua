@@ -37,16 +37,6 @@ fn actor_value_reuse_cli_is_annealed_only_with_legacy_off_and_canonical_enabled_
         scope(&enabled),
         format!("{original} --balanced-minibatches --host-math-workers 4 --reuse-actor-values")
     );
-    for operation in ["train", "train-full"] {
-        let error = crate::cli::parse_from(["drysua", operation, "--reuse-actor-values"])
-            .expect_err("annealed-only option");
-        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
-        assert!(
-            error
-                .to_string()
-                .contains("unexpected argument '--reuse-actor-values'")
-        );
-    }
 }
 
 #[test]

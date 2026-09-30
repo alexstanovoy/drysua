@@ -37,7 +37,7 @@ impl PendingRound {
         stream_base: usize,
         samples: (&[usize], &[PpoPolicyChoice]),
         rollout: &mut PpoRollout,
-        report: &mut PpoSmokeReport,
+        report: &mut CollectionReport,
     ) -> Result<(), PpoError> {
         let (active, choices) = samples;
         assert_eq!(active.len(), choices.len());
@@ -60,7 +60,7 @@ impl PendingRound {
         stream_base: usize,
         prepared: &[Option<(FeatureFrame, ActionSpace)>],
         rollout: &mut PpoRollout,
-        report: &mut PpoSmokeReport,
+        report: &mut CollectionReport,
     ) -> Result<(), PpoError> {
         assert_eq!(prepared.len(), self.worlds);
         // Bounded windows can end before the next sample; never consume another actor draw.
@@ -81,7 +81,7 @@ impl PendingRound {
         streams: &mut [EpisodeStream],
         stream_base: usize,
         rollout: &mut PpoRollout,
-        report: &mut PpoSmokeReport,
+        report: &mut CollectionReport,
         mut next_value: impl FnMut(usize) -> Result<f32, PpoError>,
     ) -> Result<(), PpoError> {
         assert_eq!(streams.len(), self.worlds);

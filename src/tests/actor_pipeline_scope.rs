@@ -57,16 +57,6 @@ fn actor_pipeline_cli_legacy_explicit_one_preserves_scope_and_scopes_two_or_four
         };
         assert_eq!(scope(&parsed), expected);
     }
-    for operation in ["train", "train-full"] {
-        let error = crate::cli::parse_from(["drysua", operation, "--actor-pipeline-groups", "2"])
-            .expect_err("annealed-only option");
-        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
-        assert!(
-            error
-                .to_string()
-                .contains("unexpected argument '--actor-pipeline-groups'")
-        );
-    }
 }
 
 #[test]

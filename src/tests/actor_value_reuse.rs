@@ -36,7 +36,7 @@ fn actor_value_reuse_completion_failure_does_not_commit_sampled_rng_or_advance_a
     let config = parity_settings_for_test().ppo;
     let mut worlds: Vec<_> = (0..2)
         .map(|stream| {
-            map2_tests::configured_environment(TICK_CAP - 72, stream, OpponentSpec::Weak, |_| {})
+            map2_tests::configured_environment(TICK_CAP - 72, stream, OpponentSpec::Idle, |_| {})
         })
         .collect();
     let mut random = actor_stream_rngs(&mut PpoRng::new(9952202), 2).expect("actor streams");
@@ -45,7 +45,7 @@ fn actor_value_reuse_completion_failure_does_not_commit_sampled_rng_or_advance_a
     let mut states: Vec<_> = (0..2).map(|_| EpisodeStream::default()).collect();
     let mut rollout = PpoRollout::for_config(config, model.policy_identity().expect("identity"))
         .expect("rollout");
-    let mut report = PpoSmokeReport {
+    let mut report = CollectionReport {
         elapsed_ticks: u64::MAX,
         ..Default::default()
     };
@@ -98,7 +98,7 @@ struct Trial {
     batch: PpoBatch,
     random: Vec<PpoRng>,
     traces: Vec<(u64, [u32; ActionKind::COUNT], usize)>,
-    report: PpoSmokeReport,
+    report: CollectionReport,
 }
 
 fn trial(
@@ -118,7 +118,7 @@ fn trial(
     };
     let mut worlds: Vec<_> = (0..count)
         .map(|stream| {
-            let opponent = opponent.map_or(OpponentSpec::Weak, |model| {
+            let opponent = opponent.map_or(OpponentSpec::Idle, |model| {
                 OpponentSpec::SharedPolicy(Arc::clone(model))
             });
             map2_tests::configured_environment(
@@ -138,7 +138,7 @@ fn trial(
     let mut random = actor_stream_rngs(&mut PpoRng::new(9952202), count).expect("actor streams");
     let mut rollout = PpoRollout::for_config(config, model.policy_identity().expect("identity"))
         .expect("rollout");
-    let mut report = PpoSmokeReport::default();
+    let mut report = CollectionReport::default();
 
     collect_batch_with_actor_values(
         model,

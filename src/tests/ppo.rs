@@ -3,8 +3,6 @@
     reason = "PPO numerical and transaction regressions"
 )]
 
-#[cfg(feature = "builtin")]
-use crate::ppo::test_directory as training_directory;
 use bota_proto::Team;
 
 use super::feature::{encode, tracker_with_view, world_view};
@@ -20,7 +18,6 @@ mod capacity;
 #[test]
 fn actor_batch_sampling_preserves_scalar_actions_rng_and_learner_likelihood() {
     let model = PolicyModel::fresh(9_101).expect("model");
-    let actor = model.actor_snapshot().expect("actor");
     let (frames, spaces, mut random) = sampling_inputs(MODEL_TRAINING_BATCH);
     let mut scalar_random = random.clone();
     let batch = model
@@ -31,7 +28,7 @@ fn actor_batch_sampling_preserves_scalar_actions_rng_and_learner_likelihood() {
     assert_eq!(chosen.len(), batch.len());
     let mut samples = Vec::new();
     for (index, sampled) in batch.into_iter().enumerate() {
-        let scalar = actor
+        let scalar = model
             .sample(&frames[index], &spaces[index], &mut scalar_random[index])
             .expect("actor");
         assert_eq!(sampled.action(), scalar.action());
@@ -495,125 +492,6 @@ fn set_parameter_range(
 
 #[cfg(feature = "builtin")]
 #[test]
-fn production_load_update_resume_matches_uninterrupted_parameters_optimizer_and_rng() {
-    let weights = training_directory("weights");
-    let uninterrupted = training_directory("uninterrupted");
-    let resumed = training_directory("resumed");
-    let initial = PolicyModel::fresh(23_074).expect("initial model");
-    crate::TrainingArtifact::save_runtime_weights(&initial, &weights).expect("initial weights");
-    let fingerprint = crate::PolicySnapshot::capture(&initial, 0)
-        .expect("snapshot")
-        .fingerprint();
-    let mut settings = crate::ppo::training_settings_for_test(23_071, 1);
-    for update in 1..=2 {
-        settings.updates = update;
-        let report = crate::run_training_job_on_with_initial_weights(
-            settings.clone(),
-            crate::PolicyDevice::Cpu,
-            &resumed,
-            update > 1,
-            if update == 1 {
-                Some(weights.as_path())
-            } else {
-                None
-            },
-            |_| {},
-        )
-        .expect("update");
-        assert_eq!(report.completed_updates, update);
-        if update == 1 {
-            assert_eq!(report.starting_policy_fingerprint, fingerprint);
-        }
-    }
-    crate::run_training_job_on_with_initial_weights(
-        settings.clone(),
-        crate::PolicyDevice::Cpu,
-        &uninterrupted,
-        false,
-        Some(&weights),
-        |_| {},
-    )
-    .expect("uninterrupted");
-    let source = crate::TrainingArtifact::load(&uninterrupted).expect("reference");
-    let target = crate::TrainingArtifact::load(&resumed).expect("resumed");
-    assert_eq!(source.run(), target.run());
-    assert_eq!(source.progress(), target.progress());
-    assert_eq!(target.progress().global_update, 2);
-    assert_eq!(target.progress().rollout_samples, 8);
-    assert_restored_training_equal(&source, &target);
-    assert_checkpoint_scope_rejections(&settings, &resumed);
-    for directory in [weights, uninterrupted, resumed] {
-        std::fs::remove_dir_all(directory).expect("cleanup");
-    }
-}
-
-#[cfg(feature = "builtin")]
-fn assert_restored_training_equal(
-    source: &crate::TrainingArtifact,
-    target: &crate::TrainingArtifact,
-) {
-    let first = PolicyModel::fresh(23_072).expect("first model");
-    let second = PolicyModel::fresh(23_073).expect("second model");
-    let source = source.restore(&first, source.run()).expect("first restore");
-    let target = target
-        .restore(&second, target.run())
-        .expect("second restore");
-    let source = source.trainer();
-    let target = target.trainer();
-    let source_state = source.checkpoint_snapshot(&first).expect("first snapshot");
-    let target_state = target
-        .checkpoint_snapshot(&second)
-        .expect("second snapshot");
-    assert_eq!(source_state.parameters, target_state.parameters);
-    assert_eq!(source_state.adam.moments(), target_state.adam.moments());
-    assert_eq!(source.optimizer_step(), target.optimizer_step());
-    assert_eq!(source.config(), target.config());
-    assert_eq!(source.updates(), target.updates());
-    assert_eq!(source.rng_checkpoint(), target.rng_checkpoint());
-    assert!(target.optimizer_step() > 0);
-    assert!(target.rng_checkpoint().1 > 0);
-}
-
-#[cfg(feature = "builtin")]
-fn assert_checkpoint_scope_rejections(
-    settings: &crate::TrainingJobConfig,
-    directory: &std::path::Path,
-) {
-    let mutations: [fn(&mut crate::TrainingJobConfig); 3] = [
-        |config| config.ppo.learning_rate *= 0.1,
-        |config| config.updates = 1,
-        |config| {
-            config.git_commit = "next-git-commit".to_owned();
-            config.simulator_commit = "foreign-simulator".to_owned();
-            config.resume_provenance = crate::ResumeProvenance::MigrateGitCommit;
-        },
-    ];
-    for (mutate, message) in mutations.into_iter().zip([
-        "invalid PPO config field: training checkpoint PPO config",
-        "invalid PPO config field: training update target precedes checkpoint",
-        "invalid PPO config field: provenance migration scope",
-    ]) {
-        let mut invalid = settings.clone();
-        mutate(&mut invalid);
-        let error = crate::run_training_job_on_with_initial_weights(
-            invalid,
-            crate::PolicyDevice::Cpu,
-            directory,
-            true,
-            None,
-            |_| {},
-        )
-        .expect_err("incompatible checkpoint");
-        assert_eq!(error.to_string(), message);
-        let artifact =
-            crate::TrainingArtifact::load(directory).expect("checkpoint survives rejection");
-        assert_eq!(artifact.progress().global_update, 2);
-        assert_eq!(artifact.run().simulator_commit, settings.simulator_commit);
-    }
-}
-
-#[cfg(feature = "builtin")]
-#[test]
 fn episode_retention_preserves_actor_rng_delayed_credit_and_timeout_bootstrap() {
     let model = PolicyModel::fresh(23_077).expect("model");
     let mut parameters = vec![0.0; model.parameter_count()];
@@ -623,5 +501,4 @@ fn episode_retention_preserves_actor_rng_delayed_credit_and_timeout_bootstrap() 
     crate::ppo_arena::episode::assert_retention_actor_parity_for_test(&model);
     crate::ppo_arena::episode::assert_retention_boundaries_for_test(&model);
     crate::ppo_arena::episode::assert_full_mc_for_test();
-    crate::ppo_arena::episode::assert_reset_loses_terminal_credit_for_test();
 }

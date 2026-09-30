@@ -8,12 +8,6 @@ mod test_support;
 /// the rollout capacity as well.
 pub const MAX_TRAINING_ENVIRONMENTS: usize = 26;
 
-/// Even environment counts up to the training maximum; mastery codec and
-/// checkpoint scope share this predicate with the collector.
-pub const fn valid_environment_count(count: usize) -> bool {
-    count >= 2 && count <= MAX_TRAINING_ENVIRONMENTS && count.is_multiple_of(2)
-}
-
 /// Map used by every production training and evaluation entry point.
 pub const MAP2_ID: bota_proto::MapId = bota_proto::MapId(2);
 /// Simulation ticks per second in the Map2 duration contract.

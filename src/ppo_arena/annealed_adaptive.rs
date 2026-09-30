@@ -168,7 +168,7 @@ impl GenerationCache {
         settings: &AnnealedJobConfig,
         harness: AnnealedHarness,
         update: u64,
-        report: &PpoSmokeReport,
+        report: &CollectionReport,
     ) -> Result<Option<AdaptiveEnvironmentCheckpoint>, PpoError> {
         let Some(mut checkpoint) = self.adaptive else {
             return Ok(None);
@@ -213,7 +213,7 @@ fn adaptive_wins(
     settings: &AnnealedJobConfig,
     _harness: AnnealedHarness,
     _update: u64,
-    report: &PpoSmokeReport,
+    report: &CollectionReport,
 ) -> Result<u64, PpoError> {
     #[cfg(test)]
     if let Some(wins) = _harness.adaptive_wins {

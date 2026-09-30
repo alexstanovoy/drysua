@@ -209,11 +209,11 @@ fn adaptive_scope_rejects_missing_duplicate_unbounded_or_noncanonical_tokens() {
 }
 
 #[test]
-fn adaptive_scope_requires_state_and_rejects_state_without_marker_or_mastery_league() {
+fn adaptive_scope_requires_state_and_rejects_state_without_marker_or_league() {
     for (case, field) in [
         (0, "adaptive environment configuration/state mismatch"),
         (1, "adaptive environment scope suffix"),
-        (2, "adaptive environment mastery or league"),
+        (2, "adaptive environment league"),
         (3, "adaptive environment scope suffix"),
     ] {
         let mut artifact = fixture(PpoSampleBudget::Standard);
@@ -230,11 +230,6 @@ fn adaptive_scope_requires_state_and_rejects_state_without_marker_or_mastery_lea
         let encoded = encode_manifest(&artifact, artifact.tensor_hash).expect("fixture");
         assert_manifest_error(&encoded, field);
     }
-    let mut artifact = fixture(PpoSampleBudget::Standard);
-    artifact.run.mastery_config = Some(crate::MasteryConfig::default());
-    artifact.progress.mastery = Some(crate::MasteryProgress::default());
-    let encoded = encode_manifest(&artifact, artifact.tensor_hash).expect("fixture");
-    assert_manifest_error(&encoded, "adaptive environment mastery or league");
 }
 
 #[test]

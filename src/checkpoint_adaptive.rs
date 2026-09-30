@@ -84,12 +84,9 @@ pub(super) fn validate_scope(
     };
     checkpoint.config.validate().map_err(controller_error)?;
     checkpoint.limits.validate().map_err(controller_error)?;
-    if run.mastery_config.is_some()
-        || progress.mastery.is_some()
-        || !progress.league_references.is_empty()
-    {
+    if !progress.league_references.is_empty() {
         return Err(CheckpointError::InvalidManifest(
-            "adaptive environment mastery or league",
+            "adaptive environment league",
         ));
     }
     let suffix = checkpoint.config.scope_suffix();

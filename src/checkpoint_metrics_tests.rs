@@ -140,7 +140,6 @@ fn metrics_manifest_identity_hashes_input_bytes_without_reencoding() {
 fn manifest_artifact() -> TrainingArtifact {
     TrainingArtifact {
         run: CheckpointRun {
-            mastery_config: None,
             git_commit: "metrics-drysua".to_owned(),
             simulator_commit: "metrics-simulator".to_owned(),
             enabled_features: compiled_features(),
@@ -154,7 +153,6 @@ fn manifest_artifact() -> TrainingArtifact {
         },
         progress: CheckpointProgress {
             adaptive_environment: None,
-            mastery: None,
             global_update: 3,
             policy_version: 3,
             scheduler_step: 3,

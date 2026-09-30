@@ -25,11 +25,7 @@ const INVALID_CASES: [&str; 10] = [
 
 #[test]
 fn only_valid_completed_updates_forward_exact_durations_and_counters() {
-    for mode in [
-        TrainingUpdateMode::Annealed,
-        TrainingUpdateMode::CompleteEpisodes,
-        TrainingUpdateMode::ResetWindow,
-    ] {
+    for mode in [TrainingUpdateMode::Annealed] {
         for (nanos, outcome) in [
             ([999_999_999, 2, 3, 4, 5], TrainingTimingOutcome::Complete),
             ([0; 5], TrainingTimingOutcome::Complete),

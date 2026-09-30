@@ -19,7 +19,6 @@ mod map2_inference;
 mod map2_reward;
 mod map2_reward_bounds;
 mod map2_reward_contract;
-mod mastery;
 mod model;
 #[cfg(feature = "builtin")]
 mod navigation_contract;
@@ -32,7 +31,6 @@ mod neural_persistence;
 #[cfg(feature = "builtin")]
 mod parity;
 mod persistence;
-mod pipeline;
 mod ppo;
 #[cfg(feature = "builtin")]
 mod pregame_server;
@@ -49,5 +47,3 @@ mod teacher_arena;
 #[cfg(feature = "builtin")]
 mod teacher_economy;
 mod tracker;
-#[cfg(feature = "builtin")]
-mod train_full_identity;

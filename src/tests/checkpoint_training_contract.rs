@@ -17,18 +17,6 @@ fn ppo26_runtime_metadata() -> std::collections::HashMap<String, String> {
 }
 
 #[test]
-fn training_contract_map2_versions_change_both_actor_and_training_identities() {
-    crate::tests::support::assert_frozen_schema_versions();
-    assert_ne!(crate::FEATURE_SCHEMA_HASH, 1_577_122_233_561_586_211);
-    assert_ne!(crate::MODEL_SCHEMA_HASH, 7_970_187_849_195_607_202);
-    assert_eq!(crate::IMITATION_RULES_AUDIT_VERSION, 22);
-    assert_eq!(crate::LEAGUE_SCHEMA_VERSION, 37);
-    assert_eq!(crate::LEAGUE_RULES_AUDIT_VERSION, 32);
-    assert!(crate::PPO_SCHEMA_DESCRIPTOR.contains("observer=explicit_from_trajectory_start"));
-    assert!(crate::LEAGUE_SCHEMA_DESCRIPTOR.contains("frozen_weights_not_legacy_execution"));
-}
-
-#[test]
 fn training_contract_ppo26_checkpoint_binding_rejects_even_with_current_tensor_layout() {
     let directory = test_directory("training-contract-ppo26-resume");
     let model = PolicyModel::fresh(10_093_100).expect("model");

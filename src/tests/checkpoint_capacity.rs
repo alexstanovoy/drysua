@@ -191,18 +191,6 @@ fn public_nonstandard_checkpoint_preserves_state_and_rejects_invalid_capture_res
                 .moments()
         );
         assert_eq!(snapshot.parameters, artifact.parameters);
-        let error = state
-            .pipeline(1, 1, &target)
-            .err()
-            .expect("standard-only pipeline");
-        assert_eq!(
-            error,
-            CheckpointError::InvalidManifest("annealed actor-learner pipeline")
-        );
-        assert_eq!(
-            error.to_string(),
-            "checkpoint manifest has invalid annealed actor-learner pipeline"
-        );
         drop(state);
         assert_invalid_capture_restore(&source, &trainer, &target, &loaded);
         fs::remove_dir_all(directory).expect("cleanup");
@@ -215,50 +203,35 @@ fn assert_invalid_capture_restore(
     target: &PolicyModel,
     loaded: &TrainingArtifact,
 ) {
-    for (mastery_config, mastery_progress) in
-        [(false, false), (true, true), (true, false), (false, true)]
-    {
-        let mut invalid = loaded.clone();
-        let field = if mastery_config || mastery_progress {
-            invalid.run.mastery_config = mastery_config.then(crate::MasteryConfig::default);
-            invalid.progress.mastery = mastery_progress.then(crate::MasteryProgress::default);
-            "annealed mastery"
-        } else {
-            invalid.progress.rollout_samples = 1;
-            "rollout sample counter"
-        };
-        let error = TrainingArtifact::capture(
-            source,
-            trainer,
-            invalid.run.clone(),
-            invalid.progress.clone(),
-        )
-        .expect_err("invalid capture");
-        assert_eq!(error, CheckpointError::InvalidManifest(field));
-        assert_eq!(
-            error.to_string(),
-            format!("checkpoint manifest has invalid {field}")
-        );
-        let bytes = encode_manifest(&invalid, invalid.tensor_hash).expect("invalid fixture");
-        let decode_field = if mastery_progress && !mastery_config {
-            "mastery configuration/state mismatch"
-        } else {
-            field
-        };
-        assert_eq!(
-            decode_manifest(&bytes).expect_err("invalid decode"),
-            CheckpointError::InvalidManifest(decode_field)
-        );
-        let before = target.export_parameters().expect("before");
-        assert_eq!(
-            invalid
-                .restore(target, invalid.run())
-                .err()
-                .expect("invalid restore"),
-            error
-        );
-        assert_eq!(target.export_parameters().expect("after"), before);
-    }
+    let mut invalid = loaded.clone();
+    invalid.progress.rollout_samples = 1;
+    let field = "rollout sample counter";
+    let error = TrainingArtifact::capture(
+        source,
+        trainer,
+        invalid.run.clone(),
+        invalid.progress.clone(),
+    )
+    .expect_err("invalid capture");
+    assert_eq!(error, CheckpointError::InvalidManifest(field));
+    assert_eq!(
+        error.to_string(),
+        format!("checkpoint manifest has invalid {field}")
+    );
+    let bytes = encode_manifest(&invalid, invalid.tensor_hash).expect("invalid fixture");
+    assert_eq!(
+        decode_manifest(&bytes).expect_err("invalid decode"),
+        CheckpointError::InvalidManifest(field)
+    );
+    let before = target.export_parameters().expect("before");
+    assert_eq!(
+        invalid
+            .restore(target, invalid.run())
+            .err()
+            .expect("invalid restore"),
+        error
+    );
+    assert_eq!(target.export_parameters().expect("after"), before);
 }
 
 #[test]
@@ -367,7 +340,6 @@ pub(super) fn manifest_artifact(
 ) -> TrainingArtifact {
     TrainingArtifact {
         run: CheckpointRun {
-            mastery_config: None,
             git_commit: "capacity-drysua".to_owned(),
             simulator_commit: "capacity-simulator".to_owned(),
             enabled_features: compiled_features(),
@@ -381,7 +353,6 @@ pub(super) fn manifest_artifact(
         },
         progress: CheckpointProgress {
             adaptive_environment: None,
-            mastery: None,
             global_update: updates,
             policy_version: updates,
             scheduler_step: updates,

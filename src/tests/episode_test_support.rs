@@ -36,21 +36,61 @@ fn reference_sampling_rejects_missing_world_without_advancing_rng() {
     assert_eq!(random, before);
 }
 
-pub(crate) fn parity_settings_for_test() -> TrainingJobConfig {
-    crate::cli::training_settings_for_test(&[
-        "--complete-episodes",
-        "--map",
-        "2",
-        "--environments",
-        "2",
-        "--rollout",
-        &crate::MAP2_RETAINED_DECISIONS.to_string(),
-        "--minibatch",
-        "512",
-        "--gamma-per-tick",
-        "1",
-    ])
-    .expect("episode settings")
+/// Two paired complete-episode Map2 worlds against Teacher, the smallest
+/// production-shaped collection.
+pub(crate) struct ParitySettings {
+    pub(crate) ppo: PpoConfig,
+    pub(crate) seed: u64,
+}
+
+pub(crate) fn parity_settings_for_test() -> ParitySettings {
+    ParitySettings {
+        ppo: PpoConfig {
+            decision_interval_ticks: crate::MAP2_DECISION_INTERVAL_TICKS,
+            environments: 2,
+            rollout_decisions: crate::MAP2_RETAINED_DECISIONS,
+            minibatch: 512,
+            gamma_tick: MAP2_REWARD_GAMMA_TICK,
+            ..PpoConfig::default()
+        },
+        seed: 9_001,
+    }
+}
+
+/// Paired worlds whose seeds depend on the pair, not the seat, so both sides of
+/// one pair play the same world.
+pub(super) fn environments(
+    settings: &ParitySettings,
+    update: u64,
+) -> Result<Vec<TrainingEnvironment>, PpoError> {
+    let first_pair = update * (settings.ppo.environments / 2) as u64;
+    (0..settings.ppo.environments)
+        .map(|stream| {
+            let pair = first_pair + (stream / 2) as u64;
+            build_environment(
+                derive_training_seed(settings.seed, pair, crate::randomization::ARENA_DOMAIN),
+                derive_training_seed(settings.seed, pair, crate::randomization::OPPONENT_DOMAIN),
+                MapId(2),
+                stream % 2,
+                OpponentSpec::Teacher,
+                Vec::new(),
+            )
+        })
+        .collect()
+}
+
+pub(super) fn streams_for_collection(
+    settings: &ParitySettings,
+    update: u64,
+) -> Result<Vec<EpisodeStream>, PpoError> {
+    (0..settings.ppo.environments)
+        .map(|stream| {
+            Ok(EpisodeStream {
+                retention_phase: retention_phase(settings.seed, update, stream)?,
+                ..EpisodeStream::default()
+            })
+        })
+        .collect()
 }
 
 pub(crate) fn assert_batch_parity_for_test(source: &PpoBatch, target: &PpoBatch) {
@@ -127,7 +167,7 @@ fn actor_trial(model: &PolicyModel, phase: usize) -> ActorTrial {
     let mut rewards = vec![0.0; count];
     let mut rollout =
         PpoRollout::new(count * 2, model.policy_identity().expect("identity")).expect("rollout");
-    let mut report = PpoSmokeReport::default();
+    let mut report = CollectionReport::default();
     for decision in 0..16 {
         let active: Vec<_> = (0..count).filter(|&stream| !states[stream].done).collect();
         if active.is_empty() {
@@ -222,7 +262,7 @@ fn assert_unsampled_terminal(choice: &PpoPolicyChoice) {
     assert!(!short.should_flush());
     assert!(short.choice.is_none());
     assert_eq!(short.interval.steps, 0);
-    let mut report = PpoSmokeReport::default();
+    let mut report = CollectionReport::default();
     record_episode(
         0,
         4,
@@ -235,39 +275,13 @@ fn assert_unsampled_terminal(choice: &PpoPolicyChoice) {
     assert_eq!(report.terminal_wins, 1);
     assert_eq!(report.map2_reward, short.map2_reward);
     assert_eq!(
-        validate_episode_batch(
-            &PpoRollout::new(1, choice.policy()).expect("empty"),
-            &report
-        )
-        .expect_err("no fabricated sample")
-        .to_string(),
+        PpoRollout::new(1, choice.policy())
+            .expect("empty")
+            .finish(parity_settings_for_test().ppo)
+            .err()
+            .expect("no fabricated sample")
+            .to_string(),
         "PPO rollout is empty"
-    );
-}
-
-pub(crate) fn assert_reset_loses_terminal_credit_for_test() {
-    let settings = TrainingJobConfig {
-        complete_episodes: false,
-        ..parity_settings_for_test()
-    };
-    let model = PolicyModel::fresh(9911000).expect("model");
-    let mut initial =
-        build_training_environments(&settings, 0, settings.ppo, &model, None).expect("windows");
-    let start = initial[0].seats[0].tracker.current().expect("start").tick;
-    advance_interval(&mut initial[0], vec![None, None], 3).expect("progress");
-    let rebuilt =
-        build_training_environments(&settings, 8, settings.ppo, &model, None).expect("new windows");
-    assert_eq!(
-        rebuilt[0].seats[0].tracker.current().expect("rebuilt").tick,
-        start
-    );
-    assert!(
-        initial[0].seats[0]
-            .tracker
-            .current()
-            .expect("progressed")
-            .tick
-            > start
     );
 }
 
@@ -374,9 +388,4 @@ fn wide_capacity_actor_streams_preserve_rng_order_and_reject_overflow_without_dr
         Err(PpoError::InvalidConfig("actor RNG streams"))
     );
     assert_eq!(master, expected);
-    assert!(valid_environment_count(26));
-    assert!(
-        !valid_environment_count(40),
-        "standard train-full remains bounded at 26"
-    );
 }

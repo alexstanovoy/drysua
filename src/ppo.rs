@@ -792,42 +792,6 @@ impl PpoRollout {
         Ok(())
     }
 
-    /// Appends every transition of `other` in its stored order.
-    ///
-    /// Pipeline groups own disjoint streams, so per-stream decision continuity
-    /// survives the merge; frames are copied through the validated
-    /// [`Self::push`] path instead of sharing arena rows, which keeps every
-    /// rollout invariant in one place. The caller merges in fixed group order,
-    /// so the resulting sample sequence is deterministic.
-    #[cfg(feature = "builtin")]
-    pub(crate) fn append(&mut self, other: Self) -> Result<(), PpoError> {
-        if self.sample_budget != other.sample_budget {
-            return Err(PpoError::InvalidConfig("rollout sample budget"));
-        }
-        if other.policy != self.policy {
-            return Err(PpoError::PolicyMismatch);
-        }
-        let combined = self
-            .transitions
-            .len()
-            .checked_add(other.transitions.len())
-            .ok_or(PpoError::CounterOverflow)?;
-        if combined > self.capacity {
-            return Err(PpoError::RolloutFull {
-                capacity: self.capacity,
-            });
-        }
-        let PpoRollout {
-            transitions,
-            frames,
-            ..
-        } = other;
-        for compact in transitions {
-            self.push(expand_transition(&frames, &compact)?)?;
-        }
-        Ok(())
-    }
-
     pub fn len(&self) -> usize {
         self.transitions.len()
     }
@@ -1042,46 +1006,6 @@ impl PpoTrainer {
             return Err(PpoError::PolicyMismatch);
         }
         self.train_accepted_update(model, batch)
-    }
-
-    /// Trains one pipeline batch accepted at current or one-generation lag.
-    pub fn train_pipeline_update(
-        &mut self,
-        model: &PolicyModel,
-        pipeline: &crate::PipelineBatch,
-    ) -> Result<PpoUpdateReport, PpoError> {
-        if self.config.sample_budget != PpoSampleBudget::Standard {
-            return Err(PpoError::InvalidConfig("pipeline sample budget"));
-        }
-        let generation = self.lock_pipeline_update(model, pipeline)?;
-        let report = self.train_accepted_update(model, &pipeline.batch);
-        drop(generation);
-        report
-    }
-
-    fn lock_pipeline_update<'pipeline>(
-        &self,
-        model: &PolicyModel,
-        pipeline: &'pipeline crate::PipelineBatch,
-    ) -> Result<crate::PipelineGenerationGuard<'pipeline>, PpoError> {
-        let generation = pipeline
-            .lock_generation()
-            .map_err(|error| PpoError::Model(error.to_string()))?;
-        let current = model
-            .policy_identity()
-            .map_err(|error| PpoError::Model(error.to_string()))?;
-        let rollout = pipeline.batch.policy;
-        let generation_lag = generation
-            .version()
-            .get()
-            .checked_sub(pipeline.rollout_version.get());
-        let accepted_generation = generation_lag.is_some_and(|lag| lag <= 1);
-        let accepted_identity =
-            current.lineage() == rollout.lineage() && current.revision() >= rollout.revision();
-        if !accepted_generation || !accepted_identity || self.adam.policy_identity() != current {
-            return Err(PpoError::PolicyMismatch);
-        }
-        Ok(generation)
     }
 
     fn train_accepted_update(

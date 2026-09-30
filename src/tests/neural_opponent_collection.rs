@@ -187,12 +187,12 @@ fn neural_opponent_failure_after_learner_sampling_commits_neither_rng_nor_world_
         &mut groups,
         16,
         &mut rollout,
-        &mut PpoSmokeReport::default(),
+        &mut CollectionReport::default(),
         true,
         true,
         |stream, world, job| {
             assert_ne!(std::thread::current().id(), owner);
-            let mut reply = run_stream_job(world, job, config, None, None)?;
+            let mut reply = run_stream_job(world, job, config, None)?;
             if let StreamReply::PreparedNeural(_, opponent) = &mut reply
                 && stream == 1
             {
@@ -240,7 +240,7 @@ fn neural_opponent_pipeline_matches_sequential_groups_and_counts_one_call_per_gr
             let mut rollout =
                 PpoRollout::for_config(config, learner.policy_identity().expect("policy"))
                     .expect("rollout");
-            let mut report = PpoSmokeReport::default();
+            let mut report = CollectionReport::default();
             neural_opponent::take_batch_counts();
             if pipelined {
                 collect_actor_pipeline_with_opponent_batching(
@@ -291,7 +291,7 @@ fn neural_opponent_pipeline_matches_sequential_groups_and_counts_one_call_per_gr
     }
 }
 
-type Trial = (crate::PpoBatch, Vec<PpoRng>, Vec<u64>, PpoSmokeReport);
+type Trial = (crate::PpoBatch, Vec<PpoRng>, Vec<u64>, CollectionReport);
 
 #[derive(PartialEq)]
 enum Mode {
@@ -304,7 +304,7 @@ fn trial(learner: &PolicyModel, opponent: &Arc<PolicyModel>, mode: Mode, reuse: 
     let (config, mut group) = inputs(opponent, 0, 4);
     let mut rollout = PpoRollout::for_config(config, learner.policy_identity().expect("policy"))
         .expect("rollout");
-    let mut report = PpoSmokeReport::default();
+    let mut report = CollectionReport::default();
     if mode != Mode::Reference {
         collect(
             learner,
@@ -345,7 +345,7 @@ fn collect(
     config: PpoConfig,
     group: &mut ActorGroup,
     rollout: &mut PpoRollout,
-    report: &mut PpoSmokeReport,
+    report: &mut CollectionReport,
     reuse: bool,
     neural: bool,
 ) {
@@ -372,7 +372,7 @@ fn reference(
     config: PpoConfig,
     group: &mut ActorGroup,
     rollout: &mut PpoRollout,
-    report: &mut PpoSmokeReport,
+    report: &mut CollectionReport,
 ) {
     for _ in 0..16 {
         let active: Vec<_> = (0..group.streams.len())

@@ -217,29 +217,9 @@ fn annealed_cli_requires_group_one_or_batched_inference_for_weights_and_micro64_
 }
 
 #[test]
-fn annealed_fast_defaults_do_not_change_library_or_other_command_defaults() {
+fn annealed_fast_defaults_do_not_change_library_defaults() {
     let execution = crate::TrainingExecutionOptions::default();
     assert_eq!(execution.actor_pipeline_groups, 1);
     assert_eq!(execution.training_microbatch, 64);
     assert!(!execution.reuse_actor_values);
-    let Some(Operation::Train(train)) = Cli::try_parse_from(["drysua", "train"]).unwrap().operation
-    else {
-        panic!("train");
-    };
-    assert_eq!(train.environments, 2);
-    let Some(Operation::TrainFull(train)) = Cli::try_parse_from([
-        "drysua",
-        "train-full",
-        "--updates",
-        "1",
-        "--checkpoint-directory",
-        ".",
-    ])
-    .unwrap()
-    .operation
-    else {
-        panic!("train-full");
-    };
-    assert_eq!(train.environments, 4);
-    assert_eq!(train.pipeline_groups, 1);
 }

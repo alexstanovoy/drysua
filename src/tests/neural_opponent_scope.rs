@@ -52,16 +52,6 @@ fn neural_opponent_cli_defaults_to_batched_weights_but_preserves_teacher_and_sca
             options.ppo
         );
     }
-    for command in ["train", "train-full"] {
-        let error = crate::cli::parse_from(["drysua", command, "--opponent-inference", "batched"])
-            .expect_err("annealed-only flag");
-        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
-        assert!(
-            error
-                .to_string()
-                .contains("unexpected argument '--opponent-inference'")
-        );
-    }
     let error =
         crate::cli::parse_from(["drysua", "train-annealed", "--opponent-inference", "greedy"])
             .expect_err("closed inference modes");

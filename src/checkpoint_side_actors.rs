@@ -141,9 +141,3 @@ fn source_metadata() -> HashMap<String, String> {
     }
     metadata
 }
-
-#[cfg(test)]
-use super::{Dtype, TensorView, serialize};
-#[cfg(test)]
-#[path = "tests/side_actor_initialization.rs"]
-mod tests;

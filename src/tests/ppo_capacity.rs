@@ -185,43 +185,6 @@ fn capacity_mismatch_cannot_relabel_rollouts_or_mutate_trainer_state() {
     }
 }
 
-#[test]
-fn pipeline_cannot_opt_into_annealed_capacity() {
-    let model = PolicyModel::fresh(725).expect("model");
-    assert!(crate::ActorLearnerPipeline::new(PPO_MAX_SAMPLES, 1, &model).is_ok());
-    assert_eq!(
-        crate::ActorLearnerPipeline::new(PPO_MAX_SAMPLES + 1, 1, &model)
-            .err()
-            .expect("capacity")
-            .to_string(),
-        "actor-learner sample capacity 32769 is outside 1..=32768"
-    );
-    let mut pipeline = crate::ActorLearnerPipeline::new(1, 1, &model).expect("pipeline");
-    let actor = pipeline.take_actor(0).expect("actor");
-    for expanded_finish in [true, false] {
-        let lease = actor.lease().expect("lease");
-        let mut buffer = lease.rollout().expect("buffer");
-        buffer.push(transition(lease.policy())).expect("sample");
-        lease.try_submit(buffer).expect("submit");
-        let accepted = pipeline.accept().expect("accept");
-        if expanded_finish {
-            assert_eq!(
-                accepted.finish(annealed_config()).err(),
-                Some(PpoError::InvalidConfig("rollout sample budget"))
-            );
-        } else {
-            let batch = accepted.finish(smoke_config()).expect("batch");
-            let mut trainer = PpoTrainer::new(&model, annealed_config(), 1).expect("trainer");
-            assert_eq!(
-                trainer.train_pipeline_update(&model, &batch),
-                Err(PpoError::InvalidConfig("pipeline sample budget"))
-            );
-            assert_eq!(trainer.optimizer_step(), 0);
-            assert_eq!(trainer.rng_checkpoint().1, 0);
-        }
-    }
-}
-
 fn annealed_config() -> PpoConfig {
     PpoConfig {
         sample_budget: PpoSampleBudget::Annealed,

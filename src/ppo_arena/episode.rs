@@ -3,8 +3,6 @@
     reason = "Discounted n-step rewards use floating-point arithmetic"
 )]
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-
 use super::*;
 
 #[cfg(test)]
@@ -24,14 +22,6 @@ pub(super) use actor_pipeline::{
 #[cfg(test)]
 #[path = "../tests/actor_value_reuse.rs"]
 mod actor_value_reuse_tests;
-
-#[cfg(test)]
-#[path = "../tests/episode_log_contract.rs"]
-mod log_contract_tests;
-
-#[cfg(test)]
-#[path = "../tests/mastery_training.rs"]
-mod mastery_tests;
 
 #[cfg(test)]
 #[path = "../tests/map2_collection.rs"]
@@ -67,328 +57,12 @@ const _: () =
     assert!(MAX_EPISODE_ENVIRONMENTS * RETAINED_BYTES_PER_ENVIRONMENT < 6 * 1024 * 1024 * 1024);
 const _: () = assert!(MAX_EPISODE_ENVIRONMENTS * RETAINED_PER_EPISODE <= crate::PPO_MAX_SAMPLES);
 
-/// Map2 comprehensive-reward contract shared by the parallel and serial collectors.
-fn validate_reward_contract(settings: &TrainingJobConfig) -> Result<(), PpoError> {
-    if settings.ppo.sample_budget != crate::PpoSampleBudget::Standard {
-        return Err(PpoError::InvalidConfig("train-full sample budget"));
-    }
-    if (settings.opponent_schedule == crate::TrainingOpponentSchedule::MasteryV1)
-        != settings.mastery_config.is_some()
-    {
-        return Err(PpoError::InvalidConfig(
-            "mastery-v1 requires mastery config; other schedules forbid it",
-        ));
-    }
-    if settings.map != MapId(2) {
-        return Err(PpoError::InvalidConfig("production training requires Map2"));
-    }
-    if settings.ppo.gamma_tick != MAP2_REWARD_GAMMA_TICK {
-        return Err(PpoError::InvalidConfig(
-            "Map2 comprehensive reward requires gamma per tick one",
-        ));
-    }
-    if settings.terminal_only {
-        return Err(PpoError::InvalidConfig(
-            "Map2 requires comprehensive reward; terminal-only is unsupported",
-        ));
-    }
-    if settings.episode_time_cost != 0.0 {
-        return Err(PpoError::InvalidConfig(
-            "Map2 comprehensive reward requires zero episode time cost",
-        ));
-    }
-    Ok(())
-}
-
-pub(crate) fn validate(settings: &TrainingJobConfig) -> Result<(), PpoError> {
-    validate_reward_contract(settings)?;
-    validate_pipeline_groups(settings)?;
-    if !settings.complete_episodes {
-        if settings.opponent_schedule != crate::TrainingOpponentSchedule::Teacher {
-            return Err(PpoError::InvalidConfig(
-                "opponent curriculum requires complete episodes",
-            ));
-        }
-        return Ok(());
-    }
-    if !valid_environment_count(settings.ppo.environments)
-        || settings.ppo.decision_interval_ticks != crate::MAP2_DECISION_INTERVAL_TICKS
-    {
-        return Err(PpoError::InvalidConfig(
-            "complete episodes require Map2, an even environment count up to the training maximum, and three-tick actions",
-        ));
-    }
-    if settings.ppo.rollout_decisions < RETAINED_PER_EPISODE {
-        return Err(PpoError::InvalidConfig(
-            "complete episode retained capacity",
-        ));
-    }
-    assert!(settings.ppo.environments * RETAINED_BYTES_PER_ENVIRONMENT < 6 * 1024 * 1024 * 1024);
-    assert!(valid_environment_count(settings.ppo.environments));
-    settings.ppo.validate()?;
-    Ok(())
-}
-
-/// Settings of the one-stream serial baseline: the same Map2 reward contract
-/// and cadence as production, with only the paired evenness rule lifted, since
-/// one stream has no pair to schedule against. `PpoConfig` admits one
-/// environment; this predicate exists for the benchmark slice and its tests.
-fn validate_serial(settings: &TrainingJobConfig) -> Result<(), PpoError> {
-    validate_reward_contract(settings)?;
-    validate_pipeline_groups(settings)?;
-    if !settings.complete_episodes
-        || settings.ppo.environments != 1
-        || settings.ppo.decision_interval_ticks != crate::MAP2_DECISION_INTERVAL_TICKS
-    {
-        return Err(PpoError::InvalidConfig(
-            "serial collection requires one complete-episode environment and three-tick actions",
-        ));
-    }
-    if settings.ppo.rollout_decisions < RETAINED_PER_EPISODE {
-        return Err(PpoError::InvalidConfig(
-            "complete episode retained capacity",
-        ));
-    }
-    settings.ppo.validate()?;
-    Ok(())
-}
-
-/// Even stream counts up to the training maximum keep pair seeding and the
-/// mastery batch math simple; odd counts have no paired policy seat.
-pub(super) fn valid_environment_count(count: usize) -> bool {
-    (2..=super::TRAINING_MAX_ENVIRONMENTS).contains(&count) && count.is_multiple_of(2)
-}
-
-/// Pipeline-group contract: one global barrier by default, or 2/4 fixed groups
-/// each running its own paired complete-episode batch concurrently.
-///
-/// Complete episodes are required because only they define one episode per
-/// stream and therefore a global update boundary independent of the groups. A
-/// group must own at least one full paired batch, so the count cannot exceed
-/// the number of environment pairs.
-pub(super) fn validate_pipeline_groups(settings: &TrainingJobConfig) -> Result<(), PpoError> {
-    if !matches!(settings.pipeline_groups, 1 | 2 | 4) {
-        return Err(PpoError::InvalidConfig("pipeline groups"));
-    }
-    if settings.pipeline_groups > 1 && !settings.complete_episodes {
-        return Err(PpoError::InvalidConfig(
-            "pipeline groups require complete episodes",
-        ));
-    }
-    if settings.pipeline_groups > 1 && settings.ppo.environments / 2 < settings.pipeline_groups {
-        return Err(PpoError::InvalidConfig(
-            "pipeline groups exceed paired environments",
-        ));
-    }
-    Ok(())
-}
-
-/// Fixed pair-aligned partition of `environments` streams into `groups` ranges.
-///
-/// Groups are contiguous by pair: group boundaries never split the mirrored
-/// policy seats that one seed pair schedules against each other, and groups
-/// differ by at most one pair, so their expected episode work is balanced.
-/// The sizes are a pure function of `(environments, groups)`, which makes the
-/// partition deterministic and reproducible without any runtime scheduling.
-pub(super) fn training_group_ranges(
-    environments: usize,
-    groups: usize,
-) -> Result<Vec<std::ops::Range<usize>>, PpoError> {
-    if !matches!(groups, 1 | 2 | 4) {
-        return Err(PpoError::InvalidConfig("pipeline groups"));
-    }
-    if !valid_environment_count(environments) {
-        return Err(PpoError::InvalidConfig("pipeline group environments"));
-    }
-    let pairs = environments / 2;
-    if pairs < groups {
-        return Err(PpoError::InvalidConfig(
-            "pipeline groups exceed paired environments",
-        ));
-    }
-    let base = pairs / groups;
-    let extra = pairs % groups;
-    let mut ranges = Vec::with_capacity(groups);
-    let mut first_pair = 0;
-    for group in 0..groups {
-        let group_pairs = base + usize::from(group < extra);
-        let start = first_pair * 2;
-        first_pair += group_pairs;
-        ranges.push(start..first_pair * 2);
-    }
-    assert_eq!(first_pair, pairs);
-    assert_eq!(
-        ranges.iter().map(std::ops::Range::len).sum::<usize>(),
-        environments
-    );
-    assert!(ranges.iter().all(|range| {
-        range.len() >= 2 && range.len().is_multiple_of(2) && valid_environment_count(range.len())
-    }));
-    Ok(ranges)
-}
-
-pub(super) fn environments(
-    settings: &TrainingJobConfig,
-    update: u64,
-) -> Result<Vec<TrainingEnvironment>, PpoError> {
-    environments_with_mastery(settings, update, None)
-}
-
-pub(super) fn environments_with_mastery(
-    settings: &TrainingJobConfig,
-    update: u64,
-    mastery: Option<&crate::MasteryProgress>,
-) -> Result<Vec<TrainingEnvironment>, PpoError> {
-    validate(settings)?;
-    assert!(settings.complete_episodes);
-    let mastery_teacher = mastery_teacher_stage(settings, mastery)?;
-    let first_pair = update
-        .checked_mul((settings.ppo.environments / 2) as u64)
-        .ok_or(PpoError::CounterOverflow)?;
-    (0..settings.ppo.environments)
-        .map(|stream| {
-            let pair = first_pair
-                .checked_add((stream / 2) as u64)
-                .ok_or(PpoError::CounterOverflow)?;
-            build_environment(
-                derive_training_seed(settings.seed, pair, crate::randomization::ARENA_DOMAIN),
-                derive_training_seed(settings.seed, pair, crate::randomization::OPPONENT_DOMAIN),
-                settings.map,
-                stream % 2,
-                0,
-                match mastery_teacher {
-                    Some(true) => OpponentSpec::Teacher,
-                    Some(false) => OpponentSpec::Weak,
-                    None => scheduled_opponent(settings, update, stream),
-                },
-            )
-        })
-        .collect()
-}
-
-fn mastery_teacher_stage(
-    settings: &TrainingJobConfig,
-    mastery: Option<&crate::MasteryProgress>,
-) -> Result<Option<bool>, PpoError> {
-    match (settings.mastery_config, mastery) {
-        (None, None) => Ok(None),
-        (Some(config), Some(progress)) => {
-            progress.validate(config).map_err(PpoError::InvalidConfig)?;
-            if progress.completed() {
-                return Err(PpoError::InvalidConfig("mastery already completed"));
-            }
-            Ok(Some(progress.stage() == crate::MasteryStage::Teacher))
-        }
-        _ => Err(PpoError::InvalidConfig(
-            "mastery configuration/state mismatch",
-        )),
-    }
-}
-
-fn scheduled_opponent(settings: &TrainingJobConfig, update: u64, stream: usize) -> OpponentSpec {
-    assert!(settings.complete_episodes);
-    assert!(stream < settings.ppo.environments);
-    if settings.opponent_schedule.is_teacher(update, stream / 2) {
-        OpponentSpec::Teacher
-    } else {
-        OpponentSpec::Weak
-    }
-}
-
-/// The stream-zero world of `update`, built exactly as the even-count
-/// production collector builds its first pair, for the serial baseline.
-///
-/// Pair index `update` matches the first pair of an even run at the same
-/// update, so the serial slice and stream zero of the two-stream slice start
-/// from identical worlds. The mastery argument follows
-/// [`environments_with_mastery`]: `Some` for mastery schedules, `None` for the
-/// legacy schedules that only admit up to three pairs.
-pub(super) fn single_environment(
-    settings: &TrainingJobConfig,
-    update: u64,
-    mastery: Option<&crate::MasteryProgress>,
-) -> Result<TrainingEnvironment, PpoError> {
-    validate_serial(settings)?;
-    let mastery_teacher = mastery_teacher_stage(settings, mastery)?;
-    build_environment(
-        derive_training_seed(settings.seed, update, crate::randomization::ARENA_DOMAIN),
-        derive_training_seed(settings.seed, update, crate::randomization::OPPONENT_DOMAIN),
-        settings.map,
-        0,
-        0,
-        match mastery_teacher {
-            Some(true) => OpponentSpec::Teacher,
-            Some(false) => OpponentSpec::Weak,
-            None => scheduled_opponent(settings, update, 0),
-        },
-    )
-}
-
 fn opponent_name(opponent: &OpponentRuntime) -> &'static str {
     match opponent {
         OpponentRuntime::Teacher => "Teacher",
-        OpponentRuntime::Weak => "Weak",
+        #[cfg(test)]
+        OpponentRuntime::Idle => "Idle",
         OpponentRuntime::Policy { .. } => "Policy",
-    }
-}
-
-fn collection_opponents(environments: &[TrainingEnvironment]) -> (&'static str, usize, usize) {
-    assert!(valid_environment_count(environments.len()));
-    let weak = environments
-        .iter()
-        .filter(|arena| matches!(arena.opponent, OpponentRuntime::Weak))
-        .count();
-    let teacher = environments
-        .iter()
-        .filter(|arena| matches!(arena.opponent, OpponentRuntime::Teacher))
-        .count();
-    assert_eq!(weak + teacher, environments.len());
-    let name = if weak == 0 {
-        "Teacher"
-    } else if teacher == 0 {
-        "Weak"
-    } else {
-        "Mixed"
-    };
-    (name, weak, teacher)
-}
-
-/// Opt-in per-phase wall accounting for collection diagnosis.
-///
-/// Production always collects without a recorder; the benchmark slice passes
-/// one recorder per group and reports the sums. Counters are relaxed atomics
-/// because each group owns one recorder and phases only add disjoint
-/// durations, so every run observes the same totals regardless of thread
-/// interleaving. A zeroed recorder never changes collection results: the
-/// instrumented operations are unchanged, only measured.
-#[derive(Default)]
-pub(super) struct CollectionPhases {
-    /// Stream worker: policy sample preparation (feature encode plus orders).
-    pub(super) prepare_ns: AtomicU64,
-    /// Stream worker: sampled action application and three-tick world advance.
-    pub(super) advance_ns: AtomicU64,
-    /// Group orchestrator: batched policy forward, autoregressive decode and
-    /// sampling for one round.
-    pub(super) forward_ns: AtomicU64,
-    /// Group orchestrator: waiting for every active stream worker's reply.
-    pub(super) barrier_ns: AtomicU64,
-    /// Group orchestrator: reply application, rollout push and episode
-    /// bookkeeping. Contains `flush_wait_ns`.
-    pub(super) apply_ns: AtomicU64,
-    /// Group orchestrator: waiting for a retained-interval next value from the
-    /// dedicated evaluator; a subset of `apply_ns`.
-    pub(super) flush_wait_ns: AtomicU64,
-    /// Flush evaluator: the batch-1 next-value forward.
-    pub(super) evaluator_ns: AtomicU64,
-}
-
-impl CollectionPhases {
-    /// Accumulates one optional measured phase into its counter.
-    fn record(started: Option<Instant>, counter: Option<&AtomicU64>) {
-        if let (Some(started), Some(counter)) = (started, counter) {
-            let nanos = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
-            counter.fetch_add(nanos, Ordering::Relaxed);
-        }
     }
 }
 
@@ -483,13 +157,8 @@ impl FlushEvaluator {
 }
 
 /// Drains queued flush requests until every sender is dropped.
-fn flush_evaluator_loop(
-    model: &PolicyModel,
-    receiver: &std::sync::mpsc::Receiver<FlushRequest>,
-    phases: Option<&CollectionPhases>,
-) {
+fn flush_evaluator_loop(model: &PolicyModel, receiver: &std::sync::mpsc::Receiver<FlushRequest>) {
     while let Ok((frame, reply)) = receiver.recv() {
-        let started = phases.map(|_| Instant::now());
         let value = model
             .evaluate_batch(std::slice::from_ref(&frame))
             .map_err(text_error)
@@ -500,7 +169,6 @@ fn flush_evaluator_loop(
                     .map(|output| output.value)
                     .ok_or(PpoError::InvalidTransition("episode flush value"))
             });
-        CollectionPhases::record(started, phases.map(|phases| &phases.evaluator_ns));
         // A dropped receiver means the collector no longer needs this value;
         // the evaluator keeps draining so later requests still complete.
         let _ = reply.send(value);
@@ -516,316 +184,12 @@ impl Drop for FlushThreadGuard<'_> {
     }
 }
 
-/// Logs one collection batch before its first decision.
-///
-/// One group logs its own line, so an operator can attribute every stream
-/// range to a group; the default one-group line is byte-identical to the
-/// historical single-barrier collector.
-fn log_collection(
-    environments: &[TrainingEnvironment],
-    settings: &TrainingJobConfig,
-    update: u64,
-    group: Option<(usize, usize)>,
-) {
-    if prometheus::enabled() {
-        return;
-    }
-    let config = settings.ppo;
-    let retained_bytes_bound = environments.len() * RETAINED_BYTES_PER_ENVIRONMENT;
-    let (opponent, weak_environments, teacher_environments) = collection_opponents(environments);
-    let prefix = match group {
-        None => "collection:".to_owned(),
-        Some((index, groups)) => format!("collection: group={}/{}", index + 1, groups),
-    };
-    eprintln!(
-        "{prefix} complete-episodes map=2 reward=map2_full gamma_tick=1 opponent={opponent} actor_ticks={} retention_stride={RETENTION_STRIDE} retention_phase=random_episode_independent_rng tick_cap={TICK_CAP} environments={} retained_bytes_bound={retained_bytes_bound} opponent_schedule={} update_index={update} weak_environments={weak_environments} teacher_environments={teacher_environments}",
-        config.decision_interval_ticks,
-        environments.len(),
-        settings.opponent_schedule.as_str(),
-    );
-}
-
-/// Runs the worker-pool collector for at most `rounds` decision rounds.
-///
-/// Production always passes [`ACTOR_DECISIONS`] and `require_complete = true`,
-/// which keeps the exact full-episode behaviour: every stream must finish and
-/// the batch must contain at least one completed episode. The bounded
-/// benchmark slice passes a smaller round count and `false`, so the engine
-/// still performs one decision round per active stream per iteration while the
-/// caller owns the window and terminal bookkeeping.
-#[allow(clippy::too_many_arguments)]
-pub(super) fn collect_bounded(
-    model: &PolicyModel,
-    sampling: &mut PpoRng,
-    environments: &mut [TrainingEnvironment],
-    settings: &TrainingJobConfig,
-    update: u64,
-    rounds: usize,
-    require_complete: bool,
-    rollout: &mut PpoRollout,
-    report: &mut PpoSmokeReport,
-) -> Result<(), PpoError> {
-    collect_groups_bounded(
-        model,
-        sampling,
-        environments,
-        settings,
-        update,
-        1,
-        rounds,
-        require_complete,
-        None,
-        rollout,
-        report,
-    )
-}
-
-/// Runs the worker-pool collector as `groups` fixed independent batches.
-///
-/// One group is the default global-barrier collector. More groups partition
-/// the paired streams by [`training_group_ranges`]; every group runs its own
-/// bounded worker pool, decision barrier, batched forward and sampling on its
-/// own orchestrator thread, so one group's forward or apply overlaps another
-/// group's world stepping. The update boundary stays global: the caller sees
-/// exactly the same number of completed episodes and one merged rollout in
-/// fixed group order, which keeps the mode deterministic while changing batch
-/// composition (a new training contract recorded in the checkpoint run scope).
-#[allow(clippy::too_many_arguments)]
-pub(super) fn collect_groups_bounded(
-    model: &PolicyModel,
-    sampling: &mut PpoRng,
-    environments: &mut [TrainingEnvironment],
-    settings: &TrainingJobConfig,
-    update: u64,
-    groups: usize,
-    rounds: usize,
-    require_complete: bool,
-    phases: Option<&[CollectionPhases]>,
-    rollout: &mut PpoRollout,
-    report: &mut PpoSmokeReport,
-) -> Result<(), PpoError> {
-    validate(settings)?;
-    assert!(valid_environment_count(environments.len()));
-    assert_eq!(
-        settings.pipeline_groups, groups,
-        "collection group request must match the typed settings"
-    );
-    assert_eq!(
-        settings.ppo.decision_interval_ticks,
-        crate::MAP2_DECISION_INTERVAL_TICKS
-    );
-    if rounds == 0 || rounds > ACTOR_DECISIONS {
-        return Err(PpoError::InvalidConfig("collection rounds"));
-    }
-    let ranges = training_group_ranges(environments.len(), groups)?;
-    if phases.is_some_and(|phases| phases.len() != groups) {
-        return Err(PpoError::InvalidConfig("collection phase counters"));
-    }
-    let mut random = actor_stream_rngs(sampling, environments.len())?;
-    let mut streams = streams_for_collection(settings, update)?;
-    if groups == 1 {
-        log_collection(environments, settings, update, None);
-        let completed = collect_with_workers(
-            model,
-            settings.ppo,
-            0,
-            "ppo",
-            environments,
-            &mut streams,
-            &mut random,
-            rounds,
-            None,
-            phases.map(|phases| &phases[0]),
-            rollout,
-            report,
-            false,
-        )?;
-        assert!(completed, "the one-group collector cannot cancel");
-        finish_collection(&streams, environments, require_complete, report)?;
-        return if require_complete {
-            validate_episode_batch(rollout, report)
-        } else {
-            Ok(())
-        };
-    }
-    let policy = model.policy_identity().map_err(text_error)?;
-    let cancel = AtomicBool::new(false);
-    let outcomes = std::thread::scope(|scope| -> Result<Vec<GroupOutcome>, PpoError> {
-        let mut handles = Vec::with_capacity(groups);
-        let mut environments_rest: &mut [TrainingEnvironment] = environments;
-        let mut streams_rest = streams.into_iter();
-        let mut random_rest = random.into_iter();
-        for (index, range) in ranges.iter().enumerate() {
-            let length = range.len();
-            let (group_environments, rest) =
-                std::mem::take(&mut environments_rest).split_at_mut(length);
-            environments_rest = rest;
-            let group_streams: Vec<_> = streams_rest.by_ref().take(length).collect();
-            let group_random: Vec<_> = random_rest.by_ref().take(length).collect();
-            let capacity = length
-                .checked_mul(settings.ppo.rollout_decisions)
-                .ok_or(PpoError::InvalidConfig("group rollout capacity"))?;
-            let group_rollout = PpoRollout::new(capacity, policy)?;
-            let group_report = PpoSmokeReport::default();
-            let group_phases = phases.map(|phases| &phases[index]);
-            let stream_base = range.start;
-            let cancel = &cancel;
-            let thread_prefix = format!("ppo-g{index}");
-            log_collection(group_environments, settings, update, Some((index, groups)));
-            let handle = match std::thread::Builder::new()
-                .name(format!("ppo-group-{index}"))
-                .spawn_scoped(scope, move || {
-                    let result = collect_group(
-                        model,
-                        settings,
-                        stream_base,
-                        &thread_prefix,
-                        group_environments,
-                        group_streams,
-                        group_random,
-                        rounds,
-                        require_complete,
-                        cancel,
-                        group_rollout,
-                        group_report,
-                        group_phases,
-                    );
-                    if result.is_err() {
-                        cancel.store(true, Ordering::Relaxed);
-                    }
-                    result
-                }) {
-                Ok(handle) => handle,
-                Err(error) => {
-                    cancel.store(true, Ordering::Relaxed);
-                    return Err(PpoError::EpisodeWorker {
-                        stream: stream_base,
-                        cause: error.to_string(),
-                    });
-                }
-            };
-            handles.push(handle);
-        }
-        // Join in group order: erroring groups already cancelled the others,
-        // so every join is bounded by one decision round of remaining work.
-        let mut outcomes = Vec::with_capacity(groups);
-        let mut first_error = None;
-        let mut first_panic = None;
-        for handle in handles {
-            match handle.join() {
-                Ok(Ok(outcome)) => outcomes.push(outcome),
-                Ok(Err(error)) => {
-                    first_error.get_or_insert(error);
-                }
-                Err(payload) => {
-                    first_panic.get_or_insert(payload);
-                }
-            }
-        }
-        if let Some(payload) = first_panic {
-            std::panic::resume_unwind(payload);
-        }
-        if let Some(error) = first_error {
-            return Err(error);
-        }
-        Ok(outcomes)
-    })?;
-    merge_group_outcomes(outcomes, require_complete, rollout, report)
-}
-
-/// One finished or cancelled collection group.
-///
-/// One outcome exists per group per update, so the boxed payloads trade two
-/// cold-path allocations for a small enum moved through join results.
-enum GroupOutcome {
-    Complete {
-        rollout: Box<PpoRollout>,
-        report: Box<PpoSmokeReport>,
-    },
-    Cancelled,
-}
-
-/// Runs one group's complete collection on its own orchestrator thread.
-#[allow(clippy::too_many_arguments)]
-fn collect_group(
-    model: &PolicyModel,
-    settings: &TrainingJobConfig,
-    stream_base: usize,
-    thread_prefix: &str,
-    environments: &mut [TrainingEnvironment],
-    mut streams: Vec<EpisodeStream>,
-    mut random: Vec<PpoRng>,
-    rounds: usize,
-    require_complete: bool,
-    cancel: &AtomicBool,
-    mut rollout: PpoRollout,
-    mut report: PpoSmokeReport,
-    phases: Option<&CollectionPhases>,
-) -> Result<GroupOutcome, PpoError> {
-    assert_eq!(streams.len(), environments.len());
-    assert_eq!(random.len(), environments.len());
-    let completed = collect_with_workers(
-        model,
-        settings.ppo,
-        stream_base,
-        thread_prefix,
-        environments,
-        &mut streams,
-        &mut random,
-        rounds,
-        Some(cancel),
-        phases,
-        &mut rollout,
-        &mut report,
-        false,
-    )?;
-    if !completed {
-        return Ok(GroupOutcome::Cancelled);
-    }
-    finish_collection(&streams, environments, require_complete, &mut report)?;
-    Ok(GroupOutcome::Complete {
-        rollout: Box::new(rollout),
-        report: Box::new(report),
-    })
-}
-
-/// Merges the fixed-group results into the one global update batch.
-///
-/// Group order is the partition order, never completion order, so the merged
-/// sample sequence and the mastery outcome order are deterministic.
-fn merge_group_outcomes(
-    outcomes: Vec<GroupOutcome>,
-    require_complete: bool,
-    rollout: &mut PpoRollout,
-    report: &mut PpoSmokeReport,
-) -> Result<(), PpoError> {
-    for outcome in outcomes {
-        match outcome {
-            GroupOutcome::Complete {
-                rollout: group_rollout,
-                report: group_report,
-            } => {
-                super::merge_actor_report(report, *group_report)?;
-                rollout.append(*group_rollout)?;
-            }
-            GroupOutcome::Cancelled => {
-                return Err(PpoError::InvalidConfig("collection group cancelled"));
-            }
-        }
-    }
-    if require_complete {
-        return validate_episode_batch(rollout, report);
-    }
-    Ok(())
-}
-
 /// Runs one bounded worker pool and applies completions in stream order.
 /// Actor-value reuse replaces the default flush evaluator with one pending round;
 /// a failed sample/completion aborts the uncommitted update, never retries its worlds.
 ///
-/// Returns `false` when `cancel` was observed at a round boundary, leaving
-/// every worker idle; all exits join the pool and close the evaluator through
-/// an enclosing scope guard, so no path leaks a thread.
+/// All exits join the pool and close the evaluator through an enclosing scope
+/// guard, so no path leaks a thread.
 #[allow(clippy::too_many_arguments)]
 fn collect_with_workers(
     model: &PolicyModel,
@@ -836,12 +200,10 @@ fn collect_with_workers(
     streams: &mut [EpisodeStream],
     random: &mut [PpoRng],
     rounds: usize,
-    cancel: Option<&AtomicBool>,
-    phases: Option<&CollectionPhases>,
     rollout: &mut PpoRollout,
-    report: &mut PpoSmokeReport,
+    report: &mut CollectionReport,
     reuse_actor_values: bool,
-) -> Result<bool, PpoError> {
+) -> Result<(), PpoError> {
     assert_eq!(streams.len(), environments.len());
     assert_eq!(random.len(), environments.len());
     // The paired production collector passes even counts; the annealed batch
@@ -862,7 +224,6 @@ fn collect_with_workers(
         ));
     }
     let (flush_evaluator, flush_receiver) = if reuse_actor_values {
-        assert!(cancel.is_none(), "actor value reuse is annealed-only");
         (None, None)
     } else {
         // Preserve the queue size for existing batches; expanded batches need one slot per world.
@@ -875,13 +236,11 @@ fn collect_with_workers(
             Some(receiver),
         )
     };
-    std::thread::scope(|scope| -> Result<bool, PpoError> {
+    std::thread::scope(|scope| -> Result<(), PpoError> {
         if let Some(receiver) = flush_receiver {
             std::thread::Builder::new()
                 .name(format!("{thread_prefix}-flush-eval"))
-                .spawn_scoped(scope, move || {
-                    flush_evaluator_loop(model, &receiver, phases)
-                })
+                .spawn_scoped(scope, move || flush_evaluator_loop(model, &receiver))
                 .map_err(|error| PpoError::EpisodeWorker {
                     stream: stream_base,
                     cause: error.to_string(),
@@ -894,7 +253,7 @@ fn collect_with_workers(
             environments,
             thread_prefix,
             move |_, environment, job| {
-                run_stream_job(environment, job, config, flush_evaluator_ref, phases)
+                run_stream_job(environment, job, config, flush_evaluator_ref)
             },
         )?;
         // Bootstrap: every stream builds its first frame before any action.
@@ -905,12 +264,7 @@ fn collect_with_workers(
         let mut pending =
             reuse_actor_values.then(|| actor_values::PendingRound::new(streams.len()));
         let mut staged_random = reuse_actor_values.then(|| random.to_vec());
-        let mut completed = true;
         for _ in 0..rounds {
-            if cancel.is_some_and(|cancel| cancel.load(Ordering::Relaxed)) {
-                completed = false;
-                break;
-            }
             active.clear();
             active.extend((0..streams.len()).filter(|&stream| !streams[stream].done));
             if active.is_empty() {
@@ -925,7 +279,6 @@ fn collect_with_workers(
                 frames.push(sample.0);
                 spaces.push(sample.1);
             }
-            let started = phases.map(|_| Instant::now());
             if let Some(staged) = &mut staged_random {
                 staged.clone_from_slice(random);
             }
@@ -936,10 +289,8 @@ fn collect_with_workers(
                 frames,
                 spaces,
             );
-            CollectionPhases::record(started, phases.map(|phases| &phases.forward_ns));
             let (choices, spaces) = sampled?;
             if let Some(pending) = &mut pending {
-                let started = phases.map(|_| Instant::now());
                 pending.finish_sampled(
                     streams,
                     stream_base,
@@ -947,7 +298,6 @@ fn collect_with_workers(
                     rollout,
                     report,
                 )?;
-                CollectionPhases::record(started, phases.map(|phases| &phases.apply_ns));
                 random.clone_from_slice(staged_random.as_ref().expect("staged actor RNGs"));
             }
             let mut samples = choices.into_iter().zip(spaces);
@@ -965,12 +315,8 @@ fn collect_with_workers(
                 )?;
             }
             assert!(samples.next().is_none());
-            let started = phases.map(|_| Instant::now());
-            let replies = workers.receive(&active);
-            CollectionPhases::record(started, phases.map(|phases| &phases.barrier_ns));
-            let replies = replies?;
+            let replies = workers.receive(&active)?;
             assert_eq!(replies.len(), active.len());
-            let apply_started = phases.map(|_| Instant::now());
             for (stream, reply) in active.iter().copied().zip(replies) {
                 let StreamReply::Advanced(reply) = reply else {
                     return Err(PpoError::InvalidConfig("stream worker reply"));
@@ -987,21 +333,13 @@ fn collect_with_workers(
                     pending.push(stream, reply.completed, reply.opponent);
                     continue;
                 }
-                let value = match reply.value {
-                    Some(receiver) => {
-                        let started = phases.map(|_| Instant::now());
-                        let received = receiver.recv();
-                        CollectionPhases::record(
-                            started,
-                            phases.map(|phases| &phases.flush_wait_ns),
-                        );
-                        let value = received.map_err(|_| {
+                let value =
+                    match reply.value {
+                        Some(receiver) => Some(receiver.recv().map_err(|_| {
                             PpoError::InvalidConfig("episode flush evaluator reply")
-                        })?;
-                        Some(value?)
-                    }
-                    None => None,
-                };
+                        })??),
+                        None => None,
+                    };
                 finish_advance_from_parts(
                     &mut streams[stream],
                     stream_base + stream,
@@ -1012,13 +350,11 @@ fn collect_with_workers(
                     report,
                 )?;
             }
-            CollectionPhases::record(apply_started, phases.map(|phases| &phases.apply_ns));
         }
         if let Some(pending) = &mut pending {
             pending.finish_fallback(model, streams, stream_base, &prepared, rollout, report)?;
         }
-        workers.finish()?;
-        Ok(completed)
+        workers.finish()
     })
 }
 
@@ -1027,7 +363,6 @@ fn run_stream_job(
     job: StreamJob,
     config: PpoConfig,
     evaluator: Option<&FlushEvaluator>,
-    phases: Option<&CollectionPhases>,
 ) -> Result<StreamReply, PpoError> {
     if matches!(&job, StreamJob::PrepareNeural) {
         let sample = prepare_policy_sample(environment)?;
@@ -1044,24 +379,19 @@ fn run_stream_job(
         opponent,
     } = job
     else {
-        let started = phases.map(|_| Instant::now());
-        let sample = prepare_policy_sample(environment);
-        CollectionPhases::record(started, phases.map(|phases| &phases.prepare_ns));
-        return sample.map(|sample| StreamReply::Prepared(Box::new(sample)));
+        return prepare_policy_sample(environment)
+            .map(|sample| StreamReply::Prepared(Box::new(sample)));
     };
     let batched_opponent = opponent.is_some();
-    let started = phases.map(|_| Instant::now());
-    let advanced = advance_cpu_with_opponent(
+    let completed = advance_cpu_with_opponent(
         environment,
         &mut state,
         choice,
         space,
         config,
         opponent.map(|value| *value),
-    );
-    CollectionPhases::record(started, phases.map(|phases| &phases.advance_ns));
-    let completed = advanced?;
-    let (value, prepared) = prepare_after_advance(environment, &state, evaluator, phases)?;
+    )?;
+    let (value, prepared) = prepare_after_advance(environment, &state, evaluator)?;
     let opponent_prepared = if batched_opponent && !state.done {
         Some(Box::new(neural_opponent::prepare(environment)?))
     } else {
@@ -1083,16 +413,12 @@ fn prepare_after_advance(
     environment: &mut TrainingEnvironment,
     state: &EpisodeStream,
     evaluator: Option<&FlushEvaluator>,
-    phases: Option<&CollectionPhases>,
 ) -> Result<PreparedNext, PpoError> {
     let mut value = None;
     let prepared = if state.done {
         None
     } else {
-        let started = phases.map(|_| Instant::now());
-        let sample = prepare_policy_sample(environment);
-        CollectionPhases::record(started, phases.map(|phases| &phases.prepare_ns));
-        let sample = sample?;
+        let sample = prepare_policy_sample(environment)?;
         if state.should_flush()
             && let Some(evaluator) = evaluator
         {
@@ -1105,118 +431,6 @@ fn prepare_after_advance(
     assert_eq!(prepared.is_none(), state.done);
     assert!(value.is_none() || state.should_flush());
     Ok((value, prepared))
-}
-
-/// Applies the shared completion contract to one finished group.
-fn finish_collection(
-    streams: &[EpisodeStream],
-    environments: &[TrainingEnvironment],
-    require_complete: bool,
-    report: &mut PpoSmokeReport,
-) -> Result<(), PpoError> {
-    if require_complete {
-        assert!(streams.iter().all(|stream| stream.done));
-        assert!(streams.iter().all(|stream| stream.choice.is_none()));
-        report.rejected_orders = environment_rejections(environments)?;
-        return Ok(());
-    }
-    // A bounded slice must never finish or flush a final episode: the caller
-    // needs the same number of active streams in every round it measures.
-    assert!(
-        streams.iter().all(|stream| !stream.done),
-        "bounded collection window ended an episode"
-    );
-    Ok(())
-}
-
-/// Runs the one-stream collector serially on the calling thread.
-///
-/// Each round performs exactly the parallel collector's steady-state work:
-/// prepare the policy sample, run the same batched sampler, apply the chosen
-/// action, advance the world three ticks, and evaluate a retained-interval
-/// value in line every eighth decision. Production requires an even paired
-/// count, so this path is reachable only through
-/// [`crate::TrainingCollectionSlice`].
-#[allow(clippy::too_many_arguments)]
-pub(super) fn collect_serial_bounded(
-    model: &PolicyModel,
-    sampling: &mut PpoRng,
-    environment: &mut TrainingEnvironment,
-    settings: &TrainingJobConfig,
-    update: u64,
-    rounds: usize,
-    rollout: &mut PpoRollout,
-    report: &mut PpoSmokeReport,
-) -> Result<(), PpoError> {
-    validate_serial(settings)?;
-    if rounds == 0 || rounds > ACTOR_DECISIONS {
-        return Err(PpoError::InvalidConfig("serial collection rounds"));
-    }
-    assert_eq!(settings.ppo.environments, 1);
-    assert!(!environment.seats.is_empty());
-    let mut random = actor_stream_rngs(sampling, 1)?;
-    let mut state = EpisodeStream {
-        retention_phase: retention_phase(settings.seed, update, 0)?,
-        ..EpisodeStream::default()
-    };
-    for _ in 0..rounds {
-        let (frame, space) = prepare_policy_sample(environment)?;
-        let (choices, spaces) = select_choices(model, &mut random, &[0], vec![frame], vec![space])?;
-        let mut samples = choices.into_iter().zip(spaces);
-        let (choice, space) = samples
-            .next()
-            .ok_or(PpoError::InvalidTransition("serial policy choice"))?;
-        assert!(samples.next().is_none());
-        advance_stream(
-            model,
-            environment,
-            &mut state,
-            (0, choice, space),
-            settings.ppo,
-            rollout,
-            report,
-        )?;
-        assert!(
-            !state.done,
-            "bounded serial collection window ended an episode"
-        );
-    }
-    Ok(())
-}
-
-fn validate_episode_batch(rollout: &PpoRollout, report: &PpoSmokeReport) -> Result<(), PpoError> {
-    if rollout.is_empty() {
-        return Err(PpoError::EmptyRollout);
-    }
-    if [
-        report.terminal_wins,
-        report.terminal_losses,
-        report.terminal_draws,
-        report.episode_timeouts,
-    ]
-    .iter()
-    .all(|count| *count == 0)
-    {
-        return Err(PpoError::InvalidTransition(
-            "complete episode batch has no completed episodes",
-        ));
-    }
-    Ok(())
-}
-
-fn streams_for_collection(
-    settings: &TrainingJobConfig,
-    update: u64,
-) -> Result<Vec<EpisodeStream>, PpoError> {
-    validate(settings)?;
-    (0..settings.ppo.environments)
-        .map(|stream| {
-            Ok(EpisodeStream {
-                retention_phase: retention_phase(settings.seed, update, stream)?,
-                ..EpisodeStream::default()
-            })
-        })
-        .collect()
 }
 
 fn retention_phase(seed: u64, update: u64, stream: usize) -> Result<usize, PpoError> {
@@ -1260,7 +474,7 @@ pub(super) fn collect_batch_with_actor_values(
     random: &mut [PpoRng],
     rounds: usize,
     rollout: &mut PpoRollout,
-    report: &mut PpoSmokeReport,
+    report: &mut CollectionReport,
     reuse_actor_values: bool,
 ) -> Result<(), PpoError> {
     assert!(!environments.is_empty());
@@ -1269,7 +483,7 @@ pub(super) fn collect_batch_with_actor_values(
     if rounds == 0 || rounds > ACTOR_DECISIONS {
         return Err(PpoError::InvalidConfig("annealed collection rounds"));
     }
-    let completed = collect_with_workers(
+    collect_with_workers(
         model,
         config,
         stream_base,
@@ -1278,13 +492,10 @@ pub(super) fn collect_batch_with_actor_values(
         streams,
         random,
         rounds,
-        None,
-        None,
         rollout,
         report,
         reuse_actor_values,
     )?;
-    assert!(completed, "an annealed batch cannot cancel");
     finish_annealed_batch(streams, rounds);
     Ok(())
 }
@@ -1300,7 +511,7 @@ pub(super) fn collect_batch_with_opponent_batching(
     random: &mut [PpoRng],
     rounds: usize,
     rollout: &mut PpoRollout,
-    report: &mut PpoSmokeReport,
+    report: &mut CollectionReport,
     reuse_actor_values: bool,
     neural_opponent_batching: bool,
 ) -> Result<(), PpoError> {
@@ -1508,6 +719,7 @@ impl DiscountedInterval {
     }
 }
 
+#[cfg(test)]
 /// Applies one sampled decision and advances the world through the serial
 /// reward and retained-interval bookkeeping shared with the serial slice and
 /// the parity tests.
@@ -1518,7 +730,7 @@ fn advance_stream(
     sample: (usize, PpoPolicyChoice, ActionSpace),
     config: PpoConfig,
     rollout: &mut PpoRollout,
-    report: &mut PpoSmokeReport,
+    report: &mut CollectionReport,
 ) -> Result<(), PpoError> {
     let (stream, choice, space) = sample;
     let completed = advance_cpu(environment, state, choice, space, config)?;
@@ -1540,6 +752,7 @@ struct CompletedAdvance {
     outcome: Option<PpoTerminalOutcome>,
 }
 
+#[cfg(test)]
 fn advance_cpu(
     environment: &mut TrainingEnvironment,
     state: &mut EpisodeStream,
@@ -1607,6 +820,7 @@ fn advance_cpu_with_opponent(
     })
 }
 
+#[cfg(test)]
 /// Serial completion of one advanced decision: retained-interval flush with an
 /// in-line next-value evaluation, then terminal episode bookkeeping.
 fn finish_advance(
@@ -1616,7 +830,7 @@ fn finish_advance(
     stream: usize,
     completed: CompletedAdvance,
     rollout: &mut PpoRollout,
-    report: &mut PpoSmokeReport,
+    report: &mut CollectionReport,
 ) -> Result<(), PpoError> {
     report.elapsed_ticks = report
         .elapsed_ticks
@@ -1648,7 +862,7 @@ fn finish_advance_from_parts(
     value: Option<f32>,
     opponent: &'static str,
     rollout: &mut PpoRollout,
-    report: &mut PpoSmokeReport,
+    report: &mut CollectionReport,
 ) -> Result<(), PpoError> {
     report.elapsed_ticks = report
         .elapsed_ticks
@@ -1699,6 +913,7 @@ fn observe_reward(
     Ok(emitted)
 }
 
+#[cfg(test)]
 /// Serial retained-interval flush used by [`advance_stream`]; the worker pool
 /// evaluates the same next frame on its dedicated evaluator thread instead.
 fn flush(
@@ -1745,7 +960,7 @@ fn record_episode(
     tick: u32,
     state: &EpisodeStream,
     outcome: Option<PpoTerminalOutcome>,
-    report: &mut PpoSmokeReport,
+    report: &mut CollectionReport,
     opponent: &'static str,
 ) -> Result<(), PpoError> {
     let label = accumulate_episode(stream, tick, state, outcome, report)?;
@@ -1783,7 +998,7 @@ fn accumulate_episode(
     tick: u32,
     state: &EpisodeStream,
     outcome: Option<PpoTerminalOutcome>,
-    report: &mut PpoSmokeReport,
+    report: &mut CollectionReport,
 ) -> Result<&'static str, PpoError> {
     assert!(state.done);
     assert!(tick <= TICK_CAP);

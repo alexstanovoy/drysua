@@ -426,8 +426,8 @@ fn run_evaluation(config: &EvalConfig, device: PolicyDevice) -> Result<String, P
             game.opponent_seed,
             MapId(2),
             game.seat,
-            0,
             spec,
+            Vec::new(),
         )?);
     }
     let started = Instant::now();

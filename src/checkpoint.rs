@@ -23,11 +23,6 @@ mod adaptive_tests;
 #[path = "tests/checkpoint_capacity.rs"]
 mod capacity_tests;
 #[cfg(test)]
-#[path = "tests/checkpoint_fixed_golden.rs"]
-mod fixed_golden_tests;
-#[path = "checkpoint_mastery.rs"]
-mod mastery;
-#[cfg(test)]
 #[path = "checkpoint_metrics_tests.rs"]
 mod metrics_tests;
 #[cfg(feature = "side-actors")]
@@ -155,8 +150,6 @@ pub enum CheckpointDevice {
 /// Immutable run provenance required for strict artifact compatibility.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CheckpointRun {
-    /// Typed mastery thresholds/window; None for nonmastery training.
-    pub mastery_config: Option<crate::MasteryConfig>,
     pub git_commit: String,
     pub simulator_commit: String,
     pub enabled_features: String,
@@ -214,8 +207,6 @@ impl RngCheckpoint {
 pub struct CheckpointProgress {
     /// Typed adaptive controller and snapshot commitment, or None for fixed schedules.
     pub adaptive_environment: Option<AdaptiveEnvironmentCheckpoint>,
-    /// Current mastery stage and complete ordered recent window, or None outside mastery.
-    pub mastery: Option<crate::MasteryProgress>,
     pub global_update: u64,
     pub policy_version: u64,
     pub scheduler_step: u64,
@@ -338,26 +329,6 @@ impl RestoredTrainingState {
         &self.progress
     }
 
-    pub fn pipeline(
-        &self,
-        sample_capacity: usize,
-        workers: usize,
-        model: &PolicyModel,
-    ) -> Result<crate::ActorLearnerPipeline, CheckpointError> {
-        if self.trainer.config().sample_budget != PpoSampleBudget::Standard {
-            return Err(CheckpointError::InvalidManifest(
-                "annealed actor-learner pipeline",
-            ));
-        }
-        crate::ActorLearnerPipeline::new_at(
-            sample_capacity,
-            workers,
-            model,
-            crate::RolloutVersion::new(self.progress.policy_version),
-        )
-        .map_err(|error| CheckpointError::Model(error.to_string()))
-    }
-
     pub fn into_parts(self) -> (PpoTrainer, CheckpointRun, CheckpointProgress) {
         (self.trainer, self.run, self.progress)
     }
@@ -373,12 +344,6 @@ impl TrainingArtifact {
         validate_run(&run, model, trainer.config())?;
         validate_progress(&progress, trainer.updates(), trainer.config())?;
         adaptive::validate_scope(&run, &progress, trainer.config())?;
-        mastery::validate_scope(
-            run.mastery_config,
-            progress.mastery.as_ref(),
-            progress.global_update,
-            trainer.config().environments,
-        )?;
         let snapshot = trainer
             .checkpoint_snapshot(model)
             .map_err(|error| CheckpointError::Model(error.to_string()))?;
@@ -617,12 +582,6 @@ impl TrainingArtifact {
         validate_run_without_model(&self.run, self.config)?;
         validate_progress(&self.progress, self.trainer_updates, self.config)?;
         adaptive::validate_scope(&self.run, &self.progress, self.config)?;
-        mastery::validate_scope(
-            self.run.mastery_config,
-            self.progress.mastery.as_ref(),
-            self.progress.global_update,
-            self.config.environments,
-        )?;
         validate_tensor_values("model.parameters", &self.parameters)?;
         validate_tensor_values("adam.first_moment", &self.optimizer.first_moment)?;
         validate_tensor_values("adam.second_moment", &self.optimizer.second_moment)?;
@@ -724,9 +683,6 @@ fn validate_run_without_model(
     config
         .validate()
         .map_err(|_| CheckpointError::InvalidManifest("PPO config"))?;
-    if config.sample_budget != PpoSampleBudget::Standard && run.mastery_config.is_some() {
-        return Err(CheckpointError::InvalidManifest("annealed mastery"));
-    }
     for (field, value) in [
         ("git commit", &run.git_commit),
         ("simulator commit", &run.simulator_commit),
@@ -757,9 +713,6 @@ fn validate_progress(
     trainer_updates: u64,
     config: PpoConfig,
 ) -> Result<(), CheckpointError> {
-    if config.sample_budget != PpoSampleBudget::Standard && progress.mastery.is_some() {
-        return Err(CheckpointError::InvalidManifest("annealed mastery"));
-    }
     if progress.global_update != trainer_updates || trainer_updates > MAX_TRAINING_COUNTER {
         return Err(CheckpointError::InvalidManifest("global update"));
     }
@@ -1093,15 +1046,9 @@ fn decode_manifest(bytes: &[u8]) -> Result<TrainingArtifact, CheckpointError> {
     let (budget, is_adaptive) = decode_checkpoint_identity(&mut reader)?;
     decode_schema(&mut reader, budget)?;
     let run = decode_run(&mut reader)?;
-    let mut progress = decode_progress(&mut reader, run.mastery_config)?;
+    let mut progress = decode_progress(&mut reader)?;
     let config = decode_config(&mut reader, budget)?;
     validate_run_without_model(&run, config)?;
-    mastery::validate_scope(
-        run.mastery_config,
-        progress.mastery.as_ref(),
-        progress.global_update,
-        config.environments,
-    )?;
     let trainer_updates = reader.u64()?;
     validate_progress(&progress, trainer_updates, config)?;
     let step = reader.u64()?;
@@ -1212,7 +1159,6 @@ fn encode_run(writer: &mut ManifestWriter, run: &CheckpointRun) -> Result<(), Ch
             .map_err(|_| CheckpointError::InvalidManifest("batch size"))?,
     );
     writer.u32(run.rules_audit_version);
-    mastery::encode_config(writer, run.mastery_config);
     Ok(())
 }
 
@@ -1228,7 +1174,6 @@ fn decode_run(reader: &mut ManifestReader<'_>) -> Result<CheckpointRun, Checkpoi
         device: decode_device(reader)?,
         batch_size: reader.u32()? as usize,
         rules_audit_version: reader.u32()?,
-        mastery_config: mastery::decode_config(reader)?,
     })
 }
 
@@ -1271,14 +1216,10 @@ fn encode_progress(
     for reference in &progress.league_references {
         writer.u64(*reference);
     }
-    mastery::encode_progress(writer, progress.mastery.as_ref());
     Ok(())
 }
 
-fn decode_progress(
-    reader: &mut ManifestReader<'_>,
-    mastery_config: Option<crate::MasteryConfig>,
-) -> Result<CheckpointProgress, CheckpointError> {
+fn decode_progress(reader: &mut ManifestReader<'_>) -> Result<CheckpointProgress, CheckpointError> {
     let global_update = reader.u64()?;
     let policy_version = reader.u64()?;
     let scheduler_step = reader.u64()?;
@@ -1301,7 +1242,6 @@ fn decode_progress(
     }
     Ok(CheckpointProgress {
         adaptive_environment: None,
-        mastery: mastery::decode_progress(reader, mastery_config)?,
         global_update,
         policy_version,
         scheduler_step,
@@ -1454,13 +1394,6 @@ impl<'data> ManifestReader<'data> {
     }
     fn array<const N: usize>(&mut self) -> Result<[u8; N], CheckpointError> {
         Ok(self.take(N)?.try_into().expect("exact array length"))
-    }
-    fn flag(&mut self, field: &'static str) -> Result<bool, CheckpointError> {
-        match self.u8()? {
-            0 => Ok(false),
-            1 => Ok(true),
-            _ => Err(CheckpointError::InvalidManifest(field)),
-        }
     }
     fn string(&mut self) -> Result<String, CheckpointError> {
         let count = self.u16()? as usize;

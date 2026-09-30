@@ -12,8 +12,6 @@ use crate::{
     RngCheckpoint, TrainingArtifact,
 };
 
-#[path = "checkpoint_mastery.rs"]
-mod checkpoint_mastery;
 #[path = "checkpoint_training_contract.rs"]
 mod checkpoint_training_contract;
 
@@ -150,15 +148,6 @@ fn strict_checkpoint_restores_adam_rng_and_identical_next_update() {
     assert_eq!(state.progress(), &progress_metadata(1));
     assert_eq!(state.trainer().config(), trainer.config());
     assert_eq!(state.trainer().updates(), trainer.updates());
-    assert_eq!(
-        state
-            .pipeline(4, 1, &target)
-            .expect("pipeline")
-            .version()
-            .expect("version")
-            .get(),
-        1
-    );
     assert_snapshot_equal(&source, &trainer, &target, state.trainer());
     let (source_batch, source_actions) = checkpoint_batch(&source, 18_005);
     let (target_batch, target_actions) = checkpoint_batch(&target, 18_005);
@@ -196,39 +185,6 @@ fn assert_snapshot_equal(
     assert_eq!(trainer.rng_checkpoint(), source_rng);
     assert_eq!(restored.rng_checkpoint(), target_rng);
     assert_eq!(trainer.rng_checkpoint(), restored.rng_checkpoint());
-}
-
-#[cfg(feature = "builtin")]
-#[test]
-fn provenance_migration_cannot_bypass_old_training_schema() {
-    let directory = Directory::new();
-    fresh_artifact().save(&directory.0).expect("save");
-    let path = directory.0.join("checkpoint.meta");
-    let mut bytes = fs::read(&path).expect("manifest");
-    bytes[56..60].copy_from_slice(&13u32.to_le_bytes());
-    bytes[60..68].copy_from_slice(&11_103_744_726_312_279_053u64.to_le_bytes());
-    fs::write(&path, &bytes).expect("legacy schema");
-    let settings = crate::TrainingJobConfig {
-        ppo: checkpoint_config(),
-        resume_provenance: crate::ResumeProvenance::MigrateGitCommit,
-        git_commit: "different-commit".to_owned(),
-        simulator_commit: "b575129".to_owned(),
-        ..crate::ppo::training_settings_for_test(18_000, 1)
-    };
-    let error = crate::run_training_job_on_with_initial_weights(
-        settings,
-        crate::PolicyDevice::Cpu,
-        &directory.0,
-        true,
-        None,
-        |_| panic!("legacy migration must not train"),
-    )
-    .expect_err("schema is not provenance");
-    assert_eq!(
-        error.to_string(),
-        "PPO model error: checkpoint schema does not match this build"
-    );
-    assert_eq!(fs::read(path).expect("unchanged manifest"), bytes);
 }
 
 #[test]
@@ -296,22 +252,6 @@ fn restore_rejects_optimizer_ownership_actor_and_scope_without_mutation() {
         CheckpointError::InvalidManifest("compatibility scope")
     );
     assert_eq!(target.export_parameters().expect("after"), before);
-    let mut pipeline = crate::ActorLearnerPipeline::new(4, 1, &target).expect("pipeline");
-    let actor = pipeline.take_actor(0).expect("actor");
-    let lease = actor.lease().expect("lease");
-    let before = lease
-        .policy()
-        .export_parameters()
-        .expect("actor parameters");
-    let error = artifact
-        .restore(lease.policy(), &run_metadata())
-        .err()
-        .expect("immutable actor");
-    assert_eq!(
-        error.to_string(),
-        "checkpoint model restore failed: immutable actor model cannot own an optimizer"
-    );
-    assert_eq!(lease.policy().export_parameters().expect("after"), before);
 }
 
 #[cfg(unix)]
@@ -382,7 +322,6 @@ fn checkpoint_config() -> PpoConfig {
 
 fn run_metadata() -> CheckpointRun {
     CheckpointRun {
-        mastery_config: None,
         git_commit: "28e196f".to_owned(),
         simulator_commit: "b575129".to_owned(),
         enabled_features: crate::compiled_features(),
@@ -399,7 +338,6 @@ fn run_metadata() -> CheckpointRun {
 fn progress_metadata(global_update: u64) -> CheckpointProgress {
     CheckpointProgress {
         adaptive_environment: None,
-        mastery: None,
         global_update,
         policy_version: global_update,
         scheduler_step: 3,

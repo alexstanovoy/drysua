@@ -2,51 +2,32 @@ use super::{OrderPersistence, PersistenceError, record_sent_for_ledgers};
 use crate::{ActivePolicyOrder, IssuedOrder, LocalPolicyError, LocalPolicyState, StateTracker};
 use bota_proto::EntityId;
 
-/// Training-only execution role. Observer changes model-facing bookkeeping, never transport.
-/// Both neural roles follow actual sent requests, not unissued labels or proof of execution.
+/// Training-only execution role; the candidate follows actual sent requests, not
+/// unissued labels or proof of execution.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "one inline value per seat; boxing would allocate on the decision path"
+)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum PolicyOrderBookkeeping {
     #[default]
     Legacy,
     Candidate(OrderPersistence),
-    Observer(OrderPersistence),
 }
 
 impl PolicyOrderBookkeeping {
-    pub(crate) fn for_new_trajectory(&self) -> Self {
-        match self {
-            Self::Legacy => Self::Legacy,
-            Self::Candidate(_) => Self::Candidate(OrderPersistence::default()),
-            Self::Observer(_) => Self::Observer(OrderPersistence::default()),
-        }
-    }
-
     pub(crate) fn enable_candidate(
         &mut self,
         legacy: &OrderPersistence,
     ) -> Result<(), &'static str> {
         match self {
             Self::Candidate(_) => Ok(()),
-            Self::Observer(_) => Err("neural observer cannot become a candidate"),
             Self::Legacy => {
                 self.validate_start(legacy)?;
                 *self = Self::Candidate(*legacy);
                 Ok(())
             }
         }
-    }
-
-    #[cfg(test)]
-    pub(crate) fn enable_observer(
-        &mut self,
-        legacy: &OrderPersistence,
-    ) -> Result<(), &'static str> {
-        if matches!(self, Self::Legacy) {
-            self.validate_start(legacy)?;
-            *self = Self::Observer(*legacy);
-        }
-        // Prediction and label collection must never downgrade a candidate's execution role.
-        Ok(())
     }
 
     fn validate_start(&self, legacy: &OrderPersistence) -> Result<(), &'static str> {
@@ -62,10 +43,6 @@ impl PolicyOrderBookkeeping {
         matches!(self, Self::Candidate(_))
     }
 
-    pub(crate) const fn is_neural(&self) -> bool {
-        !matches!(self, Self::Legacy)
-    }
-
     pub(crate) fn transport<'a>(&'a self, legacy: &'a OrderPersistence) -> &'a OrderPersistence {
         if self.is_candidate() {
             self.effective(legacy)
@@ -76,14 +53,14 @@ impl PolicyOrderBookkeeping {
 
     pub(crate) fn effective<'a>(&'a self, legacy: &'a OrderPersistence) -> &'a OrderPersistence {
         match self {
-            Self::Candidate(neural) | Self::Observer(neural) => neural,
+            Self::Candidate(neural) => neural,
             Self::Legacy => legacy,
         }
     }
 
     fn neural_mut(&mut self) -> Option<&mut OrderPersistence> {
         match self {
-            Self::Candidate(neural) | Self::Observer(neural) => Some(neural),
+            Self::Candidate(neural) => Some(neural),
             Self::Legacy => None,
         }
     }
@@ -119,12 +96,6 @@ impl PolicyOrderBookkeeping {
     pub(crate) fn clear_body_for(&mut self, unit: Option<EntityId>) {
         if let Some(neural) = self.neural_mut() {
             neural.clear_body_for(unit);
-        }
-    }
-
-    pub(crate) fn clear_body(&mut self) {
-        if let Some(neural) = self.neural_mut() {
-            neural.clear_body();
         }
     }
 }

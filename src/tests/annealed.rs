@@ -95,42 +95,58 @@ fn resume_rejects_swapped_opponent_weights() {
 }
 
 #[test]
-fn checkpoint_job_modes_reject_cross_resume_without_mutation() {
-    for annealed in [false, true] {
-        let directory = test_directory("cross-mode");
-        let execute = |annealed, resume| {
-            if annealed {
-                return run(settings(0x7b01, 1), &directory, resume).map(|_| ());
-            }
-            let config = crate::cli::training_settings_for_test(&[
-                "--complete-episodes=false",
-                "--environments",
-                "2",
-                "--rollout",
-                "2",
-                "--epochs",
-                "1",
-                "--minibatch",
-                "2",
-                "--map",
-                "2",
-            ])
-            .expect("window settings");
-            crate::run_training_job_on_with_initial_weights(
-                config,
-                PolicyDevice::Cpu,
-                &directory,
-                resume,
-                None,
-                |_| {},
-            )
-            .map(|_| ())
-        };
-        execute(annealed, false).expect("source update");
-        let before = checkpoint_digests(&directory);
-        let error = execute(!annealed, true).expect_err("cross-mode resume");
-        assert!(error.to_string().contains("compatibility scope"), "{error}");
-        assert_eq!(checkpoint_digests(&directory), before);
+fn initial_weights_then_resume_matches_uninterrupted_parameters_optimizer_and_rng() {
+    let weights = test_directory("initial-weights");
+    let uninterrupted = test_directory("initial-uninterrupted");
+    let resumed = test_directory("initial-resumed");
+    let initial = PolicyModel::fresh(23_074).expect("initial model");
+    TrainingArtifact::save_runtime_weights(&initial, &weights).expect("initial weights");
+    let fingerprint = PolicySnapshot::capture(&initial, 0)
+        .expect("snapshot")
+        .fingerprint();
+    let config = settings(23_071, 2);
+    let start = |directory: &std::path::Path, stop_after| {
+        run_annealed_job_harnessed(
+            config.clone(),
+            AnnealedHarness {
+                stop_after,
+                ..harness()
+            },
+            PolicyDevice::Cpu,
+            directory,
+            false,
+            Some(&weights),
+            |_| {},
+        )
+        .expect("fresh run from initial weights")
+    };
+    let reference = start(&uninterrupted, None);
+    assert_eq!(reference.starting_policy_fingerprint, fingerprint);
+    assert_eq!(reference.completed_updates, 2);
+    let first = start(&resumed, Some(1));
+    assert_eq!(first.starting_policy_fingerprint, fingerprint);
+    assert_eq!(first.completed_updates, 1);
+    let before = checkpoint_digests(&resumed);
+    let error = run_annealed_job_harnessed(
+        config.clone(),
+        harness(),
+        PolicyDevice::Cpu,
+        &resumed,
+        true,
+        Some(&weights),
+        |_| {},
+    )
+    .expect_err("resume cannot reload initial weights");
+    assert_eq!(
+        error.to_string(),
+        "invalid PPO config field: resume initial weights"
+    );
+    assert_eq!(checkpoint_digests(&resumed), before);
+    let second = run(config, &resumed, true).expect("resume");
+    assert_eq!(second.completed_updates, 2);
+    assert_trajectory_equal(&uninterrupted, &resumed);
+    assert_artifact_bits(&uninterrupted, &resumed, PolicyDevice::Cpu);
+    for directory in [weights, uninterrupted, resumed] {
         std::fs::remove_dir_all(directory).expect("cleanup");
     }
 }

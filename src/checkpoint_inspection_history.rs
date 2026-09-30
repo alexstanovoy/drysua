@@ -24,8 +24,6 @@ pub(super) fn plan(artifact: &TrainingArtifact) -> Result<HistoryPlan, Checkpoin
     let command = &artifact.run.command_line;
     let kind = match command.split(' ').next() {
         Some("train-annealed") => "train-annealed",
-        Some("train-full") => "train-full",
-        Some("train") => "train",
         _ => "other",
     };
     let mut plan = HistoryPlan {

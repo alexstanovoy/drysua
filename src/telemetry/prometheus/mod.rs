@@ -165,11 +165,6 @@ fn render_registry() -> io::Result<String> {
     )
 }
 
-#[cfg(all(test, feature = "builtin"))]
-pub(crate) fn render_directory_for_test(directory: &Path) -> io::Result<String> {
-    DirectoryReader::new(directory.to_owned()).render()
-}
-
 struct DirectoryReader {
     directory: PathBuf,
     failure: Option<String>,
