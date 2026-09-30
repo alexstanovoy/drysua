@@ -23,6 +23,9 @@ python3 scripts/train.py run temp/my-new-campaign
 python3 scripts/train.py run temp/my-new-campaign --detach
 python3 scripts/train.py pause temp/my-new-campaign
 python3 scripts/train.py resume temp/my-new-campaign --detach
+# Read-only training statistics; never requires a live process:
+python3 scripts/train.py report temp/my-new-campaign
+python3 scripts/train.py report temp/my-new-campaign --block 25 --json
 # Explicitly interrupt only the runner child owned by the active controller:
 python3 scripts/train.py stop temp/my-new-campaign --immediate
 # Offline, explicitly gated reconciliation; never launches training:
@@ -33,6 +36,71 @@ python3 scripts/train.py recover temp/my-new-campaign --confirm-offline
 `run` requires prepared state, `resume` requires paused state. A failed or stale
 campaign requires explicit recovery. No operation retries failed training.
 `adopt` is deliberately unsupported and makes no changes.
+
+## Reading training statistics
+
+`report` is read-only: it validates the campaign with the same `status` rules
+(manifest integrity, frozen files, receipt chain), reads only the **accepted**
+invocations `1..accepted_invocation`, and never signals, locks, or writes. A
+pending invocation is ignored because its payload log may still be written. It
+works for `prepared`, `running`, `paused`, `failed` and `completed` campaigns.
+
+```text
+$ python3 scripts/train.py report temp/my-new-campaign
+campaign 0000000000000000000000000000000 phase=running updates=122/200 games=976 (8 per update)
+overall 484-482-10 win=49.6%
+block 001-010 37-43-0 win=46.2%
+...
+block 121-122 8-6-2 win=50.0%
+last10 36-41-3 win=45.0%
+last20 73-84-3 win=45.6%
+per-update wins: 3,4,4,3,4,5,4,5,4,1,...
+environments total=41 completed=41 current=0 skipped_early=0 clean_truncated=0 avg_spent=4.0 min=4 max=4
+extensions environments=2 awards=2 extra_updates=0
+adaptive generation=41 start_update=164 updates_in_generation=0 success_streak=0 poor_streak=0 extension_awards=0 snapshot_count=41
+timing 42.911s/update (122/122 timed) eta=0h56m
+```
+
+### Environment transitions
+
+`adaptive_environment_transition` records from the accepted payload logs describe
+each completed environment and the running one:
+
+* **completed** counts environments closed by a logged transition, **current** is
+  `1` when updates were played after the last transition start (so a completed
+  campaign can still end inside its last environment), and **total** is their sum.
+* **skipped_early** lists the transitions whose environment played fewer than
+  `limits.base_updates` updates with `clean=false`: the environment was cut short
+  by the success streak, not by the clean tail.
+* **clean_truncated** lists the same shortfall with `clean=true`: the forced clean
+  boundary at `total_updates - zero_updates`.
+* **spent** is `min`/`max`/`mean` of played updates per environment.
+* **extensions.environments** counts environments whose completed awards (or the
+  running generation's `extension_awards`) are positive, **awards_total** sums
+  those award counts, and **extra_updates_total** sums the actually played
+  `max(0, spent - base_updates)`. An award is credit (`extension_units`, 0.75 by
+  default), so awards can be positive while no whole extra update was played.
+* A transition count that disagrees with the checkpoint's
+  `adaptive.state.generation` is an error, never a silent undercount, and a fixed
+  schedule prints `environments n/a (fixed schedule)` with `null` JSON fields.
+
+Games per update comes from the last accepted receipt's `inspection.ppo.environments`,
+falling back to the `--games` value of the recorded run scope. Every accepted
+invocation must contain exactly `updates covered × games per update` `episode:`
+lines; a short or unreadable payload log is a specific error rather than silent
+zeros. Blocks default to 10 updates (`--block N`, only the last block may be
+shorter), `last10`/`last20` appear once that many updates exist, and timing is the
+mean owned-container wall time from `result.json` with an ETA for the remaining
+updates (`n/a` when no invocation has usable timestamps).
+
+`--json` prints one machine-readable object with schema
+`drysua-training-report/v1`: `campaign_id`, `phase`, `accepted_updates`,
+`total_updates`, `remaining_updates`, `accepted_invocations`, `games_per_update`,
+`games`, `overall`, `blocks`, `recent`, `per_update`, `adaptive`,
+`environments`, `extensions`, `timing`. `environments` carries
+`total`, `completed`, `current`, `skipped_early`, `clean_truncated` and
+`spent: {min, max, mean}`; `extensions` carries `environments`, `awards_total`
+and `extra_updates_total`. Both are `null` for a fixed schedule.
 
 Detached startup returns `phase: started` only after preflight, exclusive campaign
 ownership, and a durable running status. This is **not** a completion receipt; use

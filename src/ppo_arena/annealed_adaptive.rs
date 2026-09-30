@@ -72,6 +72,11 @@ pub(super) fn append_scope(
     if let EnvironmentSchedule::Adaptive(config) = settings.environment_schedule {
         config.append_scope(command);
     }
+    // The scale ramp is recorded after the adaptive suffix for both schedules,
+    // in a fixed order, and only when it differs from the historical default.
+    if settings.scale != crate::randomization::AnnealScale::FULL {
+        command.push_str(&settings.scale.scope_suffix());
+    }
 }
 
 pub(super) fn preflight_resume(
@@ -96,6 +101,7 @@ pub(super) fn preflight_resume(
                 settings.seed,
                 settings.games_per_update as u64,
                 &actual,
+                settings.scale,
             )
         }
         _ => Err(PpoError::InvalidConfig(
@@ -116,6 +122,7 @@ pub(super) fn verified_generation_count(
             settings.seed,
             settings.games_per_update as u64,
             &checkpoint,
+            settings.scale,
         )?;
         Ok(checkpoint.snapshot_count)
     } else {
@@ -140,11 +147,14 @@ impl GenerationCache {
             .as_ref()
             .is_none_or(|draw| draw.generation != checkpoint.state.generation)
         {
+            // The adaptive draw ramps with the configured environment scale.
+            let scale = self.schedule.scale;
             self.last = Some(crate::adaptive_randomization::draw_adaptive_generation(
                 &self.directory,
                 self.seed,
                 self.games_per_update,
                 checkpoint,
+                scale,
             )?);
         }
         let draw = self.last.expect("adaptive draw materialized");

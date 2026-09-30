@@ -59,6 +59,7 @@ fn cached_generation_metrics_turn_off_at_the_zero_window_boundary() {
     let schedule = AnnealSchedule {
         updates: 4,
         zero_updates: 1,
+        scale: crate::randomization::AnnealScale::FULL,
     };
     let draw = draw_generation(3, 1, 4, 2, schedule).expect("truncated draw");
     assert!(draw.scale_bp > 0);
@@ -147,6 +148,7 @@ fn settings(seed: u64, updates: u64) -> AnnealedJobConfig {
         parallel_worlds: 2,
         games_per_generation: 2,
         zero_updates: 0,
+        scale: crate::randomization::AnnealScale::FULL,
         seed,
         opponent: AnnealedOpponent::Teacher,
         ppo: PpoConfig {
@@ -243,4 +245,69 @@ fn assert_trajectory_equal(source: &std::path::Path, target: &std::path::Path) {
     // These bytes include model, Adam, actor/shuffle RNG, progress, scope and runtime weights.
     assert_eq!(checkpoint_digests(source), checkpoint_digests(target));
     assert_eq!(generation_files(source), generation_files(target));
+}
+
+#[test]
+fn the_scope_records_a_non_default_environment_scale_in_a_fixed_order() {
+    let options = settings(9001, 2);
+    let scope = |options: &AnnealedJobConfig| {
+        annealed_run(options, PolicyDevice::Cpu, options.ppo, harness(), None)
+            .expect("scope")
+            .command_line
+    };
+    let plain = scope(&options);
+    assert!(!plain.contains("--environment-scale"), "{plain}");
+    let ramp = crate::randomization::AnnealScale {
+        start_bp: 0,
+        end_bp: 20_000,
+    };
+    let mut scaled = options.clone();
+    scaled.scale = ramp;
+    assert_eq!(
+        scope(&scaled),
+        format!("{plain} --environment-scale-start 0 --environment-scale-end 2")
+    );
+    // The adaptive suffix keeps its own order and the scale comes after it.
+    let mut adaptive = options.clone();
+    adaptive.environment_schedule = crate::EnvironmentSchedule::Adaptive(Default::default());
+    adaptive.scale = ramp;
+    let text = scope(&adaptive);
+    assert!(
+        text.ends_with(
+            "--environment-extension 0.75 --environment-scale-start 0 --environment-scale-end 2"
+        ),
+        "{text}"
+    );
+    // A fixed schedule with equal endpoints keeps one constant scale all run.
+    let mut fixed = options.clone();
+    fixed.scale = crate::randomization::AnnealScale {
+        start_bp: 5_000,
+        end_bp: 5_000,
+    };
+    assert!(scope(&fixed).ends_with("--environment-scale-start 0.5 --environment-scale-end 0.5"));
+}
+
+#[test]
+fn resume_rejects_a_changed_environment_scale_without_committing() {
+    let directory = test_directory("annealed-scale-scope");
+    let options = settings(9001, 2);
+    let run_result = run(options.clone(), &directory, false).expect("fresh run");
+    assert_eq!(run_result.completed_updates, 2);
+    let before = checkpoint_digests(&directory);
+    let mut changed = options.clone();
+    changed.scale = crate::randomization::AnnealScale {
+        start_bp: 5_000,
+        end_bp: 5_000,
+    };
+    let error = run(changed, &directory, true).expect_err("changed scale");
+    let text = error.to_string();
+    assert!(text.contains("--environment-scale-start"), "{text}");
+    assert_eq!(checkpoint_digests(&directory), before);
+    assert_eq!(
+        run(options, &directory, true)
+            .expect("recorded scale resumes")
+            .completed_updates,
+        2
+    );
+    std::fs::remove_dir_all(directory).expect("remove own checkpoint");
 }

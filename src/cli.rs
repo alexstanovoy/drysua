@@ -292,6 +292,12 @@ struct TrainAnnealedArgs {
     /// Weights-opponent sampling mode; batched changes numerics and checkpoint scope. Ignored for Teacher.
     #[arg(long, value_enum, default_value_t = OpponentInferenceArg::Batched)]
     opponent_inference: OpponentInferenceArg,
+    /// Environment scale at the first update in exact decimals; 1 is full variance, at most 10.
+    #[arg(long)]
+    environment_scale_start: Option<crate::EnvironmentDecimal>,
+    /// Environment scale at the clean tail boundary; 0 is no modifiers, at most 10.
+    #[arg(long)]
+    environment_scale_end: Option<crate::EnvironmentDecimal>,
     /// Run seed; a fresh run without it draws a random seed, and resume adopts the recorded one.
     #[arg(long)]
     seed: Option<u64>,
@@ -823,6 +829,7 @@ impl TrainAnnealedArgs {
             ));
         }
         let opponent = self.frozen_opponent()?;
+        let scale = self.environment_scale()?;
         let zero_updates = self
             .zero_updates
             .unwrap_or_else(|| self.updates.div_ceil(5));
@@ -851,6 +858,7 @@ impl TrainAnnealedArgs {
             games_per_generation: self.generation_games,
             zero_updates,
             seed: self.resolved_seed()?,
+            scale,
             opponent,
             ppo,
             checkpoint_cadence: self.checkpoint.cadence(),
@@ -881,6 +889,28 @@ impl TrainAnnealedArgs {
             return random_run_seed();
         };
         Ok(seed)
+    }
+
+    /// The environment scale ramp in basis points.
+    ///
+    /// The command line keeps six fractional digits; the loop works in basis
+    /// points, so each endpoint truncates to a hundredth of full variance.
+    fn environment_scale(&self) -> std::io::Result<crate::randomization::AnnealScale> {
+        let start_bp = scale_bp(
+            "--environment-scale-start",
+            self.environment_scale_start,
+            crate::randomization::AnnealScale::FULL.start_bp,
+        )?;
+        let end_bp = scale_bp(
+            "--environment-scale-end",
+            self.environment_scale_end,
+            crate::randomization::AnnealScale::FULL.end_bp,
+        )?;
+        crate::randomization::AnnealScale { start_bp, end_bp }
+            .validate()
+            .map_err(|error| {
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string())
+            })
     }
 
     fn frozen_opponent(&self) -> std::io::Result<crate::AnnealedOpponent> {
@@ -935,6 +965,26 @@ fn random_run_seed() -> std::io::Result<u64> {
         mixed = (mixed ^ (mixed >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
         Ok(mixed ^ (mixed >> 31))
     }
+}
+
+/// One scale endpoint in basis points, bounded to ten times full variance.
+#[cfg(feature = "builtin")]
+fn scale_bp(
+    name: &str,
+    value: Option<crate::EnvironmentDecimal>,
+    default_bp: i32,
+) -> std::io::Result<i32> {
+    let Some(value) = value else {
+        return Ok(default_bp);
+    };
+    let units = value.units();
+    if units > 10 * crate::EnvironmentDecimal::SCALE {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{name} must be within 0 and 10"),
+        ));
+    }
+    Ok((units / 100) as i32)
 }
 
 #[cfg(all(test, feature = "builtin"))]

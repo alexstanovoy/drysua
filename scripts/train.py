@@ -2,6 +2,7 @@
 """Tracked, bounded training through a frozen runner and native inspector."""
 import argparse
 from dataclasses import asdict
+from datetime import datetime
 import hashlib
 import json
 import math
@@ -27,6 +28,9 @@ MAX_TOTAL = 1024 * 1024 * 1024
 MAX_CAMPAIGN_BYTES = 100 * MAX_TOTAL
 MAX_JOB_ENTRIES = MAX_CHECKPOINT_FILES + 128
 MAX_CAMPAIGN_ENTRIES = 2560256
+MAX_PAYLOAD = 16 * 1024 * 1024
+MAX_REPORT_BLOCK = 10000
+REPORT_SCHEMA = "drysua-training-report/v1"
 PERSISTENCE_RESERVE_BYTES = 16 * 1024 * 1024
 JOB_DISK_RESERVE_BYTES = 2 * MAX_TOTAL + 64 * 1024 * 1024
 INSPECTION_SCHEMA = "drysua-checkpoint-inspection/v1"
@@ -44,6 +48,7 @@ ARGUMENTS = frozenset({
     "--environment-poor-updates", "--environment-poor-rate", "--environment-extension",
     "--zero-updates", "--learning-rate", "--epochs", "--minibatch", "--gae-lambda",
     "--entropy-coefficient", "--opponent-inference",
+    "--environment-scale-start", "--environment-scale-end",
 })
 
 
@@ -777,6 +782,181 @@ def accept_job(directory, current, job, expected, deadline=None):
     atomic_status(directory, current)
 
 
+def invocation_wall(job):
+    """Seconds from owned-container start to stop, or None without usable timing."""
+    container = read_json(job / "result.json").get("container_state")
+    if not isinstance(container, dict):
+        return None
+    started, finished = container.get("StartedAt"), container.get("FinishedAt")
+    if not isinstance(started, str) or not isinstance(finished, str):
+        return None
+    try:
+        seconds = (datetime.fromisoformat(finished) - datetime.fromisoformat(started)).total_seconds()
+    except ValueError:
+        return None
+    return seconds if 0 < seconds < 86400 else None
+
+
+def receipt_invocation_updates(receipt):
+    """Updates covered by one accepted invocation, bounded by the frozen budget."""
+    covered = receipt["expected_updates"] - receipt["start_updates"]
+    return bounded_integer(covered, "invocation updates", 1, 10000)
+
+
+def last_accepted_inspection(directory, count):
+    """Inspection of the last accepted invocation, or None without receipts."""
+    if not count:
+        return None
+    return read_json(job_path(directory, count) / "accepted.json")["inspection"]
+
+
+def report_invocations(directory, count, games):
+    """Ordered outcomes, walls and environment transitions of accepted invocations.
+
+    A pending invocation is never read: its payload log may still be written.
+    """
+    outcomes, walls, transitions = [], [], []
+    for number in range(1, count + 1):
+        job = job_path(directory, number)
+        receipt = read_json(job / "accepted.json")
+        payload = job / "payload.log"
+        if payload.is_symlink() or not payload.is_file():
+            raise ValueError(f"invocation {number:06d} has no bounded payload log")
+        bytes_value = read_bytes(payload, MAX_PAYLOAD)
+        expected = receipt_invocation_updates(receipt) * games
+        outcomes.append(state.episode_outcomes(bytes_value, expected))
+        transitions.extend(state.environment_transitions(bytes_value))
+        walls.append(invocation_wall(job))
+    return outcomes, walls, transitions
+
+
+def environment_totals(adaptive, transitions, accepted_updates):
+    """Environment and extension totals, or `(None, None)` for a fixed schedule."""
+    if adaptive is None:
+        return None, None
+    limits, summary = adaptive.get("limits"), adaptive.get("state")
+    if not isinstance(limits, dict) or not isinstance(summary, dict):
+        raise ValueError("adaptive report requires the accepted limits and state objects")
+    totals = state.environment_summary(transitions, summary.get("generation"), accepted_updates,
+                                       limits.get("base_updates"), summary.get("extension_awards"))
+    return totals["environments"], totals["extensions"]
+
+
+def report(campaign_path, block=10):
+    """Read-only accepted-progress statistics for one campaign."""
+    directory = private_path(campaign_path)
+    current = status(directory)
+    manifest = decode_json(read_bytes(directory / "manifest.json", MAX_JSON))
+    total_updates = bounded_integer(manifest["config"]["total_updates"], "total updates", 1, 10000)
+    block = bounded_integer(block, "report block", 1, MAX_REPORT_BLOCK)
+    count = bounded_integer(current["accepted_invocation"], "accepted invocation", 0, 10000)
+    last = last_accepted_inspection(directory, count)
+    games = state.games_per_update(last) if last else None
+    invocation_outcomes, walls, transitions = report_invocations(directory, count, games)
+    updates = state.update_records(invocation_outcomes, games) if games else []
+    seconds = state.mean_seconds(walls)
+    remaining = total_updates - current["accepted_updates"]
+    adaptive = last.get("adaptive") if last else None
+    environments, extensions = environment_totals(adaptive, transitions, current["accepted_updates"])
+    return {
+        "schema": REPORT_SCHEMA,
+        "campaign_id": current["campaign_id"],
+        "phase": current["phase"],
+        "accepted_updates": current["accepted_updates"],
+        "total_updates": total_updates,
+        "remaining_updates": remaining,
+        "accepted_invocations": count,
+        "games_per_update": games,
+        "games": sum(record["games"] for record in updates),
+        "overall": state.add_wins(updates),
+        "blocks": state.block_records(updates, block),
+        "recent": {"last10": state.recent_record(updates, 10),
+                   "last20": state.recent_record(updates, 20)},
+        "per_update": [{"update": record["update"], "wins": record["wins"],
+                        "losses": record["losses"], "draws": record["draws"]} for record in updates],
+        "adaptive": adaptive,
+        "environments": environments,
+        "extensions": extensions,
+        "timing": {"timed_invocations": sum(1 for wall in walls if wall is not None),
+                   "seconds_per_update": seconds,
+                   "eta_seconds": round(remaining * seconds) if seconds is not None else None},
+    }
+
+
+def record_text(record):
+    """One win-loss-draw record with its win rate on a single line."""
+    rate = record["win_rate"]
+    percent = "n/a" if rate is None else f"{rate:.1%}"
+    return f"{record['wins']}-{record['losses']}-{record['draws']} win={percent}"
+
+
+def count_text(value):
+    """Integer count, or `n/a` when the report has no such value."""
+    return "n/a" if value is None else str(value)
+
+
+def duration_text(seconds):
+    """Hours and minutes for one bounded duration, or `n/a`."""
+    if seconds is None:
+        return "n/a"
+    minutes = round(seconds / 60)
+    return f"{minutes // 60}h{minutes % 60:02d}m"
+
+
+def format_report(value):
+    """Human-readable rendering of one bounded report value."""
+    games = value["games_per_update"]
+    lines = [f"campaign {value['campaign_id']} phase={value['phase']} "
+             f"updates={value['accepted_updates']}/{value['total_updates']} "
+             f"games={value['games']} ({games if games else 'n/a'} per update)"]
+    lines.append(f"overall {record_text(value['overall'])}")
+    for block in value["blocks"]:
+        last = block["first_update"] + block["updates"] - 1
+        lines.append(f"block {block['first_update']:03d}-{last:03d} {record_text(block)}")
+    for name in ("last10", "last20"):
+        if value["recent"][name] is not None:
+            lines.append(f"{name} {record_text(value['recent'][name])}")
+    if value["per_update"]:
+        lines.append("per-update wins: " + ",".join(str(entry["wins"]) for entry in value["per_update"]))
+    environments, extensions = value["environments"], value["extensions"]
+    if environments is None:
+        lines.append("environments n/a (fixed schedule)")
+    else:
+        spent = environments["spent"]
+        lines.append(f"environments total={environments['total']} completed={environments['completed']} "
+                     f"current={environments['current']} "
+                     f"skipped_early={len(environments['skipped_early'])} "
+                     f"clean_truncated={len(environments['clean_truncated'])} "
+                     f"avg_spent={count_text(spent['mean'])} "
+                     f"min={count_text(spent['min'])} max={count_text(spent['max'])}")
+        for name in ("skipped_early", "clean_truncated"):
+            if environments[name]:
+                lines.append(f"{name.replace('_', ' ')} at updates="
+                             + ",".join(str(update) for update in environments[name]))
+        lines.append(f"extensions environments={extensions['environments']} "
+                     f"awards={extensions['awards_total']} "
+                     f"extra_updates={extensions['extra_updates_total']}")
+    adaptive = value["adaptive"]
+    if isinstance(adaptive, dict):
+        state_value = adaptive.get("state")
+        fields = ("generation", "start_update", "updates_in_generation",
+                  "success_streak", "poor_streak", "extension_awards")
+        parts = [f"{name}={state_value[name]}" for name in fields
+                 if isinstance(state_value, dict) and name in state_value]
+        if "snapshot_count" in adaptive:
+            parts.append(f"snapshot_count={adaptive['snapshot_count']}")
+        if parts:
+            lines.append("adaptive " + " ".join(parts))
+    timing = value["timing"]
+    if timing["seconds_per_update"] is None:
+        lines.append("timing n/a")
+    else:
+        lines.append(f"timing {timing['seconds_per_update']}s/update "
+                     f"({timing['timed_invocations']}/{value['accepted_invocations']} timed) "
+                     f"eta={duration_text(timing['eta_seconds'])}")
+    return "\n".join(lines)
+
+
 def owner_record(directory):
     path = private_path(directory / "owner.json")
     if not path.exists():
@@ -974,6 +1154,10 @@ def main(arguments=None):
         command = commands.add_parser(name, help="freeze a new, never-run campaign")
         command.add_argument("--config", required=True, type=Path)
         command.add_argument("campaign", type=Path)
+    report_command = commands.add_parser("report", help="read-only accepted-progress statistics")
+    report_command.add_argument("campaign", type=Path)
+    report_command.add_argument("--block", type=int, default=10)
+    report_command.add_argument("--json", action="store_true", dest="as_json")
     for name in ("status", "run", "pause", "resume", "recover", "adopt", "stop"):
         command = commands.add_parser(name)
         command.add_argument("campaign", type=Path)
@@ -989,6 +1173,10 @@ def main(arguments=None):
         result = create(options.config, options.campaign)
     elif options.operation == "status":
         result = status(options.campaign)
+    elif options.operation == "report":
+        value = report(options.campaign, block=options.block)
+        print(json.dumps(value, sort_keys=True) if options.as_json else format_report(value))
+        return 0
     elif options.operation in {"run", "resume"}:
         if options.detach and options.ready_fd is not None:
             raise ValueError("detach cannot override handshake descriptor")

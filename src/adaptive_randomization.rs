@@ -30,6 +30,7 @@ pub(crate) fn verify_adaptive_snapshots(
     seed: u64,
     games_per_update: u64,
     checkpoint: &AdaptiveEnvironmentCheckpoint,
+    scale: crate::randomization::AnnealScale,
 ) -> Result<(), PpoError> {
     validate_checkpoint(checkpoint, games_per_update)?;
     if !validate_directory(directory)? && checkpoint.snapshot_count != 0 {
@@ -52,7 +53,7 @@ pub(crate) fn verify_adaptive_snapshots(
             generation,
             start_update,
             games_per_update,
-            schedule(checkpoint),
+            schedule(checkpoint, scale),
         )?;
         compare_snapshot(&stored, &adaptive_generation_json(&draw))?;
         hash = append_hash(hash, stored.as_bytes());
@@ -88,6 +89,7 @@ pub(crate) fn draw_adaptive_generation(
     seed: u64,
     games_per_update: u64,
     checkpoint: &mut AdaptiveEnvironmentCheckpoint,
+    scale: crate::randomization::AnnealScale,
 ) -> Result<GenerationDraw, PpoError> {
     validate_checkpoint(checkpoint, games_per_update)?;
     let directory_exists = validate_directory(directory)?;
@@ -101,7 +103,7 @@ pub(crate) fn draw_adaptive_generation(
         checkpoint.state.generation,
         checkpoint.state.start_update,
         games_per_update,
-        schedule(checkpoint),
+        schedule(checkpoint, scale),
     )?;
     let path = generation_path(directory, draw.generation);
     let canonical = adaptive_generation_json(&draw);
@@ -164,10 +166,14 @@ fn validate_checkpoint(
     Ok(())
 }
 
-fn schedule(checkpoint: &AdaptiveEnvironmentCheckpoint) -> AnnealSchedule {
+fn schedule(
+    checkpoint: &AdaptiveEnvironmentCheckpoint,
+    scale: crate::randomization::AnnealScale,
+) -> AnnealSchedule {
     AnnealSchedule {
         updates: checkpoint.limits.total_updates,
         zero_updates: checkpoint.limits.zero_updates,
+        scale,
     }
 }
 

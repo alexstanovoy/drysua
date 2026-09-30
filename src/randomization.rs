@@ -210,6 +210,8 @@ pub struct AnnealSchedule {
     pub updates: u64,
     /// Final updates played with no modifiers.
     pub zero_updates: u64,
+    /// Scale ramp endpoints; [`AnnealScale::FULL`] is the historical ramp.
+    pub scale: AnnealScale,
 }
 
 impl AnnealSchedule {
@@ -219,6 +221,8 @@ impl AnnealSchedule {
     }
 
     /// The scale at one update, in basis points of full variance.
+    ///
+    /// The clean tail is always zero, whatever the ramp endpoints are.
     pub fn scale_bp(&self, update: u64) -> i32 {
         let span = self.zero_from_update();
         if span == 0 || update >= span {
@@ -227,7 +231,107 @@ impl AnnealSchedule {
         let numerator = u128::from(update) * (NOMINAL_BP as u128) * (NOMINAL_BP as u128);
         let root = isqrt_u128(numerator / u128::from(span));
         let root = i32::try_from(root).unwrap_or(NOMINAL_BP);
-        (NOMINAL_BP - root).max(0)
+        self.scale.apply(root)
+    }
+}
+
+/// One environment scale ramp, in basis points of full variance.
+///
+/// `NOMINAL_BP` is one hundred percent; the command line admits up to ten times
+/// that. Only the ramp endpoints are configurable: the eleven randomized
+/// variable ranges and their clamps are model constants, so a larger scale
+/// widens the sampling sigmas while every sampled delta still clamps to its
+/// variable's bounds. The default ramp, [`AnnealScale::FULL`], is
+/// bit-for-bit the historical `NOMINAL_BP - root`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AnnealScale {
+    /// Scale at the first update of the ramp, in basis points.
+    pub start_bp: i32,
+    /// Scale at the clean tail boundary, in basis points.
+    pub end_bp: i32,
+}
+
+impl AnnealScale {
+    /// Full variance at the start, zero across the clean tail.
+    pub const FULL: Self = Self {
+        start_bp: NOMINAL_BP,
+        end_bp: 0,
+    };
+    /// Ten times full variance is the largest admitted scale.
+    pub const MAX_BP: i32 = 10 * NOMINAL_BP;
+
+    /// Rejects a scale outside zero to ten times full variance.
+    pub fn validate(self) -> Result<Self, PpoError> {
+        if !(0..=Self::MAX_BP).contains(&self.start_bp)
+            || !(0..=Self::MAX_BP).contains(&self.end_bp)
+        {
+            return Err(PpoError::InvalidConfig(
+                "environment scale must be within zero and ten times full variance",
+            ));
+        }
+        Ok(self)
+    }
+
+    /// Interpolates the ramp for one normalized root in `0..=NOMINAL_BP`.
+    ///
+    /// Integer arithmetic only, so the value is identical on every platform.
+    pub const fn apply(self, root: i32) -> i32 {
+        let numerator = self.start_bp as i64 * (NOMINAL_BP as i64 - root as i64)
+            + self.end_bp as i64 * root as i64;
+        (numerator / NOMINAL_BP as i64) as i32
+    }
+
+    /// Canonical scope tokens, in a fixed order.
+    pub fn scope_suffix(self) -> String {
+        format!(
+            " --environment-scale-start {} --environment-scale-end {}",
+            decimal_text(self.start_bp),
+            decimal_text(self.end_bp)
+        )
+    }
+}
+
+/// One endpoint as the exact plain decimal the command line records.
+fn decimal_text(bp: i32) -> crate::EnvironmentDecimal {
+    crate::EnvironmentDecimal::from_units(bp as u64 * 100)
+}
+
+/// One canonical scale endpoint in basis points.
+fn canonical_bp(value: &str) -> Option<i32> {
+    let units = value.parse::<crate::EnvironmentDecimal>().ok()?.units();
+    if !units.is_multiple_of(100) || units > (AnnealScale::MAX_BP as u64) * 100 {
+        return None;
+    }
+    i32::try_from(units / 100).ok()
+}
+
+/// Splits one optional canonical trailing scale suffix from a command line.
+///
+/// Only the exact canonical rendering is split, so a partial or malformed
+/// `--environment-scale-*` token stays in the returned prefix where the scope
+/// validator rejects it instead of accepting it silently.
+pub(crate) fn split_scale_scope(command: &str) -> (&str, AnnealScale) {
+    let tokens: Vec<&str> = command.split(' ').collect();
+    if tokens.len() < 4
+        || tokens[tokens.len() - 4] != "--environment-scale-start"
+        || tokens[tokens.len() - 2] != "--environment-scale-end"
+    {
+        return (command, AnnealScale::FULL);
+    }
+    let (Some(start_bp), Some(end_bp)) = (
+        canonical_bp(tokens[tokens.len() - 3]),
+        canonical_bp(tokens[tokens.len() - 1]),
+    ) else {
+        return (command, AnnealScale::FULL);
+    };
+    let scale = AnnealScale { start_bp, end_bp };
+    if scale == AnnealScale::FULL {
+        // The default ramp is never recorded, so default tokens are not canonical.
+        return (command, AnnealScale::FULL);
+    }
+    match command.strip_suffix(&scale.scope_suffix()) {
+        Some(prefix) => (prefix, scale),
+        None => (command, AnnealScale::FULL),
     }
 }
 
@@ -350,7 +454,7 @@ fn draw_modifiers(
     generation: u64,
     scale_bp: i32,
 ) -> Result<([i32; VARIABLES.len()], ModifierSpec), PpoError> {
-    assert!((0..=NOMINAL_BP).contains(&scale_bp));
+    assert!((0..=AnnealScale::MAX_BP).contains(&scale_bp));
     let mut deltas = [0i32; VARIABLES.len()];
     let mut spec = ModifierSpec::NOMINAL;
     if scale_bp > 0 {

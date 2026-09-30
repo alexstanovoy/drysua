@@ -23,6 +23,7 @@ fn schedule(updates: u64, zero_updates: u64) -> AnnealSchedule {
     AnnealSchedule {
         updates,
         zero_updates,
+        scale: AnnealScale::FULL,
     }
 }
 
@@ -292,6 +293,224 @@ fn resume_verification_covers_every_started_generation() {
     );
     let error =
         verify_generation_snapshots(&directory, 22, 4, 8, schedule, 8).expect_err("different seed");
+    assert_eq!(
+        error.to_string(),
+        "invalid PPO config field: domain randomization snapshot mismatch"
+    );
+    std::fs::remove_dir_all(directory).expect("remove directory");
+}
+
+/// Independent integer square root: brute force, deliberately not the kernel's.
+fn reference_root(value: u128) -> u128 {
+    let mut root = 0u128;
+    while (root + 1) * (root + 1) <= value {
+        root += 1;
+    }
+    root
+}
+
+/// Independent reference for the whole scale ramp, in basis points.
+fn reference_scale_bp(scale: AnnealScale, updates: u64, zero_updates: u64, update: u64) -> i32 {
+    let span = updates - zero_updates;
+    if span == 0 || update >= span {
+        return 0;
+    }
+    let root = reference_root(u128::from(update) * 100_000_000 / u128::from(span));
+    ((i64::from(scale.start_bp) * (10_000 - root as i64) + i64::from(scale.end_bp) * root as i64)
+        / 10_000) as i32
+}
+
+#[test]
+fn the_default_scale_ramp_matches_an_independent_reference_at_every_update() {
+    for (updates, zero_updates) in [(64, 0), (100, 20), (200, 40), (9, 3), (40, 40), (2, 0)] {
+        let schedule = schedule(updates, zero_updates);
+        for update in 0..=updates {
+            assert_eq!(
+                schedule.scale_bp(update),
+                reference_scale_bp(AnnealScale::FULL, updates, zero_updates, update),
+                "updates={updates} zero={zero_updates} update={update}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_custom_scale_ramp_interpolates_its_endpoints_exactly() {
+    // A ten thousand update ramp keeps the integer root exact at these points.
+    let rising = AnnealSchedule {
+        updates: 10_000,
+        zero_updates: 0,
+        scale: AnnealScale {
+            start_bp: 0,
+            end_bp: 20_000,
+        },
+    };
+    assert_eq!(rising.scale_bp(0), 0);
+    assert_eq!(rising.scale_bp(2_500), 10_000);
+    assert_eq!(rising.scale_bp(9_999), 19_998);
+    assert_eq!(rising.scale_bp(10_000), 0);
+    assert!(rising.scale_bp(2_500) > rising.scale_bp(1_000));
+    let falling = AnnealSchedule {
+        updates: 10_000,
+        zero_updates: 0,
+        scale: AnnealScale {
+            start_bp: 10_000,
+            end_bp: 0,
+        },
+    };
+    assert_eq!(falling.scale_bp(0), 10_000);
+    assert_eq!(falling.scale_bp(2_500), 5_000);
+    assert_eq!(falling.scale_bp(9_999), 1);
+    let fixed = AnnealSchedule {
+        updates: 10_000,
+        zero_updates: 0,
+        scale: AnnealScale {
+            start_bp: 5_000,
+            end_bp: 5_000,
+        },
+    };
+    for update in [0, 1, 2_500, 9_999] {
+        assert_eq!(
+            fixed.scale_bp(update),
+            5_000,
+            "fixed half scale at {update}"
+        );
+    }
+}
+
+#[test]
+fn a_custom_scale_still_honours_the_clean_tail() {
+    let schedule = AnnealSchedule {
+        updates: 100,
+        zero_updates: 20,
+        scale: AnnealScale {
+            start_bp: 0,
+            end_bp: 20_000,
+        },
+    };
+    assert!(schedule.scale_bp(79) > 0);
+    assert_eq!(schedule.scale_bp(80), 0);
+    assert_eq!(schedule.scale_bp(99), 0);
+    let all_zero = AnnealSchedule {
+        updates: 8,
+        zero_updates: 8,
+        scale: AnnealScale {
+            start_bp: 10_000,
+            end_bp: 20_000,
+        },
+    };
+    for update in 0..=8 {
+        assert_eq!(all_zero.scale_bp(update), 0);
+    }
+}
+
+#[test]
+fn scale_endpoints_are_bounded_to_ten_times_full_variance() {
+    for scale in [
+        AnnealScale {
+            start_bp: 0,
+            end_bp: 0,
+        },
+        AnnealScale::FULL,
+        AnnealScale {
+            start_bp: AnnealScale::MAX_BP,
+            end_bp: AnnealScale::MAX_BP,
+        },
+    ] {
+        assert_eq!(scale.validate().expect("valid scale"), scale);
+    }
+    for scale in [
+        AnnealScale {
+            start_bp: -1,
+            end_bp: 0,
+        },
+        AnnealScale {
+            start_bp: 0,
+            end_bp: AnnealScale::MAX_BP + 1,
+        },
+        AnnealScale {
+            start_bp: 1_000_000,
+            end_bp: 0,
+        },
+    ] {
+        assert!(scale.validate().is_err(), "{scale:?} must be rejected");
+    }
+}
+
+#[test]
+fn the_scale_scope_suffix_is_canonical_and_only_non_default_is_split() {
+    assert_eq!(
+        AnnealScale::FULL.scope_suffix(),
+        " --environment-scale-start 1 --environment-scale-end 0"
+    );
+    assert_eq!(
+        AnnealScale {
+            start_bp: 0,
+            end_bp: 20_000,
+        }
+        .scope_suffix(),
+        " --environment-scale-start 0 --environment-scale-end 2"
+    );
+    assert_eq!(
+        AnnealScale {
+            start_bp: 5_000,
+            end_bp: 5_000,
+        }
+        .scope_suffix(),
+        " --environment-scale-start 0.5 --environment-scale-end 0.5"
+    );
+    let ramp = AnnealScale {
+        start_bp: 0,
+        end_bp: 20_000,
+    };
+    let command = format!("train-annealed --updates 8{}", ramp.scope_suffix());
+    assert_eq!(
+        split_scale_scope(&command),
+        ("train-annealed --updates 8", ramp)
+    );
+    assert_eq!(
+        split_scale_scope("train-annealed --updates 8"),
+        ("train-annealed --updates 8", AnnealScale::FULL)
+    );
+    // The default ramp is never recorded, so its tokens are not canonical.
+    assert_eq!(
+        split_scale_scope("train-annealed --environment-scale-start 1 --environment-scale-end 0"),
+        (
+            "train-annealed --environment-scale-start 1 --environment-scale-end 0",
+            AnnealScale::FULL
+        )
+    );
+    // A partial pair or a sub-basis-point value stays for the validator to reject.
+    for text in [
+        "train-annealed --environment-scale-start 0",
+        "train-annealed --environment-scale-end 2",
+        "train-annealed --environment-scale-start 0.00005 --environment-scale-end 0",
+        "train-annealed --environment-scale-start 0 --environment-scale-end 2 --environment-unknown",
+    ] {
+        assert_eq!(split_scale_scope(text), (text, AnnealScale::FULL), "{text}");
+    }
+}
+
+#[test]
+fn a_snapshot_chain_is_verified_only_under_its_own_scale() {
+    let directory = test_directory("scale-snapshots");
+    let schedule = schedule(20, 4);
+    let draw = draw_generation(7, 0, 4, 8, schedule).expect("draw");
+    write_generation_snapshot(&directory, &draw).expect("write");
+    assert_eq!(
+        verify_generation_snapshots(&directory, 7, 4, 8, schedule, 4).expect("own scale"),
+        1
+    );
+    let rescaled = AnnealSchedule {
+        updates: 20,
+        zero_updates: 4,
+        scale: AnnealScale {
+            start_bp: 0,
+            end_bp: 20_000,
+        },
+    };
+    let error = verify_generation_snapshots(&directory, 7, 4, 8, rescaled, 4)
+        .expect_err("a changed scale must reject the chain");
     assert_eq!(
         error.to_string(),
         "invalid PPO config field: domain randomization snapshot mismatch"

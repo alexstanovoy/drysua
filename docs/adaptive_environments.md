@@ -103,6 +103,45 @@ controller forces a fresh clean environment even when extension credit remains.
 The clean tail therefore cannot be delayed by poor results. The final update does
 not create an unused next environment. These controls never change reward shaping.
 
+## Environment scale ramp
+
+`train-annealed` controls how far the domain randomization spreads over the run
+with two exact decimals:
+
+```sh
+# Default: full variance at the first update, zero across the clean tail.
+drysua train-annealed --updates 200 --generation-games 32 ...
+# Rise from a clean start to twice full variance.
+drysua train-annealed --updates 200 --generation-games 32 \
+  --environment-scale-start 0 --environment-scale-end 2 ...
+# Hold one constant scale for the whole run (equal endpoints).
+drysua train-annealed --updates 200 --generation-games 32 \
+  --environment-scale-start 0.5 --environment-scale-end 0.5 ...
+```
+
+* `--environment-scale-start` defaults to `1` and `--environment-scale-end` to
+  `0`; both accept `0..=10` (ten times full variance) written as plain unsigned
+  decimals with at most six fractional digits. The loop works in basis points, so
+  an endpoint truncates to a hundredth of full variance.
+* The ramp is `scale_bp = (start * (10000 - root) + end * root) / 10000` with
+  integer floor division and `root = isqrt(update * 10^8 / (updates - zero_updates))`.
+  The default endpoints reproduce the historical `10000 - root` bit for bit.
+* The clean tail (`updates - zero_updates .. updates`) is always zero whatever the
+  endpoints are, and a zero window covering every update stays all zero.
+* Only the ramp endpoints are configurable. The eleven randomized variable ranges
+  and their clamps in `VARIABLES` are model constants: a scale above one widens
+  the sampling sigmas, and every sampled delta still clamps to its variable's
+  lower and upper bound, so the saturation is the variable range, not the scale.
+* A non-default ramp is recorded in the run scope as
+  `--environment-scale-start <decimal> --environment-scale-end <decimal>`, in that
+  fixed order after the adaptive environment suffix. The default ramp records
+  nothing, so existing checkpoints and their scope bytes are unchanged, and a
+  resume compares the recorded ramp byte for byte. Generation snapshots are
+  recomputed from the seed and the schedule, so a resume under a substituted ramp
+  stops before the first game.
+* The maintained controller accepts both flags through `training_args` in
+  `scripts/train.py`.
+
 ## Run seed
 
 `train-annealed` has no fixed seed default:

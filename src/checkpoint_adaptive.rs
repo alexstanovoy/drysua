@@ -65,8 +65,17 @@ pub(super) fn validate_scope(
     ppo: PpoConfig,
 ) -> Result<(), CheckpointError> {
     super::validate_text("command line", &run.command_line)?;
+    // A non-default scale ramp is recorded after the adaptive suffix. Only the
+    // canonical rendering is split here, so a partial or malformed
+    // `--environment-scale-*` token stays in the prefix and is rejected below.
+    // Only the builtin feature carries the randomization module; without it the
+    // scale flags cannot be produced, so every such token stays a mismatch.
+    #[cfg(feature = "builtin")]
+    let (command, _scale) = crate::randomization::split_scale_scope(&run.command_line);
+    #[cfg(not(feature = "builtin"))]
+    let command = run.command_line.as_str();
     let Some(checkpoint) = progress.adaptive_environment.as_ref() else {
-        if has_environment_flags(&run.command_line) {
+        if has_environment_flags(command) {
             return Err(CheckpointError::InvalidManifest(
                 "adaptive environment configuration/state mismatch",
             ));
@@ -84,8 +93,7 @@ pub(super) fn validate_scope(
         ));
     }
     let suffix = checkpoint.config.scope_suffix();
-    let prefix = run
-        .command_line
+    let prefix = command
         .strip_suffix(&suffix)
         .ok_or(CheckpointError::InvalidManifest(
             "adaptive environment scope suffix",

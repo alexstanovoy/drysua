@@ -416,6 +416,7 @@ mod files {
         let schedule = crate::randomization::AnnealSchedule {
             updates: 8,
             zero_updates: 0,
+            scale: crate::randomization::AnnealScale::FULL,
         };
         for generation in 0..2 {
             let draw =
@@ -862,6 +863,7 @@ mod files {
             let schedule = crate::randomization::AnnealSchedule {
                 updates: 8,
                 zero_updates: 0,
+                scale: crate::randomization::AnnealScale::FULL,
             };
             let draw = crate::randomization::draw_generation(9001, 0, 4, 2, schedule).unwrap();
             crate::randomization::write_generation_snapshot(&directory, &draw).unwrap();
@@ -876,8 +878,14 @@ mod files {
 
     #[cfg(feature = "builtin")]
     fn write_adaptive_prefix(directory: &Path, checkpoint: &mut AdaptiveEnvironmentCheckpoint) {
-        crate::adaptive_randomization::draw_adaptive_generation(directory, 9001, 2, checkpoint)
-            .expect("own committed generation");
+        crate::adaptive_randomization::draw_adaptive_generation(
+            directory,
+            9001,
+            2,
+            checkpoint,
+            crate::randomization::AnnealScale::FULL,
+        )
+        .expect("own committed generation");
         for update in 1..=2 {
             checkpoint.state = checkpoint
                 .state
@@ -885,8 +893,14 @@ mod files {
                 .expect("pending next generation");
         }
         let mut orphan = *checkpoint;
-        crate::adaptive_randomization::draw_adaptive_generation(directory, 9001, 2, &mut orphan)
-            .expect("own uncommitted generation");
+        crate::adaptive_randomization::draw_adaptive_generation(
+            directory,
+            9001,
+            2,
+            &mut orphan,
+            crate::randomization::AnnealScale::FULL,
+        )
+        .expect("own uncommitted generation");
         fs::write(
             directory.join("adaptive-generation-0000000000000001.json"),
             b"uncommitted orphan",

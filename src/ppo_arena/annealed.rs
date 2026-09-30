@@ -93,6 +93,8 @@ pub struct AnnealedJobConfig {
     pub zero_updates: u64,
     /// Deterministic run seed.
     pub seed: u64,
+    /// Environment scale ramp endpoints; `AnnealScale::FULL` is the default ramp.
+    pub scale: crate::randomization::AnnealScale,
     /// Opponent, frozen for the whole run.
     pub opponent: AnnealedOpponent,
     /// PPO dimensions and hyperparameters; `environments` and `rollout_decisions`
@@ -917,6 +919,7 @@ fn anneal_schedule(settings: &AnnealedJobConfig) -> AnnealSchedule {
     AnnealSchedule {
         updates: settings.updates,
         zero_updates: settings.zero_updates,
+        scale: settings.scale,
     }
 }
 
@@ -1027,6 +1030,7 @@ pub(crate) fn validate_annealed(
     settings
         .execution
         .validate_ppo_memory(settings.ppo.sample_budget)?;
+    settings.scale.validate()?;
     if settings.updates == 0 || settings.updates > MAX_TRAINING_COUNTER {
         return Err(PpoError::InvalidConfig("annealed updates"));
     }

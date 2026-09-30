@@ -151,6 +151,7 @@ fn annealed_settings(settings: crate::TrainingJobConfig) -> AnnealedJobConfig {
         parallel_worlds: 2,
         games_per_generation: 2,
         zero_updates: 0,
+        scale: crate::randomization::AnnealScale::FULL,
         seed: settings.seed,
         opponent: AnnealedOpponent::Teacher,
         ppo: PpoConfig {

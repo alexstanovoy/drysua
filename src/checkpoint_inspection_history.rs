@@ -13,6 +13,11 @@ pub(super) struct HistoryPlan {
     games_per_update: u64,
     generation_games: u64,
     zero_updates: u64,
+    /// Scale ramp endpoints in basis points; only the builtin feature parses them.
+    #[cfg(feature = "builtin")]
+    scale_start_bp: i32,
+    #[cfg(feature = "builtin")]
+    scale_end_bp: i32,
 }
 
 pub(super) fn plan(artifact: &TrainingArtifact) -> Result<HistoryPlan, CheckpointError> {
@@ -31,6 +36,10 @@ pub(super) fn plan(artifact: &TrainingArtifact) -> Result<HistoryPlan, Checkpoin
         games_per_update: 0,
         generation_games: 0,
         zero_updates: 0,
+        #[cfg(feature = "builtin")]
+        scale_start_bp: 0,
+        #[cfg(feature = "builtin")]
+        scale_end_bp: 0,
     };
     if kind != "train-annealed" {
         return Ok(plan);
@@ -39,6 +48,14 @@ pub(super) fn plan(artifact: &TrainingArtifact) -> Result<HistoryPlan, Checkpoin
         return Err(CheckpointError::InvalidManifest(
             "annealed history inspection requires builtin feature",
         ));
+    }
+    // The scope validator has already accepted the canonical ordering. Only the
+    // builtin feature carries the randomization module, so parse the ramp there.
+    #[cfg(feature = "builtin")]
+    {
+        let (_, scale) = crate::randomization::split_scale_scope(command);
+        plan.scale_start_bp = scale.start_bp;
+        plan.scale_end_bp = scale.end_bp;
     }
     plan.updates = counter(command, "--updates")?;
     plan.games_per_update = counter(command, "--games")?;
@@ -189,6 +206,10 @@ fn verify_annealed(
             artifact.run.run_seed,
             plan.games_per_update,
             checkpoint,
+            crate::randomization::AnnealScale {
+                start_bp: plan.scale_start_bp,
+                end_bp: plan.scale_end_bp,
+            },
         )
         .map_err(|error| CheckpointError::Io(format!("snapshot verification: {error}")))?;
     }
@@ -211,6 +232,10 @@ fn verify_fixed(
     let schedule = crate::randomization::AnnealSchedule {
         updates: plan.updates,
         zero_updates: plan.zero_updates,
+        scale: crate::randomization::AnnealScale {
+            start_bp: plan.scale_start_bp,
+            end_bp: plan.scale_end_bp,
+        },
     };
     let draw = crate::randomization::draw_generation(
         seed,

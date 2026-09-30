@@ -504,3 +504,92 @@ fn parse_annealed(flags: &[&str]) -> std::io::Result<TrainAnnealedArgs> {
     };
     Ok(train)
 }
+
+#[cfg(feature = "builtin")]
+#[test]
+fn annealed_cli_resolves_environment_scale_endpoints() {
+    let base = ["--updates", "20", "--generation-games", "160"];
+    let settings = |extra: &[&str]| {
+        let mut arguments = base.to_vec();
+        arguments.extend_from_slice(extra);
+        crate::cli::annealed_settings_for_test(&arguments)
+    };
+    assert_eq!(
+        settings(&[]).expect("default scale").scale,
+        crate::randomization::AnnealScale::FULL
+    );
+    assert_eq!(
+        settings(&[
+            "--environment-scale-start",
+            "0",
+            "--environment-scale-end",
+            "2"
+        ])
+        .expect("rising ramp")
+        .scale,
+        crate::randomization::AnnealScale {
+            start_bp: 0,
+            end_bp: 20_000
+        }
+    );
+    assert_eq!(
+        settings(&[
+            "--environment-scale-start",
+            "0.5",
+            "--environment-scale-end",
+            "0.5"
+        ])
+        .expect("fixed half scale")
+        .scale,
+        crate::randomization::AnnealScale {
+            start_bp: 5_000,
+            end_bp: 5_000
+        }
+    );
+    assert_eq!(
+        settings(&[
+            "--environment-scale-start",
+            "10",
+            "--environment-scale-end",
+            "10"
+        ])
+        .expect("ten times full variance")
+        .scale,
+        crate::randomization::AnnealScale {
+            start_bp: 100_000,
+            end_bp: 100_000
+        }
+    );
+    // The loop works in basis points, so an endpoint truncates to a hundredth.
+    assert_eq!(
+        settings(&["--environment-scale-start", "0.007"])
+            .expect("zero point seven percent")
+            .scale
+            .start_bp,
+        70
+    );
+    assert_eq!(
+        settings(&["--environment-scale-start", "0.00005"])
+            .expect("sub-basis-point")
+            .scale
+            .start_bp,
+        0
+    );
+    for value in ["10.000001", "11"] {
+        let error = settings(&["--environment-scale-start", value]).expect_err("above the bound");
+        assert!(
+            error.to_string().contains("must be within 0 and 10"),
+            "{error}"
+        );
+    }
+    // The equals form keeps a leading sign with the value, so the decimal
+    // parser rejects it instead of clap treating it as an unknown flag.
+    for value in ["-1", "1e1", "abc", "1.", ".5.5"] {
+        let argument = format!("--environment-scale-end={value}");
+        let error = settings(&[argument.as_str()]).expect_err("notation");
+        assert!(
+            error.to_string().contains("environment decimal"),
+            "{value}: {error}"
+        );
+    }
+}
