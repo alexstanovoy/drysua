@@ -578,12 +578,17 @@ impl TrainAnnealedArgs {
         });
         let cores = std::thread::available_parallelism()?.get();
         let simulation_threads = self.simulation_threads.unwrap_or(cores);
-        let simulation_groups = match self.simulation_groups {
-            Some(groups) => usize::from(groups),
-            None => crate::ppo_arena::topology::cache_domains().len(),
-        };
+        let domains = crate::ppo_arena::topology::cache_domains().len();
+        let explicit_groups = self.simulation_groups.map(usize::from);
         let seed = self.resolved_seed()?;
-        let (slots, lanes) = self.collection_shape(cores, simulation_groups)?;
+        let (slots, lanes) = self.collection_shape(cores, explicit_groups.unwrap_or(domains))?;
+        // By default the most cache domains that evenly split the lanes and threads.
+        let simulation_groups = explicit_groups.unwrap_or_else(|| {
+            (1..=domains.min(simulation_threads))
+                .rev()
+                .find(|groups| lanes.is_multiple_of(*groups))
+                .unwrap_or(1)
+        });
         Ok(crate::AnnealedJobConfig {
             environment_schedule,
             execution: crate::TrainingExecutionOptions {

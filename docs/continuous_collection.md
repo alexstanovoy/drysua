@@ -11,7 +11,7 @@ lanes (--lanes)               one thread, CUDA stream and actor weight replica p
                               lane l owns slots l, l+lanes, ...; at most 64 slots per lane;
                               default two per simulation group, more if the slots need them
 simulation groups             --simulation-groups (default: last-level cache domains, i.e.
-                              CCDs) split consecutive lanes and --simulation-threads workers
+                              CCDs, or fewer so they divide the lanes) split consecutive lanes and --simulation-threads workers
                               (default: available cores) into pools, so a lane's round never
                               waits on another CCD; --pin-threads pins each group to its
                               domain (opt-in). Neither changes results
