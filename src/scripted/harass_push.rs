@@ -1,36 +1,48 @@
-//! Shadow Fiend rule policy that harasses Teacher off the lane and pushes its tower meanwhile.
+//! Shadow Fiend rule policy that holds the lane against Teacher and pushes its tower.
 //!
-//! Evidence from `drysua duel` shaped every rule here. Teacher spends its mana on razes at
-//! creeps and heroes, walks home at 40% health with no hysteresis, and never walks into
-//! tower range while an enemy hero stands within 1200. HarassPush therefore:
+//! Evidence from `drysua duel` shaped every rule here. Nearly every game ends by a tower, and
+//! Teacher's hero dealt most of the damage to ours while our hero was home or walking back:
+//! Teacher never walks into tower range while an enemy hero stands within 1200, so presence
+//! is the defense. Trades were even, but Teacher stays until 40% health and we went home.
+//! HarassPush therefore:
+//! - keeps four Healing Salves and four Clarities, restocked at the home shop, and counts an
+//!   active salve as health when deciding to stop walking home (without them it wins 55%
+//!   instead of 90%);
+//! - hovers at 1200 from Teacher, outside its raze reach and inside its push veto, and keeps
+//!   a hero that vanished into fog where it was last seen;
+//! - fights only for a kill, when Teacher lacks raze mana (attacking it then, since it can
+//!   only answer with attacks), or when Teacher sieges our tower and a raze pair is ready;
+//!   forcing Teacher home with raze trades gained nothing;
 //! - razes only once its facing has settled on the target (a turning hero sweeps 32 degrees a
 //!   tick, and a raze fires along the facing at resolution time);
-//! - fights when its ready razes force Teacher home or kill it, when Teacher lacks raze mana
-//!   (attacking it then, since it can only answer with attacks), or when Teacher sieges our
-//!   tower and a raze pair is ready;
-//! - otherwise hovers just outside Teacher's far-raze disk, which also denies its tower push;
-//! - with Teacher away, hits the tower its wave tanks;
-//! - never idles in enemy tower range, backs off when bleeding, and walks home below 30% health.
+//! - with Teacher away, hits the tower once one of its creeps tanks it;
+//! - never idles in enemy tower range, backs off when bleeding, and walks home below 30%
+//!   health.
 //!
-//! It buys nothing and learns razes first. Every action goes through the drysua action space
-//! and every input is seat-visible, so the policy is a behaviour-cloning target.
+//! [`STYLE_KNOBS`] turns these choices into seeded styles for training opponents. Every
+//! action goes through the drysua action space and every input is seat-visible, so the policy
+//! is a behaviour-cloning target.
 
 use bota_proto::{
-    AbilityId, AbilitySlot, EffectId, EntityId, Fixed, Order, Target, Team, UnitKind, UnitView,
-    Vec2,
+    AbilityId, AbilitySlot, EffectId, EntityId, Fixed, ItemId, Order, Target, Team, UnitKind,
+    UnitView, Vec2,
 };
 
 use crate::raze_aim::{
     SHADOWRAZE_RADIUS, SHADOWRAZES, facing_towards, isqrt, point_along, predicted_position,
     raze_center, raze_reach,
 };
+use crate::scripted::ScriptKind;
+use crate::scripted::progress::GoalProgress;
+use crate::scripted::style::{Knob, StyleValues};
 use crate::scripted::tactics::{
     best_attack_creep, cast_at, enemy_tower_danger, facing_gap, in_attack_reach, is_lane_creep,
     magical_damage, physical_damage, ratio_at_most, ratio_below, raze_damage, tower_corridor_safe,
 };
+use crate::teacher_economy::select_sustain;
 use crate::{
     ActionError, ActionSpace, ControlledUnit, EntityIndex, EntityRelation, IssuedOrder,
-    ItemReadiness, OrderPersistence, PointIndex, StateTracker, StructuredAction,
+    ItemReadiness, OrderPersistence, PointIndex, ShopIndex, StateTracker, StructuredAction,
 };
 
 const REQUIEM: AbilityId = AbilityId(16);
@@ -39,22 +51,22 @@ const PRESENCE: AbilityId = AbilityId(18);
 const RAZE_STACK_EFFECT: EffectId = EffectId(15);
 const RAZE_STACK_DAMAGE: [i32; 4] = [50, 60, 70, 80];
 const RAZE_MANA: [i32; 4] = [75, 80, 85, 90];
-/// Teacher walks home at or below this health share.
-const ENEMY_RETREAT_PERCENT: i32 = 40;
-/// Own health that always starts a walk home.
-const RETREAT_PERCENT: i32 = 30;
-/// Own health that ends a walk home; hysteresis stops lane/fountain oscillation.
-const RETURN_PERCENT: i32 = 80;
 /// Own health share below which the hero never starts a fight.
 const ENGAGE_HEALTH_PERCENT: i32 = 50;
 /// Farthest reach of an enemy raze disk plus one decision of approach.
 const THREAT_DISTANCE: i32 = 1_000;
-/// Just outside Teacher's far-raze disk, still inside the 1200 that stops its tower push.
-const HOVER_DISTANCE: i32 = 1_100;
 /// Enemy heroes farther than this cannot contest a push.
 const ENGAGE_DISTANCE: i32 = 1_600;
-/// An enemy hero seen this recently still threatens where it vanished into fog.
-const ENEMY_MEMORY_TICKS: u32 = 120;
+const HEALING_SALVE: ItemId = ItemId(2);
+const CLARITY: ItemId = ItemId(1);
+/// Health a Healing Salve mends over its whole duration, and that duration.
+const SALVE_HEAL: i32 = 400;
+const SALVE_TICKS: u32 = 300;
+const MENDING_EFFECT: EffectId = EffectId(1);
+/// Consumables are bought only this deep inside shop range, so they land in the bag.
+const SHOP_DISTANCE: i32 = 900;
+/// Item slots the bag offers for consumables.
+const ACTIVE_ITEM_SLOTS: usize = 6;
 /// Score improvement below which a walk is not worth an order.
 const PROGRESS_SLACK: i32 = 40;
 /// Tower attack range (700) plus the tower (144) and hero (24) bounds.
@@ -72,14 +84,80 @@ const FRONT_OFFSET: i32 = 250;
 const AHEAD_SLACK: i32 = 200;
 /// Facing error (about 5.5 degrees) under which the hero has finished turning toward a target.
 const AIM_TOLERANCE_BRADS: u16 = 1_000;
-/// Allied creeps that must stand near the enemy tower before the hero hits it.
-const TOWER_TANKS: usize = 2;
 /// A tower keeps its target while it stays in range, so a focused hero stays out this long.
 const TOWER_SHY_TICKS: u32 = 150;
+
+/// Own health share that starts a walk home.
+const RETREAT_KNOB: Knob = Knob::new("retreat", 30, (5, 60), (10, 40));
+/// Own health share, counting an active salve, that ends it; hysteresis stops lane/fountain
+/// oscillation.
+const RETURN_KNOB: Knob = Knob::new("return", 80, (10, 100), (45, 90));
+/// Distance kept from an enemy hero: outside its raze reach and at the edge of the 1200
+/// within which Teacher neither chases the hero nor walks into our tower's range.
+const HOVER_KNOB: Knob = Knob::new("hover", 1_200, (600, 1_600), (900, 1_400));
+
+/// Style knobs after the shared noise knobs; defaults are the canonical HarassPush.
+pub(crate) const STYLE_KNOBS: [Knob; 9] = [
+    RETREAT_KNOB,
+    RETURN_KNOB,
+    // Healing Salves and Clarities kept in the bag, restocked at the home shop.
+    Knob::new("salves", 4, (0, 6), (0, 5)),
+    Knob::new("clarities", 4, (0, 6), (0, 5)),
+    HOVER_KNOB,
+    // Also fights when the ready razes leave the enemy at or below this health share
+    // (Teacher walks home at 40%); 0 fights only for kills, unarmed enemies and tower
+    // defense, which won more than forcing Teacher home.
+    Knob::new("engage", 0, (0, 100), (0, 70)),
+    // Own creeps that must tank the enemy tower before the hero hits it; 9 never pushes.
+    Knob::new("tanks", 1, (0, 9), (1, 4)),
+    // Ticks an enemy hero that vanished into fog still counts where it was last seen.
+    Knob::new("memory", 120, (0, 600), (0, 300)),
+    // 1 levels razes first; 0 takes Necromastery first.
+    Knob::new("razes_first", 1, (0, 1), (0, 1)),
+];
+
+/// One game's HarassPush knobs, typed; see [`STYLE_KNOBS`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HarassStyle {
+    retreat_percent: i32,
+    return_percent: i32,
+    salves: i32,
+    clarities: i32,
+    hover_distance: i32,
+    engage_percent: i32,
+    tower_tanks: usize,
+    memory_ticks: u32,
+    razes_first: bool,
+}
+
+impl HarassStyle {
+    /// Reads the HarassPush knobs of one drawn style.
+    pub fn from_values(values: &StyleValues) -> Self {
+        let get = |name| values.get(ScriptKind::HarassPush, name);
+        Self {
+            retreat_percent: get("retreat"),
+            return_percent: get("return"),
+            salves: get("salves"),
+            clarities: get("clarities"),
+            hover_distance: get("hover"),
+            engage_percent: get("engage"),
+            tower_tanks: usize::try_from(get("tanks")).expect("knob bounds"),
+            memory_ticks: u32::try_from(get("memory")).expect("knob bounds"),
+            razes_first: get("razes_first") == 1,
+        }
+    }
+}
+
+impl Default for HarassStyle {
+    fn default() -> Self {
+        Self::from_values(&StyleValues::canonical(ScriptKind::HarassPush))
+    }
+}
 
 /// Deterministic HarassPush rule policy; see the module documentation.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct HarassPush {
+    style: HarassStyle,
     hero: Option<EntityId>,
     retreating: bool,
     last_hp: i32,
@@ -89,9 +167,15 @@ pub struct HarassPush {
 }
 
 impl HarassPush {
-    /// Creates a policy with empty per-match memory.
-    pub const fn new() -> Self {
+    /// Creates a canonical policy with empty per-match memory.
+    pub fn new() -> Self {
+        Self::with_style(HarassStyle::default())
+    }
+
+    /// Creates a policy of one drawn style with empty per-match memory.
+    pub const fn with_style(style: HarassStyle) -> Self {
         Self {
+            style,
             hero: None,
             retreating: false,
             last_hp: 0,
@@ -139,7 +223,7 @@ impl HarassPush {
             return;
         };
         if self.hero != Some(hero.id) {
-            *self = Self::new();
+            *self = Self::with_style(self.style);
             self.hero = Some(hero.id);
             self.last_hp = hero.hp;
         }
@@ -151,9 +235,10 @@ impl HarassPush {
         {
             self.tower_shy_until = tick.saturating_add(TOWER_SHY_TICKS);
         }
-        if ratio_at_most(hero.hp, hero.max_hp, RETREAT_PERCENT) {
+        let healed = hero.hp.saturating_add(pending_heal(hero));
+        if ratio_at_most(hero.hp, hero.max_hp, self.style.retreat_percent) {
             self.retreating = true;
-        } else if !ratio_below(hero.hp, hero.max_hp, RETURN_PERCENT) {
+        } else if !ratio_below(healed, hero.max_hp, self.style.return_percent) {
             self.retreating = false;
         }
     }
@@ -171,6 +256,7 @@ impl HarassPush {
             return StructuredAction::Continue;
         };
         let turn = Turn {
+            style: &self.style,
             tracker,
             space,
             hero,
@@ -181,8 +267,12 @@ impl HarassPush {
         };
         let enemy = nearest_enemy_hero(tracker, hero.pos, ENGAGE_DISTANCE);
         let fight = enemy.filter(|enemy| turn.wants_fight(enemy));
-        let lurking = enemy.or_else(|| remembered_enemy_hero(tracker, hero.pos));
-        let action = learn(hero, space)
+        let lurking =
+            enemy.or_else(|| remembered_enemy_hero(tracker, hero.pos, self.style.memory_ticks));
+        let action = learn(hero, space, self.style.razes_first)
+            .or_else(|| turn.restock())
+            // Drinks a salve or clarity once no hit would break the drink.
+            .or_else(|| select_sustain(tracker, space, self.retreating, &GoalProgress::new()))
             .or_else(|| {
                 let free = self.retreating || fight.is_some();
                 enemy
@@ -281,6 +371,7 @@ impl<'a> Lane<'a> {
 
 /// Everything one decision reads, so the tactical helpers share one borrow.
 struct Turn<'a> {
+    style: &'a HarassStyle,
     tracker: &'a StateTracker,
     space: &'a ActionSpace,
     hero: &'a UnitView,
@@ -304,7 +395,7 @@ impl Turn<'_> {
         }
         let (burst, razes) = own_burst(self.space, hero, enemy);
         let left = enemy.hp.saturating_sub(burst);
-        if left <= 0 || ratio_at_most(left, enemy.max_hp, ENEMY_RETREAT_PERCENT) {
+        if left <= 0 || ratio_at_most(left, enemy.max_hp, self.style.engage_percent) {
             return true;
         }
         let sieging = self.lane.own_tower.is_some_and(|tower| {
@@ -355,7 +446,7 @@ impl Turn<'_> {
         self.walk(
             |position: Vec2| {
                 let gap = distance(position, enemy.pos);
-                (HOVER_DISTANCE - gap).max(0) * 4 + distance(position, post) / 2
+                (self.style.hover_distance - gap).max(0) * 4 + distance(position, post) / 2
             },
             false,
         )
@@ -374,6 +465,37 @@ impl Turn<'_> {
             .and_then(|tower| self.hit_tower(tower))
             .or_else(|| self.farm(None))
             .or_else(|| self.move_towards(post, true))
+    }
+
+    /// Tops up Healing Salves, then Clarities, while standing in the home shop.
+    ///
+    /// Sustain is what keeps the hero in lane: without it every trade ended in a walk home,
+    /// and Teacher pushed the tower meanwhile.
+    fn restock(&self) -> Option<StructuredAction> {
+        let (hero, space) = (self.hero, self.space);
+        if !hero
+            .pos
+            .within(self.lane.own_fountain, Fixed::from_int(SHOP_DISTANCE))
+        {
+            return None;
+        }
+        let mask = space.buy_mask(ControlledUnit::Hero);
+        [
+            (HEALING_SALVE, self.style.salves),
+            (CLARITY, self.style.clarities),
+        ]
+        .into_iter()
+        .filter(|(item, wanted)| carried(hero, *item) < *wanted)
+        .find_map(|(item, _)| {
+            let index = space
+                .shop_candidates()
+                .iter()
+                .position(|candidate| candidate.item == item)?;
+            (mask.get(index) == Some(&true)).then_some(StructuredAction::Buy {
+                unit: ControlledUnit::Hero,
+                item: ShopIndex(index),
+            })
+        })
     }
 
     fn tower_shy_here(&self) -> bool {
@@ -395,7 +517,7 @@ impl Turn<'_> {
                         .within(tower.pos, Fixed::from_int(700) + tower.bound)
             })
             .count();
-        if tanks < TOWER_TANKS {
+        if tanks < self.style.tower_tanks {
             return None;
         }
         let target = self.space.entity_index(tower.id)?;
@@ -510,10 +632,15 @@ impl Turn<'_> {
     }
 }
 
-/// Raze levels first; Requiem, Necromastery and Presence only take otherwise wasted points.
-fn learn(hero: &UnitView, space: &ActionSpace) -> Option<StructuredAction> {
+/// Raze levels first, or Necromastery first; the rest only take otherwise wasted points.
+fn learn(hero: &UnitView, space: &ActionSpace, razes_first: bool) -> Option<StructuredAction> {
     let mask = space.learn_slot_mask();
-    for wanted in [SHADOWRAZES[0].0, REQUIEM, NECROMASTERY, PRESENCE] {
+    let order = if razes_first {
+        [SHADOWRAZES[0].0, REQUIEM, NECROMASTERY, PRESENCE]
+    } else {
+        [NECROMASTERY, SHADOWRAZES[0].0, REQUIEM, PRESENCE]
+    };
+    for wanted in order {
         for (index, ability) in hero.abilities.iter().enumerate() {
             let same = ability.id == wanted
                 || wanted == SHADOWRAZES[0].0 && raze_reach(ability.id).is_some();
@@ -622,8 +749,33 @@ fn raze_hit_radius(hero: &UnitView, enemy: &UnitView) -> Fixed {
     }
 }
 
+/// Charges of `item` in the bag.
+fn carried(hero: &UnitView, item: ItemId) -> i32 {
+    hero.items
+        .iter()
+        .take(ACTIVE_ITEM_SLOTS)
+        .flatten()
+        .filter(|held| held.id == item)
+        .map(|held| i32::from(held.charges.unwrap_or(1)))
+        .sum()
+}
+
+/// Health an active salve still mends; the hero counts it as already healed.
+fn pending_heal(hero: &UnitView) -> i32 {
+    hero.effects
+        .iter()
+        .filter(|effect| effect.id == MENDING_EFFECT)
+        .filter_map(|effect| effect.ticks_left)
+        .map(|left| {
+            let left = i32::try_from(left.min(SALVE_TICKS)).expect("bounded ticks");
+            SALVE_HEAL * left / SALVE_TICKS as i32
+        })
+        .max()
+        .unwrap_or(0)
+}
+
 /// The enemy hero last seen near `from` a moment ago; fog does not make it leave.
-fn remembered_enemy_hero(tracker: &StateTracker, from: Vec2) -> Option<&UnitView> {
+fn remembered_enemy_hero(tracker: &StateTracker, from: Vec2, memory: u32) -> Option<&UnitView> {
     let tick = tracker.current()?.tick;
     tracker
         .entities()
@@ -636,7 +788,7 @@ fn remembered_enemy_hero(tracker: &StateTracker, from: Vec2) -> Option<&UnitView
                 && track
                     .last_death
                     .is_none_or(|death| death.tick < track.last_seen_tick)
-                && tick.saturating_sub(track.last_seen_tick) <= ENEMY_MEMORY_TICKS
+                && tick.saturating_sub(track.last_seen_tick) <= memory
                 && from.within(track.unit.pos, Fixed::from_int(ENGAGE_DISTANCE))
         })
         .min_by_key(|track| (from.distance_squared(track.unit.pos), track.id))
@@ -663,9 +815,9 @@ fn distance(from: Vec2, to: Vec2) -> i32 {
     (raw / Fixed::ONE.raw as u64).min(i32::MAX as u64) as i32
 }
 
-const _: () = assert!(HOVER_DISTANCE > SHADOWRAZES[2].1 + SHADOWRAZE_RADIUS);
-const _: () = assert!(HOVER_DISTANCE < 1_200);
+const _: () = assert!(HOVER_KNOB.default > SHADOWRAZES[2].1 + SHADOWRAZE_RADIUS);
+const _: () = assert!(HOVER_KNOB.default <= 1_200);
 const _: () = assert!(POST_TOWER_CLEARANCE > TOWER_REACH);
-const _: () = assert!(THREAT_DISTANCE < HOVER_DISTANCE);
-const _: () = assert!(RETREAT_PERCENT < ENGAGE_HEALTH_PERCENT);
-const _: () = assert!(ENGAGE_HEALTH_PERCENT < RETURN_PERCENT);
+const _: () = assert!(THREAT_DISTANCE < HOVER_KNOB.default);
+const _: () = assert!(RETREAT_KNOB.default < ENGAGE_HEALTH_PERCENT);
+const _: () = assert!(ENGAGE_HEALTH_PERCENT < RETURN_KNOB.default);

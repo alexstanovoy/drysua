@@ -132,11 +132,12 @@ pub(crate) fn select_purchase(
     space: &ActionSpace,
     bought_once: &[bool; ECONOMY_PLAN.len()],
     observation: &EconomyObservation,
+    planned: usize,
 ) -> Option<StructuredAction> {
     let hero = tracker.own_hero().filter(|hero| hero.hp > 0)?;
     assert_eq!(space.tick(), tracker.current()?.tick);
     assert!(hero.items.len() <= 9);
-    for (index, wanted) in ECONOMY_PLAN.into_iter().enumerate() {
+    for (index, wanted) in ECONOMY_PLAN.into_iter().enumerate().take(planned) {
         if bought_once[index] || purchase_satisfied(tracker, wanted) {
             continue;
         }
