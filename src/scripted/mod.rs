@@ -4,6 +4,7 @@
 mod duel;
 pub(crate) mod duel_cli;
 mod harass_push;
+pub(crate) mod progress;
 pub(crate) mod tactics;
 
 #[cfg(feature = "builtin")]

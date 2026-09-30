@@ -8,6 +8,7 @@ use crate::raze_aim::{
     SHADOWRAZE_RADIUS, SHADOWRAZES, TURN_RATE_BRADS, facing_towards, isqrt, point_along,
     predicted_position, raze_center, raze_contains, raze_radius, raze_reach,
 };
+use crate::scripted::progress::{GoalProgress, Pursuit};
 use crate::scripted::tactics::{
     ATTACK_POINT_TICKS, ATTACK_PROJECTILE_UNITS_PER_TICK, DECISION_TICKS, allied_creep_near,
     attack_turn_ticks, best_attack_creep, cast_at, enemy_heroes, enemy_tower_danger, facing_gap,
@@ -43,6 +44,7 @@ const BACKOFF_DISTANCE: i32 = 200;
 const COMBAT_PLAN_TICKS: u32 = 90;
 const AIM_PLAN_TICKS: u32 = 18;
 const NAVIGATION_STALL_TICKS: u32 = 18;
+const WALK_ARRIVAL_UNITS: i32 = 100;
 const AGGRO_COOLDOWN_TICKS: u32 = 90;
 const AGGRO_HOLD_TICKS: u32 = 70;
 const AGGRO_RANGE: i32 = 500;
@@ -123,6 +125,7 @@ pub struct Teacher {
     combat: CombatMemory,
     combat_proposal: Option<CombatPlan>,
     combat_rollback: Option<(u32, CombatMemory)>,
+    progress: GoalProgress,
     /// Hands hero razes straight to the aim macro instead of FollowUnit, Stop, Cast.
     macro_hero_aim: bool,
 }
@@ -154,6 +157,7 @@ impl Teacher {
             },
             combat_proposal: None,
             combat_rollback: None,
+            progress: GoalProgress::new(),
             macro_hero_aim: false,
         }
     }
@@ -175,6 +179,8 @@ impl Teacher {
     ) -> Result<(StructuredAction, ActionSpace), ActionError> {
         let space = ActionSpace::from_tracker_with_readiness(tracker, readiness)?;
         self.prepare_decision(tracker);
+        let pursuit = self.pursuit(persistence, space.tick());
+        self.progress.observe(tracker, pursuit);
         let choice = self.priority_action(tracker, persistence, &space);
         let selected = self.stage_choice(tracker, &space, choice)?;
         let decoded = space.decode(selected)?;
@@ -212,6 +218,36 @@ impl Teacher {
         self.sync_combat(tracker);
     }
 
+    /// The spot the hero is still being sent toward: a walk kept alive by persistence,
+    /// or an item aimed at a spot that was re-sent on the previous decision.
+    fn pursuit(&self, persistence: &OrderPersistence, now: u32) -> Option<Pursuit> {
+        if let Some((_, issued)) = persistence.active_body_for(None) {
+            return match issued.order {
+                Order::Move {
+                    target: Target::Pos(target),
+                }
+                | Order::Attack {
+                    target: Target::Pos(target),
+                } => Some(Pursuit {
+                    target,
+                    arrival: Some(WALK_ARRIVAL_UNITS),
+                }),
+                _ => None,
+            };
+        }
+        let note = self.latest_note(None)?;
+        match note.issued.order {
+            Order::Use {
+                target: Target::Pos(target),
+                ..
+            } if now.saturating_sub(note.tick) <= DECISION_TICKS => Some(Pursuit {
+                target,
+                arrival: None,
+            }),
+            _ => None,
+        }
+    }
+
     fn stage_choice(
         &mut self,
         tracker: &StateTracker,
@@ -219,10 +255,7 @@ impl Teacher {
         choice: CombatChoice,
     ) -> Result<StructuredAction, ActionError> {
         assert_eq!(tracker.current().map(|view| view.tick), Some(space.tick()));
-        let choice = if space
-            .decode(choice.action)?
-            .is_some_and(|issued| issued.unit.is_none() && !tower_order_safe(tracker, issued.order))
-        {
+        let choice = if !tower_safe_action(tracker, space, choice.action) {
             CombatChoice::plain(StructuredAction::Stop {
                 unit: ControlledUnit::Hero,
             })
@@ -368,24 +401,11 @@ impl Teacher {
         if self.protects_active_unit_attack(tracker, persistence, space) {
             return CombatChoice::plain(StructuredAction::Continue);
         }
-        if let Some(choice) = self
-            .attack_last_hit(tracker, space)
-            .map(CombatChoice::plain)
-            .or_else(|| self.raze_last_hit(tracker, space))
-            .or_else(|| self.deny(tracker, space).map(CombatChoice::plain))
-            .or_else(|| self.harass(tracker, space).map(CombatChoice::plain))
-            .or_else(|| {
-                self.attack_structure(tracker, space)
-                    .map(CombatChoice::plain)
-            })
-        {
+        if let Some(choice) = self.lane_work(tracker, space) {
             return choice;
         }
-        if let Some(choice) = self
-            .teacher_aim(tracker, space)
-            .or_else(|| self.aggro_pull(tracker, space))
-        {
-            return choice;
+        if let Some(action) = self.escape_dead_end(tracker, space) {
+            return CombatChoice::plain(action);
         }
         if self.protects_useful_navigation(tracker, persistence) {
             return CombatChoice::plain(StructuredAction::Continue);
@@ -395,6 +415,30 @@ impl Teacher {
                 .or_else(|| self.hold_lane(tracker, space))
                 .unwrap_or(StructuredAction::Continue),
         )
+    }
+
+    /// Farming, harassment, structure hits, aiming and aggro, in priority order.
+    fn lane_work(&self, tracker: &StateTracker, space: &ActionSpace) -> Option<CombatChoice> {
+        // A proposal the tower veto in `stage_choice` would turn into Stop freezes the hero
+        // when re-proposed every decision; let the next rule act instead.
+        let issuable = |choice: Option<CombatChoice>| {
+            choice.filter(|choice| tower_safe_action(tracker, space, choice.action))
+        };
+        issuable(
+            self.attack_last_hit(tracker, space)
+                .map(CombatChoice::plain),
+        )
+        .or_else(|| issuable(self.raze_last_hit(tracker, space)))
+        .or_else(|| issuable(self.deny(tracker, space).map(CombatChoice::plain)))
+        .or_else(|| issuable(self.harass(tracker, space).map(CombatChoice::plain)))
+        .or_else(|| {
+            issuable(
+                self.attack_structure(tracker, space)
+                    .map(CombatChoice::plain),
+            )
+        })
+        .or_else(|| issuable(self.teacher_aim(tracker, space)))
+        .or_else(|| issuable(self.aggro_pull(tracker, space)))
     }
 
     fn teacher_aim(&self, tracker: &StateTracker, space: &ActionSpace) -> Option<CombatChoice> {
@@ -749,7 +793,7 @@ impl Teacher {
             return None;
         }
         let anchor = allied_ranged_anchor(tracker, hero.pos)?;
-        short_lane_point(tracker, space, anchor, None)?;
+        short_lane_point(tracker, space, &self.progress, anchor, None)?;
         let view = tracker.current()?;
         let eligible = view.units.iter().any(|creep| {
             creep.team != hero.team
@@ -792,7 +836,7 @@ impl Teacher {
         {
             return Some(CombatChoice::plain(action));
         }
-        let action = short_lane_point(tracker, space, anchor, None).map_or(
+        let action = short_lane_point(tracker, space, &self.progress, anchor, None).map_or(
             StructuredAction::Stop {
                 unit: ControlledUnit::Hero,
             },
@@ -897,7 +941,7 @@ impl Teacher {
             }
             | Order::Attack {
                 target: Target::Pos(target),
-            } => useful_walk(tracker, target),
+            } => useful_walk(tracker, target) && self.progress.allows(target),
             _ => false,
         }
     }
@@ -1032,7 +1076,7 @@ impl Teacher {
         let hero = tracker.own_hero()?;
         let emergency = ratio_at_most(hero.hp, hero.max_hp, RETREAT_HEALTH_PERCENT)
             || visible_pressure(tracker, hero) >= hero.hp.max(0);
-        teacher_economy::select_sustain(tracker, space, emergency)
+        teacher_economy::select_sustain(tracker, space, emergency, &self.progress)
     }
 
     fn retreat(&self, tracker: &StateTracker, space: &ActionSpace) -> Option<StructuredAction> {
@@ -1060,6 +1104,7 @@ impl Teacher {
         let point = best_safe_point(
             space,
             tracker,
+            &self.progress,
             space.move_point_mask(ControlledUnit::Hero),
             fountain,
             true,
@@ -1241,11 +1286,33 @@ impl Teacher {
         let point = best_safe_point(
             space,
             tracker,
+            &self.progress,
             space.move_point_mask(ControlledUnit::Hero),
             wanted,
             false,
         )?;
         Some(StructuredAction::MovePoint {
+            unit: ControlledUnit::Hero,
+            point,
+        })
+    }
+
+    /// Walks back toward where the hero came from while every way on has stalled.
+    fn escape_dead_end(
+        &self,
+        tracker: &StateTracker,
+        space: &ActionSpace,
+    ) -> Option<StructuredAction> {
+        let breadcrumb = self.progress.escape()?;
+        best_safe_point(
+            space,
+            tracker,
+            &self.progress,
+            space.move_point_mask(ControlledUnit::Hero),
+            breadcrumb,
+            false,
+        )
+        .map(|point| StructuredAction::MovePoint {
             unit: ControlledUnit::Hero,
             point,
         })
@@ -1261,6 +1328,7 @@ impl Teacher {
         best_safe_point(
             space,
             tracker,
+            &self.progress,
             space.attack_move_point_mask(ControlledUnit::Hero),
             objective,
             true,
@@ -1274,6 +1342,18 @@ impl Teacher {
 
 fn tactical_chase_safe(tracker: &StateTracker, hero: &UnitView, target: Vec2) -> bool {
     tower_corridor_safe(tracker, hero, target, false)
+}
+
+fn tower_safe_action(
+    tracker: &StateTracker,
+    space: &ActionSpace,
+    action: StructuredAction,
+) -> bool {
+    space
+        .decode(action)
+        .ok()
+        .flatten()
+        .is_none_or(|issued| issued.unit.is_some() || tower_order_safe(tracker, issued.order))
 }
 
 fn tower_order_safe(tracker: &StateTracker, order: Order) -> bool {
@@ -1373,6 +1453,7 @@ fn combat_victim<'a>(
 fn short_lane_point(
     tracker: &StateTracker,
     space: &ActionSpace,
+    progress: &GoalProgress,
     wanted: Vec2,
     away: Option<Vec2>,
 ) -> Option<PointIndex> {
@@ -1397,6 +1478,7 @@ fn short_lane_point(
                     point.position.distance_squared(enemy) > hero.pos.distance_squared(enemy)
                 })
                 && tactical_chase_safe(tracker, hero, point.position)
+                && progress.allows(point.position)
                 && anchor.is_none_or(|anchor| {
                     point.position.distance_squared(anchor)
                         <= hero
@@ -1772,7 +1854,7 @@ fn useful_walk(tracker: &StateTracker, target: Vec2) -> bool {
     let Some(hero) = tracker.own_hero() else {
         return false;
     };
-    if hero.pos.within(target, Fixed::from_int(100)) {
+    if hero.pos.within(target, Fixed::from_int(WALK_ARRIVAL_UNITS)) {
         return false;
     }
     let healthy = !ratio_at_most(hero.hp, hero.max_hp, 25);
@@ -1926,6 +2008,7 @@ fn unsafe_tower_without_wave(tracker: &StateTracker, hero: &UnitView) -> bool {
 fn best_safe_point(
     space: &ActionSpace,
     tracker: &StateTracker,
+    progress: &GoalProgress,
     mask: &[bool],
     wanted: Vec2,
     require_progress: bool,
@@ -1939,6 +2022,7 @@ fn best_safe_point(
         .filter(|(index, point)| {
             mask.get(*index) == Some(&true)
                 && (!require_progress || point.position.distance_squared(wanted) < current)
+                && progress.allows(point.position)
                 && tower_corridor_safe(tracker, hero, point.position, true)
                 && (!enemy_tower_danger(tracker, point.position, hero.bound)
                     || allied_creep_near(tracker, point.position, 750))

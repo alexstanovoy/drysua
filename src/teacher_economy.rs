@@ -3,6 +3,7 @@ use bota_proto::{
     UnitView,
 };
 
+use crate::scripted::progress::GoalProgress;
 use crate::{
     ActionSpace, ActionTarget, ControlledUnit, MAX_ABILITY_SLOTS, MAX_RECENT_EVENTS, MAX_SEATS,
     MAX_TRACKED_ENTITIES, PointIndex, PointSource, ShopIndex, StateTracker, StructuredAction,
@@ -161,6 +162,7 @@ pub(crate) fn select_sustain(
     tracker: &StateTracker,
     space: &ActionSpace,
     emergency: bool,
+    progress: &GoalProgress,
 ) -> Option<StructuredAction> {
     let hero = tracker
         .own_hero()
@@ -172,7 +174,9 @@ pub(crate) fn select_sustain(
             let Some(held) = held.as_ref().filter(|item| item.id == wanted) else {
                 continue;
             };
-            let Some(target) = sustain_target(tracker, space, hero, held, slot, emergency) else {
+            let Some(target) =
+                sustain_target(tracker, space, progress, hero, held, slot, emergency)
+            else {
                 continue;
             };
             let action = StructuredAction::Use {
@@ -273,6 +277,7 @@ fn confirmed_cast_tick(
 fn sustain_target(
     tracker: &StateTracker,
     space: &ActionSpace,
+    progress: &GoalProgress,
     hero: &UnitView,
     item: &ItemView,
     slot: usize,
@@ -296,6 +301,7 @@ fn sustain_target(
                 .enumerate()
                 .find(|(index, point)| {
                     mask.points().get(*index) == Some(&true)
+                        && progress.allows(point.position)
                         && matches!(
                             point.source,
                             PointSource::StaticTree | PointSource::PlantedTree

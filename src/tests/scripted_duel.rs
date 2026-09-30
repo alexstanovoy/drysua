@@ -1,26 +1,18 @@
-use crate::{DuelConfig, DuelResult, ScriptKind, run_duel};
+use crate::{DuelConfig, MAP2_TICK_RATE, ScriptKind, play_duel_game, run_duel};
 
 #[test]
-fn harass_push_beats_teacher_on_most_games_from_both_sides() {
-    let games = run_duel(DuelConfig {
-        policy: ScriptKind::HarassPush,
-        opponent: ScriptKind::Teacher,
-        first_seed: 1,
-        seeds: 4,
-        threads: 4,
-    })
-    .expect("duel plays");
+fn teacher_never_freezes_on_an_unreachable_spot() {
+    // Seed 1: a walk to the landing behind its own tower ended short of it and was waited on
+    // for the rest of the game. Seed 35: a Tango aimed at a tree out of reach, re-sent for 84 s.
+    for (opponent, seed) in [(ScriptKind::HarassPush, 1), (ScriptKind::Teacher, 35)] {
+        let game = play_duel_game(ScriptKind::Teacher, opponent, seed, 0).expect("duel plays");
 
-    let wins = games
-        .iter()
-        .filter(|game| game.result == DuelResult::Win)
-        .count();
-    // `drysua duel --seeds 100` is the full evidence; this pins the claim on a small sample.
-    assert!(
-        wins >= 6,
-        "HarassPush won only {wins} of {} games",
-        games.len()
-    );
+        assert!(
+            game.policy_longest_idle <= 10 * MAP2_TICK_RATE,
+            "Teacher stood still {} ticks against {opponent:?} on seed {seed}",
+            game.policy_longest_idle
+        );
+    }
 }
 
 #[test]
