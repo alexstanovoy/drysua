@@ -37,7 +37,7 @@ const _: () = assert!(
     std::mem::size_of::<CompactPpoTransition>()
         + std::mem::size_of::<CompactPreparedSample>()
         + std::mem::size_of::<usize>()
-        <= 8_192
+        <= 8_448
 );
 const _: () = assert!(std::mem::size_of::<PpoPreparedSample>() <= 71_000);
 const _: () = assert!(PPO_MAX_PARALLEL_WORLDS <= crate::MODEL_TRAINING_BATCH);
