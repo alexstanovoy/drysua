@@ -31,7 +31,7 @@ pub(crate) use test_support::*;
 /// Distance at which drysua permits stash swaps around the own fountain.
 pub const STASH_ACCESS_RANGE: i32 = 1_000;
 /// Version of the append-only structured-action schema.
-pub const ACTION_SCHEMA_VERSION: u32 = 7;
+pub const ACTION_SCHEMA_VERSION: u32 = 8;
 /// Canonical action families, head widths, and autoregressive branch order.
 pub const ACTION_SCHEMA_DESCRIPTOR: &str = concat!(
     "bota-drysua-action/v7;kinds=Continue,Stop,MovePoint,FollowUnit,Hold,AttackMovePoint,AttackUnit,Cast,Use,PutPoint,PutUnit,Take,Buy,Sell,Swap,Learn;",
@@ -41,10 +41,10 @@ pub const ACTION_SCHEMA_DESCRIPTOR: &str = concat!(
     "buy_mango=item42_one_charge_repeatable_home_bag_then_stash_remote_stash_empty_or_visible_compatible_stack_below3;",
     "use_mango=hero_active_slots0..5_unmuted_charges1..3_target_none_provable_positive_own_mana_deficit;",
     "mana_legality=all_casts_and_uses_conservative_own_wire_mana_affordability;",
-    "raze_legality=ready_none,ready_point_any_candidate_but_the_caster_position,ready_entity_live_enemy_or_neutral_candidate_within_reach_pm_radius250_plus1;",
+    "raze_legality=ready_none,ready_point_any_candidate_but_the_caster_position,ready_entity_live_enemy_or_neutral_nonstructure_candidate_within_reach_pm_radius250_plus1;",
     "raze_execution=none_casts_along_current_facing_at_once,entity_and_point_intents_decode_to_unit_and_pos_casts_resolved_by_aim_macro,entity_walk48_toward_one_tick_prediction_until_next_tick_landing_covers_it,point_heading_fixed_toward_point_at_decision_walk48_along_it_until_next_tick_landing_within25_of_heading_landing,then_untargeted_cast_limit15_ticks_continue_advances_other_decisions_replace;",
-    "point_candidates=general48_then_raze_only16:facing450,best_landing_per_reach_most_hostile_then_heroes_128_headings_widest_run_middle,fogged_enemy_heroes2_age_le150_last_seen_then_extrapolated,blind_ring8_between_tactical_directions450;raze_only_points_are_raze_targets_only;",
-    "move_point_legality=live_body_unstunned_unrooted_and_walkable_including_existing_building_landing;attack_move_point_legality=unchanged_building_landing_source_excluded;building_landing_provenance=unchanged_tp_walkability_allied_anchor_and_target_kind_checks,no_new_points_or_goal_features;",
+    "point_candidates=general48_then_raze_only16:facing450,best_landing_per_reach_most_hostile_nonstructure_then_heroes_128_headings_widest_run_middle,fogged_enemy_heroes2_age_le150_last_seen_then_extrapolated,blind_ring8_between_tactical_directions450;raze_only_points_are_raze_targets_only;",
+    "move_point_legality=live_body_unstunned_and_walkable_including_existing_building_landing;attack_move_point_legality=unchanged_building_landing_source_excluded;building_landing_provenance=unchanged_tp_walkability_allied_anchor_and_target_kind_checks,no_new_points_or_goal_features;",
     "entity_order=active_effect15_max_lexicographic_stacks_remaining_then_guarded13_inspired14_timers_then_prior_received_manual_hp_mana_report_semantics_before_opaque_id;",
 );
 /// Stable FNV-1a identity of [`ACTION_SCHEMA_DESCRIPTOR`].
@@ -1406,7 +1406,7 @@ impl StaticPassability {
 
 fn live_state(passability: &StaticPassability, unit: Option<&UnitView>) -> Option<ControlledState> {
     let unit = unit?;
-    if unit.hp <= 0 || has_status(unit, StatusFlags::DEAD) {
+    if unit.hp <= 0 {
         return None;
     }
     Some(ControlledState {
@@ -1421,11 +1421,7 @@ fn build_entity_candidates(
     current: &WorldView,
     center: Option<Vec2>,
 ) -> Vec<EntityCandidate> {
-    let mut selected: Vec<&UnitView> = current
-        .units
-        .iter()
-        .filter(|unit| unit.hp > 0 && !has_status(unit, StatusFlags::DEAD))
-        .collect();
+    let mut selected: Vec<&UnitView> = current.units.iter().filter(|unit| unit.hp > 0).collect();
     selected.sort_by_key(|unit| entity_priority(tracker, unit, center));
     selected.truncate(UNIT_TOKENS);
     let mut output = Vec::with_capacity(UNIT_TOKENS);
@@ -2252,12 +2248,9 @@ fn build_controlled_masks(space: &ActionSpace, unit: ControlledUnit) -> Controll
     let Some(state) = &space.controlled[unit.index()] else {
         return masks;
     };
-    let movement_enabled = !has_status(&state.unit, StatusFlags::STUNNED)
-        && !has_status(&state.unit, StatusFlags::ROOTED);
-    let attack_enabled = !has_status(&state.unit, StatusFlags::STUNNED)
-        && !has_status(&state.unit, StatusFlags::DISARMED);
+    let enabled = !has_status(&state.unit, StatusFlags::STUNNED);
     masks.stop = true;
-    fill_body_masks(space, state, movement_enabled, attack_enabled, &mut masks);
+    fill_body_masks(space, state, enabled, &mut masks);
     fill_cast_masks(space, state, &mut masks);
     fill_use_masks(space, state, unit, &mut masks);
     fill_put_masks(space, state, unit, &mut masks);
@@ -2268,23 +2261,22 @@ fn build_controlled_masks(space: &ActionSpace, unit: ControlledUnit) -> Controll
 fn fill_body_masks(
     space: &ActionSpace,
     state: &ControlledState,
-    movement_enabled: bool,
-    attack_enabled: bool,
+    enabled: bool,
     masks: &mut ControlledMasks,
 ) {
     for (index, point) in space.points.iter().enumerate() {
         let walkable = point.walkable && !point.source.raze_only();
         let body_navigation_target =
             walkable && !matches!(point.source, PointSource::BuildingLanding(_));
-        masks.move_points[index] = movement_enabled && walkable;
-        masks.attack_move_points[index] = attack_enabled && body_navigation_target;
+        masks.move_points[index] = enabled && walkable;
+        masks.attack_move_points[index] = enabled && body_navigation_target;
     }
     for (index, target) in space.entities.iter().enumerate() {
         let other = target.id != state.id;
-        masks.follow_entities[index] = movement_enabled && other;
-        masks.attack_entities[index] = attack_enabled && other;
+        masks.follow_entities[index] = enabled && other;
+        masks.attack_entities[index] = enabled && other;
     }
-    masks.hold = attack_enabled;
+    masks.hold = enabled;
 }
 
 fn fill_cast_masks(space: &ActionSpace, state: &ControlledState, masks: &mut ControlledMasks) {
@@ -2302,7 +2294,6 @@ fn fill_cast_masks(space: &ActionSpace, state: &ControlledState, masks: &mut Con
 pub(crate) fn ability_ready(unit: &UnitView, ability: &AbilityView) -> bool {
     let disabled = has_status(unit, StatusFlags::STUNNED)
         || has_status(unit, StatusFlags::FEARED)
-        || has_status(unit, StatusFlags::SILENCED)
         || has_status(unit, StatusFlags::CHANNELLING);
     !disabled
         && !ability.passive
@@ -2333,7 +2324,7 @@ fn raze_target_mask(
             target.relation,
             EntityRelation::Enemy | EntityRelation::Neutral
         ) && target.unit.hp > 0
-            && !has_status(&target.unit, StatusFlags::DEAD)
+            && !is_structure(target.kind)
             && within_reach_window(state.unit.pos, target.position, reach);
     }
     mask

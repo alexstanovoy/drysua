@@ -46,8 +46,11 @@ fn public_decision_requires_snapshot_and_preserves_channels() {
 fn public_cast_contract_requires_mana_and_cooldown_readiness() {
     for (mana, cooldown, casts) in [(75, 0, true), (74, 0, false), (75, 1, false)] {
         let mut view = base_view();
+        view.units
+            .push(unit(ENEMY, UnitKind::Hero, Team::Dire, 3_700, 3_000));
+        view.units.sort_by_key(|unit| unit.id);
+        view.players[1].unit = Some(ENEMY);
         let hero = body(&mut view, HERO);
-        hero.pos = Vec2::from_ints(5_100, 6_000);
         hero.mana = mana;
         hero.abilities[2].cooldown_left = cooldown;
         let mut teacher = Teacher::new();

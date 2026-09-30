@@ -589,5 +589,6 @@ pub(super) fn item(aim: Option<Aim>, range: i32) -> ItemView {
         range,
         aim,
         for_sale: false,
+        owner: SlotId(0),
     }
 }

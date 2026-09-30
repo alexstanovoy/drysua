@@ -128,7 +128,7 @@ fn tango_distant_tree_stays_masked_when_dead_disabled_or_item_not_ready() {
     let (_, mut tracker) = tango_arena();
     let original = tracker.current().unwrap().clone();
     let cases = [
-        (StatusFlags::DEAD, 0, 0, 0, 3),
+        (0, 0, 0, 0, 3),
         (StatusFlags::STUNNED, 200, 0, 0, 3),
         (StatusFlags::FEARED, 200, 0, 0, 3),
         (StatusFlags::CHANNELLING, 200, 0, 0, 3),

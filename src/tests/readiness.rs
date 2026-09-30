@@ -125,6 +125,7 @@ fn space_at(tick: u32, readiness: &ItemReadiness) -> ActionSpace {
         range: 0,
         aim: Some(Aim::Own),
         for_sale: false,
+        owner: SlotId(0),
     });
     let mut tracker = StateTracker::new(SlotId(0), &match_info()).expect("tracker");
     tracker

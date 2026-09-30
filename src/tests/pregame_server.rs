@@ -119,13 +119,14 @@ fn pregame_server_applies_shop_learn_and_movement_orders() {
 #[test]
 fn pregame_server_executes_a_learned_cast_and_masks_its_cooldown() {
     let (mut arena, mut seat) = pregame_arena();
-    pregame_order(
+    let learn_cast = pregame_order(
         &mut arena,
         &mut seat,
         Order::Learn {
             slot: AbilitySlot(0),
         },
     );
+    assert!(!learn_cast, "learning is not reported as a cast");
     let space = ActionSpace::from_tracker(&seat.tracker).expect("learned space");
     assert!(space.cast_ready(ControlledUnit::Hero, AbilitySlot(0)));
 

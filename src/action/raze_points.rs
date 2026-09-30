@@ -17,6 +17,7 @@ use crate::raze_aim::{
     SHADOWRAZE_RADIUS, SHADOWRAZES, extrapolated_position, facing_towards, raze_center,
     within_reach_window,
 };
+use crate::tracker::is_structure;
 
 /// Raze-only candidates appended after the general point candidates.
 pub(super) const RAZE_POINT_CANDIDATES: usize = 16;
@@ -40,7 +41,7 @@ const _: () = assert!(CLUSTER_STEP as u32 * CLUSTER_HEADINGS as u32 == 65_536);
 /// Visible hostile units one raze landing would strike.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct RazeCoverage {
-    /// Live enemy or neutral units that are not heroes, structures included.
+    /// Live enemy or neutral units that are neither heroes nor structures.
     pub units: u8,
     /// Live enemy heroes.
     pub heroes: u8,
@@ -67,9 +68,7 @@ pub(super) struct RazeTarget {
 
 /// The own hero while it could ever cast a raze.
 pub(super) fn raze_caster(tracker: &StateTracker) -> Option<&UnitView> {
-    tracker
-        .own_hero()
-        .filter(|hero| hero.hp > 0 && !has_status(hero, StatusFlags::DEAD))
+    tracker.own_hero().filter(|hero| hero.hp > 0)
 }
 
 /// Visible hostile units any raze landing could strike from `origin`.
@@ -86,7 +85,7 @@ pub(super) fn raze_targets(
         .filter(|unit| {
             unit.team != tracker.team()
                 && unit.hp > 0
-                && !has_status(unit, StatusFlags::DEAD)
+                && !is_structure(unit.kind)
                 && !has_status(unit, StatusFlags::INVULNERABLE)
                 && origin.within(unit.pos, outermost)
         })
@@ -254,7 +253,6 @@ fn fog_heroes<'a>(tracker: &'a StateTracker, current: &WorldView) -> Vec<(u32, &
                 && track.unit.team != tracker.team()
                 && track.unit.team != Team::Neutral
                 && track.unit.hp > 0
-                && !has_status(&track.unit, StatusFlags::DEAD)
                 && track
                     .last_death
                     .is_none_or(|death| death.tick < track.last_seen_tick)

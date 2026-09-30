@@ -268,7 +268,6 @@ fn confirmed_cast_tick(
                 .flatten()
                 .find(|(id, _)| *id == ability)?;
             let now = enemy.abilities.iter().find(|held| held.id == ability)?;
-            // Learning emits AbilityCast too, but cannot increase an existing cooldown.
             (now.level > 0 && !now.passive && now.cooldown_left > *before).then_some(event.tick)
         })
         .min()

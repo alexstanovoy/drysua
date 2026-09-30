@@ -250,6 +250,8 @@ mod tests {
                 hero: crate::SHADOW_FIEND,
             }],
             shop: Vec::new(),
+            fountains: [bota_proto::Vec2::ZERO; 2],
+            shop_range: 0,
         };
         let mut tracker = crate::StateTracker::new(SlotId(0), &info).expect("tracker");
         let view = WorldView {

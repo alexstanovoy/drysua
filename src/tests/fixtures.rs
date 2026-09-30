@@ -110,6 +110,8 @@ impl MatchInfoFixture {
                 mode: TickMode::Lockstep,
                 picks,
                 shop: Vec::new(),
+                fountains: [Vec2::ZERO; 2],
+                shop_range: 0,
             },
         }
     }

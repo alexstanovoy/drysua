@@ -5,7 +5,10 @@ use super::*;
 use crate::ppo_arena::game_summary::GameSummary;
 use crate::ppo_arena::{build_environment, issue_request, terminal_outcome};
 use crate::raze_aim::{SHADOWRAZE_RADIUS, facing_towards, raze_center};
-use crate::{ActionTarget, ControlledUnit, PointIndex, PointSource, StructuredAction, Teacher};
+use crate::{
+    ActionTarget, ControlledUnit, PointIndex, PointSource, ScriptKind, ScriptedPolicy,
+    StructuredAction, Teacher,
+};
 use bota_proto::{AbilitySlot, Fixed, MapId, Order, Target, Team, UnitKind, Vec2};
 use bota_server::game::{Entity, MELEE_CREEP, UnitOrder, World, wire_id};
 
@@ -448,5 +451,101 @@ fn raze_environment(
         }
         world.mana.get_mut(hero).expect("mana").mana = Fixed::from_int(150);
         configure(world, hero, enemy);
+    })
+}
+
+/// Decisions each rule policy gets beside the lone enemy tower.
+const TOWER_DECISIONS: usize = 10;
+
+/// A raze never targets a structure: with only the enemy tower under the far raze and the
+/// own wave tanking it, neither rule policy razes, no raze target mode is legal on the
+/// tower, and no raze point candidate counts it.
+#[test]
+fn no_rule_policy_or_raze_candidate_aims_a_raze_at_a_lone_enemy_tower() {
+    for kind in [ScriptKind::Teacher, ScriptKind::HarassPush] {
+        let mut environment = lone_tower_environment();
+        environment.seats[0].script = ScriptedPolicy::new(kind);
+        for decision in 0..TOWER_DECISIONS {
+            let seat = &mut environment.seats[0];
+            let (action, space) = seat
+                .script
+                .decide(&seat.tracker, &seat.persistence, &seat.readiness)
+                .expect("decision");
+            let tower = space
+                .entity_candidates()
+                .iter()
+                .position(|candidate| candidate.kind == UnitKind::Tower)
+                .expect("visible enemy tower");
+            for slot in 0..3 {
+                let at_tower = StructuredAction::Cast {
+                    unit: ControlledUnit::Hero,
+                    slot: AbilitySlot(slot),
+                    target: ActionTarget::Entity(crate::EntityIndex(tower)),
+                };
+                assert!(!space.allows(at_tower), "{kind:?} {decision}: slot {slot}");
+            }
+            assert!(
+                space.point_candidates().iter().all(|point| {
+                    point.source != PointSource::RazeCluster { reach: 700 }
+                        && point.raze_coverage.iter().all(|covered| covered.units == 0)
+                }),
+                "{kind:?} {decision}: a raze candidate counts the tower"
+            );
+            assert!(
+                !matches!(action, StructuredAction::Cast { unit: ControlledUnit::Hero, slot, .. } if slot.0 < 3),
+                "{kind:?} {decision}: razed beside the tower: {action:?}"
+            );
+            seat.local
+                .note_decision(space.tick(), action.kind())
+                .expect("decision history");
+            let issued = space.decode(action).expect("decode");
+            let request =
+                issue_request(seat, issued, &space, action.kind(), true).expect("request");
+            advance_interval(&mut environment, vec![request, None], 3).expect("ticks");
+        }
+    }
+}
+
+/// Shadow Fiend 900 from the Dire tower nearest mid, facing it with mana for every raze,
+/// two own melee creeps tanking the tower, and the enemy hero at the far corner.
+fn lone_tower_environment() -> TrainingEnvironment {
+    let mid = Vec2::from_ints(9_216, 9_216);
+    raze_environment(mid, 0, |world, hero, enemy| {
+        let tower = world
+            .entities
+            .iter()
+            .filter(|entity| {
+                world.kind.get(*entity) == Some(&UnitKind::Tower)
+                    && world.team.get(*entity) == Some(&Team::Dire)
+            })
+            .min_by_key(|entity| {
+                let at = world.transform.get(*entity).expect("tower position").pos;
+                (at.distance_squared(mid), *entity)
+            })
+            .expect("Dire tower");
+        let at = world.transform.get(tower).expect("tower position").pos;
+        let toward_mid = |distance: f64| {
+            let (dx, dy) = (
+                f64::from(mid.x.to_int() - at.x.to_int()),
+                f64::from(mid.y.to_int() - at.y.to_int()),
+            );
+            let scale = distance / dx.hypot(dy);
+            Vec2::from_ints(
+                at.x.to_int() + (dx * scale).round() as i32,
+                at.y.to_int() + (dy * scale).round() as i32,
+            )
+        };
+        let own = toward_mid(900.0);
+        let placed = world.transform.get_mut(hero).expect("own position");
+        placed.pos = own;
+        placed.facing.brads = facing_towards(own, at);
+        world.mana.get_mut(hero).expect("mana").mana = Fixed::from_int(400);
+        for offset in [-60, 60] {
+            let near = toward_mid(450.0);
+            let near = Vec2::from_ints(near.x.to_int() + offset, near.y.to_int() - offset);
+            world.spawn_creep(&MELEE_CREEP, Team::Radiant, near, 0, 0);
+        }
+        world.transform.get_mut(enemy).expect("enemy position").pos =
+            Vec2::from_ints(17_000, 17_000);
     })
 }

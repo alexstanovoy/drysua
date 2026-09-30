@@ -124,8 +124,9 @@ exception: it warm-starts from any runtime weights with the current parameter la
   instead of a turn and a cast that were rarely retained together.
 - **Teacher weaknesses** the policy has not found: it retreats at 40% HP without
   hysteresis, never pushes into tower range while the enemy hero is within 1,200,
-  spends its mana on creep and tower razes. HarassPush (`src/scripted/harass_push.rs`)
-  wins 83 of 200 `drysua duel` games against it (seeds 1–100, both sides). Before
+  spends its mana on creep razes. HarassPush (`src/scripted/harass_push.rs`)
+  wins 115 of 200 `drysua duel` games against it (seeds 1–100, both sides); it won 83
+  while razes still damaged towers and both scripts razed them. Before
   Teacher abandoned unreachable walks and Tango trees (`src/scripted/progress.rs`) it
   froze in most of those games and HarassPush won 195; E0 and every other number
   measured against Teacher before that fix are against the freezing Teacher.

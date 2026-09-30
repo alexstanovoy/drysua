@@ -151,5 +151,6 @@ fn equip(view: &mut WorldView, slot: usize, id: u16) {
         range: definition.range,
         aim: definition.aim,
         for_sale: false,
+        owner: SlotId(0),
     });
 }
