@@ -392,9 +392,8 @@ impl Teacher {
             return choice;
         }
         if let Some(action) = self
-            .raze_enemy(tracker, space, UnitKind::Hero)
+            .raze_hero(tracker, space)
             .or_else(|| self.requiem(tracker, space))
-            .or_else(|| self.raze_enemy(tracker, space, UnitKind::Tower))
         {
             return CombatChoice::plain(action);
         }
@@ -1142,52 +1141,12 @@ impl Teacher {
         })
     }
 
-    fn raze_enemy(
-        &self,
-        tracker: &StateTracker,
-        space: &ActionSpace,
-        kind: UnitKind,
-    ) -> Option<StructuredAction> {
+    fn raze_hero(&self, tracker: &StateTracker, space: &ActionSpace) -> Option<StructuredAction> {
         let hero = tracker.own_hero()?;
-        let view = tracker.current()?;
-        if kind == UnitKind::Hero {
-            let (target, enemy) = combat_victim(tracker, space, hero)?;
-            if best_hero_raze(tracker, space, hero, enemy, hero.facing.brads).is_some() {
-                return self
-                    .aim_raze(tracker, space, hero, enemy, target)
-                    .map(|choice| choice.action);
-            }
-            return None;
-        }
-        for (slot, ability) in hero.abilities.iter().enumerate() {
-            let Some(reach) = raze_reach(ability.id) else {
-                continue;
-            };
-            if !raze_ready(space, slot) {
-                continue;
-            }
-            let center = raze_center(hero.pos, hero.facing.brads, reach);
-            let struck = view.units.iter().find(|enemy| {
-                enemy.kind == kind
-                    && enemy.team != tracker.team()
-                    && enemy.team != Team::Neutral
-                    && enemy.hp > 0
-                    && magical_damage(raze_damage(ability.level), enemy.magic_resist) > 0
-                    && center.within(enemy.pos, Fixed::from_int(SHADOWRAZE_RADIUS))
-            });
-            if let Some(target) = struck.and_then(|enemy| space.entity_index(enemy.id)) {
-                let action = cast_at(slot, target);
-                return if self.facing_stable(tracker) {
-                    space.allows(action).then_some(action)
-                } else {
-                    let stop = StructuredAction::Stop {
-                        unit: ControlledUnit::Hero,
-                    };
-                    space.allows(stop).then_some(stop)
-                };
-            }
-        }
-        None
+        let (target, enemy) = combat_victim(tracker, space, hero)?;
+        best_hero_raze(tracker, space, hero, enemy, hero.facing.brads)?;
+        self.aim_raze(tracker, space, hero, enemy, target)
+            .map(|choice| choice.action)
     }
 
     fn requiem(&self, tracker: &StateTracker, space: &ActionSpace) -> Option<StructuredAction> {

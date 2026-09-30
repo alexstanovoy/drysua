@@ -1,7 +1,7 @@
 //! Shadow Fiend rule policy that harasses Teacher off the lane and pushes its tower meanwhile.
 //!
 //! Evidence from `drysua duel` shaped every rule here. Teacher spends its mana on razes at
-//! creeps, towers and heroes, walks home at 40% health with no hysteresis, and never walks into
+//! creeps and heroes, walks home at 40% health with no hysteresis, and never walks into
 //! tower range while an enemy hero stands within 1200. HarassPush therefore:
 //! - razes only once its facing has settled on the target (a turning hero sweeps 32 degrees a
 //!   tick, and a raze fires along the facing at resolution time);
@@ -9,7 +9,7 @@
 //!   (attacking it then, since it can only answer with attacks), or when Teacher sieges our
 //!   tower and a raze pair is ready;
 //! - otherwise hovers just outside Teacher's far-raze disk, which also denies its tower push;
-//! - with Teacher away, hits and razes the tower its wave tanks;
+//! - with Teacher away, hits the tower its wave tanks;
 //! - never idles in enemy tower range, backs off when bleeding, and walks home below 30% health.
 //!
 //! It buys nothing and learns razes first. Every action goes through the drysua action space
@@ -64,14 +64,12 @@ const TOWER_REACH: i32 = 868;
 const POST_TOWER_CLEARANCE: i32 = 950;
 /// Extra distance kept outside enemy tower attack range while walking.
 const TOWER_MARGIN: i32 = 150;
-/// An enemy hero this close to the own tower is razing or pushing it.
+/// An enemy hero this close to the own tower is pushing it.
 const TOWER_DEFENSE_DISTANCE: i32 = 1_300;
 /// Distance kept behind the own front creep while laning.
 const FRONT_OFFSET: i32 = 250;
 /// How far past the lane post the hero may drift while fighting creeps.
 const AHEAD_SLACK: i32 = 200;
-/// Mana kept for a two-raze trade before spending razes on structures.
-const HARASS_MANA_RESERVE: i32 = 160;
 /// Facing error (about 5.5 degrees) under which the hero has finished turning toward a target.
 const AIM_TOLERANCE_BRADS: u16 = 1_000;
 /// Allied creeps that must stand near the enemy tower before the hero hits it.
@@ -400,18 +398,8 @@ impl Turn<'_> {
         if tanks < TOWER_TANKS {
             return None;
         }
-        let (hero, space) = (self.hero, self.space);
-        let target = space.entity_index(tower.id)?;
-        if hero.mana >= HARASS_MANA_RESERVE
-            && let Some((slot, _, _)) = ready_razes(hero, space).find(|(_, reach, _)| {
-                raze_center(hero.pos, hero.facing.brads, *reach)
-                    .within(tower.pos, Fixed::from_int(SHADOWRAZE_RADIUS))
-            })
-            && space.allows(cast_at(slot, target))
-        {
-            return Some(cast_at(slot, target));
-        }
-        attack(space, target)
+        let target = self.space.entity_index(tower.id)?;
+        attack(self.space, target)
     }
 
     /// Last hits first; with no enemy hero around also hits the weakest creep in reach.

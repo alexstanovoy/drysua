@@ -17,6 +17,7 @@ use crate::raze_aim::{
     SHADOWRAZE_RADIUS, SHADOWRAZES, extrapolated_position, facing_towards, raze_center,
     within_reach_window,
 };
+use crate::tracker::is_structure;
 
 /// Raze-only candidates appended after the general point candidates.
 pub(super) const RAZE_POINT_CANDIDATES: usize = 16;
@@ -40,7 +41,7 @@ const _: () = assert!(CLUSTER_STEP as u32 * CLUSTER_HEADINGS as u32 == 65_536);
 /// Visible hostile units one raze landing would strike.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct RazeCoverage {
-    /// Live enemy or neutral units that are not heroes, structures included.
+    /// Live enemy or neutral units that are neither heroes nor structures.
     pub units: u8,
     /// Live enemy heroes.
     pub heroes: u8,
@@ -84,6 +85,7 @@ pub(super) fn raze_targets(
         .filter(|unit| {
             unit.team != tracker.team()
                 && unit.hp > 0
+                && !is_structure(unit.kind)
                 && !has_status(unit, StatusFlags::INVULNERABLE)
                 && origin.within(unit.pos, outermost)
         })

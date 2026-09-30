@@ -31,7 +31,7 @@ pub(crate) use test_support::*;
 /// Distance at which drysua permits stash swaps around the own fountain.
 pub const STASH_ACCESS_RANGE: i32 = 1_000;
 /// Version of the append-only structured-action schema.
-pub const ACTION_SCHEMA_VERSION: u32 = 7;
+pub const ACTION_SCHEMA_VERSION: u32 = 8;
 /// Canonical action families, head widths, and autoregressive branch order.
 pub const ACTION_SCHEMA_DESCRIPTOR: &str = concat!(
     "bota-drysua-action/v7;kinds=Continue,Stop,MovePoint,FollowUnit,Hold,AttackMovePoint,AttackUnit,Cast,Use,PutPoint,PutUnit,Take,Buy,Sell,Swap,Learn;",
@@ -41,10 +41,10 @@ pub const ACTION_SCHEMA_DESCRIPTOR: &str = concat!(
     "buy_mango=item42_one_charge_repeatable_home_bag_then_stash_remote_stash_empty_or_visible_compatible_stack_below3;",
     "use_mango=hero_active_slots0..5_unmuted_charges1..3_target_none_provable_positive_own_mana_deficit;",
     "mana_legality=all_casts_and_uses_conservative_own_wire_mana_affordability;",
-    "raze_legality=ready_none,ready_point_any_candidate_but_the_caster_position,ready_entity_live_enemy_or_neutral_candidate_within_reach_pm_radius250_plus1;",
+    "raze_legality=ready_none,ready_point_any_candidate_but_the_caster_position,ready_entity_live_enemy_or_neutral_nonstructure_candidate_within_reach_pm_radius250_plus1;",
     "raze_execution=none_casts_along_current_facing_at_once,entity_and_point_intents_decode_to_unit_and_pos_casts_resolved_by_aim_macro,entity_walk48_toward_one_tick_prediction_until_next_tick_landing_covers_it,point_heading_fixed_toward_point_at_decision_walk48_along_it_until_next_tick_landing_within25_of_heading_landing,then_untargeted_cast_limit15_ticks_continue_advances_other_decisions_replace;",
-    "point_candidates=general48_then_raze_only16:facing450,best_landing_per_reach_most_hostile_then_heroes_128_headings_widest_run_middle,fogged_enemy_heroes2_age_le150_last_seen_then_extrapolated,blind_ring8_between_tactical_directions450;raze_only_points_are_raze_targets_only;",
-    "move_point_legality=live_body_unstunned_unrooted_and_walkable_including_existing_building_landing;attack_move_point_legality=unchanged_building_landing_source_excluded;building_landing_provenance=unchanged_tp_walkability_allied_anchor_and_target_kind_checks,no_new_points_or_goal_features;",
+    "point_candidates=general48_then_raze_only16:facing450,best_landing_per_reach_most_hostile_nonstructure_then_heroes_128_headings_widest_run_middle,fogged_enemy_heroes2_age_le150_last_seen_then_extrapolated,blind_ring8_between_tactical_directions450;raze_only_points_are_raze_targets_only;",
+    "move_point_legality=live_body_unstunned_and_walkable_including_existing_building_landing;attack_move_point_legality=unchanged_building_landing_source_excluded;building_landing_provenance=unchanged_tp_walkability_allied_anchor_and_target_kind_checks,no_new_points_or_goal_features;",
     "entity_order=active_effect15_max_lexicographic_stacks_remaining_then_guarded13_inspired14_timers_then_prior_received_manual_hp_mana_report_semantics_before_opaque_id;",
 );
 /// Stable FNV-1a identity of [`ACTION_SCHEMA_DESCRIPTOR`].
@@ -2324,6 +2324,7 @@ fn raze_target_mask(
             target.relation,
             EntityRelation::Enemy | EntityRelation::Neutral
         ) && target.unit.hp > 0
+            && !is_structure(target.kind)
             && within_reach_window(state.unit.pos, target.position, reach);
     }
     mask

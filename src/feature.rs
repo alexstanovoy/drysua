@@ -447,7 +447,7 @@ pub const FEATURE_SCHEMA_DESCRIPTOR: &str = concat!(
     "unit_semantic_order=kind,canonical_position,canonical_facing,hp,max_hp,mana,max_mana,move_speed,attack_damage,attack_range,attack_time,attack_point,attack_speed,armor,magic_resistance,bound,collision,vision,true_sight,statuses,item_slot_count,free_item_slots,item_capacity_available,canonical_velocity,hp_delta,mana_delta,recent_damage,recent_cast,recent_attack;",
     "unit_memory=units_exact_current_pointer_order,own_units_fixed_hero_courier_current_or_remembered,remembered_units_nonown_hidden_cap32_lexicographic_complete_encoded_token,tracker_cap4096_evict_complete_oldest_invisible_last_seen_tick_cohorts,no_target_handles;",
     "point_candidates=cap64,deduplicate_position_keep_first_source,canonical_team_directions,generate:general_cap48_tactical_radii200_600_1200_in_E_NE_N_NW_W_SW_S_SE_order_then_allied_building_landings_then_nearest8_visible_or_static-baseline_trees_then_own_fountain_enemy_fountain_own_tower_enemy_tower_then_predicted_units,then_live_own_hero_raze_only_cap16_facing_then_best_landing_near_mid_far_then_fogged_enemy_heroes_last_seen_extrapolated_then_blind_ring8;",
-    "point_features=exact_action_pointer_prefix,present,pointer_valid,canonical_position,relative_position,distance,direction,source_category,direction_radius_kind_relation_parameters,walkable,standing_tree,allied_building,fog_sighting_age,raze_coverage_along_heading_to_point_units_and_heroes_per_reach_200_450_700_visible_hostile_live_uninvulnerable_within250_of_landing;",
+    "point_features=exact_action_pointer_prefix,present,pointer_valid,canonical_position,relative_position,distance,direction,source_category,direction_radius_kind_relation_parameters,walkable,standing_tree,allied_building,fog_sighting_age,raze_coverage_along_heading_to_point_units_and_heroes_per_reach_200_450_700_visible_hostile_live_uninvulnerable_nonstructure_within250_of_landing;",
     "point_order=building:distance_kind_canonical_landing_position_entity_id_identical_tie,tree:distance_canonical_position_planted,predicted:distance_source_relation_canonical_position_entity_id_identical_tie,landmark:distance_canonical_position_entity_id_identical_tie;shop_order=item_id;",
     "loot_candidates=current_visible,cap16,order:item_then_charges_then_position_then_entity_id_only_for_semantically_identical_ties;",
     "projectile_order=lexicographic_encoded_semantics,select_first32,feature_identical_ties_indistinguishable;",
@@ -510,7 +510,7 @@ pub const FEATURE_SCHEMA_HASH: u64 = crate::model::linked_schema_hash(
     &[(crate::ACTION_SCHEMA_VERSION, crate::ACTION_SCHEMA_HASH)],
 );
 
-const _: () = assert!(crate::ACTION_SCHEMA_VERSION == 7);
+const _: () = assert!(crate::ACTION_SCHEMA_VERSION == 8);
 const _: () = assert!(StatusFlags::INVULNERABLE == 1 << 9);
 const _: () = assert!(StatusFlags::CHANNELLING == 1 << 10);
 const _: () = assert!(global_feature::MAP2_REWARD_POTENTIAL + 1 == global_feature::RESERVED_START);
