@@ -7,7 +7,7 @@ use bota_proto::{DamageKind, EventKind, Fixed, MapId, ServerMsg, SlotId, Team, U
 
 use crate::raze_aim::{SHADOWRAZE_RADIUS, SHADOWRAZES, isqrt, raze_reach};
 use crate::scripted::tactics::{DECISION_TICKS, own_fountain};
-use crate::scripted::{ScriptedPolicy, StyleSpec, StyleValues};
+use crate::scripted::{ScriptedPolicy, StyleSpec, StyleValues, seat_seed};
 use crate::{
     Arena, ArenaConfig, ItemReadiness, OrderPersistence, RazeAim, Request, StateTracker,
     tracker::map_maximum_raw,
@@ -170,10 +170,7 @@ pub fn play_duel_game(
         } else {
             opponent
         };
-        let style_seed = seed
-            .wrapping_mul(2)
-            .wrapping_add(index as u64)
-            .wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        let style_seed = seat_seed(seed, index);
         styles[index] = spec.draw(style_seed);
         let script = ScriptedPolicy::styled(spec.kind(), &styles[index], style_seed);
         seats[index] = Some(DuelSeat::new(script, index, &messages)?);

@@ -11,7 +11,7 @@ pub(crate) mod tactics;
 #[cfg(feature = "builtin")]
 pub use duel::{DuelConfig, DuelEnd, DuelGame, DuelResult, play_duel_game, run_duel};
 pub use harass_push::{HarassPush, HarassStyle};
-pub use style::{StyleSpec, StyleValues};
+pub use style::{StyleSpec, StyleValues, seat_seed};
 
 use bota_proto::AbilitySlot;
 

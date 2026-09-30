@@ -517,6 +517,7 @@ fn load_opponents(settings: &AnnealedJobConfig) -> Result<OpponentPool, PpoError
         let kind = match opponent {
             AnnealedOpponent::Teacher => OpponentKind::Teacher,
             AnnealedOpponent::HarassPush => OpponentKind::HarassPush,
+            AnnealedOpponent::Styled(kind) => OpponentKind::Styled(*kind),
             AnnealedOpponent::SelfPlay => OpponentKind::SelfPlay,
             AnnealedOpponent::League => {
                 league = Some(League {
@@ -637,6 +638,9 @@ fn append_opponent_scope(
             }
             AnnealedOpponent::HarassPush => {
                 command_line.push_str(&format!(" --opponent harass-push:{weight}"))
+            }
+            AnnealedOpponent::Styled(kind) => {
+                command_line.push_str(&format!(" --opponent {}:{weight}", kind.styled_label()))
             }
             AnnealedOpponent::League => {
                 let league = pool

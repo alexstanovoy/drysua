@@ -201,6 +201,12 @@ fn knobs(kind: ScriptKind) -> impl Iterator<Item = &'static Knob> + Clone {
     NOISE_KNOBS.iter().chain(own)
 }
 
+/// The style seed of one seat of the game played on `arena_seed`.
+pub fn seat_seed(arena_seed: u64, seat: usize) -> u64 {
+    let mut state = arena_seed ^ (seat as u64).wrapping_add(1).wrapping_mul(STYLE_DOMAIN);
+    splitmix64(&mut state)
+}
+
 /// One step of splitmix64; also the noise stream of a styled policy.
 pub(crate) fn splitmix64(state: &mut u64) -> u64 {
     *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);

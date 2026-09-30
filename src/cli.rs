@@ -226,6 +226,7 @@ struct TrainAnnealedArgs {
     #[arg(long)]
     zero_updates: Option<u64>,
     /// Per-game opponent mixture entry, repeatable: `teacher[:weight]`, `harass-push[:weight]`,
+    /// `teacher-styled[:weight]` and `harass-push-styled[:weight]` (a style drawn per game),
     /// `self[:weight]`, `weights:<runtime weights directory>:<weight>` or `league:<weight>`
     /// (each of the latest --league-size learner snapshots); weights are exact decimals.
     #[arg(long = "opponent", default_value = "teacher:1", value_parser = parse_annealed_opponent)]
@@ -717,6 +718,12 @@ fn parse_annealed_opponent(
         None if value == "teacher" => Ok((crate::AnnealedOpponent::Teacher, one)),
         None if value == "self" => Ok((crate::AnnealedOpponent::SelfPlay, one)),
         None if value == "harass-push" => Ok((crate::AnnealedOpponent::HarassPush, one)),
+        None if let Some((kind, true)) = crate::ScriptKind::parse_label(value) => {
+            Ok((crate::AnnealedOpponent::Styled(kind), one))
+        }
+        Some((label, rest)) if let Some((kind, true)) = crate::ScriptKind::parse_label(label) => {
+            Ok((crate::AnnealedOpponent::Styled(kind), weight(rest)?))
+        }
         Some(("teacher", rest)) => Ok((crate::AnnealedOpponent::Teacher, weight(rest)?)),
         Some(("self", rest)) => Ok((crate::AnnealedOpponent::SelfPlay, weight(rest)?)),
         Some(("harass-push", rest)) => {
@@ -736,7 +743,7 @@ fn parse_annealed_opponent(
             ))
         }
         _ => Err(
-            "opponent must be teacher[:weight], harass-push[:weight], self[:weight], weights:<directory>:<weight> or league:<weight>"
+            "opponent must be teacher[:weight], harass-push[:weight], teacher-styled[:weight], harass-push-styled[:weight], self[:weight], weights:<directory>:<weight> or league:<weight>"
                 .to_owned(),
         ),
     }
@@ -974,6 +981,7 @@ fn run_eval(arguments: EvalArgs) -> std::io::Result<()> {
             .map(|name| name.to_string_lossy().into_owned())
             .ok_or_else(|| std::io::Error::other("weights directory has no name; pass --name"))?,
         (None, PlayerSpec::Script(kind)) => kind.label().to_owned(),
+        (None, PlayerSpec::Styled(kind)) => kind.styled_label().to_owned(),
         (None, PlayerSpec::Average(_)) => {
             return Err(std::io::Error::other("an average candidate needs --name"));
         }

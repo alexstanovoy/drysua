@@ -1,6 +1,7 @@
 //! Evaluation players and the opponent pool file.
 //!
-//! A player is a rule policy (`teacher`, `harass-push`), `weights:<dir>` or
+//! A player is a rule policy (`teacher`, `harass-push`), a rule policy drawing its
+//! styled preset per game (`teacher-styled`, `harass-push-styled`), `weights:<dir>` or
 //! `average:<dir>,<dir>,...`: the parameter mean of several runtime weights,
 //! e.g. the latest history snapshots. Its key names it across runs: the rule
 //! label, the weights file SHA-256, or a SHA-256 over the member hashes in order.
@@ -11,7 +12,6 @@ use std::sync::Arc;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::scripted::duel_cli::ScriptArg;
 use crate::{PolicyDevice, PolicyModel, PpoError, ScriptKind, TrainingArtifact};
 
 const POOL_SCHEMA: &str = "drysua-eval-pool/v1";
@@ -27,6 +27,7 @@ const MAX_EXECUTABLE_BYTES: u64 = 1024 * 1024 * 1024;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PlayerSpec {
     Script(ScriptKind),
+    Styled(ScriptKind),
     Weights(PathBuf),
     Average(Vec<PathBuf>),
 }
@@ -39,9 +40,11 @@ impl PlayerSpec {
             )
         };
         match value.split_once(':') {
-            None => <ScriptArg as clap::ValueEnum>::from_str(value, false)
-                .map(|script| Self::Script(script.into()))
-                .map_err(|_| invalid()),
+            None => match ScriptKind::parse_label(value) {
+                Some((kind, false)) => Ok(Self::Script(kind)),
+                Some((kind, true)) => Ok(Self::Styled(kind)),
+                None => Err(invalid()),
+            },
             Some(("weights", directory)) if !directory.is_empty() => {
                 Ok(Self::Weights(directory.into()))
             }
@@ -64,7 +67,7 @@ impl PlayerSpec {
     /// The same player with relative directories taken from `base`.
     fn resolved(self, base: &Path) -> Self {
         match self {
-            Self::Script(_) => self,
+            Self::Script(_) | Self::Styled(_) => self,
             Self::Weights(directory) => Self::Weights(base.join(directory)),
             Self::Average(members) => {
                 Self::Average(members.into_iter().map(|path| base.join(path)).collect())
@@ -82,6 +85,7 @@ impl PlayerSpec {
         };
         match self {
             Self::Script(kind) => kind.label().to_owned(),
+            Self::Styled(kind) => kind.styled_label().to_owned(),
             Self::Weights(directory) => format!("weights:{}", directory.display()),
             Self::Average(members) => format!("average:{}", join(members)),
         }
@@ -197,6 +201,7 @@ fn parse_pool(value: &Value, base: &Path) -> Result<Vec<PoolEntry>, String> {
 /// How a loaded player acts.
 pub(crate) enum Policy {
     Script(ScriptKind),
+    Styled(ScriptKind),
     Neural(Arc<PolicyModel>),
 }
 
@@ -208,7 +213,7 @@ pub(crate) struct Player {
 impl Player {
     pub(crate) fn model(&self) -> Option<&Arc<PolicyModel>> {
         match &self.policy {
-            Policy::Script(_) => None,
+            Policy::Script(_) | Policy::Styled(_) => None,
             Policy::Neural(model) => Some(model),
         }
     }
@@ -219,6 +224,10 @@ pub(crate) fn load_player(spec: &PlayerSpec, device: PolicyDevice) -> Result<Pla
         PlayerSpec::Script(kind) => Ok(Player {
             key: format!("script:{}", kind.label()),
             policy: Policy::Script(*kind),
+        }),
+        PlayerSpec::Styled(kind) => Ok(Player {
+            key: format!("script:{}", kind.styled_label()),
+            policy: Policy::Styled(*kind),
         }),
         PlayerSpec::Weights(directory) => Ok(Player {
             key: format!("weights:{}", weights_sha256(directory)?),

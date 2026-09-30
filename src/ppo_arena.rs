@@ -146,6 +146,8 @@ enum OpponentRuntime {
     Neural,
     Teacher,
     HarassPush,
+    /// A rule policy drawing its styled preset from the game's arena seed.
+    Styled(ScriptKind),
     /// Test fixture that always continues, keeping native worlds deterministic.
     #[cfg(test)]
     Idle,
@@ -564,8 +566,15 @@ fn build_environment(
     }
     .map_err(|error| PpoError::Model(error.to_string()))?;
     let mut seats = setup_seats(start)?;
-    if opponent == OpponentRuntime::HarassPush {
-        seats[1 - policy_seat].script = ScriptedPolicy::new(ScriptKind::HarassPush);
+    match opponent {
+        OpponentRuntime::HarassPush => {
+            seats[1 - policy_seat].script = ScriptedPolicy::new(ScriptKind::HarassPush);
+        }
+        OpponentRuntime::Styled(kind) => {
+            seats[1 - policy_seat].script =
+                ScriptedPolicy::styled_preset(kind, crate::seat_seed(seed, 1 - policy_seat));
+        }
+        _ => {}
     }
     Ok(TrainingEnvironment {
         arena,
@@ -770,7 +779,9 @@ fn scripted_request(
     runtime: OpponentRuntime,
 ) -> Result<Option<Request>, PpoError> {
     match runtime {
-        OpponentRuntime::Teacher | OpponentRuntime::HarassPush => teacher_request(seat),
+        OpponentRuntime::Teacher | OpponentRuntime::HarassPush | OpponentRuntime::Styled(_) => {
+            teacher_request(seat)
+        }
         OpponentRuntime::Neural => Err(PpoError::InvalidTransition(
             "neural opponent without a decision",
         )),
