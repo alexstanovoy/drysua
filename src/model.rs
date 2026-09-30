@@ -16,7 +16,7 @@ mod sampling;
 mod side_actors;
 #[cfg(test)]
 pub(crate) use side_actors::take_encoder_forwards_for_test;
-use side_actors::{ActorHead, ActorRouting};
+use side_actors::{ActorHead, ActorRouting, QueuedPair, StageRequest, StageValues};
 #[cfg(test)]
 #[path = "tests/model_side_actors.rs"]
 mod side_actor_tests;
@@ -1484,28 +1484,8 @@ impl PolicyModel {
     ) -> Result<Vec<PolicyOutput>, ModelError> {
         let routing = ActorRouting::new(frames, self.tensor_device(), false)?;
         let state = self.forward_frames(frames)?;
-        let values = self
-            .value
-            .forward(&state.trunk)?
-            .flatten_all()?
-            .to_vec1::<f32>()?;
-        validate_value_rows(&values, batch_offset)?;
-        let kinds = routing
-            .forward(self, ActorHead::Kind, &state.trunk)
-            .map_err(|error| match error {
-                ModelError::NonFiniteOutput {
-                    field,
-                    batch,
-                    index,
-                } => ModelError::NonFiniteOutput {
-                    field,
-                    batch: batch_offset + batch,
-                    index,
-                },
-                error => error,
-            })?
-            .to_vec2::<f32>()?;
-        collect_outputs(values, kinds, batch_offset)
+        let base = self.base_logits(&state, &routing, batch_offset)?;
+        collect_outputs(base.value, base.kind, batch_offset)
     }
 
     /// Selects one greedy legal structured action and returns its state value.
@@ -1659,7 +1639,7 @@ impl PolicyModel {
         mut rngs: Option<&mut [PpoRng]>,
     ) -> Result<Vec<BatchSelection>, ModelError> {
         let routing = ActorRouting::new(frames, self.tensor_device(), false)?;
-        let base = self.sampling_base_logits(&state, &routing)?;
+        let base = self.base_logits(&state, &routing, 0)?;
         let mut rows = initialize_sampling_rows(&base, action_spaces, &mut rngs)?;
         let kind = self.sampling_kind_logits(&state, &sampling_prefixes(&rows), &routing)?;
         select_sampling_units(&mut rows, &kind, action_spaces, &mut rngs)?;
@@ -2209,19 +2189,32 @@ impl PolicyModel {
         })
     }
 
-    fn sampling_base_logits(
+    /// Value and side-selected kind logits; errors report rows offset by `batch_offset`.
+    fn base_logits(
         &self,
         state: &ForwardState,
         routing: &ActorRouting,
+        batch_offset: usize,
     ) -> Result<SamplingBaseLogits, ModelError> {
-        let value = self.value.forward(&state.trunk)?.flatten_all()?.to_vec1()?;
-        validate_value_rows(&value, 0)?;
-        Ok(SamplingBaseLogits {
-            value,
-            kind: routing
-                .forward(self, ActorHead::Kind, &state.trunk)?
-                .to_vec2()?,
-        })
+        let mut request = StageRequest::new(state.trunk.dim(0)?);
+        let value = request.push(self.value.forward(&state.trunk)?)?;
+        let kind = routing.queue_pair(self, ActorHead::Kind, &state.trunk, &mut request)?;
+        let values = request.read()?;
+        let value = values.column(value);
+        validate_value_rows(&value, batch_offset)?;
+        let kind = routing.select(&values, kind).map_err(|error| match error {
+            ModelError::NonFiniteOutput {
+                field,
+                batch,
+                index,
+            } => ModelError::NonFiniteOutput {
+                field,
+                batch: batch_offset + batch,
+                index,
+            },
+            error => error,
+        })?;
+        Ok(SamplingBaseLogits { value, kind })
     }
 
     fn sampling_kind_logits(
@@ -2235,14 +2228,15 @@ impl PolicyModel {
             return Ok(SamplingKindLogits::default());
         }
         let context = self.sampling_context(&state.trunk, prefixes, SamplingContext::Kind)?;
+        let mut request = StageRequest::new(prefixes.len());
+        let mut queue =
+            |needed, head| self.queue_actor_head(needed, head, &context, routing, &mut request);
+        let controlled = queue(controlled, ActorHead::Controlled)?;
+        let learn = queue(learn, ActorHead::Learn)?;
+        let values = request.read()?;
         Ok(SamplingKindLogits {
-            controlled: self.sampling_actor_head(
-                controlled,
-                ActorHead::Controlled,
-                &context,
-                routing,
-            )?,
-            learn: self.sampling_actor_head(learn, ActorHead::Learn, &context, routing)?,
+            controlled: select_queued(routing, &values, controlled)?,
+            learn: select_queued(routing, &values, learn)?,
         })
     }
 
@@ -2268,25 +2262,26 @@ impl PolicyModel {
         }
         let [ability, item, shop, loot, entity, point] = needed;
         let context = self.sampling_context(&state.trunk, prefixes, SamplingContext::Unit)?;
+        let mut request = StageRequest::new(prefixes.len());
+        let mut queue =
+            |needed, head| self.queue_actor_head(needed, head, &context, routing, &mut request);
+        let ability = queue(ability, ActorHead::Ability)?;
+        let item = queue(item, ActorHead::Item)?;
+        let shop = queue(shop, ActorHead::Shop)?;
+        let loot = queue(loot, ActorHead::Loot)?;
+        let mut pointer = |needed, tokens, head| {
+            self.queue_pointer_head(needed, &context, tokens, head, routing, &mut request)
+        };
+        let entity = pointer(entity, &state.current_units, ActorHead::EntityQuery)?;
+        let point = pointer(point, &state.points, ActorHead::PointQuery)?;
+        let values = request.read()?;
         Ok(SamplingUnitLogits {
-            ability: self.sampling_actor_head(ability, ActorHead::Ability, &context, routing)?,
-            item: self.sampling_actor_head(item, ActorHead::Item, &context, routing)?,
-            shop: self.sampling_actor_head(shop, ActorHead::Shop, &context, routing)?,
-            loot: self.sampling_actor_head(loot, ActorHead::Loot, &context, routing)?,
-            entity: self.sampling_pointer_logits(
-                entity,
-                &context,
-                &state.current_units,
-                ActorHead::EntityQuery,
-                routing,
-            )?,
-            point: self.sampling_pointer_logits(
-                point,
-                &context,
-                &state.points,
-                ActorHead::PointQuery,
-                routing,
-            )?,
+            ability: select_queued(routing, &values, ability)?,
+            item: select_queued(routing, &values, item)?,
+            shop: select_queued(routing, &values, shop)?,
+            loot: select_queued(routing, &values, loot)?,
+            entity: pointer_queued(routing, &values, entity)?,
+            point: pointer_queued(routing, &values, point)?,
         })
     }
 
@@ -2312,39 +2307,35 @@ impl PolicyModel {
         }
         let [swap, target_mode, put_mode, entity, point] = needed;
         let context = self.sampling_context(&state.trunk, prefixes, SamplingContext::Slot)?;
+        let mut request = StageRequest::new(prefixes.len());
+        let mut queue =
+            |needed, head| self.queue_actor_head(needed, head, &context, routing, &mut request);
+        let swap = queue(swap, ActorHead::Swap)?;
+        let target_mode = queue(target_mode, ActorHead::TargetMode)?;
+        let put_mode = queue(put_mode, ActorHead::PutMode)?;
+        let mut pointer = |needed, tokens, head| {
+            self.queue_pointer_head(needed, &context, tokens, head, routing, &mut request)
+        };
+        let entity = pointer(entity, &state.current_units, ActorHead::EntityQuery)?;
+        let point = pointer(point, &state.points, ActorHead::PointQuery)?;
+        let values = request.read()?;
         Ok(SamplingSlotLogits {
-            swap: self.sampling_actor_head(swap, ActorHead::Swap, &context, routing)?,
-            target_mode: self.sampling_actor_head(
-                target_mode,
-                ActorHead::TargetMode,
-                &context,
-                routing,
-            )?,
-            put_mode: self.sampling_actor_head(put_mode, ActorHead::PutMode, &context, routing)?,
-            entity: self.sampling_pointer_logits(
-                entity,
-                &context,
-                &state.current_units,
-                ActorHead::EntityQuery,
-                routing,
-            )?,
-            point: self.sampling_pointer_logits(
-                point,
-                &context,
-                &state.points,
-                ActorHead::PointQuery,
-                routing,
-            )?,
+            swap: select_queued(routing, &values, swap)?,
+            target_mode: select_queued(routing, &values, target_mode)?,
+            put_mode: select_queued(routing, &values, put_mode)?,
+            entity: pointer_queued(routing, &values, entity)?,
+            point: pointer_queued(routing, &values, point)?,
         })
     }
 
-    fn sampling_actor_head(
+    fn queue_actor_head(
         &self,
         needed: bool,
         head: ActorHead,
         context: &Tensor,
         routing: &ActorRouting,
-    ) -> Result<Option<Vec<Vec<f32>>>, ModelError> {
+        request: &mut StageRequest,
+    ) -> Result<Option<QueuedPair>, ModelError> {
         if !needed {
             return Ok(None);
         }
@@ -2353,24 +2344,26 @@ impl PolicyModel {
         assert_eq!(width, DECODER_CONTEXT);
         #[cfg(test)]
         sampling::record_dispatch(batch);
-        Ok(Some(routing.forward(self, head, context)?.to_vec2()?))
+        routing.queue_pair(self, head, context, request).map(Some)
     }
 
-    fn sampling_pointer_logits(
+    fn queue_pointer_head(
         &self,
         needed: bool,
         context: &Tensor,
         tokens: &Tensor,
         head: ActorHead,
         routing: &ActorRouting,
-    ) -> Result<Option<Vec<Vec<f32>>>, ModelError> {
+        request: &mut StageRequest,
+    ) -> Result<Option<(QueuedPair, usize)>, ModelError> {
         if !needed {
             return Ok(None);
         }
         #[cfg(test)]
         sampling::record_dispatch(context.dim(0)?);
-        let query = routing.forward(self, head, context)?.unsqueeze(1)?;
-        Ok(Some(scaled_pointer_dot(tokens, &query)?.to_vec2()?))
+        routing
+            .queue_pointer(self, head, context, tokens, request)
+            .map(Some)
     }
 
     fn sampling_context(
@@ -2380,13 +2373,14 @@ impl PolicyModel {
         depth: SamplingContext,
     ) -> Result<Tensor, ModelError> {
         let batch = prefixes.len();
-        let kind = self.training_kind_embeddings(prefixes)?;
+        let upload = PrefixUpload::new(prefixes, self.tensor_device())?;
+        let kind = self.kind_embeddings(&upload)?;
         if matches!(depth, SamplingContext::Kind) {
             return self.kind_context_from_embedding(trunk, &kind);
         }
-        let unit = self.training_unit_embeddings(prefixes)?;
+        let unit = self.unit_embeddings(&upload)?;
         let slot = match depth {
-            SamplingContext::Slot => self.training_slot_embeddings(prefixes)?,
+            SamplingContext::Slot => self.slot_embeddings(&upload)?,
             SamplingContext::Kind | SamplingContext::Unit => {
                 Tensor::zeros((batch, SLOT_EMBEDDING), DType::F32, self.tensor_device())?
             }
@@ -2416,9 +2410,10 @@ impl PolicyModel {
         trunk: &Tensor,
         prefixes: &[TrainingPrefix],
     ) -> Result<TrainingContexts, ModelError> {
-        let kind = self.training_kind_embeddings(prefixes)?;
-        let unit = self.training_unit_embeddings(prefixes)?;
-        let slot = self.training_slot_embeddings(prefixes)?;
+        let upload = PrefixUpload::new(prefixes, self.tensor_device())?;
+        let kind = self.kind_embeddings(&upload)?;
+        let unit = self.unit_embeddings(&upload)?;
+        let slot = self.slot_embeddings(&upload)?;
         let zero_unit = Tensor::zeros(unit.shape(), DType::F32, self.tensor_device())?;
         let zero_slot = Tensor::zeros(slot.shape(), DType::F32, self.tensor_device())?;
         Ok(TrainingContexts {
@@ -2428,63 +2423,36 @@ impl PolicyModel {
         })
     }
 
-    fn training_kind_embeddings(&self, prefixes: &[TrainingPrefix]) -> Result<Tensor, ModelError> {
-        let indices = prefixes
-            .iter()
-            .map(|prefix| prefix.kind.index() as u32)
-            .collect::<Vec<_>>();
-        let indices = Tensor::from_vec(indices, prefixes.len(), self.tensor_device())?;
-        self.kind_embedding_from_indices(&indices)
-    }
-
-    fn kind_embedding_from_indices(&self, indices: &Tensor) -> Result<Tensor, ModelError> {
-        assert_eq!(indices.rank(), 1);
-        assert_eq!(indices.dtype(), DType::U32);
+    fn kind_embeddings(&self, upload: &PrefixUpload) -> Result<Tensor, ModelError> {
         Ok(self
             .kind_embedding
             .value
             .as_tensor()
-            .index_select(indices, 0)?)
+            .index_select(&upload.indices(PrefixIndex::Kind)?, 0)?)
     }
 
-    fn training_unit_embeddings(&self, prefixes: &[TrainingPrefix]) -> Result<Tensor, ModelError> {
-        let indices = prefixes
-            .iter()
-            .map(|prefix| prefix.unit.map_or(0, ControlledUnit::index) as u32)
-            .collect::<Vec<_>>();
-        let presence = prefixes
-            .iter()
-            .map(|prefix| prefix.unit.is_some() as u8 as f32)
-            .collect::<Vec<_>>();
-        let indices = Tensor::from_vec(indices, prefixes.len(), self.tensor_device())?;
-        let presence = Tensor::from_vec(presence, (prefixes.len(), 1), self.tensor_device())?;
+    fn unit_embeddings(&self, upload: &PrefixUpload) -> Result<Tensor, ModelError> {
         Ok(self
             .unit_embedding
             .value
             .as_tensor()
-            .index_select(&indices, 0)?
-            .broadcast_mul(&presence)?)
+            .index_select(&upload.indices(PrefixIndex::Unit)?, 0)?
+            .broadcast_mul(&upload.mask(PrefixMask::Unit)?)?)
     }
 
-    fn training_slot_embeddings(&self, prefixes: &[TrainingPrefix]) -> Result<Tensor, ModelError> {
-        let ability = training_slot_indices(prefixes, true);
-        let item = training_slot_indices(prefixes, false);
-        let ability_indices = Tensor::from_vec(ability.0, prefixes.len(), self.tensor_device())?;
-        let item_indices = Tensor::from_vec(item.0, prefixes.len(), self.tensor_device())?;
-        let ability_mask = Tensor::from_vec(ability.1, (prefixes.len(), 1), self.tensor_device())?;
-        let item_mask = Tensor::from_vec(item.1, (prefixes.len(), 1), self.tensor_device())?;
+    fn slot_embeddings(&self, upload: &PrefixUpload) -> Result<Tensor, ModelError> {
         let ability = self
             .ability_embedding
             .value
             .as_tensor()
-            .index_select(&ability_indices, 0)?
-            .broadcast_mul(&ability_mask)?;
+            .index_select(&upload.indices(PrefixIndex::Ability)?, 0)?
+            .broadcast_mul(&upload.mask(PrefixMask::Ability)?)?;
         let item = self
             .item_embedding
             .value
             .as_tensor()
-            .index_select(&item_indices, 0)?
-            .broadcast_mul(&item_mask)?;
+            .index_select(&upload.indices(PrefixIndex::Item)?, 0)?
+            .broadcast_mul(&upload.mask(PrefixMask::Item)?)?;
         Ok((ability + item)?)
     }
 
@@ -4050,6 +4018,98 @@ fn sum_training_tensors(output: &PolicyTensorTensors) -> Result<Tensor, ModelErr
         loss = (loss + tensor.sum_all()?)?;
     }
     Ok(loss)
+}
+
+/// Validated side-selected rows of one optionally queued actor head.
+fn select_queued(
+    routing: &ActorRouting,
+    values: &StageValues,
+    pair: Option<QueuedPair>,
+) -> Result<Option<Vec<Vec<f32>>>, ModelError> {
+    pair.map(|pair| routing.select(values, pair)).transpose()
+}
+
+/// Pointer scores of one optionally queued pointer head after validating its raw query pair.
+fn pointer_queued(
+    routing: &ActorRouting,
+    values: &StageValues,
+    pointer: Option<(QueuedPair, usize)>,
+) -> Result<Option<Vec<Vec<f32>>>, ModelError> {
+    pointer
+        .map(|(pair, scores)| {
+            routing.validate(values, pair)?;
+            Ok(values.rows(scores))
+        })
+        .transpose()
+}
+
+#[derive(Clone, Copy)]
+enum PrefixIndex {
+    Kind,
+    Unit,
+    Ability,
+    Item,
+}
+
+#[derive(Clone, Copy)]
+enum PrefixMask {
+    Unit,
+    Ability,
+    Item,
+}
+
+/// Embedding indices and presence masks of one prefix batch, uploaded with two copies
+/// instead of one per field; views select the same values the per-field uploads held.
+struct PrefixUpload {
+    batch: usize,
+    indices: Tensor,
+    masks: Tensor,
+}
+
+impl PrefixUpload {
+    fn new(prefixes: &[TrainingPrefix], device: &Device) -> Result<Self, ModelError> {
+        let batch = prefixes.len();
+        assert!((1..=MODEL_PPO_MAX_MICROBATCH).contains(&batch));
+        let (ability, ability_mask) = training_slot_indices(prefixes, true);
+        let (item, item_mask) = training_slot_indices(prefixes, false);
+        let mut indices = Vec::with_capacity(4 * batch);
+        indices.extend(prefixes.iter().map(|prefix| prefix.kind.index() as u32));
+        indices.extend(
+            prefixes
+                .iter()
+                .map(|prefix| prefix.unit.map_or(0, ControlledUnit::index) as u32),
+        );
+        indices.extend(ability);
+        indices.extend(item);
+        let mut masks = Vec::with_capacity(3 * batch);
+        masks.extend(
+            prefixes
+                .iter()
+                .map(|prefix| prefix.unit.is_some() as u8 as f32),
+        );
+        masks.extend(ability_mask);
+        masks.extend(item_mask);
+        assert_eq!(indices.len(), 4 * batch);
+        assert_eq!(masks.len(), 3 * batch);
+        Ok(Self {
+            batch,
+            indices: Tensor::from_vec(indices, 4 * batch, device)?,
+            masks: Tensor::from_vec(masks, 3 * batch, device)?,
+        })
+    }
+
+    fn indices(&self, field: PrefixIndex) -> Result<Tensor, ModelError> {
+        Ok(self
+            .indices
+            .narrow(0, field as usize * self.batch, self.batch)?)
+    }
+
+    fn mask(&self, field: PrefixMask) -> Result<Tensor, ModelError> {
+        Ok(self
+            .masks
+            .narrow(0, field as usize * self.batch, self.batch)?
+            .reshape((self.batch, 1))?)
+    }
 }
 
 struct ForwardState {

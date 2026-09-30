@@ -129,8 +129,111 @@ impl PolicyModel {
 
 pub(super) struct ActorRouting {
     mask: Tensor,
+    /// Host copy of `mask`: one means the radiant head, zero the dire head.
+    sides: Vec<u8>,
     training: bool,
     raw: RefCell<[Option<[Tensor; 2]>; 12]>,
+}
+
+/// Queued raw radiant and dire outputs of one actor head inside a [`StageRequest`].
+#[derive(Clone, Copy)]
+pub(super) struct QueuedPair {
+    head: ActorHead,
+    radiant: usize,
+    dire: usize,
+}
+
+/// Row-major `[batch, width]` tensors of one sampling stage, read back with one device
+/// synchronization instead of one readback and one finiteness check per head.
+pub(super) struct StageRequest {
+    batch: usize,
+    tensors: Vec<Tensor>,
+}
+
+/// Host values of one [`StageRequest`], in queue order.
+pub(super) struct StageValues {
+    batch: usize,
+    values: Vec<f32>,
+    ranges: Vec<(usize, usize)>,
+}
+
+impl StageRequest {
+    pub(super) fn new(batch: usize) -> Self {
+        assert!((1..=MODEL_PPO_MAX_MICROBATCH).contains(&batch));
+        Self {
+            batch,
+            tensors: Vec::with_capacity(2 * ActorHead::ALL.len() + 3),
+        }
+    }
+
+    /// Queues one `[batch, width]` tensor and returns its index.
+    pub(super) fn push(&mut self, tensor: Tensor) -> Result<usize, ModelError> {
+        let (rows, width) = tensor.dims2()?;
+        assert_eq!(rows, self.batch);
+        assert!((1..=UNIT_EMBEDDING).contains(&width));
+        assert_eq!(tensor.dtype(), DType::F32);
+        assert!(self.tensors.len() < 2 * ActorHead::ALL.len() + 3);
+        self.tensors.push(tensor);
+        Ok(self.tensors.len() - 1)
+    }
+
+    pub(super) fn read(self) -> Result<StageValues, ModelError> {
+        assert!(!self.tensors.is_empty());
+        let mut ranges = Vec::with_capacity(self.tensors.len());
+        let mut total = 0usize;
+        let mut flat = Vec::with_capacity(self.tensors.len());
+        for tensor in &self.tensors {
+            let count = tensor.elem_count();
+            ranges.push((total, tensor.dim(1)?));
+            total += count;
+            flat.push(tensor.detach().flatten_all()?);
+        }
+        assert!(total <= MODEL_PPO_MAX_MICROBATCH * 1_200);
+        let packed = if flat.len() == 1 {
+            flat.pop().expect("one tensor").force_contiguous()?
+        } else {
+            Tensor::cat(&flat, 0)?
+        };
+        let values = packed.to_vec1::<f32>()?;
+        assert_eq!(values.len(), total);
+        Ok(StageValues {
+            batch: self.batch,
+            values,
+            ranges,
+        })
+    }
+}
+
+impl StageValues {
+    fn slice(&self, index: usize) -> (&[f32], usize) {
+        let (offset, width) = self.ranges[index];
+        (&self.values[offset..offset + self.batch * width], width)
+    }
+
+    /// One queued tensor split into host rows.
+    pub(super) fn rows(&self, index: usize) -> Vec<Vec<f32>> {
+        let (values, width) = self.slice(index);
+        values.chunks_exact(width).map(<[f32]>::to_vec).collect()
+    }
+
+    /// One queued `[batch, 1]` tensor as a column.
+    pub(super) fn column(&self, index: usize) -> Vec<f32> {
+        let (values, width) = self.slice(index);
+        assert_eq!(width, 1);
+        values.to_vec()
+    }
+
+    fn validate(&self, index: usize, field: &'static str) -> Result<(), ModelError> {
+        let (values, width) = self.slice(index);
+        match values.iter().position(|value| !value.is_finite()) {
+            Some(position) => Err(ModelError::NonFiniteOutput {
+                field,
+                batch: position / width,
+                index: position % width,
+            }),
+            None => Ok(()),
+        }
+    }
 }
 
 impl ActorRouting {
@@ -148,10 +251,86 @@ impl ActorRouting {
             .map(|(index, frame)| side_row(frame, index))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
-            mask: Tensor::from_vec(rows, (frames.len(), 1), device)?,
+            mask: Tensor::from_slice(&rows, (frames.len(), 1), device)?,
+            sides: rows,
             training,
             raw: RefCell::new(std::array::from_fn(|_| None)),
         })
+    }
+
+    /// Queues both raw outputs of one actor head for host-side validation and selection.
+    pub(super) fn queue_pair(
+        &self,
+        model: &PolicyModel,
+        head: ActorHead,
+        input: &Tensor,
+        request: &mut StageRequest,
+    ) -> Result<QueuedPair, ModelError> {
+        assert!(!self.training);
+        let [radiant, dire] = model.raw_actor_pair(head, input)?;
+        assert_eq!(radiant.dims(), dire.dims());
+        Ok(QueuedPair {
+            head,
+            radiant: request.push(radiant)?,
+            dire: request.push(dire)?,
+        })
+    }
+
+    /// Queues one pointer head: its raw query pair for validation and the scores of the
+    /// device-selected query against `tokens`.
+    pub(super) fn queue_pointer(
+        &self,
+        model: &PolicyModel,
+        head: ActorHead,
+        input: &Tensor,
+        tokens: &Tensor,
+        request: &mut StageRequest,
+    ) -> Result<(QueuedPair, usize), ModelError> {
+        assert!(!self.training);
+        let [radiant, dire] = model.raw_actor_pair(head, input)?;
+        assert_eq!(radiant.dims(), dire.dims());
+        assert_eq!(radiant.dim(0)?, self.mask.dim(0)?);
+        let query = self
+            .mask
+            .broadcast_as(radiant.shape())?
+            .where_cond(&radiant, &dire)?
+            .unsqueeze(1)?;
+        let scores = scaled_pointer_dot(tokens, &query)?;
+        let pair = QueuedPair {
+            head,
+            radiant: request.push(radiant)?,
+            dire: request.push(dire)?,
+        };
+        Ok((pair, request.push(scores)?))
+    }
+
+    /// Validates one queued pair exactly like `forward` and returns the side-selected rows.
+    pub(super) fn select(
+        &self,
+        values: &StageValues,
+        pair: QueuedPair,
+    ) -> Result<Vec<Vec<f32>>, ModelError> {
+        self.validate(values, pair)?;
+        let (radiant, width) = values.slice(pair.radiant);
+        let (dire, _) = values.slice(pair.dire);
+        assert_eq!(radiant.len(), self.sides.len() * width);
+        Ok(self
+            .sides
+            .iter()
+            .zip(radiant.chunks_exact(width).zip(dire.chunks_exact(width)))
+            .map(|(&side, (radiant, dire))| if side == 1 { radiant } else { dire }.to_vec())
+            .collect())
+    }
+
+    /// Validates one queued pair in the radiant-then-dire order of `forward`.
+    pub(super) fn validate(
+        &self,
+        values: &StageValues,
+        pair: QueuedPair,
+    ) -> Result<(), ModelError> {
+        let names = pair.head.fields();
+        values.validate(pair.radiant, names[0])?;
+        values.validate(pair.dire, names[1])
     }
 
     pub(super) fn forward(
