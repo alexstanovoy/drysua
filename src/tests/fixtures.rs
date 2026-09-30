@@ -152,46 +152,21 @@ impl MatchInfoFixture {
     }
 }
 
-/// Flattens a frame in encoder order, limiting a category to its leading terms
-/// when a frozen layout captured only those.
-pub(super) fn feature_values(
-    frame: &FeatureFrame,
-    global_limit: Option<usize>,
-    unit_limit: Option<usize>,
-) -> impl Iterator<Item = f32> + '_ {
-    fn prefix(values: &[f32], limit: Option<usize>) -> &[f32] {
-        match limit {
-            Some(limit) => &values[..limit],
-            None => values,
-        }
-    }
-    prefix(&frame.global, global_limit)
+/// Flattens a frame in encoder order.
+pub(super) fn feature_values(frame: &FeatureFrame) -> impl Iterator<Item = f32> + '_ {
+    frame
+        .global
         .iter()
+        .chain(frame.history.iter().flatten())
+        .chain(frame.policy_history.iter().flatten())
+        .chain(frame.units.iter().flatten())
+        .chain(frame.own_units.iter().flatten())
+        .chain(frame.remembered_units.iter().flatten())
+        .chain(frame.points.iter().flatten())
+        .chain(frame.abilities.iter().flatten())
+        .chain(frame.items.iter().flatten())
+        .chain(frame.projectiles.iter().flatten())
+        .chain(frame.loot.iter().flatten())
+        .chain(frame.map.iter())
         .copied()
-        .chain(frame.history.iter().flatten().copied())
-        .chain(frame.policy_history.iter().flatten().copied())
-        .chain(
-            frame
-                .units
-                .iter()
-                .flat_map(move |row| prefix(row, unit_limit).iter().copied()),
-        )
-        .chain(
-            frame
-                .own_units
-                .iter()
-                .flat_map(move |row| prefix(row, unit_limit).iter().copied()),
-        )
-        .chain(
-            frame
-                .remembered_units
-                .iter()
-                .flat_map(move |row| prefix(row, unit_limit).iter().copied()),
-        )
-        .chain(frame.points.iter().flatten().copied())
-        .chain(frame.abilities.iter().flatten().copied())
-        .chain(frame.items.iter().flatten().copied())
-        .chain(frame.projectiles.iter().flatten().copied())
-        .chain(frame.loot.iter().flatten().copied())
-        .chain(frame.map.iter().copied())
 }

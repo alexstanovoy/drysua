@@ -84,8 +84,8 @@ Reward: [reward.md](reward.md) (version 8, outcome plus potential-based shaping)
 
 ## Versions
 
-Every contract carries a version and hash: action schema 7, feature schema 24, model
-schema 26 (1,878,775 parameters), checkpoint format 20 (collection state v2), reward 8. Backward
+Every contract carries a version and hash: action schema 8, feature schema 26, model
+schema 27 (2,004,663 parameters), checkpoint format 20 (collection state v2), reward 8. Backward
 compatibility is not kept: a change bumps the version and old artifacts are
 rejected; old bots are played from their git commit. `--initial-weights` is the one
 exception: it warm-starts from any runtime weights, reusing every tensor whose name and

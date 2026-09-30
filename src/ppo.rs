@@ -49,9 +49,10 @@ pub const PPO_STORAGE_PEAK_BYTES: u64 = crate::feature::FEATURE_ARENA_PEAK_BYTES
         * (std::mem::size_of::<CompactPpoTransition>()
             + std::mem::size_of::<CompactPreparedSample>()
             + std::mem::size_of::<usize>()) as u64
-    + MODEL_MAX_BATCH as u64 * std::mem::size_of::<PpoPreparedSample>() as u64;
+    + MODEL_MAX_BATCH as u64
+        * (std::mem::size_of::<PpoPreparedSample>() + crate::FEATURE_FRAME_HEAP_BYTES) as u64;
 const _: () = assert!(PPO_MAX_SAMPLES == 33_280);
-const _: () = assert!(PPO_STORAGE_PEAK_BYTES < 6 * 1024 * 1024 * 1024);
+const _: () = assert!(PPO_STORAGE_PEAK_BYTES < 10 * 1024 * 1024 * 1024);
 /// Maximum decisions retained from each environment in one policy update.
 /// Maximum updates between a sample's behaviour weights and the learner: one
 /// pipelined update plus an interval that straddles an update boundary.
@@ -104,8 +105,8 @@ pub const PPO_SCHEMA_HASH: u64 = crate::model::linked_schema_hash(
 );
 
 const _: () = assert!(ACTION_SCHEMA_VERSION == 8);
-const _: () = assert!(FEATURE_SCHEMA_VERSION == 25);
-const _: () = assert!(MODEL_SCHEMA_VERSION == 26);
+const _: () = assert!(FEATURE_SCHEMA_VERSION == 26);
+const _: () = assert!(MODEL_SCHEMA_VERSION == 27);
 const _: () = assert!(PPO_RULES_AUDIT_VERSION == 32);
 
 /// PPO hyperparameters and bounded rollout dimensions.

@@ -3,7 +3,7 @@
 use super::feature::{encode, match_info, world_view};
 use crate::{
     ActionSpace, FeatureEncoder, FeatureFrame, ItemReadiness, LocalPolicyState, Map2RewardEnd,
-    StateTracker, unit_feature,
+    StateTracker, global_feature, unit_feature,
 };
 use bota_proto::{
     EffectId, EffectView, EntityId, EventKind, MapId, MatchInfo, SlotId, Team, WorldView,
@@ -23,7 +23,9 @@ fn map_metadata_selects_strict_reward_or_independent_legacy_streams() {
             tracker
                 .observe_snapshot(&world_view(Team::Radiant, 1))
                 .expect("independent snapshot");
-            assert_eq!(&frame(&tracker).global()[72..], &[0.0; 20]);
+            let slots =
+                global_feature::MAP2_OWN_TOWER_HEALTH..=global_feature::MAP2_REWARD_POTENTIAL;
+            assert_eq!(&frame(&tracker).global()[slots], &[0.0; 8]);
             tracker
                 .observe_snapshot(&world_view(Team::Radiant, 30))
                 .expect("sparse snapshot");
@@ -201,10 +203,17 @@ fn replacement_and_observed_death_clear_raze_before_its_timer_expires() {
         };
         advance(&mut tracker, &mut view, &events);
         let frame = frame(&tracker);
-        assert_eq!(&frame.own_units()[0][73..76], &[0.0; 3]);
+        let own_row = &frame.own_units()[0];
         assert_eq!(
-            frame.own_units()[0][unit_feature::REMEMBERED],
-            f32::from(died)
+            &own_row[unit_feature::RAZE_EFFECT_PRESENT..=unit_feature::RAZE_TICKS_LEFT],
+            &[0.0; 3]
+        );
+        assert_eq!(
+            [
+                own_row[unit_feature::TOKEN_PRESENT],
+                own_row[unit_feature::VISIBLE]
+            ],
+            [1.0, f32::from(!died)]
         );
         if !died {
             assert!(tracker.entity(own).is_none());

@@ -31,7 +31,7 @@ fn fresh_session_imports_only_initial_parameters_and_resets_all_training_state()
     )
     .unwrap();
     let actual = session.model.export_parameters().unwrap();
-    assert_eq!(actual.len(), 1_878_775);
+    assert_eq!(actual.len(), crate::MODEL_PARAMETER_COUNT);
     assert!(
         actual
             .iter()
