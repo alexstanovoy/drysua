@@ -20,6 +20,9 @@ mod invocation_tests;
 mod neural_opponent_scope;
 #[path = "annealed_seed.rs"]
 mod seed_tests;
+#[cfg(unix)]
+#[path = "annealed_session.rs"]
+mod session_tests;
 #[path = "training_microbatch_scope.rs"]
 mod training_microbatch_scope;
 
@@ -160,6 +163,7 @@ fn settings(seed: u64, updates: u64) -> AnnealedJobConfig {
         execution: crate::TrainingExecutionOptions::default(),
         updates,
         invocation_updates: None,
+        history: None,
         games_per_update: 2,
         parallel_worlds: 2,
         games_per_generation: 2,

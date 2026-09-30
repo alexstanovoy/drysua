@@ -221,9 +221,6 @@ struct OptimizerArgs {
 /// Persistence controls; a run cannot initialize and resume together.
 #[derive(Args)]
 struct CheckpointArgs {
-    /// Monotonic wall-clock seconds between durable checkpoints.
-    #[arg(long, default_value_t = 300)]
-    checkpoint_seconds: u64,
     /// Existing empty directory for a fresh run, or checkpoint directory when resuming.
     #[arg(long)]
     checkpoint_directory: std::path::PathBuf,
@@ -233,6 +230,12 @@ struct CheckpointArgs {
     /// Resume strict model, optimizer, counters, RNG state and collection progress.
     #[arg(long, default_value_t = false)]
     resume: bool,
+    /// Existing directory receiving runtime weights `u<update>/` at milestones.
+    #[arg(long, requires = "history_every")]
+    history_directory: Option<std::path::PathBuf>,
+    /// Milestone spacing in updates; the final update is always exported.
+    #[arg(long, requires = "history_directory", value_parser = clap::builder::RangedU64ValueParser::<std::num::NonZeroU64>::new().range(1..=crate::MAX_TRAINING_COUNTER))]
+    history_every: Option<std::num::NonZeroU64>,
 }
 
 /// Parses command line arguments and plays one match.
@@ -331,6 +334,7 @@ fn run_train_annealed_with_settings(
 ) -> std::io::Result<()> {
     crate::ppo_arena::validate_annealed(&settings, Default::default())
         .map_err(std::io::Error::other)?;
+    crate::training_signals::install()?;
     let device = arguments.device.policy_device(arguments.device_ordinal)?;
     validate_checkpoint_directory(
         &arguments.checkpoint.checkpoint_directory,
@@ -391,6 +395,12 @@ fn run_train_annealed_with_settings(
     report
         .map2_reward
         .log("invocation", report.completed_updates);
+    if crate::training_signals::stop_requested() {
+        println!(
+            "level=INFO event=training_stopped reason=signal completed_updates={}",
+            report.completed_updates
+        );
+    }
     Ok(())
 }
 
@@ -531,6 +541,7 @@ impl TrainAnnealedArgs {
             },
             updates: self.updates,
             invocation_updates: self.invocation_updates,
+            history: self.checkpoint.history()?,
             games_per_update: self.games,
             parallel_worlds: self.parallel,
             games_per_generation: self.generation_games,
@@ -539,7 +550,8 @@ impl TrainAnnealedArgs {
             scale,
             opponent,
             ppo,
-            checkpoint_cadence: self.checkpoint.cadence(),
+            // Every update commits: a stop or crash loses at most the in-flight update.
+            checkpoint_cadence: crate::TrainingCheckpointCadence::Updates(1),
             git_commit,
             simulator_commit,
         })
@@ -745,10 +757,27 @@ impl OptimizerArgs {
 
 #[cfg(feature = "builtin")]
 impl CheckpointArgs {
-    fn cadence(&self) -> crate::TrainingCheckpointCadence {
-        crate::TrainingCheckpointCadence::WallTime(std::time::Duration::from_secs(
-            self.checkpoint_seconds,
-        ))
+    fn history(&self) -> std::io::Result<Option<crate::RuntimeHistory>> {
+        let (Some(directory), Some(every)) = (&self.history_directory, self.history_every) else {
+            return Ok(None);
+        };
+        if !directory.is_dir() {
+            return Err(std::io::Error::other(
+                "history directory must already exist and be a directory",
+            ));
+        }
+        if directory.starts_with(&self.checkpoint_directory)
+            || self.checkpoint_directory.starts_with(directory)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "history and checkpoint directories must not contain each other",
+            ));
+        }
+        Ok(Some(crate::RuntimeHistory {
+            directory: directory.clone(),
+            every,
+        }))
     }
 }
 
