@@ -189,27 +189,30 @@ fn simulation_thread_count_never_changes_training_bits() {
 }
 
 #[test]
-fn mixed_opponents_resume_in_flight_neural_games_exactly() {
+fn pfsp_league_mixtures_resume_in_flight_neural_games_exactly() {
     let weights = test_directory("mixed-opponent-weights");
     let frozen = PolicyModel::fresh(0x0dd).expect("frozen opponent");
     TrainingArtifact::save_runtime_weights(&frozen, &weights).expect("frozen weights");
-    let mut config = settings(23_076, 2);
+    let mut config = settings(23_074, 6);
     config.slots = 4;
-    config.ppo.samples_per_update = 10;
+    config.ppo.samples_per_update = 40;
+    config.league_size = 4;
+    config.league_every = 2;
     config.opponents = vec![
         (AnnealedOpponent::Teacher, one()),
         (AnnealedOpponent::HarassPush, one()),
         (AnnealedOpponent::SelfPlay, one()),
         (AnnealedOpponent::Weights(weights.clone()), one()),
+        (AnnealedOpponent::League, one()),
     ];
     let uninterrupted = test_directory("mixed-uninterrupted");
     let resumed = test_directory("mixed-resumed");
     run(config.clone(), &uninterrupted, false).expect("uninterrupted mixture");
     let stopped = AnnealedHarness {
-        stop_after: Some(1),
+        stop_after: Some(4),
         ..harness()
     };
-    run_with(config.clone(), stopped, &resumed, false).expect("first update");
+    run_with(config.clone(), stopped, &resumed, false).expect("first updates");
     let artifact = TrainingArtifact::load(&resumed).expect("checkpoint");
     let state =
         crate::ppo_arena::collector_state::CollectorState::decode(&artifact.collection().state)
@@ -218,20 +221,27 @@ fn mixed_opponents_resume_in_flight_neural_games_exactly() {
         state.slots.iter().any(|slot| !slot.log.opponent.is_empty()),
         "a neural opponent game is in flight at the boundary"
     );
-    let in_flight = |kind| state.slots.iter().any(|slot| slot.plan.opponent == kind);
-    for kind in [
-        OpponentKind::Teacher,
-        OpponentKind::HarassPush,
-        OpponentKind::SelfPlay,
-        OpponentKind::Snapshot(0),
-    ] {
-        assert!(
-            in_flight(kind),
-            "{kind:?} game is in flight at the boundary"
-        );
-    }
+    let league = |kind: &OpponentKind| matches!(kind, OpponentKind::League(_));
+    assert!(state.mixture.entries().iter().any(|(kind, _)| league(kind)));
+    assert!(state.outcomes.entries.iter().any(|(kind, _)| league(kind)));
+    let reweighted = state.mixture.entries().windows(2).any(|pair| pair[0].1 != pair[1].1);
+    assert!(reweighted, "PFSP reweighted the configured equal weights");
+    let written: Vec<u64> = state.league.iter().map(|(update, _)| *update).collect();
+    assert_eq!(written, [0, 2], "the checkpoint's own update 4 is its model");
     run(config, &resumed, true).expect("resume");
     assert_trajectory_equal(&uninterrupted, &resumed);
+    let artifact = TrainingArtifact::load(&resumed).expect("final checkpoint");
+    let recorded =
+        crate::ppo_arena::collector_state::CollectorState::decode(&artifact.collection().state)
+            .expect("final collection state")
+            .league;
+    let mut kept: Vec<String> = std::fs::read_dir(resumed.join("league"))
+        .expect("league")
+        .map(|entry| entry.expect("entry").file_name().into_string().expect("name"))
+        .collect();
+    kept.sort();
+    let expected: Vec<String> = recorded.iter().map(|(update, _)| format!("u{update:04}")).collect();
+    assert_eq!(kept, expected, "only the snapshots the final checkpoint records");
     for directory in [weights, uninterrupted, resumed] {
         std::fs::remove_dir_all(directory).expect("cleanup");
     }
@@ -256,6 +266,9 @@ fn settings(seed: u64, updates: u64) -> AnnealedJobConfig {
         scale: crate::randomization::AnnealScale::FULL,
         seed,
         opponents: vec![(AnnealedOpponent::Teacher, one())],
+        opponent_schedule: crate::OpponentSchedule::Pfsp,
+        league_size: 4,
+        league_every: 20,
         ppo: PpoConfig {
             decision_interval_ticks: MAP2_DECISION_INTERVAL_TICKS,
             samples_per_update: 6,

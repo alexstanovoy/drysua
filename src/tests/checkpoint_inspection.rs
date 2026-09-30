@@ -549,7 +549,7 @@ mod files {
             },
             config: PpoConfig {
                 gamma_tick: 1.0,
-                samples_per_update: 2 * crate::MAP2_RETAINED_DECISIONS,
+                samples_per_update: 2_326,
                 minibatch: 2,
                 epochs: 1,
                 ..PpoConfig::default()
@@ -731,7 +731,7 @@ mod files {
             ("adam_epsilon", config.adam_epsilon),
             ("gradient_clip", config.gradient_clip),
             ("gamma_tick", config.gamma_tick),
-            ("gae_lambda", config.gae_lambda),
+            ("gae_lambda_tick", config.gae_lambda_tick),
             ("target_kl", config.target_kl),
         ] {
             assert_eq!(

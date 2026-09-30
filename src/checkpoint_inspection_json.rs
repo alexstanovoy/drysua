@@ -65,13 +65,13 @@ pub(super) fn ppo(config: PpoConfig) -> Value {
         "entropy_coefficient": f64::from(config.entropy_coefficient), "learning_rate": f64::from(config.learning_rate),
         "adam_beta1": f64::from(config.adam_beta1), "adam_beta2": f64::from(config.adam_beta2),
         "adam_epsilon": f64::from(config.adam_epsilon), "gradient_clip": f64::from(config.gradient_clip),
-        "gamma_tick": f64::from(config.gamma_tick), "gae_lambda": f64::from(config.gae_lambda),
+        "gamma_tick": f64::from(config.gamma_tick), "gae_lambda_tick": f64::from(config.gae_lambda_tick),
         "target_kl": f64::from(config.target_kl),
         "f32_bits": {"clip_epsilon": config.clip_epsilon.to_bits(), "value_coefficient": config.value_coefficient.to_bits(),
             "entropy_coefficient": config.entropy_coefficient.to_bits(), "learning_rate": config.learning_rate.to_bits(),
             "adam_beta1": config.adam_beta1.to_bits(), "adam_beta2": config.adam_beta2.to_bits(),
             "adam_epsilon": config.adam_epsilon.to_bits(), "gradient_clip": config.gradient_clip.to_bits(),
-            "gamma_tick": config.gamma_tick.to_bits(), "gae_lambda": config.gae_lambda.to_bits(), "target_kl": config.target_kl.to_bits()}})
+            "gamma_tick": config.gamma_tick.to_bits(), "gae_lambda_tick": config.gae_lambda_tick.to_bits(), "target_kl": config.target_kl.to_bits()}})
 }
 
 pub(super) fn adaptive(progress: &CheckpointProgress) -> Value {

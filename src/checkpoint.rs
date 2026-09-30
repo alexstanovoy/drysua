@@ -42,7 +42,7 @@ pub const CHECKPOINT_SCHEMA_DESCRIPTOR: &str = concat!(
     "tensors=model.parameters,adam.first_moment,adam.second_moment,actor.parameters_f32,collection.state_u8_bounded;dtype=f32_except_collection_state;runtime=one_named_f32_tensor_per_model_parameter_in_export_order;runtime_metadata=action_feature_model_ppo_schema_hashes,ppo_schema_version,ppo_rules_audit_version,map2_reward_version;load=exact_names_shapes_dtype_finite_schema_sha256;",
     "initialization=runtime_weights_same_name_and_shape_tensors_reused_others_fresh,optimizer_progress_rng=fresh;",
     "manifest=magic_version_hash_linked_schemas_then_git_simulator_features_command_seed_map_hero_device_batch_rules32_then_progress_rng_curriculum_league_then_ppo_config_trainer_updates_optimizer_step_shuffle_rng_tensor_sha256_then_adaptive_presence_u8_and_optional152_byte_block,no_trailing_bytes,max65536;",
-    "progress=committed_rollout_samples_le_updates_times_samples_per_update_plus_two_per_max_slot;collection=next_update_actor_version_spec_and_replayable_in_flight_slot_games;",
+    "progress=committed_rollout_samples_le_updates_times_samples_per_update_plus_two_per_max_slot;collection_v2=next_update_actor_version_spec_opponent_mixture_pfsp_outcome_window_league_snapshot_fingerprints_and_replayable_in_flight_slot_games;league=runtime_weights_under_league_u_update_written_once_pruned_after_commit;",
     "adaptive_block=le64_success_updates_success_rate_millionths_poor_updates_poor_rate_millionths_extension_millionths_base_updates_total_updates_zero_updates_generation_start_update_updates_in_generation_success_streak_poor_streak_extension_awards_snapshot_count_then_snapshot_sha256_raw32;adaptive_scope=train-annealed_only_no_league_exact_config_scope_suffix_last_once;",
     "save=immutable_generation_then_runtime_then_manifest_rename,one_fsync_per_file_then_one_directory_fsync;"
 );
@@ -60,9 +60,13 @@ pub const CHECKPOINT_SCHEMA_HASH: u64 =
 const CHECKPOINT_META_FILE: &str = "checkpoint.meta";
 const RUNTIME_TENSOR_FILE: &str = "drysua.weights.safetensors";
 const MAX_META_BYTES: u64 = 64 * 1024;
-/// Largest encoded collection state: every slot with two full action logs.
-pub(crate) const MAX_COLLECTION_STATE_BYTES: usize =
-    64 + crate::PPO_MAX_SLOTS * (160 + 2 * 4 * crate::MAP2_ACTOR_DECISIONS);
+/// Largest encoded collection state: every slot with two full action logs,
+/// plus the opponent mixture and outcome window.
+pub(crate) const MAX_COLLECTION_STATE_BYTES: usize = 64
+    + MAX_OPPONENT_STATE_BYTES
+    + crate::PPO_MAX_SLOTS * (160 + 2 * 4 * crate::MAP2_ACTOR_DECISIONS);
+/// Bound of the collection state's opponent mixture and outcome window.
+pub(crate) const MAX_OPPONENT_STATE_BYTES: usize = 64 * 1024;
 pub(crate) const MAX_TRAINING_TENSOR_BYTES: u64 =
     MODEL_PARAMETER_COUNT as u64 * 16 + MAX_COLLECTION_STATE_BYTES as u64 + 64 * 1024;
 const MAX_RUNTIME_TENSOR_BYTES: u64 = MODEL_PARAMETER_COUNT as u64 * 4 + 64 * 1024;
@@ -475,6 +479,26 @@ impl TrainingArtifact {
             .export_parameters()
             .map_err(|error| CheckpointError::Model(error.to_string()))?;
         save_runtime(&parameter_schema(model)?, &parameters, directory)
+    }
+
+    /// Saves exported parameters as deployment weights of this build.
+    #[cfg(feature = "builtin")]
+    pub(crate) fn save_runtime_parameters(
+        parameters: &[f32],
+        directory: &Path,
+    ) -> Result<(), CheckpointError> {
+        save_runtime(&current_parameter_schema()?, parameters, directory)
+    }
+
+    /// Parameters of runtime weights whose metadata, names and shapes match this build.
+    #[cfg(feature = "builtin")]
+    pub(crate) fn load_runtime_parameters(directory: &Path) -> Result<Vec<f32>, CheckpointError> {
+        validate_directory(directory)?;
+        let bytes = read_bounded(
+            &directory.join(RUNTIME_TENSOR_FILE),
+            MAX_RUNTIME_TENSOR_BYTES,
+        )?;
+        decode_runtime_parameters(&bytes)
     }
 
     /// Constructs a fresh current model, reusing every runtime-weights tensor
@@ -1113,7 +1137,7 @@ fn decode_config(reader: &mut ManifestReader<'_>) -> Result<PpoConfig, Checkpoin
         adam_epsilon: reader.f32()?,
         gradient_clip: reader.f32()?,
         gamma_tick: reader.f32()?,
-        gae_lambda: reader.f32()?,
+        gae_lambda_tick: reader.f32()?,
         target_kl: reader.f32()?,
     }
     .validate()
@@ -1131,7 +1155,7 @@ fn config_floats(config: PpoConfig) -> [f32; 11] {
         config.adam_epsilon,
         config.gradient_clip,
         config.gamma_tick,
-        config.gae_lambda,
+        config.gae_lambda_tick,
         config.target_kl,
     ]
 }

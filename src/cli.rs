@@ -148,6 +148,12 @@ enum LearnerDevice {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum OpponentScheduleArg {
+    Fixed,
+    Pfsp,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum EnvironmentScheduleArg {
     Adaptive,
     Fixed,
@@ -219,9 +225,20 @@ struct TrainAnnealedArgs {
     #[arg(long)]
     zero_updates: Option<u64>,
     /// Per-game opponent mixture entry, repeatable: `teacher[:weight]`, `harass-push[:weight]`,
-    /// `self[:weight]` or `weights:<runtime weights directory>:<weight>`; weights are exact decimals.
+    /// `self[:weight]`, `weights:<runtime weights directory>:<weight>` or `league:<weight>`
+    /// (each of the latest --league-size learner snapshots); weights are exact decimals.
     #[arg(long = "opponent", default_value = "teacher:1", value_parser = parse_annealed_opponent)]
     opponents: Vec<(crate::AnnealedOpponent, crate::EnvironmentDecimal)>,
+    /// How configured opponent weights become each update's mixture: `pfsp` scales
+    /// them by (1 - recent win rate)^2, `fixed` keeps them.
+    #[arg(long, value_enum, default_value_t = OpponentScheduleArg::Pfsp)]
+    opponent_schedule: OpponentScheduleArg,
+    /// Learner snapshots a `league` opponent entry plays at once (1..=16).
+    #[arg(long, default_value_t = 4)]
+    league_size: usize,
+    /// Updates between league snapshots; the checkpoint persists the ones in play.
+    #[arg(long, default_value_t = 20)]
+    league_every: u64,
     /// Environment scale at the first update in exact decimals; 1 is full variance, at most 10.
     #[arg(long)]
     environment_scale_start: Option<crate::EnvironmentDecimal>,
@@ -252,11 +269,14 @@ struct OptimizerArgs {
     #[arg(long, default_value_t = crate::PpoConfig::default().minibatch)]
     minibatch: usize,
     /// Generalized advantage trace decay in [0, 1]; one uses full discounted Monte Carlo returns.
-    #[arg(long, default_value_t = crate::PpoConfig::default().gae_lambda)]
-    gae_lambda: f32,
+    #[arg(long, default_value_t = crate::PpoConfig::default().gae_lambda_tick)]
+    gae_lambda_tick: f32,
     /// Entropy bonus coefficient; must be finite and positive.
     #[arg(long, default_value_t = crate::PpoConfig::default().entropy_coefficient)]
     entropy_coefficient: f32,
+    /// Value loss coefficient; must be finite and positive.
+    #[arg(long, default_value_t = crate::PpoConfig::default().value_coefficient)]
+    value_coefficient: f32,
 }
 
 /// Persistence controls; a run cannot initialize and resume together.
@@ -583,6 +603,12 @@ impl TrainAnnealedArgs {
             seed,
             scale,
             opponents: self.opponents.clone(),
+            opponent_schedule: match self.opponent_schedule {
+                OpponentScheduleArg::Fixed => crate::OpponentSchedule::Fixed,
+                OpponentScheduleArg::Pfsp => crate::OpponentSchedule::Pfsp,
+            },
+            league_size: self.league_size,
+            league_every: self.league_every,
             ppo,
             checkpoint_cadence: crate::TrainingCheckpointCadence::WallTime(
                 std::time::Duration::from_secs(self.checkpoint.checkpoint_interval_seconds),
@@ -693,6 +719,7 @@ fn parse_annealed_opponent(
         Some(("harass-push", rest)) => {
             Ok((crate::AnnealedOpponent::HarassPush, weight(rest)?))
         }
+        Some(("league", rest)) => Ok((crate::AnnealedOpponent::League, weight(rest)?)),
         Some(("weights", rest)) => {
             let (directory, share) = rest
                 .rsplit_once(':')
@@ -706,7 +733,7 @@ fn parse_annealed_opponent(
             ))
         }
         _ => Err(
-            "opponent must be teacher[:weight], harass-push[:weight], self[:weight] or weights:<directory>:<weight>"
+            "opponent must be teacher[:weight], harass-push[:weight], self[:weight], weights:<directory>:<weight> or league:<weight>"
                 .to_owned(),
         ),
     }
@@ -839,8 +866,9 @@ impl OptimizerArgs {
             epochs: self.epochs,
             minibatch: self.minibatch,
             learning_rate: self.learning_rate,
-            gae_lambda: self.gae_lambda,
+            gae_lambda_tick: self.gae_lambda_tick,
             entropy_coefficient: self.entropy_coefficient,
+            value_coefficient: self.value_coefficient,
             ..config
         }
     }

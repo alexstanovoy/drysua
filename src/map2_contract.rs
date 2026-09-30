@@ -19,16 +19,13 @@ pub const MAP2_DECISION_INTERVAL_TICKS: u32 = 3;
 /// Maximum decisions from the initial tick-one snapshot through the cap.
 pub const MAP2_ACTOR_DECISIONS: usize =
     (MAP2_TICK_CAP - 1).div_ceil(MAP2_DECISION_INTERVAL_TICKS) as usize;
-/// One independently phased action retained per this many actor decisions.
-pub const MAP2_RETENTION_STRIDE: usize = 8;
-/// Per-environment retained capacity sufficient for every retention phase.
-pub const MAP2_RETAINED_DECISIONS: usize = MAP2_ACTOR_DECISIONS.div_ceil(MAP2_RETENTION_STRIDE);
+/// Longest retained interval in decisions: every non-Continue decision begins
+/// one, and a Continue decision begins one once the open interval is this long.
+pub const MAP2_CONTINUE_STRIDE: usize = 8;
 
-const _: () = assert!(MAP2_RETENTION_STRIDE.is_power_of_two());
 const _: () = assert!(MAP2_TICK_CAP > MAP2_PREGAME_TICKS);
 const _: () = assert!(MAP2_TICK_CAP.is_multiple_of(MAP2_DECISION_INTERVAL_TICKS));
-const _: () = assert!((MAP2_RETAINED_DECISIONS - 1) * MAP2_RETENTION_STRIDE < MAP2_ACTOR_DECISIONS);
-const _: () = assert!(MAP2_RETAINED_DECISIONS * MAP2_RETENTION_STRIDE >= MAP2_ACTOR_DECISIONS);
+const _: () = assert!(MAP2_CONTINUE_STRIDE > 1 && MAP2_CONTINUE_STRIDE < MAP2_ACTOR_DECISIONS);
 
 #[cfg(feature = "builtin")]
 const _: () = {

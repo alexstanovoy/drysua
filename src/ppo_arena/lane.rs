@@ -8,6 +8,7 @@
 //! whose closed intervals reach the lane's sample target, and the next part's
 //! weights are installed before its first round.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
@@ -17,17 +18,36 @@ use bota_proto::ModifierSpec;
 
 use super::episode::EpisodeRecord;
 use super::pool::{Outcome, Reply, SimPool, Work};
-use super::slot::{Decision, GamePlan, GameSchedule, NextGame, OpponentKind, Slot, SlotSnapshot};
+use super::slot::{
+    Decision, GamePlan, GameSchedule, NextGame, OpponentKind, OpponentMixture, Slot, SlotSnapshot,
+};
 use super::text_error;
 use crate::{EncoderRow, PolicyDevice, PolicyModel, PpoError, PpoRng, PpoTransition};
 
-/// The actor weights and world rules of one update's collection.
+/// The actor weights, world rules and opponents of one update's collection.
 pub(super) struct PartConfig {
     pub(super) update: u64,
     /// Completed updates of the weights in `actor`.
     pub(super) version: u64,
     pub(super) actor: Arc<Vec<f32>>,
     pub(super) spec: ModifierSpec,
+    /// The per-game opponent draw of games starting in this update.
+    pub(super) mixture: Arc<OpponentMixture>,
+    /// League milestones this mixture may draw, with their weights.
+    pub(super) league: LeagueWeights,
+}
+
+/// League milestone weights by completed update.
+pub(super) type LeagueWeights = Vec<(u64, Arc<Vec<f32>>)>;
+
+impl PartConfig {
+    fn next_game(&self) -> NextGame {
+        NextGame {
+            update: self.update,
+            spec: self.spec,
+            mixture: Arc::clone(&self.mixture),
+        }
+    }
 }
 
 /// One closed interval tagged with the game it belongs to.
@@ -60,6 +80,8 @@ pub(super) struct LaneSettings {
     pub(super) device: PolicyDevice,
     /// Frozen opponent pool parameters.
     pub(super) snapshots: Arc<Vec<Arc<Vec<f32>>>>,
+    /// League weights replayed games reference beyond the first part's league.
+    pub(super) league: LeagueWeights,
 }
 
 /// How a lane obtains its first games.
@@ -78,38 +100,79 @@ pub(super) struct LaneLinks<'a> {
 }
 
 struct LaneModels {
+    device: PolicyDevice,
     actor: PolicyModel,
     version: u64,
     snapshots: Vec<PolicyModel>,
+    /// League milestones the current mixture or any live game still plays.
+    league: BTreeMap<u64, PolicyModel>,
 }
 
 impl LaneModels {
     fn new(settings: &LaneSettings, config: &PartConfig) -> Result<Self, PpoError> {
-        let load = |parameters: &[f32]| -> Result<PolicyModel, PpoError> {
-            let model = PolicyModel::fresh_on(0, settings.device).map_err(text_error)?;
-            model.import_parameters(parameters).map_err(text_error)?;
-            Ok(model)
-        };
-        Ok(Self {
-            actor: load(&config.actor)?,
+        let device = settings.device;
+        let mut models = Self {
+            device,
+            actor: load_model(device, &config.actor)?,
             version: config.version,
             snapshots: settings
                 .snapshots
                 .iter()
-                .map(|parameters| load(parameters))
+                .map(|parameters| load_model(device, parameters))
                 .collect::<Result<_, _>>()?,
-        })
+            league: BTreeMap::new(),
+        };
+        models.add_league(&settings.league)?;
+        models.add_league(&config.league)?;
+        Ok(models)
     }
 
-    fn install(&mut self, config: &PartConfig) -> Result<(), PpoError> {
+    fn install(&mut self, config: &PartConfig, slots: &[Box<Slot>]) -> Result<(), PpoError> {
         if config.version != self.version {
             self.actor
                 .import_parameters(&config.actor)
                 .map_err(text_error)?;
             self.version = config.version;
         }
+        self.add_league(&config.league)?;
+        self.league.retain(|milestone, _| {
+            config.league.iter().any(|(member, _)| member == milestone)
+                || slots
+                    .iter()
+                    .any(|slot| slot.plan.opponent == OpponentKind::League(*milestone))
+        });
         Ok(())
     }
+
+    fn add_league(&mut self, league: &LeagueWeights) -> Result<(), PpoError> {
+        for (milestone, parameters) in league {
+            if !self.league.contains_key(milestone) {
+                let model = load_model(self.device, parameters)?;
+                self.league.insert(*milestone, model);
+            }
+        }
+        Ok(())
+    }
+
+    fn model(&self, key: ModelKey) -> Result<&PolicyModel, PpoError> {
+        match key {
+            ModelKey::Actor => Ok(&self.actor),
+            ModelKey::Snapshot(index) => self
+                .snapshots
+                .get(index)
+                .ok_or(PpoError::InvalidConfig("opponent snapshot index")),
+            ModelKey::League(milestone) => self
+                .league
+                .get(&milestone)
+                .ok_or(PpoError::InvalidConfig("league opponent weights")),
+        }
+    }
+}
+
+fn load_model(device: PolicyDevice, parameters: &[f32]) -> Result<PolicyModel, PpoError> {
+    let model = PolicyModel::fresh_on(0, device).map_err(text_error)?;
+    model.import_parameters(parameters).map_err(text_error)?;
+    Ok(model)
 }
 
 /// Runs one lane until the session stops it or a part fails.
@@ -146,17 +209,13 @@ fn run_lane_inner(
         let decisions = infer(&mut slots, &models, &config, &mut part)?;
         part.inference += started.elapsed();
         let started = Instant::now();
-        let next = NextGame {
-            update: config.update,
-            spec: config.spec,
-        };
         for (position, (slot, decision)) in slots.drain(..).zip(decisions).enumerate() {
             links.pool.submit(
                 position,
                 Work::Advance {
                     slot,
                     decision,
-                    next,
+                    next: config.next_game(),
                 },
                 &reply,
             )?;
@@ -177,7 +236,7 @@ fn run_lane_inner(
             if next.update != config.update + 1 {
                 return Err(PpoError::InvalidTransition("lane part configuration order"));
             }
-            models.install(&next)?;
+            models.install(&next, &slots)?;
             config = next;
         }
     }
@@ -232,7 +291,7 @@ fn start_slots(
     match start {
         LaneStart::Fresh => {
             for (position, &slot) in settings.slots.iter().enumerate() {
-                let plan = GamePlan::new(links.schedule, slot, 0, config.update, config.spec)?;
+                let plan = GamePlan::new(links.schedule, slot, 0, &config.next_game())?;
                 links.pool.submit(position, Work::Start(plan), reply)?;
             }
         }
@@ -320,15 +379,8 @@ fn infer(
     let mut actions: Vec<Option<crate::SampledRow>> = (0..slots.len()).map(|_| None).collect();
     let mut opponents: Vec<Option<crate::SampledRow>> = (0..slots.len()).map(|_| None).collect();
     let groups = row_groups(slots);
-    for (model, rows) in &groups {
-        let model = match model {
-            None => &models.actor,
-            Some(index) => models
-                .snapshots
-                .get(*index)
-                .ok_or(PpoError::InvalidConfig("opponent snapshot index"))?,
-        };
-        let sampled = sample_group(slots, model, rows)?;
+    for (key, rows) in &groups {
+        let sampled = sample_group(slots, models.model(*key)?, rows)?;
         for (row, sampled) in rows.iter().zip(sampled) {
             let target = if row.opponent {
                 &mut opponents[row.position]
@@ -341,16 +393,21 @@ fn infer(
     let mut decisions = Vec::with_capacity(slots.len());
     for (slot, (action, opponent)) in slots.iter_mut().zip(actions.into_iter().zip(opponents)) {
         let action = action.ok_or(PpoError::InvalidTransition("missing policy row"))?;
-        if slot.stream.awaits_value() {
+        let kind = action.action.kind();
+        if slot.stream.closes_interval(kind) {
             part.samples.push(LaneSample {
                 slot: slot.plan.slot,
                 game: slot.plan.game,
                 transition: slot.stream.flush(Some(action.value))?,
             });
         }
-        let retained = action
+        let statistics = action
             .statistics
-            .map(|statistics| Box::new((statistics, action.value, config.version)));
+            .ok_or(PpoError::InvalidTransition("policy row statistics"))?;
+        let retained = slot
+            .stream
+            .retains(kind)
+            .then(|| Box::new((statistics, action.value, config.version)));
         decisions.push(Decision {
             action: action.action,
             retained,
@@ -360,26 +417,34 @@ fn infer(
     Ok(decisions)
 }
 
+/// Which of a lane's models samples a row.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum ModelKey {
+    Actor,
+    Snapshot(usize),
+    League(u64),
+}
+
 /// The sampling calls of one round: the actor's rows (policy and self-play
-/// opponents) first, then one group per frozen snapshot in snapshot order.
-fn row_groups(slots: &[Box<Slot>]) -> Vec<(Option<usize>, Vec<RowRef>)> {
-    let mut groups: Vec<(Option<usize>, Vec<RowRef>)> = vec![(None, Vec::new())];
+/// opponents) first, then one group per frozen or league snapshot in order.
+fn row_groups(slots: &[Box<Slot>]) -> Vec<(ModelKey, Vec<RowRef>)> {
+    let mut groups: Vec<(ModelKey, Vec<RowRef>)> = vec![(ModelKey::Actor, Vec::new())];
     for (position, slot) in slots.iter().enumerate() {
         groups[0].1.push(RowRef {
             position,
             opponent: false,
         });
-        let group = match slot.plan.opponent {
+        let key = match slot.plan.opponent {
             OpponentKind::Teacher | OpponentKind::HarassPush => continue,
-            OpponentKind::SelfPlay => 0,
-            OpponentKind::Snapshot(index) => {
-                match groups.iter().position(|(model, _)| *model == Some(index)) {
-                    Some(group) => group,
-                    None => {
-                        groups.push((Some(index), Vec::new()));
-                        groups.len() - 1
-                    }
-                }
+            OpponentKind::SelfPlay => ModelKey::Actor,
+            OpponentKind::Snapshot(index) => ModelKey::Snapshot(index),
+            OpponentKind::League(milestone) => ModelKey::League(milestone),
+        };
+        let group = match groups.iter().position(|(model, _)| *model == key) {
+            Some(group) => group,
+            None => {
+                groups.push((key, Vec::new()));
+                groups.len() - 1
             }
         };
         groups[group].1.push(RowRef {
@@ -415,7 +480,8 @@ fn sample_group(
         encoded.push(&seat.row);
         spaces.push(&seat.space);
         random.push(rng.clone());
-        statistics.push(!row.opponent && slot.stream.begins_interval());
+        // Retention depends on the sampled kind, so every policy row needs statistics.
+        statistics.push(!row.opponent);
     }
     let sampled = model
         .sample_rows(&encoded, &spaces, &mut random, &statistics)

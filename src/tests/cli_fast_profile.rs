@@ -34,7 +34,7 @@ fn annealed_cli_resolves_the_continuous_profile_and_validates() {
     assert!(settings.slots.is_multiple_of(settings.lanes) && settings.slots / settings.lanes <= 64);
     assert!(!settings.pin_threads);
     assert_eq!(settings.simulation_threads, 3);
-    assert_eq!(settings.ppo.samples_per_update, 8_000);
+    assert_eq!(settings.ppo.samples_per_update, 24_000);
     assert_eq!(settings.generation_updates, 4);
     assert_eq!(settings.zero_updates, 40);
     assert_eq!(

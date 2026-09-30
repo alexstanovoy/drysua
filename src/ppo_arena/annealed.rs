@@ -23,7 +23,8 @@ use bota_server::game::{
 };
 
 use super::episode::ACTOR_DECISIONS;
-use super::slot::{MAX_SLOTS, OpponentKind, OpponentMixture};
+use super::opponents::{League, MAX_LEAGUE_SIZE, OpponentSchedule};
+use super::slot::{MAX_SLOTS, OpponentKind};
 use super::{
     TrainingCheckpointReport, TrainingDirectoryLock, device_name, text_error,
     validate_checkpoint_cadence, validate_initial_weights_directory, validate_training_directory,
@@ -80,6 +81,12 @@ pub struct AnnealedJobConfig {
     pub scale: crate::randomization::AnnealScale,
     /// Per-game opponent mixture with positive weights, in configured order.
     pub opponents: Vec<(AnnealedOpponent, EnvironmentDecimal)>,
+    /// How the configured weights become each update's mixture.
+    pub opponent_schedule: OpponentSchedule,
+    /// League milestones playing at once when the mixture has a league entry.
+    pub league_size: usize,
+    /// Updates between league snapshots of the learner.
+    pub league_every: u64,
     /// PPO dimensions and hyperparameters.
     pub ppo: PpoConfig,
     /// When to write a durable checkpoint.
@@ -138,11 +145,31 @@ pub struct AnnealedJobReport {
     pub latest: PpoUpdateReport,
 }
 
-/// Frozen opponent snapshots, host parameters and fingerprints in mixture order.
+/// Configured opponents with their weights, frozen snapshot parameters and
+/// fingerprints in mixture order, and the league.
 pub(crate) struct OpponentPool {
-    pub(crate) mixture: OpponentMixture,
+    /// Configured entries except the league, in configured order.
+    pub(crate) entries: Vec<(OpponentKind, u64)>,
+    pub(crate) league: Option<League>,
+    pub(crate) schedule: OpponentSchedule,
     pub(crate) snapshots: Vec<std::sync::Arc<Vec<f32>>>,
     fingerprints: Vec<u64>,
+}
+
+impl OpponentPool {
+    /// Configured entries plus the league members playing `update`.
+    pub(crate) fn entries_for(&self, update: u64) -> Vec<(OpponentKind, u64)> {
+        let mut entries = self.entries.clone();
+        if let Some(league) = self.league {
+            entries.extend(
+                league
+                    .members(update)
+                    .into_iter()
+                    .map(|milestone| (OpponentKind::League(milestone), league.weight)),
+            );
+        }
+        entries
+    }
 }
 
 /// Runs the annealed loop, optionally loading deployment weights first.
@@ -483,6 +510,7 @@ fn anneal_schedule(settings: &AnnealedJobConfig) -> AnnealSchedule {
 /// Loads every frozen snapshot of the mixture once, on the host.
 fn load_opponents(settings: &AnnealedJobConfig) -> Result<OpponentPool, PpoError> {
     let mut entries = Vec::with_capacity(settings.opponents.len());
+    let mut league = None;
     let mut snapshots = Vec::new();
     let mut fingerprints = Vec::new();
     for (opponent, weight) in &settings.opponents {
@@ -490,6 +518,14 @@ fn load_opponents(settings: &AnnealedJobConfig) -> Result<OpponentPool, PpoError
             AnnealedOpponent::Teacher => OpponentKind::Teacher,
             AnnealedOpponent::HarassPush => OpponentKind::HarassPush,
             AnnealedOpponent::SelfPlay => OpponentKind::SelfPlay,
+            AnnealedOpponent::League => {
+                league = Some(League {
+                    weight: weight.units(),
+                    size: settings.league_size,
+                    every: settings.league_every,
+                });
+                continue;
+            }
             AnnealedOpponent::Weights(directory) => {
                 let model = PolicyModel::fresh_on(0, PolicyDevice::Cpu).map_err(text_error)?;
                 TrainingArtifact::load_runtime_weights(&model, directory).map_err(text_error)?;
@@ -502,8 +538,13 @@ fn load_opponents(settings: &AnnealedJobConfig) -> Result<OpponentPool, PpoError
         };
         entries.push((kind, weight.units()));
     }
+    if entries.is_empty() && league.is_none() {
+        return Err(PpoError::InvalidConfig("annealed opponent mixture is empty"));
+    }
     Ok(OpponentPool {
-        mixture: OpponentMixture::new(entries)?,
+        entries,
+        league,
+        schedule: settings.opponent_schedule,
         snapshots,
         fingerprints,
     })
@@ -546,13 +587,19 @@ fn annealed_run(
     if config.learning_rate != defaults.learning_rate {
         command_line.push_str(&format!(" --learning-rate {}", config.learning_rate));
     }
-    if config.gae_lambda != defaults.gae_lambda {
-        command_line.push_str(&format!(" --gae-lambda {}", config.gae_lambda));
+    if config.gae_lambda_tick != defaults.gae_lambda_tick {
+        command_line.push_str(&format!(" --gae-lambda-tick {}", config.gae_lambda_tick));
     }
     if config.entropy_coefficient != defaults.entropy_coefficient {
         command_line.push_str(&format!(
             " --entropy-coefficient {}",
             config.entropy_coefficient
+        ));
+    }
+    if config.value_coefficient != defaults.value_coefficient {
+        command_line.push_str(&format!(
+            " --value-coefficient {}",
+            config.value_coefficient
         ));
     }
     settings.execution.append_scope(&mut command_line);
@@ -589,6 +636,15 @@ fn append_opponent_scope(
             AnnealedOpponent::HarassPush => {
                 command_line.push_str(&format!(" --opponent harass-push:{weight}"))
             }
+            AnnealedOpponent::League => {
+                let league = pool
+                    .league
+                    .ok_or(PpoError::InvalidConfig("annealed league"))?;
+                command_line.push_str(&format!(
+                    " --opponent league:{weight} --league-size {} --league-every {}",
+                    league.size, league.every
+                ));
+            }
             AnnealedOpponent::Weights(directory) => {
                 let fingerprint = fingerprints
                     .next()
@@ -600,6 +656,10 @@ fn append_opponent_scope(
             }
         }
     }
+    command_line.push_str(&format!(
+        " --opponent-schedule {}",
+        pool.schedule.name()
+    ));
     Ok(())
 }
 
@@ -679,6 +739,19 @@ fn validate_opponents(settings: &AnnealedJobConfig) -> Result<(), PpoError> {
     if settings.opponents.is_empty() || settings.opponents.len() > 16 {
         return Err(PpoError::InvalidConfig(
             "annealed opponent mixture needs 1..=16 entries",
+        ));
+    }
+    let leagues = settings
+        .opponents
+        .iter()
+        .filter(|(opponent, _)| *opponent == AnnealedOpponent::League)
+        .count();
+    if leagues > 1
+        || !(1..=MAX_LEAGUE_SIZE).contains(&settings.league_size)
+        || !(1..=MAX_TRAINING_COUNTER).contains(&settings.league_every)
+    {
+        return Err(PpoError::InvalidConfig(
+            "annealed league: at most one entry of 1..=16 snapshots, taken every 1.. updates",
         ));
     }
     for (opponent, weight) in &settings.opponents {

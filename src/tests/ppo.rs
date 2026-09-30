@@ -309,7 +309,7 @@ fn gae_discounts_elapsed_ticks_and_stops_bootstrapping_at_terminal() {
             samples_per_update: 2,
             minibatch: 1,
             gamma_tick: 0.9,
-            gae_lambda: 0.8,
+            gae_lambda_tick: 0.8,
             ..PpoConfig::default()
         })
         .expect("batch");
@@ -543,18 +543,20 @@ fn full_monte_carlo_returns_ignore_intermediate_bootstraps_but_not_truncation() 
     let model = PolicyModel::fresh(9921000).expect("model");
     let sampled = choice(&model, &frame, &space, StructuredAction::Continue);
     let config = PpoConfig {
-        samples_per_update: 2 * crate::MAP2_RETAINED_DECISIONS,
+        samples_per_update: 2 * RETAINED,
         minibatch: 512,
-        gae_lambda: 1.0,
+        gae_lambda_tick: 1.0,
         gamma_tick: crate::MAP2_REWARD_GAMMA_TICK,
         ..PpoConfig::default()
     };
-    let retained = crate::MAP2_RETAINED_DECISIONS;
+    // One full-length game retaining every eighth of its decisions.
+    const RETAINED: usize = 1_163;
+    const STRIDE: usize = 8;
+    let retained = RETAINED;
     let mut rollout = PpoRollout::new(2 * retained).expect("rollout");
     for decision in 0..retained {
         let terminal = decision + 1 == retained;
-        let stride = crate::MAP2_RETENTION_STRIDE;
-        let ticks = (crate::MAP2_ACTOR_DECISIONS - decision * stride).min(stride) as u32 * 3
+        let ticks = (crate::MAP2_ACTOR_DECISIONS - decision * STRIDE).min(STRIDE) as u32 * 3
             - u32::from(terminal);
         for stream in 0..2 {
             let reward = match (terminal, stream) {

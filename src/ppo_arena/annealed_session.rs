@@ -15,8 +15,10 @@ use rustc_hash::FxHashMap;
 use super::super::collector::Collector;
 use super::super::collector_state::CollectorState;
 use super::super::lane::{LaneSettings, LaneStart, PartConfig, PartDone};
+use super::super::league::LeagueStore;
+use super::super::opponents::{OutcomeWindow, log_pool, schedule_mixture};
 use super::super::pool::SimPool;
-use super::super::slot::{GameSchedule, SlotSnapshot};
+use super::super::slot::{GameSchedule, OpponentKind, OpponentMixture, SlotSnapshot};
 use super::super::{CollectionReport, TrainingSession};
 use super::*;
 use crate::telemetry::{TrainingStage, TrainingUpdateMode, TrainingUpdateTimer};
@@ -29,6 +31,10 @@ pub(super) struct AnnealedSession {
     games: u64,
     /// Collection state the next update starts from, when resuming.
     restored: Option<CollectorState>,
+    /// Recent outcomes of every finished update, per opponent.
+    outcomes: OutcomeWindow,
+    /// League snapshots the next publications or in-flight games need.
+    league: LeagueStore,
 }
 
 impl AnnealedSession {
@@ -63,12 +69,21 @@ impl AnnealedSession {
             (0, None)
         };
         state.trainer.set_execution(settings.execution)?;
+        let outcomes = restored
+            .as_ref()
+            .map_or_else(OutcomeWindow::default, |state| state.outcomes.clone());
+        let league = match &restored {
+            Some(collection) => restore_league(settings, &state, directory, collection)?,
+            None => LeagueStore::default(),
+        };
         Ok(Self {
             state,
             random_directory: random_directory.to_path_buf(),
             generations,
             games: 0,
             restored,
+            outcomes,
+            league,
         })
     }
 
@@ -95,7 +110,6 @@ impl AnnealedSession {
         }
         let schedule = GameSchedule {
             seed: settings.seed,
-            mixture: pool.mixture.clone(),
             decision_cap: harness.episode_decisions(),
             config,
         };
@@ -134,10 +148,10 @@ impl AnnealedSession {
                 collector,
                 configs: BTreeMap::new(),
             };
-            self.publish_initial(settings, &mut pipeline, &mut generations)?;
+            self.publish_initial(settings, pool, &mut pipeline, &mut generations)?;
             self.update_loop(
                 settings,
-                harness,
+                (harness, pool),
                 directory,
                 target,
                 (&mut pipeline, &mut generations),
@@ -152,7 +166,7 @@ impl AnnealedSession {
     fn update_loop(
         &mut self,
         settings: &AnnealedJobConfig,
-        harness: AnnealedHarness,
+        (harness, pool): (AnnealedHarness, &OpponentPool),
         directory: &Path,
         target: u64,
         (pipeline, generations): (&mut Pipeline, &mut GenerationCache),
@@ -163,7 +177,7 @@ impl AnnealedSession {
             super::super::TrainingCheckpointSchedule::new(settings.checkpoint_cadence)?;
         let mut committed = self.state.completed_updates;
         while self.state.completed_updates < target {
-            self.train_update(settings, harness, pipeline, generations)?;
+            self.train_update(settings, (harness, pool), pipeline, generations)?;
             let report = self.state.checkpoint_report(None);
             report.log_progress();
             let completed = self.state.completed_updates;
@@ -173,9 +187,12 @@ impl AnnealedSession {
                 // Snapshots and milestones precede the manifest, so a commit implies them.
                 generations.write_pending()?;
                 self.export_history(settings, committed)?;
+                let league = self.league.manifest(completed);
+                self.league.persist(directory, &league)?;
                 let durable = crate::telemetry::time_training_checkpoint(completed, || {
                     self.state.save(directory, report)
                 })?;
+                LeagueStore::prune(directory, &league)?;
                 checkpointed(durable);
                 schedule.mark_committed(started.elapsed())?;
                 committed = completed;
@@ -228,16 +245,70 @@ impl AnnealedSession {
             } else {
                 LaneStart::Fresh
             };
+            let league = match &start {
+                LaneStart::Replay(games) => self.league.weights(league_references(games))?,
+                LaneStart::Fresh => Vec::new(),
+            };
             let settings = LaneSettings {
                 index: lane,
                 slots,
                 target: settings.ppo.samples_per_update / settings.lanes,
                 device: self.state.model.device(),
                 snapshots: Arc::clone(&snapshots),
+                league,
             };
             lanes.push((settings, start));
         }
         Ok(lanes)
+    }
+
+    /// The collection configuration of `update` with its opponent mixture and league.
+    fn part_config(
+        &self,
+        pool: &OpponentPool,
+        (update, version, actor): (u64, u64, Arc<Vec<f32>>),
+        (spec, mixture): (ModifierSpec, Option<OpponentMixture>),
+    ) -> Result<PartConfig, PpoError> {
+        let entries = pool.entries_for(update);
+        let mixture = match mixture {
+            Some(mixture) => mixture,
+            None => schedule_mixture(&entries, &self.outcomes, pool.schedule)?,
+        };
+        let league = self.league.weights(entries.iter().filter_map(|(kind, _)| match kind {
+            OpponentKind::League(milestone) => Some(*milestone),
+            _ => None,
+        }))?;
+        Ok(PartConfig {
+            update,
+            version,
+            actor,
+            spec,
+            mixture: Arc::new(mixture),
+            league,
+        })
+    }
+
+    /// Takes a league snapshot of the just-completed update when one is due.
+    fn remember_milestone(&mut self, pool: &OpponentPool, actor: &Arc<Vec<f32>>) {
+        let completed = self.state.completed_updates;
+        if pool
+            .league
+            .is_some_and(|league| completed.is_multiple_of(league.every))
+        {
+            self.league.insert(completed, Arc::clone(actor));
+        }
+    }
+
+    /// Forgets snapshots that neither the current nor the next publication
+    /// draws and no in-flight game plays.
+    fn prune_league(&mut self, pool: &OpponentPool, snapshots: &[SlotSnapshot], next: u64) {
+        let Some(league) = pool.league else {
+            return;
+        };
+        let mut kept = league.members(next - 1);
+        kept.extend(league.members(next));
+        kept.extend(league_references(snapshots));
+        self.league.retain(|update| kept.contains(&update));
     }
 
     /// Publishes the configurations of every update collected before the
@@ -245,37 +316,43 @@ impl AnnealedSession {
     fn publish_initial(
         &mut self,
         settings: &AnnealedJobConfig,
+        pool: &OpponentPool,
         pipeline: &mut Pipeline,
         generations: &mut GenerationCache,
     ) -> Result<(), PpoError> {
         let completed = self.state.completed_updates;
         let current = Arc::new(self.state.model.export_parameters().map_err(text_error)?);
+        if completed == 0 {
+            self.remember_milestone(pool, &current);
+        }
         let first = match &self.state.collection {
             Some(checkpoint) if completed > 0 => {
                 let state = CollectorState::decode(&checkpoint.state)?;
-                PartConfig {
-                    update: completed,
-                    version: state.actor_version,
-                    actor: Arc::new(checkpoint.actor.clone()),
-                    spec: state.spec,
-                }
+                self.part_config(
+                    pool,
+                    (completed, state.actor_version, Arc::new(checkpoint.actor.clone())),
+                    (state.spec, Some(state.mixture)),
+                )?
             }
-            _ => PartConfig {
-                update: completed,
-                version: completed,
-                actor: Arc::clone(&current),
-                spec: run_spec(settings, generations, completed)?,
-            },
+            _ => {
+                let spec = run_spec(settings, generations, completed)?;
+                self.part_config(
+                    pool,
+                    (completed, completed, Arc::clone(&current)),
+                    (spec, None),
+                )?
+            }
         };
         pipeline.publish(first)?;
         for offset in 1..=PIPELINE_STALENESS {
             let update = completed + offset;
-            pipeline.publish(PartConfig {
-                update,
-                version: completed,
-                actor: Arc::clone(&current),
-                spec: run_spec(settings, generations, update)?,
-            })?;
+            let spec = run_spec(settings, generations, update)?;
+            let config = self.part_config(
+                pool,
+                (update, completed, Arc::clone(&current)),
+                (spec, None),
+            )?;
+            pipeline.publish(config)?;
         }
         Ok(())
     }
@@ -283,7 +360,7 @@ impl AnnealedSession {
     fn train_update(
         &mut self,
         settings: &AnnealedJobConfig,
-        harness: AnnealedHarness,
+        context: (AnnealedHarness, &OpponentPool),
         pipeline: &mut Pipeline,
         generations: &mut GenerationCache,
     ) -> Result<(), PpoError> {
@@ -292,7 +369,7 @@ impl AnnealedSession {
             TrainingUpdateMode::Annealed,
             self.state.trainer.optimizer_step(),
         );
-        let result = self.train_update_timed(settings, harness, pipeline, generations, &mut timing);
+        let result = self.train_update_timed(settings, context, pipeline, generations, &mut timing);
         timing.observe_result(result)?;
         timing.complete();
         Ok(())
@@ -301,7 +378,7 @@ impl AnnealedSession {
     fn train_update_timed(
         &mut self,
         settings: &AnnealedJobConfig,
-        harness: AnnealedHarness,
+        (harness, pool): (AnnealedHarness, &OpponentPool),
         pipeline: &mut Pipeline,
         generations: &mut GenerationCache,
         timing: &mut TrainingUpdateTimer,
@@ -312,6 +389,7 @@ impl AnnealedSession {
         let parts = pipeline.collector.take(update)?;
         timing.enter(TrainingStage::BatchPreparation);
         let (rollout, report, snapshots) = assemble(&parts, settings.slots, config)?;
+        self.record_outcomes(&parts, pool, update)?;
         let samples = rollout.len();
         timing.set_samples(samples);
         let next_adaptive = generations.next_adaptive(settings, harness, update, &report)?;
@@ -334,13 +412,31 @@ impl AnnealedSession {
         let completed = self.state.completed_updates;
         let next = completed + PIPELINE_STALENESS;
         let actor = Arc::new(self.state.model.export_parameters().map_err(text_error)?);
-        pipeline.publish(PartConfig {
-            update: next,
-            version: completed,
-            actor,
-            spec: run_spec(settings, generations, next)?,
-        })?;
-        self.state.collection = Some(pipeline.checkpoint(completed, snapshots)?);
+        self.remember_milestone(pool, &actor);
+        self.prune_league(pool, &snapshots, next);
+        let spec = run_spec(settings, generations, next)?;
+        let published = self.part_config(pool, (next, completed, actor), (spec, None))?;
+        log_pool(completed, &published.mixture, &self.outcomes);
+        pipeline.publish(published)?;
+        let opponents = (&self.outcomes, self.league.manifest(completed));
+        self.state.collection = Some(pipeline.checkpoint(completed, snapshots, opponents)?);
+        Ok(())
+    }
+
+    /// Books every game the update's parts finished, then forgets opponents
+    /// that no longer play from the next publication on.
+    fn record_outcomes(
+        &mut self,
+        parts: &[PartDone],
+        pool: &OpponentPool,
+        update: u64,
+    ) -> Result<(), PpoError> {
+        for episode in parts.iter().flat_map(|part| &part.episodes) {
+            self.outcomes.record(episode.opponent, episode.outcome)?;
+        }
+        let playing = pool.entries_for(update + 1 + PIPELINE_STALENESS);
+        self.outcomes
+            .retain(|kind| playing.iter().any(|(entry, _)| *entry == kind));
         Ok(())
     }
 
@@ -414,6 +510,7 @@ impl Pipeline {
         &mut self,
         update: u64,
         snapshots: Vec<SlotSnapshot>,
+        (outcomes, league): (&OutcomeWindow, Vec<(u64, u64)>),
     ) -> Result<CollectionCheckpoint, PpoError> {
         self.configs.retain(|&published, _| published >= update);
         let config = self
@@ -424,6 +521,9 @@ impl Pipeline {
             update,
             actor_version: config.version,
             spec: config.spec,
+            mixture: config.mixture.as_ref().clone(),
+            outcomes: outcomes.clone(),
+            league,
             slots: snapshots,
         };
         Ok(CollectionCheckpoint {
@@ -493,6 +593,37 @@ fn run_spec(
     } else {
         Ok(ModifierSpec::NOMINAL)
     }
+}
+
+/// League snapshots in-flight games play.
+fn league_references(games: &[SlotSnapshot]) -> Vec<u64> {
+    games
+        .iter()
+        .filter_map(|game| match game.plan.opponent {
+            OpponentKind::League(update) => Some(update),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The checkpoint's league: its written snapshots plus, when one was due, its own model.
+fn restore_league(
+    settings: &AnnealedJobConfig,
+    state: &TrainingSession,
+    directory: &Path,
+    collection: &CollectorState,
+) -> Result<LeagueStore, PpoError> {
+    let mut league = LeagueStore::restore(directory, &collection.league)?;
+    let completed = state.completed_updates;
+    let league_played = settings
+        .opponents
+        .iter()
+        .any(|(opponent, _)| *opponent == AnnealedOpponent::League);
+    if league_played && completed.is_multiple_of(settings.league_every) {
+        let parameters = state.model.export_parameters().map_err(text_error)?;
+        league.insert(completed, Arc::new(parameters));
+    }
+    Ok(league)
 }
 
 /// Decodes and checks the checkpointed collection state against this run.

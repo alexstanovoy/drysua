@@ -107,7 +107,7 @@ fn step_policy(
     let choice = model
         .sample(&frame, &space, &mut PpoRng::new(982_004))
         .expect("action");
-    if stream.begins_interval() {
+    if stream.retains(choice.action().kind()) {
         stream.retain(RetainedChoice {
             frame,
             target: choice.target.clone(),
@@ -153,7 +153,7 @@ fn final_native_damage_is_rewarded_before_draw_finalization() {
             DamageKind::Pure,
         );
     });
-    let mut stream = EpisodeStream::new(1);
+    let mut stream = EpisodeStream::new();
     let completed = step_policy(&mut environment, &mut stream, &model, false);
     assert_eq!(completed.ticks, 1);
     assert_eq!(completed.outcome, Some(PpoTerminalOutcome::Draw));
@@ -176,7 +176,7 @@ fn final_native_damage_is_rewarded_before_draw_finalization() {
 fn learner_deadline_zero_bootstraps_without_inventing_match_over() {
     let model = stop_model();
     let mut environment = configured_environment(1, 0, OpponentRuntime::Idle, |_| {});
-    let mut stream = EpisodeStream::new(0);
+    let mut stream = EpisodeStream::new();
     let completed = step_policy(&mut environment, &mut stream, &model, true);
     assert_eq!(completed.outcome, None);
     assert_eq!((completed.end_tick, completed.ticks), (4, 3));
@@ -186,7 +186,7 @@ fn learner_deadline_zero_bootstraps_without_inventing_match_over() {
     assert_eq!(transition.ticks, 3);
     assert_eq!(stream.map2_reward().components[5], 0.0);
     let summary = crate::ppo_arena::game_summary::GameSummary::capture(&environment, None, 4);
-    let record = stream.record(0, 0, &completed, "idle", &summary);
+    let record = stream.record(0, 0, &completed, crate::ppo_arena::slot::OpponentKind::Teacher, &summary);
     let mut report = CollectionReport::default();
     record.accumulate(&mut report).expect("report");
     assert_eq!(report.episode_timeouts, 1);

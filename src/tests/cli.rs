@@ -128,7 +128,7 @@ fn train_annealed_configuration_rejects_invalid_hyperparameters_before_execution
     for (flags, field) in [
         ("--learning-rate=NaN", "learning rate"),
         ("--learning-rate=0", "learning rate"),
-        ("--gae-lambda=1.01", "discount"),
+        ("--gae-lambda-tick=1.01", "discount"),
         ("--entropy-coefficient=0", "entropy coefficient"),
     ] {
         let mut arguments = base.to_vec();
@@ -143,7 +143,7 @@ fn train_annealed_configuration_rejects_invalid_hyperparameters_before_execution
     }
     let mut arguments = base.to_vec();
     arguments.extend(
-        "--learning-rate 3e-5 --gae-lambda .995 --entropy-coefficient .001"
+        "--learning-rate 3e-5 --gae-lambda-tick .995 --entropy-coefficient .001"
             .split_ascii_whitespace(),
     );
     let settings = crate::cli::annealed_settings_for_test(&arguments).expect("boundaries");

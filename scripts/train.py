@@ -43,10 +43,12 @@ ARGUMENTS = frozenset({
     "--balanced-minibatches", "--environment-schedule",
     "--environment-success-updates", "--environment-success-rate",
     "--environment-poor-updates", "--environment-poor-rate", "--environment-extension",
-    "--zero-updates", "--learning-rate", "--epochs", "--minibatch", "--gae-lambda",
-    "--entropy-coefficient", "--environment-scale-start", "--environment-scale-end",
+    "--zero-updates", "--learning-rate", "--epochs", "--minibatch", "--gae-lambda-tick",
+    "--entropy-coefficient", "--value-coefficient", "--environment-scale-start", "--environment-scale-end",
+    "--opponent-schedule", "--league-size", "--league-every",
 })
-CONFIG_FIELDS = {"schema", "trainer", "inspector", "initial_weights", "opponent_weights", "total_updates",
+MAX_OPPONENTS = 16
+CONFIG_FIELDS = {"schema", "trainer", "inspector", "initial_weights", "opponents", "total_updates",
                  "history_every", "checkpoint_seconds", "max_seconds", "stop_seconds",
                  "training_args", "mode", "docker_context",
                  "image", "gpu_uuid", "lock_paths", "memory_gib", "cuda_directory"}
@@ -84,14 +86,41 @@ def validate_config(value):
                                         ("memory_gib", 12, 1, 48)):
         result[name] = io.bounded_integer(value.get(name, default), name, lower, upper)
     result["training_args"] = validate_arguments(value.get("training_args", []))
-    for name in ("trainer", "inspector", "initial_weights", "opponent_weights"):
+    for name in ("trainer", "inspector", "initial_weights"):
         entry = value.get(name, value.get("trainer") if name == "inspector" else None)
-        if entry is None and name in {"initial_weights", "opponent_weights"}:
+        if entry is None and name == "initial_weights":
             continue
         if not isinstance(entry, str) or not 1 <= len(entry) <= 4096:
             raise ValueError(f"{name} must be a nonempty path")
         result[name] = entry
+    if "opponents" in value:
+        result["opponents"] = validate_opponents(value["opponents"])
     result.update(validate_execution(value))
+    return result
+
+
+def validate_opponents(value):
+    """The per-game opponent pool: `{"kind", "weight"}` entries, plus `"path"` for `weights`.
+
+    Kinds other than `weights` pass through to the trainer, which owns their vocabulary.
+    """
+    if not isinstance(value, list) or not 1 <= len(value) <= MAX_OPPONENTS:
+        raise ValueError(f"opponents must be a list of 1..{MAX_OPPONENTS} entries")
+    result = []
+    for entry in value:
+        if not isinstance(entry, dict) or not isinstance(entry.get("kind"), str):
+            raise ValueError("each opponent needs a kind")
+        kind, weight = entry["kind"], entry.get("weight", "1")
+        if not re.fullmatch(r"[a-z][a-z-]{0,31}", kind):
+            raise ValueError(f"invalid opponent kind: {kind!r}")
+        if not isinstance(weight, str) or not re.fullmatch(r"[0-9]{1,4}(\.[0-9]{1,6})?", weight):
+            raise ValueError(f"opponent weight must be a decimal string, got {weight!r}")
+        expected = {"kind", "weight", "path"} if kind == "weights" else {"kind", "weight"}
+        if set(entry) - expected or (kind == "weights") != ("path" in entry):
+            raise ValueError(f"opponent fields must be {sorted(expected)}")
+        if kind == "weights" and not (isinstance(entry["path"], str) and 1 <= len(entry["path"]) <= 4096):
+            raise ValueError("weights opponents need a nonempty path")
+        result.append(dict(entry, weight=weight))
     return result
 
 
@@ -125,14 +154,16 @@ def collect_inputs(config, base):
     files = [(f"frozen/{name}", SOURCE_DIRECTORY / name) for name in SOURCES]
     for name in ("trainer", "inspector"):
         files.append((f"bin/{name}", io.private_path(base / config[name])))
-    for key, target in (("initial_weights", "initial_weights"), ("opponent_weights", "opponent")):
-        if key not in config:
+    weights = [("initial_weights", config.get("initial_weights"))]
+    weights += [(f"opponent-{index}", entry.get("path")) for index, entry in enumerate(config.get("opponents", []))]
+    for target, path in weights:
+        if path is None:
             continue
-        source = io.private_path(base / config[key])
+        source = io.private_path(base / path)
         if source.is_dir():
             source = io.private_path(source / RUNTIME_FILE)
         if not source.is_file():
-            raise ValueError(f"{key} must select a regular runtime weights file")
+            raise ValueError(f"{target} must select a regular runtime weights file")
         files.append((f"inputs/{target}/{RUNTIME_FILE}", source))
     return sorted(files)
 
@@ -170,9 +201,11 @@ def create(config_path, campaign_path):
     io.write_exclusive(directory / "owner.lock", b"", 0o600)
     records = freeze_inputs(directory, inputs)
     frozen = dict(config, trainer="bin/trainer", inspector="bin/inspector")
-    for key, target in (("initial_weights", "inputs/initial_weights"), ("opponent_weights", "inputs/opponent")):
-        if key in frozen:
-            frozen[key] = target
+    if "initial_weights" in frozen:
+        frozen["initial_weights"] = "inputs/initial_weights"
+    if "opponents" in frozen:
+        frozen["opponents"] = [dict(entry, path=f"inputs/opponent-{index}") if "path" in entry else entry
+                               for index, entry in enumerate(frozen["opponents"])]
     manifest = {"schema": SCHEMA, "campaign_id": uuid.uuid4().hex, "config": frozen, "files": records}
     payload = io.encode(manifest)
     io.write_exclusive(directory / "manifest.json", payload)
@@ -211,7 +244,8 @@ def load_campaign(campaign_path):
 
 def verify_frozen(directory, manifest):
     expected = {f"frozen/{name}" for name in SOURCES} | {"bin/trainer", "bin/inspector"}
-    optional = {f"inputs/initial_weights/{RUNTIME_FILE}", f"inputs/opponent/{RUNTIME_FILE}"}
+    optional = {f"inputs/initial_weights/{RUNTIME_FILE}"}
+    optional |= {f"inputs/opponent-{index}/{RUNTIME_FILE}" for index in range(MAX_OPPONENTS)}
     if not expected <= manifest["files"].keys() <= expected | optional:
         raise ValueError("unexpected frozen file inventory")
     for relative, record in manifest["files"].items():
@@ -360,8 +394,11 @@ def trainer_command(directory, config, resume):
         command.append("--resume")
     elif "initial_weights" in config:
         command += ["--initial-weights", str(directory / config["initial_weights"])]
-    if "opponent_weights" in config:
-        command += ["--opponent", f"weights:{directory / config['opponent_weights']}:1"]
+    for entry in config.get("opponents", []):
+        if entry["kind"] == "weights":
+            command += ["--opponent", f"weights:{directory / entry['path']}:{entry['weight']}"]
+        else:
+            command += ["--opponent", f"{entry['kind']}:{entry['weight']}"]
     return command
 
 

@@ -165,6 +165,15 @@ pub(crate) const fn fnv1a_extend(mut hash: u64, bytes: &[u8]) -> u64 {
     hash
 }
 
+/// FNV-1a over the little-endian bits of exported parameters.
+pub(crate) fn parameter_fingerprint_of(parameters: &[f32]) -> u64 {
+    let mut hash = FNV_OFFSET;
+    for value in parameters {
+        hash = fnv1a_extend(hash, &value.to_bits().to_le_bytes());
+    }
+    hash
+}
+
 /// Folds ordered imported identities and the Map2 reward version.
 pub(crate) const fn linked_schema_hash(descriptor: &str, schemas: &[(u32, u64)]) -> u64 {
     let mut hash = fnv1a_extend(FNV_OFFSET, descriptor.as_bytes());
@@ -1779,11 +1788,7 @@ impl PolicyModel {
     /// FNV-1a over the little-endian bits of one coherent parameter export.
     /// Run scopes record it to pin frozen opponent weights; reports log it.
     pub fn parameter_fingerprint(&self) -> Result<u64, ModelError> {
-        let mut hash = FNV_OFFSET;
-        for value in self.export_parameters()? {
-            hash = fnv1a_extend(hash, &value.to_bits().to_le_bytes());
-        }
-        Ok(hash)
+        Ok(parameter_fingerprint_of(&self.export_parameters()?))
     }
 
     fn export_parameters_locked(&self) -> Result<Vec<f32>, ModelError> {

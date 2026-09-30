@@ -70,7 +70,7 @@ Fields:
   `decision_interval_ticks`, `rollout_decisions`, `environments`, `epochs`,
   `minibatch`, and all eleven floating hyperparameters: `clip_epsilon`,
   `value_coefficient`, `entropy_coefficient`, `learning_rate`, `adam_beta1`,
-  `adam_beta2`, `adam_epsilon`, `gradient_clip`, `gamma_tick`, `gae_lambda`,
+  `adam_beta2`, `adam_epsilon`, `gradient_clip`, `gamma_tick`, `gae_lambda_tick`,
   `target_kl`. JSON floats are the stored F32 values widened exactly to F64;
   `ppo.f32_bits` additionally maps these eleven names to their exact U32 bits.
 - `adaptive`: null, or `{config,limits,state,snapshot_count,snapshot_hash}`.
