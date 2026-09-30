@@ -177,11 +177,8 @@ struct TrainAnnealedArgs {
     optimizer: OptimizerArgs,
     #[command(flatten)]
     checkpoint: CheckpointArgs,
-    /// Local gradient-fold worker ceiling (1 is the historical serial path).
-    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u8).range(1..=32))]
-    host_math_workers: u8,
-    /// PPO tensor microbatch (64/128/256); larger modes change reductions and checkpoint scope.
-    #[arg(long, default_value_t = 256, value_parser = crate::training_execution::parse_training_microbatch)]
+    /// Rows per device PPO pass (256/512/1024/2048); regroups reductions, recorded in scope.
+    #[arg(long, default_value_t = crate::training_execution::DEFAULT_TRAINING_MICROBATCH, value_parser = crate::training_execution::parse_training_microbatch)]
     training_microbatch: usize,
     /// Spread all rollout rows across nearly equal minibatches; recorded in checkpoint scope.
     #[arg(long)]
@@ -585,7 +582,6 @@ impl TrainAnnealedArgs {
             environment_schedule,
             execution: crate::TrainingExecutionOptions {
                 balanced_minibatches: self.balanced_minibatches,
-                host_math_workers: usize::from(self.host_math_workers),
                 training_microbatch: self.training_microbatch,
             },
             updates: self.updates,

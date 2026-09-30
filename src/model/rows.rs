@@ -7,7 +7,7 @@
 use super::*;
 
 /// Per-frame lengths of the encoder input parts, in device buffer order.
-const PART_LENGTHS: [usize; ENCODER_PARTS] = [
+pub(super) const PART_LENGTHS: [usize; ENCODER_PARTS] = [
     ENCODER_UNIT_TOKENS * UNIT_FEATURES,
     ENCODER_UNIT_TOKENS,
     ENCODER_UNIT_TOKENS,
@@ -29,7 +29,7 @@ const PART_LENGTHS: [usize; ENCODER_PARTS] = [
     LOOT_FEATURE_TOKENS,
     ENCODER_SCALARS,
 ];
-const ENCODER_PARTS: usize = 3 + UNIT_GROUPS + 12;
+pub(super) const ENCODER_PARTS: usize = 3 + UNIT_GROUPS + 12;
 
 /// Scalars of one packed row.
 pub const ENCODER_ROW_ELEMENTS: usize = {
@@ -43,7 +43,7 @@ pub const ENCODER_ROW_ELEMENTS: usize = {
 };
 const _: () = assert!(ENCODER_ROW_ELEMENTS < 32 * 1024);
 
-const fn part_offset(part: usize) -> usize {
+pub(super) const fn part_offset(part: usize) -> usize {
     let mut total = 0;
     let mut index = 0;
     while index < part {
@@ -104,6 +104,11 @@ impl EncoderRow {
 
     pub(crate) const fn radiant(&self) -> bool {
         self.radiant
+    }
+
+    pub(super) fn part_values(&self, part: usize) -> &[f32] {
+        let offset = part_offset(part);
+        &self.values[offset..offset + PART_LENGTHS[part]]
     }
 
     fn part(&mut self, part: usize) -> &mut [f32] {

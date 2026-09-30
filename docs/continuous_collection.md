@@ -55,6 +55,18 @@ fingerprinted in the run scope). The default is `teacher:1`.
 adaptive schedules may only use reports of updates every lane has finished.
 Episode logs carry `slot=`, `game=` and `opponent=`.
 
+## Learner
+
+The learner is device resident (`src/model/device_learner.rs`). An update's
+samples are packed into encoder rows and uploaded once, in 256-row chunks, into
+preallocated device columns. Each Adam step gathers its minibatch on the device,
+runs `--training-microbatch` rows (256/512/1024/2048, default 512) per
+forward/backward, sums the microbatch gradients on the device and applies a
+clipped f32 Adam there. Per step the host reads back the loss sums with a
+finiteness probe, the gradient norm, the new Adam moments and the candidate KL;
+a rejected candidate is restored from device copies of the parameters. The loss
+definitions live only in `src/model/ppo_objective.rs`.
+
 ## What changed numerically
 
 - PPO is 1-stale: the importance ratio uses the stored behaviour log-probability,
@@ -66,3 +78,7 @@ Episode logs carry `slot=`, `game=` and `opponent=`.
 - Inference batches are a lane's slots (plus self-play rows), so GEMM shapes and
   therefore sampled trajectories differ from the old waves.
 - Adaptive environment transitions apply two updates later than before.
+- The learner computes each microbatch's losses divided by the whole minibatch
+  size and adds gradients, so `--training-microbatch` only regroups float sums.
+  Adam now runs in f32 on the device (it used f64 temporaries on the host) and the
+  gradient norm sums per-tensor f32 squares in f64.

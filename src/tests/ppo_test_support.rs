@@ -38,11 +38,6 @@ impl PpoBatch {
     }
 
     #[cfg(test)]
-    pub(crate) fn reject_minibatch_for_test(&mut self, index: usize) {
-        self.samples[index].transition.old_log_probability = -5.0;
-    }
-
-    #[cfg(test)]
     pub(crate) fn replace_advantage_for_test(&mut self, index: usize, value: f32) -> f32 {
         std::mem::replace(&mut self.samples[index].advantage, value)
     }
