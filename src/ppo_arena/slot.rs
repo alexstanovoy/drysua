@@ -27,6 +27,8 @@ const MIXTURE_DOMAIN: u64 = 0x736c_6f74_5f6d_6978;
 pub(crate) enum OpponentKind {
     /// The scripted Teacher, run on the simulation worker.
     Teacher,
+    /// The HarassPush rule policy, run on the simulation worker.
+    HarassPush,
     /// Frozen weights snapshot `index` of the run's opponent pool.
     Snapshot(usize),
     /// The actor weights the policy seat samples from.
@@ -37,6 +39,7 @@ impl OpponentKind {
     pub(crate) fn label(self) -> String {
         match self {
             Self::Teacher => "teacher".to_owned(),
+            Self::HarassPush => "harass-push".to_owned(),
             Self::Snapshot(index) => format!("weights{index}"),
             Self::SelfPlay => "self".to_owned(),
         }
@@ -254,6 +257,7 @@ impl Slot {
         let seed = schedule.seed;
         let runtime = match plan.opponent {
             OpponentKind::Teacher => OpponentRuntime::Teacher,
+            OpponentKind::HarassPush => OpponentRuntime::HarassPush,
             OpponentKind::Snapshot(_) | OpponentKind::SelfPlay => OpponentRuntime::Neural,
         };
         let mut environment = build_environment(

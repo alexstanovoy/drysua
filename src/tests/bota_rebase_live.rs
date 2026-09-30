@@ -3,7 +3,7 @@ use std::io;
 
 use crate::{
     Arena, ArenaConfig, MAP2_ID, MAP2_TICK_CAP, MAP2_TICK_RATE, PolicyModel, Request, Seated, Wire,
-    play_neural_on, play_teacher_on,
+    play_neural_on, play_script_on,
 };
 use bota_proto::{
     DamageKind, EntityId, EventKind, Order, PlayerId, ServerMsg, SlotId, Team, TickMode, Vec2,
@@ -61,7 +61,7 @@ fn native_session(side: usize, model: Option<&PolicyModel>, terminal: bool) {
     let limit = Some(MAP2_TICK_CAP + u32::from(terminal));
     let outcome = match model {
         Some(model) => play_neural_on(&mut wire, seated, limit, model),
-        None => play_teacher_on(&mut wire, seated, limit),
+        None => play_script_on(&mut wire, seated, limit, crate::ScriptKind::Teacher),
     }
     .expect("production controller");
     assert_eq!(outcome.slot, Some(SlotId(side as u8)));

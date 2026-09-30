@@ -112,6 +112,7 @@ fn put_slot(bytes: &mut Vec<u8>, slot: &SlotSnapshot) {
         OpponentKind::Teacher => (0, 0),
         OpponentKind::Snapshot(index) => (1, index as u32),
         OpponentKind::SelfPlay => (2, 0),
+        OpponentKind::HarassPush => (3, 0),
     };
     put_u32(bytes, kind);
     put_u32(bytes, index);
@@ -209,6 +210,7 @@ impl Reader<'_> {
             (0, 0) => OpponentKind::Teacher,
             (1, index) if index < 16 => OpponentKind::Snapshot(index),
             (2, 0) => OpponentKind::SelfPlay,
+            (3, 0) => OpponentKind::HarassPush,
             _ => return Err(invalid()),
         };
         let decision_cap = self.u32()? as usize;

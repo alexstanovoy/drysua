@@ -55,6 +55,7 @@ pub use ppo::*;
 pub use ppo_arena::*;
 pub use raze_aim::RazeAim;
 pub use readiness::*;
+pub use scripted::*;
 pub use seat::*;
 pub use teacher::*;
 pub use tracker::*;

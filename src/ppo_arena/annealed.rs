@@ -464,6 +464,7 @@ fn load_opponents(settings: &AnnealedJobConfig) -> Result<OpponentPool, PpoError
     for (opponent, weight) in &settings.opponents {
         let kind = match opponent {
             AnnealedOpponent::Teacher => OpponentKind::Teacher,
+            AnnealedOpponent::HarassPush => OpponentKind::HarassPush,
             AnnealedOpponent::SelfPlay => OpponentKind::SelfPlay,
             AnnealedOpponent::Weights(directory) => {
                 let model = PolicyModel::fresh_on(0, PolicyDevice::Cpu).map_err(text_error)?;
@@ -560,6 +561,9 @@ fn append_opponent_scope(
             }
             AnnealedOpponent::SelfPlay => {
                 command_line.push_str(&format!(" --opponent self:{weight}"))
+            }
+            AnnealedOpponent::HarassPush => {
+                command_line.push_str(&format!(" --opponent harass-push:{weight}"))
             }
             AnnealedOpponent::Weights(directory) => {
                 let fingerprint = fingerprints

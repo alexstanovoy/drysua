@@ -86,7 +86,7 @@ fn selected_deployment_rejects_policy_and_weight_mismatches() {
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
         assert_eq!(
             error.to_string(),
-            "default Teacher must be weights-free; default neural policies must specify weights"
+            "default rule policies must be weights-free; default neural policies must specify weights"
         );
     }
 }

@@ -38,6 +38,7 @@ const WILSON_Z: f64 = 1.959_963_984_540_054;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum EvaluationOpponent {
     Teacher,
+    HarassPush,
     Weights(PathBuf),
 }
 
@@ -77,6 +78,8 @@ impl EvaluationSettings {
 struct PlannedGame {
     seed: u64,
     seat: usize,
+    /// Who plays the opponent seat when no opponent weights are loaded.
+    script: OpponentRuntime,
 }
 
 /// One live world; `prepared` is taken for inference and refilled after each step.
@@ -120,13 +123,13 @@ pub(crate) fn run_evaluation(settings: &EvaluationSettings, output: &Path) -> Re
     }
     let candidate_sha = weights_sha256(&settings.candidate)?;
     let opponent_sha = match &settings.opponent {
-        EvaluationOpponent::Teacher => None,
+        EvaluationOpponent::Teacher | EvaluationOpponent::HarassPush => None,
         EvaluationOpponent::Weights(directory) => Some(weights_sha256(directory)?),
     };
     let models = Models {
         learner: load_model(&settings.candidate, settings.device)?,
         opponent: match &settings.opponent {
-            EvaluationOpponent::Teacher => None,
+            EvaluationOpponent::Teacher | EvaluationOpponent::HarassPush => None,
             EvaluationOpponent::Weights(directory) => {
                 Some(Arc::new(load_model(directory, settings.device)?))
             }
@@ -200,6 +203,12 @@ fn plan_groups(settings: &EvaluationSettings) -> Vec<VecDeque<PlannedGame>> {
         groups[(index % settings.groups as u64) as usize].push_back(PlannedGame {
             seed: settings.first_seed + index / 2,
             seat: (index % 2) as usize,
+            script: match settings.opponent {
+                EvaluationOpponent::HarassPush => OpponentRuntime::HarassPush,
+                EvaluationOpponent::Teacher | EvaluationOpponent::Weights(_) => {
+                    OpponentRuntime::Teacher
+                }
+            },
         });
     }
     groups
@@ -282,7 +291,7 @@ fn start_game(
 ) -> Result<LiveWorld, PpoError> {
     let runtime = match opponent {
         Some(_) => OpponentRuntime::Neural,
-        None => OpponentRuntime::Teacher,
+        None => game.script,
     };
     let opponent_seed = derive_training_seed(game.seed, game.seat as u64, OPPONENT_DOMAIN);
     let mut environment = build_environment(
@@ -561,6 +570,7 @@ fn summary_json(
     }
     let opponent = match &settings.opponent {
         EvaluationOpponent::Teacher => "teacher".to_owned(),
+        EvaluationOpponent::HarassPush => "harass-push".to_owned(),
         EvaluationOpponent::Weights(directory) => format!("weights:{}", directory.display()),
     };
     json!({

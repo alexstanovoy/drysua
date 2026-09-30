@@ -15,6 +15,24 @@ renderer slows simulation. See [human-reward-play.md](human-reward-play.md) for
 components, completeness flags, raw seat-visible counters and verified native examples.
 The GUI is for the human to launch from a desktop; agent verification was headless.
 
+## Watch or play HarassPush
+
+HarassPush (`src/scripted/harass_push.rs`) is a weightless rule policy that razes
+Teacher off the lane and pushes its tower. `--opponent harass-push` plays it against
+the human; `--watch harass-push` seats it where the human would sit and opens
+bota-client as a spectator, so it plays the `--opponent` rule policy:
+
+```sh
+/home/alexstanovoy/Workspace/bots/play.sh --watch harass-push --opponent teacher --no-build
+```
+
+Headless head-to-head numbers come from the builtin arena, every seed once per side:
+
+```sh
+cargo run --release --features builtin -- duel --policy harass-push --opponent teacher \
+  --seed 1 --seeds 100
+```
+
 ## Default Neural mode still fails closed without explicit weights
 
 The current Map2 reward (version 8) is documented in [reward.md](reward.md).

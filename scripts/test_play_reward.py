@@ -12,7 +12,7 @@ import unittest
 from unittest.mock import Mock, patch
 
 import play_match
-from play_admission import Endpoint, SeatRelay, varint
+from play_admission import Admission, Endpoint, SeatRelay, varint, verify_hello
 from play_reward import RewardPipe, print_overview
 
 
@@ -63,8 +63,24 @@ class OpponentTests(unittest.TestCase):
             with patch("play_match.current_paths", side_effect=AssertionError("weights touched")):
                 binary, weights = play_match.opponent_paths(Path("/repo"), arguments)
             self.assertIsNone(weights)
-            self.assertEqual(play_match.bot_command(binary, "127.0.0.1:1", arguments, weights),
+            self.assertEqual(play_match.bot_command(binary, "127.0.0.1:1", arguments.opponent, weights),
                              [str(binary), "--addr", "127.0.0.1:1", "--name", "drysua", "--policy", "teacher"])
+
+    def test_watch_seats_a_named_rule_bot_where_the_human_would_sit(self):
+        for side, slot in (("radiant", 0), ("dire", 1)):
+            arguments = play_match.parse_arguments(
+                ["--watch", "harass-push", "--opponent", "teacher", "--human-side", side])
+            admission = Admission(1, arguments.human_side, watch=arguments.watch is not None)
+            try:
+                self.assertEqual([relay.role for relay in admission.relays][slot], "watched")
+                verify_hello(b"\x00\x01\x07watched", "watched")
+                with self.assertRaisesRegex(ValueError, "expected watched identity"):
+                    verify_hello(b"\x00\x00\x05human", "watched")
+                self.assertEqual(
+                    play_match.bot_command(Path("/drysua"), "127.0.0.1:2", arguments.watch, None, name="watched"),
+                    ["/drysua", "--addr", "127.0.0.1:2", "--name", "watched", "--policy", "harass-push"])
+            finally:
+                admission.close()
 
     def test_default_neural_still_fails_closed_without_weights(self):
         arguments = play_match.parse_arguments([])
@@ -74,6 +90,7 @@ class OpponentTests(unittest.TestCase):
 
     def test_ambiguous_teacher_weights_and_bad_flags_rejected(self):
         for flags in (["--opponent", "teacher", "--weights-directory", "."],
+                      ["--opponent", "harass-push", "--weights-directory", "."], ["--watch", "neural"],
                       ["--opponent", "hybrid"], ["--reward-interval", "0"],
                       ["--human-side", "dire", "--bot-side", "dire"]):
             with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):

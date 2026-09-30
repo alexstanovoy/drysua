@@ -22,8 +22,9 @@ from play_pacing import ACK_TIMEOUT_TICKS
 
 
 BUILD_TIMEOUT = 1200
+RULE_POLICIES = ("teacher", "harass-push")
 LOG_LIMIT = 16 * 1024 * 1024
-MAX_CHILDREN = 7
+MAX_CHILDREN = 8
 READ_CHUNK = 65536
 RUNTIME_FILE = "drysua.weights.safetensors"
 READINESS_LIMIT = 4096
@@ -89,8 +90,11 @@ def main(arguments=None):
 
 def parse_arguments(arguments):
     parser = argparse.ArgumentParser(
-        prog="play.sh", description="Map2 human play: explicit Teacher without weights, or pure Neural with compatible explicit weights.")
-    parser.add_argument("--opponent", choices=("neural", "teacher"), default="neural")
+        prog="play.sh", description="Map2 human play against a weightless rule policy (Teacher, HarassPush) "
+                                    "or pure Neural with compatible explicit weights.")
+    parser.add_argument("--opponent", choices=("neural",) + RULE_POLICIES, default="neural")
+    parser.add_argument("--watch", choices=RULE_POLICIES,
+                        help="Replace the human with this rule policy and open bota-client as a spectator")
     parser.add_argument("--reward-report", action="store_true",
                         help="Score both original streams using paced native Lockstep at 30 Hz; slow clients slow simulation")
     parser.add_argument("--reward-interval", type=lambda value: reward_interval(value), default=300,
@@ -112,8 +116,8 @@ def parse_arguments(arguments):
     parser.add_argument("--weights-directory", type=Path,
                         help="Runtime weights exported by train-annealed; required for Neural, forbidden for Teacher")
     result = parser.parse_args(arguments)
-    if result.opponent == "teacher" and result.weights_directory is not None:
-        parser.error("--opponent teacher forbids --weights-directory")
+    if result.opponent in RULE_POLICIES and result.weights_directory is not None:
+        parser.error(f"--opponent {result.opponent} forbids --weights-directory")
     opposite = {"radiant": "dire", "dire": "radiant"}
     if result.human_side is None:
         result.human_side = opposite[result.bot_side] if result.bot_side else "radiant"
@@ -132,20 +136,20 @@ def reward_interval(value):
 
 
 def opponent_paths(root, arguments):
-    if arguments.opponent == "teacher":
+    if arguments.opponent in RULE_POLICIES:
         if arguments.weights_directory is not None:
-            raise RuntimeError("--opponent teacher forbids --weights-directory")
+            raise RuntimeError(f"--opponent {arguments.opponent} forbids --weights-directory")
         return root / "drysua/target/release/drysua", None
     return current_paths(root, arguments.weights_directory)
 
 
-def bot_command(binary, address, arguments, weights):
-    command = [str(binary), "--addr", address, "--name", "drysua", "--policy", arguments.opponent]
-    if arguments.opponent == "neural":
+def bot_command(binary, address, policy, weights, name="drysua"):
+    command = [str(binary), "--addr", address, "--name", name, "--policy", policy]
+    if policy == "neural":
         assert weights is not None
         command.extend(["--weights-directory", str(weights)])
     else:
-        assert arguments.opponent == "teacher" and weights is None
+        assert policy in RULE_POLICIES and weights is None
     return command
 
 
@@ -355,7 +359,7 @@ class Supervisor:
 
     def run(self, root, arguments):
         binary, weights = opponent_paths(root, arguments)
-        label = "pure Neural" if arguments.opponent == "neural" else "explicit Teacher (no model)"
+        label = "pure Neural" if arguments.opponent == "neural" else f"explicit {arguments.opponent} (no model)"
         print(f"play: current Map2 {label}; weights: {weights}; executable: {binary}", flush=True)
         if not arguments.no_build:
             binaries = release_paths(root)
@@ -381,25 +385,37 @@ class Supervisor:
         resource.prlimit(server.process.pid, resource.RLIMIT_FSIZE, (REPLAY_LIMIT, REPLAY_LIMIT))
         port = self.wait_ready(server, arguments.port)
         self.admission = Admission(port, arguments.human_side, mode=int(arguments.reward_report),
-                                   paced=arguments.reward_report)
+                                   paced=arguments.reward_report, watch=arguments.watch is not None)
         if arguments.reward_report:
             print("play: reward-report uses native LOCKSTEP paced at 30 ticks/s by delaying original ACKs; "
                   "slow clients slow simulation, not snapshot delivery. No generated ACKs or orders.", flush=True)
             start_observers(self, binary, root, arguments)
-        client = self.spawn("client", [str(binaries[1]), "--addr", self.admission.addresses["human"],
-                                      "--name", "human"], root)
-        bot = self.spawn("bot", bot_command(binary, self.admission.addresses["bot"], arguments, weights), root)
-        print(f"play: requested human {arguments.human_side} / {arguments.opponent} bot {arguments.bot_side}; "
-              "verifying server Welcome seats. Choose a hero (1/2/3), then R to ready. Ctrl+C stops all.",
-              flush=True)
-        self.wait_game(server, bot, client)
+        if arguments.watch is None:
+            client = self.spawn("client", [str(binaries[1]), "--addr", self.admission.addresses["human"],
+                                          "--name", "human"], root)
+            seat = client
+        else:
+            seat = self.spawn("watched", bot_command(binary, self.admission.addresses["watched"],
+                                                     arguments.watch, None, name="watched"), root)
+            client = self.spawn("client", [str(binaries[1]), "--addr", f"127.0.0.1:{port}", "--spectate",
+                                          "--name", "spectator"], root)
+        bot = self.spawn("bot", bot_command(binary, self.admission.addresses["bot"], arguments.opponent,
+                                            weights), root)
+        if arguments.watch is None:
+            print(f"play: requested human {arguments.human_side} / {arguments.opponent} bot {arguments.bot_side}; "
+                  "verifying server Welcome seats. Choose a hero (1/2/3), then R to ready. Ctrl+C stops all.",
+                  flush=True)
+        else:
+            print(f"play: watching {arguments.watch} {arguments.human_side} / {arguments.opponent} "
+                  f"{arguments.bot_side} from a spectator client. Ctrl+C stops all.", flush=True)
+        self.wait_game(server, bot, client, seat)
 
-    def wait_game(self, server, bot, client):
+    def wait_game(self, server, bot, client, seat):
         # The results window controls lifetime; successful server/bot exits do not close it.
         disconnected = {}
         while True:
             self.check_stop()
-            for child in (server, bot, client):
+            for child in dict.fromkeys((server, bot, client, seat)):
                 status = child.exit_status()
                 if status not in (None, 0):
                     raise RuntimeError(f"{child.name} exited with status {status}; see {child.name}.log")
@@ -409,14 +425,15 @@ class Supervisor:
             for relay in self.admission.relays:
                 if relay.endpoints and relay.endpoints[0].eof:
                     deadline = disconnected.setdefault(relay.role, time.monotonic() + TERM_GRACE)
-                    child = client if relay.role == "human" else bot
+                    child = bot if relay.role == "bot" else seat
                     if time.monotonic() >= deadline and child.exit_status() is None:
                         raise RuntimeError(f"{relay.role} disconnected but process did not exit; see {child.name}.log")
-                    if relay.role == "human":
+                    if relay.role != "bot":
                         continue
                 if not relay.welcomed and relay.endpoints and any(peer.eof for peer in relay.endpoints):
                     raise RuntimeError(f"{relay.role} disconnected before verified Welcome")
-            if not self.admission.welcomed and any(child.exit_status() == 0 for child in (server, bot)):
+            if not self.admission.welcomed and any(child.exit_status() == 0 for child in (server, bot, seat)
+                                                   if child is not client):
                 raise RuntimeError("server or bot exited before verified Welcome; see server.log and bot.log")
 
     def signal_groups(self, number):

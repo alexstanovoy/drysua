@@ -38,6 +38,8 @@ enum Operation {
     TrainAnnealed(TrainAnnealedArgs),
     /// Evaluate frozen runtime weights on both sides of paired seeds; never trains.
     Eval(EvalArgs),
+    /// Play two rule policies against each other on Map2 seeds from both sides.
+    Duel(crate::scripted::duel_cli::DuelArgs),
 }
 
 /// Options for a frozen-weights evaluation.
@@ -46,7 +48,7 @@ struct EvalArgs {
     /// Candidate runtime weights directory.
     #[arg(long)]
     weights: std::path::PathBuf,
-    /// `teacher` or `weights:<runtime weights directory>`.
+    /// `teacher`, `harass-push` or `weights:<runtime weights directory>`.
     #[arg(long, default_value = "teacher", value_parser = parse_eval_opponent)]
     opponent: EvalOpponentArg,
     /// Seed range `<start>:<count>`; every seed is played once per side.
@@ -75,17 +77,19 @@ struct EvalArgs {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum EvalOpponentArg {
     Teacher,
+    HarassPush,
     Weights(std::path::PathBuf),
 }
 
 fn parse_eval_opponent(value: &str) -> Result<EvalOpponentArg, String> {
     match value.split_once(':') {
         None if value == "teacher" => Ok(EvalOpponentArg::Teacher),
+        None if value == "harass-push" => Ok(EvalOpponentArg::HarassPush),
         Some(("weights", directory)) if !directory.is_empty() => {
             Ok(EvalOpponentArg::Weights(directory.into()))
         }
         _ => Err(format!(
-            "opponent must be teacher or weights:<directory>, got {value:?}"
+            "opponent must be teacher, harass-push or weights:<directory>, got {value:?}"
         )),
     }
 }
@@ -130,7 +134,7 @@ struct RewardObserverArgs {
 /// Options for one server match.
 #[derive(Args)]
 struct PlayArgs {
-    /// Override the repository-selected default with Neural or Teacher.
+    /// Override the repository-selected default with Neural or a rule policy.
     #[arg(long, value_enum)]
     policy: Option<PlayPolicy>,
     /// Server socket address.
@@ -151,6 +155,7 @@ struct PlayArgs {
 pub(crate) enum PlayPolicy {
     Neural,
     Teacher,
+    HarassPush,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -223,8 +228,8 @@ struct TrainAnnealedArgs {
     /// Final updates with no modifiers; defaults to one fifth of the update budget.
     #[arg(long)]
     zero_updates: Option<u64>,
-    /// Per-game opponent mixture entry, repeatable: `teacher[:weight]`, `self[:weight]`
-    /// or `weights:<runtime weights directory>:<weight>`; weights are exact decimals.
+    /// Per-game opponent mixture entry, repeatable: `teacher[:weight]`, `harass-push[:weight]`,
+    /// `self[:weight]` or `weights:<runtime weights directory>:<weight>`; weights are exact decimals.
     #[arg(long = "opponent", default_value = "teacher:1", value_parser = parse_annealed_opponent)]
     opponents: Vec<(crate::AnnealedOpponent, crate::EnvironmentDecimal)>,
     /// Environment scale at the first update in exact decimals; 1 is full variance, at most 10.
@@ -298,6 +303,7 @@ fn run(arguments: Cli) -> std::io::Result<()> {
         Some(Operation::Play(play)) => play,
         Some(Operation::TrainAnnealed(train)) => return run_train_annealed(train),
         Some(Operation::Eval(evaluation)) => return run_eval(evaluation),
+        Some(Operation::Duel(duel)) => return crate::scripted::duel_cli::run(duel),
         None => arguments.play,
     };
     let (policy, weights_directory) = resolve_play_deployment(&play)?;
@@ -314,7 +320,18 @@ fn run(arguments: Cli) -> std::io::Result<()> {
             })?;
             crate::seat::play_neural(&play.addr, &play.name, play.limit, directory)?
         }
-        PlayPolicy::Teacher => crate::play_teacher(&play.addr, &play.name, play.limit)?,
+        PlayPolicy::Teacher => crate::play_script(
+            crate::ScriptKind::Teacher,
+            &play.addr,
+            &play.name,
+            play.limit,
+        )?,
+        PlayPolicy::HarassPush => crate::play_script(
+            crate::ScriptKind::HarassPush,
+            &play.addr,
+            &play.name,
+            play.limit,
+        )?,
     };
     println!(
         "played {} ticks as {:?}; winner {:?}; {} decisions, {} orders, {} rejected orders",
@@ -351,10 +368,10 @@ fn resolve_play_deployment(
     play: &PlayArgs,
 ) -> std::io::Result<(PlayPolicy, Option<std::path::PathBuf>)> {
     if let Some(policy) = play.policy {
-        if policy == PlayPolicy::Teacher && play.weights_directory.is_some() {
+        if policy != PlayPolicy::Neural && play.weights_directory.is_some() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
-                "teacher forbids --weights-directory",
+                "rule policies forbid --weights-directory",
             ));
         }
         return Ok((policy, play.weights_directory.clone()));
@@ -649,8 +666,12 @@ fn parse_annealed_opponent(
     match value.split_once(':') {
         None if value == "teacher" => Ok((crate::AnnealedOpponent::Teacher, one)),
         None if value == "self" => Ok((crate::AnnealedOpponent::SelfPlay, one)),
+        None if value == "harass-push" => Ok((crate::AnnealedOpponent::HarassPush, one)),
         Some(("teacher", rest)) => Ok((crate::AnnealedOpponent::Teacher, weight(rest)?)),
         Some(("self", rest)) => Ok((crate::AnnealedOpponent::SelfPlay, weight(rest)?)),
+        Some(("harass-push", rest)) => {
+            Ok((crate::AnnealedOpponent::HarassPush, weight(rest)?))
+        }
         Some(("weights", rest)) => {
             let (directory, share) = rest
                 .rsplit_once(':')
@@ -664,7 +685,7 @@ fn parse_annealed_opponent(
             ))
         }
         _ => Err(
-            "opponent must be teacher[:weight], self[:weight] or weights:<directory>:<weight>"
+            "opponent must be teacher[:weight], harass-push[:weight], self[:weight] or weights:<directory>:<weight>"
                 .to_owned(),
         ),
     }
@@ -892,6 +913,7 @@ fn run_eval(arguments: EvalArgs) -> std::io::Result<()> {
         candidate: arguments.weights,
         opponent: match arguments.opponent {
             EvalOpponentArg::Teacher => crate::ppo_arena::EvaluationOpponent::Teacher,
+            EvalOpponentArg::HarassPush => crate::ppo_arena::EvaluationOpponent::HarassPush,
             EvalOpponentArg::Weights(directory) => {
                 crate::ppo_arena::EvaluationOpponent::Weights(directory)
             }

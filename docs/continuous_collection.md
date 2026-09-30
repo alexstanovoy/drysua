@@ -48,8 +48,9 @@ equals an uninterrupted run bit for bit, including games against neural opponent
 ## Opponents
 
 `--opponent` is repeatable and forms a per-game mixture: `teacher[:w]`,
-`self[:w]` (the lane's current actor weights) and `weights:<dir>:<w>` (frozen
-snapshots, fingerprinted in the run scope). The default is `teacher:1`.
+`harass-push[:w]` (the HarassPush rule policy in `src/scripted/`), `self[:w]` (the
+lane's current actor weights) and `weights:<dir>:<w>` (frozen snapshots,
+fingerprinted in the run scope). The default is `teacher:1`.
 `draw_opponent` in `src/ppo_arena/slot.rs` is the single pluggable schedule;
 adaptive schedules may only use reports of updates every lane has finished.
 Episode logs carry `slot=`, `game=` and `opponent=`.

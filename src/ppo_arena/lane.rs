@@ -370,7 +370,7 @@ fn row_groups(slots: &[Box<Slot>]) -> Vec<(Option<usize>, Vec<RowRef>)> {
             opponent: false,
         });
         let group = match slot.plan.opponent {
-            OpponentKind::Teacher => continue,
+            OpponentKind::Teacher | OpponentKind::HarassPush => continue,
             OpponentKind::SelfPlay => 0,
             OpponentKind::Snapshot(index) => {
                 match groups.iter().position(|(model, _)| *model == Some(index)) {

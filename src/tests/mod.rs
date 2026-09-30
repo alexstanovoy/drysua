@@ -34,6 +34,8 @@ mod pregame_server;
 mod readiness;
 mod reward_observer;
 mod sampling_dispatch;
+#[cfg(feature = "builtin")]
+mod scripted_duel;
 mod seat;
 pub(crate) mod support;
 mod teacher;

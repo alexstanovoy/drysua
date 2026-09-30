@@ -44,9 +44,12 @@ assert HANDSHAKE_TIMEOUT < SESSION_TIMEOUT
 
 
 class Admission:
-    """Two loopback relays; slot one cannot reach the server before Welcome zero."""
+    """Two loopback relays; slot one cannot reach the server before Welcome zero.
 
-    def __init__(self, port, human_side, mode=0, *, paced=False, clock=time.monotonic):
+    With `watch`, a second bot named "watched" holds the human seat instead of bota-client.
+    """
+
+    def __init__(self, port, human_side, mode=0, *, paced=False, watch=False, clock=time.monotonic):
         assert 1 <= port <= 65535
         assert human_side in ("radiant", "dire")
         assert mode in (0, 1)
@@ -55,7 +58,8 @@ class Admission:
         self.pacer = PacedClock(clock) if paced else None
         self.relays = []
         self.deadline = time.monotonic() + SESSION_TIMEOUT
-        roles = ("human", "bot") if human_side == "radiant" else ("bot", "human")
+        seat = "watched" if watch else "human"
+        roles = (seat, "bot") if human_side == "radiant" else ("bot", seat)
         try:
             for slot, role in enumerate(roles):
                 self.relays.append(SeatRelay(port, slot, role, mode, pacer=self.pacer))
@@ -91,9 +95,11 @@ class Admission:
             relay.close()
 
 
+HELLO_IDENTITIES = {"human": (0, b"human"), "bot": (1, b"drysua"), "watched": (1, b"watched")}
+
+
 def verify_hello(payload, role):
-    assert role in ("human", "bot")
-    expected_role, name = (0, b"human") if role == "human" else (1, b"drysua")
+    expected_role, name = HELLO_IDENTITIES[role]
     # All fields are single-byte postcard integers for these fixed identities.
     expected = bytes([0, expected_role, len(name)]) + name
     if payload != expected:
@@ -172,7 +178,7 @@ class Endpoint:
 class SeatRelay:
     def __init__(self, port, slot, role, mode, *, pacer=None):
         assert slot in (0, 1)
-        assert role in ("human", "bot")
+        assert role in HELLO_IDENTITIES
         self.port, self.slot, self.role, self.mode = port, slot, role, mode
         self.pacer = pacer
         self.hello = self.welcomed = False
