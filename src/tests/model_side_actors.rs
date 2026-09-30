@@ -842,7 +842,8 @@ fn assert_ppo_rollback(device: PolicyDevice) {
         }
         let after = model.coherent_snapshot(&adam).expect("after candidate");
         assert_eq!(after.adam.step, 1);
-        for moments in [&after.adam.first_moment, &after.adam.second_moment] {
+        let (after_first, after_second) = after.adam.moments().expect("after moments");
+        for moments in [&after_first, &after_second] {
             assert!(
                 moments[1_651_905..1_656_017]
                     .iter()
@@ -856,8 +857,9 @@ fn assert_ppo_rollback(device: PolicyDevice) {
         }
         if scenario != 0 {
             assert_bits(&after.parameters, &before.parameters);
-            assert_bits(&after.adam.first_moment, &before.adam.first_moment);
-            assert_bits(&after.adam.second_moment, &before.adam.second_moment);
+            let (before_first, before_second) = before.adam.moments().expect("before moments");
+            assert_bits(&after_first, &before_first);
+            assert_bits(&after_second, &before_second);
             assert_eq!(after.adam.binding, before.adam.binding);
             assert_eq!(after.adam.config, before.adam.config);
         }

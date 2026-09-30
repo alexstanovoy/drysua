@@ -101,10 +101,12 @@ samples are packed into encoder rows and uploaded once, in 256-row chunks, into
 preallocated device columns. Each Adam step gathers its minibatch on the device,
 runs `--training-microbatch` rows (256/512/1024/2048, default 512) per
 forward/backward, sums the microbatch gradients on the device and applies a
-clipped f32 Adam there. Per step the host reads back the loss sums with a
-finiteness probe, the gradient norm, the new Adam moments and the candidate KL;
-a rejected candidate is restored from device copies of the parameters. The loss
-definitions live only in `src/model/ppo_objective.rs`.
+clipped f32 Adam there. The Adam moments stay on the device (read back only
+for checkpoints). Per step the host reads back the loss sums with a finiteness
+probe, the gradient norm, one moment/parameter finiteness check and the
+candidate KL; a rejected candidate is restored from device copies of the
+parameters and the previous moment tensors. The loss definitions live only in
+`src/model/ppo_objective.rs`.
 
 ## What changed numerically
 

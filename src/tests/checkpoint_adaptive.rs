@@ -367,8 +367,9 @@ fn adaptive_capture_save_restore_carries_model_adam_rng_and_rejects_without_muta
         .checkpoint_snapshot(&target)
         .expect("snapshot");
     assert_eq!(snapshot.parameters, artifact.parameters);
-    assert_eq!(snapshot.adam.moments().0, artifact.optimizer.first_moment);
-    assert_eq!(snapshot.adam.moments().1, artifact.optimizer.second_moment);
+    let (first, second) = snapshot.adam.moments().expect("moments");
+    assert_eq!(first, artifact.optimizer.first_moment);
+    assert_eq!(second, artifact.optimizer.second_moment);
 }
 
 #[test]

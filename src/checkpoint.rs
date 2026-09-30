@@ -317,7 +317,10 @@ impl TrainingArtifact {
         let snapshot = trainer
             .checkpoint_snapshot(model)
             .map_err(|error| CheckpointError::Model(error.to_string()))?;
-        let (first_moment, second_moment) = snapshot.adam.moments();
+        let (first_moment, second_moment) = snapshot
+            .adam
+            .moments()
+            .map_err(|error| CheckpointError::Model(error.to_string()))?;
         let artifact = Self {
             run,
             progress,
@@ -326,8 +329,8 @@ impl TrainingArtifact {
             shuffle: trainer.rng_checkpoint(),
             parameters: snapshot.parameters,
             optimizer: CheckpointOptimizer {
-                first_moment: first_moment.to_vec(),
-                second_moment: second_moment.to_vec(),
+                first_moment,
+                second_moment,
                 step: snapshot.adam.step(),
             },
             collection,

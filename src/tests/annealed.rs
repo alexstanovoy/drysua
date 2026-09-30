@@ -459,12 +459,12 @@ fn assert_artifact_bits(source: &std::path::Path, target: &std::path::Path, devi
     assert_eq!(source.progress(), target.progress());
     let (source, source_rng, source_updates) = restored_state(&source, device);
     let (target, target_rng, target_updates) = restored_state(&target, device);
-    let (source_first, source_second) = source.adam.moments();
-    let (target_first, target_second) = target.adam.moments();
+    let (source_first, source_second) = source.adam.moments().expect("source moments");
+    let (target_first, target_second) = target.adam.moments().expect("target moments");
     for (source, target) in [
         (source.parameters.as_slice(), target.parameters.as_slice()),
-        (source_first, target_first),
-        (source_second, target_second),
+        (&source_first, &target_first),
+        (&source_second, &target_second),
     ] {
         assert_eq!(source.len(), target.len());
         assert!(
