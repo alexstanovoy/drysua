@@ -31,7 +31,6 @@ use bota_proto::{EventKind, MapId, RejectReason, ServerMsg, SlotId, Team};
 use bota_server::game::SpawnModifier;
 
 use crate::persistence::training::PolicyOrderBookkeeping;
-use crate::telemetry::prometheus::{self, TrainingMetricsStart};
 
 use crate::{
     ActionKind, ActionSpace, ActivePolicyOrder, Arena, ArenaConfig, ArenaStart, CheckpointProgress,
@@ -260,31 +259,6 @@ struct TrainingSession {
 }
 
 impl TrainingSession {
-    fn begin_metrics(
-        &self,
-        directory: &Path,
-        resume: bool,
-        updates_target: u64,
-        parallel: usize,
-        games_per_update: usize,
-    ) -> Result<(), PpoError> {
-        prometheus::begin_training(
-            &self.run,
-            self.trainer.config(),
-            directory,
-            resume,
-            TrainingMetricsStart {
-                completed_updates: self.completed_updates,
-                samples: self.rollout_samples,
-                optimizer_steps: self.trainer.optimizer_step(),
-                updates_target,
-                parallel,
-                games_per_update,
-            },
-        )
-        .map_err(text_error)
-    }
-
     fn initialize(
         device: PolicyDevice,
         directory: &Path,

@@ -42,9 +42,6 @@ fn adaptive_environment_cli_accepts_explicit_schedules_and_exact_credit() {
     }
 }
 
-#[path = "cli_metrics.rs"]
-mod metrics_tests;
-
 #[cfg(feature = "builtin")]
 pub(crate) fn legacy_fixed_annealed_settings_for_test(
     overrides: &[&str],

@@ -5,7 +5,6 @@ mod live;
 mod measured_wire;
 mod monitor;
 mod output;
-pub(crate) mod prometheus;
 #[cfg(feature = "builtin")]
 mod training;
 #[cfg(all(test, feature = "builtin"))]

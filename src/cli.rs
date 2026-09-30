@@ -30,8 +30,6 @@ struct Cli {
 enum Operation {
     /// Inspect a validated checkpoint or this build's contract as bounded read-only JSON.
     CheckpointInspect(CheckpointInspectArgs),
-    /// Serve persistent training metrics without starting a learner.
-    MetricsServe(MetricsServeArgs),
     /// Passively score copied native participant frames from stdin; never sends orders or ACKs.
     RewardObserver(RewardObserverArgs),
     /// Connect to a server and play one match.
@@ -52,16 +50,6 @@ struct CheckpointInspectArgs {
     /// Describe this build's model and checkpoint identities without reading a checkpoint.
     #[arg(long, conflicts_with = "checkpoint_directory")]
     contract: bool,
-}
-
-#[derive(Args)]
-struct MetricsServeArgs {
-    /// Persistent training metrics directory to serve.
-    #[arg(long)]
-    metrics_directory: std::path::PathBuf,
-    /// Socket address for the standalone metrics server.
-    #[arg(long, default_value = "127.0.0.1:9464")]
-    metrics_listen: std::net::SocketAddr,
 }
 
 #[derive(Args)]
@@ -129,8 +117,6 @@ enum EnvironmentScheduleArg {
 /// Options for the annealed domain-randomization loop.
 #[derive(Args)]
 struct TrainAnnealedArgs {
-    #[command(flatten)]
-    metrics: crate::telemetry::prometheus::MetricsOptions,
     #[command(flatten)]
     optimizer: OptimizerArgs,
     #[command(flatten)]
@@ -258,12 +244,6 @@ pub fn run_from_env() -> std::io::Result<()> {
 fn run(arguments: Cli) -> std::io::Result<()> {
     let play = match arguments.operation {
         Some(Operation::CheckpointInspect(inspect)) => return run_checkpoint_inspect(inspect),
-        Some(Operation::MetricsServe(serve)) => {
-            return crate::telemetry::prometheus::serve_directory(
-                serve.metrics_directory,
-                serve.metrics_listen,
-            );
-        }
         Some(Operation::RewardObserver(observer)) => {
             return crate::reward_observer::run(&observer.output, observer.interval_ticks);
         }
@@ -361,7 +341,10 @@ fn run_train_annealed_with_settings(
     crate::ppo_arena::validate_annealed(&settings, Default::default())
         .map_err(std::io::Error::other)?;
     let device = arguments.device.policy_device(arguments.device_ordinal)?;
-    arguments.checkpoint.validate(&arguments.metrics)?;
+    validate_checkpoint_directory(
+        &arguments.checkpoint.checkpoint_directory,
+        arguments.checkpoint.resume,
+    )?;
     if arguments.checkpoint.resume {
         crate::ppo_arena::preflight_annealed_resume(
             &settings,
@@ -370,7 +353,6 @@ fn run_train_annealed_with_settings(
         )
         .map_err(std::io::Error::other)?;
     }
-    let metrics = arguments.metrics.start()?;
     if arguments.seed.is_none() {
         eprintln!(
             "annealed: seed {} resolved from {}; recorded in the run scope",
@@ -418,7 +400,7 @@ fn run_train_annealed_with_settings(
     report
         .map2_reward
         .log("invocation", report.completed_updates);
-    metrics.finish()
+    Ok(())
 }
 
 #[cfg(feature = "builtin")]
@@ -777,14 +759,6 @@ impl CheckpointArgs {
         crate::TrainingCheckpointCadence::WallTime(std::time::Duration::from_secs(
             self.checkpoint_seconds,
         ))
-    }
-
-    fn validate(
-        &self,
-        metrics: &crate::telemetry::prometheus::MetricsOptions,
-    ) -> std::io::Result<()> {
-        validate_checkpoint_directory(&self.checkpoint_directory, self.resume)?;
-        metrics.validate_checkpoint_directory(&self.checkpoint_directory)
     }
 }
 

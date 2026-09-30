@@ -26,7 +26,7 @@ smallvec = { version = "1.15.2", default-features = false, features = ["const_ge
 candle-cuda-feature = { path = "crates/candle-cuda-feature", default-features = false, optional = true }
 
 [target.'cfg(unix)'.dependencies]
-# std has no signal API; reuse the locked libc for standalone metrics shutdown.
+# Opens untrusted checkpoint and snapshot paths without following symlinks.
 libc = { version = "=0.2.189", default-features = false }
 
 [target.'cfg(windows)'.dependencies]

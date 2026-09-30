@@ -32,7 +32,6 @@ use crate::randomization::{
     AnnealSchedule, GenerationDraw, RANDOMIZATION_DIRECTORY, derive_training_seed, draw_generation,
     verify_generation_snapshots, write_generation_snapshot,
 };
-use crate::telemetry::prometheus;
 use crate::telemetry::{
     FlushPerformanceLogs, TrainingStage, TrainingTimingScope, TrainingUpdateMode,
     TrainingUpdateTimer, time_training_scope,
@@ -233,7 +232,7 @@ where
         .map_err(|_| PpoError::Model("annealed worker panicked".to_owned()))?
 }
 
-/// Read-only CLI admission before metrics storage or listeners are started.
+/// Read-only CLI admission before the checkpoint directory is locked.
 pub(crate) fn preflight_annealed_resume(
     settings: &AnnealedJobConfig,
     device: PolicyDevice,
@@ -306,13 +305,6 @@ where
                 opponent.runtime,
             )
         })?;
-    session.state.begin_metrics(
-        directory,
-        resume,
-        settings.updates,
-        settings.parallel_worlds,
-        settings.games_per_update,
-    )?;
     session.run_updates(&settings, harness, config, directory, &mut checkpointed)?;
     Ok(session.report())
 }
@@ -443,9 +435,6 @@ impl AnnealedSession {
         );
         let result = self.train_update_timed(settings, harness, config, generations, &mut timing);
         timing.observe_result(result)?;
-        let observed = prometheus::observe_training_update(&self.state.checkpoint_report(None))
-            .map_err(text_error);
-        timing.observe_result(observed)?;
         timing.complete();
         Ok(())
     }
@@ -586,8 +575,6 @@ impl AnnealedSession {
         let batch_len = settings.parallel_worlds;
         assert!(local + batch_len <= settings.games_per_update);
         assert!(global_game + batch_len as u64 <= draw.end_game);
-        let (generation, scale_bp) = generation_metrics(&draw, global_game);
-        prometheus::set_generation(generation, scale_bp);
         let environments = batch_environments(
             settings,
             global_game,
@@ -635,8 +622,6 @@ impl AnnealedSession {
             global_game + batch_len as u64 <= draw.end_game,
             "batch stays inside one generation"
         );
-        let (generation, scale_bp) = generation_metrics(&draw, global_game);
-        prometheus::set_generation(generation, scale_bp);
         let mut environments = batch_environments(
             settings,
             global_game,
@@ -727,17 +712,6 @@ fn generation_rules(draw: &GenerationDraw, global_game: u64) -> Vec<SpawnModifie
     } else {
         Vec::new()
     }
-}
-
-fn generation_metrics(draw: &GenerationDraw, global_game: u64) -> (u64, u32) {
-    let applied_through = draw.start_game.saturating_add(draw.applied_games);
-    let scale_bp = if draw.applies() && global_game < applied_through {
-        // An applying draw has a positive scale; cached draws can outlive their applied games.
-        draw.scale_bp as u32
-    } else {
-        0
-    };
-    (draw.generation, scale_bp)
 }
 
 /// The trusted spawn rules one generation's spec turns into.
@@ -873,15 +847,13 @@ impl GenerationCache {
             write_generation_snapshot(&self.directory, &draw)?;
             let next = generation.checked_add(1).ok_or(PpoError::CounterOverflow)?;
             self.counted_through = self.counted_through.max(next);
-            if !prometheus::enabled() {
-                eprintln!(
-                    "annealed: generation={generation} scale_bp={} start_game={} applied_games={} rules={}",
-                    draw.scale_bp,
-                    draw.start_game,
-                    draw.applied_games,
-                    spawn_modifiers_for(draw.spec).len(),
-                );
-            }
+            eprintln!(
+                "annealed: generation={generation} scale_bp={} start_game={} applied_games={} rules={}",
+                draw.scale_bp,
+                draw.start_game,
+                draw.applied_games,
+                spawn_modifiers_for(draw.spec).len(),
+            );
             self.last = Some(draw);
         }
         Ok(self.last.expect("drawn above"))

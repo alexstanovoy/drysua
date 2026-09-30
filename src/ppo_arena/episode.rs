@@ -964,31 +964,24 @@ fn record_episode(
     opponent: &'static str,
 ) -> Result<(), PpoError> {
     let label = accumulate_episode(stream, tick, state, outcome, report)?;
-    emit_episode_logs(
-        prometheus::enabled(),
-        || {
-            eprintln!(
-                "episode: stream={stream} map=2 opponent={opponent} tick={tick} outcome={label} actor_decisions={} retained={} terminal_sample={} raw_return={:.9} discounted_return={:.9} terminal_reward={} shaping_return={:.9} actions={:?} noncontinue={} retention_phase={}",
-                state.decisions,
-                state.retained,
-                state.retained > 0,
-                state.raw_return,
-                state.discounted_return,
-                state.terminal_reward,
-                state.shaping_return,
-                state.actions,
-                state.decisions - state.actions[ActionKind::Continue.index()] as usize,
-                state.retention_phase
-            )
-        },
-        || {
-            crate::telemetry::PerformanceOutput::new(crate::telemetry::AsyncLogWriter::default()).emit(
-                &format_args!(
-                    "level=INFO event=map2_episode_reward stream={stream} tick={tick} outcome={label} opponent={opponent} {}",
-                    state.map2_reward
-                ),
-            )
-        },
+    eprintln!(
+        "episode: stream={stream} map=2 opponent={opponent} tick={tick} outcome={label} actor_decisions={} retained={} terminal_sample={} raw_return={:.9} discounted_return={:.9} terminal_reward={} shaping_return={:.9} actions={:?} noncontinue={} retention_phase={}",
+        state.decisions,
+        state.retained,
+        state.retained > 0,
+        state.raw_return,
+        state.discounted_return,
+        state.terminal_reward,
+        state.shaping_return,
+        state.actions,
+        state.decisions - state.actions[ActionKind::Continue.index()] as usize,
+        state.retention_phase
+    );
+    crate::telemetry::PerformanceOutput::new(crate::telemetry::AsyncLogWriter::default()).emit(
+        &format_args!(
+            "level=INFO event=map2_episode_reward stream={stream} tick={tick} outcome={label} opponent={opponent} {}",
+            state.map2_reward
+        ),
     );
     Ok(())
 }
@@ -1021,12 +1014,4 @@ fn accumulate_episode(
         },
     )?;
     Ok(label)
-}
-
-fn emit_episode_logs(prometheus_mode: bool, audit: impl FnOnce(), reward: impl FnOnce()) {
-    // The guarded runner consumes the exact episode event independently of telemetry.
-    audit();
-    if !prometheus_mode {
-        reward();
-    }
 }

@@ -105,8 +105,6 @@ impl Drop for TrainingUpdateTimer {
             boundary.saturating_duration_since(self.started),
             self.outcome.on_scope_exit(std::thread::panicking()),
         );
-        self.timing
-            .forward_metrics(super::prometheus::record_update_timing);
         emit_training_timing(&self.timing);
     }
 }
@@ -186,18 +184,6 @@ impl TrainingUpdateTiming {
         self.timing_valid &= !self.duration_overflow && self.measured <= elapsed;
         if outcome == TrainingTimingOutcome::Complete {
             self.timing_valid &= self.last_stage == Some(TrainingStage::Finalization);
-        }
-    }
-
-    pub(crate) fn forward_metrics(
-        &self,
-        observe: impl FnOnce(u64, Duration, [Option<Duration>; TRAINING_STAGE_COUNT], bool),
-    ) {
-        if self.outcome == TrainingTimingOutcome::Complete
-            && self.timing_valid
-            && let Some(elapsed) = self.elapsed
-        {
-            observe(self.update_index, elapsed, self.stages, true);
         }
     }
 }
@@ -316,7 +302,6 @@ impl Drop for TrainingScopeTimer {
             self.started.elapsed(),
             self.outcome.on_scope_exit(std::thread::panicking()),
         );
-        timing.forward_metrics(super::prometheus::record_scope_timing);
         emit_training_timing(&timing);
     }
 }
@@ -341,18 +326,6 @@ impl TrainingScopeTiming {
             elapsed,
             outcome,
         }
-    }
-
-    pub(crate) fn forward_metrics(&self, observe: impl FnOnce(usize, Duration, bool)) {
-        let index = match self.scope {
-            TrainingTimingScope::SessionInitialization => 0,
-            TrainingTimingScope::CheckpointCaptureSaveRuntimeExport => 1,
-        };
-        observe(
-            index,
-            self.elapsed,
-            self.outcome == TrainingTimingOutcome::Complete,
-        );
     }
 }
 
@@ -397,7 +370,7 @@ impl<T: Display> Display for TrainingValue<T> {
 }
 
 fn emit_training_timing(timing: &impl Display) {
-    if !super::prometheus::enabled() && !TRAINING_LOG_DISABLED.load(Ordering::Relaxed) {
+    if !TRAINING_LOG_DISABLED.load(Ordering::Relaxed) {
         write_training_timing(
             &mut AsyncLogWriter::default(),
             &TRAINING_LOG_DISABLED,

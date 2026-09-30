@@ -52,7 +52,7 @@ fn resume_requires_intact_generation_history_without_mutating_checkpoint() {
 }
 
 #[test]
-fn cached_generation_metrics_turn_off_at_the_zero_window_boundary() {
+fn cached_generation_rules_turn_off_at_the_zero_window_boundary() {
     let schedule = AnnealSchedule {
         updates: 4,
         zero_updates: 1,
@@ -61,14 +61,8 @@ fn cached_generation_metrics_turn_off_at_the_zero_window_boundary() {
     let draw = draw_generation(3, 1, 4, 2, schedule).expect("truncated draw");
     assert!(draw.scale_bp > 0);
     assert_eq!(draw.applied_games, 2);
-    for (game, scale) in [
-        (4, draw.scale_bp as u32),
-        (5, draw.scale_bp as u32),
-        (6, 0),
-        (7, 0),
-    ] {
-        assert_eq!(generation_metrics(&draw, game), (1, scale));
-        assert_eq!(generation_rules(&draw, game).is_empty(), scale == 0);
+    for (game, applied) in [(4, true), (5, true), (6, false), (7, false)] {
+        assert_eq!(!generation_rules(&draw, game).is_empty(), applied);
     }
 }
 
