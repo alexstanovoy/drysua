@@ -36,9 +36,9 @@ use crate::{
     ActionKind, ActionSpace, ActivePolicyOrder, Arena, ArenaConfig, ArenaStart, CheckpointProgress,
     CheckpointRun, CheckpointSaveOutcome, FeatureEncoder, FeatureFrame, ItemReadiness,
     LocalPolicyState, OrderPersistence, PPO_MAX_ROLLOUT_DECISIONS, PolicyDevice, PolicyModel,
-    PolicySnapshot, PpoConfig, PpoError, PpoOutcome, PpoPolicyChoice, PpoRng, PpoRollout,
-    PpoTerminalOutcome, PpoTrainer, PpoUpdateReport, Request, RngCheckpoint, StateTracker, Teacher,
-    TrainingArtifact, tick_discount,
+    PpoConfig, PpoError, PpoOutcome, PpoPolicyChoice, PpoRng, PpoRollout, PpoTerminalOutcome,
+    PpoTrainer, PpoUpdateReport, Request, RngCheckpoint, StateTracker, Teacher, TrainingArtifact,
+    tick_discount,
 };
 use crate::{MAP2_REWARD_GAMMA_TICK, Map2RewardBreakdown, Map2RewardEnd};
 
@@ -112,8 +112,6 @@ struct TrainingEnvironment {
 
 #[derive(Clone)]
 enum OpponentSpec {
-    #[cfg(test)]
-    Policy(PolicySnapshot),
     SharedPolicy(Arc<PolicyModel>),
     Teacher,
     /// Test fixture that always continues, keeping native worlds deterministic.
@@ -285,10 +283,7 @@ impl TrainingSession {
                 rollout_samples: 0,
             }
         };
-        let starting_policy_fingerprint =
-            PolicySnapshot::capture(&model, restored.completed_updates)
-                .map_err(text_error)?
-                .fingerprint();
+        let starting_policy_fingerprint = model.parameter_fingerprint().map_err(text_error)?;
         Ok(Self {
             adaptive_environment: restored.adaptive_environment,
             model,
@@ -568,20 +563,11 @@ fn build_environment(
     })
 }
 
-fn build_opponent(spec: &OpponentSpec, _seed: u64) -> Result<OpponentRuntime, PpoError> {
+fn build_opponent(spec: &OpponentSpec, seed: u64) -> Result<OpponentRuntime, PpoError> {
     match spec {
-        #[cfg(test)]
-        OpponentSpec::Policy(snapshot) => Ok(OpponentRuntime::Policy {
-            model: Arc::new(
-                snapshot
-                    .instantiate()
-                    .map_err(|error| PpoError::Model(error.to_string()))?,
-            ),
-            rng: PpoRng::new(_seed),
-        }),
         OpponentSpec::SharedPolicy(model) => Ok(OpponentRuntime::Policy {
             model: Arc::clone(model),
-            rng: PpoRng::new(_seed),
+            rng: PpoRng::new(seed),
         }),
         OpponentSpec::Teacher => Ok(OpponentRuntime::Teacher),
         #[cfg(test)]

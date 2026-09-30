@@ -1729,6 +1729,16 @@ impl PolicyModel {
         self.export_parameters_locked()
     }
 
+    /// FNV-1a over the little-endian bits of one coherent parameter export.
+    /// Run scopes record it to pin frozen opponent weights; reports log it.
+    pub fn parameter_fingerprint(&self) -> Result<u64, ModelError> {
+        let mut hash = FNV_OFFSET;
+        for value in self.export_parameters()? {
+            hash = fnv1a_extend(hash, &value.to_bits().to_le_bytes());
+        }
+        Ok(hash)
+    }
+
     fn export_parameters_locked(&self) -> Result<Vec<f32>, ModelError> {
         let parameters = self.parameters();
         let mut output = Vec::with_capacity(MODEL_PARAMETER_COUNT);

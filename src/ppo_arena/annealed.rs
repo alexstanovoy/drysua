@@ -40,9 +40,8 @@ use crate::{
     CheckpointDevice, CheckpointRun, CollectionReport, MAP2_DECISION_INTERVAL_TICKS,
     MAP2_RETAINED_DECISIONS, MAP2_REWARD_GAMMA_TICK, MAX_TRAINING_COUNTER,
     MODEL_MAX_OPTIMIZER_STEP, PPO_MAX_GAMES, PPO_MAX_POLICY_SAMPLE_DRAWS, PPO_MAX_SAMPLES,
-    PPO_RULES_AUDIT_VERSION, PolicyDevice, PolicyModel, PolicySnapshot, PpoConfig, PpoError,
-    PpoRng, PpoRollout, PpoUpdateReport, SHADOW_FIEND, TrainingArtifact, TrainingCheckpointReport,
-    compiled_features,
+    PPO_RULES_AUDIT_VERSION, PolicyDevice, PolicyModel, PpoConfig, PpoError, PpoRng, PpoRollout,
+    PpoUpdateReport, SHADOW_FIEND, TrainingArtifact, TrainingCheckpointReport, compiled_features,
 };
 
 const _: () = assert!(PPO_MAX_GAMES * MAP2_RETAINED_DECISIONS == PPO_MAX_SAMPLES);
@@ -894,9 +893,7 @@ fn load_opponent(
         AnnealedOpponent::Weights(directory) => {
             let model = PolicyModel::fresh_on(0, device).map_err(text_error)?;
             TrainingArtifact::load_runtime_weights(&model, directory).map_err(text_error)?;
-            let fingerprint = PolicySnapshot::capture(&model, 0)
-                .map_err(text_error)?
-                .fingerprint();
+            let fingerprint = model.parameter_fingerprint().map_err(text_error)?;
             Ok(LoadedOpponent {
                 runtime: AnnealedOpponentRuntime::Weights(Arc::new(model)),
                 fingerprint: Some(fingerprint),

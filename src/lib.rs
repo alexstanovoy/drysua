@@ -15,7 +15,6 @@ mod map2_contract;
 mod map2_reward;
 mod model;
 mod persistence;
-mod policy_snapshot;
 mod ppo;
 #[cfg(feature = "builtin")]
 mod ppo_arena;
@@ -46,7 +45,6 @@ pub use map2_contract::*;
 pub use map2_reward::*;
 pub use model::*;
 pub use persistence::*;
-pub use policy_snapshot::*;
 pub use ppo::*;
 #[cfg(feature = "builtin")]
 pub use ppo_arena::*;
