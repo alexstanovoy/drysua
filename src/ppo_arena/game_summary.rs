@@ -35,6 +35,8 @@ pub(crate) struct Standing {
     deaths: u16,
     /// Weakest own tower's HP in basis points.
     tower_bp: u16,
+    /// Own hero's HP in basis points; zero while dead.
+    hp_bp: u16,
 }
 
 /// Own minus enemy standing at one milestone.
@@ -46,6 +48,8 @@ pub(crate) struct Lead {
     pub deaths: i32,
     /// Own minus enemy weakest-tower HP in basis points.
     pub tower_bp: i32,
+    /// Own minus enemy hero HP in basis points.
+    pub hp_bp: i32,
 }
 
 /// Casts and structure losses one seat observed over its whole game.
@@ -159,6 +163,7 @@ impl SeatCombat {
                     bounty: self.bounty,
                     deaths: player.map_or(0, |player| player.deaths),
                     tower_bp: basis_points(tower),
+                    hp_bp: basis_points(hero_fraction(tracker)),
                 });
             }
         }
@@ -259,6 +264,7 @@ impl GameSummary {
                 gold: own.bounty - enemy.bounty,
                 deaths: i32::from(enemy.deaths) - i32::from(own.deaths),
                 tower_bp: i32::from(own.tower_bp) - i32::from(enemy.tower_bp),
+                hp_bp: i32::from(own.hp_bp) - i32::from(enemy.hp_bp),
             })
         })
     }
@@ -278,7 +284,7 @@ impl GameSummary {
                 .map(|(minutes, lead)| {
                     let lead = lead.map(|lead| {
                         json!({"xp": lead.xp, "gold": lead.gold, "deaths": lead.deaths,
-                               "tower_bp": lead.tower_bp})
+                               "tower_bp": lead.tower_bp, "hp_bp": lead.hp_bp})
                     });
                     (format!("{minutes}m"), lead.unwrap_or(Value::Null))
                 })
@@ -329,8 +335,8 @@ impl fmt::Display for GameSummary {
             if let Some(lead) = lead {
                 write!(
                     formatter,
-                    " lead_{minutes}m_xp={} lead_{minutes}m_gold={} lead_{minutes}m_deaths={} lead_{minutes}m_tower_bp={}",
-                    lead.xp, lead.gold, lead.deaths, lead.tower_bp
+                    " lead_{minutes}m_xp={} lead_{minutes}m_gold={} lead_{minutes}m_deaths={} lead_{minutes}m_tower_bp={} lead_{minutes}m_hp_bp={}",
+                    lead.xp, lead.gold, lead.deaths, lead.tower_bp, lead.hp_bp
                 )?;
             }
         }
@@ -368,6 +374,20 @@ fn weakest_tower_fraction(tracker: &StateTracker, team: Team) -> f64 {
         .map(|unit| f64::from(unit.hp.max(0)) / f64::from(unit.max_hp))
         .fold(1.0, f64::min);
     (weakest * 10_000.0).round() / 10_000.0
+}
+
+/// Own hero's HP fraction; zero while dead or unseen.
+#[allow(
+    clippy::float_arithmetic,
+    reason = "a reported HP fraction; never feeds back into play"
+)]
+fn hero_fraction(tracker: &StateTracker) -> f64 {
+    tracker
+        .own_hero()
+        .filter(|hero| hero.max_hp > 0)
+        .map_or(0.0, |hero| {
+            (f64::from(hero.hp.max(0)) / f64::from(hero.max_hp)).min(1.0)
+        })
 }
 
 #[allow(
