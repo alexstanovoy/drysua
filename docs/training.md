@@ -22,6 +22,7 @@ python3 scripts/train.py resume temp/my-campaign [--detach]
 python3 scripts/train.py recover temp/my-campaign --confirm-offline
 python3 scripts/train.py report temp/my-campaign [--json] [--block N]
 python3 scripts/train.py report temp/my-campaign --html temp/my-campaign.html [--refresh 60 --follow]
+python3 scripts/train.py eval temp/my-campaign [--every N] [--pool pool.json]  # see Evaluation
 ```
 
 Phases: `prepared` -> `running` -> `paused` | `failed` | `completed`. `run` starts a
@@ -123,7 +124,8 @@ A campaign directory (mode 0700) holds `manifest.json`, `status.json`,
 `owner.lock`, `owner.json` while a session is open, read-only `bin/` and `inputs/`,
 `frozen/` (the controller sources that created it; `--detach` runs this snapshot and
 a foreground run refuses changed sources), `checkpoint/`, `history/`, `cuda-cache/`
-(1 GiB) and `sessions/NNNN/`.
+(1 GiB), `sessions/NNNN/` and, once evaluated, `eval/` (the [evaluation](#evaluation) store,
+written only by `train.py eval` on the host with the frozen `bin/trainer`).
 
 ## Environment schedule
 
@@ -197,25 +199,81 @@ every `S` seconds while the campaign runs.
 
 ## Evaluation
 
-`drysua eval` plays frozen runtime weights once per side of every seed, with no
-optimizer, rollout or checkpoint:
+The frozen pool evaluation is the one measure of strength: a candidate plays every
+opponent of a fixed pool on both sides of the same seeds, with no optimizer or
+rollout. Training win rate mixes randomized environments, opponents and stale
+policies; select checkpoints by the pool, judging the worst case and the held-out
+opponents, never by training win rate.
 
 ```sh
-drysua eval --weights artifacts/weights/u200v2-v18 --opponent teacher \
-  --seeds 1000000:200 --device cuda --output temp/eval-u200v2.jsonl
-python3 scripts/eval_compare.py temp/eval-u200v2.jsonl temp/eval-other.jsonl
+python3 scripts/train.py eval temp/my-campaign [--every 5] [--pool pool.json] \
+  [--seeds 1000000:100] [--average 4] [--device cuda]
+python3 scripts/train.py report temp/my-campaign --html temp/my-campaign.html
+python3 scripts/eval_pool.py run --drysua target/release/drysua --store temp/eval \
+  --pool docs/eval_pool.example.json --candidate weights:NEW --baseline weights:OLD --delta 0.05
+python3 scripts/eval_pool.py report --store temp/eval [--json]
+python3 scripts/eval_pool.py compare --store temp/eval NEW OLD
 ```
 
-`--opponent` is `teacher`, `harass-push` or `weights:<dir>`; `--greedy` takes the legal argmax
-instead of sampling; `--parallel` (default 16) and `--actor-pipeline-groups`
-(default 2) change only speed, never results. Each game's arena seed and actor RNG
-depend only on `(seed, seat)`, so results are identical across batch shapes and
-CPU/CUDA. The output (`drysua-eval/v1`, never overwritten) has one line per game
-(outcome, end reason, ticks, kills, deaths, level, XP, weakest tower HP, casts per
-ability, raze hero hits for both heroes) and a summary with a Wilson 95% interval,
-side split and end reasons. `eval_compare.py` prints win rates and exact McNemar
-tests on shared `(seed, side)` games of results that faced the same opponent.
-Detecting +10 points at 35% needs about 370 games per arm; +5 points about 1,500.
+**Players** are a rule policy (`teacher`, `harass-push`), `weights:<dir>` or
+`average:<dir>,<dir>,...` (the parameter mean of runtime weights: an EMA-like
+average of the latest history snapshots, `train.py eval --average K`). The **pool**
+(`drysua-eval-pool/v1`, [example](eval_pool.example.json)) lists up to 16 opponents
+with a unique `name`, a `player` (relative directories are relative to the pool
+file) and a `role`: `train` for opponents the run trains against, `held-out` for the
+rest, which measure generalization.
+
+`drysua eval --candidate PLAYER [--name NAME] --pool POOL --seeds S:N --output FILE`
+plays every seed once per side against every opponent. `--greedy` takes the legal
+argmax instead of sampling; `--parallel` (default 16) and `--actor-pipeline-groups`
+(default 2) change only speed, never results. Each game's arena seed and RNG streams
+depend only on `(seed, seat)`, so every candidate and opponent meets the same worlds
+and results are identical across batch shapes and CPU/CUDA. The output
+(`drysua-eval/v3`, a new file, never overwritten) is a header line (the context,
+seeds, candidate and pool with each player's key: the rule label, the weights
+SHA-256, or a SHA-256 over an average's member hashes) and one line per game in
+`(seed, opponent, side)` order: outcome, end reason, ticks, and for both heroes
+kills, deaths, level, XP, weakest tower HP, casts, raze hero hits and raze target
+modes, plus `leads` at game minutes 2, 3 and 5 (own minus enemy XP, bounty gold,
+deaths, weakest-tower HP and hero HP in basis points; `null` if the game ended
+earlier). Stderr carries per-opponent, per-side W-L-D.
+
+**Store.** `eval_pool.py` and `train.py eval` run `drysua eval` in chunks of
+`--chunk-seeds` seeds (default 16) and keep each invocation's output as one file in
+the store (default `<campaign>/eval/` for a campaign). Files are append-only and a
+game is identified by `(context, candidate key, opponent key, seed, side)`, where the
+context is the SHA-256 of the evaluating binary plus the sampling mode. Games the
+store already holds are never played again, so re-running `train.py eval` only rates
+new snapshots or new opponents; a replay that differs from the stored game is
+rejected as a determinism failure. Only games of one context are paired or rated
+together (default: the latest run's).
+
+**Metrics.** Per candidate: score (draws count half) with a Wilson 95% interval per
+opponent, per side and pooled over `train` and `held-out` opponents; the worst case
+(lowest per-opponent score); end reasons; raze hero-hit rate for both heroes; mean
+early leads and the win rate when ahead in XP at each milestone. **Ratings** are a
+Bradley-Terry fit over every game of the context (players are keys; each player also
+gets one virtual draw against the anchor, `teacher` by default, so perfect records
+stay finite) with standard errors from the Fisher information. The dashboard's
+"Frozen pool evaluation" section plots, per snapshot update, the Elo curve (and each
+`avgK` curve), worst-case, held-out and train scores, per-opponent and per-side
+rates, raze hit rates, loss reasons and early leads.
+
+**Sequential test.** With `--baseline`, each chunk first completes the baseline's
+games, then the candidate's; the unit is one `(opponent, seed)`: half the difference
+of the two players' pair scores (both sides of the seed; win 1, draw 1/2), in
+[-1, 1]. A GSPRT (normal approximation, as fishtest uses for game pairs) tests H0
+mean 0 against H1 mean `--delta` with `--alpha`/`--beta` (default 0.05) and stops at
+the first chunk that decides (at least 16 units); the seed range bounds it. A
+pool holding only the baseline makes it head-to-head: the unit mean is then the
+candidate's score against the baseline minus 1/2 (its mirror games score 1/2 on
+average). `compare` is the
+fixed-n variant on stored games: the mean pair-score difference with a 95% interval
+and an exact McNemar test.
+
+Rough sizes: a +10-point difference at 35% needs about 370 games per arm, +5 points
+about 1,500; pairing by seed and side removes the side variance (Radiant wins 78% of
+Teacher mirrors), which is why the sequential test works on seed pairs.
 
 ## Machine rules
 
