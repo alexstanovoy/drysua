@@ -97,6 +97,11 @@ is the checkpoint model. Episode logs carry `slot=`, `game=` and `opponent=`.
 
 ## Learner
 
+A preparer thread (`src/ppo_arena/collector.rs`) takes each update's lane parts
+and builds its batch (rollout, GAE, report, snapshots) while the learner still
+trains the previous update; the learner logs the parts' games and takes the
+batches in update order.
+
 The learner is device resident (`src/model/device_learner.rs`). An update's
 samples are packed into encoder rows and uploaded once, in 256-row chunks, into
 preallocated device columns. Each Adam step gathers its minibatch on the device,
