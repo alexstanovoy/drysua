@@ -1253,9 +1253,27 @@ impl PolicyDevice {
         match self {
             Self::Cpu => Ok(Device::Cpu),
             #[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
-            Self::Cuda { ordinal } => Device::new_cuda(ordinal).map_err(ModelError::from),
+            Self::Cuda { ordinal } => cuda_device(ordinal),
         }
     }
+}
+
+/// A CUDA device on the calling thread's per-thread stream, without cudarc's
+/// per-allocation event pairs.
+///
+/// With event tracking on, cudarc creates and destroys two events for every
+/// allocation but consults them only in multi-stream mode, which a context
+/// that only uses candle's per-thread stream never enters. The events were
+/// about half of every learner and lane thread's CUDA API time.
+#[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
+fn cuda_device(ordinal: usize) -> Result<Device, ModelError> {
+    let device = Device::new_cuda(ordinal)?;
+    let cuda = device.as_cuda_device()?;
+    // SAFETY: the context is fresh and never gets a second stream (drysua
+    // creates none; candle uses the per-thread stream), so cudarc records and
+    // waits on no event either way.
+    unsafe { cuda.disable_event_tracking() };
+    Ok(device)
 }
 
 /// F32 DeepSets policy with an autoregressive masked decoder.
