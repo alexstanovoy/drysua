@@ -1080,25 +1080,25 @@ fn cuda_device(ordinal: usize) -> Result<Device, ModelError> {
     Ok(device)
 }
 
-// Budget constants, measured on CUDA by
-// `vram_budget_constants_bound_measured_peaks` (which keeps them upper
-// bounds) with about 5% headroom; rows have a fixed token capacity.
-/// Device bytes one staged training row holds (measured 130,443 with shadow labels).
+// Budget constants: CUDA measurements of
+// `vram_budget_constants_bound_measured_peaks` (which keeps them upper bounds)
+// plus 1-5%; rows have a fixed token capacity, so content does not matter.
+/// Device bytes one staged training row holds (measured 130,447 with shadow labels).
 #[cfg(feature = "builtin")]
-pub(crate) const VRAM_STAGED_ROW_BYTES: u64 = 132 << 10;
+pub(crate) const VRAM_STAGED_ROW_BYTES: u64 = 128 << 10;
 /// Learner transient bytes of one Adam step beyond its rows' share (measured ~25 MB).
 #[cfg(feature = "builtin")]
 pub(crate) const VRAM_LEARNER_FIXED_BYTES: u64 = 64 << 20;
 /// Learner transient bytes per microbatch row, activations and gradients
-/// (measured 4.84 MB with imitation, 4.74 MB without).
+/// (measured 4.94 MB with imitation at 256 rows, 4.89 MB at 512).
 #[cfg(feature = "builtin")]
-pub(crate) const VRAM_LEARNER_ROW_BYTES: u64 = 5 << 20;
+pub(crate) const VRAM_LEARNER_ROW_BYTES: u64 = 19 << 18;
 /// Inference transient bytes of one sampling call beyond its rows' share (measured ~0).
 #[cfg(feature = "builtin")]
 pub(crate) const VRAM_INFERENCE_FIXED_BYTES: u64 = 16 << 20;
 /// Inference transient bytes per sampled row (measured 1.63 MB).
 #[cfg(feature = "builtin")]
-pub(crate) const VRAM_INFERENCE_ROW_BYTES: u64 = 7 << 18;
+pub(crate) const VRAM_INFERENCE_ROW_BYTES: u64 = 13 << 17;
 
 /// What the trainer's VRAM budget pool holds and has held, in bytes.
 #[cfg(feature = "builtin")]

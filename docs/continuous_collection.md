@@ -129,11 +129,16 @@ change only the loss, so they work the same under either guard. The
 loss definitions live only in `src/model/ppo_objective.rs`.
 
 Device memory: a CUDA trainer reserves a fixed VRAM budget at startup
-(`--vram-budget-mib`, default the configuration's worst case from
-`vram_budget_estimate`: parameter replicas at their caps, the staged update at
-rollout capacity, one Adam step at the full microbatch and every lane's largest
-sampling call, plus a quarter for fragmentation; per-row costs are measured by
-`vram_budget_constants_bound_measured_peaks`). The budget becomes the device's
+(`--vram-budget-mib`, default from `vram_budget_estimate`: the sum of every
+stream's own high-water mark, because streams do not share freed memory: the
+learner's optimizer state, staged update at rollout capacity and one Adam step
+at the full microbatch, each lane's largest sampling call, and the replicas the
+configuration keeps (per lane the actor, frozen weights opponents and, with a
+league, three times its size: current, still-played and spare milestones),
+plus 5% for block rounding; per-row costs are measured by
+`vram_budget_constants_bound_measured_peaks`). Production (24k samples, 256
+slots, microbatch 2048, league 4) reserves 15,008 MiB against a measured
+300-update peak of 13,122 MiB. The budget becomes the device's
 allocation pool, capped, filled up front and never released; streams reuse
 only their own freed blocks, so each lane and the learner settle into a steady
 state and the process footprint is the budget plus the CUDA context from the

@@ -881,7 +881,13 @@ fn vram_budget_constants_bound_measured_peaks() {
         ..PpoConfig::default()
     };
     let mut adam = model.claim_optimizer(config.adam()).expect("Adam");
-    for (rows, imitation) in [(256_usize, false), (512, false), (256, true), (512, true)] {
+    for (rows, imitation, microbatch) in [
+        (256_usize, false, 256_usize),
+        (512, false, 512),
+        (256, true, 256),
+        (512, true, 512),
+        (512, true, 256),
+    ] {
         let samples: Vec<_> = (0..rows)
             .map(|row| {
                 let mut sample = base[row % 2].clone();
@@ -916,20 +922,21 @@ fn vram_budget_constants_bound_measured_peaks() {
                         critic_only: false,
                     },
                 ),
-                (rows, crate::KlGuard::PostStep),
+                (microbatch, crate::KlGuard::PostStep),
             )
             .expect("step");
         let (_, high) = current_pool_usage(0, false);
-        let learner_row = (high - resting) / rows as u64;
         eprintln!(
-            "vram rows={rows} staged_row={staged_row} learner_peak={} learner_row={learner_row}",
+            "vram rows={rows} microbatch={microbatch} imitation={imitation} staged_row={staged_row} learner_peak={}",
             high - resting
         );
         assert!(staged_row <= crate::model::VRAM_STAGED_ROW_BYTES);
+        // One microbatch's activations bound the step: accumulated microbatches
+        // must not keep each other's graphs alive.
         assert!(
             high - resting
                 <= crate::model::VRAM_LEARNER_FIXED_BYTES
-                    + rows as u64 * crate::model::VRAM_LEARNER_ROW_BYTES
+                    + microbatch as u64 * crate::model::VRAM_LEARNER_ROW_BYTES
         );
     }
     for rows in [64_usize, 128] {

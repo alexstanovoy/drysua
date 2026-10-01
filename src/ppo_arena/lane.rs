@@ -114,9 +114,6 @@ struct LaneModels {
     spare: Vec<PolicyModel>,
 }
 
-/// Retired league replicas a lane keeps for reuse.
-pub(super) const MAX_SPARE_REPLICAS: usize = 16;
-
 impl LaneModels {
     fn new(settings: &LaneSettings, config: &PartConfig) -> Result<Self, PpoError> {
         let actor = PolicyModel::fresh_on(0, settings.device).map_err(text_error)?;
@@ -155,7 +152,8 @@ impl LaneModels {
             })
             .map(|(_, model)| model);
         self.spare.extend(retired);
-        self.spare.truncate(MAX_SPARE_REPLICAS);
+        // At most as many spares as the mixture has milestones (the budget's count).
+        self.spare.truncate(config.league.len());
         self.add_league(&config.league)
     }
 

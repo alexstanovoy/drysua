@@ -201,13 +201,16 @@ where
     )
 }
 
-/// Upper bound, in bytes, on the CUDA memory one training process of
-/// `settings` allocates: parameter replicas at their caps, the learner's
-/// optimizer state, the staged update at rollout capacity, one Adam step's
-/// transients at the full microbatch and every lane's sampling call at its
-/// largest batch (policy plus self-play rows), plus a quarter for pool
-/// fragmentation. Encoder rows have a fixed token capacity, so per-row bytes
-/// do not depend on what a frame holds.
+/// The CUDA memory, in bytes, one training process of `settings` reserves.
+///
+/// Each stream reuses only the memory it freed, so the pool must hold the sum
+/// of every stream's own high-water mark, not just the simultaneous peak:
+/// the learner's (optimizer state, the staged update at rollout capacity and
+/// one Adam step at the full microbatch), each lane's largest sampling call
+/// and the parameter replicas the configuration keeps. Encoder rows have a
+/// fixed token capacity, so per-row bytes do not depend on what a frame holds.
+/// The margin covers block rounding inside a stream (3% measured for the
+/// learner alone) and the few transients the sum leaves out.
 pub(crate) fn vram_budget_estimate(settings: &AnnealedJobConfig) -> u64 {
     use crate::model::{
         VRAM_INFERENCE_FIXED_BYTES, VRAM_INFERENCE_ROW_BYTES, VRAM_LEARNER_FIXED_BYTES,
@@ -216,18 +219,23 @@ pub(crate) fn vram_budget_estimate(settings: &AnnealedJobConfig) -> u64 {
     let parameters = crate::MODEL_PARAMETER_COUNT as u64 * 4;
     let lanes = settings.lanes.max(1) as u64;
     let lane_slots = (settings.slots / settings.lanes.max(1)) as u64;
-    let count = |wanted: fn(&AnnealedOpponent) -> bool| {
+    let has = |wanted: fn(&AnnealedOpponent) -> bool| {
         settings
             .opponents
             .iter()
-            .filter(|(opponent, _)| wanted(opponent))
-            .count() as u64
+            .any(|(opponent, _)| wanted(opponent))
     };
-    let weights = count(|opponent| matches!(opponent, AnnealedOpponent::Weights(_)));
-    // Live league replicas: the mixture's milestones plus older ones in-flight
-    // games still play (at most one per slot), and the retired spares.
-    let league = if count(|opponent| matches!(opponent, AnnealedOpponent::League)) > 0 {
-        settings.league_size as u64 + lane_slots + super::lane::MAX_SPARE_REPLICAS as u64
+    let weights = settings
+        .opponents
+        .iter()
+        .filter(|(opponent, _)| matches!(opponent, AnnealedOpponent::Weights(_)))
+        .count() as u64;
+    // Per lane: the actor (self-play and the learner's seat share it), one
+    // replica per frozen weights opponent and, with a league, its current
+    // milestones, as many retired ones still played by in-flight games and as
+    // many spares kept for reuse.
+    let league = if has(|opponent| matches!(opponent, AnnealedOpponent::League)) {
+        3 * settings.league_size as u64
     } else {
         0
     };
@@ -240,10 +248,15 @@ pub(crate) fn vram_budget_estimate(settings: &AnnealedJobConfig) -> u64 {
         + settings.ppo.rollout_capacity(settings.slots) as u64 * VRAM_STAGED_ROW_BYTES
         + VRAM_LEARNER_FIXED_BYTES
         + microbatch * VRAM_LEARNER_ROW_BYTES;
-    let inference =
-        lanes * (VRAM_INFERENCE_FIXED_BYTES + 2 * lane_slots * VRAM_INFERENCE_ROW_BYTES);
+    // A lane's largest call: its slots' policy rows plus, with self-play, as
+    // many opponent rows on the same actor.
+    let self_play = u64::from(has(|opponent| {
+        matches!(opponent, AnnealedOpponent::SelfPlay)
+    }));
+    let inference = lanes
+        * (VRAM_INFERENCE_FIXED_BYTES + (1 + self_play) * lane_slots * VRAM_INFERENCE_ROW_BYTES);
     let total = replicas + learner + inference;
-    total + total / 4
+    total + total / 20
 }
 
 /// Parameter-sized learner tensors alive at once during an Adam step: the
