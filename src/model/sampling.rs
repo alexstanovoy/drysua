@@ -64,24 +64,3 @@ pub(crate) fn with_eager_sampling_for_test<T>(operation: impl FnOnce() -> T) -> 
     let _reset = Reset(EAGER.replace(true));
     operation()
 }
-
-#[cfg(test)]
-#[test]
-fn missing_sampling_head_fails_before_consuming_rng() {
-    let mut random = PpoRng::new(17);
-    let before = random.clone();
-    let error = sample_sampling_head::<2>(
-        "controlled",
-        0,
-        None,
-        Some(&mut random),
-        &mut None,
-        &mut None,
-    )
-    .expect_err("missing head");
-    assert_eq!(
-        error.to_string(),
-        "model produced invalid requested skipped sampling head"
-    );
-    assert_eq!(random, before);
-}

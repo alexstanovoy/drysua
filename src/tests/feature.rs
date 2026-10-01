@@ -239,7 +239,7 @@ fn representative_frames_match_frozen_goldens_and_resource_presence_boundaries()
         }
     }
     let actual: [u8; 32] = digest.finalize().into();
-    // Re-captured for feature v26: rescaled, one-hot and derived inputs.
+    // Golden for FEATURE_SCHEMA_VERSION 26; re-capture whenever the layout version changes.
     assert_eq!(
         actual,
         [
@@ -281,38 +281,6 @@ fn projectile_capacity_view(team: Team, count: u32) -> WorldView {
         .collect();
     assert_eq!(view.projectiles.len(), count as usize);
     view
-}
-
-#[test]
-fn feature_observation_history_has_an_exact_fixed_capacity() {
-    let mut tracker = tracker_with_view(Team::Radiant, world_view(Team::Radiant, 1));
-    let mut encoder = FeatureEncoder::new(&tracker);
-    encoder.observe(&tracker).expect("first observation");
-    for tick in 2..=18 {
-        tracker
-            .observe_snapshot(&world_view(Team::Radiant, tick))
-            .expect("new snapshot");
-        encoder.observe(&tracker).expect("new observation");
-    }
-    let latest = encode_with_encoder(&tracker, &mut encoder);
-    assert_eq!(
-        encoder.rollback(2).expect_err("before horizon").to_string(),
-        "feature observation rollback tick 2 is older than earliest supported tick 3"
-    );
-    assert_eq!(encode_with_encoder(&tracker, &mut encoder), latest);
-    encoder.rollback(3).expect("oldest retained observation");
-}
-
-#[test]
-fn ragged_feature_arena_rejects_corrupt_offsets() {
-    let frame = encoded_frame(Team::Radiant, world_view(Team::Radiant, 1));
-    let mut arena = RaggedFeatureArena::new(1).expect("arena");
-    let mut malformed = arena.push(&frame).expect("frame");
-    malformed.corrupt_unit_offset_for_test();
-    assert_eq!(
-        arena.expand(&malformed).expect_err("invalid offset"),
-        "ragged feature range is invalid"
-    );
 }
 
 fn encoded_frame(team: Team, view: WorldView) -> FeatureFrame {

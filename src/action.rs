@@ -30,9 +30,10 @@ pub(crate) use test_support::*;
 
 /// Distance at which drysua permits stash swaps around the own fountain.
 pub const STASH_ACCESS_RANGE: i32 = 1_000;
-/// Version of the append-only structured-action schema.
+/// Structured-action schema version.
 pub const ACTION_SCHEMA_VERSION: u32 = 8;
-/// Canonical action families, head widths, and autoregressive branch order.
+/// Action families, head widths, and autoregressive branch order; hashed into
+/// [`ACTION_SCHEMA_HASH`].
 pub const ACTION_SCHEMA_DESCRIPTOR: &str = concat!(
     "bota-drysua-action/v7;kinds=Continue,Stop,MovePoint,FollowUnit,Hold,AttackMovePoint,AttackUnit,Cast,Use,PutPoint,PutUnit,Take,Buy,Sell,Swap,Learn;",
     "heads=kind16,controlled2,ability8,item15,swap15,learn6,shop64,loot16,target_mode3,put_mode2,entity96,point64;",
@@ -47,7 +48,7 @@ pub const ACTION_SCHEMA_DESCRIPTOR: &str = concat!(
     "move_point_legality=live_body_unstunned_and_walkable_including_existing_building_landing;attack_move_point_legality=unchanged_building_landing_source_excluded;building_landing_provenance=unchanged_tp_walkability_allied_anchor_and_target_kind_checks,no_new_points_or_goal_features;",
     "entity_order=active_effect15_max_lexicographic_stacks_remaining_then_guarded13_inspired14_timers_then_prior_received_manual_hp_mana_report_semantics_before_opaque_id;",
 );
-/// Stable FNV-1a identity of [`ACTION_SCHEMA_DESCRIPTOR`].
+/// FNV-1a hash of [`ACTION_SCHEMA_DESCRIPTOR`].
 pub const ACTION_SCHEMA_HASH: u64 = crate::model::fnv1a_extend(
     crate::model::FNV_OFFSET,
     ACTION_SCHEMA_DESCRIPTOR.as_bytes(),
@@ -57,7 +58,8 @@ const ACTION_KIND_COUNT: usize = 16;
 const ACTIVE_ITEM_SLOTS: usize = 6;
 const STASH_SLOT_START: usize = HERO_BAG_SLOTS;
 const WIRE_ITEM_SLOTS: usize = HERO_BAG_SLOTS + STASH_SLOTS;
-/// Movement, item and raze candidates; raze-only candidates follow up to the full cap.
+/// Candidates usable by movement, items and razes; raze-only candidates fill the
+/// rest up to [`MAX_POINT_CANDIDATES`].
 const GENERAL_POINT_CANDIDATES: usize = 48;
 const NEARBY_TREE_POINTS: usize = 8;
 const PREDICTED_HERO_POINTS: usize = 4;
@@ -68,7 +70,8 @@ const MANGO_ITEM: ItemId = ItemId(42);
 const MANGO_STACK_MAX: u8 = 3;
 const TANGO_ITEM: ItemId = ItemId(7);
 const TACTICAL_RADII: [i32; 3] = [200, 600, 1_200];
-/// Cells scanned around a structure for a teleport landing; covers its range.
+/// Cells scanned around a structure for a teleport landing; 10 × 64 covers the
+/// 600-unit scroll range.
 const LANDING_SEARCH_CELLS: usize = 10;
 
 const _: () = assert!(ACTIVE_ITEM_SLOTS <= HERO_BAG_SLOTS);
@@ -77,7 +80,7 @@ const _: () =
 const _: () = assert!(STASH_SLOTS <= HERO_BAG_SLOTS);
 const _: () = assert!(MANGO_STACK_MAX > 1);
 
-/// Stable append-only top-level action discriminator.
+/// Top-level action kind; the discriminant is the model head index.
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum ActionKind {
@@ -100,9 +103,8 @@ pub enum ActionKind {
 }
 
 impl ActionKind {
-    /// Number of append-only action kinds in this schema.
     pub const COUNT: usize = ACTION_KIND_COUNT;
-    /// All action kinds in stable model-index order.
+    /// All action kinds in model-index order.
     pub const ALL: [Self; ACTION_KIND_COUNT] = [
         Self::Continue,
         Self::Stop,
@@ -122,12 +124,10 @@ impl ActionKind {
         Self::Learn,
     ];
 
-    /// Stable zero-based model index.
     pub const fn index(self) -> usize {
         self as usize
     }
 
-    /// Converts a stable model index to its action kind.
     pub const fn from_index(index: usize) -> Option<Self> {
         if index < Self::COUNT {
             Some(Self::ALL[index])
@@ -145,7 +145,6 @@ pub enum ControlledUnit {
 }
 
 impl ControlledUnit {
-    /// Stable conditional-head index.
     pub const fn index(self) -> usize {
         match self {
             Self::Hero => 0,
@@ -254,7 +253,6 @@ pub enum StructuredAction {
 }
 
 impl StructuredAction {
-    /// Top-level discriminator used by the kind mask.
     pub const fn kind(self) -> ActionKind {
         match self {
             Self::Continue => ActionKind::Continue,
@@ -314,7 +312,6 @@ pub struct EntityCandidate {
     unit: UnitView,
     /// Unit category from the current `WorldView`.
     pub kind: UnitKind,
-    /// Relation to this seat.
     pub relation: EntityRelation,
     /// Current visible position.
     pub position: Vec2,
@@ -330,7 +327,7 @@ impl EntityCandidate {
     }
 }
 
-/// One of the eight deterministic tactical directions.
+/// One of eight tactical directions, counter-clockwise from East.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum PointDirection {
     East,
@@ -396,18 +393,18 @@ impl PointSource {
     }
 }
 
-/// Deterministic model-visible point candidate.
+/// Model-visible point candidate.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct PointCandidate {
-    /// Candidate position clamped to the terrain grid.
+    /// Position clamped to the map bounds.
     pub position: Vec2,
-    /// Candidate provenance used by Tree and Building target masks.
+    /// Provenance; raze-only sources are masked out of every non-raze target.
     pub source: PointSource,
     /// Whether public terrain and candidate provenance permit standing here.
     pub walkable: bool,
     /// Whether a currently standing static or planted tree occupies this point.
     pub standing_tree: bool,
-    /// Whether this point is a landing candidate near a visible allied structure.
+    /// Whether this point is a teleport landing near an allied structure.
     pub allied_building: bool,
     /// Per Shadowraze reach, what its landing along the heading toward this point strikes.
     pub raze_coverage: [RazeCoverage; 3],
@@ -431,7 +428,7 @@ impl LootCandidate {
     }
 }
 
-/// One bounded shop output in stable item-id order.
+/// One shop entry; candidates are in item-id order.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ShopCandidate {
     /// Item sent in a decoded buy order.
@@ -440,7 +437,7 @@ pub struct ShopCandidate {
     pub cost: i32,
 }
 
-/// Boolean mask for all stable top-level kinds.
+/// Top-level mask indexed by [`ActionKind::index`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KindMask([bool; ACTION_KIND_COUNT]);
 
@@ -450,7 +447,7 @@ impl KindMask {
         self.0[kind.index()]
     }
 
-    /// Fixed model-head representation in stable kind order.
+    /// The mask in model-head order.
     pub const fn as_array(&self) -> &[bool; ACTION_KIND_COUNT] {
         &self.0
     }
@@ -466,7 +463,7 @@ impl ControlledUnitMask {
         self.0[unit.index()]
     }
 
-    /// Fixed model-head representation in Hero, Courier order.
+    /// The mask in model-head order.
     pub const fn as_array(&self) -> &[bool; 2] {
         &self.0
     }
@@ -517,7 +514,7 @@ impl TargetMask {
 pub struct IssuedOrder {
     /// `None` selects the own hero; `Some` selects the current courier.
     pub unit: Option<EntityId>,
-    /// Exact wire order built only from current candidates.
+    /// Wire order built from current candidates.
     pub order: Order,
 }
 
@@ -588,7 +585,7 @@ struct BuyRequirement {
 struct StaticPassability {
     axis: usize,
     open: Vec<bool>,
-    /// Sorted static tree indices this seat saw felled (the key's list).
+    /// Sorted indices of static trees this seat saw felled, as in the key.
     felled: Vec<u32>,
     /// Nearest landing cell of each allied structure position, computed once per grid.
     landings: Vec<(Vec2, Option<Vec2>)>,
@@ -602,12 +599,12 @@ struct PassabilityKey {
     felled: Vec<u32>,
     /// Planted trees this seat can observe.
     planted: Vec<Vec2>,
-    /// Every structure's position, clearance and whether it is allied.
+    /// Each visible structure's position, raw clearance radius and whether it is allied.
     structures: Vec<(Vec2, i32, bool)>,
 }
 
-/// One tracker's last passability grid; the grid changes only when a tree
-/// falls or grows in view or a structure dies, not with each decision.
+/// One tracker's last passability grid; it changes only when a tree falls or
+/// grows in view or a structure dies or leaves view, not with each decision.
 #[derive(Debug, Default)]
 pub(crate) struct PassabilityCache(
     std::sync::Mutex<Option<(PassabilityKey, std::sync::Arc<StaticPassability>)>>,
@@ -697,7 +694,7 @@ impl ControlledMasks {
     }
 }
 
-/// Bounded candidates and all conditional legality masks for one snapshot.
+/// Candidates and conditional legality masks for one snapshot.
 pub struct ActionSpace {
     provenance: TrackerProvenance,
     controlled: [Option<ControlledState>; 2],
@@ -717,9 +714,8 @@ pub struct ActionSpace {
 }
 
 impl ActionSpace {
-    /// Builds candidates only from the latest validated seat-specific snapshot.
-    ///
-    /// Without recorded local timers this trusts the wire readiness fields.
+    /// Builds the space from the tracker's latest snapshot with no local item
+    /// timers, trusting the wire readiness fields.
     pub fn from_tracker(tracker: &StateTracker) -> Result<Self, ActionError> {
         Self::from_tracker_with_readiness(tracker, &ItemReadiness::new())
     }
@@ -825,7 +821,7 @@ impl ActionSpace {
             .map(EntityIndex)
     }
 
-    /// Top-level mask in stable append-only kind order.
+    /// Top-level kind mask.
     pub const fn kind_mask(&self) -> &KindMask {
         &self.kind_mask
     }
@@ -845,7 +841,7 @@ impl ActionSpace {
         &self.entities
     }
 
-    /// Deterministic deduplicated point candidates.
+    /// Point candidates, deduplicated by position.
     pub fn point_candidates(&self) -> &[PointCandidate] {
         &self.points
     }
@@ -972,13 +968,13 @@ impl ActionSpace {
 
     /// Shop mask after selecting a controlled unit.
     ///
-    /// The current server sends remote buys to stash. The selected body only
-    /// receives a purchase directly while it is within the local shop range.
+    /// Remote buys go to the stash; the selected body receives a purchase
+    /// directly only within shop range.
     pub fn buy_mask(&self, unit: ControlledUnit) -> &[bool] {
         &self.masks[unit.index()].buy
     }
 
-    /// Sell slots whose `for_sale` state proves prior server ownership acceptance.
+    /// Sell slot mask: slots whose item the wire reports `for_sale`.
     pub const fn sell_slot_mask(&self, unit: ControlledUnit) -> &[bool; WIRE_ITEM_SLOTS] {
         &self.masks[unit.index()].sell
     }
@@ -997,7 +993,7 @@ impl ActionSpace {
         &self.masks[ControlledUnit::Hero.index()].learn
     }
 
-    /// Whether the exact complete structured action is legal in this snapshot.
+    /// Whether the complete structured action is legal in this snapshot.
     pub fn allows(&self, action: StructuredAction) -> bool {
         if !self.kind_mask.allows(action.kind()) {
             return false;
@@ -1005,7 +1001,7 @@ impl ActionSpace {
         self.allows_conditionals(action)
     }
 
-    /// Validates the exact action and converts candidate indices to wire values.
+    /// Validates the action and converts candidate indices to wire values.
     ///
     /// An aimed raze decodes to its intent, a cast at the target unit, which the
     /// wire rejects; [`crate::RazeAim::resolve`] turns it into the orders to send.
@@ -1243,9 +1239,8 @@ fn validate_shop_recipes(shop: &[ShopEntry]) -> Result<(), ActionError> {
     {
         return Err(ActionError::InvalidSchema("duplicate shop item"));
     }
-    // Both scratch arrays are bounded by the native shop limits
-    // (`MAX_SHOP_ITEMS` entries, one visit per entry), so
-    // the whole validation runs without touching the heap.
+    // The colour array here and the DFS stack in `validate_recipe_from` are
+    // fixed arrays of `MAX_SHOP_ITEMS`, so validation does not allocate.
     assert!(shop.len() <= MAX_SHOP_ITEMS);
     let mut colors = [0u8; MAX_SHOP_ITEMS];
     let colors = &mut colors[..shop.len()];
@@ -1262,9 +1257,8 @@ fn validate_recipe_from(
     root: usize,
     colors: &mut [u8],
 ) -> Result<(), ActionError> {
-    // Depth-first traversal bounded by the recipe depth cap: a component can
-    // only push a state that is still unvisited and each entry is visited
-    // once, so the stack never exceeds the shop size.
+    // Iterative DFS: only unvisited entries are pushed and each at most once,
+    // so the stack never exceeds the shop size.
     assert!(shop.len() <= MAX_SHOP_ITEMS);
     let mut stack = [(0usize, 0usize); MAX_SHOP_ITEMS];
     let mut depth = 1usize;
@@ -1481,10 +1475,9 @@ impl StaticPassability {
         let start_y = center_y.saturating_sub(span);
         let end_x = center_x.saturating_add(span).min(self.axis - 1);
         let end_y = center_y.saturating_add(span).min(self.axis - 1);
-        // Same `within` test as before, evaluated row by row: the squared
-        // radius limit lets every cell of an out-of-range row be skipped
-        // without computing its centre, and each in-range row walks the
-        // cell centres incrementally instead of rebuilding them per cell.
+        // Blocks cells whose centre passes `Vec2::within(center, radius)`.
+        // Rows beyond the squared radius are skipped, and in-range rows step
+        // the raw x coordinate instead of rebuilding each centre.
         let limit = radius.squared_raw();
         let center_raw_x = i64::from(center.x.raw);
         let center_raw_y = i64::from(center.y.raw);
@@ -1835,12 +1828,12 @@ fn nearest_landing_cell(passability: &StaticPassability, center: Vec2, team: Tea
     let end_x = center_x
         .saturating_add(LANDING_SEARCH_CELLS)
         .min(passability.axis - 1);
-    // Incremental coordinates avoid rebuilding/dividing each cell while preserving
-    // the `(distance, canonical cell index)` tie-break. Canonicalize only the winner.
+    // Coordinates step incrementally; ties break on `(distance, canonical cell
+    // index)`, and only the winner is canonicalized.
     let step = i64::from(TERRAIN_CELL_SIZE) << Fixed::FRAC_BITS;
     let half = i64::from(TERRAIN_CELL_SIZE / 2) << Fixed::FRAC_BITS;
-    // A Dire canonical cell position is the mirrored cell center minus one raw
-    // unit, as `canonical_cell_position` builds it.
+    // For Dire, `canonical_cell_position` returns the cell centre minus one raw
+    // unit, so distances are measured to that point.
     let dire_shift = if team == Team::Dire { 1 } else { 0 };
     let center_raw_x = i64::from(center.x.raw);
     let center_raw_y = i64::from(center.y.raw);
@@ -2273,8 +2266,7 @@ fn build_buy_requirements(
         .collect();
     let held_template = held.clone();
     let mut output = Vec::with_capacity(candidates.len());
-    // One reusable expansion stack for the whole catalog check: cleared and
-    // refilled per candidate, so only this single allocation remains.
+    // One expansion stack reused across all candidates.
     let mut stack = Vec::new();
     for candidate in candidates {
         held.clone_from(&held_template);
@@ -2488,7 +2480,8 @@ fn fill_use_masks(
             continue;
         }
         if item.id == TANGO_ITEM && item.aim == Some(Aim::Tree) {
-            // Native Tango Use approaches the selected trunk before consuming a charge.
+            // The server walks a Tango user to the tree before consuming a charge,
+            // so no range check applies.
             let mut mask = empty_target_mask(space);
             for (allowed, point) in mask.points.iter_mut().zip(&space.points) {
                 *allowed = ready && point.standing_tree;

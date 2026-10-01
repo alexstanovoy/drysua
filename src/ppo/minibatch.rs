@@ -29,33 +29,6 @@ mod tests {
     use super::super::*;
 
     #[test]
-    fn partition_full_capacity_preserves_every_row_and_order_in_both_modes() {
-        let order: Vec<_> = (0..PPO_MAX_SAMPLES).rev().collect();
-        assert_eq!(order.len(), 33_280);
-        for balanced in [false, true] {
-            let chunks = minibatch::partition(&order, 2048, balanced).collect::<Vec<_>>();
-            assert_eq!(chunks.len(), order.len().div_ceil(2048));
-            assert_eq!(
-                chunks.iter().map(|chunk| chunk.len()).sum::<usize>(),
-                order.len()
-            );
-            assert!(
-                chunks
-                    .iter()
-                    .all(|chunk| !chunk.is_empty() && chunk.len() <= 2048)
-            );
-            assert_eq!(chunks.concat(), order);
-            if balanced {
-                let smallest = chunks.iter().map(|chunk| chunk.len()).min().unwrap();
-                let largest = chunks.iter().map(|chunk| chunk.len()).max().unwrap();
-                assert!(largest - smallest <= 1);
-            } else {
-                assert!(chunks.into_iter().eq(order.chunks(2048)));
-            }
-        }
-    }
-
-    #[test]
     fn partition_full_capacity_rejects_maximum_plus_one_with_the_bound() {
         let order = vec![0; PPO_MAX_SAMPLES + 1];
         assert_eq!(order.len(), 33_281);
@@ -75,7 +48,7 @@ mod tests {
     }
 
     #[test]
-    fn balanced_partitions_preserve_order_and_bound_sizes_without_a_tiny_tail() {
+    fn partitions_preserve_order_and_balance_sizes_up_to_full_capacity() {
         let order = [8, 2, 6, 0, 7, 1, 5, 3, 4, 9];
         for (count, sizes) in [
             (0, &[][..]),
@@ -88,9 +61,27 @@ mod tests {
         ] {
             let slices = minibatch::partition(&order[..count], 4, true).collect::<Vec<_>>();
             let lengths = slices.iter().map(|slice| slice.len()).collect::<Vec<_>>();
-            assert_eq!(lengths, sizes);
-            assert_eq!(slices.concat(), order[..count]);
+            assert_eq!(lengths, sizes, "{count} rows");
+            assert_eq!(slices.concat(), order[..count], "{count} rows");
             assert!(minibatch::partition(&order[..count], 4, false).eq(order[..count].chunks(4)));
+        }
+        let order: Vec<_> = (0..PPO_MAX_SAMPLES).rev().collect();
+        for balanced in [false, true] {
+            let chunks = minibatch::partition(&order, 2048, balanced).collect::<Vec<_>>();
+            assert_eq!(
+                chunks.len(),
+                order.len().div_ceil(2048),
+                "balanced={balanced}"
+            );
+            assert_eq!(chunks.concat(), order, "balanced={balanced}");
+            let smallest = chunks.iter().map(|chunk| chunk.len()).min().unwrap();
+            let largest = chunks.iter().map(|chunk| chunk.len()).max().unwrap();
+            assert!(smallest > 0 && largest <= 2048, "balanced={balanced}");
+            if balanced {
+                assert!(largest - smallest <= 1);
+            } else {
+                assert!(chunks.into_iter().eq(order.chunks(2048)));
+            }
         }
     }
 
@@ -115,45 +106,19 @@ mod tests {
                 .unwrap();
             let batch = sampled_batch(&model, config);
             let before = model.export_parameters().unwrap();
-            let frame = batch.sample(0).unwrap().transition.frame;
-            let value_before = model.evaluate(&frame).unwrap().value;
             let report = trainer
                 .train_update(&model, &batch, crate::UpdateObjective::default())
                 .unwrap();
+            assert_eq!(report.samples_optimized, 18, "balanced={balanced}");
+            assert_eq!(report.minibatches, 6, "balanced={balanced}");
+            assert_eq!(report.optimizer_step, 6, "balanced={balanced}");
             let after = model.export_parameters().unwrap();
-            assert_eq!(report.samples_optimized, 18);
-            assert_eq!(report.minibatches, 6);
-            assert_eq!(report.optimizer_step, 6);
-            assert_ne!(before, after);
-            let order: Vec<_> = (0..9).collect();
-            let sizes: Vec<_> = minibatch::partition(&order, 4, balanced)
-                .map(<[_]>::len)
-                .collect();
-            eprintln!(
-                "minibatch-comparison source=synthetic_fixed_state_terminal_rewards_1_to_9 seed=9101 balanced={balanced} sizes={sizes:?} epochs=2 rows_optimized={} adam_steps={} value_before={value_before} value_after={} policy_loss={} value_loss={} gradient_norm={} applied_scale={} shuffle={:?}",
-                report.samples_optimized,
-                report.optimizer_step,
-                model.evaluate(&frame).unwrap().value,
-                report.policy_loss,
-                report.value_loss,
-                report.gradient_norm,
-                report.applied_scale,
-                trainer.rng_checkpoint()
-            );
+            assert_ne!(before, after, "balanced={balanced}");
             results.push((before, after, trainer.rng_checkpoint()));
         }
         assert_eq!(results[0].0, results[1].0);
         assert_eq!(results[0].2, results[1].2);
         assert_ne!(results[0].1, results[1].1);
-        let difference = results[0]
-            .1
-            .iter()
-            .zip(&results[1].1)
-            .map(|(left, right)| (left - right).abs())
-            .fold(0.0_f32, f32::max);
-        eprintln!(
-            "minibatch-comparison max_parameter_difference={difference} identical_work=true numerical_equivalence=false"
-        );
     }
 
     #[test]
@@ -297,7 +262,8 @@ mod tests {
             )
             .expect("frame");
         model
-            .sample(&frame, &space, &mut PpoRng::new(5))
+            .sample_batch(&[frame], &[space], &mut [PpoRng::new(5)])
             .expect("choice")
+            .remove(0)
     }
 }

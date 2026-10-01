@@ -1,4 +1,5 @@
-//! Read-only inspection anchored to owned directory descriptors, never pathname parents.
+//! Read-only inspection I/O on Linux, resolved through `/proc/self/fd` of open directory
+//! descriptors so a swapped parent path cannot redirect reads. Other platforms are unsupported.
 use crate::CheckpointError;
 use std::path::Path;
 #[cfg(any(target_os = "linux", feature = "builtin"))]
@@ -155,8 +156,8 @@ impl Directory {
         Ok(Some(bytes))
     }
 
-    /// The final dot lets existing validators inspect the directory, not the procfs symlink.
-    /// Keep this directory alive until every consumer of the returned path has finished.
+    /// The trailing `/.` makes metadata calls see the directory rather than the procfs symlink.
+    /// The path is valid only while `self` stays open.
     pub(super) fn anchored_path(&self) -> PathBuf {
         PathBuf::from(format!("/proc/self/fd/{}/.", self.file.as_raw_fd()))
     }

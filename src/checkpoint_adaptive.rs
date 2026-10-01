@@ -11,8 +11,9 @@ const BLOCK_BYTES: usize = 152;
 const _: () = assert!(BLOCK_BYTES == 15 * 8 + 32);
 const _: () = assert!(BLOCK_BYTES < super::MAX_META_BYTES as usize);
 
-/// Atomic controller and generation-snapshot commitment, alongside model, Adam, and RNG state.
-/// The runtime owns the rolling SHA-256; the checkpoint codec never reads snapshot files.
+/// Adaptive controller state plus the snapshot commitment (count and rolling SHA-256), saved
+/// atomically with the model, Adam and RNG state. The checkpoint codec never reads snapshot files;
+/// `adaptive_randomization` maintains the hash.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AdaptiveEnvironmentCheckpoint {
     pub config: AdaptiveEnvironmentConfig,
@@ -27,11 +28,10 @@ pub(super) fn validate_scope(
     progress: &CheckpointProgress,
 ) -> Result<(), CheckpointError> {
     super::validate_text("command line", &run.command_line)?;
-    // A non-default scale ramp is recorded after the adaptive suffix. Only the
-    // canonical rendering is split here, so a partial or malformed
-    // `--environment-scale-*` token stays in the prefix and is rejected below.
-    // Only the builtin feature carries the randomization module; without it the
-    // scale flags cannot be produced, so every such token stays a mismatch.
+    // A non-default scale ramp is recorded after the adaptive suffix. Only its exact
+    // rendering is split off, so a partial or malformed `--environment-scale-*` token
+    // stays in `command` and is rejected below. Without the builtin feature no scale
+    // flags can be produced, so any such token is rejected.
     #[cfg(feature = "builtin")]
     let (command, _scale) = crate::randomization::split_scale_scope(&run.command_line);
     #[cfg(not(feature = "builtin"))]

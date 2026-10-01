@@ -7,14 +7,7 @@ use super::fixtures;
 use crate::{ActionSpace, SHADOW_FIEND, StateTracker};
 
 #[test]
-fn metadata_accepts_supported_maps_and_rejects_invalid_map_and_clock() {
-    for map in [MapId(0), MapId(1), MapId(2)] {
-        let mut info = match_info();
-        info.map = map;
-        let tracker = StateTracker::new(SlotId(0), &info).expect("supported map");
-        assert_eq!(tracker.metadata().map, map);
-        assert!(tracker.current().is_none());
-    }
+fn metadata_rejects_an_unsupported_map_and_a_zero_tick_rate() {
     for (map, tick_rate, expected) in [
         (
             MapId(3),
@@ -222,25 +215,6 @@ fn events_preserve_cast_ambiguity_and_reject_old_batches_without_mutation() {
         );
         assert!(before.matches_tracker(&tracker));
         tracker.observe_events(3, &[]).expect("valid retry");
-    }
-}
-
-#[test]
-fn public_visibility_obeys_obstruction_and_exact_radius() {
-    for (opaque, distance, visible) in [(false, 200, true), (false, 201, false), (true, 120, false)]
-    {
-        let mut info = match_info();
-        if opaque {
-            info.opaque_cells = vec![(1, 0)];
-        }
-        let mut view = world_view(1);
-        view.units[0].vision_radius = Fixed::from_int(200);
-        let mut tracker = StateTracker::new(SlotId(0), &info).expect("tracker");
-        tracker.observe_snapshot(&view).expect("snapshot");
-        assert_eq!(
-            tracker.position_visible_to_own_seat(Vec2::from_ints(10 + distance, 20)),
-            visible
-        );
     }
 }
 

@@ -10,9 +10,9 @@ use std::fmt;
 
 use crate::{
     ACTION_SCHEMA_HASH, ACTION_SCHEMA_VERSION, AdamConfig, AdamState, BehavioralTarget,
-    FEATURE_SCHEMA_HASH, FEATURE_SCHEMA_VERSION, FeatureFrame, GlobalSummary, MODEL_MAX_BATCH,
-    MODEL_SCHEMA_HASH, MODEL_SCHEMA_VERSION, PackedBehavioralTarget, PolicyIdentity, PolicyModel,
-    RaggedFeatureArena, RaggedFeatureHeader, StagedPpoBatch, StructuredAction,
+    FEATURE_SCHEMA_HASH, FEATURE_SCHEMA_VERSION, FeatureFrame, MODEL_MAX_BATCH, MODEL_SCHEMA_HASH,
+    MODEL_SCHEMA_VERSION, PackedBehavioralTarget, PolicyModel, RaggedFeatureArena,
+    RaggedFeatureHeader, StagedPpoBatch, StructuredAction,
 };
 
 #[cfg(test)]
@@ -21,6 +21,8 @@ mod test_support;
 #[cfg(test)]
 pub(crate) use test_support::*;
 
+/// Maximum epoch, optimizer-step, and global-update counter value.
+pub const MAX_TRAINING_COUNTER: u64 = 1_000_000_000;
 /// Maximum concurrently interleaved environment-seat rollout streams.
 pub const PPO_MAX_STREAMS: usize = 1_280;
 /// Maximum transitions retained for one policy update: the largest target plus
@@ -53,23 +55,16 @@ pub const PPO_STORAGE_PEAK_BYTES: u64 = crate::feature::FEATURE_ARENA_PEAK_BYTES
         * (std::mem::size_of::<PpoPreparedSample>() + crate::FEATURE_FRAME_HEAP_BYTES) as u64;
 const _: () = assert!(PPO_MAX_SAMPLES == 33_280);
 const _: () = assert!(PPO_STORAGE_PEAK_BYTES < 10 * 1024 * 1024 * 1024);
-/// Maximum decisions retained from each environment in one policy update.
 /// Maximum updates between a sample's behaviour weights and the learner: one
 /// pipelined update plus an interval that straddles an update boundary.
 pub const PPO_MAX_STALENESS: u64 = 2;
 /// Maximum random draws made by one autoregressive policy sample.
 pub const PPO_MAX_POLICY_SAMPLE_DRAWS: u64 = 132;
-const PPO_REWARD_SCALE: f32 = 101.0;
-/// Episode budget for the sum of absolute emitted shaping components.
-pub const PPO_SHAPING_BUDGET: f32 = 100.0 / PPO_REWARD_SCALE;
-/// Terminal reward for winning; losing is its negation.
-pub const PPO_TERMINAL_REWARD: f32 = 1.0;
-const _: () = assert!(PPO_TERMINAL_REWARD > PPO_SHAPING_BUDGET);
 /// Version of rollout, GAE, objective, optimizer, and reward semantics.
 pub const PPO_SCHEMA_VERSION: u32 = 42;
-/// Audited simulator and learner rules required by rollouts.
+/// Version of the simulator and learner rules rollouts assume.
 pub const PPO_RULES_AUDIT_VERSION: u32 = 32;
-/// Canonical learner contract covered by [`PPO_SCHEMA_HASH`].
+/// Learner contract covered by [`PPO_SCHEMA_HASH`].
 pub const PPO_SCHEMA_DESCRIPTOR: &str = concat!(
     "bota-drysua-ppo/v42;",
     "linked_schemas=action,feature,model,map2_reward;linked_hash=fnv1a_descriptor_then_ordered_version_le32_hash_le64_then_map2_reward_descriptor_utf8;rules_audit=32;",
@@ -157,7 +152,6 @@ impl Default for PpoConfig {
 }
 
 impl PpoConfig {
-    /// Validates every finite range and fixed upper bound.
     pub fn validate(self) -> Result<Self, PpoError> {
         if self.decision_interval_ticks == 0 {
             return Err(PpoError::InvalidConfig("decision interval"));
@@ -224,7 +218,7 @@ fn validate_probabilities(config: PpoConfig) -> Result<(), PpoError> {
     Ok(())
 }
 
-/// Stage-nine rollout, advantage, optimizer, or model integration failure.
+/// Rollout, advantage, optimizer or model failure.
 #[derive(Clone, Debug, PartialEq)]
 pub enum PpoError {
     InvalidConfig(&'static str),
@@ -253,10 +247,6 @@ pub enum PpoError {
         rollback: String,
     },
     Model(String),
-    EpisodeWorker {
-        stream: usize,
-        cause: String,
-    },
     /// A checkpoint's run scope differs from the requested one, by field.
     ScopeMismatch(String),
 }
@@ -296,9 +286,6 @@ impl fmt::Display for PpoError {
                 )
             }
             Self::Model(message) => write!(formatter, "PPO model error: {message}"),
-            Self::EpisodeWorker { stream, cause } => {
-                write!(formatter, "PPO episode worker {stream} failed: {cause}")
-            }
             Self::ScopeMismatch(message) => {
                 write!(formatter, "checkpoint scope mismatch: {message}")
             }
@@ -308,7 +295,7 @@ impl fmt::Display for PpoError {
 
 impl Error for PpoError {}
 
-/// Deterministic bounded policy-sampling and minibatch-shuffle generator.
+/// SplitMix64 generator for policy sampling and minibatch shuffles; counts its draws.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PpoRng {
     state: u64,
@@ -349,10 +336,6 @@ impl PpoRng {
     /// Uniform value strictly inside `(0, 1)` using stable top 52 bits.
     pub fn uniform_open(&mut self) -> Result<f64, PpoError> {
         Ok(open_unit_from_bits(self.next_u64()? >> 12))
-    }
-
-    pub const fn draws(&self) -> u64 {
-        self.draws
     }
 
     /// Unbiased integer in `0..bound`.
@@ -407,72 +390,6 @@ pub struct PpoTransition {
     pub(crate) terminal: bool,
 }
 
-/// Arguments that close one sampled policy decision into a rollout transition.
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct PpoOutcome {
-    pub stream: usize,
-    pub decision: u32,
-    pub ticks: u32,
-    pub next_value: f32,
-    pub reward: f32,
-    pub terminal: bool,
-}
-
-/// Sampled action and old-policy statistics returned by the model.
-#[derive(Clone, Debug)]
-pub struct PpoPolicyChoice {
-    pub(crate) frame: FeatureFrame,
-    pub(crate) target: BehavioralTarget,
-    pub(crate) action: StructuredAction,
-    pub(crate) policy: PolicyIdentity,
-    pub(crate) log_probability: f32,
-    pub(crate) entropy: f32,
-    pub(crate) value: f32,
-}
-
-impl PpoPolicyChoice {
-    pub const fn action(&self) -> StructuredAction {
-        self.action
-    }
-
-    pub const fn policy(&self) -> PolicyIdentity {
-        self.policy
-    }
-
-    pub const fn log_probability(&self) -> f32 {
-        self.log_probability
-    }
-
-    pub const fn entropy(&self) -> f32 {
-        self.entropy
-    }
-
-    pub const fn value(&self) -> f32 {
-        self.value
-    }
-
-    /// Adds only bounded observable outcome data to this policy sample.
-    pub fn finish(self, behaviour: u64, outcome: PpoOutcome) -> Result<PpoTransition, PpoError> {
-        let transition = PpoTransition {
-            frame: self.frame,
-            target: self.target,
-            shadow: None,
-            action: self.action,
-            behaviour,
-            stream: outcome.stream,
-            decision: outcome.decision,
-            ticks: outcome.ticks,
-            old_log_probability: self.log_probability,
-            old_value: self.value,
-            next_value: outcome.next_value,
-            reward: outcome.reward,
-            terminal: outcome.terminal,
-        };
-        validate_transition(&transition)?;
-        Ok(transition)
-    }
-}
-
 pub(crate) fn validate_transition(transition: &PpoTransition) -> Result<(), PpoError> {
     if transition.stream >= PPO_MAX_STREAMS {
         return Err(PpoError::StreamOutOfRange {
@@ -498,7 +415,7 @@ pub(crate) fn validate_transition(transition: &PpoTransition) -> Result<(), PpoE
     if transition.old_log_probability > 1.0e-5 || !transition.frame.is_finite() {
         return Err(PpoError::InvalidTransition("policy statistics or frame"));
     }
-    let invalid = |error: crate::ImitationError| PpoError::Model(error.to_string());
+    let invalid = |error: crate::TargetError| PpoError::Model(error.to_string());
     transition.target.validate().map_err(invalid)?;
     if let Some(shadow) = &transition.shadow {
         shadow.validate().map_err(invalid)?;
@@ -531,7 +448,7 @@ struct CompactPpoTransition {
 }
 
 impl PpoRollout {
-    /// A smaller test/collector buffer may retain fewer than a full update.
+    /// A rollout holding at most `capacity` transitions.
     pub fn new(capacity: usize) -> Result<Self, PpoError> {
         if !(1..=PPO_MAX_SAMPLES).contains(&capacity) {
             return Err(PpoError::Capacity { capacity });
@@ -586,12 +503,9 @@ impl PpoRollout {
         Ok(())
     }
 
-    pub fn len(&self) -> usize {
+    #[cfg(any(feature = "builtin", test))]
+    pub(crate) fn len(&self) -> usize {
         self.transitions.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.transitions.is_empty()
     }
 
     pub fn finish(self, config: PpoConfig) -> Result<PpoBatch, PpoError> {
@@ -609,18 +523,6 @@ pub struct PpoPreparedSample {
     pub(crate) transition: PpoTransition,
     pub(crate) advantage: f32,
     pub(crate) return_value: f32,
-}
-
-impl PpoPreparedSample {
-    pub const fn action(&self) -> StructuredAction {
-        self.transition.action
-    }
-    pub const fn advantage(&self) -> f32 {
-        self.advantage
-    }
-    pub const fn return_value(&self) -> f32 {
-        self.return_value
-    }
 }
 
 /// Immutable normalized update batch.
@@ -973,12 +875,8 @@ fn finish_update_report(report: &mut PpoUpdateReport, optimizer_step: u64) -> Re
 }
 
 impl PpoBatch {
-    pub fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.samples.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.samples.is_empty()
     }
 
     /// Both explained variances; NaN where the returns are constant or absent.
@@ -1185,154 +1083,10 @@ pub fn tick_discount(gamma_tick: f32, ticks: u32) -> Result<f32, PpoError> {
         .ok_or(PpoError::InvalidDiscount)
 }
 
-/// Scalar PPO clipped surrogate used by reference tests and diagnostics.
-pub fn clipped_surrogate(ratio: f32, advantage: f32, epsilon: f32) -> f32 {
-    assert!(ratio.is_finite());
-    assert!(advantage.is_finite());
-    assert!(epsilon.is_finite());
-    assert!(epsilon > 0.0);
-    (ratio * advantage).min(ratio.clamp(1.0 - epsilon, 1.0 + epsilon) * advantage)
-}
-
-/// Observable shaping and terminal reward components for one seat transition.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct RewardBreakdown {
-    pub experience: f32,
-    pub last_hits: f32,
-    pub denies: f32,
-    pub combat: f32,
-    pub structures: f32,
-    pub wealth: f32,
-    pub terminal: f32,
-    pub total: f32,
-}
-
-/// Explicit terminal adjudication; a draw is not a nonterminal step.
+/// Terminal result of a game; a draw is terminal too.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PpoTerminalOutcome {
     Win,
     Loss,
     Draw,
-}
-
-/// Bounded seat-only reward state; no simulator state or hidden identifiers enter it.
-#[derive(Clone, Debug, Default)]
-pub struct RewardTracker {
-    previous: Option<GlobalSummary>,
-    shaping_spent: f64,
-}
-
-impl RewardTracker {
-    /// Map0 terminal-only reward: no potential, budget, or shaping state participates.
-    pub fn terminal_only(outcome: Option<PpoTerminalOutcome>) -> Result<RewardBreakdown, PpoError> {
-        let terminal = match outcome {
-            None => 0.0,
-            Some(PpoTerminalOutcome::Win) => PPO_TERMINAL_REWARD,
-            Some(PpoTerminalOutcome::Loss) => -PPO_TERMINAL_REWARD,
-            Some(PpoTerminalOutcome::Draw) => {
-                return Err(PpoError::InvalidTransition("terminal-only Map0 draw"));
-            }
-        };
-        assert!(terminal.is_finite());
-        assert!(terminal.abs() <= PPO_TERMINAL_REWARD);
-        Ok(RewardBreakdown {
-            terminal,
-            total: terminal,
-            ..RewardBreakdown::default()
-        })
-    }
-
-    pub fn observe(
-        &mut self,
-        next: GlobalSummary,
-        discount: f32,
-        outcome: Option<PpoTerminalOutcome>,
-    ) -> Result<RewardBreakdown, PpoError> {
-        if !discount.is_finite() || !(0.0..=1.0).contains(&discount) {
-            return Err(PpoError::InvalidDiscount);
-        }
-        let mut reward = self
-            .previous
-            .map_or_else(RewardBreakdown::default, |previous| {
-                shaping_delta(
-                    previous,
-                    next,
-                    if outcome.is_some() { 0.0 } else { discount },
-                )
-            });
-        let proposed = shaping_expenditure(&reward);
-        let remaining = (f64::from(PPO_SHAPING_BUDGET) - self.shaping_spent).max(0.0);
-        let allowed = proposed.min(remaining);
-        scale_shaping(&mut reward, proposed, allowed);
-        self.shaping_spent += allowed;
-        assert!(self.shaping_spent <= f64::from(PPO_SHAPING_BUDGET));
-        assert!(reward.total.abs() <= PPO_SHAPING_BUDGET + 1.0e-6);
-        reward.terminal = outcome.map_or(0.0, |outcome| match outcome {
-            PpoTerminalOutcome::Win => PPO_TERMINAL_REWARD,
-            PpoTerminalOutcome::Loss => -PPO_TERMINAL_REWARD,
-            PpoTerminalOutcome::Draw => 0.0,
-        });
-        reward.total += reward.terminal;
-        self.previous = Some(next);
-        Ok(reward)
-    }
-}
-
-fn shaping_delta(previous: GlobalSummary, next: GlobalSummary, discount: f32) -> RewardBreakdown {
-    let potential = |next: f32, previous: f32| discount * next - previous;
-    let experience = potential(score_xp(next), score_xp(previous)) * (0.02 / PPO_REWARD_SCALE);
-    let last_hits = 0.0;
-    let denies = 0.0;
-    let combat = potential(score_combat(next), score_combat(previous)) * (2.0 / PPO_REWARD_SCALE);
-    let structures =
-        potential(score_structures(next), score_structures(previous)) * (5.0 / PPO_REWARD_SCALE);
-    // Cash is not wealth: spending on useful equipment must not incur a shaping penalty.
-    let wealth = 0.0;
-    RewardBreakdown {
-        experience,
-        last_hits,
-        denies,
-        combat,
-        structures,
-        wealth,
-        terminal: 0.0,
-        total: experience + last_hits + denies + combat + structures + wealth,
-    }
-}
-
-fn score_xp(summary: GlobalSummary) -> f32 {
-    (summary.allied.xp as f64 - summary.enemy.xp as f64) as f32
-}
-
-fn score_combat(summary: GlobalSummary) -> f32 {
-    let allied = summary.allied.kills as f64 - summary.allied.deaths as f64;
-    let enemy = summary.enemy.kills as f64 - summary.enemy.deaths as f64;
-    (allied - enemy) as f32
-}
-
-fn score_structures(summary: GlobalSummary) -> f32 {
-    (i64::from(summary.enemy_structures_destroyed) - i64::from(summary.allied_structures_destroyed))
-        as f32
-}
-
-fn shaping_expenditure(reward: &RewardBreakdown) -> f64 {
-    f64::from(reward.experience).abs()
-        + f64::from(reward.combat).abs()
-        + f64::from(reward.structures).abs()
-}
-
-fn scale_shaping(reward: &mut RewardBreakdown, proposed: f64, allowed: f64) {
-    assert!(proposed.is_finite());
-    assert!(allowed >= 0.0);
-    if proposed == 0.0 || proposed == allowed {
-        return;
-    }
-    let scale = (allowed / proposed) as f32;
-    reward.experience *= scale;
-    reward.last_hits *= scale;
-    reward.denies *= scale;
-    reward.combat *= scale;
-    reward.structures *= scale;
-    reward.wealth *= scale;
-    reward.total = reward.experience + reward.combat + reward.structures;
 }

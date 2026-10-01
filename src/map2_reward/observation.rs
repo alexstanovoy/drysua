@@ -61,7 +61,7 @@ pub(super) fn roles(slot: SlotId, info: &MatchInfo) -> Result<[Role; 2], Map2Rew
     }))
 }
 
-/// Snapshot facts into a reusable tower buffer, so the steady state allocates nothing.
+/// Extracts snapshot facts into a reused tower buffer, so the steady state allocates nothing.
 pub(super) fn snapshot_into(
     view: &WorldView,
     roles: [Role; 2],

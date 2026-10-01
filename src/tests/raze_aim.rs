@@ -38,7 +38,8 @@ fn one_aimed_raze_decision_hits_a_standing_or_crossing_hero_behind_or_beside_at_
     }
 }
 
-/// Plays the aimed raze and then Continue until the raze lands, and returns the decision count.
+/// Plays the aimed raze and then Continue until a raze is cast, asserts that it hit the
+/// enemy hero, and returns the decision count.
 fn decisions_until_hit(slot: u8, reach: i32, facing: u16, motion: Motion) -> usize {
     let mut environment = aim_environment(reach, facing, motion);
     let (_, space) =
@@ -56,39 +57,24 @@ fn decisions_until_hit(slot: u8, reach: i32, facing: u16, motion: Motion) -> usi
         .unit();
     assert!(
         !crate::raze_aim::raze_contains(tracker, hero, enemy_view, hero.facing.brads, reach),
-        "the untargeted raze must miss, so the old schema needed a turn decision first"
+        "the untargeted raze must miss, so only an aimed raze can hit"
     );
-    let aimed = StructuredAction::Cast {
-        unit: ControlledUnit::Hero,
-        slot: AbilitySlot(slot),
-        target: ActionTarget::Entity(space.entity_index(enemy).expect("enemy candidate")),
-    };
-    assert!(space.allows(aimed));
-    let mut action = aimed;
-    let mut space = space;
-    for decision in 1..=DECISION_LIMIT + 1 {
-        let (_, request) =
-            neural_policy_request_in_space(&mut environment.seats[0], action, &space)
-                .expect("aim transport");
-        advance_interval(&mut environment, vec![request, None], 3).expect("aim ticks");
-        reject_production_rejection(&environment, "aimed raze").expect("no rejection");
-        let own = &GameSummary::capture(&environment, None, 3).json()["own"];
-        if own["raze_hero_hits"] == 1 {
-            let casts = &own["casts"];
-            assert_eq!(
-                casts["raze_near"].as_u64().unwrap()
-                    + casts["raze_mid"].as_u64().unwrap()
-                    + casts["raze_far"].as_u64().unwrap(),
-                1
-            );
-            return decision;
-        }
-        action = StructuredAction::Continue;
-        space = prepare_neural_seat_policy_sample(&mut environment.seats[0])
-            .expect("continue space")
-            .1;
+    let target = ActionTarget::Entity(space.entity_index(enemy).expect("enemy candidate"));
+    let decisions = raze_until_cast(&mut environment, space, slot, target);
+    let own = &GameSummary::capture(&environment, None, 3).json()["own"];
+    if decisions <= DECISION_LIMIT {
+        let casts = &own["casts"];
+        let razes: u64 = ["raze_near", "raze_mid", "raze_far"]
+            .iter()
+            .map(|label| casts[*label].as_u64().expect("raze casts"))
+            .sum();
+        assert_eq!(razes, 1, "slot {slot} facing {facing} {motion:?}");
+        assert_eq!(
+            own["raze_hero_hits"], 1,
+            "slot {slot} facing {facing} {motion:?}: the raze missed"
+        );
     }
-    DECISION_LIMIT + 1
+    decisions
 }
 
 /// Shadow Fiend at `ORIGIN` looking `facing` away from the enemy hero east of it at `reach`.
@@ -373,12 +359,13 @@ fn raze_until_cast(
         slot: AbilitySlot(slot),
         target,
     };
+    assert!(space.allows(action), "{action:?}");
     for decision in 1..=DECISION_LIMIT + 1 {
         let (_, request) =
             neural_policy_request_in_space(&mut environment.seats[0], action, &space)
                 .expect("raze transport");
         advance_interval(environment, vec![request, None], 3).expect("raze ticks");
-        reject_production_rejection(environment, "point raze").expect("no rejection");
+        reject_production_rejection(environment, "raze").expect("no rejection");
         let casts = &GameSummary::capture(environment, None, 3).json()["own"]["casts"];
         if ["raze_near", "raze_mid", "raze_far"]
             .iter()

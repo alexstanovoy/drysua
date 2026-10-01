@@ -1,34 +1,18 @@
 //! `duel` subcommand: rule policy head-to-head with a per-game log and a Wilson summary.
 
-use clap::{Args, ValueEnum};
+use clap::Args;
 
 use crate::scripted::ScriptKind;
-
-/// Rule policy spelling shared by `duel`, `play` and training opponents.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-pub(crate) enum ScriptArg {
-    Teacher,
-    HarassPush,
-}
-
-impl From<ScriptArg> for ScriptKind {
-    fn from(argument: ScriptArg) -> Self {
-        match argument {
-            ScriptArg::Teacher => Self::Teacher,
-            ScriptArg::HarassPush => Self::HarassPush,
-        }
-    }
-}
 
 /// Options for a deterministic rule-policy duel on Map2.
 #[derive(Args)]
 pub(crate) struct DuelArgs {
     /// Evaluated policy.
-    #[arg(long, value_enum, default_value_t = ScriptArg::HarassPush)]
-    policy: ScriptArg,
+    #[arg(long, value_enum, default_value_t = ScriptKind::HarassPush)]
+    policy: ScriptKind,
     /// Opponent policy.
-    #[arg(long, value_enum, default_value_t = ScriptArg::Teacher)]
-    opponent: ScriptArg,
+    #[arg(long, value_enum, default_value_t = ScriptKind::Teacher)]
+    opponent: ScriptKind,
     /// Styles the evaluated policy draws from per game: `[styled,]knob=value|knob=low..high,...`.
     /// Empty is the canonical policy; an unknown knob error lists the knobs.
     #[arg(long, default_value = "")]
@@ -51,9 +35,8 @@ pub(crate) struct DuelArgs {
 pub(crate) fn run(arguments: DuelArgs) -> std::io::Result<()> {
     use crate::scripted::StyleSpec;
     use std::io::Write;
-    let style = |kind: ScriptArg, text: &str| {
-        StyleSpec::parse(kind.into(), text).map_err(std::io::Error::other)
-    };
+    let style =
+        |kind: ScriptKind, text: &str| StyleSpec::parse(kind, text).map_err(std::io::Error::other);
     let config = crate::scripted::DuelConfig {
         policy: style(arguments.policy, &arguments.policy_style)?,
         opponent: style(arguments.opponent, &arguments.opponent_style)?,

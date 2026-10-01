@@ -63,8 +63,8 @@ pub(super) fn append_scope(
     if let EnvironmentSchedule::Adaptive(config) = settings.environment_schedule {
         config.append_scope(command);
     }
-    // The scale ramp is recorded after the adaptive suffix for both schedules,
-    // in a fixed order, and only when it differs from the historical default.
+    // The scale ramp follows the adaptive suffix for both schedules and is
+    // recorded only when it is not the full scale.
     if settings.scale != crate::randomization::AnnealScale::FULL {
         command.push_str(&settings.scale.scope_suffix());
     }
@@ -122,7 +122,7 @@ pub(super) fn verified_generation_count(
             settings.generation_updates,
             1,
             anneal_schedule(settings),
-            // Collection had already drawn every pipelined update's generation.
+            // Collection has already drawn the generation of every pipelined update.
             state
                 .completed_updates
                 .checked_add(PIPELINE_STALENESS + 1)

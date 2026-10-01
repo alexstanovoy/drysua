@@ -1,16 +1,12 @@
-#[cfg(test)]
-#[path = "tests/map2_contract_test_support.rs"]
-mod test_support;
-
 /// Map used by every production training and evaluation entry point.
 pub const MAP2_ID: bota_proto::MapId = bota_proto::MapId(2);
-/// Simulation ticks per second in the Map2 duration contract.
+/// Simulation ticks per second.
 pub const MAP2_TICK_RATE: u32 = 30;
-/// Pregame ticks included in the native Map2 cap.
+/// Pregame ticks, counted in [`MAP2_TICK_CAP`].
 pub const MAP2_PREGAME_TICKS: u32 = 30 * MAP2_TICK_RATE;
 /// Fifteen minutes of gameplay after pregame.
 pub const MAP2_GAME_TICKS: u32 = 15 * 60 * MAP2_TICK_RATE;
-/// Inclusive native terminal tick, including pregame.
+/// Tick at which the match ends as a draw if still undecided; includes pregame.
 pub const MAP2_TICK_CAP: u32 = MAP2_PREGAME_TICKS + MAP2_GAME_TICKS;
 /// Hero deaths at which a side loses; losing any tower loses as well.
 pub const MAP2_DEATH_LIMIT: u16 = 2;

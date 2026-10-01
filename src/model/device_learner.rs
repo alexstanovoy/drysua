@@ -3,8 +3,9 @@
 //! An update's samples are staged on the learner device once. Each Adam step
 //! gathers its minibatch there, accumulates gradients over microbatches on the
 //! device and runs Adam on the device; the host reads back only the loss
-//! statistics, the gradient norm and the new moments. A candidate whose KL
-//! exceeds the target is rolled back from device copies of the parameters.
+//! statistics, the gradient norm, the candidate KL and finiteness flags. A
+//! candidate whose KL exceeds the target is rolled back from device copies of
+//! the parameters.
 
 use super::ppo_objective::{
     HostTargets, ObjectiveTargets, candidate_kl_sum, ppo_loss, report_from_sums,
@@ -189,7 +190,7 @@ impl PolicyModel {
     }
 
     #[cfg(test)]
-    /// Stages prepared samples; the convenience path of tests and small updates.
+    /// Stages prepared samples in one call.
     pub(crate) fn stage_ppo_examples(
         &self,
         examples: &[&PpoPreparedSample],
@@ -213,7 +214,6 @@ impl PolicyModel {
             adam,
             config,
             crate::training_execution::DEFAULT_TRAINING_MICROBATCH,
-            #[cfg(test)]
             PpoTestFaults::default(),
         )
     }
@@ -225,7 +225,7 @@ impl PolicyModel {
         adam: &mut AdamState,
         config: PpoConfig,
         microbatch: usize,
-        #[cfg(test)] faults: PpoTestFaults,
+        faults: PpoTestFaults,
     ) -> Result<PpoMinibatchReport, ModelError> {
         if examples.is_empty() || examples.len() > MODEL_MAX_BATCH {
             return Err(ModelError::InvalidModelState("PPO minibatch count"));
@@ -238,7 +238,6 @@ impl PolicyModel {
             adam,
             (config, crate::UpdateObjective::default()),
             microbatch,
-            #[cfg(test)]
             faults,
         )
     }

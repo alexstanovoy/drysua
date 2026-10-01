@@ -14,16 +14,16 @@ const _: () = assert!(MAX_TRAINING_COUNTER < u64::MAX);
 const _: () =
     assert!(MAX_TRAINING_COUNTER as u128 * EnvironmentDecimal::SCALE as u128 <= u64::MAX as u128);
 
-/// Nonnegative exact millionths; semantic rate and extension bounds belong to config validation.
-/// Text accepts at most 27 ASCII bytes, an optional leading integer, and one to six digits
-/// after a decimal point. Signs, whitespace, exponents, and a trailing point are rejected.
+/// Unsigned fixed-point decimal in millionths; rate and extension bounds are checked by config
+/// validation. Text is at most 27 ASCII bytes with up to six fractional digits; signs,
+/// whitespace, exponents, and a trailing point are rejected.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct EnvironmentDecimal(u64);
 
 impl EnvironmentDecimal {
     pub const SCALE: u64 = 1_000_000;
 
-    /// Decodes raw millionths without imposing config-specific bounds.
+    /// Raw millionths; no config bounds are applied.
     pub const fn from_units(units: u64) -> Self {
         Self(units)
     }
@@ -157,7 +157,7 @@ impl AdaptiveEnvironmentConfig {
         Ok(self)
     }
 
-    /// Appends canonical flags, including the separating leading space, without validation.
+    /// Appends the scope flags, including the leading separator space; does not validate.
     pub fn append_scope(&self, scope: &mut String) {
         scope.push_str(&self.scope_suffix());
     }
@@ -184,13 +184,8 @@ pub enum EnvironmentSchedule {
     Adaptive(AdaptiveEnvironmentConfig),
 }
 
-impl Default for EnvironmentSchedule {
-    fn default() -> Self {
-        Self::Adaptive(AdaptiveEnvironmentConfig::default())
-    }
-}
-
-/// Numeric training limits, independent of any arbitrary environment-duration cap.
+/// Update counts: per-generation base budget, run length, and the trailing zero-randomization
+/// phase.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AdaptiveEnvironmentLimits {
     pub base_updates: u64,
@@ -220,7 +215,7 @@ impl AdaptiveEnvironmentLimits {
     }
 }
 
-/// Transactional controller state; no game history or window averages are retained.
+/// Controller state. Only streak counters are kept; no game history or window averages.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AdaptiveEnvironmentState {
     pub generation: u64,
@@ -232,9 +227,10 @@ pub struct AdaptiveEnvironmentState {
 }
 
 impl AdaptiveEnvironmentState {
-    /// Stages one complete PPO update. Publish the candidate only after PPO succeeds.
-    /// Success and forced boundaries discard credit; otherwise awards precede exhaustion.
-    /// The final update retains counters and never creates a next environment.
+    /// Returns the state after `completed_update`; publish it only after PPO succeeds.
+    /// Advancing on a success streak or the zero-phase boundary discards extension credit;
+    /// otherwise a poor-streak award is added before the budget-exhaustion check.
+    /// The final update keeps its counters and never advances to a next generation.
     pub fn observe(
         &self,
         config: AdaptiveEnvironmentConfig,

@@ -46,7 +46,8 @@ impl LiveConfig {
 
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct UpdateTiming {
-    /// Internal elapsed work, including decode when socket-read timing is available; not CPU time.
+    /// Handler wall time minus the order and ack sends, including decode when
+    /// socket-read timing is available; not CPU time.
     pub(crate) compute: Duration,
     pub(crate) receive_wait: Duration,
     /// Subset of compute; excludes the order-send call.

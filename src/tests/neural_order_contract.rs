@@ -167,9 +167,9 @@ fn assert_training_trace(
         }
         if scenario == Scenario::OwnCast && view.tick >= 4 {
             assert_eq!(
-                probe.legacy_persistence().active_body_order_for(None),
+                probe.request_persistence().active_body_order_for(None),
                 None,
-                "Teacher shadow stays legacy"
+                "the request ledger keeps no body order after the cast"
             );
         }
     }

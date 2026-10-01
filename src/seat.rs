@@ -7,8 +7,8 @@ use crate::telemetry::{
     SystemClock, UpdateBoundary,
 };
 use crate::{
-    ActionSpace, ActiveOrderUpdate, ActivePolicyOrder, FeatureEncoder, FeatureFrame, ItemReadiness,
-    Link, LocalPolicyState, OrderPersistence, PolicyModel, SHADOW_FIEND, ScriptKind,
+    ActionSpace, ActiveOrderUpdate, ActivePolicyOrder, FeatureEncoder, FeatureFrame, IssuedOrder,
+    ItemReadiness, Link, LocalPolicyState, OrderPersistence, PolicyModel, SHADOW_FIEND, ScriptKind,
     ScriptedPolicy, Seated, StateTracker, StructuredAction, TrainingArtifact, Wire,
     active_order_update_for_sent, record_sent_for_policy,
 };
@@ -67,7 +67,7 @@ impl LiveController<'_> {
     }
 }
 
-/// Connects and runs a deterministic rule policy on any supported map without weights.
+/// Connects and plays a deterministic rule policy.
 pub fn play_script(
     kind: ScriptKind,
     address: &str,
@@ -78,7 +78,7 @@ pub fn play_script(
     play_script_on(&mut link, seated, limit, kind)
 }
 
-/// Runs a deterministic rule policy on an assigned match connection without a model.
+/// Plays a deterministic rule policy on an assigned match connection.
 pub fn play_script_on(
     wire: &mut impl Wire,
     seated: Seated,
@@ -88,7 +88,7 @@ pub fn play_script_on(
     play_controller_on(wire, seated, limit, LiveController::Script(kind))
 }
 
-/// Loads required runtime weights before connecting; never constructs or invokes a rule policy.
+/// Loads runtime weights, then connects and plays greedy neural inference.
 pub fn play_neural(
     address: &str,
     name: &str,
@@ -102,7 +102,7 @@ pub fn play_neural(
     play_neural_on(&mut link, seated, limit, &model)
 }
 
-/// Runs pure greedy neural inference with legality masking on every supported map.
+/// Plays greedy neural inference over legal actions on an assigned match connection.
 pub fn play_neural_on(
     wire: &mut impl Wire,
     seated: Seated,
@@ -355,65 +355,6 @@ fn record_rejection(outcome: &mut Outcome, reason: RejectReason) -> std::io::Res
     Ok(())
 }
 
-/// Follows the explicit Continue policy for protocol-only tests.
-pub fn play_idle_on(
-    wire: &mut impl Wire,
-    seated: Seated,
-    limit: Option<u32>,
-) -> std::io::Result<Outcome> {
-    let mut outcome = Outcome {
-        slot: Some(seated.slot),
-        ..Outcome::default()
-    };
-    let mut progress = MessageProgress::new();
-    for _ in 0..MAX_MATCH_MESSAGES {
-        let Some(message) = wire.hear()? else {
-            return Err(std::io::Error::other(
-                "server closed the connection before MatchOver",
-            ));
-        };
-        progress.observe(&message)?;
-        match message {
-            ServerMsg::MatchStart { info } => {
-                validate_match_terms(info.tick_rate, info.mode, seated)?;
-                outcome.team = Some(validate_pick(&info.picks, seated.slot)?);
-            }
-            ServerMsg::Snapshot { view } => {
-                validate_snapshot(&outcome, view.viewer, view.tick)?;
-                outcome.ticks = view.tick;
-                if seated.mode == TickMode::Lockstep {
-                    wire.acknowledge(view.tick)?;
-                }
-                if limit.is_some_and(|last_tick| view.tick >= last_tick) {
-                    return Ok(outcome);
-                }
-            }
-            ServerMsg::OrderRejected { reason, .. } => {
-                outcome.rejections = outcome
-                    .rejections
-                    .checked_add(1)
-                    .ok_or_else(|| std::io::Error::other("order rejection count overflowed"))?;
-                outcome.last_rejection = Some(reason);
-            }
-            ServerMsg::MatchOver { winner, .. } => {
-                if outcome.team.is_none() {
-                    return Err(std::io::Error::other(
-                        "server sent MatchOver before MatchStart",
-                    ));
-                }
-                outcome.winner = Some(winner);
-                return Ok(outcome);
-            }
-            ServerMsg::Welcome { .. }
-            | ServerMsg::LobbyState { .. }
-            | ServerMsg::Events { .. }
-            | ServerMsg::Orders { .. }
-            | ServerMsg::ParticipantLeft { .. } => {}
-        }
-    }
-    Err(std::io::Error::other("server match message limit exceeded"))
-}
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct MessageProgress {
     without_snapshot: usize,
@@ -614,26 +555,39 @@ impl LivePolicy {
         } else {
             active_order_update_for_sent(persistence, issued.unit, sequence, kind)
         };
+        self.apply_active_update(space.tick(), (sequence, issued), update, previous)?;
+        outcome.orders = outcome
+            .orders
+            .checked_add(1)
+            .ok_or_else(|| std::io::Error::other("policy order count overflowed"))?;
+        Ok(())
+    }
+
+    /// Mirrors a sent order into the local active order; the replaced order stays
+    /// pending so a rejection of `sequence` can restore it.
+    fn apply_active_update(
+        &mut self,
+        tick: u32,
+        (sequence, issued): (u32, IssuedOrder),
+        update: ActiveOrderUpdate,
+        previous: Option<ActivePolicyOrder>,
+    ) -> std::io::Result<()> {
         self.pending_active = match update {
             ActiveOrderUpdate::Preserve => self.pending_active,
             ActiveOrderUpdate::Replace(None) if previous.is_none() => None,
             ActiveOrderUpdate::Replace(None) => {
                 self.local
-                    .set_active_order(space.tick(), None)
+                    .set_active_order(tick, None)
                     .map_err(std::io::Error::other)?;
                 Some((sequence, previous))
             }
             ActiveOrderUpdate::Replace(Some(kind)) => {
                 self.local
-                    .set_active_order_from_issued(space.tick(), kind, issued)
+                    .set_active_order_from_issued(tick, kind, issued)
                     .map_err(std::io::Error::other)?;
                 Some((sequence, previous))
             }
         };
-        outcome.orders = outcome
-            .orders
-            .checked_add(1)
-            .ok_or_else(|| std::io::Error::other("policy order count overflowed"))?;
         Ok(())
     }
 

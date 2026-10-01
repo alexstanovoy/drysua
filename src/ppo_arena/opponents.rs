@@ -2,8 +2,8 @@
 //! prioritized fictitious self-play (PFSP) weights.
 //!
 //! Every published update gets its own per-game mixture. Its entries are the
-//! configured opponents plus, with a league, the `size` latest runtime-history
-//! milestones of this run. Under PFSP each entry's configured weight is scaled
+//! configured opponents plus, with a league, the `size` latest league snapshots
+//! of this run. Under PFSP each entry's configured weight is scaled
 //! by `(1 - p)^2`, at least 1/10, where `p` is the Laplace-smoothed score (win 1, draw 1/2)
 //! of the learner's last [`PFSP_WINDOW`] games against it. Weights are exact
 //! integers computed from logged outcomes of updates every lane has finished,
@@ -20,11 +20,11 @@ use crate::{PpoError, PpoTerminalOutcome};
 
 /// Games per opponent that form its PFSP win rate.
 pub(crate) const PFSP_WINDOW: usize = 100;
-/// Every opponent keeps at least this fraction (one over it) of its configured
+/// Every opponent keeps at least 1/`PFSP_FLOOR_DIVISOR` of its configured
 /// weight: an update still plays the styles the learner already beats, so it
 /// cannot overfit to the hardest one and forget the rest.
 const PFSP_FLOOR_DIVISOR: u64 = 10;
-/// Most league milestones playing at once.
+/// Most league snapshots playing at once.
 pub(crate) const MAX_LEAGUE_SIZE: usize = 16;
 /// Most entries of one update's mixture: configured opponents plus the league.
 pub(crate) const MAX_MIXTURE_ENTRIES: usize = 16 + MAX_LEAGUE_SIZE;
@@ -34,7 +34,7 @@ pub(crate) const MAX_MIXTURE_ENTRIES: usize = 16 + MAX_LEAGUE_SIZE;
 pub enum OpponentSchedule {
     /// Configured weights, unchanged.
     Fixed,
-    /// Configured weights times `(1 - smoothed win rate)^2`.
+    /// Configured weights times `(1 - smoothed win rate)^2`, floored at a tenth.
     Pfsp,
 }
 
@@ -47,18 +47,18 @@ impl OpponentSchedule {
     }
 }
 
-/// This run's own milestone snapshots as opponents.
+/// This run's own league snapshots as opponents.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct League {
     /// Configured weight of each member, in mixture units.
     pub(crate) weight: u64,
     pub(crate) size: usize,
-    /// Milestone spacing of the runtime history.
+    /// Updates between league snapshots.
     pub(crate) every: u64,
 }
 
 impl League {
-    /// Milestones playing update `update`, oldest first: the `size` latest at
+    /// Snapshots playing update `update`, oldest first: the `size` latest at
     /// or below `update - 1`, whose weights exist when `update` is published.
     pub(crate) fn members(&self, update: u64) -> Vec<u64> {
         assert!((1..=MAX_LEAGUE_SIZE).contains(&self.size));

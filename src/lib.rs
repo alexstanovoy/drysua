@@ -8,6 +8,8 @@ mod behavioral_target;
 mod checkpoint;
 mod cli;
 mod default_deployment;
+#[cfg(any(feature = "builtin", test))]
+mod durability;
 mod feature;
 mod hero;
 mod link;

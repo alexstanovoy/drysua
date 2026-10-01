@@ -50,23 +50,14 @@ impl RuntimeHistory {
         TrainingArtifact::save_runtime_weights(model, &staging)
             .map_err(|error| PpoError::Model(format!("runtime history export: {error}")))?;
         std::fs::rename(&staging, &target).map_err(|error| history_error(&target, error))?;
-        sync_directory(&self.directory)?;
+        crate::durability::sync_directory(&self.directory)
+            .map_err(|error| history_error(&self.directory, error))?;
         crate::telemetry::log_line!(
             "level=INFO event=runtime_history_export update={update} path={}",
             target.display()
         );
         Ok(())
     }
-}
-
-fn sync_directory(directory: &Path) -> Result<(), PpoError> {
-    #[cfg(unix)]
-    std::fs::File::open(directory)
-        .and_then(|file| file.sync_all())
-        .map_err(|error| history_error(directory, error))?;
-    #[cfg(not(unix))]
-    let _ = directory;
-    Ok(())
 }
 
 fn history_error(path: &Path, error: std::io::Error) -> PpoError {

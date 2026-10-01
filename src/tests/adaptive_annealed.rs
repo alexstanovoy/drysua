@@ -136,32 +136,44 @@ fn clean_boundary_at_update_six_discards_a_long_extension_before_nominal_collect
 }
 
 #[test]
-fn every_adaptive_parameter_mismatch_rejects_before_mutating_the_training_tree() {
+fn adaptive_parameter_or_future_outcome_changes_reject_before_mutating_the_training_tree() {
     let directory = test_directory("adaptive-config-mismatch");
     let config = adaptive_settings();
     let fixture = outcome_harness(&[0, 0, 1, 1, 1, 1, 1, 1]);
     run_to(&config, fixture, &directory, 1, false);
     let before = tree_snapshot(&directory);
-    for (field, flag) in [
-        (0, "--environment-success-updates"),
-        (1, "--environment-success-rate"),
-        (2, "--environment-poor-updates"),
-        (3, "--environment-poor-rate"),
-        (4, "--environment-extension"),
-    ] {
-        let mut changed = config.clone();
-        let mut adaptive = AdaptiveEnvironmentConfig::default();
-        match field {
-            0 => adaptive.success_updates = 3,
-            1 => adaptive.success_rate = EnvironmentDecimal::from_units(900_000),
-            2 => adaptive.poor_updates = 2,
-            3 => adaptive.poor_rate = EnvironmentDecimal::from_units(100_000),
-            4 => adaptive.extension = EnvironmentDecimal::from_units(500_000),
-            _ => unreachable!("five bounded parameters"),
-        }
-        changed.environment_schedule = EnvironmentSchedule::Adaptive(adaptive);
-        let message = run_with(changed, fixture, &directory, true)
-            .expect_err("changed adaptive parameter")
+    type Change = fn(&mut AdaptiveEnvironmentConfig);
+    let changes: [(Change, &str); 5] = [
+        (|c| c.success_updates = 3, "--environment-success-updates"),
+        (
+            |c| c.success_rate = EnvironmentDecimal::from_units(900_000),
+            "--environment-success-rate",
+        ),
+        (|c| c.poor_updates = 2, "--environment-poor-updates"),
+        (
+            |c| c.poor_rate = EnvironmentDecimal::from_units(100_000),
+            "--environment-poor-rate",
+        ),
+        (
+            |c| c.extension = EnvironmentDecimal::from_units(500_000),
+            "--environment-extension",
+        ),
+    ];
+    let mut cases: Vec<_> = changes
+        .into_iter()
+        .map(|(change, flag)| {
+            let mut adaptive = AdaptiveEnvironmentConfig::default();
+            change(&mut adaptive);
+            let mut changed = config.clone();
+            changed.environment_schedule = EnvironmentSchedule::Adaptive(adaptive);
+            (changed, fixture, flag)
+        })
+        .collect();
+    let future = outcome_harness(&[0, 0, 1, 1, 1, 1, 1, 2]);
+    cases.push((config.clone(), future, "--test-adaptive-wins"));
+    for (changed, changed_fixture, flag) in cases {
+        let message = run_with(changed, changed_fixture, &directory, true)
+            .expect_err("changed adaptive scope")
             .to_string();
         assert!(
             message.starts_with("checkpoint scope mismatch:"),
@@ -203,32 +215,6 @@ fn fixed_and_adaptive_cross_resume_rejects_without_mutating_either_training_tree
         );
         assert_eq!(tree_snapshot(&directory), before);
     }
-}
-
-#[test]
-fn outcome_fixture_scope_binds_future_results_not_only_the_committed_prefix() {
-    let directory = test_directory("adaptive-outcome-scope");
-    let config = adaptive_settings();
-    run_to(
-        &config,
-        outcome_harness(&[0, 0, 1, 1, 1, 1, 1, 1]),
-        &directory,
-        1,
-        false,
-    );
-    let before = tree_snapshot(&directory);
-    let error = run_with(
-        config,
-        outcome_harness(&[0, 0, 1, 1, 1, 1, 1, 2]),
-        &directory,
-        true,
-    )
-    .expect_err("changed future fixture outcome");
-    assert!(
-        error.to_string().starts_with("checkpoint scope mismatch:"),
-        "{error}"
-    );
-    assert_eq!(tree_snapshot(&directory), before);
 }
 
 #[test]
@@ -347,9 +333,6 @@ fn cuda_side_actors_update_both_heads_and_resume_exactly() {
     assert!(
         changed(1_891_700..crate::MODEL_PARAMETER_COUNT),
         "Dire actor must train"
-    );
-    eprintln!(
-        "side-actor-native parameters=1878775 tensors=88 slots=4 lanes=2 microbatch=256 both_actor_heads_changed=true exact_model_adam_rng_controller_snapshots_resume=true"
     );
 }
 

@@ -132,7 +132,8 @@ pub(crate) fn read_message(input: &mut impl Read) -> io::Result<Option<ServerMsg
         .read_exact(&mut payload)
         .map_err(|_| invalid("truncated observer frame payload"))?;
     let message: ServerMsg = bota_proto::decode_payload(&payload).map_err(io::Error::other)?;
-    // The codec accepts a postcard value; require the entire canonical payload as well.
+    // The decoder can ignore trailing bytes or accept non-canonical encodings, so require the
+    // payload to re-encode byte for byte.
     let canonical = bota_proto::encode_frame_to_vec(&message).map_err(io::Error::other)?;
     if canonical[bota_proto::LEN_PREFIX..] != payload {
         return Err(invalid("noncanonical or trailing observer payload"));

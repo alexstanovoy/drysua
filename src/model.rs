@@ -18,7 +18,7 @@ mod sampling;
 mod side_actors;
 pub use device_learner::MODEL_PPO_MAX_MICROBATCH;
 pub(crate) use device_learner::StagedPpoBatch;
-pub use rows::{ENCODER_ROW_ELEMENTS, EncoderRow};
+pub use rows::EncoderRow;
 #[cfg(test)]
 pub(crate) use side_actors::take_encoder_forwards_for_test;
 use side_actors::{ActorHead, ActorRouting, QueuedPair, StageRequest, StageValues};
@@ -41,26 +41,24 @@ use crate::{
     ITEM_FEATURE_TOKENS, ITEM_FEATURES, LOOT_FEATURE_TOKENS, LOOT_FEATURES, LootIndex,
     MAP_FEATURES, MAX_POLICY_HISTORY, OWN_UNIT_FEATURE_TOKENS, POINT_FEATURE_TOKENS,
     POINT_FEATURES, POLICY_HISTORY_FEATURES, PROJECTILE_FEATURE_TOKENS, PROJECTILE_FEATURES,
-    PointIndex, PpoConfig, PpoMinibatchReport, PpoPolicyChoice, PpoPreparedSample, PpoRng,
-    PutPointTarget, REMEMBERED_UNIT_FEATURE_TOKENS, ShopIndex, StructuredAction,
-    UNIT_FEATURE_TOKENS, UNIT_FEATURES, ability_feature, item_feature, loot_feature, point_feature,
-    projectile_feature, unit_feature,
+    PointIndex, PpoConfig, PpoMinibatchReport, PpoPreparedSample, PpoRng, PutPointTarget,
+    REMEMBERED_UNIT_FEATURE_TOKENS, ShopIndex, StructuredAction, UNIT_FEATURE_TOKENS,
+    UNIT_FEATURES, ability_feature, item_feature, loot_feature, point_feature, projectile_feature,
+    unit_feature,
 };
 
-/// Version of the fixed policy-model layout and linked candidate execution contract.
+/// Version of the policy-model layout.
 pub const MODEL_SCHEMA_VERSION: u32 = 27;
 /// Maximum frame count accepted by one public batch call.
 pub const MODEL_MAX_BATCH: usize = 8_192;
-/// Frame count evaluated by one bounded host inference tensor graph.
-pub const MODEL_EVALUATION_MICROBATCH: usize = 64;
-/// Maximum frame count in one autograd-preserving tensor forward pass.
+/// Maximum rows in one training forward pass.
 pub const MODEL_TRAINING_BATCH: usize = 64;
 /// Maximum rows in one sampling or greedy selection call.
 pub const MODEL_SAMPLING_BATCH: usize = 128;
 const _: () = assert!(MODEL_SAMPLING_BATCH <= MODEL_PPO_MAX_MICROBATCH);
 const _: () = assert!(MODEL_TRAINING_BATCH <= MODEL_PPO_MAX_MICROBATCH);
 const _: () = assert!(MODEL_PPO_MAX_MICROBATCH <= MODEL_MAX_BATCH);
-/// Number of append-only action-kind logits.
+/// Number of action-kind logits.
 pub const MODEL_KIND_HEAD: usize = 16;
 /// Number of controlled-unit logits.
 pub const MODEL_UNIT_HEAD: usize = 2;
@@ -82,7 +80,7 @@ pub const MODEL_ENTITY_POINTER_HEAD: usize = 96;
 pub const MODEL_POINT_POINTER_HEAD: usize = 64;
 /// Maximum checked Adam optimizer step.
 pub const MODEL_MAX_OPTIMIZER_STEP: u64 = 1_000_000_000;
-/// Number of behavioral heads represented in update activity counts.
+/// Number of policy heads that carry per-action labels.
 pub const MODEL_BEHAVIORAL_HEADS: usize = 12;
 
 const UNIT_HIDDEN: usize = 64;
@@ -286,14 +284,6 @@ pub enum ModelError {
         maximum: usize,
     },
     EmptyTrainingBatch,
-    TrainingBatchTooLarge {
-        count: usize,
-        maximum: usize,
-    },
-    TrainingPrefixCount {
-        prefixes: usize,
-        frames: usize,
-    },
     BatchActionSpaceCount {
         action_spaces: usize,
         frames: usize,
@@ -324,13 +314,6 @@ pub enum ModelError {
         head: &'static str,
         label: usize,
     },
-    BehavioralExampleCount {
-        count: usize,
-        maximum: usize,
-    },
-    NonTrainingExample {
-        index: usize,
-    },
     InvalidAdamConfig(&'static str),
     OptimizerVectorLength {
         field: &'static str,
@@ -339,9 +322,6 @@ pub enum ModelError {
     },
     OptimizerStepOverflow,
     NonFiniteLoss,
-    NonFiniteGradient {
-        index: usize,
-    },
     NonFiniteMoment {
         field: &'static str,
         index: usize,
@@ -365,7 +345,6 @@ pub enum ModelError {
         index: usize,
     },
     FrameActionSpaceMismatch,
-    TrainingOutputModelMismatch,
     OptimizerAlreadyOwned,
     OptimizerOwnershipMismatch,
     ModelLineageUnavailable,
@@ -385,8 +364,6 @@ impl fmt::Display for ModelError {
             Self::EmptyBatch
             | Self::BatchTooLarge { .. }
             | Self::EmptyTrainingBatch
-            | Self::TrainingBatchTooLarge { .. }
-            | Self::TrainingPrefixCount { .. }
             | Self::BatchActionSpaceCount { .. }
             | Self::SamplingRngCount { .. }
             | Self::BatchFrameActionSpaceMismatch { .. }
@@ -394,14 +371,11 @@ impl fmt::Display for ModelError {
             | Self::NonFiniteFrame { .. }
             | Self::ParameterLength { .. }
             | Self::NonFiniteParameter { .. }
-            | Self::BehavioralTarget { .. }
-            | Self::BehavioralExampleCount { .. }
-            | Self::NonTrainingExample { .. } => self.fmt_input(formatter),
+            | Self::BehavioralTarget { .. } => self.fmt_input(formatter),
             Self::InvalidAdamConfig(_)
             | Self::OptimizerVectorLength { .. }
             | Self::OptimizerStepOverflow
             | Self::NonFiniteLoss
-            | Self::NonFiniteGradient { .. }
             | Self::NonFiniteMoment { .. }
             | Self::NonFiniteOptimizerNorm
             | Self::NonFiniteOptimizerUpdate { .. } => self.fmt_optimizer(formatter),
@@ -421,14 +395,6 @@ impl ModelError {
             Self::EmptyTrainingBatch => {
                 formatter.write_str("model training batch must contain at least one frame")
             }
-            Self::TrainingBatchTooLarge { count, maximum } => write!(
-                formatter,
-                "model training batch count {count} exceeds maximum {maximum}"
-            ),
-            Self::TrainingPrefixCount { prefixes, frames } => write!(
-                formatter,
-                "model training prefix count {prefixes} differs from frame count {frames}"
-            ),
             Self::BatchActionSpaceCount {
                 action_spaces,
                 frames,
@@ -466,16 +432,6 @@ impl ModelError {
                 formatter,
                 "model behavioral target label {label} is illegal for head {head}"
             ),
-            Self::BehavioralExampleCount { count, maximum } => write!(
-                formatter,
-                "model behavioral example count {count} is outside 1..={maximum}"
-            ),
-            Self::NonTrainingExample { index } => {
-                write!(
-                    formatter,
-                    "model behavioral training example {index} is not Train"
-                )
-            }
             _ => self.fmt_runtime(formatter),
         }
     }
@@ -495,9 +451,6 @@ impl ModelError {
                 formatter.write_str("model Adam step exceeds its maximum")
             }
             Self::NonFiniteLoss => formatter.write_str("model behavioral loss is non-finite"),
-            Self::NonFiniteGradient { index } => {
-                write!(formatter, "model gradient {index} is non-finite")
-            }
             Self::NonFiniteMoment { field, index } => {
                 write!(formatter, "model Adam {field} moment {index} is non-finite")
             }
@@ -544,9 +497,6 @@ impl ModelError {
             ),
             Self::FrameActionSpaceMismatch => formatter
                 .write_str("model feature frame does not belong to the supplied action space"),
-            Self::TrainingOutputModelMismatch => {
-                formatter.write_str("model training output belongs to a different policy model")
-            }
             Self::OptimizerAlreadyOwned => {
                 formatter.write_str("model already has a behavioral optimizer owner")
             }
@@ -582,22 +532,6 @@ impl From<candle_core::Error> for ModelError {
     }
 }
 
-/// Public value and append-only action-kind logits for one frame.
-#[derive(Clone, Debug, PartialEq)]
-pub struct PolicyOutput {
-    /// Unbounded scalar state-value prediction.
-    pub value: f32,
-    /// Logits in append-only [`ActionKind`] order.
-    pub kind_logits: [f32; MODEL_KIND_HEAD],
-}
-
-impl PolicyOutput {
-    /// Whether the value and every action-kind logit are finite.
-    pub fn is_finite(&self) -> bool {
-        self.value.is_finite() && self.kind_logits.iter().all(|value| value.is_finite())
-    }
-}
-
 /// Greedy legal structured action paired with its state value.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PolicyChoice {
@@ -612,16 +546,6 @@ pub struct PolicyChoice {
 pub struct PolicyIdentity {
     lineage: NonZeroU64,
     revision: u64,
-}
-
-impl PolicyIdentity {
-    pub const fn lineage(self) -> NonZeroU64 {
-        self.lineage
-    }
-
-    pub const fn revision(self) -> u64 {
-        self.revision
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -786,17 +710,6 @@ fn moments_pass(flags: &[f32]) -> bool {
     flags.iter().all(|value| value.is_finite()) && flags[2] >= 0.0
 }
 
-/// Pre-update behavioral loss and optimizer diagnostics for one effective batch.
-#[derive(Clone, Debug, PartialEq)]
-pub struct ModelUpdateReport {
-    pub average_loss: f64,
-    pub active_head_counts: [usize; MODEL_BEHAVIORAL_HEADS],
-    pub unclipped_norm: f64,
-    pub applied_scale: f64,
-    pub sample_count: usize,
-    pub optimizer_step: u64,
-}
-
 /// Valid zero-based ability slot selected in one training prefix.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TrainingAbilitySlot(u8);
@@ -850,7 +763,7 @@ pub enum TrainingSlot {
     Item(TrainingItemSlot),
 }
 
-/// Teacher-selected autoregressive prefix for one training frame.
+/// Decoder prefix of one labeled action: its kind, controlled unit and slot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TrainingPrefix {
     kind: ActionKind,
@@ -859,7 +772,6 @@ pub struct TrainingPrefix {
 }
 
 impl TrainingPrefix {
-    /// Builds one bounded kind, controlled-unit, and family-slot prefix.
     pub const fn new(
         kind: ActionKind,
         unit: Option<ControlledUnit>,
@@ -868,7 +780,7 @@ impl TrainingPrefix {
         Self { kind, unit, slot }
     }
 
-    /// Top-level action family used by this teacher-forced prefix.
+    /// Top-level action family.
     pub const fn kind(self) -> ActionKind {
         self.kind
     }
@@ -899,189 +811,6 @@ struct PolicyTensorTensors {
     put_mode: Tensor,
     entity_pointer: Tensor,
     point_pointer: Tensor,
-}
-
-/// Autograd-preserving output holding one complete parameter read session.
-pub struct PolicyTensorOutput<'model> {
-    model_identity: usize,
-    tensors: PolicyTensorTensors,
-    _parameter_guard: RwLockReadGuard<'model, ()>,
-}
-
-impl fmt::Debug for PolicyTensorOutput<'_> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("PolicyTensorOutput")
-            .field("shapes", &self.shapes())
-            .finish_non_exhaustive()
-    }
-}
-
-/// Exact tensor dimensions returned by [`PolicyModel::training_forward`].
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PolicyTensorShapes {
-    /// State-value tensor dimensions.
-    pub value: Vec<usize>,
-    /// Action-kind tensor dimensions.
-    pub kind: Vec<usize>,
-    /// Controlled-unit tensor dimensions.
-    pub controlled: Vec<usize>,
-    /// Ability-slot tensor dimensions.
-    pub ability: Vec<usize>,
-    /// Item-slot tensor dimensions.
-    pub item: Vec<usize>,
-    /// Swap-destination tensor dimensions.
-    pub swap: Vec<usize>,
-    /// Learn-slot tensor dimensions.
-    pub learn: Vec<usize>,
-    /// Shop tensor dimensions.
-    pub shop: Vec<usize>,
-    /// Loot tensor dimensions.
-    pub loot: Vec<usize>,
-    /// Target-mode tensor dimensions.
-    pub target_mode: Vec<usize>,
-    /// Put-mode tensor dimensions.
-    pub put_mode: Vec<usize>,
-    /// Entity-pointer tensor dimensions.
-    pub entity_pointer: Vec<usize>,
-    /// Point-pointer tensor dimensions.
-    pub point_pointer: Vec<usize>,
-}
-
-impl PolicyTensorOutput<'_> {
-    /// Shape `[batch, 1]` state values.
-    pub const fn value(&self) -> &Tensor {
-        &self.tensors.value
-    }
-
-    /// Shape `[batch, 16]` action-kind logits.
-    pub const fn kind(&self) -> &Tensor {
-        &self.tensors.kind
-    }
-
-    /// Shape `[batch, 2]` controlled-unit logits.
-    pub const fn controlled(&self) -> &Tensor {
-        &self.tensors.controlled
-    }
-
-    /// Shape `[batch, 8]` ability-slot logits.
-    pub const fn ability(&self) -> &Tensor {
-        &self.tensors.ability
-    }
-
-    /// Shape `[batch, 15]` item or source-slot logits.
-    pub const fn item(&self) -> &Tensor {
-        &self.tensors.item
-    }
-
-    /// Shape `[batch, 15]` swap-destination logits.
-    pub const fn swap(&self) -> &Tensor {
-        &self.tensors.swap
-    }
-
-    /// Shape `[batch, 6]` learn-slot logits.
-    pub const fn learn(&self) -> &Tensor {
-        &self.tensors.learn
-    }
-
-    /// Shape `[batch, 64]` shop logits.
-    pub const fn shop(&self) -> &Tensor {
-        &self.tensors.shop
-    }
-
-    /// Shape `[batch, 16]` loot logits.
-    pub const fn loot(&self) -> &Tensor {
-        &self.tensors.loot
-    }
-
-    /// Shape `[batch, 3]` None, Entity, and Point mode logits.
-    pub const fn target_mode(&self) -> &Tensor {
-        &self.tensors.target_mode
-    }
-
-    /// Shape `[batch, 2]` Underfoot and Point mode logits.
-    pub const fn put_mode(&self) -> &Tensor {
-        &self.tensors.put_mode
-    }
-
-    /// Shape `[batch, 96]` current-unit pointer logits.
-    pub const fn entity_pointer(&self) -> &Tensor {
-        &self.tensors.entity_pointer
-    }
-
-    /// Shape `[batch, 64]` point-candidate pointer logits.
-    pub const fn point_pointer(&self) -> &Tensor {
-        &self.tensors.point_pointer
-    }
-
-    /// Returns every head shape without converting tensor values to host storage.
-    pub fn shapes(&self) -> PolicyTensorShapes {
-        PolicyTensorShapes {
-            value: self.value().dims().to_vec(),
-            kind: self.kind().dims().to_vec(),
-            controlled: self.controlled().dims().to_vec(),
-            ability: self.ability().dims().to_vec(),
-            item: self.item().dims().to_vec(),
-            swap: self.swap().dims().to_vec(),
-            learn: self.learn().dims().to_vec(),
-            shop: self.shop().dims().to_vec(),
-            loot: self.loot().dims().to_vec(),
-            target_mode: self.target_mode().dims().to_vec(),
-            put_mode: self.put_mode().dims().to_vec(),
-            entity_pointer: self.entity_pointer().dims().to_vec(),
-            point_pointer: self.point_pointer().dims().to_vec(),
-        }
-    }
-
-    /// Checks every tensor value while preserving the existing autograd graph.
-    pub fn validate_finite(&self) -> Result<(), ModelError> {
-        side_actors::validate_training(&self.tensors)
-    }
-
-    /// Sums all heads into one scalar graph-connected probe loss.
-    pub fn sum_all_heads(&self) -> Result<Tensor, ModelError> {
-        sum_training_tensors(&self.tensors)
-    }
-}
-
-/// One gradient in stable parameter export order.
-pub struct NamedPolicyGradient {
-    name: &'static str,
-    parameter_shape: Vec<usize>,
-    gradient: Option<Tensor>,
-}
-
-impl NamedPolicyGradient {
-    /// Stable parameter name covered by the model schema descriptor.
-    pub const fn name(&self) -> &'static str {
-        self.name
-    }
-
-    /// Parameter dimensions expected by an optimizer update.
-    pub fn parameter_shape(&self) -> &[usize] {
-        &self.parameter_shape
-    }
-
-    /// Read-only gradient tensor, absent when the loss did not use this parameter.
-    pub const fn gradient(&self) -> Option<&Tensor> {
-        self.gradient.as_ref()
-    }
-
-    /// Gradient dimensions, absent when the parameter was outside the loss graph.
-    pub fn gradient_shape(&self) -> Option<&[usize]> {
-        self.gradient.as_ref().map(Tensor::dims)
-    }
-}
-
-impl fmt::Debug for NamedPolicyGradient {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("NamedPolicyGradient")
-            .field("name", &self.name)
-            .field("parameter_shape", &self.parameter_shape)
-            .field("gradient_shape", &self.gradient_shape())
-            .finish()
-    }
 }
 
 struct Linear {
@@ -1330,8 +1059,8 @@ impl PolicyDevice {
 ///
 /// With event tracking on, cudarc creates and destroys two events for every
 /// allocation but consults them only in multi-stream mode, which a context
-/// that only uses candle's per-thread stream never enters. The events were
-/// about half of every learner and lane thread's CUDA API time.
+/// that only uses candle's per-thread stream never enters. They cost about half
+/// of every learner and lane thread's CUDA API time.
 #[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
 fn cuda_device(ordinal: usize) -> Result<Device, ModelError> {
     let device = Device::new_cuda(ordinal)?;
@@ -1395,12 +1124,12 @@ struct PpoTestFaults {
 }
 
 impl PolicyModel {
-    /// Constructs fixed parameters from one explicit deterministic seed.
+    /// Deterministic parameters from `seed` on the CPU.
     pub fn fresh(seed: u64) -> Result<Self, ModelError> {
         Self::fresh_on(seed, PolicyDevice::Cpu)
     }
 
-    /// Constructs deterministic parameters on one explicitly selected backend.
+    /// Deterministic parameters from `seed` on `device`.
     pub fn fresh_on(seed: u64, device: PolicyDevice) -> Result<Self, ModelError> {
         let tensor_device = device.candle()?;
         let mut generator = Initializer::new(seed);
@@ -1496,18 +1225,12 @@ impl PolicyModel {
         })
     }
 
-    /// Backend currently owning every parameter tensor.
     pub const fn device(&self) -> PolicyDevice {
         self.device_kind
     }
 
     fn tensor_device(&self) -> &Device {
         &self.tensor_device
-    }
-
-    /// Exact number of scalar F32 parameters.
-    pub const fn parameter_count(&self) -> usize {
-        MODEL_PARAMETER_COUNT
     }
 
     /// Returns the process-local lineage and exact current parameter revision.
@@ -1576,37 +1299,6 @@ impl PolicyModel {
         Ok(adam)
     }
 
-    /// Evaluates one frame without mutating model state.
-    pub fn evaluate(&self, frame: &FeatureFrame) -> Result<PolicyOutput, ModelError> {
-        let mut outputs = self.evaluate_batch(std::slice::from_ref(frame))?;
-        outputs
-            .pop()
-            .ok_or(ModelError::InvalidModelState("single-frame output"))
-    }
-
-    /// Evaluates a bounded nonempty batch in input order.
-    pub fn evaluate_batch(&self, frames: &[FeatureFrame]) -> Result<Vec<PolicyOutput>, ModelError> {
-        validate_batch(frames)?;
-        let _guard = self.read_parameter_lock()?;
-        let mut output = Vec::with_capacity(frames.len());
-        for (chunk_index, chunk) in frames.chunks(MODEL_EVALUATION_MICROBATCH).enumerate() {
-            let offset = chunk_index * MODEL_EVALUATION_MICROBATCH;
-            output.extend(self.evaluate_chunk(chunk, offset)?);
-        }
-        Ok(output)
-    }
-
-    fn evaluate_chunk(
-        &self,
-        frames: &[FeatureFrame],
-        batch_offset: usize,
-    ) -> Result<Vec<PolicyOutput>, ModelError> {
-        let routing = ActorRouting::new(frames, self.tensor_device(), false)?;
-        let state = self.forward_frames(frames)?;
-        let base = self.base_logits(&state, &routing, batch_offset)?;
-        collect_outputs(base.value, base.kind, batch_offset)
-    }
-
     /// Selects one greedy legal structured action and returns its state value.
     pub fn choose(
         &self,
@@ -1673,86 +1365,25 @@ impl PolicyModel {
             .collect())
     }
 
-    /// Samples one legal autoregressive action and records exact old-policy statistics.
-    pub fn sample(
-        &self,
-        frame: &FeatureFrame,
-        space: &ActionSpace,
-        rng: &mut PpoRng,
-    ) -> Result<PpoPolicyChoice, ModelError> {
-        if !frame.matches_action_space(space) {
-            return Err(ModelError::FrameActionSpaceMismatch);
-        }
-        validate_batch(std::slice::from_ref(frame))?;
-        let _guard = self.read_parameter_lock()?;
-        let routing = ActorRouting::new(std::slice::from_ref(frame), self.tensor_device(), false)?;
-        let state = self.forward_frames(std::slice::from_ref(frame))?;
-        let value = self
-            .value
-            .forward(&state.trunk)?
-            .flatten_all()?
-            .to_vec1::<f32>()?[0];
-        validate_value_rows(std::slice::from_ref(&value), 0)?;
-        let mut source = ModelDecoder {
-            model: self,
-            state,
-            routing,
-            rng: Some(rng),
-            observed: Some(SampledPathLogits::default()),
-        };
-        let action = decode_from_source(space, &mut source)?;
-        let target = BehavioralTarget::from_action(frame, space, action)
-            .map_err(|error| ModelError::Backend(error.to_string()))?;
-        let (log_probability, entropy) = source
-            .observed
-            .as_ref()
-            .ok_or(ModelError::InvalidModelState("sampled path logits"))?
-            .statistics(&target)?;
-        Ok(PpoPolicyChoice {
-            frame: frame.clone(),
-            target,
-            action,
-            policy: self.policy_identity_locked(),
-            log_probability,
-            entropy,
-            value,
-        })
-    }
-
-    /// Samples at most [`MODEL_SAMPLING_BATCH`] rows with one transactional RNG per row.
-    pub fn sample_batch(
+    /// Samples one legal action per frame, each row drawing from its own RNG.
+    pub fn sample_actions(
         &self,
         frames: &[FeatureFrame],
         action_spaces: &[ActionSpace],
         rngs: &mut [PpoRng],
-    ) -> Result<Vec<PpoPolicyChoice>, ModelError> {
+    ) -> Result<Vec<StructuredAction>, ModelError> {
         validate_policy_batch(frames, action_spaces)?;
         validate_sampling_rng_count(frames.len(), rngs.len())?;
         let rows = packed_rows(frames)?;
         let rows = rows.iter().collect::<Vec<_>>();
         let spaces = action_spaces.iter().collect::<Vec<_>>();
-        let statistics = vec![true; frames.len()];
+        let statistics = vec![false; frames.len()];
         let _guard = self.read_parameter_lock()?;
-        let policy = self.policy_identity_locked();
-        let sampled = self.sample_rows_locked(&rows, &spaces, rngs, &statistics)?;
-        sampled
+        Ok(self
+            .sample_rows_locked(&rows, &spaces, rngs, &statistics)?
             .into_iter()
-            .zip(frames)
-            .map(|(row, frame)| {
-                let statistics = row
-                    .statistics
-                    .ok_or(ModelError::InvalidModelState("sampled row statistics"))?;
-                Ok(PpoPolicyChoice {
-                    frame: frame.clone(),
-                    target: statistics.target,
-                    action: row.action,
-                    policy,
-                    log_probability: statistics.log_probability,
-                    entropy: statistics.entropy,
-                    value: row.value,
-                })
-            })
-            .collect()
+            .map(|row| row.action)
+            .collect())
     }
 
     /// Samples packed rows with one transactional RNG per row; behaviour statistics
@@ -1822,46 +1453,6 @@ impl PolicyModel {
                 slot,
             },
         )
-    }
-
-    pub fn action_statistics(
-        &self,
-        frame: &FeatureFrame,
-        space: &ActionSpace,
-        action: StructuredAction,
-    ) -> Result<(f32, f32, f32), ModelError> {
-        if !frame.matches_action_space(space) {
-            return Err(ModelError::FrameActionSpaceMismatch);
-        }
-        let target = BehavioralTarget::from_action(frame, space, action)
-            .map_err(|error| ModelError::Backend(error.to_string()))?;
-        let _guard = self.read_parameter_lock()?;
-        let statistics = self.policy_path_statistics_locked(frame, &target)?;
-        Ok((
-            statistics.log_probability,
-            statistics.entropy,
-            statistics.value,
-        ))
-    }
-
-    fn policy_path_statistics_locked(
-        &self,
-        frame: &FeatureFrame,
-        target: &BehavioralTarget,
-    ) -> Result<PolicyPathStatistics, ModelError> {
-        let output = self.training_forward_locked(
-            std::slice::from_ref(frame),
-            std::slice::from_ref(&target.prefix()),
-        )?;
-        validate_training_tensors_finite(&output)?;
-        let value = output.value.flatten_all()?.to_vec1::<f32>()?[0];
-        let logits = BehavioralHostLogits::from_tensors(&output)?;
-        let (log_probability, entropy) = logits.statistics(0, target)?;
-        Ok(PolicyPathStatistics {
-            log_probability,
-            entropy,
-            value,
-        })
     }
 
     /// Exports parameters in stable descriptor order.
@@ -1990,35 +1581,6 @@ impl PolicyModel {
             .collect())
     }
 
-    /// Evaluates every trainable head for bounded teacher-selected prefixes.
-    pub fn training_forward<'model>(
-        &'model self,
-        frames: &[FeatureFrame],
-        prefixes: &[TrainingPrefix],
-    ) -> Result<PolicyTensorOutput<'model>, ModelError> {
-        validate_training_batch(frames, prefixes)?;
-        let guard = self.read_parameter_lock()?;
-        let tensors = self.training_forward_locked(frames, prefixes)?;
-        validate_training_tensors_finite(&tensors)?;
-        Ok(PolicyTensorOutput {
-            model_identity: std::ptr::from_ref(self).addr(),
-            tensors,
-            _parameter_guard: guard,
-        })
-    }
-
-    /// Every head over one shared trunk; the value loss trains the trunk too.
-    fn training_forward_locked(
-        &self,
-        frames: &[FeatureFrame],
-        prefixes: &[TrainingPrefix],
-    ) -> Result<PolicyTensorTensors, ModelError> {
-        let routing = ActorRouting::new(frames, self.tensor_device(), true)?;
-        let state = self.forward_frames(frames)?;
-        let prefixes = PrefixUpload::new(prefixes, self.tensor_device())?;
-        self.training_heads(state, routing, &prefixes)
-    }
-
     /// Training outputs of one staged microbatch.
     fn training_forward_inputs(
         &self,
@@ -2089,31 +1651,6 @@ impl PolicyModel {
             point_pointer: scaled_pointer_dot(&state.points, &point_query)?,
             side_raw: routing.into_raw()?,
         })
-    }
-
-    /// Backpropagates a scalar loss tied to one live guarded training output.
-    pub fn backward_named(
-        &self,
-        output: &PolicyTensorOutput<'_>,
-        loss: &Tensor,
-    ) -> Result<Vec<NamedPolicyGradient>, ModelError> {
-        if output.model_identity != std::ptr::from_ref(self).addr() {
-            return Err(ModelError::TrainingOutputModelMismatch);
-        }
-        self.backward_named_locked(loss)
-    }
-
-    fn backward_named_locked(&self, loss: &Tensor) -> Result<Vec<NamedPolicyGradient>, ModelError> {
-        let gradients = loss.backward()?;
-        Ok(self
-            .parameters()
-            .into_iter()
-            .map(|parameter| NamedPolicyGradient {
-                name: parameter.name,
-                parameter_shape: parameter.value.dims().to_vec(),
-                gradient: gradients.get(parameter.value.as_tensor()).cloned(),
-            })
-            .collect())
     }
 
     /// Value and side-selected kind logits; errors report rows offset by `batch_offset`.
@@ -2596,125 +2133,9 @@ impl PolicyModel {
     }
 }
 
-struct PolicyPathStatistics {
-    log_probability: f32,
-    entropy: f32,
-    value: f32,
-}
-
 struct AdamDiagnostics {
     unclipped_norm: f64,
     applied_scale: f64,
-}
-
-struct BehavioralHostLogits {
-    kind: Vec<Vec<f32>>,
-    controlled: Vec<Vec<f32>>,
-    ability: Vec<Vec<f32>>,
-    item: Vec<Vec<f32>>,
-    swap: Vec<Vec<f32>>,
-    learn: Vec<Vec<f32>>,
-    shop: Vec<Vec<f32>>,
-    loot: Vec<Vec<f32>>,
-    target_mode: Vec<Vec<f32>>,
-    put_mode: Vec<Vec<f32>>,
-    entity_pointer: Vec<Vec<f32>>,
-    point_pointer: Vec<Vec<f32>>,
-}
-
-impl BehavioralHostLogits {
-    fn from_tensors(output: &PolicyTensorTensors) -> Result<Self, ModelError> {
-        Ok(Self {
-            kind: output.kind.to_vec2()?,
-            controlled: output.controlled.to_vec2()?,
-            ability: output.ability.to_vec2()?,
-            item: output.item.to_vec2()?,
-            swap: output.swap.to_vec2()?,
-            learn: output.learn.to_vec2()?,
-            shop: output.shop.to_vec2()?,
-            loot: output.loot.to_vec2()?,
-            target_mode: output.target_mode.to_vec2()?,
-            put_mode: output.put_mode.to_vec2()?,
-            entity_pointer: output.entity_pointer.to_vec2()?,
-            point_pointer: output.point_pointer.to_vec2()?,
-        })
-    }
-
-    fn statistics(
-        &self,
-        index: usize,
-        target: &BehavioralTarget,
-    ) -> Result<(f32, f32), ModelError> {
-        macro_rules! add_head {
-            ($logp:ident, $entropy:ident, $values:ident, $field:ident) => {
-                let (head_logp, head_entropy) =
-                    host_head_statistics(self.row(&self.$values, index)?, &target.$field)?;
-                $logp += head_logp;
-                $entropy += head_entropy;
-            };
-        }
-        let (mut log_probability, mut entropy) =
-            host_head_statistics(self.row(&self.kind, index)?, &target.kind)?;
-        add_head!(log_probability, entropy, controlled, controlled);
-        add_head!(log_probability, entropy, ability, ability);
-        add_head!(log_probability, entropy, item, item);
-        add_head!(log_probability, entropy, swap, swap);
-        add_head!(log_probability, entropy, learn, learn);
-        add_head!(log_probability, entropy, shop, shop);
-        add_head!(log_probability, entropy, loot, loot);
-        add_head!(log_probability, entropy, target_mode, target_mode);
-        add_head!(log_probability, entropy, put_mode, put_mode);
-        add_head!(log_probability, entropy, entity_pointer, entity_pointer);
-        add_head!(log_probability, entropy, point_pointer, point_pointer);
-        if !log_probability.is_finite() || !entropy.is_finite() || entropy < 0.0 {
-            return Err(ModelError::InvalidModelState("policy path statistics"));
-        }
-        Ok((log_probability, entropy))
-    }
-
-    fn row<'a>(&self, values: &'a [Vec<f32>], index: usize) -> Result<&'a [f32], ModelError> {
-        values
-            .get(index)
-            .map(Vec::as_slice)
-            .ok_or(ModelError::InvalidModelState(
-                "behavioral output batch shape",
-            ))
-    }
-}
-
-fn host_head_statistics<const WIDTH: usize>(
-    logits: &[f32],
-    target: &HeadTarget<WIDTH>,
-) -> Result<(f32, f32), ModelError> {
-    if !target.active {
-        return Ok((0.0, 0.0));
-    }
-    if logits.len() != WIDTH || !target.is_selected_legal() {
-        return Err(ModelError::InvalidModelState("policy statistics head"));
-    }
-    let maximum = logits
-        .iter()
-        .zip(target.mask)
-        .filter_map(|(value, legal)| legal.then_some(*value))
-        .reduce(f32::max)
-        .ok_or(ModelError::NoLegalContinuation)?;
-    let sum = logits
-        .iter()
-        .zip(target.mask)
-        .filter_map(|(value, legal)| legal.then_some((*value - maximum).exp()))
-        .sum::<f32>();
-    let log_normalizer = maximum + sum.ln();
-    let log_probability = logits[target.selected] - log_normalizer;
-    let entropy = logits
-        .iter()
-        .zip(target.mask)
-        .filter(|(_, legal)| *legal)
-        .map(|(value, _)| {
-            let log_probability = *value - log_normalizer;
-            -log_probability.exp() * log_probability
-        })
-        .sum();
-    Ok((log_probability, entropy))
 }
 
 fn validate_adam_config(config: AdamConfig) -> Result<(), ModelError> {
@@ -2781,42 +2202,6 @@ fn validate_moments(
         return Err(ModelError::NonFiniteMoment { field, index });
     }
     Ok(())
-}
-
-fn collect_outputs(
-    values: Vec<f32>,
-    kinds: Vec<Vec<f32>>,
-    batch_offset: usize,
-) -> Result<Vec<PolicyOutput>, ModelError> {
-    if values.len() != kinds.len() {
-        return Err(ModelError::InvalidModelState("batch output shape"));
-    }
-    let mut output = Vec::with_capacity(values.len());
-    for (batch, (value, logits)) in values.into_iter().zip(kinds).enumerate() {
-        if !value.is_finite() {
-            return Err(ModelError::NonFiniteOutput {
-                field: "value",
-                batch: batch_offset + batch,
-                index: 0,
-            });
-        }
-        if let Some((index, _)) = logits
-            .iter()
-            .enumerate()
-            .find(|(_, value)| !value.is_finite())
-        {
-            return Err(ModelError::NonFiniteOutput {
-                field: "kind",
-                batch: batch_offset + batch,
-                index,
-            });
-        }
-        let kind_logits = logits
-            .try_into()
-            .map_err(|_| ModelError::InvalidModelState("kind head shape"))?;
-        output.push(PolicyOutput { value, kind_logits });
-    }
-    Ok(output)
 }
 
 fn validate_parameter_values(values: &[f32]) -> Result<(), ModelError> {
@@ -2920,48 +2305,6 @@ pub(crate) fn validate_batch_count(count: usize) -> Result<(), ModelError> {
         return Err(ModelError::BatchTooLarge {
             count,
             maximum: MODEL_MAX_BATCH,
-        });
-    }
-    Ok(())
-}
-
-fn validate_training_batch(
-    frames: &[FeatureFrame],
-    prefixes: &[TrainingPrefix],
-) -> Result<(), ModelError> {
-    validate_training_batch_count(frames.len())?;
-    validate_training_batch_inputs(frames, prefixes)
-}
-
-fn validate_training_batch_inputs(
-    frames: &[FeatureFrame],
-    prefixes: &[TrainingPrefix],
-) -> Result<(), ModelError> {
-    if prefixes.len() != frames.len() {
-        return Err(ModelError::TrainingPrefixCount {
-            prefixes: prefixes.len(),
-            frames: frames.len(),
-        });
-    }
-    if let Some((index, _)) = frames
-        .iter()
-        .enumerate()
-        .find(|(_, frame)| !frame.is_finite())
-    {
-        return Err(ModelError::NonFiniteFrame { index });
-    }
-    side_actors::validate_sides(frames)?;
-    Ok(())
-}
-
-pub(crate) fn validate_training_batch_count(count: usize) -> Result<(), ModelError> {
-    if count == 0 {
-        return Err(ModelError::EmptyTrainingBatch);
-    }
-    if count > MODEL_TRAINING_BATCH {
-        return Err(ModelError::TrainingBatchTooLarge {
-            count,
-            maximum: MODEL_TRAINING_BATCH,
         });
     }
     Ok(())
@@ -3246,28 +2589,6 @@ fn validate_tensor_finite(field: &'static str, tensor: &Tensor) -> Result<(), Mo
 
 fn validate_training_tensors_finite(output: &PolicyTensorTensors) -> Result<(), ModelError> {
     side_actors::validate_training(output)
-}
-
-fn sum_training_tensors(output: &PolicyTensorTensors) -> Result<Tensor, ModelError> {
-    let tensors = [
-        &output.kind,
-        &output.controlled,
-        &output.ability,
-        &output.item,
-        &output.swap,
-        &output.learn,
-        &output.shop,
-        &output.loot,
-        &output.target_mode,
-        &output.put_mode,
-        &output.entity_pointer,
-        &output.point_pointer,
-    ];
-    let mut loss = output.value.sum_all()?;
-    for tensor in tensors {
-        loss = (loss + tensor.sum_all()?)?;
-    }
-    Ok(loss)
 }
 
 /// Validated side-selected rows of one optionally queued actor head.
@@ -4181,6 +3502,41 @@ impl SampledPathLogits {
     }
 }
 
+fn host_head_statistics<const WIDTH: usize>(
+    logits: &[f32],
+    target: &HeadTarget<WIDTH>,
+) -> Result<(f32, f32), ModelError> {
+    if !target.active {
+        return Ok((0.0, 0.0));
+    }
+    if logits.len() != WIDTH || !target.is_selected_legal() {
+        return Err(ModelError::InvalidModelState("policy statistics head"));
+    }
+    let maximum = logits
+        .iter()
+        .zip(target.mask)
+        .filter_map(|(value, legal)| legal.then_some(*value))
+        .reduce(f32::max)
+        .ok_or(ModelError::NoLegalContinuation)?;
+    let sum = logits
+        .iter()
+        .zip(target.mask)
+        .filter_map(|(value, legal)| legal.then_some((*value - maximum).exp()))
+        .sum::<f32>();
+    let log_normalizer = maximum + sum.ln();
+    let log_probability = logits[target.selected] - log_normalizer;
+    let entropy = logits
+        .iter()
+        .zip(target.mask)
+        .filter(|(_, legal)| *legal)
+        .map(|(value, _)| {
+            let log_probability = *value - log_normalizer;
+            -log_probability.exp() * log_probability
+        })
+        .sum();
+    Ok((log_probability, entropy))
+}
+
 fn sampled_head_statistics<const WIDTH: usize>(
     logits: Option<&[f32; WIDTH]>,
     target: &HeadTarget<WIDTH>,
@@ -4253,17 +3609,17 @@ fn packed_rows(frames: &[FeatureFrame]) -> Result<Vec<EncoderRow>, ModelError> {
 }
 
 /// One sampled row: action, state value and, when requested, exact behaviour statistics.
-pub(crate) struct SampledRow {
-    pub(crate) action: StructuredAction,
-    pub(crate) value: f32,
-    pub(crate) statistics: Option<SampledStatistics>,
+pub struct SampledRow {
+    pub action: StructuredAction,
+    pub value: f32,
+    pub statistics: Option<SampledStatistics>,
 }
 
 /// Behavioural target and old-policy statistics of one sampled row.
-pub(crate) struct SampledStatistics {
-    pub(crate) target: BehavioralTarget,
-    pub(crate) log_probability: f32,
-    pub(crate) entropy: f32,
+pub struct SampledStatistics {
+    pub target: BehavioralTarget,
+    pub log_probability: f32,
+    pub entropy: f32,
 }
 
 struct SamplingDecoder<'logits, 'rng> {

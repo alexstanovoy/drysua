@@ -1,32 +1,27 @@
 use std::error::Error;
 use std::fmt;
 
-use bota_proto::{AbilitySlot, ItemSlot, MapId};
+use bota_proto::{AbilitySlot, ItemSlot};
 
 use crate::{
-    ActionKind, ActionSpace, ActionTarget, FeatureFrame, MODEL_ABILITY_HEAD,
-    MODEL_BEHAVIORAL_HEADS, MODEL_ENTITY_POINTER_HEAD, MODEL_ITEM_HEAD, MODEL_KIND_HEAD,
-    MODEL_LEARN_HEAD, MODEL_LOOT_HEAD, MODEL_POINT_POINTER_HEAD, MODEL_SHOP_HEAD, MODEL_SWAP_HEAD,
-    MODEL_UNIT_HEAD, ModelError, PutPointTarget, StructuredAction, TrainingAbilitySlot,
-    TrainingItemSlot, TrainingPrefix, TrainingSlot,
+    ActionKind, ActionSpace, ActionTarget, MODEL_ABILITY_HEAD, MODEL_BEHAVIORAL_HEADS,
+    MODEL_ENTITY_POINTER_HEAD, MODEL_ITEM_HEAD, MODEL_KIND_HEAD, MODEL_LEARN_HEAD, MODEL_LOOT_HEAD,
+    MODEL_POINT_POINTER_HEAD, MODEL_SHOP_HEAD, MODEL_SWAP_HEAD, MODEL_UNIT_HEAD, ModelError,
+    PutPointTarget, StructuredAction, TrainingAbilitySlot, TrainingItemSlot, TrainingPrefix,
+    TrainingSlot,
 };
-
-/// Maximum epoch, optimizer-step, and global-update counter value.
-pub const MAX_TRAINING_COUNTER: u64 = 1_000_000_000;
-/// Current sample audit: F17 wait/progress-accounting globals with unchanged A5 legality.
-/// Prior samples and reports cannot be relabelled as reward-v3 observations.
-pub const IMITATION_RULES_AUDIT_VERSION: u32 = 22;
 
 const TARGET_MODE_HEAD: usize = 3;
 const PUT_MODE_HEAD: usize = 2;
 
-/// Construction, orchestration, evaluation, or checkpoint validation failure.
+/// An action that cannot be encoded as per-head labels of the given action space.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub enum ImitationError {
+pub enum TargetError {
+    #[cfg(test)]
     FrameActionSpaceMismatch,
+    #[cfg(test)]
     NonFiniteFrame,
     ActionNotAllowed {
-        role: &'static str,
         kind: ActionKind,
     },
     TargetInactiveMask {
@@ -49,219 +44,52 @@ pub enum ImitationError {
         actual: usize,
         maximum: usize,
     },
-    InvalidFrameSide,
-    InvalidFrameMap,
-    SampleIdentityMismatch(&'static str),
-    SampleMapOutsideScope {
-        map: MapId,
-    },
-    DaggerSplit,
-    SeedMembership {
-        namespace: &'static str,
-        seed: u64,
-    },
-    DuplicateSampleIdentity,
-    NoEvictableTrainSample,
-    PoolBindingMismatch,
-    HeldOutContamination,
-    HeldOutSampleNotInPool,
-    Capacity {
-        value: usize,
-        maximum: usize,
-    },
-    EmptyTrainSet,
-    EffectiveBatch {
-        value: usize,
-        maximum: usize,
-    },
-    CounterOverflow {
-        counter: &'static str,
-        maximum: u64,
-    },
-    SeedCapacity {
-        namespace: &'static str,
-        count: usize,
-        maximum: usize,
-    },
-    DuplicateSeed {
-        namespace: &'static str,
-        seed: u64,
-    },
-    SeedOverlap {
-        first: &'static str,
-        second: &'static str,
-        seed: u64,
-    },
-    InvalidTeacherCoverage,
-    CheckpointState(&'static str),
-    Rollback {
-        cause: String,
-        rollback: String,
-    },
-    InjectedEpochFailure {
-        update: usize,
-    },
     Model(String),
 }
 
-impl fmt::Display for ImitationError {
+impl fmt::Display for TargetError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::FrameActionSpaceMismatch
-            | Self::NonFiniteFrame
-            | Self::ActionNotAllowed { .. }
-            | Self::TargetInactiveMask { .. }
-            | Self::TargetEmptyMask { .. }
-            | Self::TargetLabel { .. }
-            | Self::TargetIllegalLabel { .. }
-            | Self::TargetPathMismatch(_)
-            | Self::MaskOversize { .. }
-            | Self::InvalidFrameSide
-            | Self::InvalidFrameMap
-            | Self::SampleIdentityMismatch(_)
-            | Self::SampleMapOutsideScope { .. }
-            | Self::DaggerSplit => self.fmt_target(formatter),
-            _ => self.fmt_training(formatter),
-        }
-    }
-}
-
-impl ImitationError {
-    fn fmt_target(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::FrameActionSpaceMismatch => formatter
-                .write_str("imitation feature frame does not belong to the supplied action space"),
-            Self::NonFiniteFrame => formatter.write_str("imitation feature frame is non-finite"),
-            Self::ActionNotAllowed { role, kind } => write!(
+            #[cfg(test)]
+            Self::FrameActionSpaceMismatch => {
+                formatter.write_str("feature frame does not belong to the supplied action space")
+            }
+            #[cfg(test)]
+            Self::NonFiniteFrame => formatter.write_str("feature frame is non-finite"),
+            Self::ActionNotAllowed { kind } => write!(
                 formatter,
-                "imitation {role} action {kind:?} is not allowed by the supplied action space"
+                "action {kind:?} is not allowed by the supplied action space"
             ),
-            Self::TargetInactiveMask { head } => write!(
-                formatter,
-                "imitation inactive head {head} has a nonempty legal mask"
-            ),
+            Self::TargetInactiveMask { head } => {
+                write!(formatter, "inactive head {head} has a nonempty legal mask")
+            }
             Self::TargetEmptyMask { head } => {
-                write!(formatter, "imitation active head {head} has no legal label")
+                write!(formatter, "active head {head} has no legal label")
             }
             Self::TargetLabel { head, label, width } => write!(
                 formatter,
-                "imitation target label {label} is outside width {width} for head {head}"
+                "target label {label} is outside width {width} for head {head}"
             ),
-            Self::TargetIllegalLabel { head, label } => write!(
-                formatter,
-                "imitation target label {label} is illegal for head {head}"
-            ),
+            Self::TargetIllegalLabel { head, label } => {
+                write!(formatter, "target label {label} is illegal for head {head}")
+            }
             Self::TargetPathMismatch(field) => {
-                write!(formatter, "imitation target path does not match {field}")
+                write!(formatter, "target path does not match {field}")
             }
-            Self::MaskOversize { actual, maximum } => write!(
-                formatter,
-                "imitation mask width {actual} exceeds head width {maximum}"
-            ),
-            Self::InvalidFrameSide => {
-                formatter.write_str("imitation frame has invalid absolute side features")
+            Self::MaskOversize { actual, maximum } => {
+                write!(
+                    formatter,
+                    "mask width {actual} exceeds head width {maximum}"
+                )
             }
-            Self::InvalidFrameMap => {
-                formatter.write_str("imitation frame has invalid absolute map features")
-            }
-            Self::SampleIdentityMismatch(field) => write!(
-                formatter,
-                "imitation sample identity {field} does not match its frame or action space"
-            ),
-            Self::SampleMapOutsideScope { map } => write!(
-                formatter,
-                "imitation sample map MapId({}) is outside its training scope",
-                map.0
-            ),
-            Self::DaggerSplit => {
-                formatter.write_str("imitation DAgger sample must belong to Train")
-            }
-            _ => self.fmt_training(formatter),
-        }
-    }
-
-    fn fmt_training(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Capacity { value, maximum } => write!(
-                formatter,
-                "imitation pool capacity {value} is outside 1..={maximum}"
-            ),
-            Self::EmptyTrainSet => formatter.write_str("imitation train set is empty"),
-            Self::EffectiveBatch { value, maximum } => write!(
-                formatter,
-                "imitation effective batch {value} is outside 1..={maximum}"
-            ),
-            Self::CounterOverflow { counter, maximum } => write!(
-                formatter,
-                "imitation {counter} counter exceeds maximum {maximum}"
-            ),
-            Self::SeedCapacity {
-                namespace,
-                count,
-                maximum,
-            } => write!(
-                formatter,
-                "imitation {namespace} seed count {count} exceeds maximum {maximum}"
-            ),
-            Self::DuplicateSeed { namespace, seed } => {
-                write!(formatter, "imitation {namespace} seed {seed} is duplicated")
-            }
-            Self::SeedOverlap {
-                first,
-                second,
-                seed,
-            } => write!(
-                formatter,
-                "imitation seed {seed} appears in both {first} and {second} namespaces"
-            ),
-            Self::SeedMembership { namespace, seed } => write!(
-                formatter,
-                "imitation {namespace} seed {seed} is absent from its seed namespace"
-            ),
-            Self::DuplicateSampleIdentity => {
-                formatter.write_str("imitation sample identity is duplicated")
-            }
-            Self::NoEvictableTrainSample => {
-                formatter.write_str("imitation pool is full and has no evictable Train sample")
-            }
-            Self::PoolBindingMismatch => formatter.write_str(
-                "imitation trainer pool lineage, revision, scope, or seeds do not match",
-            ),
-            Self::HeldOutContamination => formatter
-                .write_str("imitation held-out evaluation received non-HeldOut or DAgger data"),
-            Self::HeldOutSampleNotInPool => formatter
-                .write_str("imitation held-out evaluation received a sample outside the pool"),
-            _ => self.fmt_training_state(formatter),
-        }
-    }
-
-    fn fmt_training_state(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidTeacherCoverage => {
-                formatter.write_str("imitation teacher coverage counts are inconsistent")
-            }
-            Self::CheckpointState(field) => {
-                write!(formatter, "imitation checkpoint has invalid {field}")
-            }
-            Self::Rollback { cause, rollback } => write!(
-                formatter,
-                "imitation epoch failed ({cause}); rollback failed ({rollback})"
-            ),
-            Self::InjectedEpochFailure { update } => write!(
-                formatter,
-                "imitation injected epoch failure before update {update}"
-            ),
-            Self::Model(message) => {
-                write!(formatter, "imitation model operation failed: {message}")
-            }
-            _ => formatter.write_str("imitation error category is invalid"),
+            Self::Model(message) => write!(formatter, "action target: {message}"),
         }
     }
 }
 
-impl Error for ImitationError {}
+impl Error for TargetError {}
 
-impl From<ModelError> for ImitationError {
+impl From<ModelError> for TargetError {
     fn from(error: ModelError) -> Self {
         Self::Model(error.to_string())
     }
@@ -270,11 +98,11 @@ impl From<ModelError> for ImitationError {
 /// One fixed-width legal mask and selected class for a policy head.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HeadTarget<const WIDTH: usize> {
-    /// Whether this head lies on the teacher action path.
+    /// Whether this head lies on the action's decoder path.
     pub active: bool,
-    /// Exact legal classes in stable model order; all false when inactive.
+    /// Legal classes in model order; all false when inactive.
     pub mask: [bool; WIDTH],
-    /// Teacher-selected class; zero when inactive.
+    /// Selected class; zero when inactive.
     pub selected: usize,
 }
 
@@ -300,25 +128,25 @@ impl<const WIDTH: usize> HeadTarget<WIDTH> {
         self.active && self.mask.get(self.selected).copied().unwrap_or(false)
     }
 
-    fn validate(&self, name: &'static str) -> Result<(), ImitationError> {
+    fn validate(&self, name: &'static str) -> Result<(), TargetError> {
         if !self.active {
             if self.mask.contains(&true) {
-                return Err(ImitationError::TargetInactiveMask { head: name });
+                return Err(TargetError::TargetInactiveMask { head: name });
             }
             return Ok(());
         }
         if !self.mask.contains(&true) {
-            return Err(ImitationError::TargetEmptyMask { head: name });
+            return Err(TargetError::TargetEmptyMask { head: name });
         }
         if self.selected >= WIDTH {
-            return Err(ImitationError::TargetLabel {
+            return Err(TargetError::TargetLabel {
                 head: name,
                 label: self.selected,
                 width: WIDTH,
             });
         }
         if !self.mask[self.selected] {
-            return Err(ImitationError::TargetIllegalLabel {
+            return Err(TargetError::TargetIllegalLabel {
                 head: name,
                 label: self.selected,
             });
@@ -327,7 +155,7 @@ impl<const WIDTH: usize> HeadTarget<WIDTH> {
     }
 }
 
-/// Fixed, identifier-free behavioral labels for every autoregressive policy head.
+/// Label and legal mask of one action on every autoregressive policy head.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BehavioralTarget {
     pub kind: HeadTarget<MODEL_KIND_HEAD>,
@@ -346,28 +174,29 @@ pub struct BehavioralTarget {
 }
 
 impl BehavioralTarget {
-    /// Reverse-maps one exact legal teacher action into fixed head labels and masks.
+    /// Labels a legal action of `space` taken at `frame`.
+    #[cfg(test)]
     pub fn from_action(
-        frame: &FeatureFrame,
+        frame: &crate::FeatureFrame,
         space: &ActionSpace,
         action: StructuredAction,
-    ) -> Result<Self, ImitationError> {
-        validate_action_input(frame, space, action, "teacher")?;
-        let mut target = Self::base(space, action);
-        target.map_action(space, action)?;
-        target.validate()?;
-        Ok(target)
+    ) -> Result<Self, TargetError> {
+        if !frame.matches_action_space(space) {
+            return Err(TargetError::FrameActionSpaceMismatch);
+        }
+        if !frame.is_finite() {
+            return Err(TargetError::NonFiniteFrame);
+        }
+        Self::from_sampled_action(space, action)
     }
 
-    /// Target of an action the model sampled from `space`; the frame was validated
-    /// against the same space when its encoder row was packed.
+    /// Labels an action the model sampled from `space`.
     pub(crate) fn from_sampled_action(
         space: &ActionSpace,
         action: StructuredAction,
-    ) -> Result<Self, ImitationError> {
+    ) -> Result<Self, TargetError> {
         if !space.allows(action) || space.decode(action).is_err() {
-            return Err(ImitationError::ActionNotAllowed {
-                role: "teacher",
+            return Err(TargetError::ActionNotAllowed {
                 kind: action.kind(),
             });
         }
@@ -399,7 +228,7 @@ impl BehavioralTarget {
         &mut self,
         space: &ActionSpace,
         action: StructuredAction,
-    ) -> Result<(), ImitationError> {
+    ) -> Result<(), TargetError> {
         self.map_controlled(space, action);
         match action {
             StructuredAction::Continue
@@ -478,7 +307,7 @@ impl BehavioralTarget {
         unit: crate::ControlledUnit,
         slot: AbilitySlot,
         selected: ActionTarget,
-    ) -> Result<(), ImitationError> {
+    ) -> Result<(), TargetError> {
         self.ability = HeadTarget::active(
             padded_mask(&space.ability_slot_mask(unit))?,
             usize::from(slot.0),
@@ -503,7 +332,7 @@ impl BehavioralTarget {
         unit: crate::ControlledUnit,
         slot: ItemSlot,
         selected: ActionTarget,
-    ) -> Result<(), ImitationError> {
+    ) -> Result<(), TargetError> {
         self.item = HeadTarget::active(
             padded_mask(&space.item_slot_mask(unit))?,
             usize::from(slot.0),
@@ -520,7 +349,7 @@ impl BehavioralTarget {
         &mut self,
         mask: &crate::TargetMask,
         selected: ActionTarget,
-    ) -> Result<(), ImitationError> {
+    ) -> Result<(), TargetError> {
         let modes = [
             mask.allows_none(),
             mask.entities().contains(&true),
@@ -550,7 +379,7 @@ impl BehavioralTarget {
         unit: crate::ControlledUnit,
         source: ItemSlot,
         target: PutPointTarget,
-    ) -> Result<(), ImitationError> {
+    ) -> Result<(), TargetError> {
         let underfoot = space.put_underfoot_mask(unit);
         let source_mask = std::array::from_fn(|index| {
             underfoot.get(index).copied().unwrap_or(false)
@@ -565,7 +394,7 @@ impl BehavioralTarget {
             underfoot
                 .get(usize::from(source.0))
                 .copied()
-                .ok_or(ImitationError::TargetLabel {
+                .ok_or(TargetError::TargetLabel {
                     head: "item",
                     label: usize::from(source.0),
                     width: MODEL_ITEM_HEAD,
@@ -585,7 +414,7 @@ impl BehavioralTarget {
         unit: crate::ControlledUnit,
         from: ItemSlot,
         to: ItemSlot,
-    ) -> Result<(), ImitationError> {
+    ) -> Result<(), TargetError> {
         let source_mask = std::array::from_fn(|index| {
             space
                 .swap_destination_mask(unit, ItemSlot(index as u8))
@@ -595,15 +424,15 @@ impl BehavioralTarget {
         self.swap = HeadTarget::active(
             *space
                 .swap_destination_mask(unit, from)
-                .ok_or(ImitationError::TargetEmptyMask { head: "swap" })?,
+                .ok_or(TargetError::TargetEmptyMask { head: "swap" })?,
             usize::from(to.0),
         );
         self.prefix = item_prefix(ActionKind::Swap, unit, from)?;
         Ok(())
     }
 
-    /// Validates every active and inactive head boundary.
-    pub fn validate(&self) -> Result<(), ImitationError> {
+    /// Checks every head's mask and label and that the active heads form the action's path.
+    pub fn validate(&self) -> Result<(), TargetError> {
         self.kind.validate("kind")?;
         self.controlled.validate("controlled")?;
         self.ability.validate("ability")?;
@@ -619,21 +448,21 @@ impl BehavioralTarget {
         self.validate_path()
     }
 
-    fn validate_path(&self) -> Result<(), ImitationError> {
+    fn validate_path(&self) -> Result<(), TargetError> {
         let kind = ActionKind::from_index(self.kind.selected)
-            .ok_or(ImitationError::TargetPathMismatch("kind"))?;
+            .ok_or(TargetError::TargetPathMismatch("kind"))?;
         if !self.kind.active {
-            return Err(ImitationError::TargetPathMismatch("kind active"));
+            return Err(TargetError::TargetPathMismatch("kind active"));
         }
         if self.prefix.kind() != kind {
-            return Err(ImitationError::TargetPathMismatch("prefix kind"));
+            return Err(TargetError::TargetPathMismatch("prefix kind"));
         }
         let expected_unit = (kind != ActionKind::Continue && kind != ActionKind::Learn)
             .then(|| selected_unit(self.controlled.selected))
             .transpose()?;
         if self.controlled.active != expected_unit.is_some() || self.prefix.unit() != expected_unit
         {
-            return Err(ImitationError::TargetPathMismatch("controlled unit"));
+            return Err(TargetError::TargetPathMismatch("controlled unit"));
         }
         let expected_slot = match kind {
             ActionKind::Cast => Some(TrainingSlot::Ability(training_ability_slot(
@@ -645,7 +474,7 @@ impl BehavioralTarget {
             _ => None,
         };
         if self.prefix.slot() != expected_slot {
-            return Err(ImitationError::TargetPathMismatch("slot"));
+            return Err(TargetError::TargetPathMismatch("slot"));
         }
         let expected = expected_activity(self, kind);
         let actual = [
@@ -662,165 +491,14 @@ impl BehavioralTarget {
             self.point_pointer.active,
         ];
         if actual != expected {
-            return Err(ImitationError::TargetPathMismatch("active heads"));
+            return Err(TargetError::TargetPathMismatch("active heads"));
         }
         Ok(())
     }
 
-    /// Exact teacher-forced context used by all conditional model tensors.
+    /// Decoder prefix the conditional heads are evaluated under.
     pub const fn prefix(&self) -> TrainingPrefix {
         self.prefix
-    }
-
-    /// Reconstructs the exact structured action represented by selected labels.
-    pub fn reconstruct_action(&self) -> Result<StructuredAction, ImitationError> {
-        self.validate()?;
-        let kind =
-            ActionKind::from_index(self.kind.selected).ok_or(ImitationError::TargetLabel {
-                head: "kind",
-                label: self.kind.selected,
-                width: MODEL_KIND_HEAD,
-            })?;
-        if kind == ActionKind::Continue {
-            return Ok(StructuredAction::Continue);
-        }
-        if kind == ActionKind::Learn {
-            return Ok(StructuredAction::Learn {
-                slot: AbilitySlot(self.learn.selected as u8),
-            });
-        }
-        self.reconstruct_controlled(kind)
-    }
-
-    fn reconstruct_controlled(&self, kind: ActionKind) -> Result<StructuredAction, ImitationError> {
-        let unit = selected_unit(self.controlled.selected)?;
-        let action = match kind {
-            ActionKind::Stop => StructuredAction::Stop { unit },
-            ActionKind::MovePoint => StructuredAction::MovePoint {
-                unit,
-                point: crate::PointIndex(self.point_pointer.selected),
-            },
-            ActionKind::FollowUnit => StructuredAction::FollowUnit {
-                unit,
-                target: crate::EntityIndex(self.entity_pointer.selected),
-            },
-            ActionKind::Hold => StructuredAction::Hold { unit },
-            ActionKind::AttackMovePoint => StructuredAction::AttackMovePoint {
-                unit,
-                point: crate::PointIndex(self.point_pointer.selected),
-            },
-            ActionKind::AttackUnit => StructuredAction::AttackUnit {
-                unit,
-                target: crate::EntityIndex(self.entity_pointer.selected),
-            },
-            ActionKind::Cast | ActionKind::Use => return self.reconstruct_targeted(kind, unit),
-            ActionKind::PutPoint | ActionKind::PutUnit => return self.reconstruct_put(kind, unit),
-            ActionKind::Take => StructuredAction::Take {
-                unit,
-                loot: crate::LootIndex(self.loot.selected),
-            },
-            ActionKind::Buy => StructuredAction::Buy {
-                unit,
-                item: crate::ShopIndex(self.shop.selected),
-            },
-            ActionKind::Sell => StructuredAction::Sell {
-                unit,
-                slot: ItemSlot(self.item.selected as u8),
-            },
-            ActionKind::Swap => StructuredAction::Swap {
-                unit,
-                from: ItemSlot(self.item.selected as u8),
-                to: ItemSlot(self.swap.selected as u8),
-            },
-            ActionKind::Continue | ActionKind::Learn => {
-                return Err(ImitationError::TargetEmptyMask { head: "controlled" });
-            }
-        };
-        Ok(action)
-    }
-
-    fn reconstruct_targeted(
-        &self,
-        kind: ActionKind,
-        unit: crate::ControlledUnit,
-    ) -> Result<StructuredAction, ImitationError> {
-        let target = match self.target_mode.selected {
-            0 => ActionTarget::None,
-            1 => ActionTarget::Entity(crate::EntityIndex(self.entity_pointer.selected)),
-            2 => ActionTarget::Point(crate::PointIndex(self.point_pointer.selected)),
-            label => {
-                return Err(ImitationError::TargetLabel {
-                    head: "target mode",
-                    label,
-                    width: 3,
-                });
-            }
-        };
-        Ok(if kind == ActionKind::Cast {
-            StructuredAction::Cast {
-                unit,
-                slot: AbilitySlot(self.ability.selected as u8),
-                target,
-            }
-        } else {
-            StructuredAction::Use {
-                unit,
-                slot: ItemSlot(self.item.selected as u8),
-                target,
-            }
-        })
-    }
-
-    fn reconstruct_put(
-        &self,
-        kind: ActionKind,
-        unit: crate::ControlledUnit,
-    ) -> Result<StructuredAction, ImitationError> {
-        let source = ItemSlot(self.item.selected as u8);
-        if kind == ActionKind::PutUnit {
-            return Ok(StructuredAction::PutUnit {
-                unit,
-                source,
-                target: crate::EntityIndex(self.entity_pointer.selected),
-            });
-        }
-        let target = match self.put_mode.selected {
-            0 => PutPointTarget::Underfoot,
-            1 => PutPointTarget::Point(crate::PointIndex(self.point_pointer.selected)),
-            label => {
-                return Err(ImitationError::TargetLabel {
-                    head: "put mode",
-                    label,
-                    width: 2,
-                });
-            }
-        };
-        Ok(StructuredAction::PutPoint {
-            unit,
-            source,
-            target,
-        })
-    }
-
-    /// Number of heads contributing cross entropy for this target.
-    pub fn active_head_count(&self) -> usize {
-        [
-            self.kind.active,
-            self.controlled.active,
-            self.ability.active,
-            self.item.active,
-            self.swap.active,
-            self.learn.active,
-            self.shop.active,
-            self.loot.active,
-            self.target_mode.active,
-            self.put_mode.active,
-            self.entity_pointer.active,
-            self.point_pointer.active,
-        ]
-        .into_iter()
-        .map(usize::from)
-        .sum()
     }
 }
 
@@ -930,32 +608,11 @@ fn unpack_head<const WIDTH: usize>(
     }
 }
 
-fn validate_action_input(
-    frame: &FeatureFrame,
-    space: &ActionSpace,
-    action: StructuredAction,
-    role: &'static str,
-) -> Result<(), ImitationError> {
-    if !frame.matches_action_space(space) {
-        return Err(ImitationError::FrameActionSpaceMismatch);
-    }
-    if !frame.is_finite() {
-        return Err(ImitationError::NonFiniteFrame);
-    }
-    if !space.allows(action) || space.decode(action).is_err() {
-        return Err(ImitationError::ActionNotAllowed {
-            role,
-            kind: action.kind(),
-        });
-    }
-    Ok(())
-}
-
-fn selected_unit(index: usize) -> Result<crate::ControlledUnit, ImitationError> {
+fn selected_unit(index: usize) -> Result<crate::ControlledUnit, TargetError> {
     match index {
         0 => Ok(crate::ControlledUnit::Hero),
         1 => Ok(crate::ControlledUnit::Courier),
-        label => Err(ImitationError::TargetLabel {
+        label => Err(TargetError::TargetLabel {
             head: "controlled",
             label,
             width: 2,
@@ -963,16 +620,16 @@ fn selected_unit(index: usize) -> Result<crate::ControlledUnit, ImitationError> 
     }
 }
 
-fn training_ability_slot(index: usize) -> Result<TrainingAbilitySlot, ImitationError> {
-    TrainingAbilitySlot::new(index).map_err(|_| ImitationError::TargetLabel {
+fn training_ability_slot(index: usize) -> Result<TrainingAbilitySlot, TargetError> {
+    TrainingAbilitySlot::new(index).map_err(|_| TargetError::TargetLabel {
         head: "ability",
         label: index,
         width: MODEL_ABILITY_HEAD,
     })
 }
 
-fn training_item_slot(index: usize) -> Result<TrainingItemSlot, ImitationError> {
-    TrainingItemSlot::new(index).map_err(|_| ImitationError::TargetLabel {
+fn training_item_slot(index: usize) -> Result<TrainingItemSlot, TargetError> {
+    TrainingItemSlot::new(index).map_err(|_| TargetError::TargetLabel {
         head: "item",
         label: index,
         width: MODEL_ITEM_HEAD,
@@ -1019,9 +676,9 @@ fn expected_activity(target: &BehavioralTarget, kind: ActionKind) -> [bool; 11] 
     expected
 }
 
-fn padded_mask<const WIDTH: usize>(mask: &[bool]) -> Result<[bool; WIDTH], ImitationError> {
+fn padded_mask<const WIDTH: usize>(mask: &[bool]) -> Result<[bool; WIDTH], TargetError> {
     if mask.len() > WIDTH {
-        return Err(ImitationError::MaskOversize {
+        return Err(TargetError::MaskOversize {
             actual: mask.len(),
             maximum: WIDTH,
         });
@@ -1034,16 +691,16 @@ fn padded_mask<const WIDTH: usize>(mask: &[bool]) -> Result<[bool; WIDTH], Imita
 fn pointer_target<const WIDTH: usize>(
     mask: &[bool],
     selected: usize,
-) -> Result<HeadTarget<WIDTH>, ImitationError> {
+) -> Result<HeadTarget<WIDTH>, TargetError> {
     Ok(HeadTarget::active(padded_mask(mask)?, selected))
 }
 
-fn required_mask(mask: Option<&[bool]>) -> Result<&[bool], ImitationError> {
-    mask.ok_or(ImitationError::TargetEmptyMask { head: "pointer" })
+fn required_mask(mask: Option<&[bool]>) -> Result<&[bool], TargetError> {
+    mask.ok_or(TargetError::TargetEmptyMask { head: "pointer" })
 }
 
-fn required_target(mask: Option<&crate::TargetMask>) -> Result<&crate::TargetMask, ImitationError> {
-    mask.ok_or(ImitationError::TargetEmptyMask {
+fn required_target(mask: Option<&crate::TargetMask>) -> Result<&crate::TargetMask, TargetError> {
+    mask.ok_or(TargetError::TargetEmptyMask {
         head: "target mode",
     })
 }
@@ -1052,7 +709,7 @@ fn item_prefix(
     kind: ActionKind,
     unit: crate::ControlledUnit,
     slot: ItemSlot,
-) -> Result<TrainingPrefix, ImitationError> {
+) -> Result<TrainingPrefix, TargetError> {
     Ok(TrainingPrefix::new(
         kind,
         Some(unit),

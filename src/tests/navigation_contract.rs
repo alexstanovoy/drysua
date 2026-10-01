@@ -410,63 +410,45 @@ fn fountain_trip(world: &mut World, side: usize, place: Place, goal: Vec2) -> (O
         world.validate_order(command.slot, command.unit, &command.order),
         Ok(())
     );
-    assert!(!start.within(
-        world.map.fountains[side],
-        Fixed::from_int(rules::FOUNTAIN_HEAL_RADIUS)
-    ));
+    let fountain_radius = Fixed::from_int(rules::FOUNTAIN_HEAL_RADIUS);
+    assert!(!start.within(world.map.fountains[side], fountain_radius));
+    // One tick: whether the hero stood in the fountain and gained at least 20 HP and 10 mana.
+    let regenerating_tick = |world: &mut World, commands: &[Command]| {
+        let health = world.health.get(hero).expect("health").hp;
+        let mana = world.mana.get(hero).expect("mana").mana;
+        world.advance(commands);
+        let position = world.transform.get(hero).expect("position").pos;
+        position.within(world.map.fountains[side], fountain_radius)
+            && world.health.get(hero).expect("health").hp - health >= Fixed::from_int(20)
+            && world.mana.get(hero).expect("mana").mana - mana >= Fixed::from_int(10)
+    };
     let mut regenerated = false;
-    let mut arrival = None;
     for elapsed in 1..=limit {
-        let previous_health = world.health.get(hero).expect("health").hp;
-        let previous_mana = world.mana.get(hero).expect("mana").mana;
         // Continue decodes to no command: no Teacher prefix or periodic replacement orders.
-        world.advance(if elapsed == 1 {
+        let commands = if elapsed == 1 {
             std::slice::from_ref(&command)
         } else {
             &[]
-        });
+        };
+        regenerated |= regenerating_tick(world, commands);
         assert!(world.alive(hero));
         assert_eq!(
             world.orders.get(hero).expect("held Move").current,
             UnitOrder::Move { pos: goal }
         );
-        let position = world.transform.get(hero).expect("position").pos;
-        let health = world.health.get(hero).expect("health").hp;
-        let mana = world.mana.get(hero).expect("mana").mana;
-        let fountain_range = position.within(
-            world.map.fountains[side],
-            Fixed::from_int(rules::FOUNTAIN_HEAL_RADIUS),
-        );
-        if fountain_range
-            && health - previous_health >= Fixed::from_int(20)
-            && mana - previous_mana >= Fixed::from_int(10)
-        {
-            regenerated = true;
-        }
-        if position == goal {
-            arrival = Some(elapsed);
-            // The native heal is continuous now, so observe it after arrival
-            // rather than demanding a single-tick jump while still moving.
+        if world.transform.get(hero).expect("position").pos == goal {
+            // The native heal is continuous, so observe it after arrival rather than
+            // demanding a single-tick jump while still moving.
             for _ in 0..FOUNTAIN_SETTLE_TICKS {
-                let before_health = world.health.get(hero).expect("health").hp;
-                let before_mana = world.mana.get(hero).expect("mana").mana;
-                world.advance(&[]);
-                let health = world.health.get(hero).expect("health").hp;
-                let mana = world.mana.get(hero).expect("mana").mana;
-                if position.within(
-                    world.map.fountains[side],
-                    Fixed::from_int(rules::FOUNTAIN_HEAL_RADIUS),
-                ) && health - before_health >= Fixed::from_int(20)
-                    && mana - before_mana >= Fixed::from_int(10)
-                {
-                    regenerated = true;
+                if regenerated {
                     break;
                 }
+                regenerated = regenerating_tick(world, &[]);
             }
-            break;
+            return (Some(elapsed), regenerated);
         }
     }
-    (arrival, regenerated)
+    (None, regenerated)
 }
 
 fn move_command(world: &World, side: usize, unit: ControlledUnit, goal: Vec2) -> Command {

@@ -31,7 +31,7 @@ mod capacity_tests;
 #[path = "tests/feature_test_support.rs"]
 mod test_support;
 
-/// Version of the policy feature layout and candidate input-state semantics.
+/// Version of the policy feature layout.
 pub const FEATURE_SCHEMA_VERSION: u32 = 26;
 /// Number of scalar global features.
 pub const GLOBAL_FEATURES: usize = global_feature::WIDTH;
@@ -75,8 +75,6 @@ pub const LOOT_FEATURES: usize = loot_feature::WIDTH;
 pub const LOOT_FEATURE_TOKENS: usize = MAX_LOOT;
 /// Number of scalar local map-context features.
 pub const MAP_FEATURES: usize = map_feature::WIDTH;
-/// Maximum encoded observation states retained for deterministic rollback.
-pub const MAX_FEATURE_OBSERVATION_HISTORY: usize = 16;
 /// One-hot ability identifier classes: ids below the last class, then "other".
 pub const ABILITY_ID_CLASSES: usize = 25;
 /// One-hot item identifier classes: ids below the last class, then "other".
@@ -684,63 +682,27 @@ impl FeatureFrame {
     }
 
     /// Global scalar features in stable schema order.
+    #[cfg(test)]
     pub fn global(&self) -> &[f32; GLOBAL_FEATURES] {
         &self.global
     }
 
-    /// Global-history samples in oldest-to-newest schema order.
-    pub fn history(&self) -> &[[f32; HISTORY_FEATURES]; HISTORY_SAMPLES] {
-        &self.history
-    }
-
-    /// Local policy-history samples in newest-first encoded order.
-    pub fn policy_history(&self) -> &[[f32; POLICY_HISTORY_FEATURES]; MAX_POLICY_HISTORY] {
-        &self.policy_history
-    }
-
-    /// Current unit tokens in exact entity-pointer order.
-    pub fn units(&self) -> &[[f32; UNIT_FEATURES]; UNIT_FEATURE_TOKENS] {
-        &self.units
-    }
-
     /// Fixed own hero and courier unit tokens.
+    #[cfg(test)]
     pub fn own_units(&self) -> &[[f32; UNIT_FEATURES]; OWN_UNIT_FEATURE_TOKENS] {
         &self.own_units
     }
 
     /// Non-targetable remembered unit tokens.
+    #[cfg(test)]
     pub fn remembered_units(&self) -> &[[f32; UNIT_FEATURES]; REMEMBERED_UNIT_FEATURE_TOKENS] {
         &self.remembered_units
     }
 
     /// Point tokens in exact point-pointer order.
+    #[cfg(test)]
     pub fn points(&self) -> &[[f32; POINT_FEATURES]; POINT_FEATURE_TOKENS] {
         &self.points
-    }
-
-    /// Fixed own-body ability tokens.
-    pub fn abilities(&self) -> &[[f32; ABILITY_FEATURES]; ABILITY_FEATURE_TOKENS] {
-        &self.abilities
-    }
-
-    /// Fixed inventory and shop item tokens.
-    pub fn items(&self) -> &[[f32; ITEM_FEATURES]; ITEM_FEATURE_TOKENS] {
-        &self.items
-    }
-
-    /// Current projectile tokens in deterministic semantic order.
-    pub fn projectiles(&self) -> &[[f32; PROJECTILE_FEATURES]; PROJECTILE_FEATURE_TOKENS] {
-        &self.projectiles
-    }
-
-    /// Current loot tokens in exact loot-pointer order.
-    pub fn loot(&self) -> &[[f32; LOOT_FEATURES]; LOOT_FEATURE_TOKENS] {
-        &self.loot
-    }
-
-    /// Fixed local map-context scalars.
-    pub fn map(&self) -> &[f32; MAP_FEATURES] {
-        &self.map
     }
 
     /// Whether every scalar in the frame is finite.
@@ -872,7 +834,7 @@ impl RaggedFeatureArena {
     /// Every row vector grows fallibly within its row cap.
     pub(crate) fn new(sample_capacity: usize) -> Result<Self, &'static str> {
         if !(1..=crate::PPO_MAX_SAMPLES).contains(&sample_capacity) {
-            return Err("ragged feature sample capacity is outside 1..=46520");
+            return Err("ragged feature sample capacity is outside 1..=33280");
         }
         Ok(Self {
             sample_capacity,
@@ -1168,17 +1130,10 @@ pub enum ActivePolicyTarget {
     Unit(EntityId),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct ActivePolicyTransition {
-    tick: u32,
-    order: Option<ActivePolicyOrder>,
-}
-
-/// Invalid chronology or unsupported rollback supplied to [`LocalPolicyState`].
+/// A tick older than the latest one supplied to [`LocalPolicyState`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LocalPolicyError {
     TickRegression { incoming: u32, latest: u32 },
-    RollbackBeforeHorizon { requested: u32, earliest: u32 },
 }
 
 impl fmt::Display for LocalPolicyError {
@@ -1188,71 +1143,30 @@ impl fmt::Display for LocalPolicyError {
                 formatter,
                 "local policy tick {incoming} is older than latest tick {latest}"
             ),
-            Self::RollbackBeforeHorizon {
-                requested,
-                earliest,
-            } => write!(
-                formatter,
-                "local policy rollback tick {requested} is older than earliest supported tick {earliest}"
-            ),
         }
     }
 }
 
 impl Error for LocalPolicyError {}
 
-/// Explicit bounded local policy state used by active-order and history features.
+/// Local decision history and active order behind the policy-history and active-order inputs.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LocalPolicyState {
-    earliest_rollback_tick: u32,
     latest_tick: u32,
     decisions: [Option<PolicyDecision>; MAX_POLICY_HISTORY],
     decision_count: usize,
-    active_base: Option<ActivePolicyOrder>,
-    active_transitions: [Option<ActivePolicyTransition>; MAX_POLICY_HISTORY],
-    active_transition_count: usize,
+    active: Option<ActivePolicyOrder>,
 }
 
 impl LocalPolicyState {
-    /// Creates empty local state at one rollback-safe baseline tick.
+    /// Creates empty local state at `tick`.
     pub const fn new(tick: u32) -> Self {
         Self {
-            earliest_rollback_tick: tick,
             latest_tick: tick,
             decisions: [None; MAX_POLICY_HISTORY],
             decision_count: 0,
-            active_base: None,
-            active_transitions: [None; MAX_POLICY_HISTORY],
-            active_transition_count: 0,
+            active: None,
         }
-    }
-
-    /// Clears all local policy data and starts a new epoch at `tick`.
-    pub fn reset(&mut self, tick: u32) {
-        *self = Self::new(tick);
-    }
-
-    /// Removes local data newer than `tick` when the bounded journal can prove it.
-    pub fn rollback(&mut self, tick: u32) -> Result<(), LocalPolicyError> {
-        if tick < self.earliest_rollback_tick {
-            return Err(LocalPolicyError::RollbackBeforeHorizon {
-                requested: tick,
-                earliest: self.earliest_rollback_tick,
-            });
-        }
-        let mut kept = [None; MAX_POLICY_HISTORY];
-        let mut count = 0usize;
-        for decision in self.decisions().copied() {
-            if decision.tick <= tick {
-                kept[count] = Some(decision);
-                count += 1;
-            }
-        }
-        self.decisions = kept;
-        self.decision_count = count;
-        self.rollback_active(tick);
-        self.latest_tick = tick;
-        Ok(())
     }
 
     /// Records one decision, evicting the oldest entry at the fixed bound.
@@ -1261,7 +1175,6 @@ impl LocalPolicyState {
         if self.decision_count == MAX_POLICY_HISTORY {
             self.decisions.copy_within(1..MAX_POLICY_HISTORY, 0);
             self.decision_count -= 1;
-            self.earliest_rollback_tick = self.earliest_rollback_tick.max(tick);
         }
         self.decisions[self.decision_count] = Some(PolicyDecision { tick, kind });
         self.decision_count += 1;
@@ -1281,12 +1194,12 @@ impl LocalPolicyState {
             kind,
             target: ActivePolicyTarget::None,
         });
-        self.push_active_transition(ActivePolicyTransition { tick, order });
+        self.active = order;
         self.latest_tick = tick;
         Ok(())
     }
 
-    /// Replaces the active order while retaining its opaque local target semantics.
+    /// Replaces the active order, keeping the move or attack target of `issued`.
     pub fn set_active_order_from_issued(
         &mut self,
         tick: u32,
@@ -1307,7 +1220,7 @@ impl LocalPolicyState {
             kind,
             target,
         });
-        self.push_active_transition(ActivePolicyTransition { tick, order });
+        self.active = order;
         self.latest_tick = tick;
         Ok(())
     }
@@ -1319,7 +1232,7 @@ impl LocalPolicyState {
         order: Option<ActivePolicyOrder>,
     ) -> Result<(), LocalPolicyError> {
         self.check_tick(tick)?;
-        self.push_active_transition(ActivePolicyTransition { tick, order });
+        self.active = order;
         self.latest_tick = tick;
         Ok(())
     }
@@ -1331,17 +1244,9 @@ impl LocalPolicyState {
             .filter_map(Option::as_ref)
     }
 
-    /// Current active order, if local policy state supplies one.
+    /// Current active order.
     pub const fn active_order(&self) -> Option<ActivePolicyOrder> {
-        let mut active = self.active_base;
-        let mut index = 0usize;
-        while index < self.active_transition_count {
-            if let Some(transition) = self.active_transitions[index] {
-                active = transition.order;
-            }
-            index += 1;
-        }
-        active
+        self.active
     }
 
     fn check_tick(&self, tick: u32) -> Result<(), LocalPolicyError> {
@@ -1353,34 +1258,6 @@ impl LocalPolicyState {
         }
         Ok(())
     }
-
-    fn push_active_transition(&mut self, transition: ActivePolicyTransition) {
-        if self.active_transition_count == MAX_POLICY_HISTORY {
-            let evicted = self.active_transitions[0].expect("filled active transition");
-            self.active_base = apply_active_transition(self.active_base, evicted);
-            self.earliest_rollback_tick = self.earliest_rollback_tick.max(evicted.tick);
-            self.active_transitions
-                .copy_within(1..MAX_POLICY_HISTORY, 0);
-            self.active_transition_count -= 1;
-        }
-        self.active_transitions[self.active_transition_count] = Some(transition);
-        self.active_transition_count += 1;
-    }
-
-    fn rollback_active(&mut self, tick: u32) {
-        self.active_transition_count = self.active_transitions[..self.active_transition_count]
-            .iter()
-            .take_while(|entry| entry.is_some_and(|transition| transition.tick <= tick))
-            .count();
-        self.active_transitions[self.active_transition_count..].fill(None);
-    }
-}
-
-const fn apply_active_transition(
-    _active: Option<ActivePolicyOrder>,
-    transition: ActivePolicyTransition,
-) -> Option<ActivePolicyOrder> {
-    transition.order
 }
 
 /// Feature construction failure.
@@ -1397,7 +1274,6 @@ pub enum FeatureError {
     ObservationMismatch { snapshot: u32 },
     ObservationTickNotIncreasing { incoming: u32, latest: u32 },
     ObservationPredecessorMismatch { incoming: u32 },
-    ObservationRollbackBeforeHorizon { requested: u32, earliest: u32 },
     NonFinite,
 }
 
@@ -1444,13 +1320,6 @@ impl fmt::Display for FeatureError {
             Self::ObservationPredecessorMismatch { incoming } => write!(
                 formatter,
                 "feature observation snapshot tick {incoming} does not extend its exact predecessor"
-            ),
-            Self::ObservationRollbackBeforeHorizon {
-                requested,
-                earliest,
-            } => write!(
-                formatter,
-                "feature observation rollback tick {requested} is older than earliest supported tick {earliest}"
             ),
             Self::NonFinite => formatter.write_str("feature encoder produced a non-finite value"),
         }
@@ -1526,14 +1395,10 @@ pub struct FeatureEncoder {
     /// tree index never change for an encoder.
     path_impassable: Vec<bool>,
     observation: std::sync::Arc<FeatureObservationState>,
-    observation_history:
-        [Option<std::sync::Arc<FeatureObservationState>>; MAX_FEATURE_OBSERVATION_HISTORY],
-    observation_history_count: usize,
-    earliest_observation_rollback_tick: Option<u32>,
 }
 
 impl FeatureEncoder {
-    /// Builds bounded static map context from validated public tracker inputs.
+    /// Decodes the static map context of `tracker`'s match.
     pub fn new(tracker: &StateTracker) -> Self {
         let axis = usize::try_from(tracker.metadata().terrain_cells)
             .expect("validated terrain axis fits usize");
@@ -1581,9 +1446,6 @@ impl FeatureEncoder {
             path_exhausted: false,
             path_impassable,
             observation: std::sync::Arc::new(FeatureObservationState::new()),
-            observation_history: std::array::from_fn(|_| None),
-            observation_history_count: 0,
-            earliest_observation_rollback_tick: None,
         }
     }
 
@@ -1620,45 +1482,7 @@ impl FeatureEncoder {
         Ok(())
     }
 
-    /// Restores the newest retained observation at or before `tick`.
-    pub fn rollback(&mut self, tick: u32) -> Result<(), FeatureError> {
-        if let Some(earliest) = self.earliest_observation_rollback_tick
-            && tick < earliest
-        {
-            return Err(FeatureError::ObservationRollbackBeforeHorizon {
-                requested: tick,
-                earliest,
-            });
-        }
-        let kept = self.observation_history[..self.observation_history_count]
-            .iter()
-            .take_while(|entry| {
-                entry
-                    .as_ref()
-                    .is_some_and(|state| state.tick.is_some_and(|t| t <= tick))
-            })
-            .count();
-        self.observation_history_count = kept;
-        self.observation_history[kept..].fill(None);
-        self.observation = self.observation_history[..kept]
-            .iter()
-            .rev()
-            .find_map(|entry| entry.clone())
-            .unwrap_or_else(|| std::sync::Arc::new(FeatureObservationState::new()));
-        self.path_origin = None;
-        Ok(())
-    }
-
-    /// Clears all dynamic observations while retaining the static map allocation.
-    pub fn reset(&mut self) {
-        self.observation = std::sync::Arc::new(FeatureObservationState::new());
-        self.observation_history.fill(None);
-        self.observation_history_count = 0;
-        self.earliest_observation_rollback_tick = None;
-        self.path_origin = None;
-    }
-
-    /// Encodes one fixed frame from seat-safe state and explicit local history.
+    /// Encodes one frame from seat-observable state and local history.
     pub fn encode(
         &mut self,
         tracker: &StateTracker,
@@ -1744,17 +1568,7 @@ impl FeatureEncoder {
     }
 
     fn push_observation(&mut self, observation: std::sync::Arc<FeatureObservationState>) {
-        if self.observation_history_count == MAX_FEATURE_OBSERVATION_HISTORY {
-            self.earliest_observation_rollback_tick = self.observation_history[1]
-                .as_ref()
-                .and_then(|state| state.tick);
-            self.observation_history.rotate_left(1);
-            self.observation_history[MAX_FEATURE_OBSERVATION_HISTORY - 1] = None;
-            self.observation_history_count -= 1;
-        }
-        self.observation = std::sync::Arc::clone(&observation);
-        self.observation_history[self.observation_history_count] = Some(observation);
-        self.observation_history_count += 1;
+        self.observation = observation;
         self.path_origin = None;
     }
 
@@ -2116,7 +1930,7 @@ impl FeatureEncoder {
         ] {
             for slot in 0..count {
                 let item = items.and_then(|items| items.get(slot)).copied().flatten();
-                // Stash rows keep their historical slot numbers after the bag's nine.
+                // Stash rows number their slots after the bag's nine.
                 let slot_token = if location == 1 { first + slot } else { slot };
                 output.items[first + slot] = context.encode(body, location, slot_token, slot, item);
             }
@@ -2396,15 +2210,8 @@ impl FeatureEncoder {
             self.path_origin = None;
             return;
         };
-        if self.path_origin == Some(origin) {
-            let cached = self.path_exhausted
-                || targets.iter().all(|target| {
-                    let packed = *target as u32;
-                    self.path_targets.binary_search(&packed).is_ok()
-                });
-            if cached {
-                return;
-            }
+        if self.path_origin == Some(origin) && self.cached_paths_cover(targets) {
+            return;
         }
         assert!(self.axis <= 1 << 16);
         let axis = self.axis;
@@ -2426,58 +2233,16 @@ impl FeatureEncoder {
             .extend(targets.iter().map(|target| *target as u32));
         self.path_targets.sort_unstable();
         self.path_targets.dedup();
-        let mut pending = self.path_targets.len();
         self.path_exhausted = false;
-        let origin_x = origin % axis;
-        let origin_y = origin / axis;
         distances[origin] = 0;
-        queue.push((origin_y << 16) | origin_x);
-        let mut cursor = 0usize;
-        if pending > 0 {
-            // Neighbour order matches [`MAP_DIRECTIONS`] exactly; the deltas
-            // are row strides computed once, so the inner loop needs one add
-            // per neighbour instead of a multiply.
-            let row = axis as isize;
-            const DIRECTIONS: [(isize, isize); 8] = [
-                (1, 0),
-                (1, 1),
-                (0, 1),
-                (-1, 1),
-                (-1, 0),
-                (-1, -1),
-                (0, -1),
-                (1, -1),
-            ];
-            let deltas: [isize; 8] = [1, row + 1, row, row - 1, -1, -row - 1, -row, -row + 1];
-            while cursor < queue.len() && pending > 0 {
-                let packed = queue[cursor];
-                cursor += 1;
-                let x = (packed & 0xffff) as isize;
-                let y = (packed >> 16) as isize;
-                let cell = y as usize * axis + x as usize;
-                if pending > 0 && self.path_targets.binary_search(&(cell as u32)).is_ok() {
-                    pending -= 1;
-                }
-                let next_distance = distances[cell].saturating_add(1);
-                for (index, (delta_x, delta_y)) in DIRECTIONS.iter().enumerate() {
-                    let next_x = x + delta_x;
-                    let next_y = y + delta_y;
-                    if next_x < 0 || next_y < 0 {
-                        continue;
-                    }
-                    let (next_x, next_y) = (next_x as usize, next_y as usize);
-                    if next_x >= axis || next_y >= axis {
-                        continue;
-                    }
-                    let next = (cell as isize + deltas[index]) as usize;
-                    if impassable[next] || distances[next] != u32::MAX {
-                        continue;
-                    }
-                    distances[next] = next_distance;
-                    queue.push((next_y << 16) | next_x);
-                }
-            }
-        }
+        queue.push(((origin / axis) << 16) | (origin % axis));
+        let (cursor, pending) = flood_fill(
+            axis,
+            &impassable,
+            &self.path_targets,
+            &mut distances,
+            &mut queue,
+        );
         // An exhausted queue proves the whole reachable component is known;
         // with pending targets settled the field is complete for them too.
         self.path_exhausted =
@@ -2485,6 +2250,14 @@ impl FeatureEncoder {
         self.path_distances = distances;
         self.path_queue = queue;
         self.path_impassable = impassable;
+    }
+
+    fn cached_paths_cover(&self, targets: &[usize]) -> bool {
+        self.path_exhausted
+            || targets.iter().all(|target| {
+                let packed = *target as u32;
+                self.path_targets.binary_search(&packed).is_ok()
+            })
     }
 
     fn path_steps(&self, position: Vec2) -> Option<u32> {
@@ -2531,6 +2304,65 @@ impl FeatureEncoder {
         let y = usize::try_from(position.y.to_int() / TERRAIN_CELL_SIZE).ok()?;
         (x < self.axis && y < self.axis).then_some((x, y))
     }
+}
+
+/// Breadth-first 8-neighbour fill from the queued origin until every sorted
+/// `target` cell is settled or the reachable component is exhausted. Queue
+/// entries pack a cell as `y << 16 | x`. Returns the queue cursor and the
+/// number of targets still unsettled.
+fn flood_fill(
+    axis: usize,
+    impassable: &[bool],
+    targets: &[u32],
+    distances: &mut [u32],
+    queue: &mut Vec<usize>,
+) -> (usize, usize) {
+    // Neighbour order matches [`MAP_DIRECTIONS`] exactly; the deltas are row
+    // strides computed once, so the inner loop needs one add per neighbour
+    // instead of a multiply.
+    const DIRECTIONS: [(isize, isize); 8] = [
+        (1, 0),
+        (1, 1),
+        (0, 1),
+        (-1, 1),
+        (-1, 0),
+        (-1, -1),
+        (0, -1),
+        (1, -1),
+    ];
+    let row = axis as isize;
+    let deltas: [isize; 8] = [1, row + 1, row, row - 1, -1, -row - 1, -row, -row + 1];
+    let mut pending = targets.len();
+    let mut cursor = 0usize;
+    while cursor < queue.len() && pending > 0 {
+        let packed = queue[cursor];
+        cursor += 1;
+        let x = (packed & 0xffff) as isize;
+        let y = (packed >> 16) as isize;
+        let cell = y as usize * axis + x as usize;
+        if targets.binary_search(&(cell as u32)).is_ok() {
+            pending -= 1;
+        }
+        let next_distance = distances[cell].saturating_add(1);
+        for (index, (delta_x, delta_y)) in DIRECTIONS.iter().enumerate() {
+            let next_x = x + delta_x;
+            let next_y = y + delta_y;
+            if next_x < 0 || next_y < 0 {
+                continue;
+            }
+            let (next_x, next_y) = (next_x as usize, next_y as usize);
+            if next_x >= axis || next_y >= axis {
+                continue;
+            }
+            let next = (cell as isize + deltas[index]) as usize;
+            if impassable[next] || distances[next] != u32::MAX {
+                continue;
+            }
+            distances[next] = next_distance;
+            queue.push((next_y << 16) | next_x);
+        }
+    }
+    (cursor, pending)
 }
 
 fn validate_map2_reward(tracker: &StateTracker, tick: u32) -> Result<(), FeatureError> {
@@ -3253,7 +3085,7 @@ impl OwnedItemContext<'_> {
     }
 }
 
-/// The historical one-based slot scalar shared by every item row.
+/// One-based slot scalar shared by every item row.
 fn slot_value(slot: usize) -> f32 {
     (slot + 1) as f32 / 64.0
 }

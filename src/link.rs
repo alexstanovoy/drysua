@@ -15,7 +15,7 @@ const MAX_NAME_LEN: usize = 64;
 const MAX_RESOLVED_ADDRESSES: usize = 16;
 const SERVER_IO_TIMEOUT: Duration = Duration::from_secs(300);
 
-/// The seat terms returned by the server.
+/// Seat assignment from the server's Welcome.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Seated {
     /// The connection identity assigned by the server.
@@ -24,7 +24,6 @@ pub struct Seated {
     pub slot: SlotId,
     /// Simulation ticks per second.
     pub tick_rate: u16,
-    /// The server tick advancement mode.
     pub mode: TickMode,
 }
 

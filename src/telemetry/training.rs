@@ -109,7 +109,8 @@ impl Drop for TrainingUpdateTimer {
     }
 }
 
-/// One bounded update record; supplied durations keep accounting independent of the clock.
+/// Timing of one training update; callers supply the durations, so accounting
+/// is independent of the clock.
 pub(crate) struct TrainingUpdateTiming {
     update_index: u64,
     mode: TrainingUpdateMode,

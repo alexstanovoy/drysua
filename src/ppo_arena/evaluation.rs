@@ -1,11 +1,11 @@
 //! Frozen evaluation: one candidate against every pool opponent on both sides of
 //! every seed; no optimizer, no rollout.
 //!
-//! Each game owns its arena seed and its actor RNG streams, both pure functions
-//! of `(seed, seat)`, so every candidate and every opponent meets the same worlds.
-//! Games are statically assigned to pipeline groups and to batch slots, and each
-//! policy row samples with its own RNG, so one argument set always writes
-//! byte-identical output whatever the batch shape.
+//! A game's arena seed depends only on its seed and its actor RNG streams only
+//! on `(seed, seat)`, so every candidate and every opponent meets the same
+//! worlds. Each policy row samples with its own RNG and results are written in
+//! plan order, so one argument set writes byte-identical output whatever the
+//! batch shape.
 
 use std::collections::VecDeque;
 use std::io::Write;
@@ -227,7 +227,7 @@ fn plan_groups(settings: &EvaluationSettings) -> Vec<VecDeque<PlannedGame>> {
     groups
 }
 
-/// Infers one group on this thread while the previous group steps on workers.
+/// Infers each group on this thread while the other groups step on scoped threads.
 fn play_all(
     settings: &EvaluationSettings,
     models: &Models,
@@ -433,13 +433,13 @@ fn choose(
             .collect()
     } else {
         let mut staged: Vec<PpoRng> = rngs.iter().map(|rng| (**rng).clone()).collect();
-        let choices = model
-            .sample_batch(&frames, &spaces, &mut staged)
+        let actions = model
+            .sample_actions(&frames, &spaces, &mut staged)
             .map_err(text_error)?;
         for (rng, next) in rngs.iter_mut().zip(staged) {
             **rng = next;
         }
-        choices.iter().map(|choice| choice.action()).collect()
+        actions
     };
     assert_eq!(actions.len(), indices.len());
     Ok(indices

@@ -1,6 +1,6 @@
 use crate::PpoError;
 
-/// Nondefault execution modes are bound by the canonical checkpoint run scope.
+/// Learner execution options; non-default values are recorded in the checkpoint run scope.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TrainingExecutionOptions {
     /// Spread each epoch's rows across nearly equal minibatches without dropping a tail.
@@ -85,13 +85,13 @@ pub(crate) fn parse_training_microbatch(value: &str) -> Result<usize, &'static s
 /// One opponent kind of the annealed per-game mixture.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AnnealedOpponent {
-    /// The original scripted teacher.
+    /// The scripted teacher.
     Teacher,
     /// The HarassPush rule policy.
     HarassPush,
     /// A rule policy whose style is drawn from its styled preset per game.
     Styled(crate::ScriptKind),
-    /// A strict runtime weights directory, loaded once and never updated.
+    /// A runtime weights directory, loaded once and never updated.
     Weights(std::path::PathBuf),
     /// The actor weights the learner's own seat samples from.
     SelfPlay,

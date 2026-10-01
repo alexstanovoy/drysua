@@ -19,7 +19,7 @@ struct LogPublisher {
     dropped: Arc<AtomicU64>,
 }
 
-// Inline frames bound queue storage without allocating a buffer for each log record.
+// Lines are stored inline, so the bounded queue never allocates per record.
 #[allow(clippy::large_enum_variant)]
 enum LogCommand {
     Line(LogLine),
@@ -60,7 +60,8 @@ impl Write for LogLine {
     }
 }
 
-/// One bounded line builder backed by the process-wide, non-blocking diagnostic queue.
+/// A line builder over the process-wide diagnostic queue; a full queue drops the
+/// line and counts it in the next line's `dropped_logs`.
 pub(crate) struct AsyncLogWriter {
     publisher: Option<LogPublisher>,
     line: LogLine,
@@ -165,7 +166,7 @@ fn spawn_log_writer(
 }
 
 fn drain_logs(receiver: mpsc::Receiver<LogCommand>, mut writer: impl Write) {
-    // The process-wide event loop waits for bounded work until all publishers disconnect.
+    // Runs until every publisher is dropped or a write fails.
     while let Ok(command) = receiver.recv() {
         let result = match command {
             LogCommand::Line(line) => writer.write_all(&line.bytes[..line.length]),

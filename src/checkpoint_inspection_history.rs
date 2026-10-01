@@ -1,19 +1,19 @@
 use super::*;
 
 #[cfg(feature = "builtin")]
-const HISTORY_DIRECTORY: &str = "domain-randomization";
-#[cfg(feature = "builtin")]
-const MAX_SNAPSHOT_BYTES: u64 = 4096;
+use crate::randomization::{MAX_SNAPSHOT_BYTES, RANDOMIZATION_DIRECTORY as HISTORY_DIRECTORY};
+
+/// Generations count updates: one virtual game per update.
+const GAMES_PER_UPDATE: u64 = 1;
 
 pub(super) struct HistoryPlan {
     pub(super) kind: &'static str,
     pub(super) games: Option<u64>,
     pub(super) snapshot_count: u64,
     updates: u64,
-    games_per_update: u64,
     generation_games: u64,
     zero_updates: u64,
-    /// Scale ramp endpoints in basis points; only the builtin feature parses them.
+    /// Scale ramp endpoints in basis points; parsed only with the builtin feature.
     #[cfg(feature = "builtin")]
     scale_start_bp: i32,
     #[cfg(feature = "builtin")]
@@ -31,7 +31,6 @@ pub(super) fn plan(artifact: &TrainingArtifact) -> Result<HistoryPlan, Checkpoin
         games: None,
         snapshot_count: 0,
         updates: 0,
-        games_per_update: 0,
         generation_games: 0,
         zero_updates: 0,
         #[cfg(feature = "builtin")]
@@ -47,8 +46,7 @@ pub(super) fn plan(artifact: &TrainingArtifact) -> Result<HistoryPlan, Checkpoin
             "annealed history inspection requires builtin feature",
         ));
     }
-    // The scope validator has already accepted the canonical ordering. Only the
-    // builtin feature carries the randomization module, so parse the ramp there.
+    // `decode_manifest` has already validated the scope, including the scale flags.
     #[cfg(feature = "builtin")]
     {
         let (_, scale) = crate::randomization::split_scale_scope(command);
@@ -56,12 +54,9 @@ pub(super) fn plan(artifact: &TrainingArtifact) -> Result<HistoryPlan, Checkpoin
         plan.scale_end_bp = scale.end_bp;
     }
     plan.updates = counter(command, "--updates")?;
-    // Generations count updates: one virtual game per update.
-    plan.games_per_update = 1;
     plan.generation_games = counter(command, "--generation-updates")?;
     plan.zero_updates = counter(command, "--zero-updates")?;
     if plan.updates == 0
-        || plan.games_per_update == 0
         || plan.generation_games == 0
         || plan.zero_updates > plan.updates
         || artifact.progress.global_update > plan.updates
@@ -70,13 +65,7 @@ pub(super) fn plan(artifact: &TrainingArtifact) -> Result<HistoryPlan, Checkpoin
             "inspection annealed scope counters",
         ));
     }
-    let games = artifact
-        .progress
-        .global_update
-        .checked_mul(plan.games_per_update)
-        .ok_or(CheckpointError::InvalidManifest(
-            "inspection completed game count",
-        ))?;
+    let games = artifact.progress.global_update * GAMES_PER_UPDATE;
     plan.games = Some(games);
     plan.snapshot_count = artifact.progress.adaptive_environment.map_or_else(
         || games.div_ceil(plan.generation_games),
@@ -202,7 +191,7 @@ fn verify_annealed(
         crate::adaptive_randomization::verify_adaptive_snapshots(
             &directory,
             artifact.run.run_seed,
-            plan.games_per_update,
+            GAMES_PER_UPDATE,
             checkpoint,
             crate::randomization::AnnealScale {
                 start_bp: plan.scale_start_bp,
@@ -239,7 +228,7 @@ fn verify_fixed(
         seed,
         generation,
         plan.generation_games,
-        plan.games_per_update,
+        GAMES_PER_UPDATE,
         schedule,
     )
     .map_err(|error| CheckpointError::Io(format!("snapshot draw verification: {error}")))?;

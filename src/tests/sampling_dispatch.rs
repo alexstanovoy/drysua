@@ -23,7 +23,7 @@ fn sampling_dispatch_rejects_traversed_masked_nonfinite_logits_but_not_unused_he
 
 #[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
 #[test]
-#[ignore = "requires the authorized exclusive CUDA runner"]
+#[ignore = "needs a CUDA device"]
 fn cuda_sampling_dispatch_preserves_eager_bits_and_errors() {
     assert_dispatch_parity(PolicyDevice::Cuda { ordinal: 0 });
     assert_dispatch_errors(PolicyDevice::Cuda { ordinal: 0 });
@@ -235,10 +235,43 @@ fn assert_dispatch_errors(device: PolicyDevice) {
             operation();
         }
     }
-    let prefixes = [crate::TrainingPrefix::new(ActionKind::Continue, None, None)];
-    let Err(error) = model.training_forward(&frames[..1], &prefixes) else {
-        panic!("training must still validate unused conditional heads");
+    assert_learner_rejects_skipped_overflow(&model, &frames[0], &spaces[0]);
+}
+
+/// The learner evaluates every head, so it rejects the overflow inference skipped.
+fn assert_learner_rejects_skipped_overflow(
+    model: &PolicyModel,
+    frame: &FeatureFrame,
+    space: &ActionSpace,
+) {
+    let mut random = [PpoRng::new(seed_for_kind(ActionKind::Continue))];
+    let choice = model
+        .sample_batch(
+            std::slice::from_ref(frame),
+            std::slice::from_ref(space),
+            &mut random,
+        )
+        .expect("skipped overflow")
+        .remove(0);
+    assert_eq!(choice.action().kind(), ActionKind::Continue);
+    let outcome = crate::PpoOutcome {
+        stream: 0,
+        decision: 0,
+        ticks: 3,
+        next_value: 0.0,
+        reward: 1.0,
+        terminal: true,
     };
+    let sample = crate::PpoPreparedSample {
+        transition: choice.finish(0, outcome).expect("transition"),
+        advantage: 1.0,
+        return_value: 1.0,
+    };
+    let config = crate::PpoConfig::default();
+    let mut adam = model.claim_optimizer(config.adam()).expect("optimizer");
+    let error = model
+        .ppo_update(&[&sample], &mut adam, config)
+        .expect_err("learner validates every head");
     assert_eq!(error.to_string(), controlled_overflow());
 }
 

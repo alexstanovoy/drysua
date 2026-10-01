@@ -1,7 +1,4 @@
-//! Shared harness code for the pinned-initialization and fixture tests.
-//!
-//! Every helper here preserves the exact checks each call site performed before
-//! consolidation; only the duplication was removed.
+//! Shared test harness: an in-memory match connection and bit-exact model checks.
 
 use std::collections::VecDeque;
 

@@ -93,7 +93,7 @@ impl TrainingGuidance {
     }
 }
 
-/// The exact decimal coefficient at `update`, then its nearest `f32`.
+/// The coefficient at `update`, interpolated in millionths (truncated), then as `f32`.
 #[allow(
     clippy::float_arithmetic,
     reason = "the exact millionths become the loss weight once"

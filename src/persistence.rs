@@ -169,11 +169,6 @@ impl OrderPersistence {
         self.bodies.iter_mut().any(|body| body.reject(sequence))
     }
 
-    /// Clears both body orders after external observation proves they are no longer active.
-    pub fn clear_body(&mut self) {
-        self.bodies = [BodyOrderState::default(); 2];
-    }
-
     /// Clears one controlled body's order after external lifecycle evidence invalidates it.
     pub fn clear_body_for(&mut self, unit: Option<EntityId>) {
         let index = body_index(unit);
@@ -234,30 +229,30 @@ impl OrderPersistence {
 
 /// Records both ledgers; true preserves the candidate hero's active state and rollback.
 pub(crate) fn record_sent_for_policy(
-    legacy: &mut OrderPersistence,
+    requests: &mut OrderPersistence,
     neural: &mut Option<OrderPersistence>,
     sequence: u32,
     issued: IssuedOrder,
     tracker: &StateTracker,
 ) -> Result<bool, PersistenceError> {
-    record_sent_for_ledgers(legacy, neural.as_mut(), sequence, issued, tracker)
+    record_sent_for_ledgers(requests, neural.as_mut(), sequence, issued, tracker)
 }
 
 fn record_sent_for_ledgers(
-    legacy: &mut OrderPersistence,
+    requests: &mut OrderPersistence,
     neural: Option<&mut OrderPersistence>,
     sequence: u32,
     issued: IssuedOrder,
     tracker: &StateTracker,
 ) -> Result<bool, PersistenceError> {
     let preserves = if let Some(neural) = neural {
-        assert_eq!(legacy.last_sequence(), neural.last_sequence());
+        assert_eq!(requests.last_sequence(), neural.last_sequence());
         neural.record_neural_sent(sequence, issued, tracker)?
     } else {
         false
     };
-    legacy.record_sent(sequence, issued)?;
-    assert_eq!(legacy.last_sequence(), Some(sequence));
+    requests.record_sent(sequence, issued)?;
+    assert_eq!(requests.last_sequence(), Some(sequence));
     Ok(preserves)
 }
 

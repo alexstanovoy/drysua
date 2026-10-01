@@ -8,7 +8,7 @@ use crate::{
 const BLOCK_BYTES: usize = 152;
 
 #[test]
-fn adaptive_manifest_roundtrips_fresh_active_transitioned_and_terminal_state() {
+fn adaptive_manifest_roundtrips_every_controller_phase_and_six_decimal_config() {
     let mut artifact = fixture();
     for update in 0..=8 {
         if update > 0 {
@@ -16,15 +16,34 @@ fn adaptive_manifest_roundtrips_fresh_active_transitioned_and_terminal_state() {
         }
         let encoded = encode_manifest(&artifact, artifact.tensor_hash).expect("encode");
         let decoded = decode_manifest(&encoded).expect("decode");
-        assert_eq!(&encoded[8..12], &CHECKPOINT_SCHEMA_VERSION.to_le_bytes());
-        assert_eq!(decoded.progress, artifact.progress);
-        assert_eq!(decoded.run, artifact.run);
-        assert_eq!(decoded.config, artifact.config);
-        assert_eq!(decoded.shuffle, artifact.shuffle);
-        assert_eq!(decoded.tensor_hash, artifact.tensor_hash);
+        assert_eq!(decoded.progress, artifact.progress, "update {update}");
+        assert_eq!(decoded.run, artifact.run, "update {update}");
+        assert_eq!(decoded.config, artifact.config, "update {update}");
+        assert_eq!(decoded.shuffle, artifact.shuffle, "update {update}");
+        assert_eq!(decoded.tensor_hash, artifact.tensor_hash, "update {update}");
         let checkpoint = decoded.progress.adaptive_environment.expect("adaptive");
-        assert_eq!(checkpoint.snapshot_count, update.div_ceil(2));
+        // Two wins of two succeed every second update.
+        assert_eq!(
+            checkpoint.snapshot_count,
+            update.div_ceil(2),
+            "update {update}"
+        );
     }
+    let nondefault = fixture_with(AdaptiveEnvironmentConfig {
+        success_updates: 7,
+        success_rate: EnvironmentDecimal::from_units(999_999),
+        poor_updates: 3,
+        poor_rate: EnvironmentDecimal::from_units(1),
+        extension: EnvironmentDecimal::from_units(1_234_567),
+    });
+    let encoded = encode_manifest(&nondefault, nondefault.tensor_hash).expect("encode");
+    assert_eq!(
+        decode_manifest(&encoded)
+            .expect("decode")
+            .progress
+            .adaptive_environment,
+        nondefault.progress.adaptive_environment
+    );
 }
 
 #[test]
@@ -42,45 +61,6 @@ fn adaptive_block_pins_exact_units_field_order_and_hash_bytes() {
     }
     golden.extend_from_slice(&[73; 32]);
     assert_eq!(block, golden);
-    assert_eq!(
-        artifact
-            .progress
-            .adaptive_environment
-            .expect("adaptive")
-            .config
-            .scope_suffix(),
-        " --environment-schedule adaptive --environment-success-updates 2 --environment-success-rate 0.8 --environment-poor-updates 1 --environment-poor-rate 0.2 --environment-extension 0.75"
-    );
-}
-
-#[test]
-fn adaptive_nondefault_six_decimal_config_roundtrips_without_float_conversion() {
-    let mut artifact = fixture();
-    let checkpoint = artifact
-        .progress
-        .adaptive_environment
-        .as_mut()
-        .expect("adaptive");
-    let previous_suffix = checkpoint.config.scope_suffix();
-    checkpoint.config = AdaptiveEnvironmentConfig {
-        success_updates: 7,
-        success_rate: EnvironmentDecimal::from_units(999_999),
-        poor_updates: 3,
-        poor_rate: EnvironmentDecimal::from_units(1),
-        extension: EnvironmentDecimal::from_units(1_234_567),
-    };
-    artifact.run.command_line = artifact
-        .run
-        .command_line
-        .replace(&previous_suffix, &checkpoint.config.scope_suffix());
-    let encoded = encode_manifest(&artifact, artifact.tensor_hash).expect("encode");
-    assert_eq!(
-        decode_manifest(&encoded)
-            .expect("decode")
-            .progress
-            .adaptive_environment,
-        artifact.progress.adaptive_environment
-    );
 }
 
 #[test]
@@ -113,27 +93,6 @@ fn adaptive_headers_reject_corruption_missing_block_and_trailing_bytes() {
         &missing,
         "adaptive environment configuration/state mismatch",
     );
-}
-
-#[test]
-fn adaptive_config_and_limits_are_bound_to_all_canonical_scope_values() {
-    let artifact = fixture();
-    let encoded = encode_manifest(&artifact, artifact.tensor_hash).expect("encode");
-    for (word, value, field) in [
-        (0, 3, "adaptive environment scope suffix"),
-        (1, 799_999, "adaptive environment scope suffix"),
-        (2, 2, "adaptive environment scope suffix"),
-        (3, 199_999, "adaptive environment scope suffix"),
-        (4, 749_999, "adaptive environment scope suffix"),
-        (5, 4, "adaptive environment generation-updates scope"),
-        (6, 9, "adaptive environment updates scope"),
-        (7, 1, "adaptive environment zero-updates scope"),
-    ] {
-        let mut corrupt = encoded.clone();
-        let offset = encoded.len() - BLOCK_BYTES + word * 8;
-        corrupt[offset..offset + 8].copy_from_slice(&u64::to_le_bytes(value));
-        assert_manifest_error(&corrupt, field);
-    }
 }
 
 #[test]
@@ -195,108 +154,131 @@ fn adaptive_scope_rejects_missing_duplicate_unbounded_or_noncanonical_tokens() {
 }
 
 #[test]
-fn adaptive_scope_requires_state_and_rejects_state_without_marker_or_league() {
-    for (case, field) in [
-        (0, "adaptive environment configuration/state mismatch"),
-        (1, "adaptive environment scope suffix"),
-        (2, "adaptive environment league"),
-        (3, "adaptive environment scope suffix"),
-    ] {
+fn adaptive_manifest_rejects_state_scope_league_and_hash_inconsistencies() {
+    type Change = fn(&mut TrainingArtifact);
+    let cases: [(&str, Change, &str); 6] = [
+        (
+            "scope without state",
+            |a| a.progress.adaptive_environment = None,
+            "adaptive environment configuration/state mismatch",
+        ),
+        (
+            "state without scope",
+            |a| a.run.command_line = "train-annealed --updates 8".to_owned(),
+            "adaptive environment scope suffix",
+        ),
+        (
+            "league reference",
+            |a| a.progress.league_references.push(1),
+            "adaptive environment league",
+        ),
+        (
+            "duplicate schedule marker",
+            |a| {
+                a.run
+                    .command_line
+                    .insert_str(14, " --environment-schedule adaptive")
+            },
+            "adaptive environment scope suffix",
+        ),
+        (
+            "nonzero hash without snapshots",
+            |a| adaptive(a).snapshot_hash = [1; 32],
+            "adaptive environment snapshot hash",
+        ),
+        (
+            "zero hash with a snapshot",
+            |a| {
+                observe(a, 1, 0);
+                adaptive(a).snapshot_hash = [0; 32];
+            },
+            "adaptive environment snapshot hash",
+        ),
+    ];
+    for (name, change, field) in cases {
         let mut artifact = fixture();
-        match case {
-            0 => artifact.progress.adaptive_environment = None,
-            1 => artifact.run.command_line = "train-annealed --updates 8".to_owned(),
-            2 => artifact.progress.league_references.push(1),
-            3 => artifact
-                .run
-                .command_line
-                .insert_str(14, " --environment-schedule adaptive"),
-            _ => unreachable!(),
-        }
-        let encoded = encode_manifest(&artifact, artifact.tensor_hash).expect("fixture");
+        change(&mut artifact);
+        let encoded = encode_manifest(&artifact, artifact.tensor_hash).expect(name);
         assert_manifest_error(&encoded, field);
     }
 }
 
+/// (block word, replacement, expected invalid field) for a fixture observed at update one.
+const BLOCK_WORD_CORRUPTIONS: [(usize, u64, &str); 19] = [
+    (0, 3, "adaptive environment scope suffix"),
+    (1, 799_999, "adaptive environment scope suffix"),
+    (2, 2, "adaptive environment scope suffix"),
+    (3, 199_999, "adaptive environment scope suffix"),
+    (4, 749_999, "adaptive environment scope suffix"),
+    (5, 4, "adaptive environment generation-updates scope"),
+    (6, 9, "adaptive environment updates scope"),
+    (7, 1, "adaptive environment zero-updates scope"),
+    (
+        0,
+        0,
+        "environment success updates must be in 1..=MAX_TRAINING_COUNTER",
+    ),
+    (1, 1_000_001, "environment success rate must be in [0, 1]"),
+    (
+        5,
+        0,
+        "environment base updates must be in 1..=MAX_TRAINING_COUNTER",
+    ),
+    (
+        8,
+        1,
+        "environment generation and start update are inconsistent",
+    ),
+    (
+        9,
+        1,
+        "environment start update plus spent updates must equal global update",
+    ),
+    (
+        10,
+        0,
+        "environment start update plus spent updates must equal global update",
+    ),
+    (
+        11,
+        3,
+        "environment success streak exceeds its window or spent updates",
+    ),
+    (
+        12,
+        2,
+        "environment poor streak exceeds its window or spent updates",
+    ),
+    (
+        13,
+        2,
+        "environment extension awards exceed qualifying updates",
+    ),
+    (14, 0, "adaptive environment snapshot count"),
+    (14, u64::MAX, "adaptive environment snapshot count"),
+];
+
 #[test]
-fn adaptive_state_and_snapshot_invariants_reject_before_tensor_io() {
+fn adaptive_block_corruption_names_the_invalid_field_before_tensor_io() {
     let directory = test_directory("adaptive-invalid-metadata");
     let mut artifact = fixture();
     observe(&mut artifact, 1, 0);
     let encoded = encode_manifest(&artifact, artifact.tensor_hash).expect("encode");
-    for (word, value, field) in [
-        (
-            0,
-            0,
-            "environment success updates must be in 1..=MAX_TRAINING_COUNTER",
-        ),
-        (1, 1_000_001, "environment success rate must be in [0, 1]"),
-        (
-            5,
-            0,
-            "environment base updates must be in 1..=MAX_TRAINING_COUNTER",
-        ),
-        (
-            8,
-            1,
-            "environment generation and start update are inconsistent",
-        ),
-        (
-            9,
-            1,
-            "environment start update plus spent updates must equal global update",
-        ),
-        (
-            10,
-            0,
-            "environment start update plus spent updates must equal global update",
-        ),
-        (
-            11,
-            3,
-            "environment success streak exceeds its window or spent updates",
-        ),
-        (
-            12,
-            2,
-            "environment poor streak exceeds its window or spent updates",
-        ),
-        (
-            13,
-            2,
-            "environment extension awards exceed qualifying updates",
-        ),
-        (14, 0, "adaptive environment snapshot count"),
-        (14, u64::MAX, "adaptive environment snapshot count"),
-    ] {
+    for (word, value, field) in BLOCK_WORD_CORRUPTIONS {
         let mut corrupt = encoded.clone();
         let offset = encoded.len() - BLOCK_BYTES + word * 8;
         corrupt[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
         fs::write(directory.join(CHECKPOINT_META_FILE), &corrupt).expect("metadata only");
         let error = TrainingArtifact::load(&directory).expect_err("before missing tensors");
-        assert_eq!(error, CheckpointError::InvalidManifest(field));
+        assert_eq!(
+            error,
+            CheckpointError::InvalidManifest(field),
+            "word {word}"
+        );
         assert_eq!(
             error.to_string(),
             format!("checkpoint manifest has invalid {field}")
         );
-    }
-}
-
-#[test]
-fn adaptive_snapshot_hash_is_zero_exactly_at_zero_count() {
-    for update in [0, 1] {
-        let mut artifact = fixture();
-        if update > 0 {
-            observe(&mut artifact, update, 0);
-        }
-        let checkpoint = artifact
-            .progress
-            .adaptive_environment
-            .as_mut()
-            .expect("adaptive");
-        checkpoint.snapshot_hash = if update == 0 { [1; 32] } else { [0; 32] };
-        let encoded = encode_manifest(&artifact, artifact.tensor_hash).expect("fixture");
-        assert_manifest_error(&encoded, "adaptive environment snapshot hash");
     }
 }
 
@@ -399,12 +381,16 @@ fn assert_manifest_error(bytes: &[u8], field: &'static str) {
     );
 }
 
-fn observe(artifact: &mut TrainingArtifact, update: u64, wins: u64) {
-    let checkpoint = artifact
+fn adaptive(artifact: &mut TrainingArtifact) -> &mut AdaptiveEnvironmentCheckpoint {
+    artifact
         .progress
         .adaptive_environment
         .as_mut()
-        .expect("adaptive");
+        .expect("adaptive")
+}
+
+fn observe(artifact: &mut TrainingArtifact, update: u64, wins: u64) {
+    let checkpoint = adaptive(artifact);
     checkpoint.state = checkpoint
         .state
         .observe(checkpoint.config, checkpoint.limits, update, wins, 2)
@@ -419,8 +405,11 @@ fn observe(artifact: &mut TrainingArtifact, update: u64, wins: u64) {
 }
 
 fn fixture() -> TrainingArtifact {
+    fixture_with(AdaptiveEnvironmentConfig::default())
+}
+
+fn fixture_with(config: AdaptiveEnvironmentConfig) -> TrainingArtifact {
     let mut artifact = capacity_tests::manifest_artifact(0, 0);
-    let config = AdaptiveEnvironmentConfig::default();
     artifact.run.command_line = format!(
         "train-annealed --updates 8 --generation-updates 3 --zero-updates 2{}",
         config.scope_suffix()

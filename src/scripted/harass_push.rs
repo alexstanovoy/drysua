@@ -1,22 +1,17 @@
 //! Shadow Fiend rule policy that holds the lane against Teacher and pushes its tower.
 //!
-//! Evidence from `drysua duel` shaped every rule here. Nearly every game ends by a tower, and
-//! Teacher's hero dealt most of the damage to ours while our hero was home or walking back:
 //! Teacher never walks into tower range while an enemy hero stands within 1200, so presence
-//! is the defense. Trades were even, but Teacher stays until 40% health and we went home.
-//! HarassPush therefore:
+//! is the tower's defense, and Teacher stays in lane down to 40% health. HarassPush therefore:
 //! - keeps four Healing Salves and four Clarities, restocked at the home shop, and counts an
-//!   active salve as health when deciding to stop walking home (without them it wins 55%
-//!   instead of 90%);
+//!   active salve as health when deciding to stop walking home;
 //! - hovers at 1200 from Teacher, outside its raze reach and inside its push veto, and keeps
 //!   a hero that vanished into fog where it was last seen;
 //! - fights only for a kill, when Teacher lacks raze mana (attacking it then, since it can
 //!   only answer with attacks), or when Teacher sieges our tower and a raze pair is ready;
-//!   forcing Teacher home with raze trades gained nothing;
 //! - razes only once its facing has settled on the target (a turning hero sweeps 32 degrees a
 //!   tick, and a raze fires along the facing at resolution time);
-//! - with Teacher away, hits the tower once one of its creeps tanks it;
-//! - never idles in enemy tower range, backs off when bleeding, and walks home below 30%
+//! - with Teacher away, hits the tower once one of its own creeps tanks it;
+//! - never idles in enemy tower range, backs off when bleeding, and walks home at 30%
 //!   health.
 //!
 //! [`STYLE_KNOBS`] turns these choices into seeded styles for training opponents. Every
@@ -93,7 +88,7 @@ const RETREAT_KNOB: Knob = Knob::new("retreat", 30, (5, 60), (10, 40));
 /// oscillation.
 const RETURN_KNOB: Knob = Knob::new("return", 80, (10, 100), (45, 90));
 /// Distance kept from an enemy hero: outside its raze reach and at the edge of the 1200
-/// within which Teacher neither chases the hero nor walks into our tower's range.
+/// within which Teacher does not walk into our tower's range.
 const HOVER_KNOB: Knob = Knob::new("hover", 1_200, (600, 1_600), (900, 1_400));
 
 /// Style knobs after the shared noise knobs; defaults are the canonical HarassPush.
@@ -106,7 +101,7 @@ pub(crate) const STYLE_KNOBS: [Knob; 9] = [
     HOVER_KNOB,
     // Also fights when the ready razes leave the enemy at or below this health share
     // (Teacher walks home at 40%); 0 fights only for kills, unarmed enemies and tower
-    // defense, which won more than forcing Teacher home.
+    // defense.
     Knob::new("engage", 0, (0, 100), (0, 70)),
     // Own creeps that must tank the enemy tower before the hero hits it; 9 never pushes.
     Knob::new("tanks", 1, (0, 9), (1, 4)),
@@ -167,12 +162,6 @@ pub struct HarassPush {
 }
 
 impl HarassPush {
-    /// Creates a canonical policy with empty per-match memory.
-    pub fn new() -> Self {
-        Self::with_style(HarassStyle::default())
-    }
-
-    /// Creates a policy of one drawn style with empty per-match memory.
     pub const fn with_style(style: HarassStyle) -> Self {
         Self {
             style,
@@ -184,7 +173,7 @@ impl HarassPush {
         }
     }
 
-    /// Selects an action and returns the exact action space used to select it.
+    /// Returns the selected action together with the action space it was selected in.
     pub fn decide(
         &mut self,
         tracker: &StateTracker,
@@ -283,7 +272,7 @@ impl HarassPush {
             enemy.or_else(|| remembered_enemy_hero(tracker, hero.pos, self.style.memory_ticks));
         let action = learn(hero, space, self.style.razes_first)
             .or_else(|| turn.restock())
-            // Drinks a salve or clarity once no hit would break the drink.
+            // Uses sustain items; salves and clarities only when no hit should break the drink.
             .or_else(|| select_sustain(tracker, space, self.retreating, &GoalProgress::new()))
             .or_else(|| {
                 let free = self.retreating || fight.is_some();
@@ -395,8 +384,9 @@ struct Turn<'a> {
 }
 
 impl Turn<'_> {
-    /// Fights away from the enemy tower while healthy when the ready razes force Teacher home
-    /// or kill it, when it lacks raze mana, or when it sieges our tower and a raze pair is ready.
+    /// Fights away from enemy towers while healthy when the ready razes kill the enemy or leave
+    /// it at or below the `engage` share, when it lacks raze mana, or when it sieges our tower
+    /// and a raze pair is ready.
     fn wants_fight(&self, enemy: &UnitView) -> bool {
         let (tracker, hero) = (self.tracker, self.hero);
         if enemy_tower_danger(tracker, enemy.pos, hero.bound)
@@ -479,10 +469,8 @@ impl Turn<'_> {
             .or_else(|| self.move_towards(post, true))
     }
 
-    /// Tops up Healing Salves, then Clarities, while standing in the home shop.
-    ///
-    /// Sustain is what keeps the hero in lane: without it every trade ended in a walk home,
-    /// and Teacher pushed the tower meanwhile.
+    /// Tops up Healing Salves, then Clarities, while standing in the home shop. Sustain keeps
+    /// the hero in lane; without it every trade ends in a walk home while Teacher pushes.
     fn restock(&self) -> Option<StructuredAction> {
         let (hero, space) = (self.hero, self.space);
         if !hero
@@ -593,9 +581,7 @@ impl Turn<'_> {
     }
 
     /// Walks to the safe candidate scoring lowest, if that improves on standing still.
-    ///
-    /// Re-targeting every decision is deliberate: keeping a running walk measurably kept the
-    /// hero out of Teacher's raze bait and cut kill wins from 116 to 13 in 200 games.
+    /// Re-targets every decision: keeping a running walk instead cost most kill wins in duels.
     fn walk(&self, score: impl Fn(Vec2) -> i32, attack: bool) -> Option<StructuredAction> {
         let (best, point) = self.safe_point(&score)?;
         if best + PROGRESS_SLACK >= score(self.hero.pos) {
@@ -692,7 +678,7 @@ fn own_burst(space: &ActionSpace, hero: &UnitView, enemy: &UnitView) -> (i32, us
     (damage.saturating_add(attack), razes)
 }
 
-/// Whether the enemy lacks the mana for even one raze at its level.
+/// Whether the enemy lacks the mana for one raze at the highest level its hero level allows.
 fn unarmed(enemy: &UnitView) -> bool {
     let index = usize::from(enemy.level.saturating_add(1) / 2).clamp(1, 4) - 1;
     enemy.mana < RAZE_MANA[index]
@@ -772,7 +758,8 @@ fn carried(hero: &UnitView, item: ItemId) -> i32 {
         .sum()
 }
 
-/// Health an active salve still mends; the hero counts it as already healed.
+/// Health an active salve still mends, taking any Mending effect for a salve; the hero counts
+/// it as already healed.
 fn pending_heal(hero: &UnitView) -> i32 {
     hero.effects
         .iter()

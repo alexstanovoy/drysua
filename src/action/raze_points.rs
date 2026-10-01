@@ -3,8 +3,8 @@
 //!
 //! A raze point only chooses a heading: the landing sits at the raze's fixed
 //! reach on the line toward the point. These candidates follow the general ones
-//! and are legal only as raze targets, so movement and item targeting keep
-//! exactly the general candidates.
+//! and are legal only as raze targets, so movement and item targeting see only
+//! the general candidates.
 
 use bota_proto::{EntityId, Fixed, StatusFlags, Team, UnitKind, UnitView, Vec2, WorldView};
 
@@ -48,7 +48,8 @@ pub struct RazeCoverage {
 }
 
 impl RazeCoverage {
-    /// Coverage of a point that gives the raze no heading or lies beyond the caster's view.
+    /// No units struck: every point's coverage while the hero is dead, and that of
+    /// a point at the hero's own position.
     pub const NONE: Self = Self {
         units: 0,
         heroes: 0,
@@ -66,7 +67,7 @@ pub(super) struct RazeTarget {
     hero: bool,
 }
 
-/// The own hero while it could ever cast a raze.
+/// The own hero, if alive.
 pub(super) fn raze_caster(tracker: &StateTracker) -> Option<&UnitView> {
     tracker.own_hero().filter(|hero| hero.hp > 0)
 }
