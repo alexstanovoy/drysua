@@ -109,7 +109,14 @@ struct LaneModels {
     snapshots: Vec<PolicyModel>,
     /// League milestones the current mixture or any live game still plays.
     league: BTreeMap<u64, PolicyModel>,
+    /// Retired league replicas, reloaded in place for the next milestones: a
+    /// fresh replica allocated mid-run would pin a chunk of the shared CUDA
+    /// memory pool, so the pool's footprint would creep with every milestone.
+    spare: Vec<PolicyModel>,
 }
+
+/// Retired league replicas a lane keeps for reuse.
+const MAX_SPARE_REPLICAS: usize = 16;
 
 impl LaneModels {
     fn new(settings: &LaneSettings, config: &PartConfig) -> Result<Self, PpoError> {
@@ -124,6 +131,7 @@ impl LaneModels {
                 .map(|parameters| load_model(device, parameters))
                 .collect::<Result<_, _>>()?,
             league: BTreeMap::new(),
+            spare: Vec::new(),
         };
         models.add_league(&settings.league)?;
         models.add_league(&config.league)?;
@@ -137,20 +145,30 @@ impl LaneModels {
                 .map_err(text_error)?;
             self.version = config.version;
         }
-        self.add_league(&config.league)?;
-        self.league.retain(|milestone, _| {
-            config.league.iter().any(|(member, _)| member == milestone)
-                || slots
-                    .iter()
-                    .any(|slot| slot.plan.opponent == OpponentKind::League(*milestone))
-        });
-        Ok(())
+        let retired = self
+            .league
+            .extract_if(.., |milestone, _| {
+                !config.league.iter().any(|(member, _)| member == milestone)
+                    && !slots
+                        .iter()
+                        .any(|slot| slot.plan.opponent == OpponentKind::League(*milestone))
+            })
+            .map(|(_, model)| model);
+        self.spare.extend(retired);
+        self.spare.truncate(MAX_SPARE_REPLICAS);
+        self.add_league(&config.league)
     }
 
     fn add_league(&mut self, league: &LeagueWeights) -> Result<(), PpoError> {
         for (milestone, parameters) in league {
             if !self.league.contains_key(milestone) {
-                let model = load_model(self.device, parameters)?;
+                let model = match self.spare.pop() {
+                    Some(model) => {
+                        model.import_parameters(parameters).map_err(text_error)?;
+                        model
+                    }
+                    None => load_model(self.device, parameters)?,
+                };
                 self.league.insert(*milestone, model);
             }
         }

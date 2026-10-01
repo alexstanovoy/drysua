@@ -119,6 +119,13 @@ exceeds `--target-kl`, and taken steps are kept. Imitation and critic warm-up
 change only the loss, so they work the same under either guard. The
 loss definitions live only in `src/model/ppo_objective.rs`.
 
+Device memory: lanes and the learner share the device's stream-ordered
+memory pool. After each update the learner trims the pool's free blocks back
+to the driver and logs `event=device_memory` with the pool's reserved and live
+MiB; lanes reload retired league replicas in place instead of allocating new
+ones. Without both, interleaved long-lived and transient blocks kept freed
+memory reserved and the pool footprint crept up over a session.
+
 ## What changed numerically
 
 - PPO is 1-stale: the importance ratio uses the stored behaviour log-probability,
