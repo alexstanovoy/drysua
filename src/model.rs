@@ -1072,6 +1072,68 @@ fn cuda_device(ordinal: usize) -> Result<Device, ModelError> {
     Ok(device)
 }
 
+/// Bytes the device memory pool holds and the bytes of it in live tensors.
+#[cfg(feature = "builtin")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DevicePoolUsage {
+    pub reserved: u64,
+    pub used: u64,
+}
+
+/// Returns the device memory pool's free blocks to the driver and reports
+/// what the pool still holds.
+///
+/// candle allocates from the device's default stream-ordered pool, which
+/// every lane and the learner share. The learner's large transient blocks get
+/// interleaved with longer-lived ones, so freed memory stays reserved in
+/// partly used chunks and the pool's footprint creeps up update after update
+/// while live memory stays flat. Trimming once per update bounds it.
+#[cfg(all(
+    feature = "builtin",
+    feature = "cuda",
+    any(target_os = "linux", target_os = "windows")
+))]
+fn trim_cuda_pool(device: &Device) -> Result<DevicePoolUsage, ModelError> {
+    use candle_core::cuda_backend::cudarc::driver::sys;
+    let cuda = device.as_cuda_device()?;
+    // Frees enqueued on this thread's stream must complete to be releasable.
+    device.synchronize()?;
+    let context = cuda.cuda_stream().context().clone();
+    context
+        .bind_to_thread()
+        .map_err(|error| ModelError::Backend(error.to_string()))?;
+    let check = |result: sys::CUresult| match result {
+        sys::cudaError_enum::CUDA_SUCCESS => Ok(()),
+        error => Err(ModelError::Backend(format!("CUDA memory pool: {error:?}"))),
+    };
+    let mut pool = std::ptr::null_mut();
+    let mut usage = [0_u64; 2];
+    // SAFETY: plain driver calls on the bound context's device; the pool is
+    // the device's default pool, which outlives the calls, and each attribute
+    // is a u64 written into its own element.
+    unsafe {
+        check(sys::cuDeviceGetDefaultMemPool(
+            &mut pool,
+            context.cu_device(),
+        ))?;
+        check(sys::cuMemPoolTrimTo(pool, 0))?;
+        for (value, attribute) in usage.iter_mut().zip([
+            sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT,
+            sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_USED_MEM_CURRENT,
+        ]) {
+            check(sys::cuMemPoolGetAttribute(
+                pool,
+                attribute,
+                std::ptr::from_mut(value).cast(),
+            ))?;
+        }
+    }
+    Ok(DevicePoolUsage {
+        reserved: usage[0],
+        used: usage[1],
+    })
+}
+
 /// F32 DeepSets policy with an autoregressive masked decoder.
 pub struct PolicyModel {
     dire: side_actors::ActorHeads,
@@ -1231,6 +1293,17 @@ impl PolicyModel {
 
     fn tensor_device(&self) -> &Device {
         &self.tensor_device
+    }
+
+    /// Returns cached free device memory to the driver and reports the pool's
+    /// remaining footprint; see [`trim_cuda_pool`]. Nothing on the CPU.
+    #[cfg(feature = "builtin")]
+    pub(crate) fn release_cached_memory(&self) -> Result<Option<DevicePoolUsage>, ModelError> {
+        match self.device_kind {
+            PolicyDevice::Cpu => Ok(None),
+            #[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
+            PolicyDevice::Cuda { .. } => trim_cuda_pool(&self.tensor_device).map(Some),
+        }
     }
 
     /// Returns the process-local lineage and exact current parameter revision.
