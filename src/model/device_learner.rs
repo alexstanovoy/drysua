@@ -386,15 +386,20 @@ impl PolicyModel {
             let probe = side_actors::training_finite_probe(&output)?;
             let terms = ppo_loss(&output, shadow.as_ref(), &inputs.targets, objective, total)?;
             let store = terms.loss.backward()?;
+            // Gradients and sums are detached: a tracked one keeps this
+            // microbatch's whole graph, activations included, alive through
+            // the next microbatch and the candidate pass.
             for (total, parameter) in gradients.iter_mut().zip(&parameters) {
                 if let Some(gradient) = store.get(parameter.value.as_tensor()) {
+                    let gradient = gradient.detach();
                     *total = Some(match total.take() {
-                        None => gradient.clone(),
+                        None => gradient,
                         Some(sum) => (sum + gradient)?,
                     });
                 }
             }
-            let terms = Tensor::cat(&[terms.sums, probe.reshape(1)?], 0)?;
+            drop(store);
+            let terms = Tensor::cat(&[terms.sums.detach(), probe.detach().reshape(1)?], 0)?;
             sums = Some(match sums {
                 None => terms,
                 Some(sum) => (sum + terms)?,
