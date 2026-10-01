@@ -120,6 +120,35 @@ parameters.
 CUDA contract test (ignored by default):
 `cargo test --release --features builtin,cuda model::side_actor_tests::cuda_side_actors_preserve_routing_gradients_and_ppo_rollback -- --exact --ignored`.
 
+### Side networks
+
+`--side-networks` picks the layout (`src/model/side_networks.rs`); it is recorded in
+the run scope, so a resume cannot switch it.
+
+- `shared` (default): the layout above, bit-identical to the model before the flag.
+- `separate`: two complete networks, Radiant then Dire (3,783,400 parameters in
+  128 tensors). The Radiant network carries the 64 network tensor names of the
+  shared layout, the Dire network the same names under `dire.`; neither has the
+  other side's heads. Observations stay team-canonical; a row's observed side
+  picks its network. Inference splits a batch by side and runs each network
+  once on its rows (no per-row loop; a missing side is skipped). The learner
+  gathers each network's rows of a minibatch, averages each network's PPO,
+  value, entropy and imitation terms over its own rows, and runs one Adam over
+  the concatenated parameters (one step counter, global gradient clip): a row
+  never produces a gradient for the other network. The KL guard holds the larger
+  of the two networks' KLs to `--target-kl`. Advantages are normalized and
+  retention-weighted per side, and imitation classes are balanced per side, as
+  each network's own batch.
+
+`--initial-weights` from shared (M25) weights starts both networks from the
+shared tensors and each side's actor heads from its own (`dire.X` falls back to
+`X` when the file lacks it); `event=initial_weights_loaded` counts the reused
+tensors and `from_shared_tensors`. Runtime weights of the separate layout carry
+`side_networks=separate` in their metadata (shared weights carry no such key);
+`play`, `eval`, frozen opponents and league snapshots build the layout the file
+records and load it strictly, so a frozen opponent of either layout plays against
+a learner of either layout.
+
 ## Runtime weights and neural play
 
 Training writes `drysua.weights.safetensors` (one named tensor per parameter plus
@@ -134,7 +163,7 @@ Neural play has no Teacher fallback: the model chooses every action, including
 pregame buys and skill points. Weights whose action, feature, model, PPO or reward
 identity differs from this build fail to load before connecting; play such weights
 from the commit that produced them. `play`, `eval` and frozen training opponents all
-use this strict loader (metadata, names and shapes). `--initial-weights` accepts other
+use this strict loader (metadata, side-network layout, names and shapes). `--initial-weights` accepts other
 linked schemas: it reuses each tensor with the same name and shape, keeps the seeded
 initialization for the rest and logs both in `event=initial_weights_loaded`.
 

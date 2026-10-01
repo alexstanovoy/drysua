@@ -75,7 +75,7 @@ impl PolicyModel {
     /// Makes every item head output NaN.
     pub(crate) fn poison_item_head_for_test(&self) -> Result<(), ModelError> {
         let poison = Tensor::full(f32::NAN, MODEL_ITEM_HEAD, self.tensor_device())?;
-        Ok(self.item_head.bias.set(&poison)?)
+        Ok(self.networks[0].item_head.bias.set(&poison)?)
     }
 
     /// Behaviour-action log-probabilities and the objective report at the current weights.
@@ -83,11 +83,12 @@ impl PolicyModel {
         &self,
         examples: &[&PpoPreparedSample],
     ) -> Result<(Vec<f32>, PpoMinibatchReport), ModelError> {
+        assert_eq!(self.side_networks, SideNetworks::Shared);
         let staged = self.stage_ppo_examples(examples)?;
         let _guard = self.read_parameter_lock()?;
         let rows = Tensor::arange(0u32, examples.len() as u32, self.tensor_device())?;
         let inputs = staged.gather(&rows)?;
-        let output = self.training_forward_inputs(&inputs)?;
+        let output = self.networks[0].training_forward_inputs(&inputs)?;
         validate_training_tensors_finite(&output)?;
         let log_probability = ppo_objective::log_probability(&output, &inputs.targets)?;
         let terms = ppo_objective::ppo_loss(
@@ -122,7 +123,7 @@ pub(crate) fn masked_ppo_entropy_for_test(
         &device,
     )?;
     let variable = Var::from_tensor(&tensor)?;
-    let mut targets = ppo_objective::HostTargets::with_capacity(examples.len(), None);
+    let mut targets = ppo_objective::HostTargets::with_capacity(examples.len(), None, false);
     for sample in examples {
         targets.push(sample, true)?;
     }
@@ -219,16 +220,17 @@ impl PolicyModel {
         }
         validate_batch(std::slice::from_ref(frame))?;
         let _guard = self.read_parameter_lock()?;
-        let routing = ActorRouting::new(std::slice::from_ref(frame), self.tensor_device(), false)?;
-        let state = self.forward_frames(std::slice::from_ref(frame))?;
-        let value = self
+        let network = self.frame_network(frame)?;
+        let routing = ActorRouting::new(network, std::slice::from_ref(frame), false)?;
+        let state = network.forward_frames(std::slice::from_ref(frame))?;
+        let value = network
             .value
             .forward(&state.trunk)?
             .flatten_all()?
             .to_vec1::<f32>()?[0];
         validate_value_rows(std::slice::from_ref(&value), 0)?;
         let mut source = ModelDecoder {
-            model: self,
+            network,
             state,
             routing,
             rng: Some(rng),
@@ -269,16 +271,19 @@ impl PolicyModel {
         })
     }
 
-    /// Every head over one shared trunk; the value loss trains the trunk too.
+    /// Every head over one trunk; the value loss trains the trunk too. Frames
+    /// of a separate model must all have the side of the first.
     pub(super) fn training_forward_locked(
         &self,
         frames: &[FeatureFrame],
         prefixes: &[TrainingPrefix],
     ) -> Result<PolicyTensorTensors, ModelError> {
-        let routing = ActorRouting::new(frames, self.tensor_device(), true)?;
-        let state = self.forward_frames(frames)?;
+        side_actors::validate_sides(frames)?;
+        let network = self.frame_network(&frames[0])?;
+        let routing = ActorRouting::new(network, frames, true)?;
+        let state = network.forward_frames(frames)?;
         let prefixes = PrefixUpload::new(prefixes, self.tensor_device())?;
-        self.training_heads(state, routing, &prefixes)
+        network.training_heads(state, routing, &prefixes)
     }
 
     /// Backpropagates a scalar loss tied to one live guarded training output.

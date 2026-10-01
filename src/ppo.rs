@@ -517,12 +517,18 @@ impl PpoRollout {
         self.transitions.len()
     }
 
-    pub fn finish(self, config: PpoConfig) -> Result<PpoBatch, PpoError> {
+    /// The normalized batch; separate side networks normalize each side's
+    /// advantages on their own, as each network's own batch.
+    pub fn finish(
+        self,
+        config: PpoConfig,
+        side_networks: crate::SideNetworks,
+    ) -> Result<PpoBatch, PpoError> {
         if self.transitions.is_empty() {
             return Err(PpoError::EmptyRollout);
         }
         let config = config.validate()?;
-        prepare_batch(self.transitions, self.frames, config)
+        prepare_batch(self.transitions, self.frames, config, side_networks)
     }
 }
 
@@ -1076,6 +1082,7 @@ fn prepare_batch(
     transitions: Vec<CompactPpoTransition>,
     frames: RaggedFeatureArena,
     config: PpoConfig,
+    side_networks: crate::SideNetworks,
 ) -> Result<PpoBatch, PpoError> {
     let mut next_advantage = [0.0f32; PPO_MAX_STREAMS];
     let mut next_return = [None; PPO_MAX_STREAMS];
@@ -1120,8 +1127,19 @@ fn prepare_batch(
     prepared.reverse();
     outcome_returns.reverse();
     let mut sides = [true, false].map(|radiant| side_statistics(&prepared, radiant));
-    normalize_advantages(&mut prepared)?;
-    weigh_advantages(&mut prepared);
+    match side_networks {
+        crate::SideNetworks::Shared => {
+            normalize_advantages(&mut prepared, |_| true)?;
+            weigh_advantages(&mut prepared, |_| true);
+        }
+        crate::SideNetworks::Separate => {
+            for radiant in [true, false] {
+                let side = |sample: &CompactPreparedSample| sample.transition.radiant == radiant;
+                normalize_advantages(&mut prepared, side)?;
+                weigh_advantages(&mut prepared, side);
+            }
+        }
+    }
     for (side, radiant) in sides.iter_mut().zip([true, false]) {
         let normalized = side_statistics(&prepared, radiant);
         side.normalized_advantage_mean = normalized.advantage_mean;
@@ -1207,15 +1225,25 @@ fn monte_carlo_return(
     Ok(value)
 }
 
-fn normalize_advantages(samples: &mut [CompactPreparedSample]) -> Result<(), PpoError> {
-    let count = samples.len() as f64;
+/// Normalizes the advantages of the `selected` samples over those samples.
+fn normalize_advantages(
+    samples: &mut [CompactPreparedSample],
+    selected: impl Fn(&CompactPreparedSample) -> bool + Copy,
+) -> Result<(), PpoError> {
+    let count = samples.iter().filter(|sample| selected(sample)).count();
+    if count == 0 {
+        return Ok(());
+    }
+    let count = count as f64;
     let mean = samples
         .iter()
+        .filter(|sample| selected(sample))
         .map(|sample| f64::from(sample.advantage))
         .sum::<f64>()
         / count;
     let variance = samples
         .iter()
+        .filter(|sample| selected(sample))
         .map(|sample| {
             let delta = f64::from(sample.advantage) - mean;
             delta * delta
@@ -1224,7 +1252,7 @@ fn normalize_advantages(samples: &mut [CompactPreparedSample]) -> Result<(), Ppo
         / count;
     let deviation = variance.sqrt();
     let divisor = deviation.max(1.0e-8);
-    for sample in samples {
+    for sample in samples.iter_mut().filter(|sample| selected(sample)) {
         sample.advantage = ((f64::from(sample.advantage) - mean) / divisor) as f32;
         if !sample.advantage.is_finite() || !sample.return_value.is_finite() {
             return Err(PpoError::NonFinite("normalized advantage or return"));
@@ -1233,16 +1261,24 @@ fn normalize_advantages(samples: &mut [CompactPreparedSample]) -> Result<(), Ppo
     Ok(())
 }
 
-/// Scales each normalized advantage by its decision's inverse retention
-/// probability over the batch mean; a positive factor on the advantage weighs
-/// the clipped surrogate exactly as it would weigh the sample.
-fn weigh_advantages(samples: &mut [CompactPreparedSample]) {
+/// Scales each `selected` normalized advantage by its decision's inverse
+/// retention probability over the mean of those samples; a positive factor on
+/// the advantage weighs the clipped surrogate exactly as it would weigh the sample.
+fn weigh_advantages(
+    samples: &mut [CompactPreparedSample],
+    selected: impl Fn(&CompactPreparedSample) -> bool + Copy,
+) {
+    let count = samples.iter().filter(|sample| selected(sample)).count();
+    if count == 0 {
+        return;
+    }
     let mean = samples
         .iter()
+        .filter(|sample| selected(sample))
         .map(|sample| f64::from(sample.transition.weight))
         .sum::<f64>()
-        / samples.len() as f64;
-    for sample in samples {
+        / count as f64;
+    for sample in samples.iter_mut().filter(|sample| selected(sample)) {
         sample.advantage =
             (f64::from(sample.advantage) * f64::from(sample.transition.weight) / mean) as f32;
     }

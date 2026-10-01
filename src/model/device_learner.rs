@@ -21,6 +21,8 @@ pub const MODEL_PPO_MAX_MICROBATCH: usize = 2_048;
 pub(crate) struct StagedPpoBatch {
     parts: Vec<Tensor>,
     sides: Tensor,
+    /// Host copy of `sides`: one on radiant rows.
+    row_sides: Vec<u8>,
     prefixes: PrefixUpload,
     /// Prefixes of the shadow labels, staged only for an update that imitates.
     shadow_prefixes: Option<PrefixUpload>,
@@ -154,7 +156,11 @@ impl PolicyModel {
             sides: Vec::with_capacity(capacity),
             prefixes: Vec::with_capacity(capacity),
             shadow_prefixes: imitation.map(|_| Vec::with_capacity(capacity)),
-            targets: HostTargets::with_capacity(capacity, imitation),
+            targets: HostTargets::with_capacity(
+                capacity,
+                imitation,
+                self.side_networks == SideNetworks::Separate,
+            ),
             row: EncoderRow::new(),
             capacity,
         })
@@ -178,7 +184,8 @@ impl PolicyModel {
                 .iter()
                 .map(|part| Ok(part.narrow(0, 0, rows)?))
                 .collect::<Result<_, ModelError>>()?,
-            sides: Tensor::from_vec(staging.sides, (rows, 1), device)?,
+            sides: Tensor::from_slice(&staging.sides, (rows, 1), device)?,
+            row_sides: staging.sides,
             prefixes: PrefixUpload::new(&staging.prefixes, device)?,
             shadow_prefixes: staging
                 .shadow_prefixes
@@ -289,7 +296,8 @@ impl PolicyModel {
         Ok(report)
     }
 
-    /// Validates a staged step and returns its rows, summed gradients and report.
+    /// Validates a staged step and returns its rows per network, summed
+    /// gradients and report, whose KL is the one the guard holds to the target.
     fn staged_step_gradients(
         &self,
         staged: &StagedPpoBatch,
@@ -297,7 +305,7 @@ impl PolicyModel {
         adam: &AdamState,
         objective: (PpoConfig, crate::UpdateObjective),
         microbatch: usize,
-    ) -> Result<(Tensor, Vec<Option<Tensor>>, PpoMinibatchReport), ModelError> {
+    ) -> Result<(NetworkRows, Vec<Option<Tensor>>, PpoMinibatchReport), ModelError> {
         if indices.is_empty() || indices.len() > MODEL_MAX_BATCH {
             return Err(ModelError::InvalidModelState("PPO minibatch count"));
         }
@@ -308,13 +316,50 @@ impl PolicyModel {
             return Err(ModelError::InvalidModelState("PPO staged row index"));
         }
         self.validate_optimizer_binding_locked(adam.binding)?;
-        let rows = indices
-            .iter()
-            .map(|&index| index as u32)
-            .collect::<Vec<_>>();
-        let rows = Tensor::from_vec(rows, indices.len(), self.tensor_device())?;
-        let (gradients, report) = self.staged_gradients(staged, &rows, objective, microbatch)?;
+        let rows = self.network_rows(staged, indices)?;
+        let (gradients, mut report) =
+            self.staged_gradients(staged, &rows, objective, microbatch)?;
+        report.approximate_kl = self.guarded_kl(&report);
         Ok((rows, gradients, report))
+    }
+
+    /// The minibatch rows each network trains on, as device indices: every row
+    /// for the shared network, its own side's rows for a separate one.
+    fn network_rows(
+        &self,
+        staged: &StagedPpoBatch,
+        indices: &[usize],
+    ) -> Result<NetworkRows, ModelError> {
+        let sides = indices.iter().map(|&index| staged.row_sides[index] == 1);
+        route_rows(self.side_networks, sides)
+            .into_iter()
+            .map(|(network, members)| {
+                let rows = members
+                    .iter()
+                    .map(|&member| indices[member] as u32)
+                    .collect::<Vec<_>>();
+                let count = rows.len();
+                Ok((
+                    network,
+                    Tensor::from_vec(rows, count, self.tensor_device())?,
+                ))
+            })
+            .collect()
+    }
+
+    /// The KL the guard holds to the target: the minibatch's, or the largest
+    /// of the separate networks' own, so neither network hides behind the other.
+    fn guarded_kl(&self, report: &PpoMinibatchReport) -> f64 {
+        /// The approximate KL column of [`crate::SideReport`].
+        const SIDE_KL: usize = 4;
+        match self.side_networks {
+            SideNetworks::Shared => report.approximate_kl,
+            SideNetworks::Separate => [false, true]
+                .into_iter()
+                .filter_map(|dire| report.sides.means(dire))
+                .map(|means| means[SIDE_KL])
+                .fold(f64::NEG_INFINITY, f64::max),
+        }
     }
 
     fn ppo_step_staged(
@@ -367,24 +412,36 @@ impl PolicyModel {
         Ok(report)
     }
 
-    /// Minibatch gradients summed on the device and the minibatch report.
+    /// Minibatch gradients summed on the device and the minibatch report. Each
+    /// network's loss averages over its own rows, so a separate network trains
+    /// as if alone on its side's share of the minibatch.
     fn staged_gradients(
         &self,
         staged: &StagedPpoBatch,
-        rows: &Tensor,
+        rows: &NetworkRows,
         objective: (PpoConfig, crate::UpdateObjective),
         microbatch: usize,
     ) -> Result<(Vec<Option<Tensor>>, PpoMinibatchReport), ModelError> {
-        let total = rows.elem_count();
+        let total = rows
+            .iter()
+            .map(|(_, rows)| rows.elem_count())
+            .sum::<usize>();
         let parameters = self.parameters();
         let mut gradients: Vec<Option<Tensor>> = vec![None; parameters.len()];
         let mut sums: Option<Tensor> = None;
-        for start in (0..total).step_by(microbatch) {
-            let length = microbatch.min(total - start);
+        for (start, length, network, rows) in microbatches(rows, microbatch) {
             let inputs = staged.gather(&rows.narrow(0, start, length)?)?;
-            let (output, shadow) = self.training_forward_objective(&inputs, objective.1)?;
+            let (output, shadow) =
+                self.networks[network].training_forward_objective(&inputs, objective.1)?;
             let probe = side_actors::training_finite_probe(&output)?;
-            let terms = ppo_loss(&output, shadow.as_ref(), &inputs.targets, objective, total)?;
+            let network_rows = rows.elem_count();
+            let terms = ppo_loss(
+                &output,
+                shadow.as_ref(),
+                &inputs.targets,
+                objective,
+                network_rows,
+            )?;
             let store = terms.loss.backward()?;
             // Gradients and sums are detached: a tracked one keeps this
             // microbatch's whole graph, activations included, alive through
@@ -415,37 +472,42 @@ impl PolicyModel {
         Ok((gradients, report_from_sums(sums, total)?))
     }
 
+    /// The candidate's KL: the minibatch's, or the largest separate network's.
     fn staged_candidate_kl(
         &self,
         staged: &StagedPpoBatch,
-        rows: &Tensor,
+        rows: &NetworkRows,
         microbatch: usize,
     ) -> Result<f64, ModelError> {
-        let total = rows.elem_count();
-        let mut sum: Option<Tensor> = None;
-        for start in (0..total).step_by(microbatch) {
-            let length = microbatch.min(total - start);
-            let inputs = staged.gather(&rows.narrow(0, start, length)?)?;
-            let output = self.training_forward_inputs(&inputs)?;
-            let probe = side_actors::training_finite_probe(&output)?;
-            let kl = candidate_kl_sum(&output, &inputs.targets)?.detach();
-            let terms = Tensor::stack(&[kl, probe], 0)?;
-            sum = Some(match sum {
-                None => terms,
-                Some(sum) => (sum + terms)?,
-            });
+        let mut guarded: Option<f64> = None;
+        for (network, network_rows) in rows {
+            let total = network_rows.elem_count();
+            let mut sum: Option<Tensor> = None;
+            for start in (0..total).step_by(microbatch) {
+                let length = microbatch.min(total - start);
+                let inputs = staged.gather(&network_rows.narrow(0, start, length)?)?;
+                let output = self.networks[*network].training_forward_inputs(&inputs)?;
+                let probe = side_actors::training_finite_probe(&output)?;
+                let kl = candidate_kl_sum(&output, &inputs.targets)?.detach();
+                let terms = Tensor::stack(&[kl, probe], 0)?;
+                sum = Some(match sum {
+                    None => terms,
+                    Some(sum) => (sum + terms)?,
+                });
+            }
+            let sums = sum
+                .ok_or(ModelError::EmptyTrainingBatch)?
+                .to_vec1::<f32>()?;
+            if !sums[1].is_finite() {
+                return Err(self.locate_nonfinite_output(staged, rows, microbatch));
+            }
+            let kl = f64::from(sums[0]) / total as f64;
+            if !kl.is_finite() {
+                return Err(ModelError::NonFiniteLoss);
+            }
+            guarded = Some(guarded.map_or(kl, |guarded| guarded.max(kl)));
         }
-        let sums = sum
-            .ok_or(ModelError::EmptyTrainingBatch)?
-            .to_vec1::<f32>()?;
-        if !sums[1].is_finite() {
-            return Err(self.locate_nonfinite_output(staged, rows, microbatch));
-        }
-        let kl = f64::from(sums[0]) / total as f64;
-        if !kl.is_finite() {
-            return Err(ModelError::NonFiniteLoss);
-        }
-        Ok(kl)
+        guarded.ok_or(ModelError::EmptyTrainingBatch)
     }
 
     /// The first non-finite training output, found by reading every microbatch
@@ -453,16 +515,15 @@ impl PolicyModel {
     fn locate_nonfinite_output(
         &self,
         staged: &StagedPpoBatch,
-        rows: &Tensor,
+        rows: &NetworkRows,
         microbatch: usize,
     ) -> ModelError {
-        let total = rows.elem_count();
-        for start in (0..total).step_by(microbatch) {
+        for (start, length, network, rows) in microbatches(rows, microbatch) {
             let located = rows
-                .narrow(0, start, microbatch.min(total - start))
+                .narrow(0, start, length)
                 .map_err(ModelError::from)
                 .and_then(|rows| staged.gather(&rows))
-                .and_then(|inputs| self.training_forward_inputs(&inputs))
+                .and_then(|inputs| self.networks[network].training_forward_inputs(&inputs))
                 .and_then(|output| validate_training_tensors_finite(&output));
             if let Err(error) = located {
                 return error;
@@ -480,7 +541,7 @@ impl PolicyModel {
             .map(|parameter| parameter.value.as_tensor().flatten_all())
             .collect::<Result<Vec<_>, _>>()?;
         let flat = Tensor::cat(&flat, 0)?.detach();
-        assert_eq!(flat.elem_count(), MODEL_PARAMETER_COUNT);
+        assert_eq!(flat.elem_count(), self.parameter_count());
         let parameters = unflatten(&flat, &parameters)?;
         Ok(ParameterCopy { flat, parameters })
     }
@@ -610,6 +671,24 @@ impl PolicyModel {
         }
         Ok((unflatten(&updated, &parameters)?, first, second))
     }
+}
+
+/// Each trained network's index with the device indices of its minibatch rows.
+type NetworkRows = Vec<(usize, Tensor)>;
+
+/// Every microbatch of every network's rows: its start and length within the
+/// network's rows, the network and those rows.
+fn microbatches(
+    rows: &NetworkRows,
+    microbatch: usize,
+) -> impl Iterator<Item = (usize, usize, usize, &Tensor)> {
+    assert!(microbatch > 0);
+    rows.iter().flat_map(move |(network, rows)| {
+        let total = rows.elem_count();
+        (0..total)
+            .step_by(microbatch)
+            .map(move |start| (start, microbatch.min(total - start), *network, rows))
+    })
 }
 
 /// A flat parameter copy and its per-parameter views.

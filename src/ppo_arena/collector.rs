@@ -16,7 +16,7 @@ use super::CollectionReport;
 use super::lane::{LaneLinks, LaneSettings, LaneStart, PartConfig, PartDone, run_lane};
 use super::pool::SimPool;
 use super::slot::{GameSchedule, SlotSnapshot};
-use crate::{PPO_MAX_STREAMS, PpoBatch, PpoConfig, PpoError, PpoRollout};
+use crate::{PPO_MAX_STREAMS, PpoBatch, PpoConfig, PpoError, PpoRollout, SideNetworks};
 
 /// Parts a lane may queue: its current part plus the pipelined next one.
 const LANE_QUEUE: usize = 2;
@@ -57,7 +57,7 @@ impl Collector {
         lanes: Vec<(LaneSettings, LaneStart)>,
         pools: Vec<(SimPool, Option<Vec<usize>>)>,
         schedule: &'scope GameSchedule,
-        (first, slots, config): (u64, usize, PpoConfig),
+        (first, slots, config, side_networks): (u64, usize, PpoConfig, SideNetworks),
     ) -> Result<Self, PpoError> {
         assert!(!lanes.is_empty() && lanes.len().is_multiple_of(pools.len()));
         let lanes_per_group = lanes.len() / pools.len();
@@ -99,7 +99,7 @@ impl Collector {
         std::thread::Builder::new()
             .name("batch-prepare".to_owned())
             .spawn_scoped(scope, move || {
-                prepare_batches(parts, first, (slots, config), &sender)
+                prepare_batches(parts, first, (slots, config, side_networks), &sender)
             })
             .map_err(|error| PpoError::Model(format!("preparer spawn: {error}")))?;
         Ok(Self {
@@ -183,7 +183,7 @@ impl Drop for Collector {
 fn prepare_batches(
     mut parts: Parts,
     first: u64,
-    shape: (usize, PpoConfig),
+    shape: (usize, PpoConfig, SideNetworks),
     sender: &SyncSender<Result<Prepared, PpoError>>,
 ) {
     for update in first..=u64::MAX {
@@ -202,7 +202,7 @@ fn prepare_batches(
 fn prepare(
     update: u64,
     mut parts: Vec<PartDone>,
-    (slots, config): (usize, PpoConfig),
+    (slots, config, side_networks): (usize, PpoConfig, SideNetworks),
 ) -> Result<Prepared, PpoError> {
     let mut rollout = PpoRollout::new(config.rollout_capacity(slots))?;
     let mut streams: FxHashMap<(usize, u64), usize> = FxHashMap::default();
@@ -240,7 +240,7 @@ fn prepare(
         parts,
         part_samples,
         samples,
-        batch: rollout.finish(config)?,
+        batch: rollout.finish(config, side_networks)?,
         report,
         snapshots,
     })

@@ -1,4 +1,5 @@
-//! Full-batch actor routing; the shared encoder and value head never branch.
+//! Full-batch actor routing: the shared network selects each row's side heads;
+//! a separate network serves one side and never branches.
 use super::*;
 use std::cell::RefCell;
 
@@ -51,7 +52,7 @@ impl ActorHead {
         ][self as usize]
     }
 
-    fn width(self) -> usize {
+    const fn width(self) -> usize {
         [16, 2, 8, 15, 15, 6, 64, 16, 3, 2, 128, 64][self as usize]
     }
 }
@@ -97,19 +98,82 @@ impl ActorHeads {
     }
 }
 
-impl PolicyModel {
-    pub(super) fn raw_actor_pair(
+/// The actor heads one network owns.
+pub(super) enum NetworkActors {
+    /// The shared network: its own heads serve Radiant rows, these Dire rows.
+    Both(ActorHeads),
+    /// A separate network serving only Radiant rows.
+    Radiant,
+    /// A separate network serving only Dire rows.
+    Dire,
+}
+
+/// Which rows a network is drawn to serve.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum NetworkSide {
+    Both,
+    Radiant,
+    Dire,
+}
+
+/// F32 parameters of the shared network's Dire actor heads.
+pub(super) const DIRE_HEAD_PARAMETERS: usize = dire_head_parameters();
+
+const fn dire_head_parameters() -> usize {
+    let mut total = 0;
+    let mut index = 0;
+    while index < ActorHead::ALL.len() {
+        let input = if index == ActorHead::Kind as usize {
+            TRUNK_WIDTH
+        } else {
+            DECODER_CONTEXT
+        };
+        total += linear_parameters(input, ActorHead::ALL[index].width());
+        index += 1;
+    }
+    total
+}
+
+impl NetworkActors {
+    pub(super) fn fresh(
+        side: NetworkSide,
+        generator: &mut Initializer,
+        device: &Device,
+    ) -> Result<Self, ModelError> {
+        Ok(match side {
+            NetworkSide::Both => Self::Both(ActorHeads::fresh(generator, device)?),
+            NetworkSide::Radiant => Self::Radiant,
+            NetworkSide::Dire => Self::Dire,
+        })
+    }
+
+    /// The only side a separate network's rows have (one is radiant).
+    const fn only_side(&self) -> Option<u8> {
+        match self {
+            Self::Both(_) => None,
+            Self::Radiant => Some(1),
+            Self::Dire => Some(0),
+        }
+    }
+}
+
+impl Network {
+    /// Raw radiant and dire outputs of one actor head; a separate network
+    /// computes only its own side's.
+    pub(super) fn raw_actor(
         &self,
         head: ActorHead,
         input: &Tensor,
-    ) -> Result<[Tensor; 2], ModelError> {
-        Ok([
-            self.radiant_head(head).forward(input)?,
-            self.dire.0[head as usize].forward(input)?,
-        ])
+    ) -> Result<[Option<Tensor>; 2], ModelError> {
+        let own = self.own_head(head).forward(input)?;
+        Ok(match &self.actors {
+            NetworkActors::Both(dire) => [Some(own), Some(dire.0[head as usize].forward(input)?)],
+            NetworkActors::Radiant => [Some(own), None],
+            NetworkActors::Dire => [None, Some(own)],
+        })
     }
 
-    fn radiant_head(&self, head: ActorHead) -> &Linear {
+    fn own_head(&self, head: ActorHead) -> &Linear {
         match head {
             ActorHead::Kind => &self.kind,
             ActorHead::Controlled => &self.controlled,
@@ -128,19 +192,20 @@ impl PolicyModel {
 }
 
 pub(super) struct ActorRouting {
-    mask: Tensor,
-    /// Host copy of `mask`: one means the radiant head, zero the dire head.
+    /// The shared network's per-row choice: one selects the radiant heads,
+    /// zero the dire heads. A separate network serves one side and selects nothing.
+    mask: Option<Tensor>,
+    /// Host copy of `mask`.
     sides: Vec<u8>,
     training: bool,
-    raw: RefCell<[Option<[Tensor; 2]>; 12]>,
+    raw: RefCell<[Option<[Option<Tensor>; 2]>; 12]>,
 }
 
 /// Queued raw radiant and dire outputs of one actor head inside a [`StageRequest`].
 #[derive(Clone, Copy)]
 pub(super) struct QueuedPair {
     head: ActorHead,
-    radiant: usize,
-    dire: usize,
+    raw: [Option<usize>; 2],
 }
 
 /// Row-major `[batch, width]` tensors of one sampling stage, read back with one device
@@ -238,8 +303,8 @@ impl StageValues {
 
 impl ActorRouting {
     pub(super) fn new(
+        network: &Network,
         frames: &[FeatureFrame],
-        device: &Device,
         training: bool,
     ) -> Result<Self, ModelError> {
         assert!(!frames.is_empty());
@@ -250,82 +315,97 @@ impl ActorRouting {
             .enumerate()
             .map(|(index, frame)| side_row(frame, index))
             .collect::<Result<Vec<_>, _>>()?;
-        Self::with_sides(sides, device, training)
+        Self::with_sides(network, sides, training)
     }
 
     /// Inference routing of packed rows, whose sides were validated when packed.
-    pub(super) fn from_rows(rows: &[&EncoderRow], device: &Device) -> Result<Self, ModelError> {
+    pub(super) fn from_rows(network: &Network, rows: &[&EncoderRow]) -> Result<Self, ModelError> {
         assert!(!rows.is_empty());
         assert!(rows.len() <= MODEL_PPO_MAX_MICROBATCH);
         Self::with_sides(
+            network,
             rows.iter().map(|row| u8::from(row.radiant())).collect(),
-            device,
             false,
         )
     }
 
-    /// Training routing of a gathered device side mask; training never selects on the host.
-    pub(super) fn from_mask(mask: Tensor) -> Self {
+    /// Training routing of a gathered device side mask; training never selects
+    /// on the host. A separate network's rows were gathered by side already.
+    pub(super) fn from_mask(network: &Network, mask: Tensor) -> Self {
         Self {
-            mask,
+            mask: matches!(network.actors, NetworkActors::Both(_)).then_some(mask),
             sides: Vec::new(),
             training: true,
             raw: RefCell::new(std::array::from_fn(|_| None)),
         }
     }
 
-    fn with_sides(sides: Vec<u8>, device: &Device, training: bool) -> Result<Self, ModelError> {
+    fn with_sides(network: &Network, sides: Vec<u8>, training: bool) -> Result<Self, ModelError> {
+        let mask = match network.actors.only_side() {
+            None => Some(Tensor::from_slice(
+                &sides,
+                (sides.len(), 1),
+                network.tensor_device(),
+            )?),
+            Some(side) if sides.iter().all(|&row| row == side) => None,
+            Some(_) => {
+                return Err(ModelError::InvalidModelState(
+                    "row routed to the other side's network",
+                ));
+            }
+        };
         Ok(Self {
-            mask: Tensor::from_slice(&sides, (sides.len(), 1), device)?,
+            mask,
             sides,
             training,
             raw: RefCell::new(std::array::from_fn(|_| None)),
         })
     }
 
-    /// Queues both raw outputs of one actor head for host-side validation and selection.
+    /// The side-selected output of raw head outputs: the shared network picks
+    /// each row's side on the device; a separate network has one output.
+    fn select_raw(&self, raw: &[Option<Tensor>; 2]) -> Result<Tensor, ModelError> {
+        match (raw, &self.mask) {
+            ([Some(radiant), Some(dire)], Some(mask)) => {
+                assert_eq!(radiant.dims(), dire.dims());
+                assert_eq!(radiant.dim(0)?, mask.dim(0)?);
+                Ok(mask
+                    .broadcast_as(radiant.shape())?
+                    .where_cond(radiant, dire)?)
+            }
+            ([Some(own), None] | [None, Some(own)], None) => Ok(own.clone()),
+            _ => Err(ModelError::InvalidModelState("actor routing")),
+        }
+    }
+
+    /// Queues the raw outputs of one actor head for host-side validation and selection.
     pub(super) fn queue_pair(
         &self,
-        model: &PolicyModel,
+        network: &Network,
         head: ActorHead,
         input: &Tensor,
         request: &mut StageRequest,
     ) -> Result<QueuedPair, ModelError> {
         assert!(!self.training);
-        let [radiant, dire] = model.raw_actor_pair(head, input)?;
-        assert_eq!(radiant.dims(), dire.dims());
-        Ok(QueuedPair {
-            head,
-            radiant: request.push(radiant)?,
-            dire: request.push(dire)?,
-        })
+        let raw = network.raw_actor(head, input)?;
+        queue_raw(head, raw, request)
     }
 
-    /// Queues one pointer head: its raw query pair for validation and the scores of the
+    /// Queues one pointer head: its raw queries for validation and the scores of the
     /// device-selected query against `tokens`.
     pub(super) fn queue_pointer(
         &self,
-        model: &PolicyModel,
+        network: &Network,
         head: ActorHead,
         input: &Tensor,
         tokens: &Tensor,
         request: &mut StageRequest,
     ) -> Result<(QueuedPair, usize), ModelError> {
         assert!(!self.training);
-        let [radiant, dire] = model.raw_actor_pair(head, input)?;
-        assert_eq!(radiant.dims(), dire.dims());
-        assert_eq!(radiant.dim(0)?, self.mask.dim(0)?);
-        let query = self
-            .mask
-            .broadcast_as(radiant.shape())?
-            .where_cond(&radiant, &dire)?
-            .unsqueeze(1)?;
+        let raw = network.raw_actor(head, input)?;
+        let query = self.select_raw(&raw)?.unsqueeze(1)?;
         let scores = scaled_pointer_dot(tokens, &query)?;
-        let pair = QueuedPair {
-            head,
-            radiant: request.push(radiant)?,
-            dire: request.push(dire)?,
-        };
+        let pair = queue_raw(head, raw, request)?;
         Ok((pair, request.push(scores)?))
     }
 
@@ -336,8 +416,13 @@ impl ActorRouting {
         pair: QueuedPair,
     ) -> Result<Vec<Vec<f32>>, ModelError> {
         self.validate(values, pair)?;
-        let (radiant, width) = values.slice(pair.radiant);
-        let (dire, _) = values.slice(pair.dire);
+        let (radiant, dire) = match pair.raw {
+            [Some(radiant), Some(dire)] => (radiant, dire),
+            [Some(own), None] | [None, Some(own)] => return Ok(values.rows(own)),
+            [None, None] => return Err(ModelError::InvalidModelState("empty queued head")),
+        };
+        let (radiant, width) = values.slice(radiant);
+        let (dire, _) = values.slice(dire);
         assert_eq!(radiant.len(), self.sides.len() * width);
         Ok(self
             .sides
@@ -354,44 +439,71 @@ impl ActorRouting {
         pair: QueuedPair,
     ) -> Result<(), ModelError> {
         let names = pair.head.fields();
-        values.validate(pair.radiant, names[0])?;
-        values.validate(pair.dire, names[1])
+        for (index, name) in pair.raw.into_iter().zip(names) {
+            if let Some(index) = index {
+                values.validate(index, name)?;
+            }
+        }
+        Ok(())
     }
 
     pub(super) fn forward(
         &self,
-        model: &PolicyModel,
+        network: &Network,
         head: ActorHead,
         input: &Tensor,
     ) -> Result<Tensor, ModelError> {
-        let [radiant, dire] = model.raw_actor_pair(head, input)?;
-        assert_eq!(radiant.dims(), dire.dims());
-        assert_eq!(radiant.dim(0)?, self.mask.dim(0)?);
+        let raw = network.raw_actor(head, input)?;
         if !self.training {
-            let names = head.fields();
-            validate_named(&[(names[0], &radiant), (names[1], &dire)])?;
+            validate_named(&named_raw(head, &raw))?;
         }
-        let selected = self
-            .mask
-            .broadcast_as(radiant.shape())?
-            .where_cond(&radiant, &dire)?;
+        let selected = self.select_raw(&raw)?;
         if self.training {
-            let mut raw = self.raw.borrow_mut();
-            assert!(raw[head as usize].is_none());
-            raw[head as usize] = Some([radiant, dire]);
+            let mut stored = self.raw.borrow_mut();
+            assert!(stored[head as usize].is_none());
+            stored[head as usize] = Some(raw);
         }
         Ok(selected)
     }
 
-    pub(super) fn into_raw(self) -> Result<[[Tensor; 2]; 12], ModelError> {
-        let mut raw = Vec::with_capacity(12);
-        for pair in self.raw.into_inner() {
-            raw.push(pair.ok_or(ModelError::InvalidModelState("missing side actor raw head"))?);
+    /// Every raw actor output of a training forward, named, in head then side order.
+    pub(super) fn into_raw(self) -> Result<Vec<(&'static str, Tensor)>, ModelError> {
+        let mut named = Vec::with_capacity(2 * ActorHead::ALL.len());
+        for (head, raw) in ActorHead::ALL.into_iter().zip(self.raw.into_inner()) {
+            let raw = raw.ok_or(ModelError::InvalidModelState("missing side actor raw head"))?;
+            for (name, tensor) in named_raw(head, &raw) {
+                named.push((name, tensor.clone()));
+            }
         }
-        assert_eq!(raw.len(), 12);
-        raw.try_into()
-            .map_err(|_| ModelError::InvalidModelState("side actor raw head count"))
+        assert!((ActorHead::ALL.len()..=2 * ActorHead::ALL.len()).contains(&named.len()));
+        Ok(named)
     }
+}
+
+/// The present raw outputs of one head with their side names.
+fn named_raw(head: ActorHead, raw: &[Option<Tensor>; 2]) -> Vec<(&'static str, &Tensor)> {
+    head.fields()
+        .into_iter()
+        .zip(raw)
+        .filter_map(|(name, tensor)| tensor.as_ref().map(|tensor| (name, tensor)))
+        .collect()
+}
+
+fn queue_raw(
+    head: ActorHead,
+    raw: [Option<Tensor>; 2],
+    request: &mut StageRequest,
+) -> Result<QueuedPair, ModelError> {
+    if let [Some(radiant), Some(dire)] = &raw {
+        assert_eq!(radiant.dims(), dire.dims());
+    }
+    let mut queued = [None; 2];
+    for (slot, tensor) in queued.iter_mut().zip(raw) {
+        if let Some(tensor) = tensor {
+            *slot = Some(request.push(tensor)?);
+        }
+    }
+    Ok(QueuedPair { head, raw: queued })
 }
 
 pub(super) fn validate_sides(frames: &[FeatureFrame]) -> Result<(), ModelError> {
@@ -443,14 +555,12 @@ pub(super) fn training_finite_probe(output: &PolicyTensorTensors) -> Result<Tens
 fn training_outputs(output: &PolicyTensorTensors) -> Vec<(&'static str, &Tensor)> {
     let mut named = Vec::with_capacity(27);
     named.push(("value", &output.value));
-    for (head, pair) in ActorHead::ALL.into_iter().zip(&output.side_raw) {
-        let names = head.fields();
-        named.push((names[0], &pair[0]));
-        named.push((names[1], &pair[1]));
+    for (name, tensor) in &output.actor_raw {
+        named.push((*name, tensor));
     }
     named.push(("entity pointer", &output.entity_pointer));
     named.push(("point pointer", &output.point_pointer));
-    assert_eq!(named.len(), 27);
+    assert!(named.len() == 15 || named.len() == 27);
     named
 }
 

@@ -22,7 +22,7 @@ use super::slot::{
     Decision, GamePlan, GameSchedule, NextGame, OpponentKind, OpponentMixture, Slot, SlotSnapshot,
 };
 use super::text_error;
-use crate::{EncoderRow, PolicyDevice, PolicyModel, PpoError, PpoRng, PpoTransition};
+use crate::{EncoderRow, PolicyDevice, PolicyModel, PpoError, PpoRng, PpoTransition, SideNetworks};
 
 /// The actor weights, world rules and opponents of one update's collection.
 pub(super) struct PartConfig {
@@ -116,7 +116,8 @@ struct LaneModels {
 
 impl LaneModels {
     fn new(settings: &LaneSettings, config: &PartConfig) -> Result<Self, PpoError> {
-        let actor = PolicyModel::fresh_on(0, settings.device).map_err(text_error)?;
+        let actor = PolicyModel::fresh_networks(0, layout_of(&config.actor)?, settings.device)
+            .map_err(text_error)?;
         actor.import_parameters(&config.actor).map_err(text_error)?;
         let snapshots = settings
             .snapshots
@@ -188,11 +189,18 @@ impl LaneModels {
     }
 }
 
-/// A replica of `parameters` on the actor's device handle.
+/// A replica of `parameters`, in their own side-network layout, on the actor's
+/// device handle: frozen opponents need not share the learner's layout.
 fn load_beside(actor: &PolicyModel, parameters: &[f32]) -> Result<PolicyModel, PpoError> {
-    let model = PolicyModel::fresh_beside(0, actor).map_err(text_error)?;
+    let model = PolicyModel::fresh_beside(0, layout_of(parameters)?, actor).map_err(text_error)?;
     model.import_parameters(parameters).map_err(text_error)?;
     Ok(model)
+}
+
+/// The side-network layout whose parameter count `parameters` has.
+fn layout_of(parameters: &[f32]) -> Result<SideNetworks, PpoError> {
+    SideNetworks::from_parameter_count(parameters.len())
+        .ok_or(PpoError::InvalidConfig("policy parameter count"))
 }
 
 /// Runs one lane until the session stops it or a part fails.

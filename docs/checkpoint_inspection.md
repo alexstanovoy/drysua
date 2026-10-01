@@ -21,7 +21,8 @@ Both modes return `schema: "drysua-checkpoint-inspection/v1"`.
 `--contract` works without filesystem access and returns:
 
 - `kind: "contract"`;
-- `model: {version, hash, parameters}` from this build;
+- `model: {version, hash, side_networks, parameters}` of this build's default
+  (`shared`) layout;
 - `enabled_features`, with the existing exact feature-string semantics;
 - `capabilities`: `inspection` (Linux), `annealed_history` (`builtin` compiled),
   `read_only: true`, `strict_build_features: true`, and
@@ -55,7 +56,7 @@ Fields:
 
 - `identity`: `manifest_sha256`, authoritative `tensor_sha256`, nullable
   `runtime_sha256`, and `scope_sha256`.
-- `model`: `{version, hash, parameters}`.
+- `model`: `{version, hash, side_networks, parameters}` of the checkpointed layout.
 - `checkpoint`: native `{version, hash}`, including the adaptive identity when present.
 - `progress`: `updates`, `optimizer_steps`, `rollout_samples`, `games`,
   `policy_version`, `scheduler_step`, `curriculum_stage`, `best_evaluation`,

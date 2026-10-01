@@ -38,8 +38,7 @@ use crate::{
     AnnealedOpponent, CheckpointDevice, CheckpointRun, EnvironmentDecimal,
     MAP2_DECISION_INTERVAL_TICKS, MAP2_REWARD_GAMMA_TICK, MAX_TRAINING_COUNTER,
     MODEL_MAX_OPTIMIZER_STEP, PPO_MAX_POLICY_SAMPLE_DRAWS, PPO_RULES_AUDIT_VERSION, PolicyDevice,
-    PolicyModel, PpoConfig, PpoError, PpoUpdateReport, SHADOW_FIEND, TrainingArtifact,
-    compiled_features,
+    PpoConfig, PpoError, PpoUpdateReport, SHADOW_FIEND, TrainingArtifact, compiled_features,
 };
 
 /// Updates the actor weights of a collected update lag the learner.
@@ -59,6 +58,8 @@ pub struct AnnealedJobConfig {
     pub environment_schedule: crate::EnvironmentSchedule,
     /// Learner execution choices, bound to the run scope.
     pub execution: crate::TrainingExecutionOptions,
+    /// One shared network or one complete network per side; bound to the run scope.
+    pub side_networks: crate::SideNetworks,
     /// Total updates in the run.
     pub updates: u64,
     /// Concurrent world slots; each always holds a live game.
@@ -210,13 +211,16 @@ where
 /// and the parameter replicas the configuration keeps. Encoder rows have a
 /// fixed token capacity, so per-row bytes do not depend on what a frame holds.
 /// The margin covers block rounding inside a stream (3% measured for the
-/// learner alone) and the few transients the sum leaves out.
-pub(crate) fn vram_budget_estimate(settings: &AnnealedJobConfig) -> u64 {
+/// learner alone) and the few transients the sum leaves out. Parameter-sized
+/// terms follow each model's side-network layout: the learner's for the
+/// learner, the actor and league snapshots, the file's for frozen weights.
+/// A separate network runs its own side's rows, so per-row terms keep their size.
+pub(crate) fn vram_budget_estimate(settings: &AnnealedJobConfig) -> Result<u64, PpoError> {
     use crate::model::{
         VRAM_INFERENCE_FIXED_BYTES, VRAM_INFERENCE_ROW_BYTES, VRAM_LEARNER_FIXED_BYTES,
         VRAM_LEARNER_ROW_BYTES, VRAM_STAGED_ROW_BYTES,
     };
-    let parameters = crate::MODEL_PARAMETER_COUNT as u64 * 4;
+    let parameters = settings.side_networks.parameter_count() as u64 * 4;
     let lanes = settings.lanes.max(1) as u64;
     let lane_slots = (settings.slots / settings.lanes.max(1)) as u64;
     let has = |wanted: fn(&AnnealedOpponent) -> bool| {
@@ -225,11 +229,13 @@ pub(crate) fn vram_budget_estimate(settings: &AnnealedJobConfig) -> u64 {
             .iter()
             .any(|(opponent, _)| wanted(opponent))
     };
-    let weights = settings
-        .opponents
-        .iter()
-        .filter(|(opponent, _)| matches!(opponent, AnnealedOpponent::Weights(_)))
-        .count() as u64;
+    let mut weights = 0;
+    for (opponent, _) in &settings.opponents {
+        if let AnnealedOpponent::Weights(directory) = opponent {
+            let layout = TrainingArtifact::runtime_side_networks(directory).map_err(text_error)?;
+            weights += layout.parameter_count() as u64 * 4;
+        }
+    }
     // Per lane: the actor (self-play and the learner's seat share it), one
     // replica per frozen weights opponent and, with a league, its current
     // milestones, as many retired ones still played by in-flight games and as
@@ -239,7 +245,7 @@ pub(crate) fn vram_budget_estimate(settings: &AnnealedJobConfig) -> u64 {
     } else {
         0
     };
-    let replicas = lanes * (1 + weights + league) * parameters;
+    let replicas = lanes * ((1 + league) * parameters + weights);
     let microbatch = settings
         .execution
         .training_microbatch
@@ -256,7 +262,7 @@ pub(crate) fn vram_budget_estimate(settings: &AnnealedJobConfig) -> u64 {
     let inference = lanes
         * (VRAM_INFERENCE_FIXED_BYTES + (1 + self_play) * lane_slots * VRAM_INFERENCE_ROW_BYTES);
     let total = replicas + learner + inference;
-    total + total / 20
+    Ok(total + total / 20)
 }
 
 /// Parameter-sized learner tensors alive at once during an Adam step: the
@@ -593,8 +599,8 @@ fn load_opponents(settings: &AnnealedJobConfig) -> Result<OpponentPool, PpoError
                 continue;
             }
             AnnealedOpponent::Weights(directory) => {
-                let model = PolicyModel::fresh_on(0, PolicyDevice::Cpu).map_err(text_error)?;
-                TrainingArtifact::load_runtime_weights(&model, directory).map_err(text_error)?;
+                let model = TrainingArtifact::load_runtime_model(directory, PolicyDevice::Cpu)
+                    .map_err(text_error)?;
                 fingerprints.push(model.parameter_fingerprint().map_err(text_error)?);
                 snapshots.push(std::sync::Arc::new(
                     model.export_parameters().map_err(text_error)?,
@@ -658,6 +664,12 @@ fn annealed_run(
         ));
     }
     append_optimizer_scope(config, &mut command_line);
+    if settings.side_networks != crate::SideNetworks::Shared {
+        command_line.push_str(&format!(
+            " --side-networks {}",
+            settings.side_networks.label()
+        ));
+    }
     settings.execution.append_scope(&mut command_line);
     settings.guidance.append_scope(&mut command_line);
     adaptive::append_scope(settings, harness, &mut command_line);

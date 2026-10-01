@@ -17,6 +17,7 @@ mod ppo_objective;
 mod rows;
 mod sampling;
 mod side_actors;
+mod side_networks;
 #[cfg(all(
     feature = "builtin",
     feature = "cuda",
@@ -29,7 +30,13 @@ pub use imitation_class::IMITATION_CLASSES;
 pub use rows::EncoderRow;
 #[cfg(test)]
 pub(crate) use side_actors::take_encoder_forwards_for_test;
-use side_actors::{ActorHead, ActorRouting, QueuedPair, StageRequest, StageValues};
+use side_actors::{
+    ActorHead, ActorRouting, NetworkActors, NetworkSide, QueuedPair, StageRequest, StageValues,
+};
+pub use side_networks::SideNetworks;
+use side_networks::route_rows;
+#[cfg(feature = "builtin")]
+pub(crate) use side_networks::shared_tensor_name;
 #[cfg(test)]
 #[path = "tests/model_side_actors.rs"]
 mod side_actor_tests;
@@ -620,10 +627,11 @@ impl AdamState {
     fn new(
         config: AdamConfig,
         binding: OptimizerBinding,
+        parameters: usize,
         device: &Device,
     ) -> Result<Self, ModelError> {
         validate_adam_config(config)?;
-        let zeros = Tensor::zeros(MODEL_PARAMETER_COUNT, DType::F32, device)?;
+        let zeros = Tensor::zeros(parameters, DType::F32, device)?;
         Ok(Self {
             binding,
             config,
@@ -640,18 +648,13 @@ impl AdamState {
         binding: OptimizerBinding,
         device: &Device,
     ) -> Result<Self, ModelError> {
-        validate_adam_parts(
-            config,
-            first_moment,
-            second_moment,
-            step,
-            MODEL_PARAMETER_COUNT,
-        )?;
+        let parameters = first_moment.len();
+        validate_adam_parts(config, first_moment, second_moment, step, parameters)?;
         Ok(Self {
             binding,
             config,
-            first_moment: Tensor::from_slice(first_moment, MODEL_PARAMETER_COUNT, device)?,
-            second_moment: Tensor::from_slice(second_moment, MODEL_PARAMETER_COUNT, device)?,
+            first_moment: Tensor::from_slice(first_moment, parameters, device)?,
+            second_moment: Tensor::from_slice(second_moment, parameters, device)?,
             step,
         })
     }
@@ -676,9 +679,10 @@ impl AdamState {
         ))
     }
 
-    /// Checks the config, step and moments; reads the moments back only to
-    /// locate a value the device check rejects.
-    fn validate(&self) -> Result<(), ModelError> {
+    /// Checks the config, step and moments of a model with `parameters`
+    /// parameters; reads the moments back only to locate a value the device
+    /// check rejects.
+    fn validate(&self, parameters: usize) -> Result<(), ModelError> {
         validate_adam_config(self.config)?;
         if self.step > MODEL_MAX_OPTIMIZER_STEP {
             return Err(ModelError::OptimizerStepOverflow);
@@ -687,7 +691,7 @@ impl AdamState {
             ("first moment", &self.first_moment),
             ("second moment", &self.second_moment),
         ] {
-            validate_optimizer_length(field, moment.elem_count(), MODEL_PARAMETER_COUNT)?;
+            validate_optimizer_length(field, moment.elem_count(), parameters)?;
         }
         let flags = moment_flags(&self.first_moment, &self.second_moment)?.to_vec1::<f32>()?;
         if moments_pass(&flags) {
@@ -805,7 +809,8 @@ impl TrainingPrefix {
 }
 
 struct PolicyTensorTensors {
-    side_raw: [[Tensor; 2]; 12],
+    /// Raw actor outputs by side name, for finiteness checks.
+    actor_raw: Vec<(&'static str, Tensor)>,
     value: Tensor,
     kind: Tensor,
     controlled: Tensor,
@@ -1132,13 +1137,21 @@ pub(crate) fn vram_usage() -> Result<Option<VramUsage>, ModelError> {
 
 /// F32 DeepSets policy with an autoregressive masked decoder.
 pub struct PolicyModel {
-    dire: side_actors::ActorHeads,
+    side_networks: SideNetworks,
+    /// The shared network, or the Radiant then the Dire network.
+    networks: Vec<Network>,
     parameter_lock: RwLock<()>,
     lineage: NonZeroU64,
     parameter_revision: AtomicU64,
     optimizer_lineage: AtomicU64,
     device_kind: PolicyDevice,
     tensor_device: Device,
+}
+
+/// One complete network: encoders, trunk, critic, decoder embeddings and actor heads.
+struct Network {
+    actors: NetworkActors,
+    device: Device,
     unit: Mlp,
     ability: Mlp,
     item: Mlp,
@@ -1165,15 +1178,6 @@ pub struct PolicyModel {
     point_query: Linear,
 }
 
-struct PolicyEncoders {
-    unit: Mlp,
-    ability: Mlp,
-    item: Mlp,
-    point: Mlp,
-    projectile: Mlp,
-    loot: Mlp,
-}
-
 #[cfg(test)]
 #[derive(Clone, Copy, Default)]
 struct PpoTestFaults {
@@ -1182,14 +1186,23 @@ struct PpoTestFaults {
 }
 
 impl PolicyModel {
-    /// Deterministic parameters from `seed` on the CPU.
+    /// Deterministic shared-layout parameters from `seed` on the CPU.
     pub fn fresh(seed: u64) -> Result<Self, ModelError> {
         Self::fresh_on(seed, PolicyDevice::Cpu)
     }
 
-    /// Deterministic parameters from `seed` on `device`.
+    /// Deterministic shared-layout parameters from `seed` on `device`.
     pub fn fresh_on(seed: u64, device: PolicyDevice) -> Result<Self, ModelError> {
-        Self::fresh_with(seed, device, device.candle()?)
+        Self::fresh_networks(seed, SideNetworks::Shared, device)
+    }
+
+    /// Deterministic parameters of `side_networks` from `seed` on `device`.
+    pub fn fresh_networks(
+        seed: u64,
+        side_networks: SideNetworks,
+        device: PolicyDevice,
+    ) -> Result<Self, ModelError> {
+        Self::fresh_with(seed, side_networks, device, device.candle()?)
     }
 
     /// Deterministic parameters from `seed` on `sibling`'s device handle.
@@ -1199,106 +1212,56 @@ impl PolicyModel {
     /// thread uses together share one handle so replicas created mid-run
     /// allocate none of that again.
     #[cfg(feature = "builtin")]
-    pub(crate) fn fresh_beside(seed: u64, sibling: &Self) -> Result<Self, ModelError> {
-        Self::fresh_with(seed, sibling.device_kind, sibling.tensor_device.clone())
-    }
-
-    fn fresh_with(
+    pub(crate) fn fresh_beside(
         seed: u64,
-        device: PolicyDevice,
-        tensor_device: Device,
+        side_networks: SideNetworks,
+        sibling: &Self,
     ) -> Result<Self, ModelError> {
-        let mut generator = Initializer::new(seed);
-        let unit = Mlp::fresh(
-            &[(UNIT_FEATURES, 64), (64, 128), (128, 128)],
-            &mut generator,
-            &tensor_device,
-        )?;
-        let ability = Mlp::fresh(
-            &[(ABILITY_FEATURES, 64), (64, 64)],
-            &mut generator,
-            &tensor_device,
-        )?;
-        let item = Mlp::fresh(
-            &[(ITEM_FEATURES, 64), (64, 64)],
-            &mut generator,
-            &tensor_device,
-        )?;
-        let point = Mlp::fresh(
-            &[(POINT_FEATURES, 64), (64, 64)],
-            &mut generator,
-            &tensor_device,
-        )?;
-        let projectile = Mlp::fresh(
-            &[(PROJECTILE_FEATURES, 64), (64, 64)],
-            &mut generator,
-            &tensor_device,
-        )?;
-        let loot = Mlp::fresh(
-            &[(LOOT_FEATURES, 64), (64, 64)],
-            &mut generator,
-            &tensor_device,
-        )?;
-        Self::fresh_from_encoders(
-            generator,
-            PolicyEncoders {
-                unit,
-                ability,
-                item,
-                point,
-                projectile,
-                loot,
-            },
-            device,
-            tensor_device,
+        Self::fresh_with(
+            seed,
+            side_networks,
+            sibling.device_kind,
+            sibling.tensor_device.clone(),
         )
     }
 
-    fn fresh_from_encoders(
-        mut generator: Initializer,
-        encoders: PolicyEncoders,
+    /// The separate layout draws the Radiant network exactly as the shared one
+    /// (without its Dire heads), then the Dire network from the same stream.
+    fn fresh_with(
+        seed: u64,
+        side_networks: SideNetworks,
         device_kind: PolicyDevice,
         tensor_device: Device,
     ) -> Result<Self, ModelError> {
-        let trunk = Mlp::fresh(
-            &[(TRUNK_INPUT, 512), (512, 256), (256, 256)],
-            &mut generator,
-            &tensor_device,
-        )?;
+        let mut generator = Initializer::new(seed);
+        let sides: &[NetworkSide] = match side_networks {
+            SideNetworks::Shared => &[NetworkSide::Both],
+            SideNetworks::Separate => &[NetworkSide::Radiant, NetworkSide::Dire],
+        };
+        let networks = sides
+            .iter()
+            .map(|&side| Network::fresh(&mut generator, side, &tensor_device))
+            .collect::<Result<Vec<_>, _>>()?;
         let lineage = allocate_lineage(&NEXT_MODEL_LINEAGE, ModelError::ModelLineageUnavailable)?;
         Ok(Self {
+            side_networks,
+            networks,
             parameter_lock: RwLock::new(()),
             lineage,
             parameter_revision: AtomicU64::new(0),
             optimizer_lineage: AtomicU64::new(0),
             device_kind,
-            tensor_device: tensor_device.clone(),
-            unit: encoders.unit,
-            ability: encoders.ability,
-            item: encoders.item,
-            point: encoders.point,
-            projectile: encoders.projectile,
-            loot: encoders.loot,
-            trunk,
-            value: ValueHead::fresh(&mut generator, &tensor_device)?,
-            kind: Linear::fresh(256, 16, &mut generator, &tensor_device)?,
-            kind_embedding: Embedding::fresh(16, 32, &mut generator, &tensor_device)?,
-            unit_embedding: Embedding::fresh(2, 32, &mut generator, &tensor_device)?,
-            ability_embedding: Embedding::fresh(8, 16, &mut generator, &tensor_device)?,
-            item_embedding: Embedding::fresh(15, 16, &mut generator, &tensor_device)?,
-            controlled: Linear::fresh(336, 2, &mut generator, &tensor_device)?,
-            ability_head: Linear::fresh(336, 8, &mut generator, &tensor_device)?,
-            item_head: Linear::fresh(336, 15, &mut generator, &tensor_device)?,
-            swap_head: Linear::fresh(336, 15, &mut generator, &tensor_device)?,
-            learn_head: Linear::fresh(336, 6, &mut generator, &tensor_device)?,
-            shop_head: Linear::fresh(336, 64, &mut generator, &tensor_device)?,
-            loot_head: Linear::fresh(336, 16, &mut generator, &tensor_device)?,
-            target_mode: Linear::fresh(336, 3, &mut generator, &tensor_device)?,
-            put_mode: Linear::fresh(336, 2, &mut generator, &tensor_device)?,
-            entity_query: Linear::fresh(336, 128, &mut generator, &tensor_device)?,
-            point_query: Linear::fresh(336, 64, &mut generator, &tensor_device)?,
-            dire: side_actors::ActorHeads::fresh(&mut generator, &tensor_device)?,
+            tensor_device,
         })
+    }
+
+    pub const fn side_networks(&self) -> SideNetworks {
+        self.side_networks
+    }
+
+    /// Exact F32 parameters of this model's layout.
+    pub const fn parameter_count(&self) -> usize {
+        self.side_networks.parameter_count()
     }
 
     pub const fn device(&self) -> PolicyDevice {
@@ -1329,7 +1292,12 @@ impl PolicyModel {
             lineage,
             policy: self.policy_identity_locked(),
         };
-        let adam = AdamState::new(config, binding, self.tensor_device())?;
+        let adam = AdamState::new(
+            config,
+            binding,
+            self.parameter_count(),
+            self.tensor_device(),
+        )?;
         self.optimizer_lineage
             .store(lineage.get(), Ordering::Relaxed);
         Ok(adam)
@@ -1343,13 +1311,13 @@ impl PolicyModel {
         second_moment: Vec<f32>,
         step: u64,
     ) -> Result<AdamState, ModelError> {
-        validate_parameter_values(parameters)?;
+        validate_parameter_values(parameters, self.parameter_count())?;
         validate_adam_parts(
             config,
             &first_moment,
             &second_moment,
             step,
-            MODEL_PARAMETER_COUNT,
+            self.parameter_count(),
         )?;
         let _guard = self.write_parameter_lock()?;
         if self.optimizer_lineage.load(Ordering::Relaxed) != 0 {
@@ -1386,9 +1354,10 @@ impl PolicyModel {
         }
         validate_batch(std::slice::from_ref(frame))?;
         let _guard = self.read_parameter_lock()?;
-        let routing = ActorRouting::new(std::slice::from_ref(frame), self.tensor_device(), false)?;
-        let state = self.forward_frames(std::slice::from_ref(frame))?;
-        let values = self
+        let network = self.frame_network(frame)?;
+        let routing = ActorRouting::new(network, std::slice::from_ref(frame), false)?;
+        let state = network.forward_frames(std::slice::from_ref(frame))?;
+        let values = network
             .value
             .forward(&state.trunk)?
             .flatten_all()?
@@ -1404,7 +1373,7 @@ impl PolicyModel {
             });
         }
         let mut source = ModelDecoder {
-            model: self,
+            network,
             state,
             routing,
             rng: None,
@@ -1503,34 +1472,6 @@ impl PolicyModel {
         Ok(sampled)
     }
 
-    fn selection_rows_locked(
-        &self,
-        rows: &[&EncoderRow],
-        action_spaces: &[&ActionSpace],
-        mut rngs: Option<&mut [PpoRng]>,
-    ) -> Result<Vec<BatchSelection>, ModelError> {
-        let state = self.forward_rows(rows)?;
-        let routing = ActorRouting::from_rows(rows, self.tensor_device())?;
-        let base = self.base_logits(&state, &routing, 0)?;
-        let mut rows = initialize_sampling_rows(&base, action_spaces, &mut rngs)?;
-        let kind = self.sampling_kind_logits(&state, &sampling_prefixes(&rows), &routing)?;
-        select_sampling_units(&mut rows, &kind, action_spaces, &mut rngs)?;
-        let unit = self.sampling_unit_logits(&state, &sampling_prefixes(&rows), &routing)?;
-        select_sampling_slots(&mut rows, &unit, action_spaces, &mut rngs)?;
-        let slot = self.sampling_slot_logits(&state, &sampling_prefixes(&rows), &routing)?;
-        decode_batch_rows(
-            action_spaces,
-            &mut rngs,
-            rows,
-            SamplingLogits {
-                base,
-                kind,
-                unit,
-                slot,
-            },
-        )
-    }
-
     /// Exports parameters in stable descriptor order.
     pub fn export_parameters(&self) -> Result<Vec<f32>, ModelError> {
         let _guard = self.read_parameter_lock()?;
@@ -1545,11 +1486,11 @@ impl PolicyModel {
 
     fn export_parameters_locked(&self) -> Result<Vec<f32>, ModelError> {
         let parameters = self.parameters();
-        let mut output = Vec::with_capacity(MODEL_PARAMETER_COUNT);
+        let mut output = Vec::with_capacity(self.parameter_count());
         for parameter in parameters {
             output.extend(parameter.value.flatten_all()?.to_vec1::<f32>()?);
         }
-        if output.len() != MODEL_PARAMETER_COUNT {
+        if output.len() != self.parameter_count() {
             return Err(ModelError::InvalidModelState("parameter count"));
         }
         Ok(output)
@@ -1565,7 +1506,7 @@ impl PolicyModel {
         values: &[f32],
         fail_after: Option<usize>,
     ) -> Result<(), ModelError> {
-        validate_parameter_values(values)?;
+        validate_parameter_values(values, self.parameter_count())?;
         let _guard = self.write_parameter_lock()?;
         let next = self.next_policy_identity_locked()?;
         self.import_parameters_locked(values, fail_after)?;
@@ -1606,7 +1547,7 @@ impl PolicyModel {
     ) -> Result<ModelAdamSnapshot, ModelError> {
         let _guard = self.read_parameter_lock()?;
         self.validate_optimizer_binding_locked(adam.binding)?;
-        adam.validate()?;
+        adam.validate(self.parameter_count())?;
         Ok(ModelAdamSnapshot {
             parameters: self.export_parameters_locked()?,
             adam: adam.clone(),
@@ -1629,8 +1570,8 @@ impl PolicyModel {
         expected: OptimizerBinding,
         fail_after: Option<usize>,
     ) -> Result<OptimizerBinding, ModelError> {
-        validate_parameter_values(&snapshot.parameters)?;
-        snapshot.adam.validate()?;
+        validate_parameter_values(&snapshot.parameters, self.parameter_count())?;
+        snapshot.adam.validate(self.parameter_count())?;
         let _guard = self.write_parameter_lock()?;
         self.validate_optimizer_binding_locked(expected)?;
         let next = self.next_policy_identity_locked()?;
@@ -1657,12 +1598,104 @@ impl PolicyModel {
             .collect())
     }
 
-    /// Training outputs of one staged microbatch.
+    /// The network of one validated frame's observed side.
+    fn frame_network(&self, frame: &FeatureFrame) -> Result<&Network, ModelError> {
+        Ok(self.side_network(side_actors::side_row(frame, 0)? == 1))
+    }
+}
+
+impl Network {
+    /// Draws one network's parameters in descriptor order; the shared
+    /// network's Dire heads come last.
+    fn fresh(
+        generator: &mut Initializer,
+        side: NetworkSide,
+        device: &Device,
+    ) -> Result<Self, ModelError> {
+        let unit = Mlp::fresh(
+            &[(UNIT_FEATURES, 64), (64, 128), (128, 128)],
+            generator,
+            device,
+        )?;
+        let ability = Mlp::fresh(&[(ABILITY_FEATURES, 64), (64, 64)], generator, device)?;
+        let item = Mlp::fresh(&[(ITEM_FEATURES, 64), (64, 64)], generator, device)?;
+        let point = Mlp::fresh(&[(POINT_FEATURES, 64), (64, 64)], generator, device)?;
+        let projectile = Mlp::fresh(&[(PROJECTILE_FEATURES, 64), (64, 64)], generator, device)?;
+        let loot = Mlp::fresh(&[(LOOT_FEATURES, 64), (64, 64)], generator, device)?;
+        // Struct fields evaluate in source order, which is the draw order.
+        Ok(Self {
+            device: device.clone(),
+            unit,
+            ability,
+            item,
+            point,
+            projectile,
+            loot,
+            trunk: Mlp::fresh(
+                &[(TRUNK_INPUT, 512), (512, 256), (256, 256)],
+                generator,
+                device,
+            )?,
+            value: ValueHead::fresh(generator, device)?,
+            kind: Linear::fresh(256, 16, generator, device)?,
+            kind_embedding: Embedding::fresh(16, 32, generator, device)?,
+            unit_embedding: Embedding::fresh(2, 32, generator, device)?,
+            ability_embedding: Embedding::fresh(8, 16, generator, device)?,
+            item_embedding: Embedding::fresh(15, 16, generator, device)?,
+            controlled: Linear::fresh(336, 2, generator, device)?,
+            ability_head: Linear::fresh(336, 8, generator, device)?,
+            item_head: Linear::fresh(336, 15, generator, device)?,
+            swap_head: Linear::fresh(336, 15, generator, device)?,
+            learn_head: Linear::fresh(336, 6, generator, device)?,
+            shop_head: Linear::fresh(336, 64, generator, device)?,
+            loot_head: Linear::fresh(336, 16, generator, device)?,
+            target_mode: Linear::fresh(336, 3, generator, device)?,
+            put_mode: Linear::fresh(336, 2, generator, device)?,
+            entity_query: Linear::fresh(336, 128, generator, device)?,
+            point_query: Linear::fresh(336, 64, generator, device)?,
+            actors: NetworkActors::fresh(side, generator, device)?,
+        })
+    }
+
+    fn tensor_device(&self) -> &Device {
+        &self.device
+    }
+
+    /// Selections of packed rows this network serves, in input order.
+    fn selection_rows(
+        &self,
+        rows: &[&EncoderRow],
+        action_spaces: &[&ActionSpace],
+        mut rngs: Option<&mut [PpoRng]>,
+    ) -> Result<Vec<BatchSelection>, ModelError> {
+        let state = self.forward_rows(rows)?;
+        let routing = ActorRouting::from_rows(self, rows)?;
+        let base = self.base_logits(&state, &routing, 0)?;
+        let mut rows = initialize_sampling_rows(&base, action_spaces, &mut rngs)?;
+        let kind = self.sampling_kind_logits(&state, &sampling_prefixes(&rows), &routing)?;
+        select_sampling_units(&mut rows, &kind, action_spaces, &mut rngs)?;
+        let unit = self.sampling_unit_logits(&state, &sampling_prefixes(&rows), &routing)?;
+        select_sampling_slots(&mut rows, &unit, action_spaces, &mut rngs)?;
+        let slot = self.sampling_slot_logits(&state, &sampling_prefixes(&rows), &routing)?;
+        decode_batch_rows(
+            action_spaces,
+            &mut rngs,
+            rows,
+            SamplingLogits {
+                base,
+                kind,
+                unit,
+                slot,
+            },
+        )
+    }
+
+    /// Training outputs of one staged microbatch of this network's rows.
     fn training_forward_inputs(
         &self,
         inputs: &device_learner::StagedInputs,
     ) -> Result<PolicyTensorTensors, ModelError> {
-        let routing = ActorRouting::from_mask(inputs.sides.clone());
+        let routing = ActorRouting::from_mask(self, inputs.sides.clone());
         let state = self.forward_encoder_inputs(&inputs.encoder)?;
         self.training_heads(state, routing, &inputs.prefixes)
     }
@@ -1684,13 +1717,13 @@ impl PolicyModel {
                 .ok_or(ModelError::InvalidModelState(
                     "imitation without shadow prefixes",
                 ))?;
-            let routing = ActorRouting::from_mask(inputs.sides.clone());
+            let routing = ActorRouting::from_mask(self, inputs.sides.clone());
             Some(self.training_heads(state.clone(), routing, prefixes)?)
         } else {
             None
         };
         let trunk = state.trunk.clone();
-        let routing = ActorRouting::from_mask(inputs.sides.clone());
+        let routing = ActorRouting::from_mask(self, inputs.sides.clone());
         let mut output = self.training_heads(state, routing, &inputs.prefixes)?;
         if objective.critic_only {
             output.value = self.value.forward(&trunk.detach())?;
@@ -1725,7 +1758,7 @@ impl PolicyModel {
             put_mode: routing.forward(self, ActorHead::PutMode, &contexts.slot)?,
             entity_pointer: scaled_pointer_dot(&state.current_units, &entity_query)?,
             point_pointer: scaled_pointer_dot(&state.points, &point_query)?,
-            side_raw: routing.into_raw()?,
+            actor_raw: routing.into_raw()?,
         })
     }
 
@@ -1994,7 +2027,9 @@ impl PolicyModel {
             .broadcast_mul(upload.mask(PrefixMask::Item))?;
         Ok((ability + item)?)
     }
+}
 
+impl PolicyModel {
     fn read_parameter_lock(&self) -> Result<RwLockReadGuard<'_, ()>, ModelError> {
         let guard = self
             .parameter_lock
@@ -2042,6 +2077,23 @@ impl PolicyModel {
         Ok(())
     }
 
+    /// Named parameters in export order: the shared network (88 tensors), or
+    /// the Radiant network then the Dire network under `dire.` names (2 × 64).
+    fn parameters(&self) -> Vec<NamedParameter<'_>> {
+        let mut output = Vec::with_capacity(self.side_networks.parameter_tensors());
+        for (index, network) in self.networks.iter().enumerate() {
+            let start = output.len();
+            network.parameters(&mut output);
+            if index == 1 {
+                side_networks::rename_dire_network(&mut output[start..]);
+            }
+        }
+        assert_eq!(output.len(), self.side_networks.parameter_tensors());
+        output
+    }
+}
+
+impl Network {
     fn forward_frames(&self, frames: &[FeatureFrame]) -> Result<ForwardState, ModelError> {
         let rows = frames
             .iter()
@@ -2106,50 +2158,49 @@ impl PolicyModel {
         })
     }
 
-    fn parameters(&self) -> Vec<NamedParameter<'_>> {
-        let mut output = Vec::with_capacity(MODEL_PARAMETER_TENSORS);
+    fn parameters<'a>(&'a self, output: &mut Vec<NamedParameter<'a>>) {
         self.unit.parameters(
             &[
                 ("unit.0.weight", "unit.0.bias"),
                 ("unit.1.weight", "unit.1.bias"),
                 ("unit.2.weight", "unit.2.bias"),
             ],
-            &mut output,
+            output,
         );
         self.ability.parameters(
             &[
                 ("ability.0.weight", "ability.0.bias"),
                 ("ability.1.weight", "ability.1.bias"),
             ],
-            &mut output,
+            output,
         );
         self.item.parameters(
             &[
                 ("item.0.weight", "item.0.bias"),
                 ("item.1.weight", "item.1.bias"),
             ],
-            &mut output,
+            output,
         );
         self.point.parameters(
             &[
                 ("point.0.weight", "point.0.bias"),
                 ("point.1.weight", "point.1.bias"),
             ],
-            &mut output,
+            output,
         );
         self.projectile.parameters(
             &[
                 ("projectile.0.weight", "projectile.0.bias"),
                 ("projectile.1.weight", "projectile.1.bias"),
             ],
-            &mut output,
+            output,
         );
         self.loot.parameters(
             &[
                 ("loot.0.weight", "loot.0.bias"),
                 ("loot.1.weight", "loot.1.bias"),
             ],
-            &mut output,
+            output,
         );
         self.trunk.parameters(
             &[
@@ -2157,12 +2208,12 @@ impl PolicyModel {
                 ("trunk.1.weight", "trunk.1.bias"),
                 ("trunk.2.weight", "trunk.2.bias"),
             ],
-            &mut output,
+            output,
         );
-        self.decoder_parameters(&mut output);
-        self.dire.parameters(&mut output);
-        assert_eq!(output.len(), MODEL_PARAMETER_TENSORS);
-        output
+        self.decoder_parameters(output);
+        if let NetworkActors::Both(dire) = &self.actors {
+            dire.parameters(output);
+        }
     }
 
     fn decoder_parameters<'a>(&'a self, output: &mut Vec<NamedParameter<'a>>) {
@@ -2280,11 +2331,11 @@ fn validate_moments(
     Ok(())
 }
 
-fn validate_parameter_values(values: &[f32]) -> Result<(), ModelError> {
-    if values.len() != MODEL_PARAMETER_COUNT {
+fn validate_parameter_values(values: &[f32], expected: usize) -> Result<(), ModelError> {
+    if values.len() != expected {
         return Err(ModelError::ParameterLength {
             actual: values.len(),
-            expected: MODEL_PARAMETER_COUNT,
+            expected,
         });
     }
     if let Some((index, _)) = values
@@ -2970,7 +3021,7 @@ const ENCODER_SCALARS: usize = GLOBAL_FEATURES
 const ENCODER_UNIT_TOKENS: usize = UNIT_FEATURE_TOKENS + REMEMBERED_UNIT_FEATURE_TOKENS;
 
 fn encode_units(
-    model: &PolicyModel,
+    network: &Network,
     rows: &Tensor,
     presence: &Tensor,
     groups: &[Tensor],
@@ -2979,7 +3030,7 @@ fn encode_units(
     let tokens = ENCODER_UNIT_TOKENS;
     assert_eq!(rows.dims(), [batch * tokens, UNIT_FEATURES]);
     assert_eq!(presence.dims(), [batch, tokens, 1]);
-    let encoded = model
+    let encoded = network
         .unit
         .forward(rows)?
         .reshape((batch, tokens, UNIT_EMBEDDING))?;
@@ -3004,7 +3055,7 @@ pub(crate) fn unit_group(row: &[f32; UNIT_FEATURES]) -> Option<usize> {
 }
 
 fn encode_own_units(
-    model: &PolicyModel,
+    network: &Network,
     rows: &Tensor,
     mask: &Tensor,
     batch: usize,
@@ -3015,7 +3066,7 @@ fn encode_own_units(
     );
     assert_eq!(mask.dims(), [batch, OWN_UNIT_FEATURE_TOKENS, 1]);
     let encoded =
-        model
+        network
             .unit
             .forward(rows)?
             .reshape((batch, OWN_UNIT_FEATURE_TOKENS, UNIT_EMBEDDING))?;
@@ -3813,7 +3864,7 @@ impl DecoderSource for SamplingDecoder<'_, '_> {
 }
 
 struct ModelDecoder<'model, 'rng> {
-    model: &'model PolicyModel,
+    network: &'model Network,
     state: ForwardState,
     routing: ActorRouting,
     rng: Option<&'rng mut PpoRng>,
@@ -3874,15 +3925,15 @@ impl ModelDecoder<'_, '_> {
         unit: Option<ControlledUnit>,
         slot: Option<SlotSelection>,
     ) -> Result<Tensor, ModelError> {
-        let kind = self.model.kind_embedding.row(kind.index())?;
+        let kind = self.network.kind_embedding.row(kind.index())?;
         let unit = match unit {
-            Some(unit) => self.model.unit_embedding.row(unit.index())?,
-            None => Tensor::zeros((1, 32), DType::F32, self.model.tensor_device())?,
+            Some(unit) => self.network.unit_embedding.row(unit.index())?,
+            None => Tensor::zeros((1, 32), DType::F32, self.network.tensor_device())?,
         };
         let slot = match slot {
-            Some(SlotSelection::Ability(index)) => self.model.ability_embedding.row(index)?,
-            Some(SlotSelection::Item(index)) => self.model.item_embedding.row(index)?,
-            None => Tensor::zeros((1, 16), DType::F32, self.model.tensor_device())?,
+            Some(SlotSelection::Ability(index)) => self.network.ability_embedding.row(index)?,
+            Some(SlotSelection::Item(index)) => self.network.item_embedding.row(index)?,
+            None => Tensor::zeros((1, 16), DType::F32, self.network.tensor_device())?,
         };
         Ok(Tensor::cat(&[&self.state.trunk, &kind, &unit, &slot], 1)?)
     }
@@ -3897,7 +3948,7 @@ impl ModelDecoder<'_, '_> {
     ) -> Result<[f32; SIZE], ModelError> {
         let values = self
             .routing
-            .forward(self.model, head, &self.context(kind, unit, slot)?)?
+            .forward(self.network, head, &self.context(kind, unit, slot)?)?
             .flatten_all()?
             .to_vec1::<f32>()?;
         finite_array(field, values)
@@ -3914,7 +3965,7 @@ impl ModelDecoder<'_, '_> {
     ) -> Result<[f32; SIZE], ModelError> {
         let query = self
             .routing
-            .forward(self.model, head, &self.context(kind, Some(unit), slot)?)?
+            .forward(self.network, head, &self.context(kind, Some(unit), slot)?)?
             .unsqueeze(1)?;
         let scores = scaled_pointer_dot(tokens, &query)?
             .flatten_all()?
@@ -3927,7 +3978,7 @@ impl DecoderSource for ModelDecoder<'_, '_> {
     fn kind(&mut self) -> Result<[f32; 16], ModelError> {
         let values = self
             .routing
-            .forward(self.model, ActorHead::Kind, &self.state.trunk)?
+            .forward(self.network, ActorHead::Kind, &self.state.trunk)?
             .flatten_all()?
             .to_vec1::<f32>()?;
         let logits = finite_array("kind", values)?;

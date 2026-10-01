@@ -78,11 +78,14 @@ pub(super) struct HostTargets {
     advantages: Vec<f32>,
     returns: Vec<f32>,
     dire: Vec<f32>,
+    /// Balance imitation classes within each side, for separate side networks.
+    per_side: bool,
 }
 
 impl HostTargets {
-    /// `imitation` is the class balance power of an update that imitates.
-    pub(super) fn with_capacity(rows: usize, imitation: Option<f32>) -> Self {
+    /// `imitation` is the class balance power of an update that imitates;
+    /// `per_side` balances its classes within each side's rows.
+    pub(super) fn with_capacity(rows: usize, imitation: Option<f32>, per_side: bool) -> Self {
         let mut host = Self {
             heads: HostHeads::with_capacity(rows),
             shadow: imitation.map(|balance| HostShadow {
@@ -90,6 +93,7 @@ impl HostTargets {
                 classes: Vec::with_capacity(rows),
                 balance,
             }),
+            per_side,
             ..Self::default()
         };
         host.old_log_probability.reserve_exact(rows);
@@ -136,7 +140,10 @@ impl HostTargets {
             heads: self.heads.upload(rows, device)?,
             shadow: self
                 .shadow
-                .map(|shadow| shadow.upload(rows, device))
+                .map(|shadow| {
+                    let sides = self.per_side.then_some(self.dire.as_slice());
+                    shadow.upload(rows, sides, device)
+                })
                 .transpose()?,
             old_log_probability: Tensor::from_vec(self.old_log_probability, rows, device)?,
             advantages: Tensor::from_vec(self.advantages, rows, device)?,
@@ -148,8 +155,17 @@ impl HostTargets {
 }
 
 impl HostShadow {
-    fn upload(self, rows: usize, device: &Device) -> Result<ShadowTargets, ModelError> {
-        let weights = class_weights(&self.classes, self.balance);
+    /// `dire` marks each row's side when classes balance within each side.
+    fn upload(
+        self,
+        rows: usize,
+        dire: Option<&[f32]>,
+        device: &Device,
+    ) -> Result<ShadowTargets, ModelError> {
+        let weights = match dire {
+            None => class_weights(&self.classes, self.balance),
+            Some(dire) => side_class_weights(&self.classes, dire, self.balance),
+        };
         let mut classes = vec![0.0f32; rows * IMITATION_CLASSES.len()];
         for (row, class) in self.classes.iter().enumerate() {
             if let Some(class) = class {
@@ -162,6 +178,22 @@ impl HostShadow {
             classes: Tensor::from_vec(classes, (rows, IMITATION_CLASSES.len()), device)?,
         })
     }
+}
+
+/// [`class_weights`] of each side's rows on their own.
+fn side_class_weights(classes: &[Option<u8>], dire: &[f32], balance: f32) -> Vec<f32> {
+    assert_eq!(classes.len(), dire.len());
+    let mut weights = vec![0.0; classes.len()];
+    for side in [0.0, 1.0] {
+        let members = (0..classes.len())
+            .filter(|&row| dire[row] == side)
+            .collect::<Vec<_>>();
+        let member_classes = members.iter().map(|&row| classes[row]).collect::<Vec<_>>();
+        for (&row, weight) in members.iter().zip(class_weights(&member_classes, balance)) {
+            weights[row] = weight;
+        }
+    }
+    weights
 }
 
 impl HostHeads {

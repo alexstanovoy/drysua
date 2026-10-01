@@ -1,7 +1,7 @@
 use super::*;
 
 pub(super) fn contract() -> Value {
-    json!({"schema": SCHEMA, "kind": "contract", "model": model(), "enabled_features": compiled_features(),
+    json!({"schema": SCHEMA, "kind": "contract", "model": model(SideNetworks::Shared), "enabled_features": compiled_features(),
         "capabilities": {"inspection": cfg!(target_os = "linux"), "annealed_history": cfg!(feature = "builtin"),
             "read_only": true, "strict_build_features": true, "controller_run_kind": "train-annealed"},
         "limits": {"max_json_bytes": MAX_JSON_BYTES, "max_snapshots": MAX_SNAPSHOTS, "max_files": MAX_FILES,
@@ -26,8 +26,9 @@ fn schema(version: u32, hash: u64) -> Value {
     json!({"version": version, "hash": format!("{hash:016x}")})
 }
 
-pub(super) fn model() -> Value {
-    json!({"version": MODEL_SCHEMA_VERSION, "hash": format!("{MODEL_SCHEMA_HASH:016x}"), "parameters": MODEL_PARAMETER_COUNT})
+pub(super) fn model(side_networks: SideNetworks) -> Value {
+    json!({"version": MODEL_SCHEMA_VERSION, "hash": format!("{MODEL_SCHEMA_HASH:016x}"),
+        "side_networks": side_networks.label(), "parameters": side_networks.parameter_count()})
 }
 
 pub(super) fn run(run: &CheckpointRun) -> Value {

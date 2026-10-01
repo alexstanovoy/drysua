@@ -1,4 +1,5 @@
 use super::*;
+use crate::MODEL_PARAMETER_COUNT;
 use serde_json::Value;
 
 #[test]
@@ -121,9 +122,11 @@ mod files {
             (
                 "runtime with a wrong tensor shape",
                 |root, artifact| {
-                    let mut schema = current_parameter_schema().unwrap();
+                    let mut schema = layout_schema(SideNetworks::Shared).unwrap().to_vec();
                     schema[0].1.reverse();
-                    let runtime = runtime::serialize(&schema, &artifact.parameters).unwrap();
+                    let runtime =
+                        runtime::serialize(&schema, &artifact.parameters, SideNetworks::Shared)
+                            .unwrap();
                     fs::write(root.join(RUNTIME_TENSOR_FILE), runtime).unwrap();
                 },
                 CheckpointError::TensorContract("dtype or shape"),

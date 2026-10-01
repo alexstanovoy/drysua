@@ -291,7 +291,7 @@ struct TrainingSession {
 
 impl TrainingSession {
     fn initialize(
-        device: PolicyDevice,
+        (device, side_networks): (PolicyDevice, crate::SideNetworks),
         directory: &Path,
         resume: bool,
         initial_weights_directory: Option<&Path>,
@@ -299,11 +299,15 @@ impl TrainingSession {
         run: CheckpointRun,
     ) -> Result<Self, PpoError> {
         let model = match (resume, initial_weights_directory) {
-            (false, Some(directory)) => {
-                TrainingArtifact::initialize_from_weights(directory, run.run_seed, device)
-                    .map_err(text_error)?
-            }
-            _ => PolicyModel::fresh_on(run.run_seed, device).map_err(text_error)?,
+            (false, Some(directory)) => TrainingArtifact::initialize_from_weights(
+                directory,
+                run.run_seed,
+                side_networks,
+                device,
+            )
+            .map_err(text_error)?,
+            _ => PolicyModel::fresh_networks(run.run_seed, side_networks, device)
+                .map_err(text_error)?,
         };
         let restored = if resume {
             restore_training_session(&model, directory, &run, config)?
