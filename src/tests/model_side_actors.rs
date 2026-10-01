@@ -713,6 +713,7 @@ fn ppo_samples() -> Vec<PpoPreparedSample> {
                     next_value: 0.0,
                     reward: 0.0,
                     terminal: true,
+                    weight: 1.0,
                 },
                 advantage: 1.0,
                 return_value: 1.0,

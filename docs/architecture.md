@@ -65,9 +65,10 @@ These rules keep the policy from winning through simulator leaks rather than pla
   `weights:`, `league` snapshots of the learner), weighted by PFSP per update.
 - `--lanes` inference threads (default 2) batch their slots through a weight replica;
   a shared pool steps the simulations.
-- The first decision, every non-Continue decision and each Continue that finds the
-  open interval `MAP2_CONTINUE_STRIDE = 8` decisions long begin a PPO sample (about
-  0.4 per decision); an update is due at `--samples-per-update` samples (default
+- The first decision, every non-Continue decision, each Continue that finds the
+  open interval `MAP2_CONTINUE_STRIDE = 8` decisions long and any other Continue with
+  probability 1/8 begin a PPO sample (about 0.4 per decision), weighted by the inverse
+  retention probability; an update is due at `--samples-per-update` samples (default
   24,000, about sixteen games).
 - The learner trains update `u` while lanes collect `u + 1` with the weights of
   `u - 1` (1-stale PPO; the ratio uses stored behaviour log-probabilities).

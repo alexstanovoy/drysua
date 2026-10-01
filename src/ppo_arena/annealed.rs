@@ -982,13 +982,13 @@ mod tests;
 
 fn log_ppo_update(
     report: &crate::PpoUpdateReport,
-    explained_variance: crate::ExplainedVariance,
+    (explained_variance, sides): (crate::ExplainedVariance, [crate::BatchSideStatistics; 2]),
     optimizer_steps: u64,
     samples: usize,
     learning_rate: f32,
 ) {
     crate::telemetry::log_line!(
-        "level=INFO event=ppo_update update={} policy_loss={:.6} value_loss={:.6} entropy={:.6} approx_kl={:.8} clip_fraction={:.6} explained_variance={:.6} explained_variance_mc={:.6} kl_stop={} optimizer_steps={optimizer_steps} samples={samples} learning_rate={learning_rate:e} critic_only={}{}",
+        "level=INFO event=ppo_update update={} policy_loss={:.6} value_loss={:.6} entropy={:.6} approx_kl={:.8} clip_fraction={:.6} explained_variance={:.6} explained_variance_mc={:.6} kl_stop={} optimizer_steps={optimizer_steps} samples={samples} learning_rate={learning_rate:e} critic_only={}{}{}",
         report.update,
         report.policy_loss,
         report.value_loss,
@@ -1000,7 +1000,61 @@ fn log_ppo_update(
         report.stopped_for_kl,
         report.objective.critic_only,
         imitation_fields(report),
+        side_fields(report, sides),
     );
+}
+
+/// Per-side rollout and optimization statistics, radiant then dire.
+#[allow(
+    clippy::float_arithmetic,
+    reason = "per-row means of summed statistics"
+)]
+fn side_fields(report: &crate::PpoUpdateReport, sides: [crate::BatchSideStatistics; 2]) -> String {
+    const HEADS: [&str; crate::MODEL_ACTION_HEADS] = [
+        "kind",
+        "unit",
+        "ability",
+        "item",
+        "swap",
+        "learn",
+        "shop",
+        "loot",
+        "target_mode",
+        "put_mode",
+        "entity",
+        "point",
+    ];
+    let mut fields = String::new();
+    for (side, (name, dire)) in sides.iter().zip([("radiant", false), ("dire", true)]) {
+        fields.push_str(&format!(
+            " {name}_samples={} {name}_advantage_mean={:.6} {name}_advantage_std={:.6} {name}_advantage_normalized_mean={:.6} {name}_return_mean={:.6} {name}_value_mean={:.6} {name}_explained_variance={:.6} {name}_behaviour_entropy={:.6} {name}_continue_share={:.6} {name}_continue_advantage_mean={:.6} {name}_action_advantage_mean={:.6}",
+            side.samples,
+            side.advantage_mean,
+            side.advantage_deviation,
+            side.normalized_advantage_mean,
+            side.return_mean,
+            side.value_mean,
+            side.explained_variance,
+            side.behaviour_entropy,
+            side.continue_share,
+            side.continue_advantage_mean,
+            side.action_advantage_mean,
+        ));
+        let Some(means) = report.sides.means(dire) else {
+            continue;
+        };
+        fields.push_str(&format!(
+            " {name}_policy_loss={:.6} {name}_value_loss={:.6} {name}_entropy={:.6} {name}_approx_kl={:.8} {name}_clip_fraction={:.6} {name}_imitation_loss={:.6}",
+            means[1], means[2], means[3], means[4], means[5], means[6],
+        ));
+        for (head, label) in HEADS.iter().enumerate() {
+            fields.push_str(&format!(
+                " {name}_entropy_{label}={:.6}",
+                means[crate::SIDE_QUANTITIES + head]
+            ));
+        }
+    }
+    fields
 }
 
 /// The imitation coefficient, mean cross entropy per labeled row and the

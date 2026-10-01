@@ -58,7 +58,7 @@ impl PpoStaging {
                 ModelError::NonFiniteFrame { .. } => ModelError::NonFiniteFrame { index },
                 error => error,
             })?;
-        self.targets.push(sample)?;
+        self.targets.push(sample, self.row.radiant())?;
         for (part, values) in self.chunk.iter_mut().enumerate() {
             values.extend_from_slice(self.row.part_values(part));
         }

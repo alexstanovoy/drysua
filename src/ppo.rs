@@ -61,22 +61,22 @@ pub const PPO_MAX_STALENESS: u64 = 2;
 /// Maximum random draws made by one autoregressive policy sample.
 pub const PPO_MAX_POLICY_SAMPLE_DRAWS: u64 = 132;
 /// Version of rollout, GAE, objective, optimizer, and reward semantics.
-pub const PPO_SCHEMA_VERSION: u32 = 42;
+pub const PPO_SCHEMA_VERSION: u32 = 43;
 /// Version of the simulator and learner rules rollouts assume.
 pub const PPO_RULES_AUDIT_VERSION: u32 = 32;
 /// Learner contract covered by [`PPO_SCHEMA_HASH`].
 pub const PPO_SCHEMA_DESCRIPTOR: &str = concat!(
-    "bota-drysua-ppo/v42;",
+    "bota-drysua-ppo/v43;",
     "linked_schemas=action,feature,model,map2_reward;linked_hash=fnv1a_descriptor_then_ordered_version_le32_hash_le64_then_map2_reward_descriptor_utf8;rules_audit=32;",
     "scope=map2_mid_only_dota_geometry_mid_waves_second_hero_death_or_first_tower_loss_simultaneous_draw_cap27900_including900_pregame_cap_tick_draw;",
     "collection=continuous_slots1to256_back_to_back_games,lanes_divide_slots_max64_slots_per_lane,update_due_after_whole_lane_rounds_reaching_samples_per_update_over_lanes,in_flight_intervals_continue_under_next_weights,actor_weights_lag_learner_by_pipeline_staleness_at_most2_with_boundary_intervals,per_update_opponent_mixture_teacher_frozen_weights_selfplay_league_snapshots_every_n_updates_pfsp_weight_times_one_minus_laplace_score_over_last100_games_squared_integer_from_outcomes_of_updates_every_lane_finished;",
     "candidate_order=live_neural_ppo_learner_and_neural_opponents_by_prepared_action,effective_directive_ledger_follows_all_actual_sends;teacher=original_strategy_no_learner_override;",
     "bounds=streams1280,samples_per_update32768,max_samples33280,slots256,epochs16,minibatch8192,microbatch64_128_256;",
-    "complete_episodes=map2_balanced_sides,retain_first_every_noncontinue_and_continue_after8_decision_interval,retain_original_action_logprob_exact_elapsed_ticks_and_all_intervening_reward,terminal_zero_bootstrap_partial_flush,no_synthetic_zero_tick_samples,empty_optimizer_batch_rejected;lambda1=full_monte_carlo_f64_return_recurrence;",
+    "complete_episodes=map2_balanced_sides,retain_first_every_noncontinue_continue_after8_decision_interval_else_with_probability1_8_from_game_seed_and_decision,inverse_retention_probability_weight,retain_original_action_logprob_exact_elapsed_ticks_and_all_intervening_reward,terminal_zero_bootstrap_partial_flush,no_synthetic_zero_tick_samples,empty_optimizer_batch_rejected;lambda1=full_monte_carlo_f64_return_recurrence;",
     "terminal=win.2_loss-.2_draw0_timecap-.2,victory_time=win_only_native_ticks_full.2_to9000_linear_to0_at21600,draw_and_timecap_are_nonwins_distinct_labels,infrastructure_failure_invalidates_not_fabricated_outcome;",
     "wire_rebase=bota78427bb_missed_event_ignored_without_damage_or_healing_cheat_order_never_issued_or_honoured_NoCheats_rejected_without_reward,attack_time_ms_converted_to_ticks,bound_combat_and_collision_clearance_no_terminal_or_shaping_change;",
     "actor=per_lane_weight_replica_recorded_behaviour_version,batch_max128_single_shared_trunk_forward_policy_and_selfplay_rows,side_selected_radiant_dire_actor_heads,per_game_rng_from_seed_slot_game,transactional_batch_rng,legal_masked_gumbel_max_open_f64_uniform,exact_autoregressive_log_probability_and_entropy_for_retained_rows;",
-    "gae=map2_gamma_tick1_required,lambda_per_elapsed_tick0.9997912,terminal_reset,bootstrap_collector_truncation_not_task_terminal,normalized_advantages;",
+    "gae=map2_gamma_tick1_required,lambda_per_elapsed_tick0.9997912,terminal_reset,bootstrap_collector_truncation_not_task_terminal,normalized_advantages_times_inverse_retention_probability_over_batch_mean;",
     "objective=clipped_surrogate0.2,value_mse0.5,entropy0.004,target_kl0.02;",
     "critic=value_mlp_on_shared_trunk,value_loss_trains_trunk;",
     "optimizer=adam_lr1e-5_beta1_0.9_beta2_0.999_epsilon1e-5_global_clip0.5,weighted_host_microbatch_accumulation,transactional_parameters_moments_shuffle;",
@@ -388,6 +388,8 @@ pub struct PpoTransition {
     pub(crate) next_value: f32,
     pub(crate) reward: f32,
     pub(crate) terminal: bool,
+    /// Inverse probability that the decision was retained; scales its policy gradient.
+    pub(crate) weight: f32,
 }
 
 pub(crate) fn validate_transition(transition: &PpoTransition) -> Result<(), PpoError> {
@@ -411,6 +413,9 @@ pub(crate) fn validate_transition(transition: &PpoTransition) -> Result<(), PpoE
         if !value.is_finite() {
             return Err(PpoError::NonFinite(field));
         }
+    }
+    if !(1.0..=crate::MAP2_CONTINUE_STRIDE as f32).contains(&transition.weight) {
+        return Err(PpoError::InvalidTransition("retention weight"));
     }
     if transition.old_log_probability > 1.0e-5 || !transition.frame.is_finite() {
         return Err(PpoError::InvalidTransition("policy statistics or frame"));
@@ -445,6 +450,8 @@ struct CompactPpoTransition {
     next_value: f32,
     reward: f32,
     terminal: bool,
+    weight: f32,
+    radiant: bool,
 }
 
 impl PpoRollout {
@@ -499,6 +506,8 @@ impl PpoRollout {
             next_value: transition.next_value,
             reward: transition.reward,
             terminal: transition.terminal,
+            weight: transition.weight,
+            radiant: transition.frame.global[crate::global_feature::SIDE_RADIANT] == 1.0,
         });
         Ok(())
     }
@@ -517,7 +526,7 @@ impl PpoRollout {
     }
 }
 
-/// One transition with normalized GAE and lambda return.
+/// One transition with its normalized, retention-weighted GAE and lambda return.
 #[derive(Clone, Debug)]
 pub struct PpoPreparedSample {
     pub(crate) transition: PpoTransition,
@@ -531,6 +540,31 @@ pub struct PpoBatch {
     frames: RaggedFeatureArena,
     /// Monte Carlo return of each sample whose game ended in this batch.
     outcome_returns: Vec<Option<f32>>,
+    /// Radiant, then dire.
+    sides: [BatchSideStatistics; 2],
+}
+
+/// Rollout statistics of one side's samples, before the update trains on them.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct BatchSideStatistics {
+    pub samples: usize,
+    /// Mean and standard deviation of the raw GAE advantages.
+    pub advantage_mean: f64,
+    pub advantage_deviation: f64,
+    /// Mean advantage after the batch-wide normalization the update trains on.
+    pub normalized_advantage_mean: f64,
+    pub return_mean: f64,
+    pub value_mean: f64,
+    /// Explained variance of the lambda returns by the behaviour values.
+    pub explained_variance: f64,
+    /// Mean negative behaviour log-probability, a sampled estimate of the
+    /// behaviour policy's entropy summed over its active heads.
+    pub behaviour_entropy: f64,
+    /// Share of samples that begin with Continue, and the mean normalized
+    /// advantage of those and of the others.
+    pub continue_share: f64,
+    pub continue_advantage_mean: f64,
+    pub action_advantage_mean: f64,
 }
 
 /// How much return variance the rollout critic explained before an update.
@@ -586,6 +620,69 @@ impl ImitationReport {
     }
 }
 
+/// Per-row quantities [`SideReport`] sums besides the head entropies: rows,
+/// policy loss, value loss, entropy, approximate KL, clipped rows, imitation
+/// cross entropy and imitation-labeled rows.
+pub const SIDE_QUANTITIES: usize = 8;
+
+/// Columns of one [`SideReport`] row: the side quantities, then every head's entropy.
+const SIDE_COLUMNS: usize = SIDE_QUANTITIES + crate::MODEL_ACTION_HEADS;
+
+/// Sums over optimized rows of every row and of the dire rows alone; a radiant
+/// sum is the difference. The KL is the gradient forward's, before the step.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SideReport {
+    pub all: [f64; SIDE_COLUMNS],
+    pub dire: [f64; SIDE_COLUMNS],
+}
+
+impl Default for SideReport {
+    fn default() -> Self {
+        Self {
+            all: [0.0; SIDE_COLUMNS],
+            dire: [0.0; SIDE_COLUMNS],
+        }
+    }
+}
+
+impl SideReport {
+    pub(crate) fn from_sums(sums: &[f32]) -> Self {
+        assert_eq!(sums.len(), 2 * SIDE_COLUMNS);
+        Self {
+            all: std::array::from_fn(|column| f64::from(sums[column])),
+            dire: std::array::from_fn(|column| f64::from(sums[SIDE_COLUMNS + column])),
+        }
+    }
+
+    fn add(&mut self, other: &Self) {
+        for column in 0..SIDE_COLUMNS {
+            self.all[column] += other.all[column];
+            self.dire[column] += other.dire[column];
+        }
+    }
+
+    /// Per-row means of one side (`dire` false is radiant), or `None` without rows.
+    pub fn means(&self, dire: bool) -> Option<[f64; SIDE_COLUMNS]> {
+        let sums: [f64; SIDE_COLUMNS] = std::array::from_fn(|column| {
+            if dire {
+                self.dire[column]
+            } else {
+                self.all[column] - self.dire[column]
+            }
+        });
+        let rows = sums[0];
+        (rows > 0.0).then(|| {
+            std::array::from_fn(|column| match column {
+                0 => rows,
+                6 if sums[7] > 0.0 => sums[6] / sums[7],
+                6 => f64::NAN,
+                7 => sums[7],
+                _ => sums[column] / rows,
+            })
+        })
+    }
+}
+
 /// One model minibatch result before trainer-level aggregation.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub(crate) struct PpoMinibatchReport {
@@ -599,6 +696,7 @@ pub(crate) struct PpoMinibatchReport {
     pub samples: usize,
     pub applied: bool,
     pub imitation: ImitationReport,
+    pub sides: SideReport,
 }
 
 /// One complete PPO update report across epochs and minibatches.
@@ -622,6 +720,7 @@ pub struct PpoUpdateReport {
     /// The auxiliary terms this update trained with.
     pub objective: UpdateObjective,
     pub imitation: ImitationReport,
+    pub sides: SideReport,
 }
 
 /// Exclusive PPO optimizer owner with deterministic bounded shuffling.
@@ -831,6 +930,7 @@ fn aggregate_minibatch(
     aggregate.gradient_norm += report.gradient_norm;
     aggregate.applied_scale += report.applied_scale;
     aggregate.imitation.add(&report.imitation);
+    aggregate.sides.add(&report.sides);
     aggregate.samples_optimized = aggregate
         .samples_optimized
         .checked_add(report.samples)
@@ -892,6 +992,11 @@ impl PpoBatch {
                 |(sample, outcome)| outcome.map(|outcome| (f64::from(outcome), value(sample))),
             )),
         }
+    }
+
+    /// Radiant, then dire rollout statistics.
+    pub const fn side_statistics(&self) -> [BatchSideStatistics; 2] {
+        self.sides
     }
 
     pub fn sample(&self, index: usize) -> Result<PpoPreparedSample, PpoError> {
@@ -992,12 +1097,71 @@ fn prepare_batch(
     }
     prepared.reverse();
     outcome_returns.reverse();
+    let mut sides = [true, false].map(|radiant| side_statistics(&prepared, radiant));
     normalize_advantages(&mut prepared)?;
+    weigh_advantages(&mut prepared);
+    for (side, radiant) in sides.iter_mut().zip([true, false]) {
+        let normalized = side_statistics(&prepared, radiant);
+        side.normalized_advantage_mean = normalized.advantage_mean;
+        side.continue_advantage_mean = normalized.continue_advantage_mean;
+        side.action_advantage_mean = normalized.action_advantage_mean;
+    }
     Ok(PpoBatch {
         samples: prepared,
         frames,
         outcome_returns,
+        sides,
     })
+}
+
+fn side_statistics(samples: &[CompactPreparedSample], radiant: bool) -> BatchSideStatistics {
+    let side = || {
+        samples
+            .iter()
+            .filter(move |sample| sample.transition.radiant == radiant)
+    };
+    let count = side().count();
+    if count == 0 {
+        return BatchSideStatistics::default();
+    }
+    let mean = |value: &dyn Fn(&CompactPreparedSample) -> f64| {
+        side().map(value).sum::<f64>() / count as f64
+    };
+    let advantage_mean = mean(&|sample| f64::from(sample.advantage));
+    BatchSideStatistics {
+        samples: count,
+        advantage_mean,
+        advantage_deviation: mean(&|sample| (f64::from(sample.advantage) - advantage_mean).powi(2))
+            .sqrt(),
+        normalized_advantage_mean: advantage_mean,
+        return_mean: mean(&|sample| f64::from(sample.return_value)),
+        value_mean: mean(&|sample| f64::from(sample.transition.old_value)),
+        explained_variance: explained(side().map(|sample| {
+            (
+                f64::from(sample.return_value),
+                f64::from(sample.transition.old_value),
+            )
+        })),
+        behaviour_entropy: mean(&|sample| -f64::from(sample.transition.old_log_probability)),
+        continue_share: mean(&|sample| f64::from(u8::from(continues(sample)))),
+        continue_advantage_mean: conditional_mean(side().filter(|sample| continues(sample))),
+        action_advantage_mean: conditional_mean(side().filter(|sample| !continues(sample))),
+    }
+}
+
+fn continues(sample: &CompactPreparedSample) -> bool {
+    sample.transition.action.kind() == crate::ActionKind::Continue
+}
+
+fn conditional_mean<'a>(samples: impl Iterator<Item = &'a CompactPreparedSample>) -> f64 {
+    let (count, sum) = samples.fold((0usize, 0.0f64), |(count, sum), sample| {
+        (count + 1, sum + f64::from(sample.advantage))
+    });
+    if count == 0 {
+        f64::NAN
+    } else {
+        sum / count as f64
+    }
 }
 
 fn monte_carlo_return(
@@ -1047,6 +1211,21 @@ fn normalize_advantages(samples: &mut [CompactPreparedSample]) -> Result<(), Ppo
     Ok(())
 }
 
+/// Scales each normalized advantage by its decision's inverse retention
+/// probability over the batch mean; a positive factor on the advantage weighs
+/// the clipped surrogate exactly as it would weigh the sample.
+fn weigh_advantages(samples: &mut [CompactPreparedSample]) {
+    let mean = samples
+        .iter()
+        .map(|sample| f64::from(sample.transition.weight))
+        .sum::<f64>()
+        / samples.len() as f64;
+    for sample in samples {
+        sample.advantage =
+            (f64::from(sample.advantage) * f64::from(sample.transition.weight) / mean) as f32;
+    }
+}
+
 fn expand_transition(
     frames: &RaggedFeatureArena,
     compact: &CompactPpoTransition,
@@ -1067,6 +1246,7 @@ fn expand_transition(
         next_value: compact.next_value,
         reward: compact.reward,
         terminal: compact.terminal,
+        weight: compact.weight,
     })
 }
 

@@ -157,7 +157,7 @@ fn final_native_damage_is_rewarded_before_draw_finalization() {
             DamageKind::Pure,
         );
     });
-    let mut stream = EpisodeStream::new(&environment, None, false);
+    let mut stream = EpisodeStream::new(&environment, None, false, 0);
     let completed = step_policy(&mut environment, &mut stream, &model, false);
     assert_eq!(completed.ticks, 1);
     assert_eq!(completed.outcome, Some(PpoTerminalOutcome::Draw));
@@ -180,7 +180,7 @@ fn final_native_damage_is_rewarded_before_draw_finalization() {
 fn learner_deadline_zero_bootstraps_without_inventing_match_over() {
     let model = stop_model();
     let mut environment = configured_environment(1, 0, OpponentRuntime::Idle, |_| {});
-    let mut stream = EpisodeStream::new(&environment, None, false);
+    let mut stream = EpisodeStream::new(&environment, None, false, 0);
     let completed = step_policy(&mut environment, &mut stream, &model, true);
     assert_eq!(completed.outcome, None);
     assert_eq!((completed.end_tick, completed.ticks), (4, 3));
