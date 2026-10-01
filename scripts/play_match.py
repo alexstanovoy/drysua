@@ -44,9 +44,9 @@ def main(arguments=None):
     status = 1
     try:
         _, arguments.weights_directory = opponent_paths(root, arguments)
-        preflight(root, arguments.no_build, arguments.build)
+        preflight(root, arguments.no_build)
         if arguments.no_build:
-            release_executables(root)
+            release_executables(root, require_fresh=True)
         mask = os.umask(0o077)
         parent = root / "drysua"
         for part in ("artifacts", "temp"):
@@ -103,12 +103,9 @@ def parse_arguments(arguments):
                         help="Server port, or 0 for an assigned port (default: 4455)")
     parser.add_argument("--seed", type=lambda value: integer(value, 2**64 - 1), default=9000001,
                         help="Match seed (default: 9000001)")
-    build = parser.add_mutually_exclusive_group()
-    build.add_argument("--no-build", action="store_true",
-                       help="Use existing current bota server/client and drysua release binaries; never build")
-    build.add_argument("--build", action="store_true",
-                       help="Rebuild both release workspaces before launching "
-                            "(default: build only missing release binaries)")
+    parser.add_argument("--no-build", action="store_true",
+                        help="Use existing release binaries, refusing stale bota ones; never build "
+                             "(default: incremental release builds of both workspaces)")
     parser.add_argument("--human-side", choices=("radiant", "dire"),
                         help="Human side (default: radiant, or opposite --bot-side)")
     parser.add_argument("--bot-side", choices=("radiant", "dire"),
@@ -183,12 +180,28 @@ def executable_ready(executable):
     return not executable.is_symlink() and executable.is_file() and os.access(executable, os.X_OK)
 
 
-def release_executables(root):
+def release_executables(root, require_fresh=False):
     binaries = release_paths(root)
     for executable in binaries:
         if not executable_ready(executable):
             raise RuntimeError(f"release executable missing: {executable}; rerun without --no-build")
+    if require_fresh:
+        reject_stale_bota(root, binaries[:2])
     return binaries
+
+
+def reject_stale_bota(root, executables):
+    # Binaries older than the bota HEAD commit predate its wire protocol; without git there is nothing to compare.
+    try:
+        result = subprocess.run(["git", "-C", str(root / "bota"), "log", "-1", "--format=%ct"],
+                                capture_output=True, text=True, timeout=10, check=True)
+        committed = int(result.stdout.strip())
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return
+    for executable in executables:
+        if executable.stat().st_mtime < committed:
+            raise RuntimeError(f"stale bota binary (older than the bota HEAD commit): {executable}; "
+                               "drop --no-build to rebuild so bota and drysua match")
 
 
 def integer(value, maximum):
@@ -201,7 +214,7 @@ def integer(value, maximum):
     return result
 
 
-def preflight(root, no_build, build=False):
+def preflight(root, no_build):
     if sys.platform != "linux":
         raise RuntimeError("this launcher requires Linux process groups")
     if not os.environ.get("DISPLAY", "").strip():
@@ -211,9 +224,7 @@ def preflight(root, no_build, build=False):
         manifest = root / repository / "Cargo.toml"
         if not manifest.is_file():
             raise RuntimeError(f"source manifest missing: {manifest}")
-    # Cargo is needed only for an explicit --build or a missing release binary.
-    needed = build or any(not executable_ready(executable) for executable in release_paths(root))
-    if not no_build and needed and shutil.which("cargo") is None:
+    if not no_build and shutil.which("cargo") is None:
         raise RuntimeError("cargo is required to build; install Rust or use --no-build with release binaries")
 
 
@@ -362,21 +373,15 @@ class Supervisor:
         label = "pure Neural" if arguments.opponent == "neural" else f"explicit {arguments.opponent} (no model)"
         print(f"play: current Map2 {label}; weights: {weights}; executable: {binary}", flush=True)
         if not arguments.no_build:
-            binaries = release_paths(root)
-            missing = [executable for executable in binaries if not executable_ready(executable)]
-            if arguments.build or any(executable in missing for executable in binaries[:2]):
-                command = ["cargo", "build", "--release", "--locked", "--quiet",
-                           "--manifest-path", str(root / "bota/Cargo.toml"), "-p", "bota-server",
-                           "-p", "bota-client", "--bin", "bota-server", "--bin", "bota-client"]
-                environment = dict(os.environ, CARGO_TARGET_DIR=str(root / "bota/target"))
-                self.wait_build(self.spawn("build-bota", command, root, environment))
-            if arguments.build or binaries[2] in missing:
-                command = ["cargo", "build", "--release", "--locked", "--quiet",
-                           "--bin", "drysua", "--no-default-features"]
-                environment = dict(os.environ, CARGO_TARGET_DIR=str(root / "drysua/target"))
-                self.wait_build(self.spawn("build-drysua", command, root / "drysua", environment))
-            if not arguments.build and not missing:
-                print("play: existing release binaries used; --build rebuilds, --no-build forbids builds", flush=True)
+            command = ["cargo", "build", "--release", "--locked", "--quiet",
+                       "--manifest-path", str(root / "bota/Cargo.toml"), "-p", "bota-server",
+                       "-p", "bota-client", "--bin", "bota-server", "--bin", "bota-client"]
+            environment = dict(os.environ, CARGO_TARGET_DIR=str(root / "bota/target"))
+            self.wait_build(self.spawn("build-bota", command, root, environment))
+            command = ["cargo", "build", "--release", "--locked", "--quiet",
+                       "--bin", "drysua", "--no-default-features"]
+            environment = dict(os.environ, CARGO_TARGET_DIR=str(root / "drysua/target"))
+            self.wait_build(self.spawn("build-drysua", command, root / "drysua", environment))
         binaries = release_executables(root)
         assert binary == binaries[2]
         server = self.spawn("server", [str(binaries[0]), "--port", str(arguments.port), *transport_arguments(arguments),

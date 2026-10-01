@@ -505,7 +505,7 @@ class LauncherTests(unittest.TestCase):
         self.assertIn(b"--no-build", output)
 
     def test_explicit_build_flag_rebuilds_both_workspaces_and_launches_map2_pure_neural(self):
-        port = self.game("--build")
+        port = self.game()
         build = self.child("build-bota")
         self.assertEqual(build["target"], str(self.root / "bota/target"))
         self.assertEqual(build["arguments"], ["build", "--release", "--locked", "--quiet",
@@ -560,26 +560,27 @@ class LauncherTests(unittest.TestCase):
         self.send("bota-client", b"0")
         self.finish(0)
 
-    def test_default_uses_existing_release_binaries_without_building(self):
+    def test_default_always_builds_both_workspaces_even_when_binaries_exist(self):
         self.game()
-        self.assertNotIn("build-bota", self.children)
-        self.assertNotIn("build-drysua", self.children)
+        self.child("build-bota")
+        self.child("build-drysua")
         self.send("bota-client", b"0")
         self.finish(0)
         self.assert_children_stopped()
 
-    def test_default_builds_only_missing_release_workspace(self):
-        (self.root / "drysua/target/release/drysua").unlink()
-        self.launch()
-        self.child("build-drysua")
-        self.assertNotIn("build-bota", self.children)
-        # The mock cargo never materializes binaries; a still-missing bot must fail
-        # closed before the server starts, never fall back to a stale executable.
-        self.assertIn("release executable missing", self.finish(1))
-        self.assert_children_stopped()
+    def test_no_build_refuses_bota_binaries_older_than_bota_head(self):
+        bota = self.root / "bota"
+        git = ["git", "-C", str(bota), "-c", "user.name=t", "-c", "user.email=t@t"]
+        subprocess.run([*git, "init", "-q"], check=True)
+        subprocess.run([*git, "add", "."], check=True)
+        subprocess.run([*git, "commit", "-qm", "x"], check=True)
+        for name in ("bota-server", "bota-client"):
+            os.utime(bota / "target/release" / name, (1, 1))
+        self.launch("--no-build")
+        self.assertIn("drop --no-build", self.preflight_failure("stale bota binary"))
 
     def test_interrupt_during_build_kills_children_and_term_ignoring_grandchildren(self):
-        self.launch("--build", PLAY_TEST_BUILD="hold")
+        self.launch(PLAY_TEST_BUILD="hold")
         self.send("build-bota", b"d")
         self.child("build-bota-child")
         self.child("build-bota-child-grandchild")
@@ -612,7 +613,7 @@ class LauncherTests(unittest.TestCase):
         self.assert_children_stopped()
 
     def test_term_escalates_when_build_ignores_term(self):
-        self.launch("--build", PLAY_TEST_BUILD="hold")
+        self.launch(PLAY_TEST_BUILD="hold")
         self.send("build-bota", b"i")
         self.assertEqual(json.loads(self.child("build-bota")["stream"].readline(8192)),
                          {"ignoring": True})
@@ -623,7 +624,7 @@ class LauncherTests(unittest.TestCase):
     def test_build_failures_stop_before_server_without_fallback(self):
         for name in ("build-bota", "build-drysua"):
             with self.subTest(component=name):
-                self.launch("--build", PLAY_TEST_BUILD=name)
+                self.launch(PLAY_TEST_BUILD=name)
                 self.send(name, b"7")
                 self.assertIn(f"{name} exited with status 7", self.finish(1))
                 self.assertNotIn("bota-server", self.children)
@@ -692,10 +693,9 @@ class LauncherTests(unittest.TestCase):
     def test_source_and_cargo_preflight_fail_before_artifacts(self):
         module = importlib.import_module("play_match")
         with patch("play_match.shutil.which", return_value=None), patch.dict(os.environ, DISPLAY=":fixture"):
-            # Existing release binaries make cargo unnecessary without --build.
-            self.assertIsNone(module.preflight(self.root, False, False))
+            self.assertIsNone(module.preflight(self.root, True))
             with self.assertRaisesRegex(RuntimeError, "cargo is required"):
-                module.preflight(self.root, False, True)
+                module.preflight(self.root, False)
         for target, message in ((self.tools / "cargo", b"cargo is required"),
                                 (self.root / "bota/Cargo.toml", b"source manifest missing")):
             with self.subTest(target=target), patch("play_match.shutil.which", return_value=None):
@@ -703,7 +703,7 @@ class LauncherTests(unittest.TestCase):
                     target.unlink()
                 with patch.dict(os.environ, DISPLAY=":fixture"):
                     with self.assertRaisesRegex(RuntimeError, message.decode()):
-                        module.preflight(self.root, False, True)
+                        module.preflight(self.root, False)
         self.assertFalse(list((self.root / "drysua/artifacts/temp").glob("play-*")))
 
     def test_faster_bot_waits_for_human_complete_welcome_before_server_admission(self):
@@ -1229,14 +1229,7 @@ class SupervisorTests(unittest.TestCase):
         self.assertIsNone(arguments.weights_directory)
         self.assertEqual(arguments.port, 4455)
         self.assertEqual(arguments.seed, 9000001)
-        self.assertFalse(arguments.build)
         self.assertFalse(arguments.no_build)
-
-    def test_build_and_no_build_flags_are_mutually_exclusive(self):
-        with contextlib.redirect_stderr(io.StringIO()):
-            with self.assertRaises(SystemExit) as raised:
-                self.module.parse_arguments(["--build", "--no-build"])
-        self.assertEqual(raised.exception.code, 2)
 
     def test_readiness_requires_complete_exact_line_and_valid_matching_port(self):
         parse = self.module.ready_port
