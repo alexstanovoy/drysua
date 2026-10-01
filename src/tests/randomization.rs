@@ -295,6 +295,53 @@ fn resume_verification_covers_started_generations_and_rejects_any_changed_chain(
     );
 }
 
+/// Regression: the fixed schedule followed snapshot and directory symlinks the
+/// adaptive schedule refuses.
+#[cfg(unix)]
+#[test]
+fn symlinked_snapshots_and_directories_are_refused_without_following() {
+    use std::os::unix::fs::symlink;
+
+    let directory = test_directory("snapshot-links");
+    let schedule = schedule(20, 4);
+    let draw = draw_generation(5, 0, 4, 8, schedule).expect("draw");
+    write_generation_snapshots(&directory, std::slice::from_ref(&draw)).expect("write");
+    let path = generation_path(&directory, 0);
+    let target = directory.join("target.json");
+    std::fs::rename(&path, &target).expect("move snapshot");
+    symlink(&target, &path).expect("link snapshot");
+    let regular = Some(PpoError::InvalidConfig(
+        "domain randomization snapshot must be a regular file",
+    ));
+    assert_eq!(
+        write_generation_snapshots(&directory, std::slice::from_ref(&draw)).err(),
+        regular
+    );
+    assert_eq!(
+        verify_generation_snapshots(&directory, 5, 4, 8, schedule, 1).err(),
+        regular
+    );
+    assert!(
+        std::fs::symlink_metadata(&path)
+            .expect("link kept")
+            .is_symlink()
+    );
+    std::fs::rename(&target, &path).expect("restore snapshot");
+    let link = directory.join("directory-link");
+    symlink(&*directory, &link).expect("link directory");
+    let real_directory = Some(PpoError::InvalidConfig(
+        "domain randomization directory must be a real directory",
+    ));
+    assert_eq!(
+        write_generation_snapshots(&link, std::slice::from_ref(&draw)).err(),
+        real_directory
+    );
+    assert_eq!(
+        verify_generation_snapshots(&link, 5, 4, 8, schedule, 1).err(),
+        real_directory
+    );
+}
+
 #[test]
 fn scale_endpoints_are_bounded_to_ten_times_full_variance() {
     for scale in [

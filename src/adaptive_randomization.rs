@@ -7,13 +7,14 @@
 mod tests;
 
 use std::fs::{self, OpenOptions};
-use std::io::{ErrorKind, Read, Write};
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use sha2::{Digest, Sha256};
 
 use crate::checkpoint::AdaptiveEnvironmentCheckpoint;
+use crate::durability::RegularFileError;
 use crate::randomization::MAX_SNAPSHOT_BYTES;
 use crate::randomization::{AnnealSchedule, GenerationDraw, VARIABLES, draw_generation_at_start};
 use crate::{MAX_TRAINING_COUNTER, PpoError};
@@ -256,71 +257,30 @@ fn compare_snapshot(stored: &str, canonical: &str) -> Result<(), PpoError> {
 }
 
 fn validate_directory(directory: &Path) -> Result<bool, PpoError> {
-    match fs::symlink_metadata(directory) {
-        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => Ok(true),
-        Ok(_) => Err(PpoError::InvalidConfig(
-            "adaptive randomization directory must be a real directory",
-        )),
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(io_error("directory metadata", error)),
-    }
+    crate::durability::real_directory_exists(directory).map_err(|error| match error {
+        RegularFileError::Io(error) => io_error("directory metadata", error),
+        _ => PpoError::InvalidConfig("adaptive randomization directory must be a real directory"),
+    })
 }
 
 fn read_snapshot(path: &Path) -> Result<String, PpoError> {
-    let metadata = fs::symlink_metadata(path).map_err(|error| {
-        if error.kind() == ErrorKind::NotFound {
-            PpoError::InvalidConfig("adaptive randomization snapshot is missing")
-        } else {
-            io_error("snapshot metadata", error)
-        }
-    })?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() {
-        return Err(PpoError::InvalidConfig(
-            "adaptive randomization snapshot must be a regular file",
-        ));
-    }
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
-    }
-    let file = options
-        .open(path)
-        .map_err(|error| io_error("snapshot open", error))?;
-    let metadata = file
-        .metadata()
-        .map_err(|error| io_error("snapshot metadata", error))?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() {
-        return Err(PpoError::InvalidConfig(
-            "adaptive randomization snapshot must be a regular file",
-        ));
-    }
-    if metadata.len() > MAX_SNAPSHOT_BYTES {
-        return Err(PpoError::InvalidConfig(
-            "adaptive randomization snapshot is oversized",
-        ));
-    }
-    let mut bytes = Vec::with_capacity(MAX_SNAPSHOT_BYTES as usize + 1);
-    file.take(MAX_SNAPSHOT_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|error| io_error("snapshot read", error))?;
-    if bytes.len() > MAX_SNAPSHOT_BYTES as usize {
-        return Err(PpoError::InvalidConfig(
-            "adaptive randomization snapshot is oversized",
-        ));
-    }
-    if bytes.len() as u64 != metadata.len() {
-        return Err(PpoError::InvalidConfig(
-            "adaptive randomization snapshot length changed",
-        ));
-    }
+    let bytes = crate::durability::read_regular_file(path, MAX_SNAPSHOT_BYTES).map_err(
+        |error| match error {
+            RegularFileError::Missing => {
+                PpoError::InvalidConfig("adaptive randomization snapshot is missing")
+            }
+            RegularFileError::NotRegular => {
+                PpoError::InvalidConfig("adaptive randomization snapshot must be a regular file")
+            }
+            RegularFileError::Oversized => {
+                PpoError::InvalidConfig("adaptive randomization snapshot is oversized")
+            }
+            RegularFileError::Changed => {
+                PpoError::InvalidConfig("adaptive randomization snapshot length changed")
+            }
+            RegularFileError::Io(error) => io_error("snapshot read", error),
+        },
+    )?;
     String::from_utf8(bytes)
         .map_err(|_| PpoError::InvalidConfig("adaptive randomization snapshot mismatch"))
 }
