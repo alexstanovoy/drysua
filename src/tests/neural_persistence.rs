@@ -1,12 +1,11 @@
-use super::{
-    neural_order_contract::{
-        DiagnosticPolicy::{ActiveOrderReadout, Constant},
-        Scenario, combat_start,
-    },
-    neural_order_seat::replay,
+use super::neural_order_contract::DiagnosticPolicy::{self, ActiveOrderReadout, Constant};
+use super::neural_order_contract::{Scenario, combat_start, install_policy, seated};
+use super::support::RecordingWire;
+use crate::{
+    ActionKind, IssuedOrder, LocalPolicyState, OrderPersistence, PolicyModel, StateTracker, Wire,
+    play_neural_on,
 };
-use crate::{ActionKind, IssuedOrder, LocalPolicyState, OrderPersistence, StateTracker};
-use bota_proto::{EventKind, MapId, Order, RejectReason, ServerMsg, SlotId, Target};
+use bota_proto::{EntityId, EventKind, MapId, Order, RejectReason, ServerMsg, SlotId, Target};
 
 #[test]
 fn public_neural_reconciles_fog_death_generations_and_exact_rejections_before_readout() {
@@ -86,6 +85,64 @@ fn assert_reconciliation(side: usize, scenario: &str) {
             .chain(start..=start + 6)
             .collect::<Vec<_>>()
     );
+}
+
+/// Replays `messages` through the production neural seat; only the policy schedule is synthetic.
+fn replay(
+    mut messages: Vec<ServerMsg>,
+    side: usize,
+    schedule: &[(u32, DiagnosticPolicy)],
+) -> RecordingWire {
+    struct ScheduledWire<'a> {
+        wire: RecordingWire,
+        model: &'a PolicyModel,
+        schedule: &'a [(u32, DiagnosticPolicy)],
+    }
+    impl Wire for ScheduledWire<'_> {
+        fn hear(&mut self) -> std::io::Result<Option<ServerMsg>> {
+            let message = self.wire.hear()?;
+            if let Some(ServerMsg::Events { tick, .. }) = &message {
+                for (scheduled, policy) in self.schedule {
+                    if tick == scheduled {
+                        install_policy(self.model, *policy);
+                    }
+                }
+            }
+            Ok(message)
+        }
+        fn order(&mut self, unit: Option<EntityId>, order: Order) -> std::io::Result<u32> {
+            self.wire.order(unit, order)
+        }
+        fn acknowledge(&mut self, tick: u32) -> std::io::Result<()> {
+            self.wire.acknowledge(tick)
+        }
+    }
+    assert!(messages.len() <= 32);
+    assert!(schedule.len() <= 8);
+    let mut final_view = messages
+        .iter()
+        .rev()
+        .find_map(|message| match message {
+            ServerMsg::Snapshot { view } => Some(view.clone()),
+            _ => None,
+        })
+        .expect("final snapshot");
+    final_view.tick += 1;
+    let limit = final_view.tick;
+    messages.push(ServerMsg::Snapshot { view: final_view });
+    let model = PolicyModel::fresh(10_092_101).expect("diagnostic model");
+    let mut wire = ScheduledWire {
+        model: &model,
+        schedule,
+        wire: RecordingWire {
+            messages: messages.into(),
+            orders: Vec::new(),
+            acknowledgements: Vec::new(),
+        },
+    };
+    play_neural_on(&mut wire, seated(side), Some(limit), &model).expect("production Neural replay");
+    assert!(wire.wire.messages.is_empty());
+    wire.wire
 }
 
 fn extend_reconciliation(
@@ -177,7 +234,7 @@ fn crowd_target(view: &mut bota_proto::WorldView) -> bota_proto::EntityId {
 }
 
 #[test]
-fn candidate_sequence_rejection_is_atomic_across_legacy_and_neural_ledgers() {
+fn nonmonotonic_sequence_is_rejected_atomically_across_request_and_neural_ledgers() {
     let (_, messages) = combat_start(MapId(0), 10_092_100, 0, None);
     let ServerMsg::MatchStart { info } = &messages[0] else {
         panic!("start")
@@ -193,20 +250,25 @@ fn candidate_sequence_rejection_is_atomic_across_legacy_and_neural_ledgers() {
             target: Target::None,
         },
     };
-    let mut legacy = OrderPersistence::default();
+    let mut requests = OrderPersistence::default();
     let mut candidate = Some(OrderPersistence::default());
-    crate::record_sent_for_policy(&mut legacy, &mut candidate, 5, issued, &tracker)
+    crate::record_sent_for_policy(&mut requests, &mut candidate, 5, issued, &tracker)
         .expect("first send");
-    let before = (legacy, candidate);
+    let before = (requests, candidate);
     for sequence in [0, 4, 5] {
-        let error =
-            crate::record_sent_for_policy(&mut legacy, &mut candidate, sequence, issued, &tracker)
-                .expect_err("nonmonotonic sequence");
+        let error = crate::record_sent_for_policy(
+            &mut requests,
+            &mut candidate,
+            sequence,
+            issued,
+            &tracker,
+        )
+        .expect_err("nonmonotonic sequence");
         assert_eq!(
             error.to_string(),
             format!("order sequence {sequence} must be greater than last sent sequence 5")
         );
-        assert_eq!((legacy, candidate), before);
+        assert_eq!((requests, candidate), before);
     }
     assert_chronology_atomic(tracker, view);
 }

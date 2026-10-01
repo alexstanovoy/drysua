@@ -7,14 +7,7 @@ use super::fixtures;
 use crate::{ActionSpace, SHADOW_FIEND, StateTracker};
 
 #[test]
-fn metadata_accepts_supported_maps_and_rejects_invalid_map_and_clock() {
-    for map in [MapId(0), MapId(1), MapId(2)] {
-        let mut info = match_info();
-        info.map = map;
-        let tracker = StateTracker::new(SlotId(0), &info).expect("supported map");
-        assert_eq!(tracker.metadata().map, map);
-        assert!(tracker.current().is_none());
-    }
+fn metadata_rejects_an_unsupported_map_and_a_zero_tick_rate() {
     for (map, tick_rate, expected) in [
         (
             MapId(3),

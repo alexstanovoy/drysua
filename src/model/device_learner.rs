@@ -214,7 +214,6 @@ impl PolicyModel {
             adam,
             config,
             crate::training_execution::DEFAULT_TRAINING_MICROBATCH,
-            #[cfg(test)]
             PpoTestFaults::default(),
         )
     }
@@ -226,7 +225,7 @@ impl PolicyModel {
         adam: &mut AdamState,
         config: PpoConfig,
         microbatch: usize,
-        #[cfg(test)] faults: PpoTestFaults,
+        faults: PpoTestFaults,
     ) -> Result<PpoMinibatchReport, ModelError> {
         if examples.is_empty() || examples.len() > MODEL_MAX_BATCH {
             return Err(ModelError::InvalidModelState("PPO minibatch count"));
@@ -239,7 +238,6 @@ impl PolicyModel {
             adam,
             (config, crate::UpdateObjective::default()),
             microbatch,
-            #[cfg(test)]
             faults,
         )
     }

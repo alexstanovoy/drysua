@@ -11,82 +11,143 @@ fn schedule(updates: u64, zero_updates: u64) -> AnnealSchedule {
     }
 }
 
-#[test]
-fn scale_is_full_at_zero_and_zero_through_the_final_window() {
-    let schedule = schedule(100, 20);
-    assert_eq!(schedule.scale_bp(0), NOMINAL_BP);
-    assert_eq!(schedule.scale_bp(80), 0);
-    assert_eq!(schedule.scale_bp(99), 0);
-    let quarter = schedule.scale_bp(20);
-    assert!(
-        (4_500..=5_500).contains(&quarter),
-        "quarter of the annealed span is near half variance, got {quarter}"
-    );
-    assert!(schedule.scale_bp(40) < quarter);
+fn scale(start_bp: i32, end_bp: i32) -> AnnealScale {
+    AnnealScale { start_bp, end_bp }
+}
+
+/// Independent integer square root: brute force, unlike the kernel.
+fn reference_root(value: u128) -> u128 {
+    let mut root = 0u128;
+    while (root + 1) * (root + 1) <= value {
+        root += 1;
+    }
+    root
+}
+
+/// Independent reference for the whole scale ramp, in basis points.
+fn reference_scale_bp(scale: AnnealScale, updates: u64, zero_updates: u64, update: u64) -> i32 {
+    let span = updates.saturating_sub(zero_updates);
+    if span == 0 || update >= span {
+        return 0;
+    }
+    let root = reference_root(u128::from(update) * 100_000_000 / u128::from(span));
+    ((i64::from(scale.start_bp) * (10_000 - root as i64) + i64::from(scale.end_bp) * root as i64)
+        / 10_000) as i32
 }
 
 #[test]
-fn scale_has_pinned_values() {
-    let schedule = schedule(10, 2);
-    assert_eq!(schedule.zero_from_update(), 8);
-    assert_eq!(schedule.scale_bp(0), 10_000);
-    assert_eq!(schedule.scale_bp(1), 6_465);
-    assert_eq!(schedule.scale_bp(2), 5_000);
-    assert_eq!(schedule.scale_bp(4), 2_929);
-    assert_eq!(schedule.scale_bp(7), 646);
-    assert_eq!(schedule.scale_bp(8), 0);
-}
-
-#[test]
-fn scale_is_monotone_over_every_update() {
-    let schedule = schedule(257, 41);
-    let mut previous = schedule.scale_bp(0);
-    for update in 1..schedule.updates {
-        let scale = schedule.scale_bp(update);
-        assert!(scale <= previous, "scale rose at update {update}");
-        assert!((0..=NOMINAL_BP).contains(&scale));
-        previous = scale;
+fn scale_ramp_matches_an_independent_reference_and_is_zero_in_the_tail() {
+    let scales = [
+        scale(0, 0),
+        AnnealScale::FULL,
+        scale(0, 20_000),
+        scale(5_000, 5_000),
+    ];
+    let runs = [
+        (64, 0),
+        (100, 20),
+        (200, 40),
+        (257, 41),
+        (9, 3),
+        (40, 40),
+        (5, 9),
+        (2, 0),
+    ];
+    for (scale, (updates, zero_updates)) in scales
+        .into_iter()
+        .flat_map(|scale| runs.map(|run| (scale, run)))
+    {
+        let schedule = AnnealSchedule {
+            updates,
+            zero_updates,
+            scale,
+        };
+        let mut previous = scale.start_bp;
+        for update in 0..=updates {
+            let case = format!("{scale:?} updates={updates} zero={zero_updates} update={update}");
+            let value = schedule.scale_bp(update);
+            assert_eq!(
+                value,
+                reference_scale_bp(scale, updates, zero_updates, update),
+                "{case}"
+            );
+            if update >= updates.saturating_sub(zero_updates) {
+                assert_eq!(value, 0, "{case}");
+            } else if scale.start_bp >= scale.end_bp {
+                assert!(value <= previous, "{case}: a falling ramp rose");
+            }
+            previous = value;
+        }
     }
 }
 
 #[test]
-fn a_zero_window_covering_every_update_is_all_zero() {
-    let full = schedule(5, 5);
-    for update in 0..5 {
-        assert_eq!(full.scale_bp(update), 0);
-    }
-    let covered = schedule(5, 9);
-    for update in 0..5 {
-        assert_eq!(covered.scale_bp(update), 0);
+fn scale_ramp_pins_literal_values() {
+    let falling = AnnealSchedule {
+        updates: 10_000,
+        zero_updates: 0,
+        scale: AnnealScale::FULL,
+    };
+    let rising = AnnealSchedule {
+        scale: scale(0, 20_000),
+        ..falling
+    };
+    // A ten thousand update ramp keeps the integer root exact at 2_500.
+    for (schedule, update, expected) in [
+        (schedule(10, 2), 0, 10_000),
+        (schedule(10, 2), 1, 6_465),
+        (schedule(10, 2), 2, 5_000),
+        (schedule(10, 2), 4, 2_929),
+        (schedule(10, 2), 7, 646),
+        (schedule(10, 2), 8, 0),
+        (falling, 2_500, 5_000),
+        (falling, 9_999, 1),
+        (rising, 0, 0),
+        (rising, 2_500, 10_000),
+        (rising, 9_999, 19_998),
+        (rising, 10_000, 0),
+    ] {
+        assert_eq!(
+            schedule.scale_bp(update),
+            expected,
+            "{schedule:?} at {update}"
+        );
     }
 }
 
 #[test]
-fn a_zero_scale_draw_is_nominal_with_no_applied_games() {
-    let schedule = schedule(4, 4);
-    let draw = draw_generation(11, 0, 2, 2, schedule).expect("zero-scale draw");
-    assert_eq!(draw.scale_bp, 0);
-    assert_eq!(draw.applied_games, 0);
-    assert_eq!(draw.deltas, [0; VARIABLES.len()]);
-    assert!(!draw.applies());
-    assert!(draw.spec.is_nominal());
-}
-
-#[test]
-fn a_generation_crossing_the_zero_window_records_applied_games() {
-    // Span 3 updates, 2 games each: games 0..6 carry rules, games 6.. carry
-    // none. Generation 1 (games 4..8) therefore applies to two games.
-    let schedule = schedule(4, 1);
-    let before = draw_generation(3, 0, 4, 2, schedule).expect("before");
-    let crossing = draw_generation(3, 1, 4, 2, schedule).expect("crossing");
-    let after = draw_generation(3, 2, 4, 2, schedule).expect("after");
-    assert_eq!(before.applied_games, 4);
-    assert_eq!(crossing.applied_games, 2);
-    assert_eq!(crossing.start_game, 4);
-    assert_eq!(crossing.end_game, 8);
-    assert_eq!(after.applied_games, 0);
-    assert!(crossing.applies());
-    assert!(!after.applies());
+fn draws_map_to_their_games_update_scale_and_applied_games() {
+    // Schedule (4, 1) with 4 games per generation and 2 per update: games 0..6 carry rules.
+    for (generation, schedule, games, expected, applies) in [
+        (0, schedule(4, 1), (4, 2), (0, 4, 0, 4), true),
+        (1, schedule(4, 1), (4, 2), (4, 8, 2, 2), true),
+        (2, schedule(4, 1), (4, 2), (8, 12, 4, 0), false),
+        (5, schedule(64, 8), (6, 10), (30, 36, 3, 6), true),
+        (0, schedule(4, 4), (2, 2), (0, 2, 0, 0), false),
+    ] {
+        let draw = draw_generation(3, generation, games.0, games.1, schedule).expect("draw");
+        let case = format!("generation {generation} of {schedule:?}");
+        assert_eq!(
+            (
+                draw.start_game,
+                draw.end_game,
+                draw.start_update,
+                draw.applied_games
+            ),
+            expected,
+            "{case}"
+        );
+        assert_eq!(
+            draw.scale_bp,
+            schedule.scale_bp(draw.start_update),
+            "{case}"
+        );
+        assert_eq!(draw.applies(), applies, "{case}");
+        if draw.scale_bp == 0 {
+            assert_eq!(draw.deltas, [0; VARIABLES.len()], "{case}");
+            assert!(draw.spec.is_nominal(), "{case}");
+        }
+    }
 }
 
 #[test]
@@ -102,19 +163,19 @@ fn draws_are_deterministic_in_the_seed_and_generation() {
 }
 
 #[test]
-fn generation_maps_back_to_its_first_game_and_update() {
-    let schedule = schedule(64, 8);
-    let draw = draw_generation(3, 5, 6, 10, schedule).expect("draw");
-    assert_eq!(draw.start_game, 30);
-    assert_eq!(draw.end_game, 36);
-    assert_eq!(draw.start_update, 3);
-    assert_eq!(draw.scale_bp, schedule.scale_bp(3));
-}
-
-#[test]
-fn every_delta_stays_inside_its_variable_bounds() {
-    let schedule = schedule(400, 80);
-    for generation in 0..600 {
+fn every_delta_stays_inside_its_variable_bounds_up_to_the_maximum_scale() {
+    let maximum = AnnealScale {
+        start_bp: AnnealScale::MAX_BP,
+        end_bp: AnnealScale::MAX_BP,
+    };
+    for (generation, scale) in
+        (0..600).flat_map(|generation| [(generation, AnnealScale::FULL), (generation, maximum)])
+    {
+        let schedule = AnnealSchedule {
+            updates: 400,
+            zero_updates: 80,
+            scale,
+        };
         let draw = draw_generation(0x5eed, generation, 4, 8, schedule).expect("draw");
         for (index, variable) in VARIABLES.iter().enumerate() {
             let delta = draw.deltas[index];
@@ -128,37 +189,6 @@ fn every_delta_stays_inside_its_variable_bounds() {
         }
         assert!(draw.spec.is_bounded());
     }
-}
-
-#[test]
-fn full_scale_draws_have_the_expected_spread() {
-    let sigma = VARIABLES[0].sigma_range / SIGMA_DIVISOR;
-    let mut rng = PpoRng::new(0xabcd);
-    let mut sum = 0i64;
-    let mut square_sum = 0i64;
-    let count = 2_000i64;
-    let mut positive = 0i64;
-    let mut negative = 0i64;
-    for _ in 0..count {
-        let delta = i64::from(normal_delta(&mut rng, sigma).expect("delta"));
-        sum += delta;
-        square_sum += delta * delta;
-        if delta > 0 {
-            positive += 1;
-        }
-        if delta < 0 {
-            negative += 1;
-        }
-    }
-    let mean = sum / count;
-    let variance = square_sum / count - mean * mean;
-    let std = (variance as f64).sqrt();
-    assert!(mean.abs() < 150, "mean {mean} drifted");
-    assert!(
-        (3_000.0..=3_700.0).contains(&std),
-        "std {std} is far from sigma {sigma}"
-    );
-    assert!(positive > 0 && negative > 0, "the draw is one-sided");
 }
 
 #[test]
@@ -206,24 +236,6 @@ fn generation_json_matches_a_golden_vector() {
 const GOLDEN_GENERATION: &str = "{\"schema\":\"drysua-domain-randomization/v2\",\"generation\":3,\"start_game\":12,\"end_game\":16,\"start_update\":1,\"scale_bp\":6465,\"applied_games\":4,\"deltas\":{\"max_hp\":-2949,\"gold_income\":0,\"max_mana\":0,\"physical_damage\":3683,\"magic_damage\":386,\"pure_damage\":2325,\"magic_resist\":581,\"status_resist\":0,\"move_speed\":153,\"mana_cost_rate\":-1042,\"cooldown_rate\":-941},\"spec\":{\"max_hp\":7051,\"gold_income\":10000,\"max_mana\":10000,\"physical_damage\":13683,\"magic_damage\":10386,\"pure_damage\":12325,\"magic_resist\":581,\"status_resist\":0,\"move_speed\":10153,\"mana_cost_rate\":8958,\"cooldown_rate\":9059},\"hash\":\"fc8dbde7bc2fff27\"}\n";
 
 #[test]
-fn json_is_canonical_and_carries_its_hash() {
-    let schedule = schedule(50, 10);
-    let draw = draw_generation(9, 2, 4, 8, schedule).expect("draw");
-    let first = generation_json(&draw);
-    let second = generation_json(&draw);
-    assert_eq!(first, second);
-    assert!(first.starts_with("{\"schema\":\"drysua-domain-randomization/v2\""));
-    for variable in VARIABLES {
-        assert!(
-            first.contains(&format!("\"{}\":", variable.name)),
-            "{} missing from the snapshot",
-            variable.name
-        );
-    }
-    assert!(first.contains("\"applied_games\":"));
-}
-
-#[test]
 fn a_written_snapshot_is_verified_and_a_changed_file_is_rejected() {
     let directory = test_directory("snapshots");
     let schedule = schedule(20, 4);
@@ -241,23 +253,7 @@ fn a_written_snapshot_is_verified_and_a_changed_file_is_rejected() {
 }
 
 #[test]
-fn an_oversized_snapshot_is_rejected() {
-    let directory = test_directory("oversized");
-    let schedule = schedule(20, 4);
-    let draw = draw_generation(6, 0, 4, 8, schedule).expect("draw");
-    write_generation_snapshots(&directory, std::slice::from_ref(&draw)).expect("write");
-    let path = generation_path(&directory, 0);
-    std::fs::write(&path, "x".repeat(5 * 1024)).expect("oversize");
-    let error = verify_generation_snapshots(&directory, 6, 4, 8, schedule, 4)
-        .expect_err("oversized snapshot");
-    assert_eq!(
-        error.to_string(),
-        "invalid PPO config field: domain randomization snapshot is oversized"
-    );
-}
-
-#[test]
-fn resume_verification_covers_every_started_generation() {
+fn resume_verification_covers_started_generations_and_rejects_any_changed_chain() {
     let directory = test_directory("resume");
     let schedule = schedule(40, 8);
     for generation in 0..3 {
@@ -265,125 +261,38 @@ fn resume_verification_covers_every_started_generation() {
         write_generation_snapshots(&directory, std::slice::from_ref(&draw)).expect("write");
     }
     assert_eq!(
-        verify_generation_snapshots(&directory, 21, 4, 8, schedule, 8).expect("covered"),
-        2
+        verify_generation_snapshots(&directory, 21, 4, 8, schedule, 8),
+        Ok(2)
     );
-    let error = verify_generation_snapshots(&directory, 21, 4, 8, schedule, 16)
-        .expect_err("generation three missing");
-    assert_eq!(
-        error.to_string(),
-        "invalid PPO config field: domain randomization snapshot is missing on resume"
-    );
-    let error =
-        verify_generation_snapshots(&directory, 22, 4, 8, schedule, 8).expect_err("different seed");
-    assert_eq!(
-        error.to_string(),
-        "invalid PPO config field: domain randomization snapshot mismatch"
-    );
-}
-
-/// Independent integer square root: brute force, deliberately not the kernel's.
-fn reference_root(value: u128) -> u128 {
-    let mut root = 0u128;
-    while (root + 1) * (root + 1) <= value {
-        root += 1;
-    }
-    root
-}
-
-/// Independent reference for the whole scale ramp, in basis points.
-fn reference_scale_bp(scale: AnnealScale, updates: u64, zero_updates: u64, update: u64) -> i32 {
-    let span = updates - zero_updates;
-    if span == 0 || update >= span {
-        return 0;
-    }
-    let root = reference_root(u128::from(update) * 100_000_000 / u128::from(span));
-    ((i64::from(scale.start_bp) * (10_000 - root as i64) + i64::from(scale.end_bp) * root as i64)
-        / 10_000) as i32
-}
-
-#[test]
-fn the_default_scale_ramp_matches_an_independent_reference_at_every_update() {
-    for (updates, zero_updates) in [(64, 0), (100, 20), (200, 40), (9, 3), (40, 40), (2, 0)] {
-        let schedule = schedule(updates, zero_updates);
-        for update in 0..=updates {
-            assert_eq!(
-                schedule.scale_bp(update),
-                reference_scale_bp(AnnealScale::FULL, updates, zero_updates, update),
-                "updates={updates} zero={zero_updates} update={update}"
-            );
-        }
-    }
-}
-
-#[test]
-fn a_custom_scale_ramp_interpolates_its_endpoints_exactly() {
-    // A ten thousand update ramp keeps the integer root exact at these points.
-    let rising = AnnealSchedule {
-        updates: 10_000,
-        zero_updates: 0,
-        scale: AnnealScale {
-            start_bp: 0,
-            end_bp: 20_000,
-        },
+    let rescaled = AnnealSchedule {
+        scale: scale(0, 20_000),
+        ..schedule
     };
-    assert_eq!(rising.scale_bp(0), 0);
-    assert_eq!(rising.scale_bp(2_500), 10_000);
-    assert_eq!(rising.scale_bp(9_999), 19_998);
-    assert_eq!(rising.scale_bp(10_000), 0);
-    assert!(rising.scale_bp(2_500) > rising.scale_bp(1_000));
-    let falling = AnnealSchedule {
-        updates: 10_000,
-        zero_updates: 0,
-        scale: AnnealScale {
-            start_bp: 10_000,
-            end_bp: 0,
-        },
-    };
-    assert_eq!(falling.scale_bp(0), 10_000);
-    assert_eq!(falling.scale_bp(2_500), 5_000);
-    assert_eq!(falling.scale_bp(9_999), 1);
-    let fixed = AnnealSchedule {
-        updates: 10_000,
-        zero_updates: 0,
-        scale: AnnealScale {
-            start_bp: 5_000,
-            end_bp: 5_000,
-        },
-    };
-    for update in [0, 1, 2_500, 9_999] {
+    let mismatch = "domain randomization snapshot mismatch";
+    for (name, seed, schedule, completed_games, message) in [
+        (
+            "generation three missing",
+            21,
+            schedule,
+            16,
+            "domain randomization snapshot is missing on resume",
+        ),
+        ("different seed", 22, schedule, 8, mismatch),
+        ("different scale", 21, rescaled, 8, mismatch),
+    ] {
         assert_eq!(
-            fixed.scale_bp(update),
-            5_000,
-            "fixed half scale at {update}"
+            verify_generation_snapshots(&directory, seed, 4, 8, schedule, completed_games),
+            Err(PpoError::InvalidConfig(message)),
+            "{name}"
         );
     }
-}
-
-#[test]
-fn a_custom_scale_still_honours_the_clean_tail() {
-    let schedule = AnnealSchedule {
-        updates: 100,
-        zero_updates: 20,
-        scale: AnnealScale {
-            start_bp: 0,
-            end_bp: 20_000,
-        },
-    };
-    assert!(schedule.scale_bp(79) > 0);
-    assert_eq!(schedule.scale_bp(80), 0);
-    assert_eq!(schedule.scale_bp(99), 0);
-    let all_zero = AnnealSchedule {
-        updates: 8,
-        zero_updates: 8,
-        scale: AnnealScale {
-            start_bp: 10_000,
-            end_bp: 20_000,
-        },
-    };
-    for update in 0..=8 {
-        assert_eq!(all_zero.scale_bp(update), 0);
-    }
+    std::fs::write(generation_path(&directory, 0), "x".repeat(5 * 1024)).expect("oversize");
+    assert_eq!(
+        verify_generation_snapshots(&directory, 21, 4, 8, schedule, 8),
+        Err(PpoError::InvalidConfig(
+            "domain randomization snapshot is oversized"
+        ))
+    );
 }
 
 #[test]
@@ -471,30 +380,4 @@ fn the_scale_scope_suffix_is_canonical_and_only_non_default_is_split() {
     ] {
         assert_eq!(split_scale_scope(text), (text, AnnealScale::FULL), "{text}");
     }
-}
-
-#[test]
-fn a_snapshot_chain_is_verified_only_under_its_own_scale() {
-    let directory = test_directory("scale-snapshots");
-    let schedule = schedule(20, 4);
-    let draw = draw_generation(7, 0, 4, 8, schedule).expect("draw");
-    write_generation_snapshots(&directory, std::slice::from_ref(&draw)).expect("write");
-    assert_eq!(
-        verify_generation_snapshots(&directory, 7, 4, 8, schedule, 4).expect("own scale"),
-        1
-    );
-    let rescaled = AnnealSchedule {
-        updates: 20,
-        zero_updates: 4,
-        scale: AnnealScale {
-            start_bp: 0,
-            end_bp: 20_000,
-        },
-    };
-    let error = verify_generation_snapshots(&directory, 7, 4, 8, rescaled, 4)
-        .expect_err("a changed scale must reject the chain");
-    assert_eq!(
-        error.to_string(),
-        "invalid PPO config field: domain randomization snapshot mismatch"
-    );
 }

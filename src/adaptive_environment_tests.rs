@@ -1,11 +1,24 @@
 use super::{
     AdaptiveEnvironmentConfig, AdaptiveEnvironmentLimits, AdaptiveEnvironmentState,
-    EnvironmentDecimal, EnvironmentSchedule,
+    EnvironmentDecimal,
 };
 use crate::{MAX_TRAINING_COUNTER, PpoError};
 
+type TransitionCase = (
+    &'static str,
+    AdaptiveEnvironmentConfig,
+    AdaptiveEnvironmentLimits,
+    &'static [u64],
+    u64,
+);
+
 fn decimal(text: &str) -> EnvironmentDecimal {
     text.parse().expect("valid test decimal")
+}
+
+/// An extension whose single award fills the budget to `MAX_TRAINING_COUNTER` from base one.
+fn overflowing_extension() -> EnvironmentDecimal {
+    EnvironmentDecimal::from_units((MAX_TRAINING_COUNTER - 1) * EnvironmentDecimal::SCALE)
 }
 
 fn limits(base: u64, total: u64, zero: u64) -> AdaptiveEnvironmentLimits {
@@ -16,6 +29,20 @@ fn limits(base: u64, total: u64, zero: u64) -> AdaptiveEnvironmentLimits {
     }
     .validate()
     .expect("valid test limits")
+}
+
+fn with(change: fn(&mut AdaptiveEnvironmentConfig)) -> AdaptiveEnvironmentConfig {
+    let mut config = AdaptiveEnvironmentConfig::default();
+    change(&mut config);
+    config
+}
+
+fn generation_start(generation: u64, start_update: u64) -> AdaptiveEnvironmentState {
+    AdaptiveEnvironmentState {
+        generation,
+        start_update,
+        ..AdaptiveEnvironmentState::default()
+    }
 }
 
 fn run(
@@ -36,6 +63,16 @@ fn run(
             .expect("candidate is structurally valid");
     }
     state
+}
+
+fn assert_clean_generation_starts(cases: &[TransitionCase]) {
+    for &(name, config, limits, wins, start_update) in cases {
+        assert_eq!(
+            run(config, limits, wins),
+            generation_start(1, start_update),
+            "{name}"
+        );
+    }
 }
 
 #[test]
@@ -131,229 +168,117 @@ fn decimal_parses_exact_millionths_and_displays_canonically() {
         ("18446744073709.551615", u64::MAX, "18446744073709.551615"),
     ] {
         let value = decimal(text);
-        assert_eq!(value.units(), units, "{text}");
+        assert_eq!(value, EnvironmentDecimal::from_units(units), "{text}");
         assert_eq!(value.to_string(), canonical, "{text}");
+        assert_eq!(decimal(canonical), value, "{text}");
     }
 }
 
 #[test]
-fn decimal_codec_units_round_trip_without_config_restrictions() {
-    for units in [0, 1, 100_000, 1_000_000, u64::MAX] {
-        let value = EnvironmentDecimal::from_units(units);
-        assert_eq!(value.units(), units);
-        assert_eq!(decimal(&value.to_string()), value);
-    }
-}
-
-#[test]
-fn decimal_rejects_non_plain_unsigned_notation() {
-    for text in [
+fn decimal_rejects_non_plain_notation_overprecision_and_overflow() {
+    let notation = "environment decimal must use unsigned plain decimal notation";
+    let overflow = "environment decimal exceeds u64 millionths";
+    let mut cases = [
         "", ".", "1.", "-0", "-1", "NaN", "nan", "inf", "infinity", "+1", "1e0", "1E2", " 1", "1 ",
         "1..2", "１", "0_1", "0,1",
-    ] {
-        let error = text.parse::<EnvironmentDecimal>().unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "invalid PPO config field: environment decimal must use unsigned plain decimal notation",
-            "{text}"
-        );
-    }
-}
-
-#[test]
-fn decimal_rejects_overprecision_even_when_extra_digits_are_zero() {
-    for text in ["0.0000001", "1.0000000"] {
-        assert_eq!(
-            text.parse::<EnvironmentDecimal>().unwrap_err(),
-            PpoError::InvalidConfig("environment decimal has more than six fractional digits")
-        );
-    }
-}
-
-#[test]
-fn decimal_rejects_overflow_and_bounds_input_length() {
-    for text in [
-        "18446744073709.551616",
-        "18446744073710",
-        "18446744073709551616",
-    ] {
-        assert_eq!(
-            text.parse::<EnvironmentDecimal>().unwrap_err(),
-            PpoError::InvalidConfig("environment decimal exceeds u64 millionths")
-        );
-    }
-    assert_eq!(
-        "0000000000000000000000000000"
-            .parse::<EnvironmentDecimal>()
-            .unwrap_err(),
-        PpoError::InvalidConfig("environment decimal exceeds 27 bytes")
-    );
-}
-
-#[test]
-fn defaults_select_adaptive_with_the_agreed_thresholds() {
-    let config = AdaptiveEnvironmentConfig::default();
-    assert_eq!(config.success_updates, 2);
-    assert_eq!(config.success_rate, decimal(".8"));
-    assert_eq!(config.poor_updates, 1);
-    assert_eq!(config.poor_rate, decimal(".2"));
-    assert_eq!(config.extension, decimal(".75"));
-    assert_eq!(
-        EnvironmentSchedule::default(),
-        EnvironmentSchedule::Adaptive(config)
-    );
-    assert_ne!(EnvironmentSchedule::Fixed, EnvironmentSchedule::default());
-}
-
-#[test]
-fn scope_suffix_is_canonical_and_append_preserves_the_prefix() {
-    let config = AdaptiveEnvironmentConfig {
-        success_rate: decimal("00.800000"),
-        poor_rate: decimal(".200"),
-        extension: decimal("01.250000"),
-        ..AdaptiveEnvironmentConfig::default()
-    };
-    let suffix = concat!(
-        " --environment-schedule adaptive --environment-success-updates 2",
-        " --environment-success-rate 0.8 --environment-poor-updates 1",
-        " --environment-poor-rate 0.2 --environment-extension 1.25"
-    );
-    assert_eq!(config.scope_suffix(), suffix);
-    let mut scope = String::from("existing scope");
-    config.append_scope(&mut scope);
-    assert_eq!(scope, format!("existing scope{suffix}"));
-}
-
-#[test]
-fn config_rejects_zero_and_out_of_bound_windows() {
-    for window in [0, MAX_TRAINING_COUNTER + 1] {
-        for (success_updates, poor_updates, message) in [
-            (
-                window,
-                1,
-                "environment success updates must be in 1..=MAX_TRAINING_COUNTER",
-            ),
-            (
-                2,
-                window,
-                "environment poor updates must be in 1..=MAX_TRAINING_COUNTER",
-            ),
-        ] {
-            let config = AdaptiveEnvironmentConfig {
-                success_updates,
-                poor_updates,
-                ..AdaptiveEnvironmentConfig::default()
-            };
-            assert_eq!(
-                config.validate().unwrap_err(),
-                PpoError::InvalidConfig(message)
-            );
-        }
-    }
-}
-
-#[test]
-fn config_rejects_rates_above_one_but_allows_overlapping_thresholds() {
-    for (success_rate, poor_rate, message) in [
+    ]
+    .map(|text| (text, notation))
+    .to_vec();
+    cases.extend([
         (
-            decimal("1.000001"),
-            decimal(".2"),
+            "0.0000001",
+            "environment decimal has more than six fractional digits",
+        ),
+        (
+            "1.0000000",
+            "environment decimal has more than six fractional digits",
+        ),
+        ("18446744073709.551616", overflow),
+        ("18446744073710", overflow),
+        ("18446744073709551616", overflow),
+        (
+            "0000000000000000000000000000",
+            "environment decimal exceeds 27 bytes",
+        ),
+    ]);
+    for (text, message) in cases {
+        assert_eq!(
+            text.parse::<EnvironmentDecimal>(),
+            Err(PpoError::InvalidConfig(message)),
+            "{text:?}"
+        );
+    }
+}
+
+#[test]
+fn config_validation_bounds_windows_and_rates_but_only_caps_extension_globally() {
+    let success_window = "environment success updates must be in 1..=MAX_TRAINING_COUNTER";
+    let poor_window = "environment poor updates must be in 1..=MAX_TRAINING_COUNTER";
+    let extension = "environment extension must not exceed MAX_TRAINING_COUNTER";
+    let invalid: [(&str, AdaptiveEnvironmentConfig, &str); 8] = [
+        (
+            "zero success window",
+            with(|c| c.success_updates = 0),
+            success_window,
+        ),
+        (
+            "success window above the counter bound",
+            with(|c| c.success_updates = MAX_TRAINING_COUNTER + 1),
+            success_window,
+        ),
+        (
+            "zero poor window",
+            with(|c| c.poor_updates = 0),
+            poor_window,
+        ),
+        (
+            "poor window above the counter bound",
+            with(|c| c.poor_updates = MAX_TRAINING_COUNTER + 1),
+            poor_window,
+        ),
+        (
+            "success rate above one",
+            with(|c| c.success_rate = EnvironmentDecimal::from_units(1_000_001)),
             "environment success rate must be in [0, 1]",
         ),
         (
-            decimal(".8"),
-            decimal("1.000001"),
+            "poor rate above one",
+            with(|c| c.poor_rate = EnvironmentDecimal::from_units(1_000_001)),
             "environment poor rate must be in [0, 1]",
         ),
+        (
+            "extension one millionth above the counter bound",
+            with(|c| {
+                c.extension = EnvironmentDecimal::from_units(
+                    MAX_TRAINING_COUNTER * EnvironmentDecimal::SCALE + 1,
+                )
+            }),
+            extension,
+        ),
+        (
+            "maximum extension units",
+            with(|c| c.extension = EnvironmentDecimal::from_units(u64::MAX)),
+            extension,
+        ),
+    ];
+    for (name, config, message) in invalid {
+        assert_eq!(
+            config.validate(),
+            Err(PpoError::InvalidConfig(message)),
+            "{name}"
+        );
+    }
+    for config in [
+        with(|c| (c.success_rate, c.poor_rate) = (decimal("0"), decimal("1"))),
+        with(|c| {
+            c.success_updates = MAX_TRAINING_COUNTER;
+            c.poor_updates = MAX_TRAINING_COUNTER;
+            c.extension =
+                EnvironmentDecimal::from_units(MAX_TRAINING_COUNTER * EnvironmentDecimal::SCALE);
+        }),
     ] {
-        let config = AdaptiveEnvironmentConfig {
-            success_rate,
-            poor_rate,
-            ..AdaptiveEnvironmentConfig::default()
-        };
-        assert_eq!(
-            config.validate().unwrap_err(),
-            PpoError::InvalidConfig(message)
-        );
+        assert_eq!(config.validate(), Ok(config));
     }
-    let config = AdaptiveEnvironmentConfig {
-        success_rate: decimal("0"),
-        poor_rate: decimal("1"),
-        ..AdaptiveEnvironmentConfig::default()
-    };
-    assert_eq!(config.validate().unwrap(), config);
-}
-
-#[test]
-fn config_accepts_numeric_maxima_without_a_smaller_environment_cap() {
-    let maximum_units = MAX_TRAINING_COUNTER * EnvironmentDecimal::SCALE;
-    let config = AdaptiveEnvironmentConfig {
-        success_updates: MAX_TRAINING_COUNTER,
-        poor_updates: MAX_TRAINING_COUNTER,
-        extension: EnvironmentDecimal::from_units(maximum_units),
-        ..AdaptiveEnvironmentConfig::default()
-    };
-    assert_eq!(config.validate().unwrap(), config);
-    for units in [maximum_units + 1, u64::MAX] {
-        let invalid = AdaptiveEnvironmentConfig {
-            extension: EnvironmentDecimal::from_units(units),
-            ..config
-        };
-        assert_eq!(
-            invalid.validate().unwrap_err(),
-            PpoError::InvalidConfig("environment extension must not exceed MAX_TRAINING_COUNTER")
-        );
-    }
-}
-
-#[test]
-fn limits_reject_invalid_counters_and_allow_base_above_total() {
-    for (base_updates, total_updates, zero_updates, message) in [
-        (
-            0,
-            10,
-            0,
-            "environment base updates must be in 1..=MAX_TRAINING_COUNTER",
-        ),
-        (
-            MAX_TRAINING_COUNTER + 1,
-            10,
-            0,
-            "environment base updates must be in 1..=MAX_TRAINING_COUNTER",
-        ),
-        (
-            1,
-            0,
-            0,
-            "environment total updates must be in 1..=MAX_TRAINING_COUNTER",
-        ),
-        (
-            1,
-            MAX_TRAINING_COUNTER + 1,
-            0,
-            "environment total updates must be in 1..=MAX_TRAINING_COUNTER",
-        ),
-        (
-            1,
-            10,
-            11,
-            "environment zero updates must not exceed total updates",
-        ),
-    ] {
-        let limits = AdaptiveEnvironmentLimits {
-            base_updates,
-            total_updates,
-            zero_updates,
-        };
-        assert_eq!(
-            limits.validate().unwrap_err(),
-            PpoError::InvalidConfig(message)
-        );
-    }
-    assert_eq!(
-        limits(MAX_TRAINING_COUNTER, 1, 1).base_updates,
-        MAX_TRAINING_COUNTER
-    );
 }
 
 #[test]
@@ -363,15 +288,7 @@ fn success_requires_consecutive_individually_qualifying_updates_not_an_average()
     let mixed = run(config, limits, &[7, 9]);
     assert_eq!(mixed.generation, 0);
     assert_eq!(mixed.success_streak, 1);
-    let qualifying = run(config, limits, &[8, 8]);
-    assert_eq!(
-        qualifying,
-        AdaptiveEnvironmentState {
-            generation: 1,
-            start_update: 2,
-            ..AdaptiveEnvironmentState::default()
-        }
-    );
+    assert_eq!(run(config, limits, &[8, 8]), generation_start(1, 2));
     let interrupted = run(config, limits, &[8, 7, 8]);
     assert_eq!(interrupted.generation, 0);
     assert_eq!(interrupted.success_streak, 1);
@@ -379,10 +296,7 @@ fn success_requires_consecutive_individually_qualifying_updates_not_an_average()
 
 #[test]
 fn poor_streak_awards_each_overlapping_qualifying_update_not_an_average() {
-    let config = AdaptiveEnvironmentConfig {
-        poor_updates: 2,
-        ..AdaptiveEnvironmentConfig::default()
-    };
+    let config = with(|c| c.poor_updates = 2);
     let limits = limits(20, 100, 0);
     for (wins, awards, streak) in [
         (&[1, 3][..], 0, 0),
@@ -397,194 +311,117 @@ fn poor_streak_awards_each_overlapping_qualifying_update_not_an_average() {
 }
 
 #[test]
-fn three_quarter_credits_extend_base_four_to_exactly_five_updates() {
-    let config = AdaptiveEnvironmentConfig::default();
-    let limits = limits(4, 20, 0);
-    let before = run(config, limits, &[0, 0, 5, 5]);
-    assert_eq!(before.generation, 0);
-    assert_eq!(before.extension_awards, 2);
-    assert_eq!(before.updates_in_generation, 4);
-    assert_eq!(before.effective_budget(config, limits).unwrap(), 5);
-    let after = before.observe(config, limits, 5, 5, 10).unwrap();
-    assert_eq!(
-        after,
-        AdaptiveEnvironmentState {
-            generation: 1,
-            start_update: 5,
-            ..AdaptiveEnvironmentState::default()
-        }
-    );
-    assert_eq!(after.effective_budget(config, limits).unwrap(), 4);
-}
-
-#[test]
-fn ten_tenth_credits_add_exactly_one_update_without_float_rounding() {
-    let config = AdaptiveEnvironmentConfig {
-        extension: decimal(".1"),
-        ..AdaptiveEnvironmentConfig::default()
-    };
-    let limits = limits(20, 100, 0);
-    let nine = run(config, limits, &[0; 9]);
-    assert_eq!(nine.effective_budget(config, limits).unwrap(), 20);
-    let ten = nine.observe(config, limits, 10, 0, 10).unwrap();
-    assert_eq!(ten.extension_awards, 10);
-    assert_eq!(ten.effective_budget(config, limits).unwrap(), 21);
-}
-
-#[test]
-fn zero_extension_still_records_awards_and_exhausts_the_base_budget() {
-    let config = AdaptiveEnvironmentConfig {
-        extension: decimal("0"),
-        ..AdaptiveEnvironmentConfig::default()
-    };
-    let limits = limits(2, 10, 0);
-    let first = run(config, limits, &[0]);
-    assert_eq!(first.extension_awards, 1);
-    let second = first.observe(config, limits, 2, 0, 10).unwrap();
-    assert_eq!(
-        second,
-        AdaptiveEnvironmentState {
-            generation: 1,
-            start_update: 2,
-            ..AdaptiveEnvironmentState::default()
-        }
-    );
-}
-
-#[test]
-fn extensions_of_at_least_one_award_before_exhaustion_and_retain_until_total() {
-    for extension in ["1", "1.5", "10"] {
-        for poor_updates in [1, 2] {
-            let config = AdaptiveEnvironmentConfig {
-                poor_updates,
-                extension: decimal(extension),
-                ..AdaptiveEnvironmentConfig::default()
-            };
-            let limits = limits(poor_updates, 12, 0);
-            let state = run(config, limits, &[0; 12]);
-            assert_eq!(state.generation, 0, "{extension}, window {poor_updates}");
-            assert_eq!(state.updates_in_generation, 12);
-            assert_eq!(state.poor_streak, poor_updates);
-            assert_eq!(state.extension_awards, 13 - poor_updates);
-            assert!(state.effective_budget(config, limits).unwrap() > limits.total_updates);
-        }
+fn extension_credit_adds_the_floor_of_exact_millionth_products() {
+    for (extension, base, awards, budget) in [
+        (".75", 4, 1, 4),
+        (".75", 4, 2, 5),
+        (".75", 4, 3, 6),
+        (".1", 20, 9, 20),
+        (".1", 20, 10, 21),
+        ("0", 2, 1, 2),
+    ] {
+        let config = AdaptiveEnvironmentConfig {
+            extension: decimal(extension),
+            ..AdaptiveEnvironmentConfig::default()
+        };
+        let limits = limits(base, 100, 0);
+        let state = run(config, limits, &vec![0; awards as usize]);
+        let case = format!("{awards} awards of {extension}");
+        assert_eq!(state.extension_awards, awards, "{case}");
+        assert_eq!(state.effective_budget(config, limits), Ok(budget), "{case}");
     }
 }
 
 #[test]
-fn exhausted_budget_resets_incomplete_success_and_poor_windows() {
-    let config = AdaptiveEnvironmentConfig {
-        success_updates: 3,
-        poor_updates: 3,
-        extension: decimal("10"),
-        ..Default::default()
-    };
-    let limits = limits(2, 10, 0);
-    for wins in [0, 8] {
-        let reset = run(config, limits, &[wins; 2]);
-        assert_eq!(
-            reset,
-            AdaptiveEnvironmentState {
-                generation: 1,
-                start_update: 2,
-                ..Default::default()
-            }
-        );
-        let next = reset.observe(config, limits, 3, wins, 10).unwrap();
-        assert_eq!(next.success_streak, u64::from(wins == 8));
-        assert_eq!(next.poor_streak, u64::from(wins == 0));
-        assert_eq!(next.extension_awards, 0);
-    }
-}
-
-#[test]
-fn success_overrides_existing_extension_credit_and_resets_all_local_counters() {
-    let config = AdaptiveEnvironmentConfig {
-        extension: decimal("10"),
-        ..Default::default()
-    };
-    let limits = limits(1, 20, 0);
-    let incomplete = run(config, limits, &[0, 8]);
-    assert_eq!(incomplete.success_streak, 1);
-    assert_eq!(incomplete.poor_streak, 0);
-    assert_eq!(incomplete.extension_awards, 1);
-    let next = incomplete.observe(config, limits, 3, 8, 10).unwrap();
-    assert_eq!(
-        next,
-        AdaptiveEnvironmentState {
-            generation: 1,
-            start_update: 3,
-            ..Default::default()
-        }
-    );
-}
-
-#[test]
-fn overlapping_success_has_priority_over_a_poor_award_that_would_overflow() {
-    let config = AdaptiveEnvironmentConfig {
-        success_rate: decimal(".2"),
-        poor_rate: decimal(".8"),
-        extension: EnvironmentDecimal::from_units(
-            (MAX_TRAINING_COUNTER - 1) * EnvironmentDecimal::SCALE,
+fn budget_exhaustion_starts_a_clean_generation() {
+    assert_clean_generation_starts(&[
+        (
+            "two three-quarter awards extend base four to five updates",
+            AdaptiveEnvironmentConfig::default(),
+            limits(4, 20, 0),
+            &[0, 0, 5, 5, 5],
+            5,
         ),
-        ..Default::default()
-    };
-    let state = run(config, limits(1, 10, 0), &[5, 5]);
-    assert_eq!(
-        state,
-        AdaptiveEnvironmentState {
-            generation: 1,
-            start_update: 2,
-            ..Default::default()
-        }
-    );
-    let terminal = run(config, limits(1, 2, 0), &[5, 5]);
-    assert_eq!(terminal.success_streak, 2);
-    assert_eq!(terminal.poor_streak, 1);
-    assert_eq!(terminal.extension_awards, 1);
-    assert_eq!(terminal.generation, 0);
+        (
+            "zero extension records awards but keeps the base budget",
+            with(|c| c.extension = decimal("0")),
+            limits(2, 10, 0),
+            &[0, 0],
+            2,
+        ),
+        (
+            "an incomplete success window is discarded",
+            with(|c| (c.success_updates, c.poor_updates, c.extension) = (3, 3, decimal("10"))),
+            limits(2, 10, 0),
+            &[8, 8],
+            2,
+        ),
+        (
+            "an incomplete poor window is discarded",
+            with(|c| (c.success_updates, c.poor_updates, c.extension) = (3, 3, decimal("10"))),
+            limits(2, 10, 0),
+            &[0, 0],
+            2,
+        ),
+    ]);
+}
+
+#[test]
+fn success_and_the_zero_phase_boundary_start_a_clean_generation_once() {
+    let zero_extension = with(|c| c.extension = decimal("0"));
+    assert_clean_generation_starts(&[
+        (
+            "success discards accumulated extension credit",
+            with(|c| c.extension = decimal("10")),
+            limits(1, 20, 0),
+            &[0, 8, 8],
+            3,
+        ),
+        (
+            "overlapping success outranks a poor award that would overflow",
+            with(|c| {
+                c.success_rate = decimal(".2");
+                c.poor_rate = decimal(".8");
+                c.extension = overflowing_extension();
+            }),
+            limits(1, 10, 0),
+            &[5, 5],
+            2,
+        ),
+        (
+            "the boundary discards a poor award that would overflow",
+            with(|c| c.extension = overflowing_extension()),
+            limits(1, 3, 1),
+            &[0, 0],
+            2,
+        ),
+        (
+            "boundary coinciding with success",
+            zero_extension,
+            limits(5, 8, 3),
+            &[5, 5, 5, 8, 8],
+            5,
+        ),
+        (
+            "boundary coinciding with exhaustion",
+            zero_extension,
+            limits(5, 8, 3),
+            &[5; 5],
+            5,
+        ),
+    ]);
 }
 
 #[test]
 fn zero_phase_boundary_forces_a_clean_environment_despite_extension_credit() {
-    let config = AdaptiveEnvironmentConfig {
-        extension: decimal("10"),
-        ..Default::default()
-    };
+    let config = with(|c| c.extension = decimal("10"));
     let limits = limits(10, 8, 3);
     let boundary = run(config, limits, &[0; 5]);
-    assert_eq!(
-        boundary,
-        AdaptiveEnvironmentState {
-            generation: 1,
-            start_update: 5,
-            ..Default::default()
-        }
-    );
+    assert_eq!(boundary, generation_start(1, 5));
     let after = boundary.observe(config, limits, 6, 0, 10).unwrap();
     assert_eq!(after.generation, 1);
     assert_eq!(after.updates_in_generation, 1);
     assert_eq!(after.extension_awards, 1);
-}
-
-#[test]
-fn coincident_boundary_success_and_exhaustion_advance_only_once() {
-    let config = AdaptiveEnvironmentConfig {
-        extension: decimal("0"),
-        ..Default::default()
-    };
-    let limits = limits(5, 8, 3);
-    for wins in [[5, 5, 5, 8, 8], [5; 5]] {
-        let state = run(config, limits, &wins);
-        assert_eq!(
-            state,
-            AdaptiveEnvironmentState {
-                generation: 1,
-                start_update: 5,
-                ..Default::default()
-            }
-        );
-    }
 }
 
 #[test]
@@ -600,53 +437,126 @@ fn zero_phase_covering_the_whole_run_does_not_create_an_initial_transition() {
 }
 
 #[test]
-fn terminal_success_is_retained_without_a_needless_environment_transition() {
-    let config = AdaptiveEnvironmentConfig {
-        success_updates: 1,
-        ..Default::default()
+fn extensions_of_at_least_one_award_before_exhaustion_and_retain_until_total() {
+    for extension in ["1", "1.5", "10"] {
+        for poor_updates in [1, 2] {
+            let config = AdaptiveEnvironmentConfig {
+                poor_updates,
+                extension: decimal(extension),
+                ..AdaptiveEnvironmentConfig::default()
+            };
+            let limits = limits(poor_updates, 12, 0);
+            let state = run(config, limits, &[0; 12]);
+            let case = format!("extension {extension}, window {poor_updates}");
+            assert_eq!(state.generation, 0, "{case}");
+            assert_eq!(state.updates_in_generation, 12, "{case}");
+            assert_eq!(state.poor_streak, poor_updates, "{case}");
+            assert_eq!(state.extension_awards, 13 - poor_updates, "{case}");
+            assert!(
+                state.effective_budget(config, limits).unwrap() > limits.total_updates,
+                "{case}"
+            );
+        }
+    }
+}
+
+#[test]
+fn final_update_keeps_completed_counters_without_advancing() {
+    let overlapping = |success_updates| {
+        let mut config = with(|c| (c.success_rate, c.poor_rate) = (decimal(".2"), decimal(".8")));
+        config.success_updates = success_updates;
+        config.extension = overflowing_extension();
+        config
     };
-    let state = run(config, limits(1, 1, 0), &[10]);
-    assert_eq!(state.generation, 0);
-    assert_eq!(state.success_streak, 1);
-    assert_eq!(state.updates_in_generation, 1);
-    assert_eq!(
-        state.validate(config, limits(1, 2, 0), 1).unwrap_err(),
-        PpoError::InvalidTransition(
-            "environment success streak requires advancement before total updates"
-        )
-    );
+    for (name, config, wins, expected) in [
+        (
+            "completed success streak",
+            with(|c| c.success_updates = 1),
+            &[10][..],
+            (1, 1, 0, 0),
+        ),
+        (
+            "exhausted budget",
+            AdaptiveEnvironmentConfig::default(),
+            &[5][..],
+            (1, 0, 0, 0),
+        ),
+        (
+            "success suppresses the overlapping poor award",
+            overlapping(1),
+            &[5][..],
+            (1, 1, 1, 0),
+        ),
+        (
+            "success keeps the award of an earlier update",
+            overlapping(2),
+            &[5, 5][..],
+            (2, 2, 1, 1),
+        ),
+    ] {
+        let state = run(config, limits(1, wins.len() as u64, 0), wins);
+        let (updates_in_generation, success_streak, poor_streak, extension_awards) = expected;
+        let expected = AdaptiveEnvironmentState {
+            updates_in_generation,
+            success_streak,
+            poor_streak,
+            extension_awards,
+            ..AdaptiveEnvironmentState::default()
+        };
+        assert_eq!(state, expected, "{name}");
+    }
 }
 
 #[test]
-fn terminal_exhaustion_is_valid_only_at_total_and_cannot_be_observed_again() {
+fn terminal_states_are_invalid_before_total_and_cannot_be_observed_again() {
     let config = AdaptiveEnvironmentConfig::default();
-    let terminal_limits = limits(1, 1, 0);
-    let state = run(config, terminal_limits, &[5]);
-    assert_eq!(state.generation, 0);
-    assert_eq!(state.updates_in_generation, 1);
-    assert_eq!(
-        state.validate(config, limits(1, 2, 0), 1).unwrap_err(),
-        PpoError::InvalidTransition("environment budget is exhausted before total updates")
-    );
-    assert_eq!(
-        state
-            .observe(config, terminal_limits, 2, 5, 10)
-            .unwrap_err(),
-        PpoError::InvalidTransition("environment completed update must be in 1..=total updates")
-    );
-}
-
-#[test]
-fn validation_rejects_spending_beyond_the_budget_even_at_total() {
-    let config = AdaptiveEnvironmentConfig::default();
-    let limits = limits(1, 2, 0);
-    let state = AdaptiveEnvironmentState {
+    let success = AdaptiveEnvironmentState {
+        updates_in_generation: 1,
+        success_streak: 1,
+        ..AdaptiveEnvironmentState::default()
+    };
+    let exhausted = AdaptiveEnvironmentState {
+        updates_in_generation: 1,
+        ..AdaptiveEnvironmentState::default()
+    };
+    let overspent = AdaptiveEnvironmentState {
         updates_in_generation: 2,
-        ..Default::default()
+        ..AdaptiveEnvironmentState::default()
     };
+    for (name, config, state, global, message) in [
+        (
+            "success before total",
+            with(|c| c.success_updates = 1),
+            success,
+            1,
+            "environment success streak requires advancement before total updates",
+        ),
+        (
+            "exhaustion before total",
+            config,
+            exhausted,
+            1,
+            "environment budget is exhausted before total updates",
+        ),
+        (
+            "spending beyond the budget at total",
+            config,
+            overspent,
+            2,
+            "environment spent updates exceed effective budget",
+        ),
+    ] {
+        assert_eq!(
+            state.validate(config, limits(1, 2, 0), global),
+            Err(PpoError::InvalidTransition(message)),
+            "{name}"
+        );
+    }
     assert_eq!(
-        state.validate(config, limits, 2).unwrap_err(),
-        PpoError::InvalidTransition("environment spent updates exceed effective budget")
+        exhausted.observe(config, limits(1, 1, 0), 2, 5, 10),
+        Err(PpoError::InvalidTransition(
+            "environment completed update must be in 1..=total updates"
+        ))
     );
 }
 
@@ -971,40 +881,6 @@ fn observation_rejects_disjoint_active_streaks_without_mutating_invalid_state() 
         expected
     );
     assert_eq!(state, saved);
-}
-
-#[test]
-fn terminal_overlapping_success_does_not_require_a_poor_award() {
-    let config = AdaptiveEnvironmentConfig {
-        success_updates: 1,
-        success_rate: decimal("0"),
-        poor_rate: decimal("1"),
-        ..Default::default()
-    };
-    let state = run(config, limits(1, 1, 0), &[5]);
-    assert_eq!(state.generation, 0);
-    assert_eq!(state.success_streak, 1);
-    assert_eq!(state.poor_streak, 1);
-    assert_eq!(state.extension_awards, 0);
-}
-
-#[test]
-fn boundary_discards_a_poor_award_that_would_overflow_the_old_budget() {
-    let config = AdaptiveEnvironmentConfig {
-        extension: EnvironmentDecimal::from_units(
-            (MAX_TRAINING_COUNTER - 1) * EnvironmentDecimal::SCALE,
-        ),
-        ..Default::default()
-    };
-    let state = run(config, limits(1, 3, 1), &[0, 0]);
-    assert_eq!(
-        state,
-        AdaptiveEnvironmentState {
-            generation: 1,
-            start_update: 2,
-            ..Default::default()
-        }
-    );
 }
 
 #[test]

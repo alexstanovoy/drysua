@@ -355,65 +355,6 @@ fn record_rejection(outcome: &mut Outcome, reason: RejectReason) -> std::io::Res
     Ok(())
 }
 
-/// Follows the explicit Continue policy for protocol-only tests.
-pub fn play_idle_on(
-    wire: &mut impl Wire,
-    seated: Seated,
-    limit: Option<u32>,
-) -> std::io::Result<Outcome> {
-    let mut outcome = Outcome {
-        slot: Some(seated.slot),
-        ..Outcome::default()
-    };
-    let mut progress = MessageProgress::new();
-    for _ in 0..MAX_MATCH_MESSAGES {
-        let Some(message) = wire.hear()? else {
-            return Err(std::io::Error::other(
-                "server closed the connection before MatchOver",
-            ));
-        };
-        progress.observe(&message)?;
-        match message {
-            ServerMsg::MatchStart { info } => {
-                validate_match_terms(info.tick_rate, info.mode, seated)?;
-                outcome.team = Some(validate_pick(&info.picks, seated.slot)?);
-            }
-            ServerMsg::Snapshot { view } => {
-                validate_snapshot(&outcome, view.viewer, view.tick)?;
-                outcome.ticks = view.tick;
-                if seated.mode == TickMode::Lockstep {
-                    wire.acknowledge(view.tick)?;
-                }
-                if limit.is_some_and(|last_tick| view.tick >= last_tick) {
-                    return Ok(outcome);
-                }
-            }
-            ServerMsg::OrderRejected { reason, .. } => {
-                outcome.rejections = outcome
-                    .rejections
-                    .checked_add(1)
-                    .ok_or_else(|| std::io::Error::other("order rejection count overflowed"))?;
-                outcome.last_rejection = Some(reason);
-            }
-            ServerMsg::MatchOver { winner, .. } => {
-                if outcome.team.is_none() {
-                    return Err(std::io::Error::other(
-                        "server sent MatchOver before MatchStart",
-                    ));
-                }
-                outcome.winner = Some(winner);
-                return Ok(outcome);
-            }
-            ServerMsg::Welcome { .. }
-            | ServerMsg::LobbyState { .. }
-            | ServerMsg::Events { .. }
-            | ServerMsg::Orders { .. }
-            | ServerMsg::ParticipantLeft { .. } => {}
-        }
-    }
-    Err(std::io::Error::other("server match message limit exceeded"))
-}
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct MessageProgress {
     without_snapshot: usize,

@@ -1,9 +1,7 @@
-//! Fixtures shared by the test modules whose copies differed only in values.
+//! Fixture builders shared by test modules.
 //!
-//! Each builder starts from neutral terms and takes the values that varied
-//! between the replaced copies through its constructor or setters; a caller
-//! that leaves a setter out gets only the neutral term, never another
-//! scenario's value.
+//! Each builder starts from neutral terms; a caller that leaves a setter out
+//! gets the neutral term, never another scenario's value.
 
 use bota_proto::{
     Angle, Attribute, Attributes, EntityId, Fixed, HeroId, MapId, MatchInfo, Pick, ShopEntry,
@@ -12,13 +10,13 @@ use bota_proto::{
 
 use crate::{FeatureFrame, SHADOW_FIEND};
 
-/// A unit view from the lockstep worlds, with every differing stat explicit.
+/// A unit view whose scenario-specific stats are explicit fields.
 pub(super) struct UnitFixture {
     pub(super) id: EntityId,
     pub(super) kind: UnitKind,
     pub(super) team: Team,
     pub(super) pos: Vec2,
-    /// Current and maximum mana, which every replaced copy kept equal.
+    /// Both current and maximum mana.
     pub(super) mana: i32,
     pub(super) attack_damage: i32,
     pub(super) attack_time: u32,
@@ -88,8 +86,8 @@ pub(super) fn two_seat_picks(team: Team) -> Vec<Pick> {
     ]
 }
 
-/// A match description that starts from the neutral terms and replaces exactly
-/// what each scenario changes: thirty ticks per second and a lockstep mode.
+/// A match description with neutral terms: thirty ticks per second, lockstep,
+/// no pregame, terrain, trees or shop until a setter provides them.
 pub(super) struct MatchInfoFixture {
     info: MatchInfo,
 }

@@ -39,19 +39,16 @@ fn invocation_limits_reject_zero_overflow_and_values_above_the_counter_bound() {
         );
         assert_eq!(error.to_string().lines().next(), Some(expected.as_str()));
     }
-    for limit in [MAX_TRAINING_COUNTER, MAX_TRAINING_COUNTER + 1] {
-        let mut config = invocation_settings();
-        config.invocation_updates = NonZeroU64::new(limit);
-        let result = validate_annealed(&config, harness());
-        if limit == MAX_TRAINING_COUNTER {
-            assert_eq!(result.expect("maximum limit"), config.ppo);
-        } else {
-            assert_eq!(
-                result.expect_err("library limit").to_string(),
-                "invalid PPO config field: annealed invocation updates exceed MAX_TRAINING_COUNTER"
-            );
-        }
-    }
+    let mut config = invocation_settings();
+    config.invocation_updates = NonZeroU64::new(MAX_TRAINING_COUNTER);
+    assert_eq!(validate_annealed(&config, harness()), Ok(config.ppo));
+    config.invocation_updates = NonZeroU64::new(MAX_TRAINING_COUNTER + 1);
+    assert_eq!(
+        validate_annealed(&config, harness()),
+        Err(PpoError::InvalidConfig(
+            "annealed invocation updates exceed MAX_TRAINING_COUNTER"
+        ))
+    );
 }
 
 #[test]

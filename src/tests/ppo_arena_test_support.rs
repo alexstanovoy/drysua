@@ -41,7 +41,7 @@ impl PpoOrderContractProbe {
         (frame, request, self.0.local.active_order())
     }
 
-    pub(crate) fn legacy_persistence(&self) -> OrderPersistence {
+    pub(crate) fn request_persistence(&self) -> OrderPersistence {
         self.0.persistence
     }
 }

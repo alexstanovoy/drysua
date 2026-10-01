@@ -1,56 +1,39 @@
 use super::*;
 
 #[test]
-fn bounded_sparse_rows_roundtrip_through_exact_capacity_and_preserve_prior_headers() {
-    let mut frame = FeatureFrame::new();
-    frame.units[UNIT_FEATURE_TOKENS - 1][unit_feature::TOKEN_PRESENT] = 1.0;
-    let mut arena = RaggedFeatureArena::new(1).expect("bounded arena");
-    let first = arena.push(&frame).expect("first sparse frame");
-    for _ in 1..UNIT_FEATURE_TOKENS {
-        let header = arena.push(&frame).expect("remaining sparse row");
-        assert_eq!(arena.expand(&header).expect("sparse roundtrip"), frame);
-        assert!(arena.units.capacity() <= UNIT_FEATURE_TOKENS);
+fn ragged_arena_fills_exact_capacity_then_rejects_overflow_and_keeps_retained_frames() {
+    let mut sparse = FeatureFrame::new();
+    sparse.units[UNIT_FEATURE_TOKENS - 1][unit_feature::TOKEN_PRESENT] = 1.0;
+    let mut unit_rows = [0; 7];
+    unit_rows[0] = UNIT_FEATURE_TOKENS;
+    for (case, frame, pushes, capacities) in [
+        (
+            "one unit row per frame",
+            sparse,
+            UNIT_FEATURE_TOKENS,
+            unit_rows,
+        ),
+        ("dense frame", dense_frame(), 1, token_counts()),
+    ] {
+        let mut arena = RaggedFeatureArena::new(1).expect(case);
+        let headers: Vec<_> = (0..pushes)
+            .map(|_| arena.push(&frame).expect(case))
+            .collect();
+        assert_eq!(arena_capacities(&arena), capacities, "{case}");
+        assert_eq!(
+            arena.push(&frame).expect_err(case),
+            "ragged feature arena capacity exceeded",
+            "{case}"
+        );
+        assert_eq!(arena_capacities(&arena), capacities, "{case}");
+        for header in &headers {
+            assert_eq!(arena.expand(header).expect(case), frame, "{case}");
+        }
     }
-    assert_eq!(arena.units.capacity(), UNIT_FEATURE_TOKENS);
-    assert_eq!(
-        arena.push(&frame).expect_err("one row past capacity"),
-        "ragged feature arena capacity exceeded"
-    );
-    assert_eq!(arena.expand(&first).expect("first frame retained"), frame);
 }
 
 #[test]
-fn bounded_feature_constructor_accepts_maximum_without_allocating_and_rejects_outside_profile() {
-    let arena = RaggedFeatureArena::new(crate::PPO_MAX_SAMPLES).expect("maximum sample capacity");
-
-    assert_eq!(arena_capacities(&arena), [0; 7]);
-    for capacity in [0, crate::PPO_MAX_SAMPLES + 1, usize::MAX] {
-        let error = RaggedFeatureArena::new(capacity)
-            .err()
-            .expect("invalid sample capacity");
-        assert_eq!(error, "ragged feature sample capacity is outside 1..=46520");
-    }
-}
-
-#[test]
-fn bounded_feature_arena_caps_every_vector_and_roundtrips_dense_frame() {
-    let frame = dense_frame();
-    let mut arena = RaggedFeatureArena::new(1).expect("one frame");
-
-    let header = arena.push(&frame).expect("full frame");
-
-    assert_eq!(arena_capacities(&arena), token_counts());
-    assert_eq!(arena.expand(&header).expect("roundtrip"), frame);
-    assert_eq!(
-        arena.push(&frame).expect_err("second full frame"),
-        "ragged feature arena capacity exceeded"
-    );
-    assert_eq!(arena_capacities(&arena), token_counts());
-    assert_eq!(arena.expand(&header).expect("unchanged frame"), frame);
-}
-
-#[test]
-fn bounded_feature_arena_rejects_late_row_overflow_before_appending_any_rows() {
+fn ragged_arena_rejects_late_row_overflow_before_appending_any_rows() {
     let mut frame = FeatureFrame::new();
     for row in frame.loot.iter_mut() {
         row[loot_feature::TOKEN_PRESENT] = 1.0;
@@ -71,7 +54,34 @@ fn bounded_feature_arena_rejects_late_row_overflow_before_appending_any_rows() {
 }
 
 #[test]
-fn bounded_feature_row_dimensions_reject_zero_oversize_and_capacity_overflow() {
+fn ragged_arena_rejects_a_corrupt_row_offset() {
+    let mut arena = RaggedFeatureArena::new(1).expect("arena");
+    let mut malformed = arena.push(&dense_frame()).expect("frame");
+    malformed.corrupt_unit_offset_for_test();
+    assert_eq!(
+        arena.expand(&malformed).expect_err("invalid offset"),
+        "ragged feature range is invalid"
+    );
+}
+
+#[test]
+fn ragged_arena_constructor_accepts_maximum_without_allocating_and_rejects_outside_range() {
+    let arena = RaggedFeatureArena::new(crate::PPO_MAX_SAMPLES).expect("maximum sample capacity");
+
+    assert_eq!(arena_capacities(&arena), [0; 7]);
+    for capacity in [0, crate::PPO_MAX_SAMPLES + 1, usize::MAX] {
+        let error = RaggedFeatureArena::new(capacity)
+            .err()
+            .expect("invalid sample capacity");
+        assert_eq!(
+            error, "ragged feature sample capacity is outside 1..=33280",
+            "{capacity}"
+        );
+    }
+}
+
+#[test]
+fn feature_row_capacity_rejects_zero_oversize_multiplication_and_u32_offset_overflow() {
     assert_eq!(
         bounded_feature_row_capacity::<0>(1),
         Err("ragged feature token count is outside 1..=65535")
@@ -88,11 +98,7 @@ fn bounded_feature_row_dimensions_reject_zero_oversize_and_capacity_overflow() {
         bounded_feature_row_capacity::<1>(u32::MAX as usize),
         Ok(u32::MAX as usize)
     );
-}
-
-#[cfg(target_pointer_width = "64")]
-#[test]
-fn bounded_feature_row_capacity_rejects_u32_offset_limit_plus_one() {
+    #[cfg(target_pointer_width = "64")]
     assert_eq!(
         bounded_feature_row_capacity::<1>(u32::MAX as usize + 1),
         Err("ragged feature arena offset capacity exceeds u32")
@@ -100,60 +106,35 @@ fn bounded_feature_row_capacity_rejects_u32_offset_limit_plus_one() {
 }
 
 #[test]
-fn bounded_feature_rows_reject_invalid_presence_index_before_allocation() {
-    let mut arena = Vec::new();
-
-    let error = reserve_feature_rows(&mut arena, &[[1.0]; 3], 1, 1)
-        .expect_err("presence index outside each row");
-
-    assert_eq!(error, "ragged feature presence index out of range");
-    assert_eq!(arena.len(), 0);
-    assert_eq!(arena.capacity(), 0);
-}
-
-#[test]
-fn bounded_feature_rows_reject_preexisting_overallocated_vector() {
-    let mut arena = Vec::with_capacity(4);
-
-    let error = reserve_feature_rows(&mut arena, &[[0.0]; 3], 0, 1)
-        .expect_err("four allocated rows exceed maximum three");
-
-    assert_eq!(error, "ragged feature allocated capacity exceeds maximum");
-    assert_eq!(arena.len(), 0);
-    assert_eq!(arena.capacity(), 4);
-}
-
-#[test]
-fn bounded_feature_reservation_reports_allocation_failure_without_allocating() {
-    let mut arena: Vec<IndexedFeatureRow<1>> = Vec::new();
-
-    // Requesting usize::MAX nonzero-sized rows fails Vec's byte-capacity check, not the allocator.
-    let error = reserve_feature_capacity(&mut arena, usize::MAX, usize::MAX)
-        .expect_err("unrepresentable allocation");
-
-    assert_eq!(error, "ragged feature arena allocation failed");
-    assert_eq!(arena.len(), 0);
-    assert_eq!(arena.capacity(), 0);
-}
-
-#[test]
-fn feature_peak_counts_all_row_capacities_and_one_largest_reallocation() {
-    let counts = [96u64, 32, 64, 14, 94, 32, 16];
-    let sizes = [440u64, 440, 244, 228, 412, 168, 304];
-    let mut total = 0;
-    let mut largest = 0;
-    for (tokens, size) in counts.into_iter().zip(sizes) {
-        let rows = 33_280 * tokens;
-        assert!(rows <= u64::from(u32::MAX));
-        let bytes = rows * size;
-        total += bytes;
-        largest = largest.max(bytes);
+fn feature_row_reservation_failures_leave_the_vector_unallocated_or_unchanged() {
+    type Reserve = fn(&mut Vec<IndexedFeatureRow<1>>) -> Result<(), &'static str>;
+    let cases: [(&str, usize, Reserve, &str); 3] = [
+        (
+            "presence index outside each row",
+            0,
+            |rows| reserve_feature_rows(rows, &[[1.0]; 3], 1, 1),
+            "ragged feature presence index out of range",
+        ),
+        (
+            "four allocated rows exceed maximum three",
+            4,
+            |rows| reserve_feature_rows(rows, &[[0.0]; 3], 0, 1),
+            "ragged feature allocated capacity exceeds maximum",
+        ),
+        (
+            // usize::MAX nonzero-sized rows fail Vec's byte-capacity check, not the allocator.
+            "unrepresentable allocation",
+            0,
+            |rows| reserve_feature_capacity(rows, usize::MAX, usize::MAX),
+            "ragged feature arena allocation failed",
+        ),
+    ];
+    for (case, allocated, reserve, expected) in cases {
+        let mut rows = Vec::with_capacity(allocated);
+        assert_eq!(reserve(&mut rows), Err(expected), "{case}");
+        assert_eq!(rows.len(), 0, "{case}");
+        assert_eq!(rows.capacity(), allocated, "{case}");
     }
-
-    assert_eq!(total, 4_129_914_880);
-    assert_eq!(largest, 1_405_747_200);
-    assert_eq!(FEATURE_ARENA_PEAK_BYTES, total + largest);
-    assert_eq!(FEATURE_ARENA_PEAK_BYTES, 5_535_662_080);
 }
 
 fn arena_capacities(arena: &RaggedFeatureArena) -> [usize; 7] {

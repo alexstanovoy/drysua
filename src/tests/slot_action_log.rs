@@ -4,10 +4,14 @@
 use super::*;
 use bota_proto::{AbilitySlot, ItemSlot};
 
-fn actions() -> Vec<StructuredAction> {
+fn actions() -> impl Iterator<Item = StructuredAction> {
+    body_actions().into_iter().chain(item_actions())
+}
+
+fn body_actions() -> [StructuredAction; 9] {
     use StructuredAction as Action;
     let unit = ControlledUnit::Courier;
-    vec![
+    [
         Action::Continue,
         Action::Stop { unit },
         Action::MovePoint {
@@ -39,6 +43,13 @@ fn actions() -> Vec<StructuredAction> {
             slot: AbilitySlot(1),
             target: ActionTarget::Entity(EntityIndex(95)),
         },
+    ]
+}
+
+fn item_actions() -> [StructuredAction; 9] {
+    use StructuredAction as Action;
+    let unit = ControlledUnit::Courier;
+    [
         Action::Use {
             unit,
             slot: ItemSlot(14),

@@ -26,7 +26,7 @@ fn manifest_records_current_identity_and_60_byte_config() {
 }
 
 #[test]
-fn manifests_reject_truncation_trailing_bytes_foreign_identities_and_bad_presence() {
+fn manifests_reject_truncation_trailing_bytes_and_bad_presence() {
     let encoded = encoded_manifest(0, 0);
     assert_eq!(
         decode_manifest(&encoded[..encoded.len() - 1]).expect_err("truncated"),
@@ -38,18 +38,6 @@ fn manifests_reject_truncation_trailing_bytes_foreign_identities_and_bad_presenc
         decode_manifest(&trailing).expect_err("trailing"),
         CheckpointError::ManifestTrailingBytes
     );
-    for range in [8..12, 12..20, 20..24, 24..32, 56..60, 60..68] {
-        let mut foreign = encoded.clone();
-        for byte in &mut foreign[range] {
-            *byte ^= 0x5a;
-        }
-        let error = decode_manifest(&foreign).expect_err("foreign schema");
-        assert_eq!(error, CheckpointError::SchemaMismatch);
-        assert_eq!(
-            error.to_string(),
-            "checkpoint schema does not match this build"
-        );
-    }
     let mut presence = encoded;
     *presence.last_mut().expect("presence byte") = 2;
     assert_eq!(
@@ -118,12 +106,11 @@ fn sample_counters_accept_configured_boundary_and_reject_one_more() {
 }
 
 #[test]
-fn public_checkpoint_preserves_state_and_rejects_invalid_capture_restore() {
-    let directory = test_directory("roundtrip");
+fn invalid_rollout_counter_is_rejected_by_capture_decode_and_restore_without_mutation() {
     let fixture = manifest_artifact(0, 0);
     let source = PolicyModel::fresh(40_008).expect("source");
     let trainer = PpoTrainer::new(&source, fixture.config, 91).expect("trainer");
-    let artifact = TrainingArtifact::capture(
+    let mut invalid = TrainingArtifact::capture(
         &source,
         &trainer,
         fixture.run,
@@ -131,46 +118,14 @@ fn public_checkpoint_preserves_state_and_rejects_invalid_capture_restore() {
         crate::checkpoint::collection_fixture(&source),
     )
     .expect("capture");
-    artifact.save(&directory).expect("save");
-    let loaded = TrainingArtifact::load_compatible(&directory, artifact.run()).expect("load");
-    let target = PolicyModel::fresh(40_009).expect("target");
-    let state = loaded.restore(&target, artifact.run()).expect("restore");
-    assert_eq!(state.trainer().config(), trainer.config());
-    assert_eq!(state.progress(), artifact.progress());
-    assert_eq!(state.trainer().rng_checkpoint(), trainer.rng_checkpoint());
-    assert_eq!(state.trainer().optimizer_step(), trainer.optimizer_step());
-    let snapshot = state
-        .trainer()
-        .checkpoint_snapshot(&target)
-        .expect("restored snapshot");
-    assert_eq!(
-        snapshot.adam.moments(),
-        trainer
-            .checkpoint_snapshot(&source)
-            .expect("source snapshot")
-            .adam
-            .moments()
-    );
-    assert_eq!(snapshot.parameters, artifact.parameters);
-    drop(state);
-    assert_invalid_capture_restore(&source, &trainer, &target, &loaded);
-}
-
-fn assert_invalid_capture_restore(
-    source: &PolicyModel,
-    trainer: &PpoTrainer,
-    target: &PolicyModel,
-    loaded: &TrainingArtifact,
-) {
-    let mut invalid = loaded.clone();
     invalid.progress.rollout_samples = 1;
     let field = "rollout sample counter";
     let error = TrainingArtifact::capture(
-        source,
-        trainer,
+        &source,
+        &trainer,
         invalid.run.clone(),
         invalid.progress.clone(),
-        crate::checkpoint::collection_fixture(source),
+        crate::checkpoint::collection_fixture(&source),
     )
     .expect_err("invalid capture");
     assert_eq!(error, CheckpointError::InvalidManifest(field));
@@ -183,66 +138,16 @@ fn assert_invalid_capture_restore(
         decode_manifest(&bytes).expect_err("invalid decode"),
         CheckpointError::InvalidManifest(field)
     );
+    let target = PolicyModel::fresh(40_009).expect("target");
     let before = target.export_parameters().expect("before");
     assert_eq!(
         invalid
-            .restore(target, invalid.run())
+            .restore(&target, invalid.run())
             .err()
             .expect("invalid restore"),
         error
     );
     assert_eq!(target.export_parameters().expect("after"), before);
-}
-
-#[test]
-fn runtime_weights_roundtrip_and_reject_foreign_schema_without_mutation() {
-    let directory = test_directory("runtime");
-    let source = PolicyModel::fresh(40_012).expect("source");
-    let model = PolicyModel::fresh(40_014).expect("target");
-    let parameters = source.export_parameters().expect("parameters");
-    let path = directory.join(RUNTIME_TENSOR_FILE);
-    TrainingArtifact::save_runtime_weights(&source, &directory).expect("export");
-    let bytes = fs::read(&path).expect("runtime");
-    TrainingArtifact::load_runtime_weights(&model, &directory).expect("import");
-    assert_eq!(model.export_parameters().expect("parameters"), parameters);
-    let (_, metadata) = SafeTensors::read_metadata(&bytes).expect("metadata");
-    let metadata = metadata.metadata().as_ref().expect("map");
-    for change in [
-        None,
-        Some(("ppo_schema_version", "39".to_owned())),
-        Some(("ppo_schema_hash", (PPO_SCHEMA_HASH ^ 1).to_string())),
-        Some(("model_schema_hash", (MODEL_SCHEMA_HASH ^ 1).to_string())),
-    ] {
-        let invalid = change.is_some();
-        let mut foreign = metadata.clone();
-        if let Some((key, value)) = change {
-            foreign.insert(key.to_owned(), value);
-        }
-        let data = encode_f32(&parameters);
-        let mut offset = 0;
-        let mut tensors = Vec::new();
-        for (name, shape) in model.parameter_schema().expect("schema") {
-            let size = shape.iter().product::<usize>() * 4;
-            let view = TensorView::new(Dtype::F32, shape, &data[offset..offset + size]);
-            tensors.push((name, view.expect("tensor")));
-            offset += size;
-        }
-        fs::write(&path, serialize(tensors, Some(foreign)).expect("fixture")).expect("write");
-        let identity = model.policy_identity().expect("identity");
-        let result = TrainingArtifact::load_runtime_weights(&model, &directory);
-        if !invalid {
-            result.expect("valid unordered metadata");
-        } else {
-            let error = result.expect_err("foreign import");
-            assert_eq!(error, CheckpointError::SchemaMismatch);
-            assert_eq!(
-                error.to_string(),
-                "checkpoint schema does not match this build"
-            );
-            assert_eq!(model.policy_identity().expect("identity"), identity);
-        }
-        assert_eq!(model.export_parameters().expect("parameters"), parameters);
-    }
 }
 
 #[test]

@@ -1,7 +1,3 @@
-#[cfg(test)]
-#[path = "tests/map2_contract_test_support.rs"]
-mod test_support;
-
 /// Map used by every production training and evaluation entry point.
 pub const MAP2_ID: bota_proto::MapId = bota_proto::MapId(2);
 /// Simulation ticks per second.

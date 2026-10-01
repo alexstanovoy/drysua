@@ -239,8 +239,7 @@ fn finish_arena_one_auto_at_eighty_hp_kills_and_survives_a_ready_enemy_attack() 
 #[test]
 fn finish_arena_does_not_treat_hidden_cooldown_as_ready_or_renew_after_timeout() {
     let (mut arena, mut seat) = finish_arena(200, false);
-    // The refactored attack can now kill the fixture enemy in one bounded
-    // trial; give it room so the cooldown, not a death, is what is tested.
+    // Enough enemy health that the hidden cooldown, not a kill, ends the trial.
     arena.configure_for_test(|world| {
         let enemy = world.seats[1].unit.expect("enemy");
         world.health.get_mut(enemy).expect("enemy health").hp = bota_proto::Fixed::from_int(400);
@@ -271,72 +270,78 @@ fn finish_arena_does_not_treat_hidden_cooldown_as_ready_or_renew_after_timeout()
     assert_eq!(counts.rejections, 0);
 }
 
-#[test]
-fn finish_arena_vetoes_a_mana_affordable_lethal_raze() {
-    let (_, mut seat) = finish_arena(0, true);
-    let mut counts = GateCounts::default();
-
-    let request = decide_request(&mut seat, &mut counts).expect("retreat");
-
-    assert!(matches!(request.order, bota_proto::Order::Move { .. }));
-    assert_eq!(counts.rejections, 0);
-}
-
 fn finish_arena(cooldown: u32, lethal_raze: bool) -> (Arena, SeatPolicy) {
     configured_finish_arena(cooldown, lethal_raze, |_| {})
 }
 
 #[test]
-fn finish_arena_vetoes_a_tower_projectile_after_its_launcher_is_gone() {
+fn finish_arena_retreats_from_a_lethal_raze_or_an_orphaned_tower_projectile() {
+    type Configure = fn(&mut bota_server::game::World);
+    let cases: [(&str, bool, Configure); 2] = [
+        ("mana-affordable lethal raze", true, |_| {}),
+        (
+            "tower projectile after its launcher is gone",
+            false,
+            orphan_tower_projectile,
+        ),
+    ];
+    for (case, lethal_raze, configure) in cases {
+        let (_, mut seat) = configured_finish_arena(0, lethal_raze, configure);
+        if !lethal_raze {
+            let view = seat.tracker.current().expect("seat view");
+            assert!(
+                view.projectiles
+                    .iter()
+                    .any(|shot| shot.team == Team::Dire && shot.ability.is_none()),
+                "{case}"
+            );
+            assert!(
+                !view.units.iter().any(
+                    |unit| unit.team == Team::Dire && unit.kind == bota_proto::UnitKind::Tower
+                ),
+                "{case}"
+            );
+        }
+        let request = decide_request(&mut seat, &mut GateCounts::default()).expect(case);
+        assert!(
+            matches!(request.order, bota_proto::Order::Move { .. }),
+            "{case}: {request:?}"
+        );
+    }
+}
+
+/// An enemy tower fires at the own hero, then despawns with its projectile in flight.
+fn orphan_tower_projectile(world: &mut bota_server::game::World) {
     use bota_server::game::UnitOrder;
-    let (_, mut seat) = configured_finish_arena(0, false, |world| {
-        let own = world.seats[0].unit.expect("own hero");
-        let tower = world
+    let own = world.seats[0].unit.expect("own hero");
+    let tower = world
+        .entities
+        .iter()
+        .find(|entity| {
+            world.kind.get(*entity) == Some(&bota_proto::UnitKind::Tower)
+                && world.team.get(*entity) == Some(&Team::Dire)
+        })
+        .expect("enemy tower");
+    let at = world.transform.get_mut(tower).expect("tower position");
+    at.pos = Vec2::from_ints(9_000, 8_900);
+    at.facing.brads = 32_768;
+    world.set_order(
+        tower,
+        UnitOrder::Attack {
+            target: own,
+            last_seen: Vec2::from_ints(8_600, 8_900),
+        },
+    );
+    for _ in 0..8 {
+        world.advance(&[]);
+    }
+    assert!(
+        world
             .entities
             .iter()
-            .find(|entity| {
-                world.kind.get(*entity) == Some(&bota_proto::UnitKind::Tower)
-                    && world.team.get(*entity) == Some(&Team::Dire)
-            })
-            .expect("enemy tower");
-        let at = world.transform.get_mut(tower).expect("tower position");
-        at.pos = Vec2::from_ints(9_000, 8_900);
-        at.facing.brads = 32_768;
-        world.set_order(
-            tower,
-            UnitOrder::Attack {
-                target: own,
-                last_seen: Vec2::from_ints(8_600, 8_900),
-            },
-        );
-        for _ in 0..8 {
-            world.advance(&[]);
-        }
-        assert!(
-            world
-                .entities
-                .iter()
-                .any(|entity| world.projectile.get(entity).is_some())
-        );
-        assert!(world.despawn(tower));
-    });
-    let view = seat.tracker.current().expect("seat view");
-    assert!(
-        view.projectiles
-            .iter()
-            .any(|shot| shot.team == Team::Dire && shot.ability.is_none())
+            .any(|entity| world.projectile.get(entity).is_some())
     );
-    assert!(
-        !view
-            .units
-            .iter()
-            .any(|unit| unit.team == Team::Dire && unit.kind == bota_proto::UnitKind::Tower)
-    );
-    let mut counts = GateCounts::default();
-
-    let request = decide_request(&mut seat, &mut counts).expect("retreat");
-
-    assert!(matches!(request.order, bota_proto::Order::Move { .. }));
+    assert!(world.despawn(tower));
 }
 
 #[test]

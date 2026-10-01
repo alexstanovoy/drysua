@@ -5,7 +5,6 @@ use bota_proto::{MapId, Team};
 use safetensors::tensor::{Dtype, TensorView, serialize};
 
 use super::feature::{encode, tracker_with_view, world_view};
-use super::map2_checkpoint::runtime_bytes;
 use crate::{
     ActionSpace, CheckpointDevice, CheckpointError, CheckpointProgress, CheckpointRun,
     LocalPolicyState, PolicyModel, PpoConfig, PpoOutcome, PpoRng, PpoRollout, PpoTrainer,
@@ -61,53 +60,6 @@ fn capture_requires_map2_scope_rules_and_reward_discount() {
     }
 }
 
-#[test]
-fn runtime_requires_every_current_identity_field_without_mutation() {
-    let directory = test_directory("map2-checkpoint");
-    let model = PolicyModel::fresh(18_102).expect("model");
-    let trainer = PpoTrainer::new(&model, checkpoint_config(), 1).expect("owner");
-    let identity = model.policy_identity().expect("identity");
-    let parameters = model.export_parameters().expect("parameters");
-    let current = current_runtime_metadata();
-    TrainingArtifact::save_runtime_weights(&model, &directory).expect("save");
-    let bytes = fs::read(directory.join("drysua.weights.safetensors")).expect("runtime");
-    let (_, metadata) = safetensors::SafeTensors::read_metadata(&bytes).expect("metadata");
-    assert_eq!(metadata.metadata().as_ref(), Some(&current));
-    for key in current.keys().map(String::as_str).chain(["unexpected"]) {
-        for replacement in [None, Some("wrong")] {
-            if key == "unexpected" && replacement.is_none() {
-                continue;
-            }
-            let mut metadata = current.clone();
-            metadata.remove(key);
-            if let Some(value) = replacement {
-                metadata.insert(key.to_owned(), value.to_owned());
-            }
-            let bytes = runtime_bytes(&parameters, metadata);
-            let path = directory.join("drysua.weights.safetensors");
-            fs::write(&path, &bytes).expect("fixture");
-            let error = TrainingArtifact::load_runtime_weights(&model, &directory)
-                .expect_err("exact schema required");
-            assert_eq!(error, CheckpointError::SchemaMismatch, "{key}");
-            assert_eq!(
-                error.to_string(),
-                "checkpoint schema does not match this build"
-            );
-            assert_eq!(model.policy_identity().expect("identity"), identity);
-            assert_eq!(model.export_parameters().expect("parameters"), parameters);
-            assert_eq!(fs::read(path).expect("unchanged file"), bytes);
-            TrainingArtifact::capture(
-                &model,
-                &trainer,
-                run_metadata(),
-                progress_metadata(0),
-                crate::checkpoint::collection_fixture(&model),
-            )
-            .expect("optimizer binding preserved");
-        }
-    }
-}
-
 #[cfg(feature = "builtin")]
 #[test]
 fn warm_start_reuses_named_tensors_reinitializes_the_rest_and_refuses_unrelated_files() {
@@ -115,47 +67,17 @@ fn warm_start_reuses_named_tensors_reinitializes_the_rest_and_refuses_unrelated_
     let source = PolicyModel::fresh(18_111).expect("source");
     let parameters = source.export_parameters().expect("parameters");
     let schema = source.parameter_schema().expect("schema");
-    // An older model: another critic layout under older schema metadata.
-    let data: Vec<u8> = parameters
-        .iter()
-        .flat_map(|value| value.to_le_bytes())
-        .collect();
-    let legacy_value = vec![0; 257 * 4];
-    let mut tensors = vec![
-        (
-            "value.weight".to_owned(),
-            TensorView::new(Dtype::F32, vec![256, 1], &legacy_value[..1024]),
-        ),
-        (
-            "value.bias".to_owned(),
-            TensorView::new(Dtype::F32, vec![1], &legacy_value[1024..]),
-        ),
-    ];
-    let mut offset = 0;
-    for (name, shape) in &schema {
-        let size = shape.iter().product::<usize>() * 4;
-        if !name.starts_with("value.") {
-            let view = TensorView::new(Dtype::F32, shape.clone(), &data[offset..offset + size]);
-            tensors.push(((*name).to_owned(), view));
-        }
-        offset += size;
-    }
-    let tensors = tensors
-        .into_iter()
-        .map(|(name, view)| (name, view.expect("tensor")));
-    let mut older = current_runtime_metadata();
-    older.insert("model_schema_hash".to_owned(), "1".to_owned());
     let path = directory.join("drysua.weights.safetensors");
-    fs::write(&path, serialize(tensors, Some(older)).expect("older model")).expect("fixture");
+    fs::write(&path, older_critic_runtime(&parameters, &schema)).expect("fixture");
 
     let model = TrainingArtifact::initialize_from_weights(&directory, 5, crate::PolicyDevice::Cpu)
         .expect("warm start across schemas");
 
-    let imported = model.export_parameters().expect("imported");
     let fresh = PolicyModel::fresh(5)
         .expect("fresh")
         .export_parameters()
         .expect("fresh");
+    let imported = model.export_parameters().expect("imported");
     let mut offset = 0;
     for (name, shape) in &schema {
         let range = offset..offset + shape.iter().product::<usize>();
@@ -174,7 +96,7 @@ fn warm_start_reuses_named_tensors_reinitializes_the_rest_and_refuses_unrelated_
     );
     fs::write(
         &path,
-        runtime_bytes(&parameters[1..], current_runtime_metadata()),
+        super::map2_checkpoint::runtime_bytes(&parameters[1..], current_runtime_metadata()),
     )
     .expect("flat fixture");
     assert_eq!(
@@ -182,6 +104,42 @@ fn warm_start_reuses_named_tensors_reinitializes_the_rest_and_refuses_unrelated_
         Some(CheckpointError::TensorContract("names")),
         "a file sharing no tensor is no warm start"
     );
+}
+
+/// Runtime weights of an older model: every actor tensor of `parameters`, a critic
+/// of another layout and an older model schema hash.
+#[cfg(feature = "builtin")]
+fn older_critic_runtime(parameters: &[f32], schema: &[(&str, Vec<usize>)]) -> Vec<u8> {
+    let data: Vec<u8> = parameters
+        .iter()
+        .flat_map(|value| value.to_le_bytes())
+        .collect();
+    let older_value = vec![0; 257 * 4];
+    let mut tensors = vec![
+        (
+            "value.weight".to_owned(),
+            TensorView::new(Dtype::F32, vec![256, 1], &older_value[..1024]),
+        ),
+        (
+            "value.bias".to_owned(),
+            TensorView::new(Dtype::F32, vec![1], &older_value[1024..]),
+        ),
+    ];
+    let mut offset = 0;
+    for (name, shape) in schema {
+        let size = shape.iter().product::<usize>() * 4;
+        if !name.starts_with("value.") {
+            let view = TensorView::new(Dtype::F32, shape.clone(), &data[offset..offset + size]);
+            tensors.push(((*name).to_owned(), view));
+        }
+        offset += size;
+    }
+    let tensors = tensors
+        .into_iter()
+        .map(|(name, view)| (name, view.expect("tensor")));
+    let mut older = current_runtime_metadata();
+    older.insert("model_schema_hash".to_owned(), "1".to_owned());
+    serialize(tensors, Some(older)).expect("older model")
 }
 
 #[test]
@@ -390,7 +348,7 @@ fn fresh_artifact() -> TrainingArtifact {
     .expect("capture")
 }
 
-fn current_runtime_metadata() -> std::collections::HashMap<String, String> {
+pub(super) fn current_runtime_metadata() -> std::collections::HashMap<String, String> {
     [
         ("action_schema_hash", crate::ACTION_SCHEMA_HASH.to_string()),
         (
@@ -468,30 +426,28 @@ fn checkpoint_batch(
     seed: u64,
 ) -> (crate::PpoBatch, Vec<crate::StructuredAction>) {
     let tracker = tracker_with_view(Team::Radiant, world_view(Team::Radiant, 10));
-    let space = ActionSpace::from_tracker(&tracker).expect("space");
-    let frame = encode(&tracker, &LocalPolicyState::new(0));
-    let mut rng = PpoRng::new(seed);
+    let frames = vec![encode(&tracker, &LocalPolicyState::new(0)); 4];
+    let spaces: Vec<_> = (0..4)
+        .map(|_| ActionSpace::from_tracker(&tracker).expect("space"))
+        .collect();
+    let mut rngs: Vec<_> = (0..4).map(|stream| PpoRng::new(seed + stream)).collect();
+    let choices = model
+        .sample_batch(&frames, &spaces, &mut rngs)
+        .expect("choices");
     let mut rollout = PpoRollout::new(4).expect("rollout");
     let mut actions = Vec::with_capacity(4);
-    for stream in 0..4 {
-        let choice = model.sample(&frame, &space, &mut rng).expect("choice");
+    for (stream, choice) in choices.into_iter().enumerate() {
         actions.push(choice.action());
+        let outcome = PpoOutcome {
+            stream,
+            decision: 0,
+            ticks: 3,
+            next_value: 0.0,
+            reward: stream as f32,
+            terminal: true,
+        };
         rollout
-            .push(
-                choice
-                    .finish(
-                        0,
-                        PpoOutcome {
-                            stream,
-                            decision: 0,
-                            ticks: 3,
-                            next_value: 0.0,
-                            reward: stream as f32,
-                            terminal: true,
-                        },
-                    )
-                    .expect("transition"),
-            )
+            .push(choice.finish(0, outcome).expect("transition"))
             .expect("push");
     }
     (rollout.finish(checkpoint_config()).expect("batch"), actions)

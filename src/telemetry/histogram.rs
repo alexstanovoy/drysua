@@ -2,8 +2,8 @@ use std::fmt;
 use std::time::Duration;
 
 #[cfg(test)]
-#[path = "../tests/telemetry_histogram_test_support.rs"]
-mod test_support;
+#[path = "histogram_tests.rs"]
+mod tests;
 
 const BUCKETS: usize = 66;
 

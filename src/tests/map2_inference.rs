@@ -10,7 +10,7 @@ use bota_proto::{
 };
 
 #[test]
-fn map_metadata_selects_strict_reward_or_independent_legacy_streams() {
+fn only_map2_metadata_enables_reward_tracking_and_other_maps_reject_reward_queries() {
     for map in [MapId(0), MapId(1), MapId(2)] {
         let mut info = match_info(Team::Radiant);
         info.map = map;

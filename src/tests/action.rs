@@ -1,7 +1,7 @@
 use bota_proto::{
-    AbilityId, AbilitySlot, AbilityView, Aim, Attribute, Attributes, EntityId, HeroId, ItemId,
-    ItemSlot, ItemView, LootView, MapId, MatchInfo, Order, PlayerView, ShopEntry, SlotId, Target,
-    Team, UnitKind, UnitView, Vec2, WorldView,
+    AbilityId, AbilitySlot, AbilityView, Aim, Attribute, Attributes, EntityId, Fixed, HeroId,
+    ItemId, ItemSlot, ItemView, LootView, MapId, MatchInfo, Order, PlayerView, ShopEntry, SlotId,
+    Target, Team, UnitKind, UnitView, Vec2, WorldView,
 };
 
 use super::fixtures;
@@ -319,6 +319,42 @@ fn missing_snapshot_and_invalid_recipe_schemas_report_specific_errors() {
             ActionSpace::from_tracker(&tracker).err(),
             Some(ActionError::InvalidSchema(message))
         );
+    }
+}
+
+#[test]
+fn landing_cell_breaks_grid_ties_by_team_and_rejects_outside_or_blocked_cells() {
+    for team in [Team::Radiant, Team::Dire] {
+        let shift = i32::from(team == Team::Dire);
+        let position = |coordinate| Vec2 {
+            x: Fixed {
+                raw: Fixed::from_int(coordinate).raw - shift,
+            },
+            y: Fixed {
+                raw: Fixed::from_int(coordinate).raw - shift,
+            },
+        };
+        for (open, center, expected) in [
+            (
+                [true; 4],
+                position(64),
+                Some(position(if team == Team::Radiant { 32 } else { 96 })),
+            ),
+            (
+                [true, false, false, false],
+                position(120),
+                Some(position(32)),
+            ),
+            ([false; 4], position(64), None),
+            ([true; 4], Vec2::from_ints(-1, 0), None),
+            ([true; 4], Vec2::from_ints(128, 128), None),
+        ] {
+            assert_eq!(
+                crate::landing_cell_for_test(open, center, team),
+                expected,
+                "{team:?} {open:?} {center:?}"
+            );
+        }
     }
 }
 

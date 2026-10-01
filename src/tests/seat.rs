@@ -6,7 +6,7 @@ use super::readiness;
 use crate::tests::support::RecordingWire as MockWire;
 #[cfg(feature = "builtin")]
 use crate::{ActionKind, PolicyModel};
-use crate::{Seated, play_idle_on};
+use crate::{ScriptKind, Seated, play_script_on};
 
 #[cfg(feature = "builtin")]
 fn tactical_combat_fixture(map: MapId) -> (MatchInfo, WorldView) {
@@ -55,56 +55,53 @@ fn tactical_combat_fixture(map: MapId) -> (MatchInfo, WorldView) {
 }
 
 #[test]
-fn idle_seat_acknowledges_only_lockstep_and_rejects_invalid_assignments_before_output() {
+fn seat_acknowledges_only_lockstep_and_rejects_invalid_assignments_before_output() {
     for mode in [TickMode::Lockstep, TickMode::Realtime] {
         let mut wire = mock_wire_with_mode(mode);
-        let outcome = play_idle_on(&mut wire, seated(mode), Some(1)).expect("idle seat plays");
-        assert_eq!(outcome.ticks, 1);
-        assert_eq!(wire.acknowledgements, expected_acknowledgements(mode, 1));
-        assert!(wire.orders.is_empty());
+        let outcome = play_teacher(&mut wire, mode, Some(1)).expect("teacher seat plays");
+        assert_eq!(outcome.ticks, 1, "{mode:?}");
+        assert_eq!(
+            wire.acknowledgements,
+            expected_acknowledgements(mode, 1),
+            "{mode:?}"
+        );
+        assert!(wire.orders.is_empty(), "{mode:?}");
     }
-    for (scenario, expected) in [
+    type Corrupt = fn(&mut MockWire);
+    let cases: [(&str, TickMode, Corrupt); 4] = [
         (
-            0,
             "MatchStart mode Lockstep differs from Welcome mode Realtime",
+            TickMode::Realtime,
+            |_| {},
         ),
         (
-            1,
             "MatchStart tick rate 60 differs from Welcome tick rate 30",
+            TickMode::Lockstep,
+            |wire| start_info(wire).tick_rate = 60,
         ),
         (
-            2,
             "Snapshot viewer Some(Dire) differs from assigned team Some(Radiant)",
+            TickMode::Lockstep,
+            |wire| {
+                let ServerMsg::Snapshot { view } = &mut wire.messages[1] else {
+                    panic!("snapshot second");
+                };
+                view.viewer = Some(Team::Dire);
+            },
         ),
         (
-            3,
             "assigned slot 0 picked HeroId(1), expected Shadow Fiend HeroId(2)",
+            TickMode::Lockstep,
+            |wire| start_info(wire).picks[0].hero = bota_proto::HeroId(1),
         ),
-    ] {
+    ];
+    for (expected, mode, corrupt) in cases {
         let mut wire = mock_wire();
-        let ServerMsg::MatchStart { info } = &mut wire.messages[0] else {
-            panic!("match start");
-        };
-        match scenario {
-            1 => info.tick_rate = 60,
-            3 => info.picks[0].hero = bota_proto::HeroId(1),
-            _ => {}
-        }
-        if scenario == 2 {
-            let ServerMsg::Snapshot { view } = &mut wire.messages[1] else {
-                panic!("snapshot");
-            };
-            view.viewer = Some(Team::Dire);
-        }
-        let mode = if scenario == 0 {
-            TickMode::Realtime
-        } else {
-            TickMode::Lockstep
-        };
-        let error = play_idle_on(&mut wire, seated(mode), Some(1)).expect_err(expected);
+        corrupt(&mut wire);
+        let error = play_teacher(&mut wire, mode, Some(1)).expect_err(expected);
         assert_eq!(error.to_string(), expected);
-        assert!(wire.orders.is_empty());
-        assert!(wire.acknowledgements.is_empty());
+        assert!(wire.orders.is_empty(), "{expected}");
+        assert!(wire.acknowledgements.is_empty(), "{expected}");
     }
 }
 
@@ -115,13 +112,14 @@ fn seat_loop_rejects_an_unbounded_message_stream_without_snapshots() {
         4_097,
     ));
 
-    let error = play_idle_on(&mut wire, seated(TickMode::Lockstep), None)
+    let error = play_teacher(&mut wire, TickMode::Lockstep, None)
         .expect_err("message stream must make snapshot progress");
 
     assert_eq!(
         error.to_string(),
         "server sent too many messages without a snapshot"
     );
+    assert!(wire.orders.is_empty());
 }
 
 #[test]
@@ -135,10 +133,7 @@ fn all_controllers_require_complete_ticks_with_or_without_a_live_hero() {
     ] {
         for controller in 0..2 {
             let mut wire = mock_wire();
-            let ServerMsg::MatchStart { info } = &mut wire.messages[0] else {
-                panic!("match start");
-            };
-            info.map = map;
+            start_info(&mut wire).map = map;
             let mut view = world_view(1);
             if !hero_present {
                 let hero = view.players[0].unit.take().expect("hero");
@@ -149,7 +144,7 @@ fn all_controllers_require_complete_ticks_with_or_without_a_live_hero() {
             wire.messages.push_back(ServerMsg::Snapshot { view });
             let seat = seated(TickMode::Lockstep);
             let error = match controller {
-                0 => crate::play_script_on(&mut wire, seat, None, crate::ScriptKind::Teacher),
+                0 => play_script_on(&mut wire, seat, None, ScriptKind::Teacher),
                 _ => crate::play_neural_on(&mut wire, seat, None, &model),
             }
             .expect_err("tick completion is mandatory");
@@ -178,9 +173,7 @@ fn controllers_keep_cadence_and_teacher_learning_but_neural_continue_never_buys_
         for mode in [TickMode::Lockstep, TickMode::Realtime] {
             for controller in 0..2 {
                 let mut wire = recording_wire(messages.clone());
-                let ServerMsg::MatchStart { info } = &mut wire.messages[0] else {
-                    panic!("MatchStart first");
-                };
+                let info = start_info(&mut wire);
                 if map == MapId(1) {
                     assert_eq!(info.pregame_ticks, 900);
                 }
@@ -189,12 +182,7 @@ fn controllers_keep_cadence_and_teacher_learning_but_neural_continue_never_buys_
                     info.pregame_ticks = 0;
                 }
                 let outcome = match controller {
-                    0 => crate::play_script_on(
-                        &mut wire,
-                        seated(mode),
-                        Some(limit),
-                        crate::ScriptKind::Teacher,
-                    ),
+                    0 => play_teacher(&mut wire, mode, Some(limit)),
                     _ => crate::play_neural_on(
                         &mut wire,
                         seated(mode),
@@ -217,6 +205,21 @@ fn controllers_keep_cadence_and_teacher_learning_but_neural_continue_never_buys_
             }
         }
     }
+}
+
+fn play_teacher(
+    wire: &mut MockWire,
+    mode: TickMode,
+    limit: Option<u32>,
+) -> std::io::Result<crate::Outcome> {
+    play_script_on(wire, seated(mode), limit, ScriptKind::Teacher)
+}
+
+fn start_info(wire: &mut MockWire) -> &mut MatchInfo {
+    let Some(ServerMsg::MatchStart { info }) = wire.messages.front_mut() else {
+        panic!("MatchStart first");
+    };
+    info
 }
 
 fn mock_wire() -> MockWire {
@@ -420,7 +423,11 @@ fn tcp_cli_match(
     let (mut idle, idle_seat) =
         crate::Link::join_with_timeout(&address, "idle", Duration::from_secs(5)).expect("opponent");
     assert_eq!(idle_seat.slot, SlotId(0));
-    let opponent = thread::spawn(move || play_idle_on(&mut idle, idle_seat, Some(limit + 10)));
+    // A Continue-only neural seat runs the production play loop without ever ordering.
+    let opponent = thread::spawn(move || {
+        let idle_policy = biased_policy(ActionKind::Continue);
+        crate::play_neural_on(&mut idle, idle_seat, Some(limit + 10), &idle_policy)
+    });
     let limit_argument = limit.to_string();
     let mut arguments = vec![
         "drysua",

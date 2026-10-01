@@ -94,12 +94,9 @@ impl PpoPolicyChoice {
         self.policy
     }
 
+    #[cfg(feature = "builtin")]
     pub(crate) const fn log_probability(&self) -> f32 {
         self.log_probability
-    }
-
-    pub(crate) const fn entropy(&self) -> f32 {
-        self.entropy
     }
 
     pub(crate) const fn value(&self) -> f32 {

@@ -50,7 +50,7 @@ fn full_rollout_retains_every_bounded_sample_and_rejects_the_next() {
 }
 
 #[test]
-fn stale_behaviour_cannot_mutate_trainer_state() {
+fn behaviour_policy_from_the_future_is_rejected_without_mutating_trainer_state() {
     let model = PolicyModel::fresh(722).expect("model");
     let mut sample = transition(&model);
     sample.behaviour = 1;

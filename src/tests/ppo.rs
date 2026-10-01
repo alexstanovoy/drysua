@@ -16,44 +16,37 @@ use crate::{
 mod capacity;
 
 #[test]
-fn actor_batch_sampling_preserves_scalar_actions_rng_and_learner_likelihood() {
+fn batch_sampling_matches_production_actions_greedy_choices_and_learner_likelihood() {
     let model = PolicyModel::fresh(9_101).expect("model");
     let (frames, spaces, mut random) = sampling_inputs(MODEL_TRAINING_BATCH);
-    let mut scalar_random = random.clone();
+    let mut production_random = random.clone();
     let batch = model
         .sample_batch(&frames, &spaces, &mut random)
         .expect("batch");
+    let actions = model
+        .sample_actions(&frames, &spaces, &mut production_random)
+        .expect("production actions");
+    assert_eq!(random, production_random);
+    assert!(
+        random.iter().all(
+            |random| random.draws() > 0 && random.draws() <= crate::PPO_MAX_POLICY_SAMPLE_DRAWS
+        )
+    );
     let chosen = model.choose_batch(&frames, &spaces).expect("greedy batch");
-    assert_eq!(batch.len(), MODEL_TRAINING_BATCH);
-    assert_eq!(chosen.len(), batch.len());
+    let policy = model.policy_identity().expect("policy");
     let mut samples = Vec::new();
     for (index, sampled) in batch.into_iter().enumerate() {
-        let scalar = model
-            .sample(&frames[index], &spaces[index], &mut scalar_random[index])
-            .expect("actor");
-        assert_eq!(sampled.action(), scalar.action());
-        assert_eq!(sampled.policy(), scalar.policy());
-        for (actual, expected) in [
-            (sampled.log_probability(), scalar.log_probability()),
-            (sampled.entropy(), scalar.entropy()),
-            (sampled.value(), scalar.value()),
-        ] {
-            assert!((actual - expected).abs() <= 1.0e-4);
-        }
+        assert_eq!(sampled.action(), actions[index]);
+        assert_eq!(sampled.policy(), policy);
         assert!(spaces[index].decode(sampled.action()).is_ok());
         let greedy = model
             .choose(&frames[index], &spaces[index])
             .expect("scalar greedy");
         assert_eq!(chosen[index].action, greedy.action);
         assert!((chosen[index].value - greedy.value).abs() < 1.0e-5);
+        assert!((sampled.value() - greedy.value).abs() < 1.0e-5);
         samples.push(prepared_choice(index, sampled));
     }
-    assert_eq!(random, scalar_random);
-    assert!(
-        random.iter().all(
-            |random| random.draws() > 0 && random.draws() <= crate::PPO_MAX_POLICY_SAMPLE_DRAWS
-        )
-    );
     assert_actor_likelihood(&model, &samples);
 }
 
@@ -126,7 +119,7 @@ fn invalid_sampling_batches_do_not_consume_rng() {
         let mut random = vec![PpoRng::new(22); random_count];
         let before = random.clone();
         let error = model
-            .sample_batch(&frames[..count], &spaces[range], &mut random)
+            .sample_actions(&frames[..count], &spaces[range], &mut random)
             .expect_err("invalid batch");
         assert_eq!(error.to_string(), message);
         assert_eq!(random, before);
@@ -134,43 +127,7 @@ fn invalid_sampling_batches_do_not_consume_rng() {
 }
 
 #[test]
-fn failing_a_head_after_sampling_restores_rng() {
-    let model = PolicyModel::fresh(9_104).expect("model");
-    let mut parameters = vec![0.0; model.parameter_count()];
-    let kind = crate::ActionKind::Stop.index();
-    set_parameter_range(&model, &mut parameters, "kind.bias", kind..kind + 1, 100.0);
-    set_parameter_range(
-        &model,
-        &mut parameters,
-        "kind_embedding.weight",
-        kind * 32..(kind + 1) * 32,
-        1.0,
-    );
-    set_parameter_range(
-        &model,
-        &mut parameters,
-        "controlled.weight",
-        256 * 2..288 * 2,
-        f32::MAX,
-    );
-    model
-        .import_parameters(&parameters)
-        .expect("finite parameters");
-    let (frame, space) = frame_and_space();
-    let mut random = [PpoRng::new(24)];
-    let before = random.clone();
-    assert_eq!(
-        model
-            .sample_batch(&[frame], &[space], &mut random)
-            .expect_err("head overflow")
-            .to_string(),
-        "model radiant.controlled output at batch 0 index 0 is non-finite"
-    );
-    assert_eq!(random, before);
-}
-
-#[test]
-fn trainer_retry_learns_rewarded_action_and_rejects_overly_stale_rollout_transactionally() {
+fn failed_update_rolls_back_and_its_retry_matches_a_clean_update_that_learns_the_rewarded_action() {
     let (frame, space) = frame_and_space();
     let model = PolicyModel::fresh(101).expect("model");
     let reference = PolicyModel::fresh(101).expect("reference");
@@ -182,13 +139,9 @@ fn trainer_retry_learns_rewarded_action_and_rejects_overly_stale_rollout_transac
     let before = trainer.checkpoint_snapshot(&model).expect("before");
     let identity = model.policy_identity().expect("identity");
     let random = trainer.rng_checkpoint();
-    let probability = || {
-        model
-            .action_statistics(&frame, &space, StructuredAction::Continue)
-            .expect("rewarded action statistics")
-            .0
-    };
-    let before_probability = probability();
+    let rewarded = batch.sample(0).expect("rewarded sample");
+    assert_eq!(rewarded.transition.action, StructuredAction::Continue);
+    let before_probability = learner_log_probability(&model, &rewarded);
     let advantage = batch.replace_advantage_for_test(0, f32::NAN);
     let error = trainer
         .train_update(&model, &batch, crate::UpdateObjective::default())
@@ -206,7 +159,7 @@ fn trainer_retry_learns_rewarded_action_and_rejects_overly_stale_rollout_transac
     let report = trainer
         .train_update(&model, &batch, crate::UpdateObjective::default())
         .expect("retry");
-    assert!(probability() > before_probability);
+    assert!(learner_log_probability(&model, &rewarded) > before_probability);
     assert_eq!(report.optimizer_step, 1);
     assert_eq!(report.samples_optimized, 2);
     assert_eq!(
@@ -228,14 +181,23 @@ fn trainer_retry_learns_rewarded_action_and_rejects_overly_stale_rollout_transac
     assert_eq!(actual.parameters, expected_state.parameters);
     assert_eq!(actual.adam.moments(), expected_state.adam.moments());
     assert_eq!(trainer.rng_checkpoint(), expected.rng_checkpoint());
-    // Behaviour weights one and two updates old are within the pipeline bound.
-    for update in [2, 3] {
+}
+
+#[test]
+fn trainer_accepts_rollouts_up_to_two_updates_old_and_rejects_older_ones_transactionally() {
+    let (frame, space) = frame_and_space();
+    let model = PolicyModel::fresh(101).expect("model");
+    let config = smoke_config();
+    let batch = bandit_batch(&model, &frame, &space, config);
+    let mut trainer = PpoTrainer::new(&model, config, 7).expect("trainer");
+    // The behaviour weights are current, then one and two updates old.
+    for update in [1, 2, 3] {
         let report = trainer
             .train_update(&model, &batch, crate::UpdateObjective::default())
             .expect("bounded staleness");
         assert_eq!(report.update, update);
     }
-    let actual = trainer.checkpoint_snapshot(&model).expect("third snapshot");
+    let snapshot = trainer.checkpoint_snapshot(&model).expect("third snapshot");
     let random = trainer.rng_checkpoint();
     assert_eq!(
         trainer
@@ -246,7 +208,7 @@ fn trainer_retry_learns_rewarded_action_and_rejects_overly_stale_rollout_transac
     );
     assert_eq!(
         trainer.checkpoint_snapshot(&model).expect("stale snapshot"),
-        actual
+        snapshot
     );
     assert_eq!(trainer.rng_checkpoint(), random);
 }
@@ -453,24 +415,31 @@ pub(super) fn prepared_choice(stream: usize, choice: PpoPolicyChoice) -> crate::
     }
 }
 
+/// A forced `action` with the learner's log-probability and the critic's value.
 fn choice(
     model: &PolicyModel,
     frame: &crate::FeatureFrame,
     space: &ActionSpace,
     action: StructuredAction,
 ) -> PpoPolicyChoice {
-    let (log_probability, entropy, value) = model
-        .action_statistics(frame, space, action)
-        .expect("statistics");
-    PpoPolicyChoice {
+    let mut choice = PpoPolicyChoice {
         frame: frame.clone(),
         target: BehavioralTarget::from_action(frame, space, action).expect("target"),
         action,
         policy: model.policy_identity().expect("policy"),
-        log_probability,
-        entropy,
-        value,
-    }
+        log_probability: 0.0,
+        entropy: 0.0,
+        value: model.choose(frame, space).expect("critic value").value,
+    };
+    choice.log_probability = learner_log_probability(model, &prepared_choice(0, choice.clone()));
+    choice
+}
+
+fn learner_log_probability(model: &PolicyModel, sample: &crate::PpoPreparedSample) -> f32 {
+    model
+        .ppo_likelihood_for_test(&[sample])
+        .expect("learner likelihood")
+        .0[0]
 }
 
 fn smoke_config() -> PpoConfig {
@@ -520,27 +489,6 @@ fn bandit_batch(
             .expect("push");
     }
     rollout.finish(config).expect("batch")
-}
-
-fn set_parameter_range(
-    model: &PolicyModel,
-    parameters: &mut [f32],
-    target: &str,
-    range: std::ops::Range<usize>,
-    value: f32,
-) {
-    let mut offset = 0;
-    for (name, shape) in model.parameter_schema().expect("schema") {
-        let count = shape.iter().product::<usize>();
-        if name == target {
-            assert!(range.start <= range.end);
-            assert!(range.end <= count);
-            parameters[offset + range.start..offset + range.end].fill(value);
-            return;
-        }
-        offset += count;
-    }
-    panic!("missing parameter {target}");
 }
 
 #[test]

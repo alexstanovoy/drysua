@@ -184,12 +184,6 @@ pub enum EnvironmentSchedule {
     Adaptive(AdaptiveEnvironmentConfig),
 }
 
-impl Default for EnvironmentSchedule {
-    fn default() -> Self {
-        Self::Adaptive(AdaptiveEnvironmentConfig::default())
-    }
-}
-
 /// Update counts: per-generation base budget, run length, and the trailing zero-randomization
 /// phase.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

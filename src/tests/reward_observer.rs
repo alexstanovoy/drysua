@@ -6,56 +6,13 @@ use crate::reward_observer::{BoundedInput, Observer, consume, read_message};
 #[cfg(feature = "builtin")]
 #[test]
 fn native_arena_frames_close_observers_with_seat_relative_wins_losses_and_draws() {
-    use crate::{Arena, ArenaConfig, Map2RewardEnd};
-    use bota_proto::{DamageKind, ItemId, MapId, UnitKind};
+    use crate::Map2RewardEnd;
     for loser in [Some(Team::Radiant), Some(Team::Dire), None] {
-        let (mut arena, mut start) = Arena::new(ArenaConfig {
-            seats: 2,
-            map: MapId(2),
-            seed: 41,
-        })
-        .unwrap();
-        for tick in 2..=33 {
-            let requests = if tick == 33 {
-                [Some(crate::Request {
-                    seq: tick,
-                    unit: None,
-                    order: bota_proto::Order::Buy {
-                        item: ItemId(bota_server::game::ITEM_MANGO),
-                    },
-                }); 2]
-            } else {
-                [None; 2]
-            };
-            let step = arena.step(&requests).unwrap();
-            for (stream, messages) in start.messages.iter_mut().zip(step.messages) {
-                stream.extend(messages);
-            }
-        }
-        arena.configure_for_test(|world| {
-            let towers: Vec<_> = world
-                .entities
-                .iter()
-                .filter(|entity| {
-                    world.kind.get(*entity) == Some(&UnitKind::Tower)
-                        && world.tier.get(*entity).is_some_and(|tier| tier.0 == 1)
-                        && world.lane.get(*entity).is_some_and(|lane| lane.0 == 0)
-                        && loser.is_none_or(|team| world.team.get(*entity) == Some(&team))
-                })
-                .collect();
-            assert_eq!(towers.len(), if loser.is_some() { 1 } else { 2 });
-            for tower in towers {
-                world.push_hit(None, tower, 30_000, DamageKind::Pure);
-            }
-        });
-        let final_tick = arena.step(&[None; 2]).unwrap();
+        let streams = tower_ending_streams(loser);
         for (index, team) in [Team::Radiant, Team::Dire].into_iter().enumerate() {
             let mut wire = Vec::new();
             bota_proto::encode_frame(&welcome(index as u8), &mut wire).unwrap();
-            for message in start.messages[index]
-                .iter()
-                .chain(&final_tick.messages[index])
-            {
+            for message in &streams[index] {
                 bota_proto::encode_frame(message, &mut wire).unwrap();
             }
             let mut observer = Observer::new();
@@ -65,19 +22,70 @@ fn native_arena_frames_close_observers_with_seat_relative_wins_losses_and_draws(
                 Some(loser) if loser == team => (Map2RewardEnd::Loss, -1.0),
                 _ => (Map2RewardEnd::Win, 1.0),
             };
-            assert_eq!(observer.last_interval.end, Some(end));
-            assert_eq!(observer.last_interval.terminal, terminal);
+            let case = format!("loser {loser:?}, observer {team:?}");
+            assert_eq!(observer.last_interval.end, Some(end), "{case}");
+            assert_eq!(observer.last_interval.terminal, terminal, "{case}");
             assert!(
                 observer
                     .report(None)
-                    .contains("\"complete\":true,\"valid\":true")
+                    .contains("\"complete\":true,\"valid\":true"),
+                "{case}"
             );
             assert_eq!(
                 observer.observe(empty_events()).unwrap_err().to_string(),
-                "server message after MatchOver"
+                "server message after MatchOver",
+                "{case}"
             );
         }
     }
+}
+
+/// Both seats' complete native Map2 streams: 33 ticks with a mango purchase on the last, then
+/// a tick that destroys the tier-one lane-zero tower of `loser`, or both teams' for a draw.
+#[cfg(feature = "builtin")]
+fn tower_ending_streams(loser: Option<Team>) -> Vec<Vec<ServerMsg>> {
+    use crate::{Arena, ArenaConfig};
+    use bota_proto::{DamageKind, ItemId, MapId, UnitKind};
+    let (mut arena, mut start) = Arena::new(ArenaConfig {
+        seats: 2,
+        map: MapId(2),
+        seed: 41,
+    })
+    .unwrap();
+    for tick in 2..=33 {
+        let purchase = (tick == 33).then_some(crate::Request {
+            seq: tick,
+            unit: None,
+            order: bota_proto::Order::Buy {
+                item: ItemId(bota_server::game::ITEM_MANGO),
+            },
+        });
+        let step = arena.step(&[purchase; 2]).unwrap();
+        for (stream, messages) in start.messages.iter_mut().zip(step.messages) {
+            stream.extend(messages);
+        }
+    }
+    arena.configure_for_test(|world| {
+        let towers: Vec<_> = world
+            .entities
+            .iter()
+            .filter(|entity| {
+                world.kind.get(*entity) == Some(&UnitKind::Tower)
+                    && world.tier.get(*entity).is_some_and(|tier| tier.0 == 1)
+                    && world.lane.get(*entity).is_some_and(|lane| lane.0 == 0)
+                    && loser.is_none_or(|team| world.team.get(*entity) == Some(&team))
+            })
+            .collect();
+        assert_eq!(towers.len(), if loser.is_some() { 1 } else { 2 });
+        for tower in towers {
+            world.push_hit(None, tower, 30_000, DamageKind::Pure);
+        }
+    });
+    let final_tick = arena.step(&[None; 2]).unwrap();
+    for (stream, messages) in start.messages.iter_mut().zip(final_tick.messages) {
+        stream.extend(messages);
+    }
+    start.messages
 }
 
 #[test]

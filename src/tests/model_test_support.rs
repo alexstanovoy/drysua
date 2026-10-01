@@ -208,42 +208,6 @@ impl PolicyModel {
             .collect()
     }
 
-    /// Exact number of scalar F32 parameters.
-    pub const fn parameter_count(&self) -> usize {
-        MODEL_PARAMETER_COUNT
-    }
-
-    /// Evaluates one frame without mutating model state.
-    pub fn evaluate(&self, frame: &FeatureFrame) -> Result<PolicyOutput, ModelError> {
-        let mut outputs = self.evaluate_batch(std::slice::from_ref(frame))?;
-        outputs
-            .pop()
-            .ok_or(ModelError::InvalidModelState("single-frame output"))
-    }
-
-    /// Evaluates a bounded nonempty batch in input order.
-    pub fn evaluate_batch(&self, frames: &[FeatureFrame]) -> Result<Vec<PolicyOutput>, ModelError> {
-        validate_batch(frames)?;
-        let _guard = self.read_parameter_lock()?;
-        let mut output = Vec::with_capacity(frames.len());
-        for (chunk_index, chunk) in frames.chunks(MODEL_EVALUATION_MICROBATCH).enumerate() {
-            let offset = chunk_index * MODEL_EVALUATION_MICROBATCH;
-            output.extend(self.evaluate_chunk(chunk, offset)?);
-        }
-        Ok(output)
-    }
-
-    fn evaluate_chunk(
-        &self,
-        frames: &[FeatureFrame],
-        batch_offset: usize,
-    ) -> Result<Vec<PolicyOutput>, ModelError> {
-        let routing = ActorRouting::new(frames, self.tensor_device(), false)?;
-        let state = self.forward_frames(frames)?;
-        let base = self.base_logits(&state, &routing, batch_offset)?;
-        collect_outputs(base.value, base.kind, batch_offset)
-    }
-
     /// Samples one legal autoregressive action and records exact old-policy statistics.
     pub fn sample(
         &self,
@@ -284,46 +248,6 @@ impl PolicyModel {
             target,
             action,
             policy: self.policy_identity_locked(),
-            log_probability,
-            entropy,
-            value,
-        })
-    }
-
-    pub fn action_statistics(
-        &self,
-        frame: &FeatureFrame,
-        space: &ActionSpace,
-        action: StructuredAction,
-    ) -> Result<(f32, f32, f32), ModelError> {
-        if !frame.matches_action_space(space) {
-            return Err(ModelError::FrameActionSpaceMismatch);
-        }
-        let target = BehavioralTarget::from_action(frame, space, action)
-            .map_err(|error| ModelError::Backend(error.to_string()))?;
-        let _guard = self.read_parameter_lock()?;
-        let statistics = self.policy_path_statistics_locked(frame, &target)?;
-        Ok((
-            statistics.log_probability,
-            statistics.entropy,
-            statistics.value,
-        ))
-    }
-
-    fn policy_path_statistics_locked(
-        &self,
-        frame: &FeatureFrame,
-        target: &BehavioralTarget,
-    ) -> Result<PolicyPathStatistics, ModelError> {
-        let output = self.training_forward_locked(
-            std::slice::from_ref(frame),
-            std::slice::from_ref(&target.prefix()),
-        )?;
-        validate_training_tensors_finite(&output)?;
-        let value = output.value.flatten_all()?.to_vec1::<f32>()?[0];
-        let logits = BehavioralHostLogits::from_tensors(&output)?;
-        let (log_probability, entropy) = logits.statistics(0, target)?;
-        Ok(PolicyPathStatistics {
             log_probability,
             entropy,
             value,
@@ -390,22 +314,6 @@ impl PolicyModel {
     }
 }
 
-/// Public value and append-only action-kind logits for one frame.
-#[derive(Clone, Debug, PartialEq)]
-pub struct PolicyOutput {
-    /// Unbounded scalar state-value prediction.
-    pub value: f32,
-    /// Logits in append-only [`ActionKind`] order.
-    pub kind_logits: [f32; MODEL_KIND_HEAD],
-}
-
-impl PolicyOutput {
-    /// Whether the value and every action-kind logit are finite.
-    pub fn is_finite(&self) -> bool {
-        self.value.is_finite() && self.kind_logits.iter().all(|value| value.is_finite())
-    }
-}
-
 /// Autograd-preserving output holding one complete parameter read session.
 pub struct PolicyTensorOutput<'model> {
     model_identity: usize,
@@ -417,40 +325,10 @@ impl fmt::Debug for PolicyTensorOutput<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
             .debug_struct("PolicyTensorOutput")
-            .field("shapes", &self.shapes())
+            .field("value", &self.value().dims())
+            .field("kind", &self.kind().dims())
             .finish_non_exhaustive()
     }
-}
-
-/// Exact tensor dimensions returned by [`PolicyModel::training_forward`].
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PolicyTensorShapes {
-    /// State-value tensor dimensions.
-    pub value: Vec<usize>,
-    /// Action-kind tensor dimensions.
-    pub kind: Vec<usize>,
-    /// Controlled-unit tensor dimensions.
-    pub controlled: Vec<usize>,
-    /// Ability-slot tensor dimensions.
-    pub ability: Vec<usize>,
-    /// Item-slot tensor dimensions.
-    pub item: Vec<usize>,
-    /// Swap-destination tensor dimensions.
-    pub swap: Vec<usize>,
-    /// Learn-slot tensor dimensions.
-    pub learn: Vec<usize>,
-    /// Shop tensor dimensions.
-    pub shop: Vec<usize>,
-    /// Loot tensor dimensions.
-    pub loot: Vec<usize>,
-    /// Target-mode tensor dimensions.
-    pub target_mode: Vec<usize>,
-    /// Put-mode tensor dimensions.
-    pub put_mode: Vec<usize>,
-    /// Entity-pointer tensor dimensions.
-    pub entity_pointer: Vec<usize>,
-    /// Point-pointer tensor dimensions.
-    pub point_pointer: Vec<usize>,
 }
 
 impl PolicyTensorOutput<'_> {
@@ -519,30 +397,6 @@ impl PolicyTensorOutput<'_> {
         &self.tensors.point_pointer
     }
 
-    /// Returns every head shape without converting tensor values to host storage.
-    pub fn shapes(&self) -> PolicyTensorShapes {
-        PolicyTensorShapes {
-            value: self.value().dims().to_vec(),
-            kind: self.kind().dims().to_vec(),
-            controlled: self.controlled().dims().to_vec(),
-            ability: self.ability().dims().to_vec(),
-            item: self.item().dims().to_vec(),
-            swap: self.swap().dims().to_vec(),
-            learn: self.learn().dims().to_vec(),
-            shop: self.shop().dims().to_vec(),
-            loot: self.loot().dims().to_vec(),
-            target_mode: self.target_mode().dims().to_vec(),
-            put_mode: self.put_mode().dims().to_vec(),
-            entity_pointer: self.entity_pointer().dims().to_vec(),
-            point_pointer: self.point_pointer().dims().to_vec(),
-        }
-    }
-
-    /// Checks every tensor value while preserving the existing autograd graph.
-    pub fn validate_finite(&self) -> Result<(), ModelError> {
-        side_actors::validate_training(&self.tensors)
-    }
-
     /// Sums all heads into one scalar graph-connected probe loss.
     pub fn sum_all_heads(&self) -> Result<Tensor, ModelError> {
         sum_training_tensors(&self.tensors)
@@ -588,126 +442,6 @@ impl fmt::Debug for NamedPolicyGradient {
             .finish()
     }
 }
-
-struct PolicyPathStatistics {
-    log_probability: f32,
-    entropy: f32,
-    value: f32,
-}
-
-struct BehavioralHostLogits {
-    kind: Vec<Vec<f32>>,
-    controlled: Vec<Vec<f32>>,
-    ability: Vec<Vec<f32>>,
-    item: Vec<Vec<f32>>,
-    swap: Vec<Vec<f32>>,
-    learn: Vec<Vec<f32>>,
-    shop: Vec<Vec<f32>>,
-    loot: Vec<Vec<f32>>,
-    target_mode: Vec<Vec<f32>>,
-    put_mode: Vec<Vec<f32>>,
-    entity_pointer: Vec<Vec<f32>>,
-    point_pointer: Vec<Vec<f32>>,
-}
-
-impl BehavioralHostLogits {
-    fn from_tensors(output: &PolicyTensorTensors) -> Result<Self, ModelError> {
-        Ok(Self {
-            kind: output.kind.to_vec2()?,
-            controlled: output.controlled.to_vec2()?,
-            ability: output.ability.to_vec2()?,
-            item: output.item.to_vec2()?,
-            swap: output.swap.to_vec2()?,
-            learn: output.learn.to_vec2()?,
-            shop: output.shop.to_vec2()?,
-            loot: output.loot.to_vec2()?,
-            target_mode: output.target_mode.to_vec2()?,
-            put_mode: output.put_mode.to_vec2()?,
-            entity_pointer: output.entity_pointer.to_vec2()?,
-            point_pointer: output.point_pointer.to_vec2()?,
-        })
-    }
-
-    fn statistics(
-        &self,
-        index: usize,
-        target: &BehavioralTarget,
-    ) -> Result<(f32, f32), ModelError> {
-        macro_rules! add_head {
-            ($logp:ident, $entropy:ident, $values:ident, $field:ident) => {
-                let (head_logp, head_entropy) =
-                    host_head_statistics(self.row(&self.$values, index)?, &target.$field)?;
-                $logp += head_logp;
-                $entropy += head_entropy;
-            };
-        }
-        let (mut log_probability, mut entropy) =
-            host_head_statistics(self.row(&self.kind, index)?, &target.kind)?;
-        add_head!(log_probability, entropy, controlled, controlled);
-        add_head!(log_probability, entropy, ability, ability);
-        add_head!(log_probability, entropy, item, item);
-        add_head!(log_probability, entropy, swap, swap);
-        add_head!(log_probability, entropy, learn, learn);
-        add_head!(log_probability, entropy, shop, shop);
-        add_head!(log_probability, entropy, loot, loot);
-        add_head!(log_probability, entropy, target_mode, target_mode);
-        add_head!(log_probability, entropy, put_mode, put_mode);
-        add_head!(log_probability, entropy, entity_pointer, entity_pointer);
-        add_head!(log_probability, entropy, point_pointer, point_pointer);
-        if !log_probability.is_finite() || !entropy.is_finite() || entropy < 0.0 {
-            return Err(ModelError::InvalidModelState("policy path statistics"));
-        }
-        Ok((log_probability, entropy))
-    }
-
-    fn row<'a>(&self, values: &'a [Vec<f32>], index: usize) -> Result<&'a [f32], ModelError> {
-        values
-            .get(index)
-            .map(Vec::as_slice)
-            .ok_or(ModelError::InvalidModelState(
-                "behavioral output batch shape",
-            ))
-    }
-}
-
-fn collect_outputs(
-    values: Vec<f32>,
-    kinds: Vec<Vec<f32>>,
-    batch_offset: usize,
-) -> Result<Vec<PolicyOutput>, ModelError> {
-    if values.len() != kinds.len() {
-        return Err(ModelError::InvalidModelState("batch output shape"));
-    }
-    let mut output = Vec::with_capacity(values.len());
-    for (batch, (value, logits)) in values.into_iter().zip(kinds).enumerate() {
-        if !value.is_finite() {
-            return Err(ModelError::NonFiniteOutput {
-                field: "value",
-                batch: batch_offset + batch,
-                index: 0,
-            });
-        }
-        if let Some((index, _)) = logits
-            .iter()
-            .enumerate()
-            .find(|(_, value)| !value.is_finite())
-        {
-            return Err(ModelError::NonFiniteOutput {
-                field: "kind",
-                batch: batch_offset + batch,
-                index,
-            });
-        }
-        let kind_logits = logits
-            .try_into()
-            .map_err(|_| ModelError::InvalidModelState("kind head shape"))?;
-        output.push(PolicyOutput { value, kind_logits });
-    }
-    Ok(output)
-}
-
-/// Frames per host evaluation graph.
-pub(crate) const MODEL_EVALUATION_MICROBATCH: usize = 64;
 
 fn validate_training_batch(
     frames: &[FeatureFrame],

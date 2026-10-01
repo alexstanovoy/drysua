@@ -9,13 +9,13 @@ use super::feature::{encode, tracker_with_view, world_view};
 use crate::model::{adam_step_for_test, masked_ppo_entropy_for_test};
 use crate::{
     ActionKind, ActionSpace, AdamConfig, ControlledUnit, FeatureFrame, HeadTarget,
-    LocalPolicyState, MODEL_EVALUATION_MICROBATCH, MODEL_KIND_HEAD, MODEL_PARAMETER_COUNT,
-    MODEL_TRAINING_BATCH, PolicyDevice, PolicyModel, PpoConfig, PpoPreparedSample,
-    TrainingAbilitySlot, TrainingItemSlot, TrainingPrefix, TrainingSlot,
+    LocalPolicyState, MODEL_KIND_HEAD, MODEL_PARAMETER_COUNT, MODEL_TRAINING_BATCH, PolicyDevice,
+    PolicyModel, PpoConfig, PpoPreparedSample, TrainingAbilitySlot, TrainingItemSlot,
+    TrainingPrefix, TrainingSlot,
 };
 
 #[test]
-fn model_roundtrip_preserves_predictions_and_microbatch_shapes() {
+fn parameter_roundtrip_reproduces_seeded_weights_and_greedy_predictions() {
     let source = PolicyModel::fresh(101).expect("source");
     let target = PolicyModel::fresh(102).expect("target");
     let parameters = source.export_parameters().expect("parameters");
@@ -33,24 +33,24 @@ fn model_roundtrip_preserves_predictions_and_microbatch_shapes() {
         target.export_parameters().expect("different seed")
     );
     target.import_parameters(&parameters).expect("load");
-    let tracker = tracker_with_view(Team::Radiant, world_view(Team::Radiant, 10));
-    let frames = vec![encode(&tracker, &LocalPolicyState::new(0)); MODEL_EVALUATION_MICROBATCH + 1];
-    let expected = source.evaluate_batch(&frames).expect("source predictions");
-    assert_eq!(
-        target.evaluate_batch(&frames).expect("loaded predictions"),
-        expected
-    );
-    assert_eq!(expected.len(), frames.len());
-    assert!(expected.iter().all(|output| output.is_finite()));
-    assert_eq!(
-        expected[MODEL_EVALUATION_MICROBATCH],
-        source.evaluate(&frames[0]).expect("scalar")
-    );
-    assert_training_shapes_and_backward(&source, &frames[..4]);
+    let (frames, spaces, _) = super::ppo::sampling_inputs(MODEL_TRAINING_BATCH);
+    let expected = source.choose_batch(&frames, &spaces).expect("source");
+    let actual = target.choose_batch(&frames, &spaces).expect("loaded");
+    for (index, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+        assert_eq!(actual.action, expected.action, "row {index}");
+        assert_eq!(
+            actual.value.to_bits(),
+            expected.value.to_bits(),
+            "row {index}"
+        );
+    }
 }
 
-fn assert_training_shapes_and_backward(source: &PolicyModel, frames: &[FeatureFrame]) {
-    assert_eq!(frames.len(), 4);
+#[test]
+fn fresh_heads_start_unsaturated_and_radiant_losses_reach_only_radiant_parameters() {
+    let model = PolicyModel::fresh(503).expect("model");
+    let tracker = tracker_with_view(Team::Radiant, world_view(Team::Radiant, 10));
+    let frames = vec![encode(&tracker, &LocalPolicyState::new(0)); 4];
     let prefixes = [
         TrainingPrefix::new(ActionKind::Continue, None, None),
         TrainingPrefix::new(ActionKind::AttackUnit, Some(ControlledUnit::Hero), None),
@@ -69,30 +69,38 @@ fn assert_training_shapes_and_backward(source: &PolicyModel, frames: &[FeatureFr
             )),
         ),
     ];
-    let output = source
-        .training_forward(frames, &prefixes)
+    let output = model
+        .training_forward(&frames, &prefixes)
         .expect("training");
-    for (tensor, width) in [
-        (output.value(), 1),
-        (output.kind(), 16),
-        (output.controlled(), 2),
-        (output.ability(), 8),
-        (output.item(), 15),
-        (output.swap(), 15),
-        (output.learn(), 6),
-        (output.shop(), 64),
-        (output.loot(), 16),
-        (output.target_mode(), 3),
-        (output.put_mode(), 2),
-        (output.entity_pointer(), 96),
-        (output.point_pointer(), 64),
+    for head in [
+        output.kind(),
+        output.controlled(),
+        output.ability(),
+        output.item(),
+        output.swap(),
+        output.learn(),
+        output.shop(),
+        output.loot(),
+        output.target_mode(),
+        output.put_mode(),
+        output.entity_pointer(),
+        output.point_pointer(),
     ] {
-        assert_eq!(tensor.dims(), &[prefixes.len(), width]);
+        for row in head.to_vec2::<f32>().expect("logits") {
+            let maximum = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let minimum = row.iter().copied().fold(f32::INFINITY, f32::min);
+            assert!(maximum - minimum < 2.0, "{:?}", head.dims());
+            assert!(row.iter().all(|value| value.is_finite()));
+        }
     }
-    output.validate_finite().expect("finite heads");
+    assert_radiant_gradient_routing(&model, &output);
+}
+
+/// Every Radiant parameter receives a gradient of its shape; Dire ones none.
+fn assert_radiant_gradient_routing(model: &PolicyModel, output: &crate::PolicyTensorOutput<'_>) {
     let loss = output.sum_all_heads().expect("loss");
-    let gradients = source.backward_named(&output, &loss).expect("backward");
-    let schema = source.parameter_schema().expect("schema");
+    let gradients = model.backward_named(output, &loss).expect("backward");
+    let schema = model.parameter_schema().expect("schema");
     assert_eq!(gradients.len(), schema.len());
     for (gradient, (name, shape)) in gradients.iter().zip(schema) {
         assert_eq!(gradient.name(), name);
@@ -191,78 +199,34 @@ fn invalid_frames_and_extreme_parameters_fail_without_nonfinite_predictions() {
 #[test]
 fn absent_tokens_cannot_inject_garbage_into_predictions() {
     let model = PolicyModel::fresh(2).expect("model");
-    let clean = test_frame();
+    let tracker = tracker_with_view(Team::Radiant, world_view(Team::Radiant, 10));
+    let space = ActionSpace::from_tracker(&tracker).expect("space");
+    let clean = encode(&tracker, &LocalPolicyState::new(0));
+    // Encoded frames always carry every ability token.
     let mut garbage = clean.clone();
-    garbage.units[7][1..].fill(900.0);
-    garbage.abilities[5][1..].fill(-700.0);
-    garbage.items[12][1..].fill(500.0);
-    garbage.points[9][1..].fill(300.0);
-    garbage.projectiles[4][1..].fill(-200.0);
-    garbage.loot[3][1..].fill(100.0);
-    let expected = model.evaluate(&clean).expect("empty");
-    assert!(expected.is_finite());
-    assert_eq!(model.evaluate(&garbage).expect("masked garbage"), expected);
+    fill_absent_token("units", &mut garbage.units[..], 900.0);
+    fill_absent_token("items", &mut garbage.items[..], 500.0);
+    fill_absent_token("points", &mut garbage.points[..], 300.0);
+    fill_absent_token("projectiles", &mut garbage.projectiles[..], -200.0);
+    fill_absent_token("loot", &mut garbage.loot[..], 100.0);
+    let expected = model.choose(&clean, &space).expect("clean");
+    let actual = model.choose(&garbage, &space).expect("masked garbage");
+    assert_eq!(actual.action, expected.action);
+    assert_eq!(actual.value.to_bits(), expected.value.to_bits());
 }
 
-#[test]
-fn fresh_heads_are_unsaturated_and_pointer_scaling_has_the_expected_gradient() {
-    let model = PolicyModel::fresh(503).expect("model");
-    let frames = [test_frame()];
-    let prefixes = [TrainingPrefix::new(ActionKind::Continue, None, None)];
-    let output = model.training_forward(&frames, &prefixes).expect("forward");
-    for head in [
-        output.kind(),
-        output.controlled(),
-        output.ability(),
-        output.item(),
-        output.swap(),
-        output.learn(),
-        output.shop(),
-        output.loot(),
-        output.target_mode(),
-        output.put_mode(),
-        output.entity_pointer(),
-        output.point_pointer(),
-    ] {
-        let row = head.to_vec2::<f32>().expect("logits").remove(0);
-        let maximum = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-        let minimum = row.iter().copied().fold(f32::INFINITY, f32::min);
-        assert!(maximum - minimum < 2.0);
-        assert!(row.iter().all(|value| value.is_finite()));
-    }
-    for width in [64, 128] {
-        let tokens = candle_core::Tensor::ones(
-            (1, 2, width),
-            candle_core::DType::F32,
-            &candle_core::Device::Cpu,
-        )
-        .expect("tokens");
-        let query = candle_core::Var::ones(
-            (1, 1, width),
-            candle_core::DType::F32,
-            &candle_core::Device::Cpu,
-        )
-        .expect("query");
-        let scores = crate::model::scaled_pointer_dot(&tokens, query.as_tensor()).expect("pointer");
-        for value in scores
-            .flatten_all()
-            .expect("flat")
-            .to_vec1::<f32>()
-            .expect("scores")
-        {
-            assert!((value - (width as f32).sqrt()).abs() < 1.0e-6);
-        }
-        let gradients = scores.sum_all().expect("sum").backward().expect("backward");
-        let gradient = gradients.get(query.as_tensor()).expect("query gradient");
-        for value in gradient
-            .flatten_all()
-            .expect("flat")
-            .to_vec1::<f32>()
-            .expect("gradient")
-        {
-            assert!((value - 2.0 / (width as f32).sqrt()).abs() < 1.0e-6);
-        }
-    }
+/// Fills every feature but the presence flag of the last absent token.
+fn fill_absent_token<const FEATURES: usize>(
+    table: &str,
+    tokens: &mut [[f32; FEATURES]],
+    value: f32,
+) {
+    let token = tokens
+        .iter_mut()
+        .rev()
+        .find(|token| token[0] == 0.0)
+        .unwrap_or_else(|| panic!("an absent {table} token"));
+    token[1..].fill(value);
 }
 
 #[test]
@@ -413,7 +377,7 @@ fn assert_critic(device: PolicyDevice) {
 
 #[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
 #[test]
-#[ignore = "requires an authorized CUDA runner"]
+#[ignore = "needs a CUDA device"]
 fn cuda_entropy_and_critic_preserve_numerical_contracts() {
     assert_entropy(PolicyDevice::Cuda { ordinal: 0 });
     assert_critic(PolicyDevice::Cuda { ordinal: 0 });

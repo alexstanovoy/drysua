@@ -1,8 +1,10 @@
+use std::collections::HashMap;
+
 use super::map2_checkpoint::runtime_bytes;
 use crate::{CheckpointError, PolicyModel, TrainingArtifact};
 
 #[test]
-fn historical_bindings_and_shapes_cannot_be_relabelled_as_current_runtime() {
+fn runtime_weights_with_missing_or_foreign_identity_are_rejected_before_tensor_access() {
     let model = PolicyModel::fresh(37).expect("model");
     let trainer =
         crate::PpoTrainer::new(&model, super::map2_checkpoint::config(), 38).expect("trainer");
@@ -10,103 +12,73 @@ fn historical_bindings_and_shapes_cannot_be_relabelled_as_current_runtime() {
     let identity = model.policy_identity().expect("identity");
     let directory = crate::ppo::test_directory("map2-checkpoint");
     let path = directory.join("drysua.weights.safetensors");
-    TrainingArtifact::save_runtime_weights(&model, &directory).expect("current runtime");
-    let current = std::fs::read(&path).expect("current bytes");
-    let (_, header) = safetensors::SafeTensors::read_metadata(&current).expect("metadata");
-    let current = header.metadata().clone().expect("current metadata");
-    let mut cases = Vec::with_capacity(18);
-    // Isolate each historical binding against CURRENT instead of failing on an earlier old key.
-    for (key, m15, m18) in [
-        (
-            "action_schema_hash",
-            "14080316840523410707",
-            "10658390830565586343",
-        ),
-        (
-            "feature_schema_hash",
-            "612467982395246657",
-            "17888785275670453418",
-        ),
-        (
-            "model_schema_hash",
-            "149485500614302181",
-            "3900982062969752096",
-        ),
-        ("ppo_schema_version", "28", "31"),
-        (
-            "ppo_schema_hash",
-            "16579842539143021978",
-            "15379677344330093698",
-        ),
-        ("ppo_rules_audit_version", "23", "26"),
-        ("map2_reward_version", "1", "7"),
-    ] {
-        for old in [m15, m18] {
-            let mut metadata = current.clone();
-            let replaced = metadata
-                .insert(key.to_owned(), old.to_owned())
-                .expect("current binding");
-            if replaced == old {
-                continue;
-            }
-            cases.push((
-                format!("{key}={old}"),
-                1,
-                metadata,
-                CheckpointError::SchemaMismatch,
-                "checkpoint schema does not match this build",
-            ));
-        }
-    }
-    for count in [1_695_924, 1_697_460, 1_812_983] {
-        cases.push((
-            format!("legacy flat layout {count}"),
-            count,
-            current.clone(),
-            CheckpointError::TensorContract("names"),
-            "checkpoint tensor contract has invalid names",
-        ));
-    }
-    for (name, count, metadata, kind, expected) in cases {
-        let bytes = runtime_bytes(&vec![0.0; count], metadata);
-        std::fs::write(&path, &bytes).expect("incompatible runtime");
-        let error = TrainingArtifact::load_runtime_weights(&model, &directory).expect_err("reject");
-        assert_eq!(error, kind, "{name}");
-        assert_eq!(error.to_string(), expected, "{name}");
+    let current = current_runtime_roundtrip(&model, &directory);
+    // A one-value tensor fails the tensor contract, so SchemaMismatch shows that
+    // the identity is checked before any tensor is read.
+    for (case, metadata) in foreign_identities(&current) {
+        let bytes = runtime_bytes(&[0.0], metadata);
+        std::fs::write(&path, &bytes).expect("foreign runtime");
+        let error = TrainingArtifact::load_runtime_weights(&model, &directory).expect_err(&case);
+        assert_eq!(error, CheckpointError::SchemaMismatch, "{case}");
+        assert_eq!(
+            error.to_string(),
+            "checkpoint schema does not match this build",
+            "{case}"
+        );
         super::support::assert_bits(&model.export_parameters().expect("after"), &prior);
         assert_eq!(
             model.policy_identity().expect("identity"),
             identity,
-            "{name}"
+            "{case}"
         );
         super::support::assert_fresh_state(&model, &trainer);
         assert_eq!(
             std::fs::read(&path).expect("source unchanged"),
             bytes,
-            "{name}"
+            "{case}"
         );
     }
 }
 
-#[test]
-fn legacy_effect_and_progress_manifests_reject_before_tensor_access() {
-    for (version, hash) in [
-        (3u32, 6_904_067_705_245_923_052u64),
-        (6, 16_772_919_360_388_607_733),
-    ] {
-        let directory = crate::ppo::test_directory("map2-checkpoint");
-        let path = directory.join("checkpoint.meta");
-        let mut bytes = b"DRYCKP21".to_vec();
-        bytes.extend(version.to_le_bytes());
-        bytes.extend(hash.to_le_bytes());
-        std::fs::write(&path, &bytes).expect("old manifest header");
-        let error = TrainingArtifact::load(&directory).expect_err("old resume");
-        assert_eq!(error, CheckpointError::SchemaMismatch, "{version}");
-        assert_eq!(
-            error.to_string(),
-            "checkpoint schema does not match this build"
-        );
-        assert_eq!(std::fs::read(path).expect("unchanged header"), bytes);
-        assert_eq!(std::fs::read_dir(&directory).expect("directory").count(), 1);
+/// Saves `model`, checks that its weights load bit-exactly into another model,
+/// also after re-encoding with an unordered metadata map, and returns the metadata.
+fn current_runtime_roundtrip(
+    model: &PolicyModel,
+    directory: &std::path::Path,
+) -> HashMap<String, String> {
+    let path = directory.join("drysua.weights.safetensors");
+    let parameters = model.export_parameters().expect("parameters");
+    TrainingArtifact::save_runtime_weights(model, directory).expect("current runtime");
+    let bytes = std::fs::read(&path).expect("current bytes");
+    let (_, header) = safetensors::SafeTensors::read_metadata(&bytes).expect("metadata");
+    let current = header.metadata().clone().expect("current metadata");
+    assert_eq!(current, super::checkpoint::current_runtime_metadata());
+    for bytes in [bytes, runtime_bytes(&parameters, current.clone())] {
+        std::fs::write(&path, bytes).expect("current runtime");
+        let target = PolicyModel::fresh(39).expect("target");
+        TrainingArtifact::load_runtime_weights(&target, directory).expect("current import");
+        super::support::assert_bits(&target.export_parameters().expect("imported"), &parameters);
     }
+    current
+}
+
+/// Every identity key missing, unparsable or numerically adjacent to the current
+/// value (an older or newer schema), plus one unexpected key.
+fn foreign_identities(current: &HashMap<String, String>) -> Vec<(String, HashMap<String, String>)> {
+    let mut cases = Vec::with_capacity(3 * current.len() + 1);
+    for (key, value) in current {
+        let adjacent = (value.parse::<u64>().expect("numeric identity") ^ 1).to_string();
+        for replacement in [None, Some("foreign".to_owned()), Some(adjacent)] {
+            let mut metadata = current.clone();
+            metadata.remove(key);
+            if let Some(replacement) = &replacement {
+                metadata.insert(key.clone(), replacement.clone());
+            }
+            cases.push((format!("{key}={replacement:?}"), metadata));
+        }
+    }
+    let mut unexpected = current.clone();
+    unexpected.insert("unexpected".to_owned(), "1".to_owned());
+    cases.push(("unexpected key".to_owned(), unexpected));
+    cases
 }

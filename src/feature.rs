@@ -834,7 +834,7 @@ impl RaggedFeatureArena {
     /// Every row vector grows fallibly within its row cap.
     pub(crate) fn new(sample_capacity: usize) -> Result<Self, &'static str> {
         if !(1..=crate::PPO_MAX_SAMPLES).contains(&sample_capacity) {
-            return Err("ragged feature sample capacity is outside 1..=46520");
+            return Err("ragged feature sample capacity is outside 1..=33280");
         }
         Ok(Self {
             sample_capacity,

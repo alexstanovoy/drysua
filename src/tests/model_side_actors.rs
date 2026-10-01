@@ -55,13 +55,9 @@ fn side_validation_accepts_signed_zero_and_prioritizes_nonfinite_frames() {
         frame.global[4] = radiant;
         frame.global[5] = dire;
         take_encoder_forwards_for_test();
-        let evaluation = model
-            .evaluate(&frame)
-            .expect_err("value-only API requires a side");
         let error = model
             .training_forward(&[frame], &prefix)
             .expect_err("invalid side");
-        assert_eq!(evaluation, error);
         assert_eq!(
             error,
             ModelError::InvalidSideOneHot {
@@ -106,38 +102,8 @@ fn mixed_actor_gradients_match_full_batch_masked_heads_and_pointer_references() 
 }
 
 #[test]
-fn training_rejects_unselected_query_overflow_before_backward() {
-    assert_query_overflow(PolicyDevice::Cpu);
-}
-
-#[test]
-fn evaluation_reports_global_row_for_raw_head_overflow_in_second_microbatch() {
-    assert_later_head_overflow(PolicyDevice::Cpu);
-}
-
-#[test]
-fn training_rejects_overflow_in_unselected_dire_kind_before_backward() {
-    let model = PolicyModel::fresh(9001).expect("model");
-    edit(&model, |name, values| match name {
-        "trunk.2.weight" => values.fill(0.0),
-        "trunk.2.bias" => values.fill(2.0),
-        "dire.kind.weight" | "dire.kind.bias" => values.fill(f32::MAX),
-        _ => {}
-    });
-    let error = model
-        .training_forward(
-            &[side_frame(false)],
-            &[TrainingPrefix::new(ActionKind::Continue, None, None)],
-        )
-        .expect_err("raw Dire overflow");
-    assert_eq!(
-        error,
-        ModelError::NonFiniteOutput {
-            field: "dire.kind",
-            batch: 0,
-            index: 0
-        }
-    );
+fn training_rejects_overflow_in_unselected_dire_heads_before_backward() {
+    assert_unselected_head_overflow(PolicyDevice::Cpu);
 }
 
 #[cfg(feature = "builtin")]
@@ -154,8 +120,8 @@ fn inference_skips_unused_item_family_but_rejects_traversed_controlled_overflow(
 
 #[cfg(feature = "builtin")]
 #[test]
-fn scalar_sampling_rejects_nonfinite_shared_value_before_consuming_rng() {
-    assert_scalar_value_rejection(PolicyDevice::Cpu);
+fn sampling_rejects_nonfinite_shared_value_before_consuming_rng() {
+    assert_value_rejection(PolicyDevice::Cpu);
 }
 
 #[cfg(feature = "builtin")]
@@ -170,16 +136,15 @@ fn mixed_side_ppo_accepts_then_restores_both_head_moments_on_rejection_and_error
     any(target_os = "linux", target_os = "windows")
 ))]
 #[test]
-#[ignore = "requires the owner's bounded CUDA runner"]
+#[ignore = "needs a CUDA device"]
 fn cuda_side_actors_preserve_routing_gradients_and_ppo_rollback() {
     let device = PolicyDevice::Cuda { ordinal: 0 };
     assert_gradients(device);
     assert_mixed_gradients(device);
-    assert_query_overflow(device);
-    assert_later_head_overflow(device);
+    assert_unselected_head_overflow(device);
     assert_routing(device);
     assert_unused_family_skipping(device);
-    assert_scalar_value_rejection(device);
+    assert_value_rejection(device);
     assert_ppo_rollback(device);
 }
 
@@ -467,52 +432,32 @@ fn assert_mixed_gradient_activity(named: &[NamedPolicyGradient], head: &str, slo
     );
 }
 
-fn assert_query_overflow(device: PolicyDevice) {
-    let model = PolicyModel::fresh_on(9001, device).expect("model");
-    edit(&model, |name, values| match name {
-        "trunk.2.weight" => values.fill(0.0),
-        "trunk.2.bias" => values.fill(2.0),
-        "dire.entity_query.weight" | "dire.entity_query.bias" => values.fill(f32::MAX),
-        _ => {}
-    });
-    let error = model
-        .training_forward(
-            &[side_frame(false)],
-            &[TrainingPrefix::new(ActionKind::Continue, None, None)],
-        )
-        .expect_err("unselected query overflow");
-    assert_eq!(
-        error,
-        ModelError::NonFiniteOutput {
-            field: "dire.entity_query",
-            batch: 0,
-            index: 0,
-        }
-    );
-}
-
-fn assert_later_head_overflow(device: PolicyDevice) {
-    let model = PolicyModel::fresh_on(9001, device).expect("model");
-    edit(&model, |name, values| {
-        values.fill(0.0);
-        match name {
-            "trunk.0.weight" | "trunk.1.weight" | "trunk.2.weight" => values[0] = 1.0,
-            "kind.weight" => values[0] = f32::MAX,
+fn assert_unselected_head_overflow(device: PolicyDevice) {
+    for head in ["dire.kind", "dire.entity_query"] {
+        let model = PolicyModel::fresh_on(9001, device).expect("model");
+        let (weight, bias) = (format!("{head}.weight"), format!("{head}.bias"));
+        edit(&model, |name, values| match name {
+            "trunk.2.weight" => values.fill(0.0),
+            "trunk.2.bias" => values.fill(2.0),
+            _ if name == weight || name == bias => values.fill(f32::MAX),
             _ => {}
-        }
-    });
-    let mut frames = vec![side_frame(false); 67];
-    frames[64].global[0] = 2.0;
-    assert_eq!(
-        model
-            .evaluate_batch(&frames)
-            .expect_err("second microbatch raw head"),
-        ModelError::NonFiniteOutput {
-            field: "radiant.kind",
-            batch: 64,
-            index: 0
-        }
-    );
+        });
+        let error = model
+            .training_forward(
+                &[side_frame(false)],
+                &[TrainingPrefix::new(ActionKind::Continue, None, None)],
+            )
+            .expect_err(head);
+        assert_eq!(
+            error,
+            ModelError::NonFiniteOutput {
+                field: head,
+                batch: 0,
+                index: 0,
+            },
+            "{head}"
+        );
+    }
 }
 
 #[cfg(feature = "builtin")]
@@ -624,14 +569,7 @@ fn assert_routing(device: PolicyDevice) {
             greedy[index].value.to_bits(),
             selected[index].value.to_bits()
         );
-        assert_single(
-            &model,
-            &frames[index],
-            &spaces[index],
-            &selected[index],
-            initial[index].clone(),
-            &random[index],
-        );
+        assert_single(&model, &frames[index], &spaces[index], &selected[index]);
     }
     let mut malformed = frames;
     malformed[1].global[4] = 0.0;
@@ -692,7 +630,7 @@ fn assert_unused_family_skipping(device: PolicyDevice) {
 }
 
 #[cfg(feature = "builtin")]
-fn assert_scalar_value_rejection(device: PolicyDevice) {
+fn assert_value_rejection(device: PolicyDevice) {
     let model = routing_model(device);
     let (frames, spaces) = native_inputs();
     edit(&model, |name, values| match name {
@@ -701,11 +639,11 @@ fn assert_scalar_value_rejection(device: PolicyDevice) {
         "value.1.weight" => values.fill(f32::MAX),
         _ => {}
     });
-    let mut random = PpoRng::new(19);
+    let mut random = [PpoRng::new(19)];
     let before = random.clone();
     let error = model
-        .sample(&frames[0], &spaces[0], &mut random)
-        .expect_err("scalar value must be finite");
+        .sample_actions(&frames[..1], &spaces[..1], &mut random)
+        .expect_err("value must be finite");
     assert_eq!(
         error.to_string(),
         "model value output at batch 0 index 0 is non-finite"
@@ -713,30 +651,34 @@ fn assert_scalar_value_rejection(device: PolicyDevice) {
     assert_eq!(random, before);
 }
 
+/// The scalar greedy path and the learner agree with one row of a mixed-side batch.
 #[cfg(feature = "builtin")]
 fn assert_single(
     model: &PolicyModel,
     frame: &FeatureFrame,
     space: &ActionSpace,
     expected: &crate::PpoPolicyChoice,
-    mut random: PpoRng,
-    expected_random: &PpoRng,
 ) {
-    let single = model.sample(frame, space, &mut random).expect("single");
-    assert_eq!(single.action(), expected.action());
-    assert_eq!(&random, expected_random);
     let greedy = model.choose(frame, space).expect("single greedy");
-    assert_eq!(greedy.action, single.action());
-    let statistics = model
-        .action_statistics(frame, space, single.action())
-        .expect("statistics");
+    assert_eq!(greedy.action, expected.action());
+    let outcome = crate::PpoOutcome {
+        stream: 0,
+        decision: 0,
+        ticks: 3,
+        next_value: 0.0,
+        reward: 0.0,
+        terminal: true,
+    };
+    let sample = PpoPreparedSample {
+        transition: expected.clone().finish(0, outcome).expect("transition"),
+        advantage: 0.0,
+        return_value: 0.0,
+    };
+    let (learner, _) = model
+        .ppo_likelihood_for_test(&[&sample])
+        .expect("learner likelihood");
     for (actual, expected) in [
-        (single.log_probability, expected.log_probability),
-        (single.value, expected.value),
-        (single.entropy, expected.entropy),
-        (statistics.0, expected.log_probability),
-        (statistics.1, expected.entropy),
-        (statistics.2, expected.value),
+        (learner[0], expected.log_probability),
         (greedy.value, expected.value),
     ] {
         assert!(
@@ -803,67 +745,12 @@ fn assert_ppo_rollback(device: PolicyDevice) {
     let (model, config) = ppo_model(device);
     let mut adam = model.claim_optimizer(config.adam()).expect("Adam");
     let mut samples = ppo_samples();
-    for scenario in 0..3 {
-        let (probabilities, _) = model
-            .ppo_likelihood_for_test(&samples.iter().collect::<Vec<_>>())
-            .expect("same two-row old probabilities");
-        for (sample, probability) in samples.iter_mut().zip(probabilities) {
-            sample.transition.old_log_probability = probability;
-        }
-        let before = model.coherent_snapshot(&adam).expect("before candidate");
-        let config = PpoConfig {
-            target_kl: if scenario == 1 {
-                1.0e-12
-            } else {
-                config.target_kl
-            },
-            ..config
-        };
-        let result = model.ppo_update_with_microbatch(
-            &samples.iter().collect::<Vec<_>>(),
-            &mut adam,
-            config,
-            2,
-            PpoTestFaults {
-                candidate_evaluation: scenario == 2,
-                rollback_import: false,
-            },
-        );
-        if scenario == 2 {
-            assert_eq!(
-                result.expect_err("candidate failure").to_string(),
-                "model tensor operation failed: injected PPO candidate evaluation failure after 2 rows"
-            );
-        } else {
-            let report = result.expect("candidate decision");
-            assert_eq!(report.applied, scenario == 0);
-            if scenario == 1 {
-                assert!(report.approximate_kl > f64::from(config.target_kl));
-            }
-        }
-        let after = model.coherent_snapshot(&adam).expect("after candidate");
-        assert_eq!(after.adam.step, 1);
-        let (after_first, after_second) = after.adam.moments().expect("after moments");
-        for moments in [&after_first, &after_second] {
-            assert!(
-                moments[1_777_793..1_781_905]
-                    .iter()
-                    .any(|value| *value != 0.0)
-            );
-            assert!(
-                moments[1_891_700..1_895_812]
-                    .iter()
-                    .any(|value| *value != 0.0)
-            );
-        }
-        if scenario != 0 {
-            assert_bits(&after.parameters, &before.parameters);
-            let (before_first, before_second) = before.adam.moments().expect("before moments");
-            assert_bits(&after_first, &before_first);
-            assert_bits(&after_second, &before_second);
-            assert_eq!(after.adam.binding, before.adam.binding);
-            assert_eq!(after.adam.config, before.adam.config);
-        }
+    for candidate in [
+        Candidate::Accepted,
+        Candidate::KlRejected,
+        Candidate::Failed,
+    ] {
+        assert_candidate(&model, &mut adam, &mut samples, config, candidate);
     }
     // Early stopping keeps the step the post-step guard rejected above: only
     // the KL before the step (from the gradient pass) is held to the target.
@@ -880,4 +767,98 @@ fn assert_ppo_rollback(device: PolicyDevice) {
     let after = model.coherent_snapshot(&adam).expect("after early stop");
     assert_eq!(after.adam.step, 2);
     assert_ne!(after.parameters, before.parameters);
+}
+
+#[cfg(feature = "builtin")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Candidate {
+    Accepted,
+    KlRejected,
+    Failed,
+}
+
+/// Runs one two-row candidate update after the first accepted one; only an
+/// accepted candidate may change parameters or Adam state.
+#[cfg(feature = "builtin")]
+fn assert_candidate(
+    model: &PolicyModel,
+    adam: &mut crate::AdamState,
+    samples: &mut [PpoPreparedSample],
+    config: PpoConfig,
+    candidate: Candidate,
+) {
+    let (probabilities, _) = model
+        .ppo_likelihood_for_test(&samples.iter().collect::<Vec<_>>())
+        .expect("same two-row old probabilities");
+    for (sample, probability) in samples.iter_mut().zip(probabilities) {
+        sample.transition.old_log_probability = probability;
+    }
+    let before = model.coherent_snapshot(adam).expect("before candidate");
+    let config = PpoConfig {
+        target_kl: if candidate == Candidate::KlRejected {
+            1.0e-12
+        } else {
+            config.target_kl
+        },
+        ..config
+    };
+    let result = model.ppo_update_with_microbatch(
+        &samples.iter().collect::<Vec<_>>(),
+        adam,
+        config,
+        2,
+        PpoTestFaults {
+            candidate_evaluation: candidate == Candidate::Failed,
+            rollback_import: false,
+        },
+    );
+    if candidate == Candidate::Failed {
+        assert_eq!(
+            result.expect_err("candidate failure").to_string(),
+            "model tensor operation failed: injected PPO candidate evaluation failure after 2 rows"
+        );
+    } else {
+        let report = result.expect("candidate decision");
+        assert_eq!(report.applied, candidate == Candidate::Accepted);
+        assert!(
+            candidate == Candidate::Accepted || report.approximate_kl > f64::from(config.target_kl)
+        );
+    }
+    let after = model.coherent_snapshot(adam).expect("after candidate");
+    assert_eq!(after.adam.step, 1, "{candidate:?}");
+    assert_both_kind_heads_have_moments(model, &after.adam);
+    if candidate != Candidate::Accepted {
+        assert_bits(&after.parameters, &before.parameters);
+        let (before_first, before_second) = before.adam.moments().expect("before moments");
+        let (after_first, after_second) = after.adam.moments().expect("after moments");
+        assert_bits(&after_first, &before_first);
+        assert_bits(&after_second, &before_second);
+        assert_eq!(after.adam.binding, before.adam.binding);
+        assert_eq!(after.adam.config, before.adam.config);
+    }
+}
+
+#[cfg(feature = "builtin")]
+fn assert_both_kind_heads_have_moments(model: &PolicyModel, adam: &crate::AdamState) {
+    let (first, second) = adam.moments().expect("moments");
+    for head in ["kind", "dire.kind"] {
+        let mut offset = 0;
+        let mut range = None;
+        for (name, shape) in model.parameter_schema().expect("schema") {
+            let end = offset + shape.iter().product::<usize>();
+            if name == format!("{head}.weight") {
+                range = Some(offset..end);
+            } else if name == format!("{head}.bias") {
+                range = range.map(|range: std::ops::Range<usize>| range.start..end);
+            }
+            offset = end;
+        }
+        let range = range.expect("kind head parameters");
+        for moments in [&first, &second] {
+            assert!(
+                moments[range.clone()].iter().any(|value| *value != 0.0),
+                "{head}"
+            );
+        }
+    }
 }

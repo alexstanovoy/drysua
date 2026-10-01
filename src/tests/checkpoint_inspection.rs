@@ -70,7 +70,12 @@ mod files {
         assert_eq!(report["runtime_matches_model"], true);
         assert_inventory(&fixture, &report);
         assert_eq!(report["files"].as_array().unwrap().len(), 3);
-        for name in [CHECKPOINT_META_FILE, RUNTIME_TENSOR_FILE] {
+        let payload = tensor_generation_path(Path::new(""), artifact.tensor_hash);
+        for name in [
+            CHECKPOINT_META_FILE,
+            RUNTIME_TENSOR_FILE,
+            payload.to_str().unwrap(),
+        ] {
             assert!(listed(&report, name), "matched inventory contains {name}");
         }
     }
@@ -99,80 +104,91 @@ mod files {
     }
 
     #[test]
-    fn malformed_runtime_is_an_error_not_a_lagging_export() {
-        let mut artifact = fixture_artifact("other-command", 0);
-        let fixture = Fixture::new(&mut artifact);
-        let mut schema = current_parameter_schema().unwrap();
-        schema[0].1.reverse();
-        fs::write(
-            fixture.0.join(RUNTIME_TENSOR_FILE),
-            runtime::serialize(&schema, &artifact.parameters).unwrap(),
-        )
-        .unwrap();
-        assert_eq!(
-            inspect(&fixture).expect_err("wrong runtime shape"),
-            CheckpointError::TensorContract("dtype or shape")
-        );
+    fn unsafe_corrupt_or_foreign_checkpoint_files_are_rejected_without_mutation() {
+        for (case, damage, expected) in corrupt_file_cases().into_iter().chain(unsafe_file_cases())
+        {
+            let mut artifact = fixture_artifact("other-command", 0);
+            let fixture = Fixture::new(&mut artifact);
+            damage(&fixture.0, &artifact);
+            assert_eq!(inspect(&fixture).expect_err(case), expected, "{case}");
+        }
     }
 
-    #[test]
-    fn immutable_payload_is_listed_and_checksummed() {
-        let mut artifact = fixture_artifact("other-command", 0);
-        let fixture = Fixture::new(&mut artifact);
-        let report = inspect(&fixture).expect("named tensor");
-        let name = tensor_generation_path(&fixture.0, artifact.tensor_hash);
-        assert!(listed(&report, name.file_name().unwrap().to_str().unwrap()));
-        assert_inventory(&fixture, &report);
-        let mut corrupt = fs::read(&name).unwrap();
-        *corrupt.last_mut().unwrap() ^= 1;
-        fs::write(name, corrupt).unwrap();
-        assert_eq!(
-            inspect(&fixture).expect_err("named checksum corruption"),
-            CheckpointError::TensorHashMismatch
-        );
+    type DamageCase = (&'static str, fn(&Path, &TrainingArtifact), CheckpointError);
+
+    fn corrupt_file_cases() -> [DamageCase; 3] {
+        [
+            (
+                "runtime with a wrong tensor shape",
+                |root, artifact| {
+                    let mut schema = current_parameter_schema().unwrap();
+                    schema[0].1.reverse();
+                    let runtime = runtime::serialize(&schema, &artifact.parameters).unwrap();
+                    fs::write(root.join(RUNTIME_TENSOR_FILE), runtime).unwrap();
+                },
+                CheckpointError::TensorContract("dtype or shape"),
+            ),
+            (
+                "corrupt immutable payload",
+                |root, artifact| {
+                    let path = tensor_generation_path(root, artifact.tensor_hash);
+                    let mut corrupt = fs::read(&path).unwrap();
+                    *corrupt.last_mut().unwrap() ^= 1;
+                    fs::write(path, corrupt).unwrap();
+                },
+                CheckpointError::TensorHashMismatch,
+            ),
+            (
+                "unknown checkpoint identity",
+                |root, _| {
+                    let mut writer = ManifestWriter::default();
+                    writer.bytes.extend(CHECKPOINT_MAGIC);
+                    writer.u32(u32::MAX);
+                    writer.u64(0);
+                    fs::write(root.join(CHECKPOINT_META_FILE), writer.bytes).unwrap();
+                },
+                CheckpointError::SchemaMismatch,
+            ),
+        ]
     }
 
-    #[test]
-    fn unknown_checkpoint_identity_is_rejected_without_migration() {
-        let mut artifact = fixture_artifact("other-command", 0);
-        let fixture = Fixture::new(&mut artifact);
-        let mut writer = ManifestWriter::default();
-        writer.bytes.extend(CHECKPOINT_MAGIC);
-        writer.u32(u32::MAX);
-        writer.u64(0);
-        fs::write(fixture.0.join(CHECKPOINT_META_FILE), writer.bytes).unwrap();
-        assert_eq!(
-            inspect(&fixture).expect_err("unknown tuple"),
-            CheckpointError::SchemaMismatch
-        );
-    }
-
-    #[test]
-    fn unsafe_or_oversized_runtime_is_rejected_before_runtime_classification() {
-        let mut artifact = fixture_artifact("other-command", 0);
-        let fixture = Fixture::new(&mut artifact);
-        let path = fixture.0.join(RUNTIME_TENSOR_FILE);
-        fs::remove_file(&path).unwrap();
-        symlink(CHECKPOINT_META_FILE, &path).unwrap();
-        assert_eq!(
-            inspect(&fixture).expect_err("runtime symlink"),
-            CheckpointError::InvalidManifest("inspection requires a non-symlink regular file")
-        );
-        fs::remove_file(&path).unwrap();
-        fs::create_dir(&path).unwrap();
-        assert_eq!(
-            inspect(&fixture).expect_err("runtime directory"),
-            CheckpointError::InvalidManifest("inspection requires a non-symlink regular file")
-        );
-        fs::remove_dir(&path).unwrap();
-        File::create(&path)
-            .unwrap()
-            .set_len(MAX_RUNTIME_TENSOR_BYTES + 1)
-            .unwrap();
-        assert_eq!(
-            inspect(&fixture).expect_err("runtime size"),
-            CheckpointError::InvalidManifest("inspection file size")
-        );
+    fn unsafe_file_cases() -> [DamageCase; 5] {
+        const REGULAR: &str = "inspection requires a non-symlink regular file";
+        [
+            (
+                "symlinked manifest",
+                |root, _| symlink_aside(&root.join(CHECKPOINT_META_FILE)),
+                CheckpointError::InvalidManifest(REGULAR),
+            ),
+            (
+                "symlinked payload",
+                |root, artifact| symlink_aside(&tensor_generation_path(root, artifact.tensor_hash)),
+                CheckpointError::InvalidManifest(REGULAR),
+            ),
+            (
+                "symlinked runtime",
+                |root, _| symlink_aside(&root.join(RUNTIME_TENSOR_FILE)),
+                CheckpointError::InvalidManifest(REGULAR),
+            ),
+            (
+                "runtime directory",
+                |root, _| {
+                    fs::remove_file(root.join(RUNTIME_TENSOR_FILE)).unwrap();
+                    fs::create_dir(root.join(RUNTIME_TENSOR_FILE)).unwrap();
+                },
+                CheckpointError::InvalidManifest(REGULAR),
+            ),
+            (
+                "oversized runtime",
+                |root, _| {
+                    File::create(root.join(RUNTIME_TENSOR_FILE))
+                        .unwrap()
+                        .set_len(MAX_RUNTIME_TENSOR_BYTES + 1)
+                        .unwrap();
+                },
+                CheckpointError::InvalidManifest("inspection file size"),
+            ),
+        ]
     }
 
     #[test]
@@ -252,26 +268,6 @@ mod files {
         );
         assert_eq!(inventory(&fixture.0), before);
         assert!(fs::read_dir(&holding.0).unwrap().next().is_none());
-    }
-
-    #[test]
-    fn symlinked_manifest_or_payload_is_rejected() {
-        let mut artifact = fixture_artifact("other-command", 0);
-        let fixture = Fixture::new(&mut artifact);
-        let generation = tensor_generation_path(Path::new(""), artifact.tensor_hash);
-        for name in [Path::new(CHECKPOINT_META_FILE), generation.as_path()] {
-            let primary = fixture.0.join(name);
-            let aside = fixture.0.join("aside");
-            fs::rename(&primary, &aside).unwrap();
-            symlink("aside", &primary).unwrap();
-            let result = inspect(&fixture);
-            fs::remove_file(&primary).unwrap();
-            fs::rename(&aside, &primary).unwrap();
-            assert_eq!(
-                result.expect_err("unsafe primary"),
-                CheckpointError::InvalidManifest("inspection requires a non-symlink regular file")
-            );
-        }
     }
 
     #[test]
@@ -748,6 +744,13 @@ mod files {
         assert_eq!(report["runtime_matches_model"], false);
         assert_eq!(report["identity"]["runtime_sha256"], file_hash(path));
         assert!(!listed(&report, RUNTIME_TENSOR_FILE));
+    }
+
+    /// Replaces `path` with a relative symlink to its moved original.
+    fn symlink_aside(path: &Path) {
+        let aside = path.with_file_name("aside");
+        fs::rename(path, &aside).unwrap();
+        symlink("aside", path).unwrap();
     }
 
     fn listed(report: &Value, path: &str) -> bool {

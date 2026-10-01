@@ -2,29 +2,20 @@ use super::*;
 use crate::{AdaptiveEnvironmentConfig, EnvironmentDecimal, EnvironmentSchedule};
 
 #[test]
-fn adaptive_environment_cli_defaults_all_five_values_even_on_resume() {
-    let expected = EnvironmentSchedule::Adaptive(AdaptiveEnvironmentConfig {
-        success_updates: 2,
-        success_rate: EnvironmentDecimal::from_units(800_000),
-        poor_updates: 1,
-        poor_rate: EnvironmentDecimal::from_units(200_000),
-        extension: EnvironmentDecimal::from_units(750_000),
-    });
-    for flags in [
-        vec![],
-        vec!["--resume"],
-        vec!["--environment-schedule", "adaptive"],
-    ] {
-        assert_eq!(
-            schedule_for_test(&flags).expect("adaptive defaults"),
-            expected
-        );
-    }
-}
-
-#[test]
-fn adaptive_environment_cli_preserves_all_five_explicit_nondefault_values() {
-    let actual = schedule_for_test(&[
+fn adaptive_environment_cli_resolves_defaults_and_explicit_values_even_on_resume() {
+    let config = |success_updates, success_rate, poor_updates, poor_rate, extension| {
+        EnvironmentSchedule::Adaptive(AdaptiveEnvironmentConfig {
+            success_updates,
+            success_rate: EnvironmentDecimal::from_units(success_rate),
+            poor_updates,
+            poor_rate: EnvironmentDecimal::from_units(poor_rate),
+            extension: EnvironmentDecimal::from_units(extension),
+        })
+    };
+    let defaults = config(2, 800_000, 1, 200_000, 750_000);
+    let explicit = [
+        "--environment-schedule",
+        "adaptive",
         "--environment-success-updates",
         "3",
         "--environment-success-rate",
@@ -35,34 +26,53 @@ fn adaptive_environment_cli_preserves_all_five_explicit_nondefault_values() {
         ".125002",
         "--environment-extension",
         "1.250003",
-    ])
-    .expect("explicit adaptive configuration");
-    assert_eq!(
-        actual,
-        EnvironmentSchedule::Adaptive(AdaptiveEnvironmentConfig {
-            success_updates: 3,
-            success_rate: EnvironmentDecimal::from_units(875_001),
-            poor_updates: 4,
-            poor_rate: EnvironmentDecimal::from_units(125_002),
-            extension: EnvironmentDecimal::from_units(1_250_003),
-        })
-    );
+    ];
+    for (flags, expected) in [
+        (&[][..], defaults),
+        (&["--resume"][..], defaults),
+        (&["--environment-schedule", "adaptive"][..], defaults),
+        (&explicit[..], config(3, 875_001, 4, 125_002, 1_250_003)),
+    ] {
+        assert_eq!(
+            schedule_for_test(flags).expect("adaptive"),
+            expected,
+            "{flags:?}"
+        );
+    }
 }
 
 #[test]
-fn adaptive_environment_cli_accepts_extension_at_and_above_one_without_local_cap() {
+fn adaptive_environment_cli_extension_accepts_exact_values_up_to_the_global_bound() {
+    let maximum = crate::MAX_TRAINING_COUNTER.to_string();
     for (text, units) in [
         ("0", 0),
         ("1", 1_000_000),
         ("1.25", 1_250_000),
         ("20.000001", 20_000_001),
+        (
+            maximum.as_str(),
+            crate::MAX_TRAINING_COUNTER * EnvironmentDecimal::SCALE,
+        ),
     ] {
         let EnvironmentSchedule::Adaptive(config) =
             schedule_for_test(&["--environment-extension", text]).expect(text)
         else {
             panic!("default schedule must be adaptive");
         };
-        assert_eq!(config.extension.units(), units);
+        assert_eq!(config.extension.units(), units, "{text}");
+    }
+    for value in [
+        format!("{maximum}.000001"),
+        (crate::MAX_TRAINING_COUNTER + 1).to_string(),
+    ] {
+        let error =
+            schedule_for_test(&["--environment-extension", &value]).expect_err("extension bound");
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput, "{value}");
+        assert_eq!(
+            error.to_string(),
+            "invalid PPO config field: environment extension must not exceed MAX_TRAINING_COUNTER",
+            "{value}"
+        );
     }
 }
 
@@ -101,7 +111,7 @@ fn adaptive_environment_cli_equivalent_decimals_have_exact_canonical_scope() {
 #[test]
 fn adaptive_environment_cli_fixed_rejects_every_explicit_knob_including_defaults() {
     assert_eq!(
-        schedule_for_test(&["--environment-schedule", "fixed"]).expect("legacy fixed"),
+        schedule_for_test(&["--environment-schedule", "fixed"]).expect("fixed schedule"),
         EnvironmentSchedule::Fixed
     );
     for (flag, value) in [
@@ -199,24 +209,6 @@ fn adaptive_environment_cli_windows_enforce_positive_global_counter_bounds() {
 }
 
 #[test]
-fn adaptive_environment_cli_extension_enforces_full_exact_global_bound() {
-    let maximum = crate::MAX_TRAINING_COUNTER.to_string();
-    schedule_for_test(&["--environment-extension", &maximum]).expect("global extension bound");
-    for value in [
-        format!("{maximum}.000001"),
-        (crate::MAX_TRAINING_COUNTER + 1).to_string(),
-    ] {
-        let error =
-            schedule_for_test(&["--environment-extension", &value]).expect_err("extension bound");
-        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
-        assert_eq!(
-            error.to_string(),
-            "invalid PPO config field: environment extension must not exceed MAX_TRAINING_COUNTER"
-        );
-    }
-}
-
-#[test]
 fn adaptive_environment_cli_requires_generation_updates_and_rejects_unknown_schedule() {
     let error = parse_annealed(&["--updates", "20"])
         .err()
@@ -246,7 +238,6 @@ fn adaptive_environment_cli_requires_generation_updates_and_rejects_unknown_sche
 #[test]
 fn adaptive_environment_cli_validates_base_total_and_zero_update_limits() {
     let overflow = (crate::MAX_TRAINING_COUNTER + 1).to_string();
-    let base_overflow = (crate::MAX_TRAINING_COUNTER + 1).to_string();
     for (total, generation, zero, field) in [
         (
             "0",
@@ -262,7 +253,7 @@ fn adaptive_environment_cli_validates_base_total_and_zero_update_limits() {
         ),
         (
             "20",
-            &base_overflow,
+            &overflow,
             "0",
             "environment base updates must be in 1..=MAX_TRAINING_COUNTER",
         ),
@@ -308,23 +299,6 @@ fn adaptive_environment_cli_accepts_base_above_total_and_zero_phase_endpoints() 
     }
 }
 
-#[cfg(feature = "builtin")]
-#[test]
-fn adaptive_environment_cli_settings_count_generations_in_updates() {
-    for schedule in ["adaptive", "fixed"] {
-        let settings = annealed_settings_for_test(&[
-            "--updates",
-            "20",
-            "--generation-updates",
-            "3",
-            "--environment-schedule",
-            schedule,
-        ])
-        .expect("generation in updates");
-        assert_eq!(settings.generation_updates, 3);
-    }
-}
-
 fn schedule_for_test(flags: &[&str]) -> std::io::Result<EnvironmentSchedule> {
     let mut arguments = vec!["--updates", "20", "--generation-updates", "4"];
     arguments.extend_from_slice(flags);
@@ -342,87 +316,72 @@ fn parse_annealed(flags: &[&str]) -> std::io::Result<TrainAnnealedArgs> {
 }
 
 #[cfg(feature = "builtin")]
+fn scale_settings(extra: &[&str]) -> std::io::Result<crate::AnnealedJobConfig> {
+    let mut arguments = vec!["--updates", "20", "--generation-updates", "4"];
+    arguments.extend_from_slice(extra);
+    crate::cli::annealed_settings_for_test(&arguments)
+}
+
+#[cfg(feature = "builtin")]
 #[test]
-fn annealed_cli_resolves_environment_scale_endpoints() {
-    let base = ["--updates", "20", "--generation-updates", "4"];
-    let settings = |extra: &[&str]| {
-        let mut arguments = base.to_vec();
-        arguments.extend_from_slice(extra);
-        crate::cli::annealed_settings_for_test(&arguments)
-    };
-    assert_eq!(
-        settings(&[]).expect("default scale").scale,
-        crate::randomization::AnnealScale::FULL
-    );
-    assert_eq!(
-        settings(&[
-            "--environment-scale-start",
-            "0",
-            "--environment-scale-end",
-            "2"
-        ])
-        .expect("rising ramp")
-        .scale,
-        crate::randomization::AnnealScale {
-            start_bp: 0,
-            end_bp: 20_000
-        }
-    );
-    assert_eq!(
-        settings(&[
-            "--environment-scale-start",
-            "0.5",
-            "--environment-scale-end",
-            "0.5"
-        ])
-        .expect("fixed half scale")
-        .scale,
-        crate::randomization::AnnealScale {
-            start_bp: 5_000,
-            end_bp: 5_000
-        }
-    );
-    assert_eq!(
-        settings(&[
-            "--environment-scale-start",
-            "10",
-            "--environment-scale-end",
-            "10"
-        ])
-        .expect("ten times full variance")
-        .scale,
-        crate::randomization::AnnealScale {
-            start_bp: 100_000,
-            end_bp: 100_000
-        }
-    );
-    // The loop works in basis points, so an endpoint truncates to a hundredth.
-    assert_eq!(
-        settings(&["--environment-scale-start", "0.007"])
-            .expect("zero point seven percent")
-            .scale
-            .start_bp,
-        70
-    );
-    assert_eq!(
-        settings(&["--environment-scale-start", "0.00005"])
-            .expect("sub-basis-point")
-            .scale
-            .start_bp,
-        0
-    );
+fn annealed_cli_resolves_environment_scale_endpoints_in_whole_basis_points() {
+    let scale = |start_bp, end_bp| crate::randomization::AnnealScale { start_bp, end_bp };
+    // An endpoint finer than one basis point truncates.
+    for (flags, expected) in [
+        (&[][..], crate::randomization::AnnealScale::FULL),
+        (
+            &[
+                "--environment-scale-start",
+                "0",
+                "--environment-scale-end",
+                "2",
+            ][..],
+            scale(0, 20_000),
+        ),
+        (
+            &[
+                "--environment-scale-start",
+                "0.5",
+                "--environment-scale-end",
+                "0.5",
+            ][..],
+            scale(5_000, 5_000),
+        ),
+        (
+            &[
+                "--environment-scale-start",
+                "10",
+                "--environment-scale-end",
+                "10",
+            ][..],
+            scale(100_000, 100_000),
+        ),
+        (&["--environment-scale-start", "0.007"][..], scale(70, 0)),
+        (&["--environment-scale-start", "0.00005"][..], scale(0, 0)),
+    ] {
+        assert_eq!(
+            scale_settings(flags).expect("scale").scale,
+            expected,
+            "{flags:?}"
+        );
+    }
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn annealed_cli_rejects_environment_scales_above_ten_or_in_non_plain_notation() {
     for value in ["10.000001", "11"] {
-        let error = settings(&["--environment-scale-start", value]).expect_err("above the bound");
+        let error = scale_settings(&["--environment-scale-start", value]).expect_err(value);
         assert!(
             error.to_string().contains("must be within 0 and 10"),
-            "{error}"
+            "{value}: {error}"
         );
     }
     // The equals form keeps a leading sign with the value, so the decimal
     // parser rejects it instead of clap treating it as an unknown flag.
     for value in ["-1", "1e1", "abc", "1.", ".5.5"] {
         let argument = format!("--environment-scale-end={value}");
-        let error = settings(&[argument.as_str()]).expect_err("notation");
+        let error = scale_settings(&[argument.as_str()]).expect_err(value);
         assert!(
             error.to_string().contains("environment decimal"),
             "{value}: {error}"

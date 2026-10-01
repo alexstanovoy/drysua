@@ -2,7 +2,7 @@
 use super::*;
 
 #[cfg(feature = "builtin")]
-fn arguments(extra: &[&str]) -> TrainAnnealedArgs {
+fn try_arguments(extra: &[&str]) -> Result<TrainAnnealedArgs, clap::Error> {
     let mut command = vec![
         "drysua",
         "train-annealed",
@@ -14,11 +14,16 @@ fn arguments(extra: &[&str]) -> TrainAnnealedArgs {
         "unused-fast-profile",
     ];
     command.extend_from_slice(extra);
-    let cli = Cli::try_parse_from(command).expect("annealed arguments");
+    let cli = Cli::try_parse_from(command)?;
     let Some(Operation::TrainAnnealed(arguments)) = cli.operation else {
         panic!("annealed operation");
     };
-    arguments
+    Ok(arguments)
+}
+
+#[cfg(feature = "builtin")]
+fn arguments(extra: &[&str]) -> TrainAnnealedArgs {
+    try_arguments(extra).expect("annealed arguments")
 }
 
 #[cfg(feature = "builtin")]
@@ -27,11 +32,9 @@ fn annealed_cli_resolves_the_continuous_profile_and_validates() {
     let settings = arguments(&["--simulation-threads", "3"])
         .annealed_settings("drysua".into(), "bota".into())
         .unwrap();
-    // Host-sized defaults: 16 slots per core in lanes of at most 64 slots per group.
+    // Host-sized default: 16 slots per core, capped at 256.
     let cores = std::thread::available_parallelism().unwrap().get();
     assert_eq!(settings.slots, (16 * cores).min(256));
-    assert!(settings.lanes >= 2 * settings.simulation_groups);
-    assert!(settings.slots.is_multiple_of(settings.lanes) && settings.slots / settings.lanes <= 64);
     assert!(!settings.pin_threads);
     assert_eq!(settings.simulation_threads, 3);
     assert_eq!(settings.ppo.samples_per_update, 24_000);
@@ -46,7 +49,7 @@ fn annealed_cli_resolves_the_continuous_profile_and_validates() {
     );
     assert_eq!(
         settings.environment_schedule,
-        crate::EnvironmentSchedule::default()
+        crate::EnvironmentSchedule::Adaptive(crate::AdaptiveEnvironmentConfig::default())
     );
     crate::ppo_arena::validate_annealed(&settings, Default::default()).unwrap();
 }
@@ -134,19 +137,10 @@ fn annealed_cli_parses_an_ordered_opponent_mixture_with_colon_paths() {
         "teacher:-1",
         "self:0.1234567",
     ] {
-        let command = [
-            "drysua",
-            "train-annealed",
-            "--updates",
-            "2",
-            "--generation-updates",
-            "1",
-            "--checkpoint-directory",
-            "unused",
-            "--opponent",
-            invalid,
-        ];
-        assert!(Cli::try_parse_from(command).is_err(), "{invalid}");
+        assert!(
+            try_arguments(&["--opponent", invalid]).is_err(),
+            "{invalid}"
+        );
     }
 }
 

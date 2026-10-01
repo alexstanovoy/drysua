@@ -22,8 +22,6 @@ mod navigation_contract;
 #[cfg(feature = "builtin")]
 mod neural_order_contract;
 #[cfg(feature = "builtin")]
-mod neural_order_seat;
-#[cfg(feature = "builtin")]
 mod neural_persistence;
 #[cfg(feature = "builtin")]
 mod parity;
