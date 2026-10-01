@@ -52,7 +52,7 @@ MAX_OPPONENTS = 16
 CONFIG_FIELDS = {"schema", "trainer", "inspector", "initial_weights", "opponents", "total_updates",
                  "history_every", "checkpoint_seconds", "max_seconds", "stop_seconds",
                  "training_args", "mode", "docker_context",
-                 "image", "gpu_uuid", "lock_paths", "memory_gib", "cuda_directory"}
+                 "image", "gpu_uuid", "lock_paths", "memory_gib", "cuda_directory", "vram_budget_mib"}
 
 
 def validate_arguments(arguments):
@@ -132,6 +132,13 @@ def validate_execution(value):
     cuda = value.get("cuda_directory", "/usr/local/cuda-13.3")
     if mode not in {"cpu", "gpu"}:
         raise ValueError("mode must be cpu or gpu")
+    # The trainer reserves this much VRAM at startup and never exceeds it;
+    # absent, it reserves its configuration's computed worst case.
+    budget = value.get("vram_budget_mib")
+    if budget is not None:
+        if mode != "gpu":
+            raise ValueError("vram_budget_mib needs gpu mode")
+        budget = io.bounded_integer(budget, "vram_budget_mib", 256, 1 << 20)
     if not isinstance(context, str) or not re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", context):
         raise ValueError("invalid docker_context")
     if not isinstance(image, str) or not re.fullmatch(r"[a-z0-9][a-z0-9./:_-]{0,200}@sha256:[0-9a-f]{64}", image):
@@ -147,8 +154,11 @@ def validate_execution(value):
     normalized = [str(io.private_path(path)) for path in paths]
     if len(set(normalized)) != len(normalized):
         raise ValueError("duplicate lock_paths")
-    return dict(mode=mode, docker_context=context, image=image, gpu_uuid=gpu, lock_paths=normalized,
-                cuda_directory=cuda)
+    result = dict(mode=mode, docker_context=context, image=image, gpu_uuid=gpu, lock_paths=normalized,
+                  cuda_directory=cuda)
+    if budget is not None:
+        result["vram_budget_mib"] = budget
+    return result
 
 
 def collect_inputs(config, base):
@@ -391,6 +401,8 @@ def trainer_command(directory, config, resume):
                "--device", "cuda" if config["mode"] == "gpu" else "cpu"]
     if config["mode"] == "gpu":
         command += ["--device-ordinal", "0"]
+        if "vram_budget_mib" in config:
+            command += ["--vram-budget-mib", str(config["vram_budget_mib"])]
     if resume:
         command.append("--resume")
     elif "initial_weights" in config:

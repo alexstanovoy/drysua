@@ -106,6 +106,7 @@ controller owns the campaign.
 | `training_args` | `[]` | allowlisted `train-annealed` options only |
 | `mode` | `cpu` | `cpu` or `gpu` |
 | `gpu_uuid` | null | full `GPU-...` UUID in gpu mode |
+| `vram_budget_mib` | computed | gpu mode, 256..1048576: VRAM the trainer reserves at startup and never exceeds (`--vram-budget-mib`); default is its configuration's worst case |
 | `image` | required | `name@sha256:<digest>`, present locally |
 | `docker_context` | `rootless` | Docker CLI context |
 | `cuda_directory` | `/usr/local/cuda-13.3` | directory directly under `/usr/local` |
