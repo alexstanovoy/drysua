@@ -41,8 +41,8 @@ use bota_server::game::SpawnModifier;
 use crate::persistence::training::PolicyOrderBookkeeping;
 
 use crate::{
-    ActionKind, ActionSpace, ActionTarget, ActivePolicyOrder, Arena, ArenaConfig, ArenaStart,
-    BehavioralTarget, CheckpointProgress, CheckpointRun, CheckpointSaveOutcome,
+    ActionHeadTargets, ActionKind, ActionSpace, ActionTarget, ActivePolicyOrder, Arena,
+    ArenaConfig, ArenaStart, CheckpointProgress, CheckpointRun, CheckpointSaveOutcome,
     CollectionCheckpoint, ControlledUnit, EntityIndex, FeatureEncoder, FeatureFrame, ItemReadiness,
     LocalPolicyState, LootIndex, OrderPersistence, PointIndex, PolicyDevice, PolicyModel,
     PpoConfig, PpoError, PpoRng, PpoTerminalOutcome, PpoTrainer, PpoTransition, PpoUpdateReport,
@@ -650,7 +650,7 @@ fn setup_seat(index: usize, messages: &[ServerMsg]) -> Result<ArenaSeatPolicy, P
         encoder,
         local: LocalPolicyState::new(1),
         persistence: OrderPersistence::default(),
-        order_bookkeeping: PolicyOrderBookkeeping::Legacy,
+        order_bookkeeping: PolicyOrderBookkeeping::SentRequests,
         aim: crate::RazeAim::default(),
         readiness: ItemReadiness::new(),
         script: ScriptedPolicy::new(ScriptKind::Teacher),
@@ -676,7 +676,7 @@ fn prepare_neural_seat_policy_sample(
     seat: &mut ArenaSeatPolicy,
 ) -> Result<(FeatureFrame, ActionSpace), PpoError> {
     seat.order_bookkeeping
-        .enable_candidate(&seat.persistence)
+        .enable_neural(&seat.persistence)
         .map_err(PpoError::InvalidTransition)?;
     seat.order_bookkeeping
         .reconcile(&seat.tracker, &mut seat.local, &mut seat.pending_active)
@@ -869,7 +869,7 @@ fn issue_request(
     else {
         return Ok(None);
     };
-    let persistence = seat.order_bookkeeping.transport(&seat.persistence);
+    let persistence = seat.order_bookkeeping.effective(&seat.persistence);
     let Some(issued) = persistence.should_send(Some(issued)) else {
         return Ok(None);
     };

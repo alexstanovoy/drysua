@@ -407,7 +407,7 @@ impl Slot {
                 .retained
                 .ok_or(PpoError::InvalidTransition("retained decision statistics"))?;
             let shadow = shadow
-                .map(|action| BehavioralTarget::from_sampled_action(&self.policy.space, action))
+                .map(|action| ActionHeadTargets::from_sampled_action(&self.policy.space, action))
                 .transpose()
                 .map_err(text_error)?;
             self.stream.retain(RetainedChoice {
@@ -570,14 +570,13 @@ impl Slot {
             .map(decode_action)
             .transpose()?;
         let retained = if self.stream.retains(action.kind()) {
-            let target = BehavioralTarget::from_sampled_action(&self.policy.space, action)
+            let target = ActionHeadTargets::from_sampled_action(&self.policy.space, action)
                 .map_err(text_error)?;
             let open = snapshot.open.filter(|_| Some(index) == last_start);
             Some(Box::new((
                 SampledStatistics {
                     target,
                     log_probability: open.map_or(0.0, |open| open.log_probability),
-                    entropy: 0.0,
                 },
                 open.map_or(0.0, |open| open.value),
                 open.map_or(0, |open| open.behaviour),

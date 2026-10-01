@@ -29,11 +29,10 @@ const _: () = assert!(MAX_SNAPSHOT_BYTES < usize::MAX as u64);
 pub(crate) fn verify_adaptive_snapshots(
     directory: &Path,
     seed: u64,
-    games_per_update: u64,
     checkpoint: &AdaptiveEnvironmentCheckpoint,
     scale: crate::randomization::AnnealScale,
 ) -> Result<(), PpoError> {
-    validate_checkpoint(checkpoint, games_per_update)?;
+    validate_checkpoint(checkpoint)?;
     if !validate_directory(directory)? && checkpoint.snapshot_count != 0 {
         return Err(PpoError::InvalidConfig(
             "adaptive randomization snapshot is missing",
@@ -49,13 +48,8 @@ pub(crate) fn verify_adaptive_snapshots(
                 "adaptive randomization snapshot starts are not strictly increasing from zero",
             ));
         }
-        let draw = draw_generation_at_start(
-            seed,
-            generation,
-            start_update,
-            games_per_update,
-            schedule(checkpoint, scale),
-        )?;
+        let draw =
+            draw_generation_at_start(seed, generation, start_update, schedule(checkpoint, scale))?;
         compare_snapshot(&stored, &adaptive_generation_json(&draw))?;
         hash = append_hash(hash, stored.as_bytes());
         previous_start = Some(start_update);
@@ -88,11 +82,10 @@ pub(crate) fn verify_adaptive_snapshots(
 pub(crate) fn draw_adaptive_generation(
     directory: &Path,
     seed: u64,
-    games_per_update: u64,
     checkpoint: &mut AdaptiveEnvironmentCheckpoint,
     scale: crate::randomization::AnnealScale,
 ) -> Result<GenerationDraw, PpoError> {
-    validate_checkpoint(checkpoint, games_per_update)?;
+    validate_checkpoint(checkpoint)?;
     let directory_exists = validate_directory(directory)?;
     if !directory_exists && checkpoint.snapshot_count != 0 {
         return Err(PpoError::InvalidConfig(
@@ -103,7 +96,6 @@ pub(crate) fn draw_adaptive_generation(
         seed,
         checkpoint.state.generation,
         checkpoint.state.start_update,
-        games_per_update,
         schedule(checkpoint, scale),
     )?;
     let path = generation_path(directory, draw.generation);
@@ -125,15 +117,7 @@ pub(crate) fn draw_adaptive_generation(
     Ok(draw)
 }
 
-fn validate_checkpoint(
-    checkpoint: &AdaptiveEnvironmentCheckpoint,
-    games_per_update: u64,
-) -> Result<(), PpoError> {
-    if !(1..=MAX_TRAINING_COUNTER).contains(&games_per_update) {
-        return Err(PpoError::InvalidConfig(
-            "adaptive randomization games per update must be in 1..=MAX_TRAINING_COUNTER",
-        ));
-    }
+fn validate_checkpoint(checkpoint: &AdaptiveEnvironmentCheckpoint) -> Result<(), PpoError> {
     let global_update = checkpoint
         .state
         .start_update
@@ -142,11 +126,6 @@ fn validate_checkpoint(
     checkpoint
         .state
         .validate(checkpoint.config, checkpoint.limits, global_update)?;
-    checkpoint
-        .limits
-        .total_updates
-        .checked_mul(games_per_update)
-        .ok_or(PpoError::CounterOverflow)?;
     let generation = checkpoint.state.generation;
     let count = checkpoint.snapshot_count;
     if count > MAX_TRAINING_COUNTER

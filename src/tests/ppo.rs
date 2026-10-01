@@ -7,7 +7,7 @@ use bota_proto::Team;
 
 use super::feature::{encode, tracker_with_view, world_view};
 use crate::{
-    ActionSpace, BehavioralTarget, ControlledUnit, LocalPolicyState, MODEL_TRAINING_BATCH,
+    ActionHeadTargets, ActionSpace, ControlledUnit, LocalPolicyState, MODEL_TRAINING_BATCH,
     PolicyModel, PpoConfig, PpoOutcome, PpoPolicyChoice, PpoRng, PpoRollout, PpoTrainer,
     StructuredAction, tick_discount,
 };
@@ -357,7 +357,7 @@ fn compact_rollout_storage_preserves_frame_target_and_behavior_statistics() {
         )
         .expect("push");
     assert_eq!(packed.unpack(), target);
-    assert!(std::mem::size_of_val(&packed) < std::mem::size_of::<BehavioralTarget>());
+    assert!(std::mem::size_of_val(&packed) < std::mem::size_of::<ActionHeadTargets>());
     let batch = rollout.finish(smoke_config()).expect("batch");
     let sample = batch.sample(0).expect("materialized");
     assert_eq!(sample.transition.frame, frame);
@@ -424,11 +424,10 @@ fn choice(
 ) -> PpoPolicyChoice {
     let mut choice = PpoPolicyChoice {
         frame: frame.clone(),
-        target: BehavioralTarget::from_action(frame, space, action).expect("target"),
+        target: ActionHeadTargets::from_action(frame, space, action).expect("target"),
         action,
         policy: model.policy_identity().expect("policy"),
         log_probability: 0.0,
-        entropy: 0.0,
         value: model.choose(frame, space).expect("critic value").value,
     };
     choice.log_probability = learner_log_probability(model, &prepared_choice(0, choice.clone()));

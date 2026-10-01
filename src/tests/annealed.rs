@@ -53,11 +53,11 @@ fn cached_generation_rules_turn_off_at_the_zero_window_boundary() {
         zero_updates: 1,
         scale: crate::randomization::AnnealScale::FULL,
     };
-    let draw = draw_generation(3, 1, 2, 1, schedule).expect("truncated draw");
+    let draw = draw_generation(3, 1, 2, schedule).expect("truncated draw");
     assert!(draw.scale_bp > 0);
     assert_eq!(draw.applied_games, 1);
     let directory = test_directory("zero-window-rules");
-    let mut cache = GenerationCache::new(directory.to_path_buf(), 3, 2, 1, schedule, 0);
+    let mut cache = GenerationCache::new(directory.to_path_buf(), 3, 2, schedule, 0);
     for (update, applied) in [(2, true), (3, false)] {
         let spec = cache.spec_for_update(update).expect("spec");
         assert_eq!(!spawn_modifiers_for(spec).is_empty(), applied);
@@ -254,7 +254,12 @@ fn league_resume_scenario(name: &str, schedule: crate::EnvironmentSchedule) {
     );
     run(config, &resumed, true).expect("resume");
     assert_trajectory_equal(&uninterrupted, &resumed);
-    let artifact = TrainingArtifact::load(&resumed).expect("final checkpoint");
+    assert_league_directory_matches_checkpoint(&resumed);
+}
+
+/// Only the snapshots the final checkpoint records stay on disk.
+fn assert_league_directory_matches_checkpoint(resumed: &std::path::Path) {
+    let artifact = TrainingArtifact::load(resumed).expect("final checkpoint");
     let recorded =
         crate::ppo_arena::collector_state::CollectorState::decode(&artifact.collection().state)
             .expect("final collection state")
@@ -329,17 +334,7 @@ fn guided_updates_freeze_the_policy_in_warmup_and_resume_exactly() {
         &TrainingArtifact::load(&resumed).expect("warm-up checkpoint"),
         PolicyDevice::Cpu,
     );
-    let before = initial.export_parameters().expect("initial parameters");
-    let mut offset = 0;
-    for (name, shape) in initial.parameter_schema().expect("schema") {
-        let range = offset..offset + shape.iter().product::<usize>();
-        let kept = before[range.clone()]
-            .iter()
-            .zip(&warm.parameters[range.clone()])
-            .all(|(a, b)| a.to_bits() == b.to_bits());
-        assert_eq!(kept, !name.starts_with("value."), "{name}");
-        offset = range.end;
-    }
+    assert_only_the_critic_changed(&initial, &warm.parameters);
     assert!(
         in_flight_decisions(&resumed) > 0,
         "a labeled game is in flight"
@@ -356,6 +351,21 @@ fn guided_updates_freeze_the_policy_in_warmup_and_resume_exactly() {
     assert_eq!(second.latest, reference.latest);
     assert_trajectory_equal(&uninterrupted, &resumed);
     assert_artifact_bits(&uninterrupted, &resumed, PolicyDevice::Cpu);
+}
+
+/// Every policy parameter keeps its bits through a critic-only warm-up.
+fn assert_only_the_critic_changed(initial: &PolicyModel, warm: &[f32]) {
+    let before = initial.export_parameters().expect("initial parameters");
+    let mut offset = 0;
+    for (name, shape) in initial.parameter_schema().expect("schema") {
+        let range = offset..offset + shape.iter().product::<usize>();
+        let kept = before[range.clone()]
+            .iter()
+            .zip(&warm[range.clone()])
+            .all(|(a, b)| a.to_bits() == b.to_bits());
+        assert_eq!(kept, !name.starts_with("value."), "{name}");
+        offset = range.end;
+    }
 }
 
 /// Two lanes of one slot each; with 16-decision games an update of four

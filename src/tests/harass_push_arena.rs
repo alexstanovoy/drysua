@@ -60,19 +60,7 @@ fn harass_push_counts_a_tango_at_its_own_rate_and_keeps_walking_home() {
     environment.seats[0].script = ScriptedPolicy::new(ScriptKind::HarassPush);
     let fountain = radiant_fountain(&environment);
     let start = own_distance(&environment, fountain);
-    for _ in 0..RETREAT_DECISIONS {
-        let seat = &mut environment.seats[0];
-        let (action, space) = seat
-            .script
-            .decide(&seat.tracker, &seat.persistence, &seat.readiness)
-            .expect("decision");
-        seat.local
-            .note_decision(space.tick(), action.kind())
-            .expect("decision history");
-        let issued = space.decode(action).expect("decode");
-        let request = issue_request(seat, issued, &space, action.kind(), true).expect("request");
-        advance_interval(&mut environment, vec![request, None], 3).expect("ticks");
-    }
+    run_decisions(&mut environment, RETREAT_DECISIONS);
     let hero = environment.seats[0].tracker.own_hero().expect("own hero");
     assert!(
         hero.hp * 100 > hero.max_hp * 30,
@@ -83,6 +71,23 @@ fn harass_push_counts_a_tango_at_its_own_rate_and_keeps_walking_home() {
         end < start,
         "still walking home: {start} -> {end} units from the fountain"
     );
+}
+
+/// Decides and plays `decisions` rule-policy decisions of seat 0, three ticks apart.
+fn run_decisions(environment: &mut TrainingEnvironment, decisions: usize) {
+    for _ in 0..decisions {
+        let seat = &mut environment.seats[0];
+        let (action, space) = seat
+            .script
+            .decide(&seat.tracker, &seat.persistence, &seat.readiness)
+            .expect("decision");
+        seat.local
+            .note_decision(space.tick(), action.kind())
+            .expect("decision history");
+        let issued = space.decode(action).expect("decode");
+        let request = issue_request(seat, issued, &space, action.kind(), true).expect("request");
+        advance_interval(environment, vec![request, None], 3).expect("ticks");
+    }
 }
 
 fn radiant_fountain(environment: &TrainingEnvironment) -> Vec2 {

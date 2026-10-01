@@ -3,11 +3,9 @@ use super::*;
 #[cfg(feature = "builtin")]
 use crate::randomization::{MAX_SNAPSHOT_BYTES, RANDOMIZATION_DIRECTORY as HISTORY_DIRECTORY};
 
-/// Generations count updates: one virtual game per update.
-const GAMES_PER_UPDATE: u64 = 1;
-
 pub(super) struct HistoryPlan {
     pub(super) kind: &'static str,
+    /// Snapshot "games": one per update.
     pub(super) games: Option<u64>,
     pub(super) snapshot_count: u64,
     updates: u64,
@@ -65,7 +63,7 @@ pub(super) fn plan(artifact: &TrainingArtifact) -> Result<HistoryPlan, Checkpoin
             "inspection annealed scope counters",
         ));
     }
-    let games = artifact.progress.global_update * GAMES_PER_UPDATE;
+    let games = artifact.progress.global_update;
     plan.games = Some(games);
     plan.snapshot_count = artifact.progress.adaptive_environment.map_or_else(
         || games.div_ceil(plan.generation_games),
@@ -191,7 +189,6 @@ fn verify_annealed(
         crate::adaptive_randomization::verify_adaptive_snapshots(
             &directory,
             artifact.run.run_seed,
-            GAMES_PER_UPDATE,
             checkpoint,
             crate::randomization::AnnealScale {
                 start_bp: plan.scale_start_bp,
@@ -224,14 +221,9 @@ fn verify_fixed(
             end_bp: plan.scale_end_bp,
         },
     };
-    let draw = crate::randomization::draw_generation(
-        seed,
-        generation,
-        plan.generation_games,
-        GAMES_PER_UPDATE,
-        schedule,
-    )
-    .map_err(|error| CheckpointError::Io(format!("snapshot draw verification: {error}")))?;
+    let draw =
+        crate::randomization::draw_generation(seed, generation, plan.generation_games, schedule)
+            .map_err(|error| CheckpointError::Io(format!("snapshot draw verification: {error}")))?;
     if bytes != crate::randomization::generation_json(&draw).as_bytes() {
         return Err(CheckpointError::InvalidManifest(
             "inspection fixed snapshot mismatch",

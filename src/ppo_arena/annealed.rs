@@ -409,7 +409,6 @@ struct GenerationCache {
     directory: PathBuf,
     seed: u64,
     games_per_generation: u64,
-    games_per_update: u64,
     schedule: AnnealSchedule,
     last: Option<GenerationDraw>,
     /// Draws whose snapshots are written with the next checkpoint.
@@ -426,7 +425,6 @@ impl GenerationCache {
         directory: PathBuf,
         seed: u64,
         games_per_generation: u64,
-        games_per_update: u64,
         schedule: AnnealSchedule,
         verified: u64,
     ) -> Self {
@@ -435,7 +433,6 @@ impl GenerationCache {
             directory,
             seed,
             games_per_generation,
-            games_per_update,
             schedule,
             last: None,
             pending: Vec::new(),
@@ -468,7 +465,6 @@ impl GenerationCache {
                 self.seed,
                 generation,
                 self.games_per_generation,
-                self.games_per_update,
                 self.schedule,
             )?;
             self.pending.push(draw);
@@ -598,6 +594,26 @@ fn annealed_run(
             potential.every, potential.games, potential.min_games
         ));
     }
+    append_optimizer_scope(config, &mut command_line);
+    settings.execution.append_scope(&mut command_line);
+    settings.guidance.append_scope(&mut command_line);
+    adaptive::append_scope(settings, harness, &mut command_line);
+    Ok(CheckpointRun {
+        git_commit: settings.git_commit.clone(),
+        simulator_commit: settings.simulator_commit.clone(),
+        enabled_features: compiled_features(),
+        command_line,
+        run_seed: settings.seed,
+        map: MapId(2),
+        hero: SHADOW_FIEND,
+        device: CheckpointDevice::from_policy(device).map_err(text_error)?,
+        batch_size: config.minibatch,
+        rules_audit_version: PPO_RULES_AUDIT_VERSION,
+    })
+}
+
+/// Records every PPO hyperparameter that differs from its default.
+fn append_optimizer_scope(config: PpoConfig, command_line: &mut String) {
     let defaults = PpoConfig::default();
     if config.learning_rate != defaults.learning_rate {
         command_line.push_str(&format!(" --learning-rate {}", config.learning_rate));
@@ -620,21 +636,6 @@ fn annealed_run(
             config.value_coefficient
         ));
     }
-    settings.execution.append_scope(&mut command_line);
-    settings.guidance.append_scope(&mut command_line);
-    adaptive::append_scope(settings, harness, &mut command_line);
-    Ok(CheckpointRun {
-        git_commit: settings.git_commit.clone(),
-        simulator_commit: settings.simulator_commit.clone(),
-        enabled_features: compiled_features(),
-        command_line,
-        run_seed: settings.seed,
-        map: MapId(2),
-        hero: SHADOW_FIEND,
-        device: CheckpointDevice::from_policy(device).map_err(text_error)?,
-        batch_size: config.minibatch,
-        rules_audit_version: PPO_RULES_AUDIT_VERSION,
-    })
 }
 
 /// Records the opponent mixture in order, pinning frozen snapshots by fingerprint.
@@ -959,7 +960,7 @@ fn log_ppo_update(
     reason = "rates of summed imitation statistics"
 )]
 fn imitation_fields(report: &crate::PpoUpdateReport) -> String {
-    const HEADS: [&str; crate::MODEL_BEHAVIORAL_HEADS] = [
+    const HEADS: [&str; crate::MODEL_ACTION_HEADS] = [
         "kind",
         "unit",
         "ability",

@@ -116,7 +116,7 @@ impl HostHeads {
         host
     }
 
-    fn push(&mut self, target: &BehavioralTarget) -> Result<(), ModelError> {
+    fn push(&mut self, target: &ActionHeadTargets) -> Result<(), ModelError> {
         self.head(0, &target.kind)?;
         self.head(1, &target.controlled)?;
         self.head(2, &target.ability)?;
@@ -150,7 +150,7 @@ impl HostHeads {
     ) -> Result<(), ModelError> {
         assert_eq!(HEADS[index].1, WIDTH);
         if target.active && !target.mask.get(target.selected).copied().unwrap_or(false) {
-            return Err(ModelError::BehavioralTarget {
+            return Err(ModelError::ActionHeadTargets {
                 head: HEADS[index].0,
                 label: target.selected,
             });

@@ -109,15 +109,7 @@ impl AnnealedSession {
         pool: &OpponentPool,
         checkpointed: &mut impl FnMut(TrainingCheckpointReport),
     ) -> Result<(), PpoError> {
-        let target = match settings.invocation_updates {
-            Some(limit) => self
-                .state
-                .completed_updates
-                .checked_add(limit.get())
-                .ok_or(PpoError::CounterOverflow)?
-                .min(settings.updates),
-            None => settings.updates,
-        };
+        let target = self.invocation_target(settings)?;
         if self.state.completed_updates >= target {
             return Ok(());
         }
@@ -128,15 +120,7 @@ impl AnnealedSession {
             shadow: settings.guidance.shadow_labels(),
             potentials: self.win.as_ref().map(|(_, _, models)| Arc::clone(models)),
         };
-        let mut generations = GenerationCache::new(
-            self.random_directory.clone(),
-            settings.seed,
-            settings.generation_updates,
-            1,
-            anneal_schedule(settings),
-            self.generations,
-        );
-        generations.adaptive = self.state.adaptive_environment;
+        let mut generations = self.generation_cache(settings);
         let lanes = self.lane_plan(settings, pool)?;
         let cpus = crate::ppo_arena::topology::group_cpus(
             settings.simulation_groups,
@@ -181,6 +165,32 @@ impl AnnealedSession {
         });
         self.generations = generations.counted_through();
         result
+    }
+
+    /// The generation draws of this invocation, resuming the recorded snapshots.
+    fn generation_cache(&self, settings: &AnnealedJobConfig) -> GenerationCache {
+        let mut generations = GenerationCache::new(
+            self.random_directory.clone(),
+            settings.seed,
+            settings.generation_updates,
+            anneal_schedule(settings),
+            self.generations,
+        );
+        generations.adaptive = self.state.adaptive_environment;
+        generations
+    }
+
+    /// The update count this invocation stops at.
+    fn invocation_target(&self, settings: &AnnealedJobConfig) -> Result<u64, PpoError> {
+        Ok(match settings.invocation_updates {
+            Some(limit) => self
+                .state
+                .completed_updates
+                .checked_add(limit.get())
+                .ok_or(PpoError::CounterOverflow)?
+                .min(settings.updates),
+            None => settings.updates,
+        })
     }
 
     #[allow(clippy::too_many_arguments)]

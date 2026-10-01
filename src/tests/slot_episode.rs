@@ -71,10 +71,9 @@ fn play(
             sampled.statistics.expect("statistics")
         } else {
             SampledStatistics {
-                target: BehavioralTarget::from_sampled_action(&slot.policy.space, action)
+                target: ActionHeadTargets::from_sampled_action(&slot.policy.space, action)
                     .expect("target"),
                 log_probability: -1.0,
-                entropy: 0.0,
             }
         };
         if slot.stream.closes_interval(action.kind()) {

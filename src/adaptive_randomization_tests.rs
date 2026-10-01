@@ -5,6 +5,7 @@ use crate::adaptive_environment::{
 use crate::randomization::{AnnealScale, draw_generation};
 
 const SEED: u64 = 0x5eed_1234;
+/// Games each update finishes, as the controller observes them.
 const GAMES: u64 = 8;
 
 fn checkpoint() -> AdaptiveEnvironmentCheckpoint {
@@ -34,11 +35,11 @@ fn draw(
     seed: u64,
     checkpoint: &mut AdaptiveEnvironmentCheckpoint,
 ) -> Result<GenerationDraw, PpoError> {
-    draw_adaptive_generation(directory, seed, GAMES, checkpoint, AnnealScale::FULL)
+    draw_adaptive_generation(directory, seed, checkpoint, AnnealScale::FULL)
 }
 
 fn verify(directory: &Path, checkpoint: &AdaptiveEnvironmentCheckpoint) -> Result<(), PpoError> {
-    verify_adaptive_snapshots(directory, SEED, GAMES, checkpoint, AnnealScale::FULL)
+    verify_adaptive_snapshots(directory, SEED, checkpoint, AnnealScale::FULL)
 }
 
 /// Commits generations 0, 1 and 2 starting at updates 0, 2 and 5.
@@ -70,7 +71,7 @@ fn rewritten_historical_starts_fail_order_or_hash_checks_without_repair() {
         let directory = crate::ppo::test_directory("adaptive-snapshots");
         let checkpoint = recorded_prefix(&directory);
         let schedule = schedule(&checkpoint, AnnealScale::FULL);
-        let rewritten = draw_generation_at_start(SEED, generation, start_update, GAMES, schedule)
+        let rewritten = draw_generation_at_start(SEED, generation, start_update, schedule)
             .expect("canonical draw at another start");
         let bytes = adaptive_generation_json(&rewritten);
         let path = generation_path(&directory, generation);
@@ -233,10 +234,10 @@ fn real_start_controls_scale_and_global_boundary_forces_clean_draw() {
     let early = early_success_then_boundary(&directory, &mut checkpoint);
     assert_eq!(
         (early.start_update, early.scale_bp, early.start_game),
-        (2, 5_000, 16)
+        (2, 5_000, 2)
     );
-    assert_eq!((early.end_game, early.applied_games), (80, 48));
-    let fixed = draw_generation(SEED, 1, 16, GAMES, schedule(&checkpoint, AnnealScale::FULL))
+    assert_eq!((early.end_game, early.applied_games), (10, 6));
+    let fixed = draw_generation(SEED, 1, 2, schedule(&checkpoint, AnnealScale::FULL))
         .expect("same generation ordinal and actual start");
     assert_eq!(early.deltas, fixed.deltas);
     assert_eq!(checkpoint.state, pending(2, 8));
@@ -259,8 +260,8 @@ fn snapshots_label_bounds_and_chain_a_length_framed_digest() {
     let json: serde_json::Value = serde_json::from_slice(&first).expect("canonical JSON");
     assert_eq!(json["schema"], "drysua-domain-randomization/adaptive-v3");
     assert_eq!(json["start_update"], 0);
-    assert_eq!(json["end_game_bound"], 160);
-    assert_eq!(json["applied_games_bound"], 128);
+    assert_eq!(json["end_game_bound"], 20);
+    assert_eq!(json["applied_games_bound"], 16);
     assert!(json.get("end_game").is_none());
     assert!(json.get("applied_games").is_none());
     let mut previous = [0; 32];
@@ -289,7 +290,7 @@ fn tampered_body_and_active_start_fail_without_changing_commitment() {
             checkpoint.state.start_update = 6;
         } else {
             let stored = std::fs::read_to_string(&path).expect("canonical snapshot");
-            let changed = stored.replace("\"end_game_bound\":160", "\"end_game_bound\":159");
+            let changed = stored.replace("\"end_game_bound\":20", "\"end_game_bound\":19");
             assert_ne!(stored, changed);
             std::fs::write(&path, changed).expect("tampered body with valid start prefix");
         }
@@ -309,30 +310,14 @@ fn tampered_body_and_active_start_fail_without_changing_commitment() {
 fn invalid_draw_creates_nothing_and_a_valid_draw_creates_the_directory() {
     let directory = crate::ppo::test_directory("adaptive-snapshots");
     let child = directory.join("snapshots");
-    for (count, games, field) in [
-        (
-            MAX_TRAINING_COUNTER + 1,
-            GAMES,
-            "adaptive randomization snapshot count is invalid",
-        ),
-        (
-            0,
-            0,
-            "adaptive randomization games per update must be in 1..=MAX_TRAINING_COUNTER",
-        ),
-    ] {
-        let mut checkpoint = checkpoint();
-        checkpoint.snapshot_count = count;
-        let original = checkpoint;
-
-        let error =
-            draw_adaptive_generation(&child, SEED, games, &mut checkpoint, AnnealScale::FULL)
-                .expect_err("invalid inputs");
-
-        assert_config_error(error, field);
-        assert_eq!(checkpoint, original);
-        assert!(!child.exists(), "{field}");
-    }
+    let mut invalid = checkpoint();
+    invalid.snapshot_count = MAX_TRAINING_COUNTER + 1;
+    let original = invalid;
+    let error = draw_adaptive_generation(&child, SEED, &mut invalid, AnnealScale::FULL)
+        .expect_err("invalid snapshot count");
+    assert_config_error(error, "adaptive randomization snapshot count is invalid");
+    assert_eq!(invalid, original);
+    assert!(!child.exists());
     let mut checkpoint = checkpoint();
     draw(&child, SEED, &mut checkpoint).expect("fresh directory");
     assert!(child.is_dir());

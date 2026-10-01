@@ -366,33 +366,29 @@ impl GenerationDraw {
 
 /// Derives one generation's modifier from the run seed and the schedule.
 ///
-/// `games_per_generation` and `games_per_update` map the generation back to
-/// its first game and update so the scale is the one the generation started
-/// under. A zero scale draws nothing and returns a nominal spec; a generation
-/// crossing into the zero window records how many of its games still carry
-/// the draw.
+/// A "game" of the snapshot format is one update's collection, so
+/// `games_per_generation` maps the generation back to its first update and
+/// the scale is the one the generation started under. A zero scale draws
+/// nothing and returns a nominal spec; a generation crossing into the zero
+/// window records how many of its updates still carry the draw.
 pub fn draw_generation(
     seed: u64,
     generation: u64,
     games_per_generation: u64,
-    games_per_update: u64,
     schedule: AnnealSchedule,
 ) -> Result<GenerationDraw, PpoError> {
     assert!(games_per_generation > 0);
-    assert!(games_per_update > 0);
     let start_game = generation
         .checked_mul(games_per_generation)
         .ok_or(PpoError::CounterOverflow)?;
     let end_game = start_game
         .checked_add(games_per_generation)
         .ok_or(PpoError::CounterOverflow)?;
-    let start_update = start_game / games_per_update;
+    let start_update = start_game;
     let scale_bp = schedule.scale_bp(start_update);
-    let zero_from_game = schedule
-        .zero_from_update()
-        .checked_mul(games_per_update)
-        .ok_or(PpoError::CounterOverflow)?;
-    let applied_games = end_game.min(zero_from_game).saturating_sub(start_game);
+    let applied_games = end_game
+        .min(schedule.zero_from_update())
+        .saturating_sub(start_game);
     let (deltas, spec) = draw_modifiers(seed, generation, scale_bp)?;
     Ok(GenerationDraw {
         generation,
@@ -413,26 +409,16 @@ pub(crate) fn draw_generation_at_start(
     seed: u64,
     generation: u64,
     start_update: u64,
-    games_per_update: u64,
     schedule: AnnealSchedule,
 ) -> Result<GenerationDraw, PpoError> {
-    if games_per_update == 0 || start_update >= schedule.updates {
+    if start_update >= schedule.updates {
         return Err(PpoError::InvalidConfig(
-            "adaptive randomization draw requires positive games and a start before total updates",
+            "adaptive randomization draw requires a start before total updates",
         ));
     }
-    let start_game = start_update
-        .checked_mul(games_per_update)
-        .ok_or(PpoError::CounterOverflow)?;
-    let end_game = schedule
-        .updates
-        .checked_mul(games_per_update)
-        .ok_or(PpoError::CounterOverflow)?;
-    let applied_games = schedule
-        .zero_from_update()
-        .saturating_sub(start_update)
-        .checked_mul(games_per_update)
-        .ok_or(PpoError::CounterOverflow)?;
+    let start_game = start_update;
+    let end_game = schedule.updates;
+    let applied_games = schedule.zero_from_update().saturating_sub(start_update);
     let scale_bp = schedule.scale_bp(start_update);
     let (deltas, spec) = draw_modifiers(seed, generation, scale_bp)?;
     debug_assert!(start_game < end_game);
@@ -626,7 +612,7 @@ pub fn write_generation_snapshots(
     for draw in draws {
         write_generation_file(directory, draw)?;
     }
-    crate::checkpoint::sync_directory(directory)
+    crate::durability::sync_directory(directory)
         .map_err(|error| PpoError::Model(format!("randomization snapshot commit: {error}")))
 }
 
@@ -667,7 +653,6 @@ pub fn verify_generation_snapshots(
     directory: &Path,
     seed: u64,
     games_per_generation: u64,
-    games_per_update: u64,
     schedule: AnnealSchedule,
     completed_games: u64,
 ) -> Result<u64, PpoError> {
@@ -680,13 +665,7 @@ pub fn verify_generation_snapshots(
         if start_game >= completed_games {
             return Ok(generation);
         }
-        let draw = draw_generation(
-            seed,
-            generation,
-            games_per_generation,
-            games_per_update,
-            schedule,
-        )?;
+        let draw = draw_generation(seed, generation, games_per_generation, schedule)?;
         let path = generation_path(directory, generation);
         let stored = read_snapshot(&path)?;
         if stored != generation_json(&draw) {

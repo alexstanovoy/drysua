@@ -12,6 +12,7 @@ pub(crate) fn sync_directory(directory: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+#[cfg(any(feature = "builtin", test))]
 /// Why a bounded read of a regular file was refused.
 #[derive(Debug)]
 pub(crate) enum RegularFileError {
@@ -27,6 +28,7 @@ pub(crate) enum RegularFileError {
     Io(std::io::Error),
 }
 
+#[cfg(any(feature = "builtin", test))]
 /// Reads a regular file of at most `limit` bytes without following a symlink at
 /// its last component. The opened handle is checked again, so a link swapped in
 /// between the check and the open is refused too.
@@ -70,6 +72,7 @@ pub(crate) fn read_regular_file(path: &Path, limit: u64) -> Result<Vec<u8>, Regu
     Ok(bytes)
 }
 
+#[cfg(any(feature = "builtin", test))]
 /// Whether `directory` exists as a real directory; a symlink or any other entry
 /// there is `NotRegular`.
 pub(crate) fn real_directory_exists(directory: &Path) -> Result<bool, RegularFileError> {
@@ -81,6 +84,7 @@ pub(crate) fn real_directory_exists(directory: &Path) -> Result<bool, RegularFil
     }
 }
 
+#[cfg(any(feature = "builtin", test))]
 /// Whether anything, a dangling symlink included, occupies `path`.
 pub(crate) fn entry_exists(path: &Path) -> std::io::Result<bool> {
     match std::fs::symlink_metadata(path) {
@@ -90,6 +94,7 @@ pub(crate) fn entry_exists(path: &Path) -> std::io::Result<bool> {
     }
 }
 
+#[cfg(any(feature = "builtin", test))]
 fn missing_or_io(error: std::io::Error) -> RegularFileError {
     if error.kind() == std::io::ErrorKind::NotFound {
         RegularFileError::Missing

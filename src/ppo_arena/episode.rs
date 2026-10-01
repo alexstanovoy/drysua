@@ -37,9 +37,9 @@ pub(super) const CONTINUE_STRIDE: usize = crate::MAP2_CONTINUE_STRIDE;
 /// Behaviour statistics of the decision that began the open retained interval.
 pub(super) struct RetainedChoice {
     pub(super) frame: FeatureFrame,
-    pub(super) target: BehavioralTarget,
+    pub(super) target: ActionHeadTargets,
     /// The shadow rule policy's label of the same decision, when this game has one.
-    pub(super) shadow: Option<BehavioralTarget>,
+    pub(super) shadow: Option<ActionHeadTargets>,
     pub(super) action: StructuredAction,
     /// Policy version (completed updates) of the actor weights that sampled it.
     pub(super) behaviour: u64,

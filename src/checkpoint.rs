@@ -375,7 +375,7 @@ impl TrainingArtifact {
         write_immutable(&generation, &tensor_bytes)?;
         replace_file(&directory.join(RUNTIME_TENSOR_FILE), &runtime_bytes)?;
         replace_file(&directory.join(CHECKPOINT_META_FILE), &manifest_bytes)?;
-        sync_directory(directory)?;
+        crate::durability::sync_directory(directory)?;
         match prune_tensor_generations(directory, tensor_hash) {
             Ok(()) => Ok(CheckpointSaveOutcome::Committed),
             Err(error) => Ok(CheckpointSaveOutcome::CommittedWithCleanupError(
@@ -742,7 +742,7 @@ fn save_runtime(
     validate_tensor_values("model.parameters", parameters)?;
     let bytes = runtime::serialize(schema, parameters)?;
     replace_file(&directory.join(RUNTIME_TENSOR_FILE), &bytes)?;
-    sync_directory(directory)
+    Ok(crate::durability::sync_directory(directory)?)
 }
 
 /// Strictly decoded runtime weights, for readers without a live model.
@@ -1442,16 +1442,4 @@ fn artifact_name(path: &Path) -> Result<&str, CheckpointError> {
     path.file_name()
         .and_then(|name| name.to_str())
         .ok_or(CheckpointError::InvalidManifest("artifact filename"))
-}
-
-#[cfg(not(windows))]
-pub(crate) fn sync_directory(directory: &Path) -> Result<(), CheckpointError> {
-    File::open(directory)?.sync_all()?;
-    Ok(())
-}
-
-#[cfg(windows)]
-pub(crate) fn sync_directory(_: &Path) -> Result<(), CheckpointError> {
-    // Every Windows replacement uses MOVEFILE_WRITE_THROUGH; directories cannot be opened.
-    Ok(())
 }

@@ -1,14 +1,13 @@
 mod action;
+mod action_head_targets;
 mod adaptive_environment;
 #[cfg(any(feature = "builtin", test))]
 mod adaptive_randomization;
 #[cfg(feature = "builtin")]
 mod arena;
-mod behavioral_target;
 mod checkpoint;
 mod cli;
 mod default_deployment;
-#[cfg(any(feature = "builtin", test))]
 mod durability;
 mod feature;
 mod hero;
@@ -39,10 +38,10 @@ mod training_signals;
 mod wire;
 
 pub use action::*;
+pub use action_head_targets::*;
 pub use adaptive_environment::*;
 #[cfg(feature = "builtin")]
 pub use arena::*;
-pub use behavioral_target::*;
 pub use checkpoint::*;
 pub use cli::*;
 pub use feature::*;

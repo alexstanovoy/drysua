@@ -561,8 +561,8 @@ fn assert_routing(device: PolicyDevice) {
         let left = &selected[index];
         let right = &permuted[1 - index];
         assert_bits(
-            &[left.value, left.log_probability, left.entropy],
-            &[right.value, right.log_probability, right.entropy],
+            &[left.value, left.log_probability],
+            &[right.value, right.log_probability],
         );
         assert_eq!(greedy[index].action, selected[index].action());
         assert_eq!(
@@ -696,7 +696,7 @@ fn ppo_samples() -> Vec<PpoPreparedSample> {
         .zip(spaces)
         .enumerate()
         .map(|(stream, (frame, space))| {
-            let target = BehavioralTarget::from_action(&frame, &space, StructuredAction::Continue)
+            let target = ActionHeadTargets::from_action(&frame, &space, StructuredAction::Continue)
                 .expect("native continue target");
             PpoPreparedSample {
                 transition: crate::PpoTransition {

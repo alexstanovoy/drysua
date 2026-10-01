@@ -377,7 +377,7 @@ mod files {
         };
         for generation in 0..2 {
             let draw =
-                crate::randomization::draw_generation(9001, generation, 2, 1, schedule).unwrap();
+                crate::randomization::draw_generation(9001, generation, 2, schedule).unwrap();
             crate::randomization::write_generation_snapshots(
                 &directory,
                 std::slice::from_ref(&draw),
@@ -817,7 +817,7 @@ mod files {
                 zero_updates: 0,
                 scale: crate::randomization::AnnealScale::FULL,
             };
-            let draw = crate::randomization::draw_generation(9001, 0, 2, 1, schedule).unwrap();
+            let draw = crate::randomization::draw_generation(9001, 0, 2, schedule).unwrap();
             crate::randomization::write_generation_snapshots(
                 &directory,
                 std::slice::from_ref(&draw),
@@ -837,7 +837,6 @@ mod files {
         crate::adaptive_randomization::draw_adaptive_generation(
             directory,
             9001,
-            1,
             checkpoint,
             crate::randomization::AnnealScale::FULL,
         )
@@ -852,7 +851,6 @@ mod files {
         crate::adaptive_randomization::draw_adaptive_generation(
             directory,
             9001,
-            1,
             &mut orphan,
             crate::randomization::AnnealScale::FULL,
         )
