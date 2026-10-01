@@ -663,7 +663,28 @@ def evaluation_charts(eval_pool, value, x, snapshots, averages):
                             [series(minute, at(lambda row, minute=minute: row["leads"].get(minute, {}).get(field)))
                              for minute in eval_pool.MINUTES], x=x,
                             note="Own minus enemy at the game minute; mean over pool games."))
+    economy = lambda hero, *path: at(lambda row: dig(row["economy"][hero], *path))
+    for field in eval_pool.ECONOMY_FIELDS:
+        charts.append(chart(f"End {field}", "lines",
+                            [series(hero, economy(hero, "end", field)) for hero in ("own", "enemy")], x=x,
+                            note="Per hero at the end of the game; mean over pool games."))
+    charts.append(chart("Own hero places", "lines",
+                        [series(place, at(lambda row, place=place: percent_of(dig(row["economy"]["own"], "places", place))))
+                         for place in eval_pool.PLACES],
+                        unit="%", x=x, domain=[0, 100], note="Share of game ticks after the pregame."))
     return charts
+
+
+def percent_of(share):
+    return None if share is None else 100 * share
+
+
+def dig(value, *path):
+    for key in path:
+        if value is None:
+            return None
+        value = value.get(key)
+    return value
 
 
 def dashboard_data(report, model, window, refresh):

@@ -128,6 +128,46 @@ fn evaluation_end_reasons_agree_with_final_state() {
     }
 }
 
+/// Teacher last-hits and buys; every game tick after the pregame places each hero once.
+#[test]
+fn evaluation_economy_sees_teacher_farm_and_places_every_tick() {
+    let mut teacher_last_hits = 0;
+    for (game, summary) in batched_games() {
+        let json = summary.json();
+        for hero in ["own", "enemy"] {
+            let places = json[hero]["spending"]["places"]
+                .as_object()
+                .expect("places");
+            let placed: u64 = places
+                .values()
+                .map(|ticks| ticks.as_u64().expect("ticks"))
+                .sum();
+            assert_eq!(
+                placed,
+                u64::from(summary.ticks - crate::MAP2_PREGAME_TICKS + 1),
+                "{game:?}"
+            );
+            assert!(
+                json[hero]["economy"]["net_worth"]
+                    .as_i64()
+                    .expect("net worth")
+                    > 0
+            );
+        }
+        if game.opponent == 0 {
+            let teacher = &json["enemy"];
+            teacher_last_hits += teacher["economy"]["last_hits"].as_u64().expect("last hits");
+            assert!(
+                !teacher["spending"]["items_bought"]
+                    .as_object()
+                    .expect("items")
+                    .is_empty()
+            );
+        }
+    }
+    assert!(teacher_last_hits > 0);
+}
+
 /// The dashboard reads the `key=value` log line; it must carry every JSON field.
 #[test]
 fn episode_summary_log_carries_every_evaluation_field() {
@@ -138,6 +178,7 @@ fn episode_summary_log_carries_every_evaluation_field() {
             .map(|field| field.split_once('=').expect("key=value"))
             .collect();
         let json = summary.json();
+        let mut leads = 0;
         for key in ["side", "outcome", "end_reason"] {
             assert_eq!(fields[key], json[key], "{key}");
         }
@@ -167,8 +208,25 @@ fn episode_summary_log_carries_every_evaluation_field() {
                 let field = format!("{hero}_raze_mode_{mode}");
                 assert_eq!(fields[field.as_str()], count.to_string(), "{field}");
             }
+            for (key, value) in expected["economy"].as_object().expect("economy") {
+                let field = format!("{hero}_{key}");
+                assert_eq!(fields[field.as_str()], value.to_string(), "{field}");
+            }
+            for (place, ticks) in expected["spending"]["places"].as_object().expect("places") {
+                let field = format!("{hero}_ticks_{place}");
+                assert_eq!(fields[field.as_str()], ticks.to_string(), "{field}");
+            }
+            for (minute, standing) in expected["minutes"].as_object().expect("minutes") {
+                if standing.is_null() {
+                    continue;
+                }
+                for key in ["net_worth", "last_hits"] {
+                    let field = format!("{hero}_{key}_{minute}");
+                    assert_eq!(fields[field.as_str()], standing[key].to_string(), "{field}");
+                    leads += 1;
+                }
+            }
         }
-        let mut leads = 0;
         for (minute, lead) in json["leads"].as_object().expect("leads") {
             let Some(lead) = lead.as_object() else {
                 continue;
@@ -180,7 +238,7 @@ fn episode_summary_log_carries_every_evaluation_field() {
             }
         }
         assert!(leads > 0, "every game lasts past the first milestone");
-        assert_eq!(fields.len(), 4 + 2 * 14 + leads);
+        assert_eq!(fields.len(), 4 + 2 * (14 + 6 + 5) + leads);
     }
 }
 

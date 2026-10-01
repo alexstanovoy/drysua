@@ -13,6 +13,7 @@ mod eval_players;
 mod evaluation;
 pub(crate) use eval_players::{PlayerSpec, read_pool};
 pub(crate) use evaluation::{EvaluationSettings, run_evaluation};
+mod economy;
 mod game_summary;
 mod guidance;
 pub use guidance::{ImitationSchedule, TrainingGuidance};

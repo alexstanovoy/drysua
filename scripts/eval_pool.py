@@ -35,8 +35,14 @@ SCRIPT = re.compile(r"[a-z][a-z-]{0,31}")
 SIDES = ("radiant", "dire")
 OUTCOMES = ("win", "loss", "draw")
 END_REASONS = ("tower", "deaths", "timecap", "draw")
-LEAD_FIELDS = ("xp", "gold", "deaths", "tower_bp", "hp_bp")
-MINUTES = ("2m", "3m", "5m")
+LEAD_FIELDS = ("xp", "gold", "deaths", "tower_bp", "hp_bp", "last_hits", "denies", "net_worth")
+MINUTES = ("2m", "3m", "5m", "10m")
+ECONOMY_FIELDS = ("last_hits", "denies", "gold_earned", "net_worth")
+PLACES = ("dead", "fountain", "base", "lane", "enemy_base")
+# Display names of bota item ids (bota-client catalog); others print as their id.
+ITEM_NAMES = {0: "boots", 1: "clarity", 2: "salve", 3: "branch", 5: "quell", 7: "tango", 8: "tp", 9: "circlet",
+              11: "slippers", 12: "mantle", 13: "belt", 19: "gloves", 29: "treads", 32: "bracer", 33: "wraith",
+              34: "null", 35: "stick", 36: "wand", 42: "mango"}
 MAX_STORE_FILES = 10000
 MAX_FILE_BYTES = 64 * 1024 * 1024
 MAX_STORE_BYTES = 1024 ** 3
@@ -279,7 +285,8 @@ def summarize(games, roles):
                                                   for game in everything) for reason in END_REASONS}
                             for outcome in OUTCOMES},
             "raze_hero_hit_rate": {hero: raze_rate(everything, hero) for hero in ("own", "enemy")},
-            "leads": leads(everything)}
+            "leads": leads(everything),
+            "economy": {hero: economy(everything, hero) for hero in ("own", "enemy")}}
 
 
 def record(games):
@@ -316,6 +323,44 @@ def leads(games):
                           "ahead_xp_win_rate": sum(lead["outcome"] == "win" for lead in ahead) / len(ahead)
                           if ahead else None}
     return result
+
+
+def economy(games, hero):
+    """Mean farming, spending and places of one hero; games from before the economy fields are skipped."""
+    games = [game[hero] for game in games if "economy" in game[hero]]
+    if not games:
+        return None
+    mean = lambda values: sum(values) / len(values) if values else None
+    minutes = {minute: {field: mean([game["minutes"][minute][field] for game in games if game["minutes"].get(minute)])
+                        for field in ECONOMY_FIELDS} for minute in MINUTES}
+    per_item = lambda kind: {ITEM_NAMES.get(int(item), item): sum(game["spending"][kind].get(item, 0)
+                                                                  for game in games) / len(games)
+                             for item in sorted({item for game in games for item in game["spending"][kind]}, key=int)}
+    placed = sum(sum(game["spending"]["places"].values()) for game in games)
+    return {"games": len(games), "end": {field: mean([game["economy"][field] for game in games])
+                                         for field in ECONOMY_FIELDS},
+            "minutes": minutes, "items_bought": per_item("items_bought"),
+            "consumables_used": per_item("consumables_used"),
+            "places": {place: sum(game["spending"]["places"][place] for game in games) / placed if placed else None
+                       for place in PLACES}}
+
+
+def economy_lines(value):
+    lines = []
+    for hero, summary in value.items():
+        if not summary:
+            continue
+        end = summary["end"]
+        lines.append(f"  {hero} economy (n={summary['games']}): end " + " ".join(
+            f"{field} {end[field]:.1f}" for field in ECONOMY_FIELDS) + "; " + " ".join(
+            f"{minute} lh {at['last_hits']:.1f} nw {at['net_worth']:.0f}"
+            for minute, at in summary["minutes"].items() if at["net_worth"] is not None))
+        lines.append(f"    bought/game " + (", ".join(f"{item} {count:.2f}" for item, count in
+                                                     summary["items_bought"].items()) or "nothing") +
+                     "; used/game " + (", ".join(f"{item} {count:.2f}" for item, count in
+                                                 summary["consumables_used"].items()) or "nothing"))
+        lines.append("    places " + " ".join(f"{place} {percent(share)}" for place, share in summary["places"].items()))
+    return lines
 
 
 def ratings(results, anchor, names):
@@ -417,6 +462,7 @@ def format_report(value):
             lines.append(f"  lead at {minute} (n={lead['games']}): " +
                          " ".join(f"{field} {lead[field]:+.1f}" for field in LEAD_FIELDS) +
                          f"; win {percent(lead['ahead_xp_win_rate'])} when ahead in XP (n={lead['ahead_xp_games']})")
+        lines.extend(economy_lines(candidate["economy"]))
     return "\n".join(lines)
 
 
