@@ -31,6 +31,12 @@ pub const MAX_TRACKED_ENTITIES: usize = 4_096;
 pub const MAX_PROJECTILES: usize = 4_096;
 /// Maximum number of ground items in one snapshot.
 pub const MAX_LOOT: usize = 16;
+/// World units a projectile may lie past each map edge. Bodies, loot and trees
+/// stay on open ground, but bota flies straight-line effects to their full reach
+/// from an in-map caster without clamping: Meat Hook 1300 (and its chain links),
+/// Requiem lines 1000, raze marks 700. The margin covers the longest of them with
+/// headroom while still rejecting corrupt coordinates.
+pub const PROJECTILE_MAP_MARGIN: i32 = 2_048;
 /// Number of fixed Shadow Fiend ability slots.
 pub const SHADOW_FIEND_ABILITY_SLOTS: usize = 6;
 /// Maximum number of ability slots accepted for another visible hero.
@@ -376,13 +382,13 @@ pub enum TrackerError {
     ZeroTerrainRun(usize),
     /// An opaque cell was outside the terrain grid.
     OpaqueCellOutOfRange { x: u16, y: u16, cells: u32 },
-    /// A geometry input was outside the fixed-point map extent.
+    /// A geometry input was outside its allowed fixed-point extent.
     PositionOutOfMap {
         field: &'static str,
         index: usize,
         x_raw: i32,
         y_raw: i32,
-        maximum_raw: i64,
+        extent: RawExtent,
     },
     /// Snapshot viewer was absent or belonged to a different team.
     WrongViewer(Option<Team>, Team),
@@ -502,10 +508,11 @@ impl fmt::Display for TrackerError {
                 index,
                 x_raw,
                 y_raw,
-                maximum_raw,
+                extent,
             } => write!(
                 formatter,
-                "{field}[{index}] position raw ({x_raw}, {y_raw}) is outside 0..={maximum_raw}"
+                "{field}[{index}] position raw ({x_raw}, {y_raw}) is outside {}..={}",
+                extent.minimum, extent.maximum
             ),
             _ => self.fmt_snapshot(formatter),
         }
@@ -1401,7 +1408,7 @@ fn validate_static_inputs(info: &MatchInfo) -> Result<(), TrackerError> {
     validate_positions(
         "MatchInfo.trees",
         &info.trees,
-        map_maximum_raw(info.terrain_cells),
+        RawExtent::map(info.terrain_cells),
     )?;
     for entry in &info.shop {
         check_limit(
@@ -1969,27 +1976,56 @@ pub(crate) fn validate_event_batch_limit(event_count: usize) -> Result<(), Track
 }
 
 fn validate_snapshot_positions(cells: u32, view: &WorldView) -> Result<(), TrackerError> {
-    let maximum = map_maximum_raw(cells);
+    let map = RawExtent::map(cells);
     for (index, unit) in view.units.iter().enumerate() {
-        validate_position("WorldView.units", index, unit.pos, maximum)?;
+        validate_position("WorldView.units", index, unit.pos, map)?;
     }
+    let flight = map.widened(PROJECTILE_MAP_MARGIN);
     for (index, projectile) in view.projectiles.iter().enumerate() {
-        validate_position("WorldView.projectiles", index, projectile.pos, maximum)?;
+        validate_position("WorldView.projectiles", index, projectile.pos, flight)?;
     }
-    validate_positions("WorldView.planted_trees", &view.planted_trees, maximum)?;
+    validate_positions("WorldView.planted_trees", &view.planted_trees, map)?;
     for (index, loot) in view.loot.iter().enumerate() {
-        validate_position("WorldView.loot", index, loot.pos, maximum)?;
+        validate_position("WorldView.loot", index, loot.pos, map)?;
     }
     Ok(())
+}
+
+/// Inclusive raw fixed-point bounds shared by both axes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RawExtent {
+    minimum: i64,
+    maximum: i64,
+}
+
+impl RawExtent {
+    fn map(cells: u32) -> Self {
+        Self {
+            minimum: 0,
+            maximum: map_maximum_raw(cells),
+        }
+    }
+
+    fn widened(self, units: i32) -> Self {
+        let margin = i64::from(units) * i64::from(Fixed::ONE.raw);
+        Self {
+            minimum: self.minimum - margin,
+            maximum: self.maximum + margin,
+        }
+    }
+
+    fn contains(self, raw: i32) -> bool {
+        (self.minimum..=self.maximum).contains(&i64::from(raw))
+    }
 }
 
 fn validate_positions(
     field: &'static str,
     positions: &[Vec2],
-    maximum: i64,
+    extent: RawExtent,
 ) -> Result<(), TrackerError> {
     for (index, position) in positions.iter().enumerate() {
-        validate_position(field, index, *position, maximum)?;
+        validate_position(field, index, *position, extent)?;
     }
     Ok(())
 }
@@ -1998,17 +2034,15 @@ fn validate_position(
     field: &'static str,
     index: usize,
     position: Vec2,
-    maximum: i64,
+    extent: RawExtent,
 ) -> Result<(), TrackerError> {
-    let x = i64::from(position.x.raw);
-    let y = i64::from(position.y.raw);
-    if x < 0 || y < 0 || x > maximum || y > maximum {
+    if !extent.contains(position.x.raw) || !extent.contains(position.y.raw) {
         return Err(TrackerError::PositionOutOfMap {
             field,
             index,
             x_raw: position.x.raw,
             y_raw: position.y.raw,
-            maximum_raw: maximum,
+            extent,
         });
     }
     Ok(())

@@ -1,6 +1,6 @@
 use bota_proto::{
-    AbilityId, DamageKind, EntityId, EventKind, Fixed, MapId, MatchInfo, SlotId, Team, UnitKind,
-    Vec2, WorldView,
+    AbilityId, Angle, DamageKind, EntityId, EventKind, Fixed, MapId, MatchInfo, ProjectileView,
+    SlotId, Team, UnitKind, Vec2, WorldView,
 };
 
 use super::fixtures;
@@ -107,6 +107,50 @@ fn snapshot_position_accepts_last_raw_coordinate_but_rejects_the_next_transactio
         "WorldView.units[0] position raw (33554432, 33554431) is outside 0..=33554431"
     );
     assert!(baseline.matches_tracker(&tracker));
+}
+
+/// Regression: bota flies requiem lines, hooks and raze marks to full reach from
+/// a caster at the map edge; eval seed 1000016 died on a requiem line 6 units
+/// west of the map (raw x -388850). Bodies stay strictly on the map.
+#[test]
+fn projectiles_may_fly_past_the_map_edge_within_the_reach_margin() {
+    let margin = crate::PROJECTILE_MAP_MARGIN * Fixed::ONE.raw;
+    let mut tracker = new_tracker();
+    for (tick, x_raw) in [(1, -388_850), (2, -margin), (3, 33_554_431 + margin)] {
+        let mut view = world_view(tick);
+        view.projectiles = vec![projectile(Vec2 {
+            x: Fixed { raw: x_raw },
+            y: Fixed { raw: 1_310_720 },
+        })];
+        tracker
+            .observe_snapshot(&view)
+            .expect("projectile within reach");
+    }
+    let mut view = world_view(4);
+    view.projectiles = vec![projectile(Vec2 {
+        x: Fixed { raw: -margin - 1 },
+        y: Fixed { raw: 1_310_720 },
+    })];
+    assert_eq!(
+        tracker
+            .observe_snapshot(&view)
+            .expect_err("projectile beyond reach")
+            .to_string(),
+        "WorldView.projectiles[0] position raw (-134217729, 1310720) is outside -134217728..=167772159"
+    );
+}
+
+fn projectile(pos: Vec2) -> ProjectileView {
+    ProjectileView {
+        id: EntityId {
+            idx: 900,
+            generation: 1,
+        },
+        pos,
+        facing: Angle { brads: 0 },
+        team: Team::Radiant,
+        ability: Some(AbilityId(16)),
+    }
 }
 
 #[test]
