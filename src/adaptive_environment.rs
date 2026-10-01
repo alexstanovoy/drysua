@@ -14,6 +14,10 @@ const _: () = assert!(MAX_TRAINING_COUNTER < u64::MAX);
 const _: () =
     assert!(MAX_TRAINING_COUNTER as u128 * EnvironmentDecimal::SCALE as u128 <= u64::MAX as u128);
 
+/// Updates by which collection trails the adaptive controller: a generation opened
+/// after update `u` is first drawn for update `u + ADAPTIVE_COLLECTION_LAG`.
+pub(crate) const ADAPTIVE_COLLECTION_LAG: u64 = 1;
+
 /// Unsigned fixed-point decimal in millionths; rate and extension bounds are checked by config
 /// validation. Text is at most 27 ASCII bytes with up to six fractional digits; signs,
 /// whitespace, exponents, and a trailing point are rejected.

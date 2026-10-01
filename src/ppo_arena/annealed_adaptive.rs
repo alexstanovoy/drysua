@@ -90,7 +90,6 @@ pub(super) fn preflight_resume(
             crate::adaptive_randomization::verify_adaptive_snapshots(
                 &directory.join(RANDOMIZATION_DIRECTORY),
                 settings.seed,
-                1,
                 &actual,
                 settings.scale,
             )
@@ -110,7 +109,6 @@ pub(super) fn verified_generation_count(
         crate::adaptive_randomization::verify_adaptive_snapshots(
             directory,
             settings.seed,
-            1,
             &checkpoint,
             settings.scale,
         )?;
@@ -120,7 +118,6 @@ pub(super) fn verified_generation_count(
             directory,
             settings.seed,
             settings.generation_updates,
-            1,
             anneal_schedule(settings),
             // Collection has already drawn the generation of every pipelined update.
             state
@@ -147,7 +144,6 @@ impl GenerationCache {
             self.last = Some(crate::adaptive_randomization::draw_adaptive_generation(
                 &self.directory,
                 self.seed,
-                self.games_per_update,
                 checkpoint,
                 scale,
             )?);

@@ -26,6 +26,10 @@ mod map2_tests;
 #[path = "../tests/raze_aim.rs"]
 mod raze_aim_tests;
 
+#[cfg(test)]
+#[path = "../tests/harass_push_arena.rs"]
+mod harass_push_tests;
+
 pub(super) const TICK_CAP: u32 = crate::MAP2_TICK_CAP;
 pub(super) const ACTOR_DECISIONS: usize = crate::MAP2_ACTOR_DECISIONS;
 pub(super) const CONTINUE_STRIDE: usize = crate::MAP2_CONTINUE_STRIDE;
@@ -33,9 +37,9 @@ pub(super) const CONTINUE_STRIDE: usize = crate::MAP2_CONTINUE_STRIDE;
 /// Behaviour statistics of the decision that began the open retained interval.
 pub(super) struct RetainedChoice {
     pub(super) frame: FeatureFrame,
-    pub(super) target: BehavioralTarget,
+    pub(super) target: ActionHeadTargets,
     /// The shadow rule policy's label of the same decision, when this game has one.
-    pub(super) shadow: Option<BehavioralTarget>,
+    pub(super) shadow: Option<ActionHeadTargets>,
     pub(super) action: StructuredAction,
     /// Policy version (completed updates) of the actor weights that sampled it.
     pub(super) behaviour: u64,

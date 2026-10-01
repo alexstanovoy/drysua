@@ -35,8 +35,8 @@ mod test_support;
 pub(crate) use test_support::*;
 
 use crate::{
-    ABILITY_FEATURE_TOKENS, ABILITY_FEATURES, ActionKind, ActionSpace, ActionTarget,
-    BehavioralTarget, ControlledUnit, EntityIndex, FEATURE_SCHEMA_HASH, FEATURE_SCHEMA_VERSION,
+    ABILITY_FEATURE_TOKENS, ABILITY_FEATURES, ActionHeadTargets, ActionKind, ActionSpace,
+    ActionTarget, ControlledUnit, EntityIndex, FEATURE_SCHEMA_HASH, FEATURE_SCHEMA_VERSION,
     FeatureFrame, GLOBAL_FEATURES, HISTORY_FEATURES, HISTORY_SAMPLES, HeadTarget,
     ITEM_FEATURE_TOKENS, ITEM_FEATURES, LOOT_FEATURE_TOKENS, LOOT_FEATURES, LootIndex,
     MAP_FEATURES, MAX_POLICY_HISTORY, OWN_UNIT_FEATURE_TOKENS, POINT_FEATURE_TOKENS,
@@ -81,7 +81,7 @@ pub const MODEL_POINT_POINTER_HEAD: usize = 64;
 /// Maximum checked Adam optimizer step.
 pub const MODEL_MAX_OPTIMIZER_STEP: u64 = 1_000_000_000;
 /// Number of policy heads that carry per-action labels.
-pub const MODEL_BEHAVIORAL_HEADS: usize = 12;
+pub const MODEL_ACTION_HEADS: usize = 12;
 
 const UNIT_HIDDEN: usize = 64;
 const UNIT_EMBEDDING: usize = 128;
@@ -310,7 +310,7 @@ pub enum ModelError {
     NonFiniteParameter {
         index: usize,
     },
-    BehavioralTarget {
+    ActionHeadTargets {
         head: &'static str,
         label: usize,
     },
@@ -371,7 +371,7 @@ impl fmt::Display for ModelError {
             | Self::NonFiniteFrame { .. }
             | Self::ParameterLength { .. }
             | Self::NonFiniteParameter { .. }
-            | Self::BehavioralTarget { .. } => self.fmt_input(formatter),
+            | Self::ActionHeadTargets { .. } => self.fmt_input(formatter),
             Self::InvalidAdamConfig(_)
             | Self::OptimizerVectorLength { .. }
             | Self::OptimizerStepOverflow
@@ -428,9 +428,9 @@ impl ModelError {
             Self::NonFiniteParameter { index } => {
                 write!(formatter, "model parameter {index} is non-finite")
             }
-            Self::BehavioralTarget { head, label } => write!(
+            Self::ActionHeadTargets { head, label } => write!(
                 formatter,
-                "model behavioral target label {label} is illegal for head {head}"
+                "model action head label {label} is illegal for head {head}"
             ),
             _ => self.fmt_runtime(formatter),
         }
@@ -3476,38 +3476,34 @@ struct SampledPathLogits {
 }
 
 impl SampledPathLogits {
-    fn statistics(&self, target: &BehavioralTarget) -> Result<(f32, f32), ModelError> {
+    fn log_probability(&self, target: &ActionHeadTargets) -> Result<f32, ModelError> {
         macro_rules! add_head {
-            ($logp:ident, $entropy:ident, $field:ident) => {
-                let (head_logp, head_entropy) =
-                    sampled_head_statistics(self.$field.as_ref(), &target.$field)?;
-                $logp += head_logp;
-                $entropy += head_entropy;
+            ($logp:ident, $field:ident) => {
+                $logp += sampled_head_log_probability(self.$field.as_ref(), &target.$field)?;
             };
         }
-        let (mut log_probability, mut entropy) =
-            sampled_head_statistics(self.kind.as_ref(), &target.kind)?;
-        add_head!(log_probability, entropy, controlled);
-        add_head!(log_probability, entropy, ability);
-        add_head!(log_probability, entropy, item);
-        add_head!(log_probability, entropy, swap);
-        add_head!(log_probability, entropy, learn);
-        add_head!(log_probability, entropy, shop);
-        add_head!(log_probability, entropy, loot);
-        add_head!(log_probability, entropy, target_mode);
-        add_head!(log_probability, entropy, put_mode);
-        add_head!(log_probability, entropy, entity_pointer);
-        add_head!(log_probability, entropy, point_pointer);
-        Ok((log_probability, entropy))
+        let mut log_probability = sampled_head_log_probability(self.kind.as_ref(), &target.kind)?;
+        add_head!(log_probability, controlled);
+        add_head!(log_probability, ability);
+        add_head!(log_probability, item);
+        add_head!(log_probability, swap);
+        add_head!(log_probability, learn);
+        add_head!(log_probability, shop);
+        add_head!(log_probability, loot);
+        add_head!(log_probability, target_mode);
+        add_head!(log_probability, put_mode);
+        add_head!(log_probability, entity_pointer);
+        add_head!(log_probability, point_pointer);
+        Ok(log_probability)
     }
 }
 
-fn host_head_statistics<const WIDTH: usize>(
+fn host_head_log_probability<const WIDTH: usize>(
     logits: &[f32],
     target: &HeadTarget<WIDTH>,
-) -> Result<(f32, f32), ModelError> {
+) -> Result<f32, ModelError> {
     if !target.active {
-        return Ok((0.0, 0.0));
+        return Ok(0.0);
     }
     if logits.len() != WIDTH || !target.is_selected_legal() {
         return Err(ModelError::InvalidModelState("policy statistics head"));
@@ -3524,28 +3520,18 @@ fn host_head_statistics<const WIDTH: usize>(
         .filter_map(|(value, legal)| legal.then_some((*value - maximum).exp()))
         .sum::<f32>();
     let log_normalizer = maximum + sum.ln();
-    let log_probability = logits[target.selected] - log_normalizer;
-    let entropy = logits
-        .iter()
-        .zip(target.mask)
-        .filter(|(_, legal)| *legal)
-        .map(|(value, _)| {
-            let log_probability = *value - log_normalizer;
-            -log_probability.exp() * log_probability
-        })
-        .sum();
-    Ok((log_probability, entropy))
+    Ok(logits[target.selected] - log_normalizer)
 }
 
-fn sampled_head_statistics<const WIDTH: usize>(
+fn sampled_head_log_probability<const WIDTH: usize>(
     logits: Option<&[f32; WIDTH]>,
     target: &HeadTarget<WIDTH>,
-) -> Result<(f32, f32), ModelError> {
+) -> Result<f32, ModelError> {
     if !target.active {
-        return Ok((0.0, 0.0));
+        return Ok(0.0);
     }
     let logits = logits.ok_or(ModelError::InvalidModelState("missing sampled head"))?;
-    host_head_statistics(logits, target)
+    host_head_log_probability(logits, target)
 }
 
 fn decode_batch_rows(
@@ -3585,13 +3571,12 @@ fn finish_sampled_row(
     statistics: bool,
 ) -> Result<SampledRow, ModelError> {
     let statistics = if statistics {
-        let target = BehavioralTarget::from_sampled_action(space, selection.action)
+        let target = ActionHeadTargets::from_sampled_action(space, selection.action)
             .map_err(|error| ModelError::Backend(error.to_string()))?;
-        let (log_probability, entropy) = selection.observed.statistics(&target)?;
+        let log_probability = selection.observed.log_probability(&target)?;
         Some(SampledStatistics {
             target,
             log_probability,
-            entropy,
         })
     } else {
         None
@@ -3615,11 +3600,10 @@ pub struct SampledRow {
     pub statistics: Option<SampledStatistics>,
 }
 
-/// Behavioural target and old-policy statistics of one sampled row.
+/// Action head targets and old-policy statistics of one sampled row.
 pub struct SampledStatistics {
-    pub target: BehavioralTarget,
+    pub target: ActionHeadTargets,
     pub log_probability: f32,
-    pub entropy: f32,
 }
 
 struct SamplingDecoder<'logits, 'rng> {

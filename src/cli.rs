@@ -481,6 +481,28 @@ fn run_train_annealed_with_settings(
         )
         .map_err(std::io::Error::other)?;
     }
+    log_annealed_start(&arguments, &settings);
+    let report = crate::run_annealed_job_on_with_initial_weights(
+        settings,
+        device,
+        &arguments.checkpoint.checkpoint_directory,
+        arguments.checkpoint.resume,
+        arguments.checkpoint.initial_weights.as_deref(),
+        report_training_checkpoint,
+    )
+    .map_err(std::io::Error::other)?;
+    log_annealed_report(&report);
+    if crate::training_signals::stop_requested() {
+        crate::telemetry::log_line!(
+            "level=INFO event=training_stopped reason=signal completed_updates={}",
+            report.completed_updates
+        );
+    }
+    Ok(())
+}
+
+#[cfg(feature = "builtin")]
+fn log_annealed_start(arguments: &TrainAnnealedArgs, settings: &crate::AnnealedJobConfig) {
     if arguments.seed.is_none() {
         crate::telemetry::log_line!(
             "annealed: seed {} resolved from {}; recorded in the run scope",
@@ -506,15 +528,10 @@ fn run_train_annealed_with_settings(
         settings.seed,
         settings.opponents,
     );
-    let report = crate::run_annealed_job_on_with_initial_weights(
-        settings,
-        device,
-        &arguments.checkpoint.checkpoint_directory,
-        arguments.checkpoint.resume,
-        arguments.checkpoint.initial_weights.as_deref(),
-        report_training_checkpoint,
-    )
-    .map_err(std::io::Error::other)?;
+}
+
+#[cfg(feature = "builtin")]
+fn log_annealed_report(report: &crate::AnnealedJobReport) {
     crate::telemetry::log_line!(
         "annealed training complete: starting fingerprint {:016x}, {} updates, {} samples, {} games, {} generations, optimizer step {}, terminal wins {}, terminal losses {}, terminal draws {}, ticks {}, episode timeouts {}",
         report.starting_policy_fingerprint,
@@ -532,13 +549,6 @@ fn run_train_annealed_with_settings(
     report
         .map2_reward
         .log("invocation", report.completed_updates);
-    if crate::training_signals::stop_requested() {
-        crate::telemetry::log_line!(
-            "level=INFO event=training_stopped reason=signal completed_updates={}",
-            report.completed_updates
-        );
-    }
-    Ok(())
 }
 
 #[cfg(feature = "builtin")]
@@ -608,18 +618,7 @@ impl TrainAnnealedArgs {
         simulator_commit: String,
     ) -> std::io::Result<crate::AnnealedJobConfig> {
         let environment_schedule = self.environment_schedule()?;
-        if self.updates == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "annealed updates must be positive",
-            ));
-        }
-        if self.generation_updates == 0 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "annealed generation updates must be positive",
-            ));
-        }
+        self.validate_update_counts()?;
         let scale = self.environment_scale()?;
         let zero_updates = self
             .zero_updates
@@ -638,14 +637,7 @@ impl TrainAnnealedArgs {
             self.resolved_collection_shape(cores, simulation_threads)?;
         Ok(crate::AnnealedJobConfig {
             environment_schedule,
-            execution: crate::TrainingExecutionOptions {
-                balanced_minibatches: self.balanced_minibatches,
-                kl_guard: match self.kl_guard {
-                    KlGuardArg::PostStep => crate::KlGuard::PostStep,
-                    KlGuardArg::EarlyStop => crate::KlGuard::EarlyStop,
-                },
-                training_microbatch: self.training_microbatch,
-            },
+            execution: self.execution_options(),
             updates: self.updates,
             invocation_updates: self.invocation_updates,
             history: self.checkpoint.history()?,
@@ -681,6 +673,33 @@ impl TrainAnnealedArgs {
             git_commit,
             simulator_commit,
         })
+    }
+
+    fn validate_update_counts(&self) -> std::io::Result<()> {
+        if self.updates == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "annealed updates must be positive",
+            ));
+        }
+        if self.generation_updates == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "annealed generation updates must be positive",
+            ));
+        }
+        Ok(())
+    }
+
+    fn execution_options(&self) -> crate::TrainingExecutionOptions {
+        crate::TrainingExecutionOptions {
+            balanced_minibatches: self.balanced_minibatches,
+            kl_guard: match self.kl_guard {
+                KlGuardArg::PostStep => crate::KlGuard::PostStep,
+                KlGuardArg::EarlyStop => crate::KlGuard::EarlyStop,
+            },
+            training_microbatch: self.training_microbatch,
+        }
     }
 
     /// Slots, lanes and simulation groups: explicit, adopted from the recorded

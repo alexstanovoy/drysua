@@ -201,7 +201,6 @@ impl PolicyModel {
                     action: row.action,
                     policy,
                     log_probability: statistics.log_probability,
-                    entropy: statistics.entropy,
                     value: row.value,
                 })
             })
@@ -236,20 +235,19 @@ impl PolicyModel {
             observed: Some(SampledPathLogits::default()),
         };
         let action = decode_from_source(space, &mut source)?;
-        let target = BehavioralTarget::from_action(frame, space, action)
+        let target = ActionHeadTargets::from_action(frame, space, action)
             .map_err(|error| ModelError::Backend(error.to_string()))?;
-        let (log_probability, entropy) = source
+        let log_probability = source
             .observed
             .as_ref()
             .ok_or(ModelError::InvalidModelState("sampled path logits"))?
-            .statistics(&target)?;
+            .log_probability(&target)?;
         Ok(PpoPolicyChoice {
             frame: frame.clone(),
             target,
             action,
             policy: self.policy_identity_locked(),
             log_probability,
-            entropy,
             value,
         })
     }

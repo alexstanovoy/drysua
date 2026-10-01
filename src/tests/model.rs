@@ -451,7 +451,7 @@ fn staged_update_rejects_invalid_rows_and_any_nonfinite_output_without_mutation(
     invalid[64].transition.target.kind.selected = MODEL_KIND_HEAD;
     assert_eq!(
         update(&invalid, &mut adam),
-        "model behavioral target label 16 is illegal for head kind"
+        "model action head label 16 is illegal for head kind"
     );
     assert_eq!(model.coherent_snapshot(&adam).expect("unchanged"), before);
     model.poison_item_head_for_test().expect("poison");

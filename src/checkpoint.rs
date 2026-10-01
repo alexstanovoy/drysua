@@ -33,17 +33,17 @@ use crate::{
 
 pub use adaptive::AdaptiveEnvironmentCheckpoint;
 
-const CHECKPOINT_MAGIC: &[u8; 8] = b"DRYCKP21";
+const CHECKPOINT_MAGIC: &[u8; 8] = b"DRYCKP22";
 /// Version of the strict on-disk tensor and manifest contract.
-pub const CHECKPOINT_SCHEMA_VERSION: u32 = 21;
+pub const CHECKPOINT_SCHEMA_VERSION: u32 = 22;
 /// Canonical strict checkpoint contract descriptor.
 pub const CHECKPOINT_SCHEMA_DESCRIPTOR: &str = concat!(
-    "bota-drysua-checkpoint/v21;linked_schemas=action,feature,model,ppo;linked_hash=fnv1a_descriptor_then_ordered_version_le32_hash_le64_then_map2_reward_version_le32;files=checkpoint.meta,drysua.weights.safetensors,immutable_sha256_tensor_generation;",
+    "bota-drysua-checkpoint/v22;linked_schemas=action,feature,model,ppo;linked_hash=fnv1a_descriptor_then_ordered_version_le32_hash_le64_then_map2_reward_version_le32;files=checkpoint.meta,drysua.weights.safetensors,immutable_sha256_tensor_generation;",
     "tensors=model.parameters,adam.first_moment,adam.second_moment,actor.parameters_f32,collection.state_u8_bounded;dtype=f32_except_collection_state;runtime=one_named_f32_tensor_per_model_parameter_in_export_order;runtime_metadata=action_feature_model_ppo_schema_hashes,ppo_schema_version,ppo_rules_audit_version,map2_reward_version;load=exact_names_shapes_dtype_finite_schema_sha256;",
     "initialization=runtime_weights_same_name_and_shape_tensors_reused_others_fresh,optimizer_progress_rng=fresh;",
     "manifest=magic_version_hash_linked_schemas_then_git_simulator_features_command_seed_map_hero_device_batch_rules32_then_progress_rng_curriculum_league_then_ppo_config_trainer_updates_optimizer_step_shuffle_rng_tensor_sha256_then_adaptive_presence_u8_and_optional152_byte_block,no_trailing_bytes,max65536;",
     "progress=committed_rollout_samples_le_updates_times_samples_per_update_plus_two_per_max_slot;collection_v3=next_update_actor_version_spec_opponent_mixture_pfsp_outcome_window_league_snapshot_fingerprints_learned_potential_window_models_and_replayable_in_flight_slot_games_with_potential_version;league=runtime_weights_under_league_u_update_written_once_pruned_after_commit;",
-    "adaptive_block=le64_success_updates_success_rate_millionths_poor_updates_poor_rate_millionths_extension_millionths_base_updates_total_updates_zero_updates_generation_start_update_updates_in_generation_success_streak_poor_streak_extension_awards_snapshot_count_then_snapshot_sha256_raw32;adaptive_scope=train-annealed_only_no_league_exact_config_scope_suffix_last_once;",
+    "adaptive_block=le64_success_updates_success_rate_millionths_poor_updates_poor_rate_millionths_extension_millionths_base_updates_total_updates_zero_updates_generation_start_update_updates_in_generation_success_streak_poor_streak_extension_awards_snapshot_count_then_snapshot_sha256_raw32;adaptive_scope=train-annealed_only_exact_config_scope_suffix_last_once;adaptive_snapshots=one_per_generation_drawn,generation_opened_for_final_update_never_drawn;",
     "save=immutable_generation_then_runtime_then_manifest_rename,one_fsync_per_file_then_one_directory_fsync;"
 );
 /// Ordered linked schema identities captured in every checkpoint manifest.
@@ -375,7 +375,7 @@ impl TrainingArtifact {
         write_immutable(&generation, &tensor_bytes)?;
         replace_file(&directory.join(RUNTIME_TENSOR_FILE), &runtime_bytes)?;
         replace_file(&directory.join(CHECKPOINT_META_FILE), &manifest_bytes)?;
-        sync_directory(directory)?;
+        crate::durability::sync_directory(directory)?;
         match prune_tensor_generations(directory, tensor_hash) {
             Ok(()) => Ok(CheckpointSaveOutcome::Committed),
             Err(error) => Ok(CheckpointSaveOutcome::CommittedWithCleanupError(
@@ -742,7 +742,7 @@ fn save_runtime(
     validate_tensor_values("model.parameters", parameters)?;
     let bytes = runtime::serialize(schema, parameters)?;
     replace_file(&directory.join(RUNTIME_TENSOR_FILE), &bytes)?;
-    sync_directory(directory)
+    Ok(crate::durability::sync_directory(directory)?)
 }
 
 /// Strictly decoded runtime weights, for readers without a live model.
@@ -1442,16 +1442,4 @@ fn artifact_name(path: &Path) -> Result<&str, CheckpointError> {
     path.file_name()
         .and_then(|name| name.to_str())
         .ok_or(CheckpointError::InvalidManifest("artifact filename"))
-}
-
-#[cfg(not(windows))]
-pub(crate) fn sync_directory(directory: &Path) -> Result<(), CheckpointError> {
-    File::open(directory)?.sync_all()?;
-    Ok(())
-}
-
-#[cfg(windows)]
-pub(crate) fn sync_directory(_: &Path) -> Result<(), CheckpointError> {
-    // Every Windows replacement uses MOVEFILE_WRITE_THROUGH; directories cannot be opened.
-    Ok(())
 }

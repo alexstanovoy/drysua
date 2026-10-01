@@ -105,7 +105,7 @@ finite parameters and moments, optimizer/RNG bounds, and control-plane consisten
 It intentionally does not call the pathname-reopening loader or restore a model:
 inspection reads are anchored to owned Linux directory descriptors.
 
-A commit (checkpoint v21) writes the immutable `checkpoint.<tensor-sha>.safetensors`,
+A commit (checkpoint v22) writes the immutable `checkpoint.<tensor-sha>.safetensors`,
 the runtime export and last the manifest, each through a synced temporary file and
 a rename, then syncs the directory once. The manifest names the only authoritative
 tensor file; there is no alias copy or `.previous` fallback, and an unsafe manifest

@@ -117,15 +117,15 @@ fn scale_ramp_pins_literal_values() {
 
 #[test]
 fn draws_map_to_their_games_update_scale_and_applied_games() {
-    // Schedule (4, 1) with 4 games per generation and 2 per update: games 0..6 carry rules.
+    // One game per update; schedule (4, 1) with 2 per generation: games 0..3 carry rules.
     for (generation, schedule, games, expected, applies) in [
-        (0, schedule(4, 1), (4, 2), (0, 4, 0, 4), true),
-        (1, schedule(4, 1), (4, 2), (4, 8, 2, 2), true),
-        (2, schedule(4, 1), (4, 2), (8, 12, 4, 0), false),
-        (5, schedule(64, 8), (6, 10), (30, 36, 3, 6), true),
-        (0, schedule(4, 4), (2, 2), (0, 2, 0, 0), false),
+        (0, schedule(4, 1), 2, (0, 2, 0, 2), true),
+        (1, schedule(4, 1), 2, (2, 4, 2, 1), true),
+        (2, schedule(4, 1), 2, (4, 6, 4, 0), false),
+        (5, schedule(64, 8), 6, (30, 36, 30, 6), true),
+        (0, schedule(4, 4), 2, (0, 2, 0, 0), false),
     ] {
-        let draw = draw_generation(3, generation, games.0, games.1, schedule).expect("draw");
+        let draw = draw_generation(3, generation, games, schedule).expect("draw");
         let case = format!("generation {generation} of {schedule:?}");
         assert_eq!(
             (
@@ -153,10 +153,10 @@ fn draws_map_to_their_games_update_scale_and_applied_games() {
 #[test]
 fn draws_are_deterministic_in_the_seed_and_generation() {
     let schedule = schedule(100, 20);
-    let first = draw_generation(7, 3, 4, 8, schedule).expect("first draw");
-    let second = draw_generation(7, 3, 4, 8, schedule).expect("second draw");
-    let other_seed = draw_generation(8, 3, 4, 8, schedule).expect("other seed");
-    let other_generation = draw_generation(7, 4, 4, 8, schedule).expect("other generation");
+    let first = draw_generation(7, 3, 4, schedule).expect("first draw");
+    let second = draw_generation(7, 3, 4, schedule).expect("second draw");
+    let other_seed = draw_generation(8, 3, 4, schedule).expect("other seed");
+    let other_generation = draw_generation(7, 4, 4, schedule).expect("other generation");
     assert_eq!(first, second);
     assert_ne!(first.spec, other_seed.spec);
     assert_ne!(first.spec, other_generation.spec);
@@ -176,7 +176,7 @@ fn every_delta_stays_inside_its_variable_bounds_up_to_the_maximum_scale() {
             zero_updates: 80,
             scale,
         };
-        let draw = draw_generation(0x5eed, generation, 4, 8, schedule).expect("draw");
+        let draw = draw_generation(0x5eed, generation, 4, schedule).expect("draw");
         for (index, variable) in VARIABLES.iter().enumerate() {
             let delta = draw.deltas[index];
             assert!(
@@ -193,14 +193,16 @@ fn every_delta_stays_inside_its_variable_bounds_up_to_the_maximum_scale() {
 
 #[test]
 fn per_variable_spread_matches_the_declared_sigma() {
-    // Every generation starts in update 0, so every draw is at full scale.
-    let schedule = schedule(2_000_000, 0);
+    // A flat full-scale ramp, so every draw is at full scale.
+    let schedule = AnnealSchedule {
+        scale: scale(NOMINAL_BP, NOMINAL_BP),
+        ..schedule(2_000_000, 0)
+    };
     let mut sums = [0i64; VARIABLES.len()];
     let mut squares = [0i64; VARIABLES.len()];
     let count = 2_000i64;
     for generation in 0..count as u64 {
-        let draw = draw_generation(0x5eed_5eed, generation, 1, 1_000_000, schedule)
-            .expect("full-scale draw");
+        let draw = draw_generation(0x5eed_5eed, generation, 1, schedule).expect("full-scale draw");
         assert_eq!(draw.scale_bp, NOMINAL_BP);
         for (index, delta) in draw.deltas.iter().enumerate() {
             let delta = i64::from(*delta);
@@ -228,18 +230,18 @@ fn per_variable_spread_matches_the_declared_sigma() {
 
 #[test]
 fn generation_json_matches_a_golden_vector() {
-    let schedule = schedule(10, 2);
-    let draw = draw_generation(0x5eed_1234, 3, 4, 8, schedule).expect("draw");
+    let schedule = schedule(40, 8);
+    let draw = draw_generation(0x5eed_1234, 3, 4, schedule).expect("draw");
     assert_eq!(generation_json(&draw), GOLDEN_GENERATION);
 }
 
-const GOLDEN_GENERATION: &str = "{\"schema\":\"drysua-domain-randomization/v2\",\"generation\":3,\"start_game\":12,\"end_game\":16,\"start_update\":1,\"scale_bp\":6465,\"applied_games\":4,\"deltas\":{\"max_hp\":-2949,\"gold_income\":0,\"max_mana\":0,\"physical_damage\":3683,\"magic_damage\":386,\"pure_damage\":2325,\"magic_resist\":581,\"status_resist\":0,\"move_speed\":153,\"mana_cost_rate\":-1042,\"cooldown_rate\":-941},\"spec\":{\"max_hp\":7051,\"gold_income\":10000,\"max_mana\":10000,\"physical_damage\":13683,\"magic_damage\":10386,\"pure_damage\":12325,\"magic_resist\":581,\"status_resist\":0,\"move_speed\":10153,\"mana_cost_rate\":8958,\"cooldown_rate\":9059},\"hash\":\"fc8dbde7bc2fff27\"}\n";
+const GOLDEN_GENERATION: &str = "{\"schema\":\"drysua-domain-randomization/v2\",\"generation\":3,\"start_game\":12,\"end_game\":16,\"start_update\":12,\"scale_bp\":3877,\"applied_games\":4,\"deltas\":{\"max_hp\":-1768,\"gold_income\":0,\"max_mana\":0,\"physical_damage\":2208,\"magic_damage\":231,\"pure_damage\":1394,\"magic_resist\":348,\"status_resist\":0,\"move_speed\":92,\"mana_cost_rate\":-625,\"cooldown_rate\":-565},\"spec\":{\"max_hp\":8232,\"gold_income\":10000,\"max_mana\":10000,\"physical_damage\":12208,\"magic_damage\":10231,\"pure_damage\":11394,\"magic_resist\":348,\"status_resist\":0,\"move_speed\":10092,\"mana_cost_rate\":9375,\"cooldown_rate\":9435},\"hash\":\"9ac73daf2c0c3f5b\"}\n";
 
 #[test]
 fn a_written_snapshot_is_verified_and_a_changed_file_is_rejected() {
     let directory = test_directory("snapshots");
     let schedule = schedule(20, 4);
-    let draw = draw_generation(5, 1, 4, 8, schedule).expect("draw");
+    let draw = draw_generation(5, 1, 4, schedule).expect("draw");
     write_generation_snapshots(&directory, std::slice::from_ref(&draw)).expect("first write");
     write_generation_snapshots(&directory, std::slice::from_ref(&draw)).expect("rewrite matches");
     let path = generation_path(&directory, 1);
@@ -257,11 +259,11 @@ fn resume_verification_covers_started_generations_and_rejects_any_changed_chain(
     let directory = test_directory("resume");
     let schedule = schedule(40, 8);
     for generation in 0..3 {
-        let draw = draw_generation(21, generation, 4, 8, schedule).expect("draw");
+        let draw = draw_generation(21, generation, 4, schedule).expect("draw");
         write_generation_snapshots(&directory, std::slice::from_ref(&draw)).expect("write");
     }
     assert_eq!(
-        verify_generation_snapshots(&directory, 21, 4, 8, schedule, 8),
+        verify_generation_snapshots(&directory, 21, 4, schedule, 8),
         Ok(2)
     );
     let rescaled = AnnealSchedule {
@@ -281,17 +283,64 @@ fn resume_verification_covers_started_generations_and_rejects_any_changed_chain(
         ("different scale", 21, rescaled, 8, mismatch),
     ] {
         assert_eq!(
-            verify_generation_snapshots(&directory, seed, 4, 8, schedule, completed_games),
+            verify_generation_snapshots(&directory, seed, 4, schedule, completed_games),
             Err(PpoError::InvalidConfig(message)),
             "{name}"
         );
     }
     std::fs::write(generation_path(&directory, 0), "x".repeat(5 * 1024)).expect("oversize");
     assert_eq!(
-        verify_generation_snapshots(&directory, 21, 4, 8, schedule, 8),
+        verify_generation_snapshots(&directory, 21, 4, schedule, 8),
         Err(PpoError::InvalidConfig(
             "domain randomization snapshot is oversized"
         ))
+    );
+}
+
+/// Regression: the fixed schedule followed snapshot and directory symlinks the
+/// adaptive schedule refuses.
+#[cfg(unix)]
+#[test]
+fn symlinked_snapshots_and_directories_are_refused_without_following() {
+    use std::os::unix::fs::symlink;
+
+    let directory = test_directory("snapshot-links");
+    let schedule = schedule(20, 4);
+    let draw = draw_generation(5, 0, 4, schedule).expect("draw");
+    write_generation_snapshots(&directory, std::slice::from_ref(&draw)).expect("write");
+    let path = generation_path(&directory, 0);
+    let target = directory.join("target.json");
+    std::fs::rename(&path, &target).expect("move snapshot");
+    symlink(&target, &path).expect("link snapshot");
+    let regular = Some(PpoError::InvalidConfig(
+        "domain randomization snapshot must be a regular file",
+    ));
+    assert_eq!(
+        write_generation_snapshots(&directory, std::slice::from_ref(&draw)).err(),
+        regular
+    );
+    assert_eq!(
+        verify_generation_snapshots(&directory, 5, 4, schedule, 1).err(),
+        regular
+    );
+    assert!(
+        std::fs::symlink_metadata(&path)
+            .expect("link kept")
+            .is_symlink()
+    );
+    std::fs::rename(&target, &path).expect("restore snapshot");
+    let link = directory.join("directory-link");
+    symlink(&*directory, &link).expect("link directory");
+    let real_directory = Some(PpoError::InvalidConfig(
+        "domain randomization directory must be a real directory",
+    ));
+    assert_eq!(
+        write_generation_snapshots(&link, std::slice::from_ref(&draw)).err(),
+        real_directory
+    );
+    assert_eq!(
+        verify_generation_snapshots(&link, 5, 4, schedule, 1).err(),
+        real_directory
     );
 }
 

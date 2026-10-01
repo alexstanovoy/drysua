@@ -9,9 +9,9 @@ use std::error::Error;
 use std::fmt;
 
 use crate::{
-    ACTION_SCHEMA_HASH, ACTION_SCHEMA_VERSION, AdamConfig, AdamState, BehavioralTarget,
+    ACTION_SCHEMA_HASH, ACTION_SCHEMA_VERSION, ActionHeadTargets, AdamConfig, AdamState,
     FEATURE_SCHEMA_HASH, FEATURE_SCHEMA_VERSION, FeatureFrame, MODEL_MAX_BATCH, MODEL_SCHEMA_HASH,
-    MODEL_SCHEMA_VERSION, PackedBehavioralTarget, PolicyModel, RaggedFeatureArena,
+    MODEL_SCHEMA_VERSION, PackedActionHeadTargets, PolicyModel, RaggedFeatureArena,
     RaggedFeatureHeader, StagedPpoBatch, StructuredAction,
 };
 
@@ -374,9 +374,9 @@ fn open_unit_from_bits(bits: u64) -> f64 {
 #[derive(Clone, Debug)]
 pub struct PpoTransition {
     pub(crate) frame: FeatureFrame,
-    pub(crate) target: BehavioralTarget,
+    pub(crate) target: ActionHeadTargets,
     /// A shadow rule policy's label of the same decision, for the imitation term.
-    pub(crate) shadow: Option<BehavioralTarget>,
+    pub(crate) shadow: Option<ActionHeadTargets>,
     pub(crate) action: StructuredAction,
     /// Completed updates of the actor weights that sampled `action`.
     pub(crate) behaviour: u64,
@@ -433,8 +433,8 @@ pub struct PpoRollout {
 
 struct CompactPpoTransition {
     frame: RaggedFeatureHeader,
-    target: PackedBehavioralTarget,
-    shadow: Option<PackedBehavioralTarget>,
+    target: PackedActionHeadTargets,
+    shadow: Option<PackedActionHeadTargets>,
     action: StructuredAction,
     behaviour: u64,
     stream: usize,
@@ -488,7 +488,7 @@ impl PpoRollout {
         self.transitions.push(CompactPpoTransition {
             frame,
             target: transition.target.pack(),
-            shadow: transition.shadow.as_ref().map(BehavioralTarget::pack),
+            shadow: transition.shadow.as_ref().map(ActionHeadTargets::pack),
             action: transition.action,
             behaviour: transition.behaviour,
             stream: transition.stream,
@@ -569,9 +569,9 @@ pub struct ImitationReport {
     /// Labeled rows whose legal argmax matches the label on every labeled head.
     pub action_agreements: f64,
     /// Per head: labeled rows whose legal argmax matches the label.
-    pub head_agreements: [f64; crate::MODEL_BEHAVIORAL_HEADS],
+    pub head_agreements: [f64; crate::MODEL_ACTION_HEADS],
     /// Per head: rows the label defines.
-    pub head_labels: [f64; crate::MODEL_BEHAVIORAL_HEADS],
+    pub head_labels: [f64; crate::MODEL_ACTION_HEADS],
 }
 
 impl ImitationReport {
@@ -579,7 +579,7 @@ impl ImitationReport {
         self.cross_entropy += other.cross_entropy;
         self.labeled += other.labeled;
         self.action_agreements += other.action_agreements;
-        for head in 0..crate::MODEL_BEHAVIORAL_HEADS {
+        for head in 0..crate::MODEL_ACTION_HEADS {
             self.head_agreements[head] += other.head_agreements[head];
             self.head_labels[head] += other.head_labels[head];
         }
@@ -1056,7 +1056,7 @@ fn expand_transition(
             .expand(&compact.frame)
             .map_err(PpoError::InvalidTransition)?,
         target: compact.target.unpack(),
-        shadow: compact.shadow.as_ref().map(PackedBehavioralTarget::unpack),
+        shadow: compact.shadow.as_ref().map(PackedActionHeadTargets::unpack),
         action: compact.action,
         behaviour: compact.behaviour,
         stream: compact.stream,

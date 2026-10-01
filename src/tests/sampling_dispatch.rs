@@ -104,18 +104,8 @@ fn assert_native_selection(model: &PolicyModel) {
     assert_eq!(random, reference);
     assert_eq!(actual[0].action(), expected[0].action());
     assert_eq!(
-        [
-            actual[0].value,
-            actual[0].log_probability,
-            actual[0].entropy
-        ]
-        .map(f32::to_bits),
-        [
-            expected[0].value,
-            expected[0].log_probability,
-            expected[0].entropy
-        ]
-        .map(f32::to_bits)
+        [actual[0].value, actual[0].log_probability].map(f32::to_bits),
+        [expected[0].value, expected[0].log_probability].map(f32::to_bits)
     );
     let request = spaces[0]
         .decode(actual[0].action())
@@ -171,8 +161,8 @@ fn assert_sample_parity(
         assert_eq!(actual.target, expected.target);
         assert_eq!(actual.policy(), expected.policy());
         assert_eq!(
-            [actual.value, actual.log_probability, actual.entropy].map(f32::to_bits),
-            [expected.value, expected.log_probability, expected.entropy].map(f32::to_bits)
+            [actual.value, actual.log_probability].map(f32::to_bits),
+            [expected.value, expected.log_probability].map(f32::to_bits)
         );
     }
 }

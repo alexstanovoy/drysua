@@ -2,8 +2,8 @@
 //!
 //! Teacher never walks into tower range while an enemy hero stands within 1200, so presence
 //! is the tower's defense, and Teacher stays in lane down to 40% health. HarassPush therefore:
-//! - keeps four Healing Salves and four Clarities, restocked at the home shop, and counts an
-//!   active salve as health when deciding to stop walking home;
+//! - keeps four Healing Salves and four Clarities, restocked at the home shop, and counts a
+//!   running salve or Tango heal as health when deciding to stop walking home;
 //! - hovers at 1200 from Teacher, outside its raze reach and inside its push veto, and keeps
 //!   a hero that vanished into fog where it was last seen;
 //! - fights only for a kill, when Teacher lacks raze mana (attacking it then, since it can
@@ -57,6 +57,10 @@ const CLARITY: ItemId = ItemId(1);
 /// Health a Healing Salve mends over its whole duration, and that duration.
 const SALVE_HEAL: i32 = 400;
 const SALVE_TICKS: u32 = 300;
+/// The same for a Tango from a grown tree; one from a planted tree runs twice as long
+/// at the same rate.
+const TANGO_HEAL: i32 = 115;
+const TANGO_TICKS: u32 = 480;
 const MENDING_EFFECT: EffectId = EffectId(1);
 /// Consumables are bought only this deep inside shop range, so they land in the bag.
 const SHOP_DISTANCE: i32 = 900;
@@ -84,7 +88,7 @@ const TOWER_SHY_TICKS: u32 = 150;
 
 /// Own health share that starts a walk home.
 const RETREAT_KNOB: Knob = Knob::new("retreat", 30, (5, 60), (10, 40));
-/// Own health share, counting an active salve, that ends it; hysteresis stops lane/fountain
+/// Own health share, counting a running heal, that ends it; hysteresis stops lane/fountain
 /// oscillation.
 const RETURN_KNOB: Knob = Knob::new("return", 80, (10, 100), (45, 90));
 /// Distance kept from an enemy hero: outside its raze reach and at the edge of the 1200
@@ -159,6 +163,49 @@ pub struct HarassPush {
     /// Health lost since the previous decision; creep and tower focus show up here first.
     bleeding: i32,
     tower_shy_until: u32,
+    /// The running Mending, if any.
+    mend: Option<Mend>,
+}
+
+/// A running Mending effect. Salve and Tango share the effect, so the item is told apart by
+/// the duration it is first seen with: only a Tango runs longer than a salve.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Mend {
+    heal: i32,
+    ticks: u32,
+    left: u32,
+}
+
+impl Mend {
+    /// The hero's Mending now: the previous one counting down, or a new one.
+    fn observe(previous: Option<Self>, hero: &UnitView) -> Option<Self> {
+        let left = hero
+            .effects
+            .iter()
+            .filter(|effect| effect.id == MENDING_EFFECT)
+            .filter_map(|effect| effect.ticks_left)
+            .max()?;
+        Some(match previous {
+            Some(mend) if left <= mend.left => Self { left, ..mend },
+            _ => Self::first_seen(left),
+        })
+    }
+
+    fn first_seen(left: u32) -> Self {
+        let (heal, ticks) = if left > SALVE_TICKS {
+            (TANGO_HEAL, TANGO_TICKS)
+        } else {
+            (SALVE_HEAL, SALVE_TICKS)
+        };
+        Self { heal, ticks, left }
+    }
+
+    /// Health still to come at the item's own rate; a planted Tango runs at most twice as long.
+    fn pending(self) -> i32 {
+        let left = self.left.min(2 * self.ticks);
+        i32::try_from(i64::from(self.heal) * i64::from(left) / i64::from(self.ticks))
+            .expect("bounded heal")
+    }
 }
 
 impl HarassPush {
@@ -170,6 +217,7 @@ impl HarassPush {
             last_hp: 0,
             bleeding: 0,
             tower_shy_until: 0,
+            mend: None,
         }
     }
 
@@ -236,7 +284,10 @@ impl HarassPush {
         {
             self.tower_shy_until = tick.saturating_add(TOWER_SHY_TICKS);
         }
-        let healed = hero.hp.saturating_add(pending_heal(hero));
+        self.mend = Mend::observe(self.mend, hero);
+        let healed = hero
+            .hp
+            .saturating_add(self.mend.map_or(0, |mend| mend.pending()));
         if ratio_at_most(hero.hp, hero.max_hp, self.style.retreat_percent) {
             self.retreating = true;
         } else if !ratio_below(healed, hero.max_hp, self.style.return_percent) {
@@ -756,21 +807,6 @@ fn carried(hero: &UnitView, item: ItemId) -> i32 {
         .filter(|held| held.id == item)
         .map(|held| i32::from(held.charges.unwrap_or(1)))
         .sum()
-}
-
-/// Health an active salve still mends, taking any Mending effect for a salve; the hero counts
-/// it as already healed.
-fn pending_heal(hero: &UnitView) -> i32 {
-    hero.effects
-        .iter()
-        .filter(|effect| effect.id == MENDING_EFFECT)
-        .filter_map(|effect| effect.ticks_left)
-        .map(|left| {
-            let left = i32::try_from(left.min(SALVE_TICKS)).expect("bounded ticks");
-            SALVE_HEAL * left / SALVE_TICKS as i32
-        })
-        .max()
-        .unwrap_or(0)
 }
 
 /// The enemy hero last seen near `from` a moment ago; fog does not make it leave.

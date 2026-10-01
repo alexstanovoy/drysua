@@ -7,13 +7,14 @@
 mod tests;
 
 use std::fs::{self, OpenOptions};
-use std::io::{ErrorKind, Read, Write};
+use std::io::{ErrorKind, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use sha2::{Digest, Sha256};
 
 use crate::checkpoint::AdaptiveEnvironmentCheckpoint;
+use crate::durability::RegularFileError;
 use crate::randomization::MAX_SNAPSHOT_BYTES;
 use crate::randomization::{AnnealSchedule, GenerationDraw, VARIABLES, draw_generation_at_start};
 use crate::{MAX_TRAINING_COUNTER, PpoError};
@@ -28,11 +29,10 @@ const _: () = assert!(MAX_SNAPSHOT_BYTES < usize::MAX as u64);
 pub(crate) fn verify_adaptive_snapshots(
     directory: &Path,
     seed: u64,
-    games_per_update: u64,
     checkpoint: &AdaptiveEnvironmentCheckpoint,
     scale: crate::randomization::AnnealScale,
 ) -> Result<(), PpoError> {
-    validate_checkpoint(checkpoint, games_per_update)?;
+    validate_checkpoint(checkpoint)?;
     if !validate_directory(directory)? && checkpoint.snapshot_count != 0 {
         return Err(PpoError::InvalidConfig(
             "adaptive randomization snapshot is missing",
@@ -48,13 +48,8 @@ pub(crate) fn verify_adaptive_snapshots(
                 "adaptive randomization snapshot starts are not strictly increasing from zero",
             ));
         }
-        let draw = draw_generation_at_start(
-            seed,
-            generation,
-            start_update,
-            games_per_update,
-            schedule(checkpoint, scale),
-        )?;
+        let draw =
+            draw_generation_at_start(seed, generation, start_update, schedule(checkpoint, scale))?;
         compare_snapshot(&stored, &adaptive_generation_json(&draw))?;
         hash = append_hash(hash, stored.as_bytes());
         previous_start = Some(start_update);
@@ -87,11 +82,10 @@ pub(crate) fn verify_adaptive_snapshots(
 pub(crate) fn draw_adaptive_generation(
     directory: &Path,
     seed: u64,
-    games_per_update: u64,
     checkpoint: &mut AdaptiveEnvironmentCheckpoint,
     scale: crate::randomization::AnnealScale,
 ) -> Result<GenerationDraw, PpoError> {
-    validate_checkpoint(checkpoint, games_per_update)?;
+    validate_checkpoint(checkpoint)?;
     let directory_exists = validate_directory(directory)?;
     if !directory_exists && checkpoint.snapshot_count != 0 {
         return Err(PpoError::InvalidConfig(
@@ -102,7 +96,6 @@ pub(crate) fn draw_adaptive_generation(
         seed,
         checkpoint.state.generation,
         checkpoint.state.start_update,
-        games_per_update,
         schedule(checkpoint, scale),
     )?;
     let path = generation_path(directory, draw.generation);
@@ -124,15 +117,7 @@ pub(crate) fn draw_adaptive_generation(
     Ok(draw)
 }
 
-fn validate_checkpoint(
-    checkpoint: &AdaptiveEnvironmentCheckpoint,
-    games_per_update: u64,
-) -> Result<(), PpoError> {
-    if !(1..=MAX_TRAINING_COUNTER).contains(&games_per_update) {
-        return Err(PpoError::InvalidConfig(
-            "adaptive randomization games per update must be in 1..=MAX_TRAINING_COUNTER",
-        ));
-    }
+fn validate_checkpoint(checkpoint: &AdaptiveEnvironmentCheckpoint) -> Result<(), PpoError> {
     let global_update = checkpoint
         .state
         .start_update
@@ -141,16 +126,13 @@ fn validate_checkpoint(
     checkpoint
         .state
         .validate(checkpoint.config, checkpoint.limits, global_update)?;
-    checkpoint
-        .limits
-        .total_updates
-        .checked_mul(games_per_update)
-        .ok_or(PpoError::CounterOverflow)?;
     let generation = checkpoint.state.generation;
     let count = checkpoint.snapshot_count;
     if count > MAX_TRAINING_COUNTER
         || (count != generation && count != generation + 1)
-        || (count == generation && checkpoint.state.updates_in_generation != 0)
+        || (count == generation
+            && checkpoint.state.updates_in_generation != 0
+            && checkpoint.current_generation_collected())
     {
         return Err(PpoError::InvalidConfig(
             "adaptive randomization snapshot count is invalid",
@@ -254,71 +236,30 @@ fn compare_snapshot(stored: &str, canonical: &str) -> Result<(), PpoError> {
 }
 
 fn validate_directory(directory: &Path) -> Result<bool, PpoError> {
-    match fs::symlink_metadata(directory) {
-        Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => Ok(true),
-        Ok(_) => Err(PpoError::InvalidConfig(
-            "adaptive randomization directory must be a real directory",
-        )),
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(io_error("directory metadata", error)),
-    }
+    crate::durability::real_directory_exists(directory).map_err(|error| match error {
+        RegularFileError::Io(error) => io_error("directory metadata", error),
+        _ => PpoError::InvalidConfig("adaptive randomization directory must be a real directory"),
+    })
 }
 
 fn read_snapshot(path: &Path) -> Result<String, PpoError> {
-    let metadata = fs::symlink_metadata(path).map_err(|error| {
-        if error.kind() == ErrorKind::NotFound {
-            PpoError::InvalidConfig("adaptive randomization snapshot is missing")
-        } else {
-            io_error("snapshot metadata", error)
-        }
-    })?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() {
-        return Err(PpoError::InvalidConfig(
-            "adaptive randomization snapshot must be a regular file",
-        ));
-    }
-    let mut options = OpenOptions::new();
-    options.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
-    }
-    let file = options
-        .open(path)
-        .map_err(|error| io_error("snapshot open", error))?;
-    let metadata = file
-        .metadata()
-        .map_err(|error| io_error("snapshot metadata", error))?;
-    if !metadata.is_file() || metadata.file_type().is_symlink() {
-        return Err(PpoError::InvalidConfig(
-            "adaptive randomization snapshot must be a regular file",
-        ));
-    }
-    if metadata.len() > MAX_SNAPSHOT_BYTES {
-        return Err(PpoError::InvalidConfig(
-            "adaptive randomization snapshot is oversized",
-        ));
-    }
-    let mut bytes = Vec::with_capacity(MAX_SNAPSHOT_BYTES as usize + 1);
-    file.take(MAX_SNAPSHOT_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .map_err(|error| io_error("snapshot read", error))?;
-    if bytes.len() > MAX_SNAPSHOT_BYTES as usize {
-        return Err(PpoError::InvalidConfig(
-            "adaptive randomization snapshot is oversized",
-        ));
-    }
-    if bytes.len() as u64 != metadata.len() {
-        return Err(PpoError::InvalidConfig(
-            "adaptive randomization snapshot length changed",
-        ));
-    }
+    let bytes = crate::durability::read_regular_file(path, MAX_SNAPSHOT_BYTES).map_err(
+        |error| match error {
+            RegularFileError::Missing => {
+                PpoError::InvalidConfig("adaptive randomization snapshot is missing")
+            }
+            RegularFileError::NotRegular => {
+                PpoError::InvalidConfig("adaptive randomization snapshot must be a regular file")
+            }
+            RegularFileError::Oversized => {
+                PpoError::InvalidConfig("adaptive randomization snapshot is oversized")
+            }
+            RegularFileError::Changed => {
+                PpoError::InvalidConfig("adaptive randomization snapshot length changed")
+            }
+            RegularFileError::Io(error) => io_error("snapshot read", error),
+        },
+    )?;
     String::from_utf8(bytes)
         .map_err(|_| PpoError::InvalidConfig("adaptive randomization snapshot mismatch"))
 }

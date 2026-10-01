@@ -4,7 +4,7 @@ use std::fmt;
 use bota_proto::{AbilitySlot, ItemSlot};
 
 use crate::{
-    ActionKind, ActionSpace, ActionTarget, MODEL_ABILITY_HEAD, MODEL_BEHAVIORAL_HEADS,
+    ActionKind, ActionSpace, ActionTarget, MODEL_ABILITY_HEAD, MODEL_ACTION_HEADS,
     MODEL_ENTITY_POINTER_HEAD, MODEL_ITEM_HEAD, MODEL_KIND_HEAD, MODEL_LEARN_HEAD, MODEL_LOOT_HEAD,
     MODEL_POINT_POINTER_HEAD, MODEL_SHOP_HEAD, MODEL_SWAP_HEAD, MODEL_UNIT_HEAD, ModelError,
     PutPointTarget, StructuredAction, TrainingAbilitySlot, TrainingItemSlot, TrainingPrefix,
@@ -157,7 +157,7 @@ impl<const WIDTH: usize> HeadTarget<WIDTH> {
 
 /// Label and legal mask of one action on every autoregressive policy head.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct BehavioralTarget {
+pub struct ActionHeadTargets {
     pub kind: HeadTarget<MODEL_KIND_HEAD>,
     pub controlled: HeadTarget<MODEL_UNIT_HEAD>,
     pub ability: HeadTarget<MODEL_ABILITY_HEAD>,
@@ -173,7 +173,7 @@ pub struct BehavioralTarget {
     prefix: TrainingPrefix,
 }
 
-impl BehavioralTarget {
+impl ActionHeadTargets {
     /// Labels a legal action of `space` taken at `frame`.
     #[cfg(test)]
     pub fn from_action(
@@ -502,7 +502,7 @@ impl BehavioralTarget {
     }
 }
 
-const BEHAVIORAL_MASK_BITS: usize = MODEL_KIND_HEAD
+const HEAD_MASK_BITS: usize = MODEL_KIND_HEAD
     + MODEL_UNIT_HEAD
     + MODEL_ABILITY_HEAD
     + MODEL_ITEM_HEAD
@@ -514,22 +514,22 @@ const BEHAVIORAL_MASK_BITS: usize = MODEL_KIND_HEAD
     + PUT_MODE_HEAD
     + MODEL_ENTITY_POINTER_HEAD
     + MODEL_POINT_POINTER_HEAD;
-const BEHAVIORAL_MASK_BYTES: usize = BEHAVIORAL_MASK_BITS.div_ceil(8);
+const HEAD_MASK_BYTES: usize = HEAD_MASK_BITS.div_ceil(8);
 
 #[derive(Clone, Debug)]
-pub(crate) struct PackedBehavioralTarget {
+pub(crate) struct PackedActionHeadTargets {
     active: u16,
-    selected: [u8; MODEL_BEHAVIORAL_HEADS],
-    masks: [u8; BEHAVIORAL_MASK_BYTES],
+    selected: [u8; MODEL_ACTION_HEADS],
+    masks: [u8; HEAD_MASK_BYTES],
     prefix: TrainingPrefix,
 }
 
-impl BehavioralTarget {
-    pub(crate) fn pack(&self) -> PackedBehavioralTarget {
-        let mut packed = PackedBehavioralTarget {
+impl ActionHeadTargets {
+    pub(crate) fn pack(&self) -> PackedActionHeadTargets {
+        let mut packed = PackedActionHeadTargets {
             active: 0,
-            selected: [0; MODEL_BEHAVIORAL_HEADS],
-            masks: [0; BEHAVIORAL_MASK_BYTES],
+            selected: [0; MODEL_ACTION_HEADS],
+            masks: [0; HEAD_MASK_BYTES],
             prefix: self.prefix,
         };
         let mut bit = 0usize;
@@ -545,15 +545,15 @@ impl BehavioralTarget {
         pack_head(&self.put_mode, 9, &mut bit, &mut packed);
         pack_head(&self.entity_pointer, 10, &mut bit, &mut packed);
         pack_head(&self.point_pointer, 11, &mut bit, &mut packed);
-        debug_assert_eq!(bit, BEHAVIORAL_MASK_BITS);
+        debug_assert_eq!(bit, HEAD_MASK_BITS);
         packed
     }
 }
 
-impl PackedBehavioralTarget {
-    pub(crate) fn unpack(&self) -> BehavioralTarget {
+impl PackedActionHeadTargets {
+    pub(crate) fn unpack(&self) -> ActionHeadTargets {
         let mut bit = 0usize;
-        let target = BehavioralTarget {
+        let target = ActionHeadTargets {
             kind: unpack_head(self, 0, &mut bit),
             controlled: unpack_head(self, 1, &mut bit),
             ability: unpack_head(self, 2, &mut bit),
@@ -568,7 +568,7 @@ impl PackedBehavioralTarget {
             point_pointer: unpack_head(self, 11, &mut bit),
             prefix: self.prefix,
         };
-        debug_assert_eq!(bit, BEHAVIORAL_MASK_BITS);
+        debug_assert_eq!(bit, HEAD_MASK_BITS);
         target
     }
 }
@@ -577,7 +577,7 @@ fn pack_head<const WIDTH: usize>(
     head: &HeadTarget<WIDTH>,
     head_index: usize,
     bit: &mut usize,
-    packed: &mut PackedBehavioralTarget,
+    packed: &mut PackedActionHeadTargets,
 ) {
     if head.active {
         packed.active |= 1 << head_index;
@@ -592,7 +592,7 @@ fn pack_head<const WIDTH: usize>(
 }
 
 fn unpack_head<const WIDTH: usize>(
-    packed: &PackedBehavioralTarget,
+    packed: &PackedActionHeadTargets,
     head_index: usize,
     bit: &mut usize,
 ) -> HeadTarget<WIDTH> {
@@ -636,7 +636,7 @@ fn training_item_slot(index: usize) -> Result<TrainingItemSlot, TargetError> {
     })
 }
 
-fn expected_activity(target: &BehavioralTarget, kind: ActionKind) -> [bool; 11] {
+fn expected_activity(target: &ActionHeadTargets, kind: ActionKind) -> [bool; 11] {
     let mut expected = [false; 11];
     expected[0] = kind != ActionKind::Continue && kind != ActionKind::Learn;
     match kind {

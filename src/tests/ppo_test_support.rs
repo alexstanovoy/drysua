@@ -144,10 +144,9 @@ impl PpoRng {
 #[derive(Clone, Debug)]
 pub struct PpoPolicyChoice {
     pub(crate) frame: FeatureFrame,
-    pub(crate) target: BehavioralTarget,
+    pub(crate) target: ActionHeadTargets,
     pub(crate) action: StructuredAction,
     pub(crate) policy: PolicyIdentity,
     pub(crate) log_probability: f32,
-    pub(crate) entropy: f32,
     pub(crate) value: f32,
 }

@@ -2,8 +2,8 @@ use super::{OrderPersistence, PersistenceError, record_sent_for_ledgers};
 use crate::{ActivePolicyOrder, IssuedOrder, LocalPolicyError, LocalPolicyState, StateTracker};
 use bota_proto::EntityId;
 
-/// Training-only order ledger selection. `Legacy` uses the ledger of sent requests alone;
-/// `Candidate` adds a neural ledger, copied from it before the first request and updated
+/// Training-only order ledger selection. `SentRequests` uses the ledger of sent requests
+/// alone; `Neural` adds a neural ledger, copied from it before the first request and updated
 /// from requests actually sent, not from unissued action labels or confirmed execution.
 #[allow(
     clippy::large_enum_variant,
@@ -12,27 +12,27 @@ use bota_proto::EntityId;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum PolicyOrderBookkeeping {
     #[default]
-    Legacy,
-    Candidate(OrderPersistence),
+    SentRequests,
+    Neural(OrderPersistence),
 }
 
 impl PolicyOrderBookkeeping {
-    pub(crate) fn enable_candidate(
+    pub(crate) fn enable_neural(
         &mut self,
         requests: &OrderPersistence,
     ) -> Result<(), &'static str> {
         match self {
-            Self::Candidate(_) => Ok(()),
-            Self::Legacy => {
+            Self::Neural(_) => Ok(()),
+            Self::SentRequests => {
                 self.validate_start(requests)?;
-                *self = Self::Candidate(*requests);
+                *self = Self::Neural(*requests);
                 Ok(())
             }
         }
     }
 
     fn validate_start(&self, requests: &OrderPersistence) -> Result<(), &'static str> {
-        assert!(matches!(self, Self::Legacy));
+        assert!(matches!(self, Self::SentRequests));
         if requests.last_sequence().is_some() {
             return Err("neural bookkeeping must start before the first actual request");
         }
@@ -40,21 +40,17 @@ impl PolicyOrderBookkeeping {
         Ok(())
     }
 
-    pub(crate) fn transport<'a>(&'a self, requests: &'a OrderPersistence) -> &'a OrderPersistence {
-        self.effective(requests)
-    }
-
     pub(crate) fn effective<'a>(&'a self, requests: &'a OrderPersistence) -> &'a OrderPersistence {
         match self {
-            Self::Candidate(neural) => neural,
-            Self::Legacy => requests,
+            Self::Neural(neural) => neural,
+            Self::SentRequests => requests,
         }
     }
 
     fn neural_mut(&mut self) -> Option<&mut OrderPersistence> {
         match self {
-            Self::Candidate(neural) => Some(neural),
-            Self::Legacy => None,
+            Self::Neural(neural) => Some(neural),
+            Self::SentRequests => None,
         }
     }
 

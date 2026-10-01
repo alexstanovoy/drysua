@@ -154,9 +154,9 @@ fn adaptive_scope_rejects_missing_duplicate_unbounded_or_noncanonical_tokens() {
 }
 
 #[test]
-fn adaptive_manifest_rejects_state_scope_league_and_hash_inconsistencies() {
+fn adaptive_manifest_rejects_state_scope_and_hash_inconsistencies() {
     type Change = fn(&mut TrainingArtifact);
-    let cases: [(&str, Change, &str); 6] = [
+    let cases: [(&str, Change, &str); 5] = [
         (
             "scope without state",
             |a| a.progress.adaptive_environment = None,
@@ -166,11 +166,6 @@ fn adaptive_manifest_rejects_state_scope_league_and_hash_inconsistencies() {
             "state without scope",
             |a| a.run.command_line = "train-annealed --updates 8".to_owned(),
             "adaptive environment scope suffix",
-        ),
-        (
-            "league reference",
-            |a| a.progress.league_references.push(1),
-            "adaptive environment league",
         ),
         (
             "duplicate schedule marker",
