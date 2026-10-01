@@ -23,6 +23,17 @@ pub struct AdaptiveEnvironmentCheckpoint {
     pub snapshot_hash: [u8; 32],
 }
 
+impl AdaptiveEnvironmentCheckpoint {
+    /// Whether collection ever draws the current generation. One opened for the
+    /// final update still counts that update but is never drawn or snapshotted.
+    pub(crate) fn current_generation_collected(&self) -> bool {
+        self.state
+            .start_update
+            .saturating_add(crate::adaptive_environment::ADAPTIVE_COLLECTION_LAG)
+            < self.limits.total_updates
+    }
+}
+
 pub(super) fn validate_scope(
     run: &CheckpointRun,
     progress: &CheckpointProgress,
@@ -46,11 +57,6 @@ pub(super) fn validate_scope(
     };
     checkpoint.config.validate().map_err(controller_error)?;
     checkpoint.limits.validate().map_err(controller_error)?;
-    if !progress.league_references.is_empty() {
-        return Err(CheckpointError::InvalidManifest(
-            "adaptive environment league",
-        ));
-    }
     let suffix = checkpoint.config.scope_suffix();
     let prefix = command
         .strip_suffix(&suffix)
@@ -67,10 +73,12 @@ pub(super) fn validate_scope(
         .state
         .validate(checkpoint.config, checkpoint.limits, progress.global_update)
         .map_err(controller_error)?;
+    let drawn =
+        checkpoint.state.updates_in_generation > 0 && checkpoint.current_generation_collected();
     let expected_count = checkpoint
         .state
         .generation
-        .checked_add(u64::from(checkpoint.state.updates_in_generation > 0))
+        .checked_add(u64::from(drawn))
         .ok_or(CheckpointError::InvalidManifest(
             "adaptive environment snapshot count",
         ))?;
@@ -156,14 +164,6 @@ fn validate_limits_scope(
     if !prefix.starts_with("train-annealed ") {
         return Err(CheckpointError::InvalidManifest(
             "adaptive environment command",
-        ));
-    }
-    if prefix
-        .split_ascii_whitespace()
-        .any(|token| token.starts_with("--league"))
-    {
-        return Err(CheckpointError::InvalidManifest(
-            "adaptive environment league",
         ));
     }
     for (flag, expected, field) in [

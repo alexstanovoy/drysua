@@ -181,12 +181,26 @@ fn simulation_thread_count_never_changes_training_bits() {
     assert_trajectory_equal(&directories[0], &directories[1]);
 }
 
+/// Runs under both environment schedules: the default adaptive one once failed
+/// its first checkpoint save with a league opponent.
 #[test]
 fn pfsp_league_mixtures_and_learned_potential_resume_in_flight_games_exactly() {
-    let weights = test_directory("mixed-opponent-weights");
+    let adaptive =
+        crate::EnvironmentSchedule::Adaptive(crate::AdaptiveEnvironmentConfig::default());
+    for (name, schedule) in [
+        ("fixed", crate::EnvironmentSchedule::Fixed),
+        ("adaptive", adaptive),
+    ] {
+        league_resume_scenario(name, schedule);
+    }
+}
+
+fn league_resume_scenario(name: &str, schedule: crate::EnvironmentSchedule) {
+    let weights = test_directory(&format!("mixed-opponent-weights-{name}"));
     let frozen = PolicyModel::fresh(0x0dd).expect("frozen opponent");
     TrainingArtifact::save_runtime_weights(&frozen, &weights).expect("frozen weights");
     let mut config = settings(23_074, 6);
+    config.environment_schedule = schedule;
     config.slots = 4;
     config.ppo.samples_per_update = 40;
     config.league_size = 4;
@@ -203,8 +217,8 @@ fn pfsp_league_mixtures_and_learned_potential_resume_in_flight_games_exactly() {
         (AnnealedOpponent::Weights(weights.to_path_buf()), one()),
         (AnnealedOpponent::League, one()),
     ];
-    let uninterrupted = test_directory("mixed-uninterrupted");
-    let resumed = test_directory("mixed-resumed");
+    let uninterrupted = test_directory(&format!("mixed-uninterrupted-{name}"));
+    let resumed = test_directory(&format!("mixed-resumed-{name}"));
     run(config.clone(), &uninterrupted, false).expect("uninterrupted mixture");
     let stopped = AnnealedHarness {
         stop_after: Some(4),

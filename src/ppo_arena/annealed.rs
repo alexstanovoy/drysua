@@ -44,6 +44,7 @@ use crate::{
 
 /// Updates the actor weights of a collected update lag the learner.
 pub(crate) const PIPELINE_STALENESS: u64 = 1;
+const _: () = assert!(PIPELINE_STALENESS == crate::adaptive_environment::ADAPTIVE_COLLECTION_LAG);
 /// Decisions one production annealed episode runs: the full Map2 ceiling.
 pub(crate) const ANNEALED_EPISODE_DECISIONS: usize = ACTOR_DECISIONS;
 /// Largest retained-interval target of one update.

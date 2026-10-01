@@ -135,6 +135,28 @@ fn clean_boundary_at_update_six_discards_a_long_extension_before_nominal_collect
     assert_ne!(final_state.snapshot_hash, extended.snapshot_hash);
 }
 
+/// Regression: a generation opened for the final update is counted but never
+/// drawn (collection runs one update behind), and the final save once rejected
+/// its missing snapshot.
+#[test]
+fn a_generation_opened_for_the_final_update_saves_without_a_snapshot() {
+    let directory = test_directory("adaptive-final-generation");
+    let mut config = adaptive_settings();
+    config.zero_updates = 1;
+    let fixture = outcome_harness(&[0; 8]);
+    run_with(config.clone(), fixture, &directory, false).expect("final save");
+    let last = controller(&directory);
+    assert_eq!(
+        (last.state.generation, last.state.start_update),
+        (1, 7),
+        "the zero-window boundary opens a generation for the final update"
+    );
+    assert_eq!(last.state.updates_in_generation, 1);
+    assert_eq!(last.snapshot_count, 1);
+    assert_eq!(generation_files(&directory).len(), 1);
+    run_with(config, fixture, &directory, true).expect("finished run resumes");
+}
+
 #[test]
 fn adaptive_parameter_or_future_outcome_changes_reject_before_mutating_the_training_tree() {
     let directory = test_directory("adaptive-config-mismatch");

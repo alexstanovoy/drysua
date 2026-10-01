@@ -150,7 +150,9 @@ fn validate_checkpoint(
     let count = checkpoint.snapshot_count;
     if count > MAX_TRAINING_COUNTER
         || (count != generation && count != generation + 1)
-        || (count == generation && checkpoint.state.updates_in_generation != 0)
+        || (count == generation
+            && checkpoint.state.updates_in_generation != 0
+            && checkpoint.current_generation_collected())
     {
         return Err(PpoError::InvalidConfig(
             "adaptive randomization snapshot count is invalid",
