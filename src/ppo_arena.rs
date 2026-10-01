@@ -155,8 +155,8 @@ enum OpponentRuntime {
     Neural,
     Teacher,
     HarassPush,
-    /// A rule policy drawing its styled preset from the game's arena seed.
-    Styled(ScriptKind),
+    /// A rule policy drawing its preset's style from the game's arena seed.
+    Styled(crate::StyledScript),
     /// Test fixture that always continues, keeping native worlds deterministic.
     #[cfg(test)]
     Idle,
@@ -579,9 +579,9 @@ fn build_environment(
         OpponentRuntime::HarassPush => {
             seats[1 - policy_seat].script = ScriptedPolicy::new(ScriptKind::HarassPush);
         }
-        OpponentRuntime::Styled(kind) => {
+        OpponentRuntime::Styled(script) => {
             seats[1 - policy_seat].script =
-                ScriptedPolicy::styled_preset(kind, crate::seat_seed(seed, 1 - policy_seat));
+                ScriptedPolicy::styled_preset(script, crate::seat_seed(seed, 1 - policy_seat));
         }
         _ => {}
     }

@@ -29,8 +29,8 @@ pub(crate) enum OpponentKind {
     Teacher,
     /// The HarassPush rule policy, run on the simulation worker.
     HarassPush,
-    /// A rule policy drawing its styled preset per game, run on the simulation worker.
-    Styled(ScriptKind),
+    /// A rule policy drawing its preset's style per game, run on the simulation worker.
+    Styled(crate::StyledScript),
     /// Frozen weights snapshot `index` of the run's opponent pool.
     Snapshot(usize),
     /// The actor weights the policy seat samples from.
@@ -44,7 +44,7 @@ impl OpponentKind {
         match self {
             Self::Teacher => "teacher".to_owned(),
             Self::HarassPush => "harass-push".to_owned(),
-            Self::Styled(kind) => kind.styled_label().to_owned(),
+            Self::Styled(script) => script.label().to_owned(),
             Self::Snapshot(index) => format!("weights{index}"),
             Self::SelfPlay => "self".to_owned(),
             Self::League(update) => format!("u{update:04}"),
@@ -306,7 +306,7 @@ impl Slot {
         let runtime = match plan.opponent {
             OpponentKind::Teacher => OpponentRuntime::Teacher,
             OpponentKind::HarassPush => OpponentRuntime::HarassPush,
-            OpponentKind::Styled(kind) => OpponentRuntime::Styled(kind),
+            OpponentKind::Styled(script) => OpponentRuntime::Styled(script),
             OpponentKind::Snapshot(_) | OpponentKind::SelfPlay | OpponentKind::League(_) => {
                 OpponentRuntime::Neural
             }

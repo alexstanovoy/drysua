@@ -75,6 +75,11 @@ pub(crate) const STYLE_KNOBS: [Knob; 8] = [
     Knob::new("razes_first", 1, (0, 1), (0, 1)),
 ];
 
+/// The fighter preset: walks home only near death, always right-clicks a hero in
+/// reach and chases from farther, so the learner meets a Teacher that trades back.
+pub(crate) const FIGHTER_STYLE: &str =
+    "styled,retreat=10..20,return=20..60,victim=1200..1800,harass=1,razes_first=1";
+
 /// One game's Teacher knobs, typed; see [`STYLE_KNOBS`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TeacherStyle {

@@ -2,6 +2,7 @@
 //! the fading imitation term and the candidate KL guard. Every learner path
 //! computes its losses here, from targets that already live on the learner device.
 
+use super::imitation_class::{IMITATION_CLASSES, class_weights, imitation_class};
 use super::*;
 
 /// Heads in [`PolicyTensorTensors`] order with their widths.
@@ -29,12 +30,21 @@ pub(super) struct HeadTargets {
     active: Tensor,
 }
 
+/// Shadow labels of an update that imitates, row aligned.
+struct ShadowTargets {
+    /// Every head of an unlabeled row is inactive.
+    heads: Vec<HeadTargets>,
+    /// Imitation class weight per row; zero on unlabeled rows.
+    weights: Tensor,
+    /// One-hot imitation class per row, `(rows, IMITATION_CLASSES)`; all zero unlabeled.
+    classes: Tensor,
+}
+
 /// Everything the objective needs besides the model outputs, row aligned.
 pub(super) struct ObjectiveTargets {
     heads: Vec<HeadTargets>,
-    /// Shadow labels, staged only for an update that imitates; unlabeled rows
-    /// have every head inactive.
-    shadow: Option<Vec<HeadTargets>>,
+    /// Staged only for an update that imitates.
+    shadow: Option<ShadowTargets>,
     old_log_probability: Tensor,
     advantages: Tensor,
     returns: Tensor,
@@ -51,11 +61,19 @@ struct HostHeads {
     active: [Vec<f32>; 12],
 }
 
+/// Host columns of [`ShadowTargets`]: labels, each row's imitation class and the
+/// class balance power the weights are drawn with.
+struct HostShadow {
+    heads: HostHeads,
+    classes: Vec<Option<u8>>,
+    balance: f32,
+}
+
 /// Host columns of [`ObjectiveTargets`] before one upload per tensor.
 #[derive(Default)]
 pub(super) struct HostTargets {
     heads: HostHeads,
-    shadow: Option<HostHeads>,
+    shadow: Option<HostShadow>,
     old_log_probability: Vec<f32>,
     advantages: Vec<f32>,
     returns: Vec<f32>,
@@ -63,10 +81,15 @@ pub(super) struct HostTargets {
 }
 
 impl HostTargets {
-    pub(super) fn with_capacity(rows: usize, imitation: bool) -> Self {
+    /// `imitation` is the class balance power of an update that imitates.
+    pub(super) fn with_capacity(rows: usize, imitation: Option<f32>) -> Self {
         let mut host = Self {
             heads: HostHeads::with_capacity(rows),
-            shadow: imitation.then(|| HostHeads::with_capacity(rows)),
+            shadow: imitation.map(|balance| HostShadow {
+                heads: HostHeads::with_capacity(rows),
+                classes: Vec::with_capacity(rows),
+                balance,
+            }),
             ..Self::default()
         };
         host.old_log_probability.reserve_exact(rows);
@@ -85,8 +108,17 @@ impl HostTargets {
         self.heads.push(&sample.transition.target)?;
         if let Some(shadow) = &mut self.shadow {
             match &sample.transition.shadow {
-                Some(label) => shadow.push(label)?,
-                None => shadow.push_unlabeled(),
+                Some(label) => {
+                    shadow.heads.push(label)?;
+                    let class = imitation_class(&sample.transition.frame, label);
+                    shadow
+                        .classes
+                        .push(Some(u8::try_from(class).expect("19 classes")));
+                }
+                None => {
+                    shadow.heads.push_unlabeled();
+                    shadow.classes.push(None);
+                }
             }
         }
         self.old_log_probability
@@ -111,6 +143,23 @@ impl HostTargets {
             returns: Tensor::from_vec(self.returns, rows, device)?,
             dire: Tensor::from_vec(self.dire, rows, device)?,
             rows,
+        })
+    }
+}
+
+impl HostShadow {
+    fn upload(self, rows: usize, device: &Device) -> Result<ShadowTargets, ModelError> {
+        let weights = class_weights(&self.classes, self.balance);
+        let mut classes = vec![0.0f32; rows * IMITATION_CLASSES.len()];
+        for (row, class) in self.classes.iter().enumerate() {
+            if let Some(class) = class {
+                classes[row * IMITATION_CLASSES.len() + usize::from(*class)] = 1.0;
+            }
+        }
+        Ok(ShadowTargets {
+            heads: self.heads.upload(rows, device)?,
+            weights: Tensor::from_vec(weights, rows, device)?,
+            classes: Tensor::from_vec(classes, (rows, IMITATION_CLASSES.len()), device)?,
         })
     }
 }
@@ -218,9 +267,16 @@ impl ObjectiveTargets {
                 })
                 .collect::<Result<Vec<_>, ModelError>>()
         };
+        let shadow = |shadow: &ShadowTargets| {
+            Ok::<_, ModelError>(ShadowTargets {
+                heads: gather(&shadow.heads)?,
+                weights: shadow.weights.index_select(indices, 0)?,
+                classes: shadow.classes.index_select(indices, 0)?,
+            })
+        };
         Ok(Self {
             heads: gather(&self.heads)?,
-            shadow: self.shadow.as_deref().map(gather).transpose()?,
+            shadow: self.shadow.as_ref().map(shadow).transpose()?,
             old_log_probability: self.old_log_probability.index_select(indices, 0)?,
             advantages: self.advantages.index_select(indices, 0)?,
             returns: self.returns.index_select(indices, 0)?,
@@ -315,8 +371,9 @@ pub(super) struct ObjectiveTerms {
 }
 
 /// Imitation statistics per evaluation: cross entropy, labeled rows, rows agreeing
-/// on every labeled head, then per head the agreeing and the labeled rows.
-const IMITATION_SUMS: usize = 3 + 2 * HEADS.len();
+/// on every labeled head, per head the agreeing and the labeled rows, then per
+/// imitation class the wholly agreeing and the labeled rows.
+const IMITATION_SUMS: usize = 3 + 2 * HEADS.len() + 2 * IMITATION_CLASSES.len();
 
 /// Side statistics per evaluation, over all rows and then over dire rows:
 /// rows, policy loss, value loss, entropy, approximate KL from the gradient's
@@ -368,16 +425,20 @@ pub(super) fn ppo_loss(
     let zeros = Tensor::zeros(targets.rows, DType::F32, output.value.device())?;
     let (imitation, imitation_rows) = match shadow {
         Some(shadow) => {
-            let heads = targets
+            let labels = targets
                 .shadow
-                .as_deref()
+                .as_ref()
                 .ok_or(ModelError::InvalidModelState(
                     "imitation without shadow labels",
                 ))?;
-            let (cross_entropy, sums) = imitation_terms(shadow, heads)?;
-            let mean = cross_entropy.sum_all()?.affine(1.0 / rows, 0.0)?;
+            let (cross_entropy, sums) = imitation_terms(shadow, labels)?;
+            let weighted = cross_entropy.mul(&labels.weights)?;
+            let mean = weighted.sum_all()?.affine(1.0 / rows, 0.0)?;
             loss = (&loss + &mean.affine(f64::from(objective.imitation), 0.0)?)?;
-            (sums, [cross_entropy.detach(), heads[0].active.clone()])
+            (
+                sums,
+                [cross_entropy.detach(), labels.heads[0].active.clone()],
+            )
         }
         None => (
             Tensor::zeros(IMITATION_SUMS, DType::F32, output.value.device())?,
@@ -443,13 +504,14 @@ fn head_cross_entropy(logits: &Tensor, head: &HeadTargets) -> Result<(Tensor, Te
 /// and the [`IMITATION_SUMS`] statistics of the legal argmax agreeing with them.
 fn imitation_terms(
     shadow: &PolicyTensorTensors,
-    heads: &[HeadTargets],
+    labels: &ShadowTargets,
 ) -> Result<(Tensor, Tensor), ModelError> {
+    let heads = &labels.heads;
     assert_eq!(heads.len(), HEADS.len());
     let mut cross_entropy: Option<Tensor> = None;
     let mut misses: Option<Tensor> = None;
     let mut agreements = Vec::with_capacity(HEADS.len());
-    let mut labels = Vec::with_capacity(HEADS.len());
+    let mut head_labels = Vec::with_capacity(HEADS.len());
     for ((logits, head), (_, width)) in head_logits(shadow).into_iter().zip(heads).zip(HEADS) {
         if logits.dim(1)? != width {
             return Err(ModelError::InvalidModelState("imitation head shape"));
@@ -463,7 +525,7 @@ fn imitation_terms(
             .mul(&head.active)?;
         let miss = (&head.active - &agree)?;
         agreements.push(agree.sum_all()?);
-        labels.push(head.active.sum_all()?);
+        head_labels.push(head.active.sum_all()?);
         cross_entropy = Some(match cross_entropy {
             None => loss,
             Some(total) => (total + loss)?,
@@ -487,7 +549,15 @@ fn imitation_terms(
         whole.sum_all()?,
     ];
     sums.extend(agreements);
-    sums.extend(labels);
+    sums.extend(head_labels);
+    let whole_by_class = whole.unsqueeze(0)?.matmul(&labels.classes)?.squeeze(0)?;
+    let labels_by_class = labels.classes.sum(0)?;
+    for class in 0..IMITATION_CLASSES.len() {
+        sums.push(whole_by_class.get(class)?);
+    }
+    for class in 0..IMITATION_CLASSES.len() {
+        sums.push(labels_by_class.get(class)?);
+    }
     assert_eq!(sums.len(), IMITATION_SUMS);
     Ok((cross_entropy, Tensor::stack(&sums, 0)?))
 }
@@ -520,6 +590,8 @@ pub(super) fn report_from_sums(
         unreachable!("five PPO sums");
     };
     let heads = HEADS.len();
+    let classes = IMITATION_CLASSES.len();
+    let class_base = 3 + 2 * heads;
     let rows_f = rows as f64;
     Ok(PpoMinibatchReport {
         policy_loss: f64::from(*policy) / rows_f,
@@ -537,6 +609,10 @@ pub(super) fn report_from_sums(
             action_agreements: f64::from(imitation[2]),
             head_agreements: std::array::from_fn(|head| f64::from(imitation[3 + head])),
             head_labels: std::array::from_fn(|head| f64::from(imitation[3 + heads + head])),
+            class_agreements: std::array::from_fn(|class| f64::from(imitation[class_base + class])),
+            class_labels: std::array::from_fn(|class| {
+                f64::from(imitation[class_base + classes + class])
+            }),
         },
         sides: crate::SideReport::from_sums(side),
     })

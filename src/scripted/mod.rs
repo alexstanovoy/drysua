@@ -41,23 +41,70 @@ impl ScriptKind {
         }
     }
 
-    /// Command-line spelling of the policy drawing a styled preset per game.
-    pub const fn styled_label(self) -> &'static str {
-        match self {
-            Self::Teacher => "teacher-styled",
-            Self::HarassPush => "harass-push-styled",
+    /// Parses [`Self::label`].
+    pub fn from_label(text: &str) -> Option<Self> {
+        [Self::Teacher, Self::HarassPush]
+            .into_iter()
+            .find(|kind| kind.label() == text)
+    }
+}
+
+/// The style ranges a styled rule policy draws from in every game.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StylePreset {
+    /// Every knob over its styled range.
+    Styled,
+    /// Styled, but it barely retreats and trades whenever it can: an opponent
+    /// that fights back instead of yielding the lane.
+    Fighter,
+}
+
+/// A rule policy that draws a fresh style from a preset for every game and seat.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct StyledScript {
+    pub kind: ScriptKind,
+    pub preset: StylePreset,
+}
+
+impl StyledScript {
+    pub const ALL: [Self; 4] = [
+        Self::new(ScriptKind::Teacher, StylePreset::Styled),
+        Self::new(ScriptKind::HarassPush, StylePreset::Styled),
+        Self::new(ScriptKind::Teacher, StylePreset::Fighter),
+        Self::new(ScriptKind::HarassPush, StylePreset::Fighter),
+    ];
+
+    pub const fn new(kind: ScriptKind, preset: StylePreset) -> Self {
+        Self { kind, preset }
+    }
+
+    /// Stable command-line spelling.
+    pub const fn label(self) -> &'static str {
+        match (self.kind, self.preset) {
+            (ScriptKind::Teacher, StylePreset::Styled) => "teacher-styled",
+            (ScriptKind::HarassPush, StylePreset::Styled) => "harass-push-styled",
+            (ScriptKind::Teacher, StylePreset::Fighter) => "teacher-fighter",
+            (ScriptKind::HarassPush, StylePreset::Fighter) => "harass-push-fighter",
         }
     }
 
-    /// Parses [`Self::label`] or [`Self::styled_label`]; the flag tells which.
-    pub fn parse_label(text: &str) -> Option<(Self, bool)> {
-        [Self::Teacher, Self::HarassPush]
-            .into_iter()
-            .find_map(|kind| {
-                (text == kind.label())
-                    .then_some((kind, false))
-                    .or((text == kind.styled_label()).then_some((kind, true)))
-            })
+    /// Parses [`Self::label`].
+    pub fn from_label(text: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|script| script.label() == text)
+    }
+
+    /// The knob ranges of this preset.
+    pub fn spec(self) -> StyleSpec {
+        match self.preset {
+            StylePreset::Styled => StyleSpec::styled(self.kind),
+            StylePreset::Fighter => {
+                let text = match self.kind {
+                    ScriptKind::Teacher => crate::teacher::FIGHTER_STYLE,
+                    ScriptKind::HarassPush => harass_push::FIGHTER_STYLE,
+                };
+                StyleSpec::parse(self.kind, text).expect("fighter presets name valid knobs")
+            }
+        }
     }
 }
 
@@ -91,9 +138,9 @@ impl ScriptedPolicy {
         Self::styled(kind, &StyleValues::canonical(kind), 0)
     }
 
-    /// Creates a policy of the styled preset drawn from `seed`, which also drives its noise.
-    pub fn styled_preset(kind: ScriptKind, seed: u64) -> Self {
-        Self::styled(kind, &StyleSpec::styled(kind).draw(seed), seed)
+    /// Creates a policy of the style `script` draws from `seed`, which also drives its noise.
+    pub fn styled_preset(script: StyledScript, seed: u64) -> Self {
+        Self::styled(script.kind, &script.spec().draw(seed), seed)
     }
 
     /// Creates a policy of one drawn style; `seed` also drives its random actions.

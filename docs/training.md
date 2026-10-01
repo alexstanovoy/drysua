@@ -96,7 +96,7 @@ controller owns the campaign.
 | `trainer` | required | `drysua` ELF built with `builtin` (and `cuda` for GPU) |
 | `inspector` | `trainer` | binary providing `checkpoint-inspect` |
 | `initial_weights` | none | runtime weights; tensors with the current name and shape are reused; fresh start only |
-| `opponents` | Teacher | 1..16 `{"kind", "weight"[, "path"]}`: `teacher`, `harass-push`, `teacher-styled`, `harass-push-styled`, `self`, `league` or `weights` with a `path` (frozen into `inputs/opponent-<i>/`); weights are decimal strings |
+| `opponents` | Teacher | 1..16 `{"kind", "weight"[, "path"]}`: `teacher`, `harass-push`, `teacher-styled`, `harass-push-styled`, `teacher-fighter`, `harass-push-fighter`, `self`, `league` or `weights` with a `path` (frozen into `inputs/opponent-<i>/`); weights are decimal strings |
 | `total_updates` | required | 1..10000 |
 | `history_every` | 20 | milestone spacing for `history/uNNNN/` runtime weights; exported only at checkpoints |
 | `checkpoint_seconds` | 600 | 60..86400, wall time between checkpoints (`--checkpoint-interval-seconds`) |
@@ -174,19 +174,41 @@ a resume recomputes them exactly.
   action at each retained decision becomes the sample's label (Teacher razes as
   single aimed casts, as the learner does). The loss adds `β · CE` of the policy,
   conditioned on the label's own kind, unit and slot, to the label on every head
-  the label defines; it never masks or overrides a choice. `β` moves linearly
+  the label defines; it never masks or overrides a choice. Each label is weighted
+  by its imitation class (`src/model/imitation_class.rs`: the action kind, with
+  unit attacks split into hero, enemy creep, deny and other):
+  `(N / (K · n_class))^b` over the update's `N` labels in `K` present classes,
+  normalized to mean 1 and capped at 30, with `b = --imitation-balance` (default
+  0.5; 0 weighs every label alike, 1 every class equally). Without it the many
+  moves drown the rare buys, item uses, last hits and denies that decide the
+  economy. The class weight scales only the imitation term, never the PPO
+  advantages (which carry the retention weights). `β` moves linearly
   from START at update 0 to END at update N and stays at END; with END 0 it is
   exactly zero from update N on and games starting at N carry no labels. Each
   `ppo_update` line adds `imitation_coefficient`, `imitation_loss` (mean cross
   entropy per labeled row), `imitation_labeled` and the agreement of the policy's
-  legal argmax with the label: `imitation_agree` for whole actions and
-  `imitation_agree_<head>` per head. The PPO KL guard (`--target-kl`, default
+  legal argmax with the label: `imitation_agree` for whole actions,
+  `imitation_agree_<head>` per head, and per present class
+  `imitation_class_agree_<class>` (whole actions) and `imitation_class_share_<class>`
+  (its share of the labels). The PPO KL guard (`--target-kl`, default
   0.02) measures the KL to the 1-stale behaviour policy and ends an update once a
   step starts from or reaches it; a strong imitation term moves the policy much
   faster than that, so raise it while β is large.
 - `--critic-warmup-updates K`: updates `0..K` train only the value head (read from
   the detached trunk); every other parameter keeps its bits. Useful after a change
   that invalidates the critic, e.g. new rewards or inputs.
+
+## Opponents that fight back
+
+Canonical Teacher walks home at 40% health and HarassPush keeps its distance, so a
+learner that only presses razes wins lanes no human would give up. The `fighter`
+presets (`teacher-fighter`, `harass-push-fighter`, as `--opponent` and pool
+players) draw every knob from its styled range except the ones that decide
+whether the opponent yields (`FIGHTER_STYLE` in `src/teacher.rs` and
+`src/scripted/harass_push.rs`): Teacher walks home at 10-20% and returns at
+20-60%, always right-clicks a hero in reach and chases from 1,200-1,800; HarassPush
+walks home at 5-15%, hovers 600-1,000 from the enemy and fights whenever its
+ready razes leave the enemy at or below 60-100% health. Both level razes first.
 
 ## Run scope and resume
 
@@ -252,7 +274,9 @@ python3 scripts/eval_pool.py compare --store temp/eval NEW OLD
 ```
 
 **Players** are a rule policy (`teacher`, `harass-push`, or `teacher-styled` and
-`harass-push-styled`, which draw a style per game and seat), `weights:<dir>` or
+`harass-push-styled`, which draw a style per game and seat, and `teacher-fighter`
+and `harass-push-fighter`, which draw from styles that barely retreat and trade
+back: [opponents that fight back](#opponents-that-fight-back)), `weights:<dir>` or
 `average:<dir>,<dir>,...` (the parameter mean of runtime weights: an EMA-like
 average of the latest history snapshots, `train.py eval --average K`). The **pool**
 (`drysua-eval-pool/v1`, [example](eval_pool.example.json)) lists up to 16 opponents
@@ -271,9 +295,17 @@ seeds, candidate and pool with each player's key: the rule label, the weights
 SHA-256, or a SHA-256 over an average's member hashes) and one line per game in
 `(seed, opponent, side)` order: outcome, end reason, ticks, and for both heroes
 kills, deaths, level, XP, weakest tower HP, casts, raze hero hits and raze target
-modes, plus `leads` at game minutes 2, 3 and 5 (own minus enemy XP, bounty gold,
-deaths, weakest-tower HP and hero HP in basis points; `null` if the game ended
-earlier). Stderr carries per-opponent, per-side W-L-D.
+modes, the economy (`economy`: last hits, denies, gold earned — every gain of
+unspent gold — and net worth, gold plus the shop cost of every owned item; the
+same at game minutes 2, 3, 5 and 10 in `minutes`; `spending`: items bought and
+charges used by bota item id, and game ticks `dead`, at the `fountain`, in the
+`base` behind the own middle tower, in the `lane` between the middle towers and
+past the enemy tower), plus `leads` at game minutes 2, 3, 5 and 10 (own minus
+enemy XP, bounty gold, deaths, weakest-tower HP and hero HP in basis points, last
+hits, denies and net worth; `null` if the game ended earlier). Each seat's numbers
+come from its own tracker. The episode log line carries the same per hero
+(`<own|enemy>_last_hits`, `_net_worth_<m>m`, `_ticks_<place>`, ...). Stderr
+carries per-opponent, per-side W-L-D.
 
 **Store.** `eval_pool.py` and `train.py eval` run `drysua eval` in chunks of
 `--chunk-seeds` seeds (default 16) and keep each invocation's output as one file in

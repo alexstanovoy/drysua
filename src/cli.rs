@@ -309,6 +309,11 @@ struct OptimizerArgs {
     /// Rule policy that labels the learner's retained decisions for imitation.
     #[arg(long, value_enum, requires = "imitation_coefficient")]
     imitation_shadow: Option<ShadowArg>,
+    /// Power in [0, 1] of the inverse imitation-class frequency (action kind, attacks
+    /// split into hero, creep, deny and other) each label is weighted by, so rare
+    /// buys, item uses, last hits and denies count; 0 weighs every label alike.
+    #[arg(long, default_value = "0.5", requires = "imitation_coefficient")]
+    imitation_balance: crate::EnvironmentDecimal,
     /// Updates at the start of the run that train only the critic (policy frozen).
     #[arg(long, default_value_t = 0)]
     critic_warmup_updates: u64,
@@ -870,11 +875,11 @@ fn parse_annealed_opponent(
         None if value == "teacher" => Ok((crate::AnnealedOpponent::Teacher, one)),
         None if value == "self" => Ok((crate::AnnealedOpponent::SelfPlay, one)),
         None if value == "harass-push" => Ok((crate::AnnealedOpponent::HarassPush, one)),
-        None if let Some((kind, true)) = crate::ScriptKind::parse_label(value) => {
-            Ok((crate::AnnealedOpponent::Styled(kind), one))
+        None if let Some(script) = crate::StyledScript::from_label(value) => {
+            Ok((crate::AnnealedOpponent::Styled(script), one))
         }
-        Some((label, rest)) if let Some((kind, true)) = crate::ScriptKind::parse_label(label) => {
-            Ok((crate::AnnealedOpponent::Styled(kind), weight(rest)?))
+        Some((label, rest)) if let Some(script) = crate::StyledScript::from_label(label) => {
+            Ok((crate::AnnealedOpponent::Styled(script), weight(rest)?))
         }
         Some(("teacher", rest)) => Ok((crate::AnnealedOpponent::Teacher, weight(rest)?)),
         Some(("self", rest)) => Ok((crate::AnnealedOpponent::SelfPlay, weight(rest)?)),
@@ -895,7 +900,7 @@ fn parse_annealed_opponent(
             ))
         }
         _ => Err(
-            "opponent must be teacher[:weight], harass-push[:weight], teacher-styled[:weight], harass-push-styled[:weight], self[:weight], weights:<directory>:<weight> or league:<weight>"
+            "opponent must be teacher[:weight], harass-push[:weight], teacher-styled[:weight], harass-push-styled[:weight], teacher-fighter[:weight], harass-push-fighter[:weight], self[:weight], weights:<directory>:<weight> or league:<weight>"
                 .to_owned(),
         ),
     }
@@ -1037,6 +1042,7 @@ impl OptimizerArgs {
                     start,
                     end,
                     updates,
+                    balance: self.imitation_balance,
                 },
             ),
             critic_warmup_updates: self.critic_warmup_updates,
@@ -1151,7 +1157,7 @@ fn run_eval(arguments: EvalArgs) -> std::io::Result<()> {
             .map(|name| name.to_string_lossy().into_owned())
             .ok_or_else(|| std::io::Error::other("weights directory has no name; pass --name"))?,
         (None, PlayerSpec::Script(kind)) => kind.label().to_owned(),
-        (None, PlayerSpec::Styled(kind)) => kind.styled_label().to_owned(),
+        (None, PlayerSpec::Styled(script)) => script.label().to_owned(),
         (None, PlayerSpec::Average(_)) => {
             return Err(std::io::Error::other("an average candidate needs --name"));
         }

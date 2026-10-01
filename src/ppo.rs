@@ -589,6 +589,9 @@ struct CompactPreparedSample {
 pub struct UpdateObjective {
     /// Weight of the cross entropy to the shadow labels; zero leaves PPO unchanged.
     pub imitation: f32,
+    /// Power in `[0, 1]` of the inverse imitation-class frequency each label is
+    /// weighted by; 0 weighs every label alike.
+    pub imitation_balance: f32,
     /// Trains only the critic head; every other parameter keeps its bits.
     pub critic_only: bool,
 }
@@ -606,6 +609,10 @@ pub struct ImitationReport {
     pub head_agreements: [f64; crate::MODEL_ACTION_HEADS],
     /// Per head: rows the label defines.
     pub head_labels: [f64; crate::MODEL_ACTION_HEADS],
+    /// Per imitation class: labeled rows agreeing on every labeled head.
+    pub class_agreements: [f64; crate::IMITATION_CLASSES.len()],
+    /// Per imitation class: labeled rows.
+    pub class_labels: [f64; crate::IMITATION_CLASSES.len()],
 }
 
 impl ImitationReport {
@@ -616,6 +623,10 @@ impl ImitationReport {
         for head in 0..crate::MODEL_ACTION_HEADS {
             self.head_agreements[head] += other.head_agreements[head];
             self.head_labels[head] += other.head_labels[head];
+        }
+        for class in 0..crate::IMITATION_CLASSES.len() {
+            self.class_agreements[class] += other.class_agreements[class];
+            self.class_labels[class] += other.class_labels[class];
         }
     }
 }
@@ -825,6 +836,9 @@ impl PpoTrainer {
         if !objective.imitation.is_finite() || objective.imitation < 0.0 {
             return Err(PpoError::InvalidConfig("imitation coefficient"));
         }
+        if !(0.0..=1.0).contains(&objective.imitation_balance) {
+            return Err(PpoError::InvalidConfig("imitation balance"));
+        }
         self.train_accepted_update(model, batch, objective)
     }
 
@@ -876,7 +890,10 @@ impl PpoTrainer {
             objective,
             ..PpoUpdateReport::default()
         };
-        let staged = batch.stage(model, imitates(objective))?;
+        let staged = batch.stage(
+            model,
+            imitates(objective).then_some(objective.imitation_balance),
+        )?;
         let mut order = (0..batch.samples.len()).collect::<Vec<_>>();
         'epochs: for epoch in 0..self.config.epochs {
             self.shuffle.shuffle(&mut order)?;
@@ -1013,7 +1030,12 @@ impl PpoBatch {
 
     /// Uploads every sample once, in batch order, to the learner device, with
     /// the shadow labels when the update imitates.
-    fn stage(&self, model: &PolicyModel, imitation: bool) -> Result<StagedPpoBatch, PpoError> {
+    /// `imitation` is the class balance power of an update that imitates.
+    fn stage(
+        &self,
+        model: &PolicyModel,
+        imitation: Option<f32>,
+    ) -> Result<StagedPpoBatch, PpoError> {
         let error = |error: crate::ModelError| PpoError::Model(error.to_string());
         let mut staging = model
             .ppo_staging(self.samples.len(), imitation)

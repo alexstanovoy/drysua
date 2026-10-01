@@ -94,8 +94,9 @@ fn initial_weights_then_resume_matches_uninterrupted_parameters_optimizer_and_rn
     let fingerprint = initial.parameter_fingerprint().expect("fingerprint");
     let mut config = settings(23_071, 2);
     // A styled opponent draws its style and noise from the game seed, so the split game
-    // must replay it exactly too.
-    config.opponents = vec![(AnnealedOpponent::Styled(crate::ScriptKind::Teacher), one())];
+    // must replay it exactly too; the fighter preset also crosses the checkpoint codec.
+    let fighter = crate::StyledScript::new(crate::ScriptKind::Teacher, crate::StylePreset::Fighter);
+    config.opponents = vec![(AnnealedOpponent::Styled(fighter), one())];
     let start = |directory: &std::path::Path, stop_after| {
         run_annealed_job_harnessed(
             config.clone(),
@@ -300,6 +301,7 @@ fn guided_updates_freeze_the_policy_in_warmup_and_resume_exactly() {
             start: one(),
             end: crate::EnvironmentDecimal::from_units(500_000),
             updates: 2,
+            balance: crate::EnvironmentDecimal::from_units(500_000),
         }),
         critic_warmup_updates: 1,
     };
@@ -324,10 +326,17 @@ fn guided_updates_freeze_the_policy_in_warmup_and_resume_exactly() {
         reference.latest.objective,
         crate::UpdateObjective {
             imitation: 0.5,
+            imitation_balance: 0.5,
             critic_only: false
         }
     );
-    assert!(reference.latest.imitation.labeled > 0.0);
+    let imitation = &reference.latest.imitation;
+    assert!(imitation.labeled > 0.0);
+    // Every label falls in exactly one imitation class.
+    assert_eq!(
+        imitation.class_labels.iter().sum::<f64>(),
+        imitation.labeled
+    );
     let resumed = test_directory("guided-resumed");
     start(&config, &resumed, Some(1));
     let (warm, _, _) = restored_state(

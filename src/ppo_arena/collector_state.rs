@@ -13,7 +13,7 @@ use super::slot::{
     ActionLog, GamePlan, MAX_SLOTS, OpenInterval, OpponentKind, OpponentMixture, SlotSnapshot,
 };
 use super::win_model::{self, WinGame, WinModel, WinState};
-use crate::{MAP2_ACTOR_DECISIONS, MAX_COLLECTION_STATE_BYTES, PpoError, ScriptKind};
+use crate::{MAP2_ACTOR_DECISIONS, MAX_COLLECTION_STATE_BYTES, PpoError};
 
 const VERSION: u32 = 3;
 /// League snapshots one checkpoint can keep: two publications' leagues and
@@ -168,8 +168,13 @@ fn put_opponent(bytes: &mut Vec<u8>, opponent: OpponentKind) {
         OpponentKind::SelfPlay => (2, 0),
         OpponentKind::HarassPush => (3, 0),
         OpponentKind::League(milestone) => (4, milestone),
-        OpponentKind::Styled(ScriptKind::Teacher) => (5, 0),
-        OpponentKind::Styled(ScriptKind::HarassPush) => (5, 1),
+        OpponentKind::Styled(script) => (
+            5,
+            crate::StyledScript::ALL
+                .iter()
+                .position(|known| *known == script)
+                .expect("every styled script is listed") as u64,
+        ),
     };
     put_u32(bytes, tag);
     put_u64(bytes, value);
@@ -297,8 +302,9 @@ impl Reader<'_> {
             (4, milestone) if milestone <= crate::MAX_TRAINING_COUNTER => {
                 OpponentKind::League(milestone)
             }
-            (5, 0) => OpponentKind::Styled(ScriptKind::Teacher),
-            (5, 1) => OpponentKind::Styled(ScriptKind::HarassPush),
+            (5, index) if index < crate::StyledScript::ALL.len() as u64 => {
+                OpponentKind::Styled(crate::StyledScript::ALL[index as usize])
+            }
             _ => return Err(invalid()),
         })
     }
