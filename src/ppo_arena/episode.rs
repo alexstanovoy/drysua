@@ -26,6 +26,10 @@ mod map2_tests;
 #[path = "../tests/raze_aim.rs"]
 mod raze_aim_tests;
 
+#[cfg(test)]
+#[path = "../tests/harass_push_arena.rs"]
+mod harass_push_tests;
+
 pub(super) const TICK_CAP: u32 = crate::MAP2_TICK_CAP;
 pub(super) const ACTOR_DECISIONS: usize = crate::MAP2_ACTOR_DECISIONS;
 pub(super) const CONTINUE_STRIDE: usize = crate::MAP2_CONTINUE_STRIDE;
