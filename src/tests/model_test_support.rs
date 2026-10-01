@@ -124,7 +124,7 @@ pub(crate) fn masked_ppo_entropy_for_test(
     let variable = Var::from_tensor(&tensor)?;
     let mut targets = ppo_objective::HostTargets::with_capacity(examples.len(), false);
     for sample in examples {
-        targets.push(sample)?;
+        targets.push(sample, true)?;
     }
     let targets = targets.upload(&device)?;
     let (masks, active) = targets.head_for_test(0);

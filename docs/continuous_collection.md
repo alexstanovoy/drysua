@@ -28,10 +28,19 @@ one advance job per slot on the pool. Lanes never wait for each other inside an
 update. A lane's share of update `u` ends after the first round in which it has
 closed `--samples-per-update / --lanes` retained intervals (default 24,000 in total),
 so an update holds at least the target and at most two more intervals per slot.
-A retained interval begins at the first decision, at every non-Continue decision and
-at a Continue that finds the open interval eight decisions long; it closes at the next
-retained decision (bootstrapped from that decision's value) or at the game's end.
-Lanes therefore compute behaviour statistics for every policy row.
+A retained interval begins at the first decision, at every non-Continue decision, at
+a Continue that finds the open interval eight decisions long, and at any other
+Continue with probability 1/8 (a draw from the game's seed and the decision index);
+it closes at the next retained decision (bootstrapped from that decision's value) or
+at the game's end. A sample's weight is the inverse of its decision's retention
+probability (8 for a drawn Continue, else 1), and the learner scales its normalized
+advantage by the weight over the update's mean weight, so the policy gradient over
+retained samples estimates the one over every decision. Retention that depends on the
+action without this weight biases the gradient: any offset of the advantages (a
+critic that over- or underestimates a side or a phase) then moves the probability of
+Continue: in the phase-2 runs of 2026-10-01 the side the critic overrated (Dire) drifted
+into idling and lost by deaths.
+Lanes compute behaviour statistics for every policy row.
 
 ## Determinism
 

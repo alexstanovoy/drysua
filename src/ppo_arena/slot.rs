@@ -10,7 +10,7 @@ use bota_proto::ModifierSpec;
 
 use super::episode::{
     ACTOR_DECISIONS, CONTINUE_STRIDE, CompletedAdvance, EpisodeRecord, EpisodeStream,
-    RetainedChoice, TICK_CAP,
+    RetainedChoice, TICK_CAP, retains_continue,
 };
 use super::game_summary::GameSummary;
 use super::*;
@@ -20,6 +20,7 @@ use crate::{EncoderRow, SampledStatistics};
 pub(crate) const MAX_SLOTS: usize = crate::PPO_MAX_SLOTS;
 const ACTOR_DOMAIN: u64 = 0x736c_6f74_5f61_6374;
 const MIXTURE_DOMAIN: u64 = 0x736c_6f74_5f6d_6978;
+const RETENTION_DOMAIN: u64 = 0x736c_6f74_5f72_6574;
 
 /// Who plays the opponent seat of one game.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -339,7 +340,12 @@ impl Slot {
             )?),
             _ => None,
         };
-        let stream = EpisodeStream::new(&environment, learned, schedule.potentials.is_some());
+        let stream = EpisodeStream::new(
+            &environment,
+            learned,
+            schedule.potentials.is_some(),
+            plan.seed(seed, RETENTION_DOMAIN)?,
+        );
         Ok(Box::new(Self {
             plan,
             environment,
@@ -533,7 +539,10 @@ impl Slot {
         {
             return Err(PpoError::InvalidConfig("collector snapshot action log"));
         }
-        let last_start = last_interval_start(&snapshot.log.policy)?;
+        let last_start = last_interval_start(
+            &snapshot.log.policy,
+            plan.seed(schedule.seed, RETENTION_DOMAIN)?,
+        )?;
         if last_start.is_some() != snapshot.open.is_some() {
             return Err(PpoError::InvalidConfig("collector snapshot open interval"));
         }
@@ -601,14 +610,16 @@ impl Slot {
     }
 }
 
-/// The decision that began the interval still open after the logged decisions.
-fn last_interval_start(log: &[u32]) -> Result<Option<usize>, PpoError> {
+/// The decision that began the interval still open after the logged decisions,
+/// by the retention rule of [`EpisodeStream`].
+fn last_interval_start(log: &[u32], retention_seed: u64) -> Result<Option<usize>, PpoError> {
     let mut start = None;
     for (index, &word) in log.iter().enumerate() {
         let continued = start.map_or(0, |start| index - start);
         if start.is_none()
             || decode_action(word)?.kind() != ActionKind::Continue
             || continued == CONTINUE_STRIDE
+            || retains_continue(retention_seed, index)
         {
             start = Some(index);
         }

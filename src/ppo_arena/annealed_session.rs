@@ -439,7 +439,7 @@ impl AnnealedSession {
         } = prepared;
         timing.set_samples(samples);
         let next_adaptive = generations.next_adaptive(settings, harness, update, &report)?;
-        let explained_variance = batch.explained_variance();
+        let explained_variance = (batch.explained_variance(), batch.side_statistics());
         let optimizer_step = self.state.trainer.optimizer_step();
         timing.enter(TrainingStage::Optimization);
         let objective = settings.guidance.objective(update);

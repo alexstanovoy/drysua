@@ -122,6 +122,7 @@ impl PpoPolicyChoice {
             next_value: outcome.next_value,
             reward: outcome.reward,
             terminal: outcome.terminal,
+            weight: 1.0,
         };
         validate_transition(&transition)?;
         Ok(transition)

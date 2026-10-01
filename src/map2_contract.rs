@@ -15,8 +15,9 @@ pub const MAP2_DECISION_INTERVAL_TICKS: u32 = 3;
 /// Maximum decisions from the initial tick-one snapshot through the cap.
 pub const MAP2_ACTOR_DECISIONS: usize =
     (MAP2_TICK_CAP - 1).div_ceil(MAP2_DECISION_INTERVAL_TICKS) as usize;
-/// Longest retained interval in decisions: every non-Continue decision begins
-/// one, and a Continue decision begins one once the open interval is this long.
+/// Longest retained interval in decisions. Every non-Continue decision begins
+/// one; a Continue decision begins one once the open interval is this long, and
+/// otherwise with probability `1 / MAP2_CONTINUE_STRIDE` and the inverse weight.
 pub const MAP2_CONTINUE_STRIDE: usize = 8;
 
 const _: () = assert!(MAP2_TICK_CAP > MAP2_PREGAME_TICKS);

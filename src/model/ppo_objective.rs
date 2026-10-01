@@ -38,6 +38,8 @@ pub(super) struct ObjectiveTargets {
     old_log_probability: Tensor,
     advantages: Tensor,
     returns: Tensor,
+    /// One on dire rows, zero on radiant rows.
+    dire: Tensor,
     rows: usize,
 }
 
@@ -57,6 +59,7 @@ pub(super) struct HostTargets {
     old_log_probability: Vec<f32>,
     advantages: Vec<f32>,
     returns: Vec<f32>,
+    dire: Vec<f32>,
 }
 
 impl HostTargets {
@@ -69,11 +72,16 @@ impl HostTargets {
         host.old_log_probability.reserve_exact(rows);
         host.advantages.reserve_exact(rows);
         host.returns.reserve_exact(rows);
+        host.dire.reserve_exact(rows);
         host
     }
 
-    /// Appends one prepared sample, rejecting a label outside its legal mask.
-    pub(super) fn push(&mut self, sample: &PpoPreparedSample) -> Result<(), ModelError> {
+    /// Appends one prepared sample of the given side, rejecting a label outside its legal mask.
+    pub(super) fn push(
+        &mut self,
+        sample: &PpoPreparedSample,
+        radiant: bool,
+    ) -> Result<(), ModelError> {
         self.heads.push(&sample.transition.target)?;
         if let Some(shadow) = &mut self.shadow {
             match &sample.transition.shadow {
@@ -85,6 +93,7 @@ impl HostTargets {
             .push(sample.transition.old_log_probability);
         self.advantages.push(sample.advantage);
         self.returns.push(sample.return_value);
+        self.dire.push(if radiant { 0.0 } else { 1.0 });
         Ok(())
     }
 
@@ -100,6 +109,7 @@ impl HostTargets {
             old_log_probability: Tensor::from_vec(self.old_log_probability, rows, device)?,
             advantages: Tensor::from_vec(self.advantages, rows, device)?,
             returns: Tensor::from_vec(self.returns, rows, device)?,
+            dire: Tensor::from_vec(self.dire, rows, device)?,
             rows,
         })
     }
@@ -214,6 +224,7 @@ impl ObjectiveTargets {
             old_log_probability: self.old_log_probability.index_select(indices, 0)?,
             advantages: self.advantages.index_select(indices, 0)?,
             returns: self.returns.index_select(indices, 0)?,
+            dire: self.dire.index_select(indices, 0)?,
             rows: indices.elem_count(),
         })
     }
@@ -281,30 +292,37 @@ pub(super) fn masked_head_entropy(
     Ok((entropy, log_normalizer))
 }
 
-fn entropy(output: &PolicyTensorTensors, targets: &ObjectiveTargets) -> Result<Tensor, ModelError> {
-    let mut total: Option<Tensor> = None;
-    for (logits, head) in head_logits(output).into_iter().zip(&targets.heads) {
-        let (entropy, _) = masked_head_entropy(logits, &head.masks, &head.active)?;
-        total = Some(match total {
-            None => entropy,
-            Some(total) => (total + entropy)?,
-        });
-    }
-    Ok(total.expect("twelve heads"))
+/// Per-row masked entropy of every head, in [`HEADS`] order.
+fn head_entropies(
+    output: &PolicyTensorTensors,
+    targets: &ObjectiveTargets,
+) -> Result<Vec<Tensor>, ModelError> {
+    head_logits(output)
+        .into_iter()
+        .zip(&targets.heads)
+        .map(|(logits, head)| Ok(masked_head_entropy(logits, &head.masks, &head.active)?.0))
+        .collect()
 }
 
 /// Loss and row-summed statistics of one objective evaluation, before any readback.
 pub(super) struct ObjectiveTerms {
     /// Scalar training loss.
     pub(super) loss: Tensor,
-    /// `[policy loss, value loss, entropy, approximate KL, clipped rows]` and the
-    /// [`IMITATION_SUMS`] imitation statistics, summed over rows.
+    /// `[policy loss, value loss, entropy, approximate KL, clipped rows]`, the
+    /// [`IMITATION_SUMS`] imitation statistics and the [`SIDE_SUMS`] side
+    /// statistics, summed over rows.
     pub(super) sums: Tensor,
 }
 
 /// Imitation statistics per evaluation: cross entropy, labeled rows, rows agreeing
 /// on every labeled head, then per head the agreeing and the labeled rows.
 const IMITATION_SUMS: usize = 3 + 2 * HEADS.len();
+
+/// Side statistics per evaluation, over all rows and then over dire rows:
+/// rows, policy loss, value loss, entropy, approximate KL from the gradient's
+/// own forward, clipped rows, imitation cross entropy and labeled rows; then the
+/// entropy of every head over all rows and over dire rows.
+const SIDE_SUMS: usize = 2 * (crate::SIDE_QUANTITIES + HEADS.len());
 
 /// The clipped surrogate, critic regression, entropy bonus and imitation term of
 /// one microbatch, each averaged over the `minibatch_rows` rows of its effective
@@ -331,7 +349,11 @@ pub(super) fn ppo_loss(
         .minimum(&clipped_ratio.mul(&targets.advantages)?)?;
     let values = output.value.squeeze(1)?;
     let squared_error = (&values - &targets.returns)?.sqr()?;
-    let entropy = entropy(output, targets)?;
+    let heads = head_entropies(output, targets)?;
+    let entropy = heads
+        .iter()
+        .skip(1)
+        .try_fold(heads[0].clone(), |total, head| total + head)?;
     let rows = minibatch_rows as f64;
     let policy_loss = surrogate.sum_all()?.affine(-1.0 / rows, 0.0)?;
     let value_loss = squared_error.sum_all()?.affine(1.0 / rows, 0.0)?;
@@ -343,7 +365,8 @@ pub(super) fn ppo_loss(
         let loss = (&policy_loss + &critic)?;
         (&loss - &mean_entropy.affine(f64::from(config.entropy_coefficient), 0.0)?)?
     };
-    let imitation = match shadow {
+    let zeros = Tensor::zeros(targets.rows, DType::F32, output.value.device())?;
+    let (imitation, imitation_rows) = match shadow {
         Some(shadow) => {
             let heads = targets
                 .shadow
@@ -354,9 +377,12 @@ pub(super) fn ppo_loss(
             let (cross_entropy, sums) = imitation_terms(shadow, heads)?;
             let mean = cross_entropy.sum_all()?.affine(1.0 / rows, 0.0)?;
             loss = (&loss + &mean.affine(f64::from(objective.imitation), 0.0)?)?;
-            sums
+            (sums, [cross_entropy.detach(), heads[0].active.clone()])
         }
-        None => Tensor::zeros(IMITATION_SUMS, DType::F32, output.value.device())?,
+        None => (
+            Tensor::zeros(IMITATION_SUMS, DType::F32, output.value.device())?,
+            [zeros.clone(), zeros],
+        ),
     };
     let kl = (&ratio.affine(1.0, -1.0)? - &log_ratio)?.detach();
     let outside = (ratio
@@ -375,7 +401,29 @@ pub(super) fn ppo_loss(
         ],
         0,
     )?;
-    let sums = Tensor::cat(&[sums, imitation], 0)?;
+    let quantities = [
+        Tensor::ones(targets.rows, DType::F32, output.value.device())?,
+        surrogate.detach().neg()?,
+        squared_error.detach(),
+        entropy.detach(),
+        kl,
+        outside,
+    ]
+    .into_iter()
+    .chain(imitation_rows)
+    .chain(heads.iter().map(Tensor::detach))
+    .collect::<Vec<_>>();
+    let mut side = Vec::with_capacity(SIDE_SUMS);
+    for mask in [None, Some(&targets.dire)] {
+        for quantity in &quantities {
+            side.push(match mask {
+                None => quantity.sum_all()?,
+                Some(dire) => quantity.mul(dire)?.sum_all()?,
+            });
+        }
+    }
+    assert_eq!(side.len(), SIDE_SUMS);
+    let sums = Tensor::cat(&[sums, imitation, Tensor::stack(&side, 0)?], 0)?;
     Ok(ObjectiveTerms { loss, sums })
 }
 
@@ -460,13 +508,14 @@ pub(super) fn report_from_sums(
     sums: &[f32],
     rows: usize,
 ) -> Result<PpoMinibatchReport, ModelError> {
-    if sums.len() != 5 + IMITATION_SUMS {
+    if sums.len() != 5 + IMITATION_SUMS + SIDE_SUMS {
         return Err(ModelError::InvalidModelState("PPO objective sums"));
     }
     if sums.iter().any(|value| !value.is_finite()) {
         return Err(ModelError::NonFiniteLoss);
     }
     let (ppo, imitation) = sums.split_at(5);
+    let (imitation, side) = imitation.split_at(IMITATION_SUMS);
     let [policy, value, entropy, kl, clipped] = ppo else {
         unreachable!("five PPO sums");
     };
@@ -489,5 +538,6 @@ pub(super) fn report_from_sums(
             head_agreements: std::array::from_fn(|head| f64::from(imitation[3 + head])),
             head_labels: std::array::from_fn(|head| f64::from(imitation[3 + heads + head])),
         },
+        sides: crate::SideReport::from_sums(side),
     })
 }

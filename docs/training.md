@@ -208,6 +208,13 @@ It parses:
 - `level=<LEVEL> event=<name> key=value ...` as an event (`scope=` becomes part of the
   series name, `*_ns` fields are shown in seconds), e.g. `ppo_update`,
   `episode_summary`, `map2_episode_reward`;
+- `ppo_update` also carries per-side fields, `radiant_*` and `dire_*`: rollout
+  statistics before the update (samples, raw advantage mean and deviation, the mean
+  normalized advantage the update trains on, return, value, explained variance,
+  behaviour entropy, Continue share and the mean advantage of Continue and of other
+  samples) and the optimization means (policy and value loss, entropy, approximate KL
+  of each step's gradient pass, clip fraction, imitation loss, entropy per head). A
+  side whose normalized advantage stays negative while its entropy falls is drifting.
 - `progress: update N, ...` as the statistics of update N (shown as
   `checkpoint.<field>` series) and `checkpoint: update N` as its durability marker. A
   process restart (`### ` separator, new file, `annealed: updates=` header) drops the

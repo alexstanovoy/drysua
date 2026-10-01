@@ -7,10 +7,18 @@
 //!
 //! The first decision, every non-Continue decision and every Continue decision
 //! that finds the open interval [`CONTINUE_STRIDE`] decisions long begin a
-//! retained interval: its behaviour statistics are kept until the next retained
-//! decision, or the game's end. The interval then closes into one PPO
-//! transition whose reward is the discounted sum of its per-decision rewards,
-//! bootstrapped from the value of the decision that closed it.
+//! retained interval; any other Continue begins one with probability
+//! `1 / CONTINUE_STRIDE`, drawn from the game's seed and the decision index. Its
+//! behaviour statistics are kept until the next retained decision, or the
+//! game's end. The interval then closes into one PPO transition whose reward is
+//! the discounted sum of its per-decision rewards, bootstrapped from the value
+//! of the decision that closed it.
+//!
+//! A transition's weight is the inverse of the probability that its decision
+//! was retained given the game so far and the action taken, so the weighted
+//! policy gradient over retained decisions estimates the one over every
+//! decision. Unweighted, retention would depend on the action, and any offset
+//! of the advantages would move Continue's probability.
 
 use std::sync::Arc;
 
@@ -57,6 +65,13 @@ pub(super) struct EpisodeStream {
     terminal_reward: f32,
     actions: [u32; ActionKind::COUNT],
     choice: Option<RetainedChoice>,
+    /// Inverse retention probability of the open interval's decision.
+    choice_weight: f32,
+    /// Decisions recorded since the last retained one; a flush keeps it, so a
+    /// decision's retention verdict is the same before and after the flush.
+    since_retained: usize,
+    /// Seed of the per-decision Continue retention draws.
+    retention_seed: u64,
     interval: DiscountedInterval,
     decisions: usize,
     retained: u32,
@@ -69,11 +84,13 @@ pub(super) struct EpisodeStream {
 
 impl EpisodeStream {
     /// A stream shaped by `learned` (else the hand potential) that samples
-    /// win-model features when `sample` holds.
+    /// win-model features when `sample` holds and draws Continue retention
+    /// from `retention_seed`.
     pub(super) fn new(
         environment: &TrainingEnvironment,
         learned: Option<Arc<WinModel>>,
         sample: bool,
+        retention_seed: u64,
     ) -> Self {
         let learned = learned.map(|model| {
             let start = model.potential(&win_model::features(environment));
@@ -90,6 +107,9 @@ impl EpisodeStream {
             terminal_reward: 0.0,
             actions: [0; ActionKind::COUNT],
             choice: None,
+            choice_weight: 0.0,
+            since_retained: 0,
+            retention_seed,
             interval: DiscountedInterval::default(),
             decisions: 0,
             retained: 0,
@@ -99,11 +119,21 @@ impl EpisodeStream {
 
     /// Whether a next decision of `kind` begins a retained interval.
     pub(super) fn retains(&self, kind: ActionKind) -> bool {
+        self.retention_weight(kind).is_some()
+    }
+
+    /// The inverse retention probability of a next decision of `kind`, or
+    /// `None` when it continues the open interval.
+    fn retention_weight(&self, kind: ActionKind) -> Option<f32> {
         assert!(!self.done);
-        assert!(self.interval.steps <= CONTINUE_STRIDE);
-        self.choice.is_none()
+        assert!(self.since_retained <= CONTINUE_STRIDE);
+        if self.decisions == 0
             || kind != ActionKind::Continue
-            || self.interval.steps == CONTINUE_STRIDE
+            || self.since_retained == CONTINUE_STRIDE
+        {
+            return Some(1.0);
+        }
+        retains_continue(self.retention_seed, self.decisions).then_some(CONTINUE_STRIDE as f32)
     }
 
     /// Whether a next decision of `kind` closes the open interval; its value
@@ -137,10 +167,14 @@ impl EpisodeStream {
     /// Opens a retained interval at a decision for which `retains` holds,
     /// after any open one was flushed.
     pub(super) fn retain(&mut self, choice: RetainedChoice) {
-        assert!(self.retains(choice.action.kind()));
+        let weight = self
+            .retention_weight(choice.action.kind())
+            .expect("a retained decision");
         assert!(self.choice.is_none());
         assert_eq!(self.interval.steps, 0);
         self.choice = Some(choice);
+        self.choice_weight = weight;
+        self.since_retained = 0;
     }
 
     /// Books one advanced decision: reward, action count and the open interval.
@@ -156,6 +190,7 @@ impl EpisodeStream {
         self.done = advanced.done;
         let reward = self.observe_reward(environment, advanced.outcome, advanced.ticks, gamma)?;
         self.actions[kind.index()] += 1;
+        self.since_retained += 1;
         if self.choice.is_some() {
             self.interval.append(reward, advanced.ticks, gamma)?;
         } else {
@@ -240,6 +275,7 @@ impl EpisodeStream {
             next_value: next_value.unwrap_or(0.0),
             reward: interval.reward as f32,
             terminal: self.done,
+            weight: self.choice_weight,
         };
         self.retained += 1;
         crate::ppo::validate_transition(&transition)?;
@@ -302,6 +338,16 @@ impl EpisodeStream {
         }
     }
 }
+
+/// Whether the Continue at decision `decision` of the game with
+/// `retention_seed` begins a retained interval when the open one is shorter
+/// than [`CONTINUE_STRIDE`].
+pub(super) const fn retains_continue(retention_seed: u64, decision: usize) -> bool {
+    crate::randomization::derive_training_seed(retention_seed, decision as u64, DRAW_DOMAIN)
+        .is_multiple_of(CONTINUE_STRIDE as u64)
+}
+
+const DRAW_DOMAIN: u64 = 0x7265_7461_696e_5f63;
 
 #[derive(Default)]
 struct DiscountedInterval {
