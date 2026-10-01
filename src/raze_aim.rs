@@ -19,7 +19,7 @@ pub(crate) const SHADOWRAZES: [(AbilityId, i32); 3] = [
     (AbilityId(14), 450),
     (AbilityId(15), 700),
 ];
-/// Every hostile unit whose centre lies within this of the landing is struck.
+/// Every hostile unit whose centre lies within this distance of the landing is struck.
 pub(crate) const SHADOWRAZE_RADIUS: i32 = 250;
 /// Hero turn rate in brads per tick.
 pub(crate) const TURN_RATE_BRADS: u16 = 5_795;
@@ -28,9 +28,9 @@ pub(crate) const TURN_RATE_BRADS: u16 = 5_795;
 const TURN_WALK: i32 = 48;
 /// An aim that has not fired within this many ticks is abandoned.
 const AIM_LIMIT_TICKS: u32 = 15;
-/// Length of the walk that turns the hero onto a point aim's heading. One walk
-/// node: longer walks route through node centres and leave the facing up to
-/// tens of degrees off the heading, while this one ends on it exactly.
+/// Length of the walk that turns the hero onto a point aim's heading: one
+/// 32-unit walk cell. Longer walks route through cell centres and can leave the
+/// facing tens of degrees off the heading; this one ends on it exactly.
 const HEADING_WALK: i32 = 32;
 /// A point aim fires once the landing centre is this close to the centre along
 /// the chosen heading: a tenth of the raze radius.
@@ -41,7 +41,7 @@ const _: () = assert!(AIM_LIMIT_TICKS >= 2 * crate::MAP2_DECISION_INTERVAL_TICKS
 const _: () = assert!(HEADING_WALK > 0);
 const _: () = assert!(HEADING_TOLERANCE > 0 && HEADING_TOLERANCE < SHADOWRAZE_RADIUS);
 
-/// Bounded state of one hero's aimed-raze macro.
+/// State of one hero's aimed-raze macro.
 ///
 /// Continue decisions keep an active aim running; any other decision replaces it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -70,9 +70,10 @@ impl RazeAim {
     /// Translates one decoded decision into the wire order to send now.
     ///
     /// An aimed raze intent (a unit or point cast) starts the macro and a
-    /// Continue advances it; an untargeted raze passes through unchanged. Both
-    /// report [`ActionKind::Cast`] as the order's family. `active_body` is the
-    /// hero's persistent order, which decides how its facing moves next tick.
+    /// Continue advances it; macro orders, walks included, report
+    /// [`ActionKind::Cast`]. Other decisions, an untargeted raze included, pass
+    /// through unchanged. `active_body` is the hero's persistent order, which
+    /// decides how its facing moves next tick.
     pub fn resolve(
         &mut self,
         tracker: &StateTracker,
@@ -283,7 +284,8 @@ pub(crate) fn extrapolated_position(tracker: &StateTracker, unit: &UnitView, tic
     predicted
 }
 
-/// Raze radius shrinks with the target's move speed uncertainty.
+/// Raze radius less one tick of the target's move speed, a margin for
+/// prediction error.
 pub(crate) fn raze_radius(unit: &UnitView) -> Fixed {
     Fixed {
         raw: Fixed::from_int(SHADOWRAZE_RADIUS)

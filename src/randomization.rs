@@ -1,9 +1,9 @@
 //! Annealed domain randomization: schedule, per-generation draws and their
 //! on-disk snapshots.
 //!
-//! Every draw is a pure function of `(run seed, generation index, schedule)`.
-//! Sampling uses only integer arithmetic and the crate's splitmix-based
-//! [`PpoRng`], so a resumed run recomputes the exact same generations.
+//! Every draw is a pure function of the run seed, the generation index and the
+//! scale at its start update. Sampling uses only integer arithmetic and
+//! [`PpoRng`], so a resumed run recomputes the same generations on any platform.
 
 use std::path::Path;
 
@@ -20,7 +20,7 @@ pub const RANDOMIZATION_SCHEMA: &str = "drysua-domain-randomization/v2";
 pub const RANDOMIZATION_DIRECTORY: &str = "domain-randomization";
 /// Nominal value of a basis-point rate, one hundred percent.
 pub const NOMINAL_BP: i32 = 10_000;
-/// One standard deviation is this fraction of a variable's range.
+/// Full-scale sigma is a variable's `sigma_range` divided by this.
 const SIGMA_DIVISOR: i32 = 3;
 /// Independent uniform draws summed for the bounded normal approximation.
 const NORMAL_DRAWS: usize = 12;
@@ -35,7 +35,7 @@ pub(crate) const ARENA_DOMAIN: u64 = 0x6172_656e_615f_7365;
 #[cfg(feature = "builtin")]
 pub(crate) const OPPONENT_DOMAIN: u64 = 0x6f70_706f_6e65_6e74;
 /// Largest accepted generation snapshot file, one small JSON line.
-const MAX_SNAPSHOT_BYTES: u64 = 4 * 1024;
+pub(crate) const MAX_SNAPSHOT_BYTES: u64 = 4096;
 
 /// One randomized variable: its bounds in spec units and the field it writes.
 #[derive(Clone, Copy, Debug)]
@@ -106,8 +106,8 @@ fn set_cooldown_rate(spec: &mut ModifierSpec, value: i32) {
 
 /// The eleven randomized variables, in snapshot order.
 ///
-/// `max_hp` alone is two-sided; the one-sided variables are truncated at
-/// nominal, which makes them half-normal over their span.
+/// `max_hp` alone is two-sided; the one-sided variables clamp at nominal, so
+/// half their draws land exactly on nominal and the rest are half-normal.
 pub const VARIABLES: [RandomizationVariable; 11] = [
     RandomizationVariable {
         name: "max_hp",
@@ -199,30 +199,29 @@ pub const VARIABLES: [RandomizationVariable; 11] = [
     },
 ];
 
-/// One update-budget annealing schedule.
+/// Annealing schedule over a run's updates.
 ///
-/// `scale_bp(u)` is `max(0, 1 - sqrt(u / (updates - zero_updates)))` in basis
-/// points; the last `zero_updates` updates always scale to zero. A run whose
-/// zero window covers every update is all-zero, not undefined.
+/// `scale_bp(u)` interpolates from `scale.start_bp` towards `scale.end_bp` by
+/// `sqrt(u / (updates - zero_updates))`; the last `zero_updates` updates always
+/// scale to zero, and a zero window covering every update makes the run all-zero.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AnnealSchedule {
     /// Total updates in the run.
     pub updates: u64,
     /// Final updates played with no modifiers.
     pub zero_updates: u64,
-    /// Scale ramp endpoints; [`AnnealScale::FULL`] is the historical ramp.
+    /// Scale ramp endpoints; the default is [`AnnealScale::FULL`].
     pub scale: AnnealScale,
 }
 
 impl AnnealSchedule {
-    /// The first update whose scale is zero.
+    /// First update of the zero-scale tail.
     pub const fn zero_from_update(&self) -> u64 {
         self.updates.saturating_sub(self.zero_updates)
     }
 
-    /// The scale at one update, in basis points of full variance.
-    ///
-    /// The clean tail is always zero, whatever the ramp endpoints are.
+    /// Scale at one update, in basis points of full-scale sigma. The zero tail is
+    /// zero whatever the ramp endpoints are.
     pub fn scale_bp(&self, update: u64) -> i32 {
         let span = self.zero_from_update();
         if span == 0 || update >= span {
@@ -235,32 +234,29 @@ impl AnnealSchedule {
     }
 }
 
-/// One environment scale ramp, in basis points of full variance.
+/// Environment scale ramp endpoints, in basis points of full-scale sigma
+/// (`NOMINAL_BP` is one hundred percent, `MAX_BP` ten times that).
 ///
-/// `NOMINAL_BP` is one hundred percent; the command line admits up to ten times
-/// that. Only the ramp endpoints are configurable: the eleven randomized
-/// variable ranges and their clamps are model constants, so a larger scale
-/// widens the sampling sigmas while every sampled delta still clamps to its
-/// variable's bounds. The default ramp, [`AnnealScale::FULL`], is
-/// bit-for-bit the historical `NOMINAL_BP - root`.
+/// Variable ranges are constants, so a larger scale widens the sampling sigmas
+/// while every sampled delta still clamps to its variable's bounds.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AnnealScale {
     /// Scale at the first update of the ramp, in basis points.
     pub start_bp: i32,
-    /// Scale at the clean tail boundary, in basis points.
+    /// Scale approached at the zero-tail boundary, in basis points.
     pub end_bp: i32,
 }
 
 impl AnnealScale {
-    /// Full variance at the start, zero across the clean tail.
+    /// Nominal scale at the start, ramping to zero at the zero tail.
     pub const FULL: Self = Self {
         start_bp: NOMINAL_BP,
         end_bp: 0,
     };
-    /// Ten times full variance is the largest admitted scale.
+    /// Largest admitted scale, ten times nominal.
     pub const MAX_BP: i32 = 10 * NOMINAL_BP;
 
-    /// Rejects a scale outside zero to ten times full variance.
+    /// Rejects an endpoint outside `0..=MAX_BP`.
     pub fn validate(self) -> Result<Self, PpoError> {
         if !(0..=Self::MAX_BP).contains(&self.start_bp)
             || !(0..=Self::MAX_BP).contains(&self.end_bp)
@@ -281,7 +277,7 @@ impl AnnealScale {
         (numerator / NOMINAL_BP as i64) as i32
     }
 
-    /// Canonical scope tokens, in a fixed order.
+    /// Scope flags with a leading space; recorded only for a non-default ramp.
     pub fn scope_suffix(self) -> String {
         format!(
             " --environment-scale-start {} --environment-scale-end {}",
@@ -291,12 +287,13 @@ impl AnnealScale {
     }
 }
 
-/// One endpoint as the exact plain decimal the command line records.
+/// Endpoint as the command-line decimal, where `1` is `NOMINAL_BP`.
 fn decimal_text(bp: i32) -> crate::EnvironmentDecimal {
     crate::EnvironmentDecimal::from_units(bp as u64 * 100)
 }
 
-/// One canonical scale endpoint in basis points.
+/// Parses an endpoint into basis points; rejects values finer than one basis
+/// point or above `MAX_BP`.
 fn canonical_bp(value: &str) -> Option<i32> {
     let units = value.parse::<crate::EnvironmentDecimal>().ok()?.units();
     if !units.is_multiple_of(100) || units > (AnnealScale::MAX_BP as u64) * 100 {
@@ -305,11 +302,11 @@ fn canonical_bp(value: &str) -> Option<i32> {
     i32::try_from(units / 100).ok()
 }
 
-/// Splits one optional canonical trailing scale suffix from a command line.
+/// Splits the trailing scale flags, if any, off a scope command line.
 ///
-/// Only the exact canonical rendering is split, so a partial or malformed
-/// `--environment-scale-*` token stays in the returned prefix where the scope
-/// validator rejects it instead of accepting it silently.
+/// Only the exact rendering of a non-default ramp is split, so a partial,
+/// malformed or default-valued `--environment-scale-*` token stays in the
+/// returned prefix, where the scope validator rejects it.
 pub(crate) fn split_scale_scope(command: &str) -> (&str, AnnealScale) {
     let tokens: Vec<&str> = command.split(' ').collect();
     if tokens.len() < 4
@@ -338,19 +335,20 @@ pub(crate) fn split_scale_scope(command: &str) -> (&str, AnnealScale) {
 /// One generation: its games, the update it started in, and its draw.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct GenerationDraw {
-    /// Global generation index, counted in generations of `games_per_generation`.
+    /// Global generation index.
     pub generation: u64,
     /// First global game index of the generation.
     pub start_game: u64,
-    /// One past the last global game index of the generation.
+    /// One past the last global game index of the generation; for adaptive
+    /// generations, the end of the run.
     pub end_game: u64,
     /// Update the generation started in; its scale is the update's scale.
     pub start_update: u64,
     /// Annealing scale at `start_update`, in basis points.
     pub scale_bp: i32,
-    /// Games of the generation that actually carry the draw: the zero window
-    /// truncates a generation that crosses into it, and a fully truncated
-    /// generation carries none.
+    /// Games of the generation that carry the draw: the zero window truncates
+    /// a generation that crosses into it. For adaptive generations this is an
+    /// upper bound, since the actual end is not known when drawing.
     pub applied_games: u64,
     /// Per-variable deltas from nominal, in spec units.
     pub deltas: [i32; VARIABLES.len()],
@@ -407,8 +405,9 @@ pub fn draw_generation(
     })
 }
 
-/// Draws at an actual controller start, retaining the original generation seed.
-/// End and applied-game counts are global bounds, not an adaptive duration.
+/// Draws a generation starting at the adaptive controller's `start_update`; the
+/// RNG stream is still keyed by generation index. End and applied-game counts are
+/// run-wide bounds, not the generation's actual duration.
 pub(crate) fn draw_generation_at_start(
     seed: u64,
     generation: u64,
@@ -475,9 +474,9 @@ fn draw_modifiers(
 
 /// One bounded normal draw in spec units, from twelve uniform words.
 ///
-/// The sum of twelve independent uniforms has mean six and variance one; the
-/// result is truncated at six standard deviations and rounded half up. Only
-/// integer arithmetic runs, so the value is identical on every platform.
+/// The sum of twelve independent uniforms has mean six and variance one, so the
+/// centered result is bounded by six standard deviations; it is rounded half up.
+/// Only integer arithmetic runs, so the value is identical on every platform.
 fn normal_delta(rng: &mut PpoRng, sigma: i32) -> Result<i32, PpoError> {
     if sigma == 0 {
         return Ok(0);
@@ -593,9 +592,9 @@ fn read_snapshot(path: &Path) -> Result<String, PpoError> {
 /// Writes generation snapshots, verifying existing files byte for byte.
 ///
 /// A mismatch means the recomputed generation disagrees with what a previous
-/// run recorded; the run is stopped rather than continued under different
-/// world modifiers. Each new file is synced once before its rename and the
-/// directory once at the end, so a batch costs one directory sync.
+/// run recorded, so the run stops rather than continue under different world
+/// modifiers. Each new file is synced before its rename and the directory once
+/// at the end, so a batch costs one directory sync.
 pub fn write_generation_snapshots(
     directory: &Path,
     draws: &[GenerationDraw],

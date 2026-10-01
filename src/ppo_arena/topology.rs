@@ -103,8 +103,9 @@ pub(crate) fn group_cpus(groups: usize, pin: bool) -> Result<Vec<Option<Vec<usiz
 /// Restricts the calling thread to `cpus`.
 #[cfg(target_os = "linux")]
 pub(crate) fn pin_current_thread(cpus: &[usize]) -> Result<(), PpoError> {
-    // SAFETY: cpu_set_t is plain data; CPU_ZERO/CPU_SET only write within it and
-    // every index is below MAX_CPUS, which fits the set.
+    // SAFETY: cpu_set_t is plain data; CPU_ZERO/CPU_SET only write within it.
+    // Every caller passes CPUs from `cache_domains`, all below MAX_CPUS (1024,
+    // glibc's CPU_SETSIZE), so each index fits the set.
     let result = unsafe {
         let mut set: libc::cpu_set_t = std::mem::zeroed();
         libc::CPU_ZERO(&mut set);

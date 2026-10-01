@@ -1,6 +1,6 @@
-//! The process's one diagnostic stream: lines are buffered and reach stderr at
-//! most every [`FLUSH_INTERVAL`] (and on an explicit flush at stop or exit), so
-//! a long training run does not turn every log line into a write.
+//! The process's one diagnostic stream: lines are buffered and reach stderr when
+//! the buffer fills, every [`FLUSH_INTERVAL`], or on an explicit flush at stop or
+//! exit, so a long training run does not turn every log line into a write.
 
 #[cfg(feature = "builtin")]
 use std::fmt;

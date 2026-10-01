@@ -74,7 +74,7 @@ const _: () = assert!(POTENTIAL_BOUND < 2.0 * MAP2_REWARD_WIN);
 const _: () = assert!(MAP2_REWARD_XP_SCALE > 0);
 const _: () = assert!(crate::MAP2_TICK_CAP > crate::MAP2_PREGAME_TICKS);
 
-/// Authoritative game result or explicit learner task deadline; never a technical failure.
+/// Native game result or learner time cap; never a technical failure.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Map2RewardEnd {
     Win,
@@ -187,7 +187,7 @@ impl Map2RewardBreakdown {
     }
 }
 
-/// ID-free observable potential inputs for a policy/critic input or diagnostic log.
+/// ID-free, seat-visible potential inputs, used as policy features and in diagnostic logs.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Map2RewardState {
     /// Own and enemy weakest-tower HP fractions, in `[0, 1]`.
@@ -364,7 +364,7 @@ impl Map2Reward {
     }
 
     /// Drains the final interval with the terminal reward and returns the whole potential.
-    /// `TimeCap` is a learner terminal, not an invented `MatchOver` or a technical timeout.
+    /// `TimeCap` is the learner's episode cap and scores as a draw.
     pub fn finish(&mut self, end: Map2RewardEnd) -> Result<Map2RewardBreakdown, Map2RewardError> {
         self.ensure_complete()?;
         let completed = self

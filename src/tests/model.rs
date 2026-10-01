@@ -166,22 +166,8 @@ fn invalid_frames_and_extreme_parameters_fail_without_nonfinite_predictions() {
     let frame = encode(&tracker, &LocalPolicyState::new(0));
     let space = ActionSpace::from_tracker(&tracker).expect("space");
     assert_eq!(
-        model.evaluate_batch(&[]).expect_err("empty").to_string(),
+        model.choose_batch(&[], &[]).expect_err("empty").to_string(),
         "model batch must contain at least one frame"
-    );
-    assert_eq!(
-        model
-            .training_forward(&[], &[])
-            .expect_err("empty training")
-            .to_string(),
-        "model training batch must contain at least one frame"
-    );
-    assert_eq!(
-        model
-            .training_forward(std::slice::from_ref(&frame), &[])
-            .expect_err("prefix count")
-            .to_string(),
-        "model training prefix count 0 differs from frame count 1"
     );
     assert_eq!(
         model
@@ -193,10 +179,6 @@ fn invalid_frames_and_extreme_parameters_fail_without_nonfinite_predictions() {
     model
         .import_parameters(&vec![f32::MAX; MODEL_PARAMETER_COUNT])
         .expect("finite import");
-    assert_eq!(
-        model.evaluate(&frame).expect_err("overflow").to_string(),
-        "model value output at batch 0 index 0 is non-finite"
-    );
     assert_eq!(
         model
             .choose(&frame, &space)

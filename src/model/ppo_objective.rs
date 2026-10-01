@@ -293,7 +293,7 @@ fn entropy(output: &PolicyTensorTensors, targets: &ObjectiveTargets) -> Result<T
     Ok(total.expect("twelve heads"))
 }
 
-/// Per-row statistics of one objective evaluation, before any readback.
+/// Loss and row-summed statistics of one objective evaluation, before any readback.
 pub(super) struct ObjectiveTerms {
     /// Scalar training loss.
     pub(super) loss: Tensor,
@@ -312,7 +312,8 @@ const IMITATION_SUMS: usize = 3 + 2 * HEADS.len();
 ///
 /// `shadow` holds the heads conditioned on the shadow labels' own prefixes and
 /// is present exactly when the update imitates. A critic-only update trains the
-/// value regression alone; its value output must not reach the trunk.
+/// value regression alone; its training forward detaches the trunk under the
+/// value head, so no gradient reaches the trunk.
 pub(super) fn ppo_loss(
     output: &PolicyTensorTensors,
     shadow: Option<&PolicyTensorTensors>,

@@ -1,11 +1,11 @@
-//! Adaptive snapshots authenticate actual starts, without predicting environment ends.
+//! Per-generation randomization snapshots for the adaptive schedule, committed to the checkpoint
+//! by count and rolling SHA-256. A snapshot records the generation's actual start update; its end
+//! is decided later by the controller, so end and applied-game fields are only bounds.
 
 #[cfg(test)]
 #[path = "adaptive_randomization_tests.rs"]
 mod tests;
 
-#[cfg(not(windows))]
-use std::fs::File;
 use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
@@ -14,17 +14,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use sha2::{Digest, Sha256};
 
 use crate::checkpoint::AdaptiveEnvironmentCheckpoint;
+use crate::randomization::MAX_SNAPSHOT_BYTES;
 use crate::randomization::{AnnealSchedule, GenerationDraw, VARIABLES, draw_generation_at_start};
 use crate::{MAX_TRAINING_COUNTER, PpoError};
 
-const MAX_SNAPSHOT_BYTES: u64 = 4096;
 const SNAPSHOT_PREFIX: &str =
     "{\"schema\":\"drysua-domain-randomization/adaptive-v3\",\"start_update\":";
 static NEXT_TEMPORARY: AtomicU64 = AtomicU64::new(0);
 const _: () = assert!(MAX_SNAPSHOT_BYTES < usize::MAX as u64);
 
-/// Reads only the committed prefix; later orphan files are deliberately ignored.
-/// Call on resume before drawing or collecting any games. No filesystem writes occur.
+/// Verifies the first `snapshot_count` snapshots against the checkpoint; orphan files beyond that
+/// prefix are ignored. Call on resume before drawing or collecting any games. Performs no writes.
 pub(crate) fn verify_adaptive_snapshots(
     directory: &Path,
     seed: u64,
@@ -80,10 +80,10 @@ pub(crate) fn verify_adaptive_snapshots(
     Ok(())
 }
 
-/// Materializes one immutable draw after resume verification, then commits its hash.
-/// Cache the result for the generation. Only snapshot_count/hash change; collection
-/// or PPO failure may leave a canonical orphan, which replay must match exactly.
-/// GenerationDraw end/applied-game fields are bounds, never actual adaptive ends.
+/// Draws the current generation and, if it is not yet committed, publishes its snapshot and
+/// advances `snapshot_count` and `snapshot_hash` (the only checkpoint fields changed). Callers cache
+/// the draw per generation. A later collection or PPO failure may leave an orphan snapshot, which a
+/// replay must reproduce byte for byte.
 pub(crate) fn draw_adaptive_generation(
     directory: &Path,
     seed: u64,
@@ -427,17 +427,8 @@ fn publish_snapshot(source: &Path, target: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-#[cfg(not(windows))]
 fn sync_directory(directory: &Path) -> Result<(), PpoError> {
-    File::open(directory)
-        .and_then(|file| file.sync_all())
-        .map_err(|error| io_error("directory sync", error))
-}
-
-#[cfg(windows)]
-fn sync_directory(_: &Path) -> Result<(), PpoError> {
-    // Snapshot publication uses MOVEFILE_WRITE_THROUGH, like checkpoint commits.
-    Ok(())
+    crate::durability::sync_directory(directory).map_err(|error| io_error("directory sync", error))
 }
 
 fn io_error(operation: &str, error: std::io::Error) -> PpoError {

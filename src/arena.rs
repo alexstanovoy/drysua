@@ -289,7 +289,7 @@ fn match_config(settings: ArenaConfig, spawn_modifiers: Vec<SpawnModifier>) -> M
         tick_rate: ARENA_TICK_RATE,
         mode: TickMode::Lockstep,
         ack_timeout_ticks: 150,
-        // Trusted setup carries the modifiers; no cheat gate is opened.
+        // Spawn modifiers are trusted setup, so the cheat gate stays closed.
         cheats: false,
         spawn_modifiers,
     }

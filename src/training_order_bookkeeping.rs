@@ -2,8 +2,9 @@ use super::{OrderPersistence, PersistenceError, record_sent_for_ledgers};
 use crate::{ActivePolicyOrder, IssuedOrder, LocalPolicyError, LocalPolicyState, StateTracker};
 use bota_proto::EntityId;
 
-/// Training-only execution role; the candidate follows actual sent requests, not
-/// unissued labels or proof of execution.
+/// Training-only order ledger selection. `Legacy` uses the ledger of sent requests alone;
+/// `Candidate` adds a neural ledger, copied from it before the first request and updated
+/// from requests actually sent, not from unissued action labels or confirmed execution.
 #[allow(
     clippy::large_enum_variant,
     reason = "one inline value per seat; boxing would allocate on the decision path"
@@ -18,43 +19,35 @@ pub(crate) enum PolicyOrderBookkeeping {
 impl PolicyOrderBookkeeping {
     pub(crate) fn enable_candidate(
         &mut self,
-        legacy: &OrderPersistence,
+        requests: &OrderPersistence,
     ) -> Result<(), &'static str> {
         match self {
             Self::Candidate(_) => Ok(()),
             Self::Legacy => {
-                self.validate_start(legacy)?;
-                *self = Self::Candidate(*legacy);
+                self.validate_start(requests)?;
+                *self = Self::Candidate(*requests);
                 Ok(())
             }
         }
     }
 
-    fn validate_start(&self, legacy: &OrderPersistence) -> Result<(), &'static str> {
+    fn validate_start(&self, requests: &OrderPersistence) -> Result<(), &'static str> {
         assert!(matches!(self, Self::Legacy));
-        if legacy.last_sequence().is_some() {
+        if requests.last_sequence().is_some() {
             return Err("neural bookkeeping must start before the first actual request");
         }
-        assert!(legacy.active_body_sequence().is_none());
+        assert!(requests.active_body_sequence().is_none());
         Ok(())
     }
 
-    pub(crate) const fn is_candidate(&self) -> bool {
-        matches!(self, Self::Candidate(_))
+    pub(crate) fn transport<'a>(&'a self, requests: &'a OrderPersistence) -> &'a OrderPersistence {
+        self.effective(requests)
     }
 
-    pub(crate) fn transport<'a>(&'a self, legacy: &'a OrderPersistence) -> &'a OrderPersistence {
-        if self.is_candidate() {
-            self.effective(legacy)
-        } else {
-            legacy
-        }
-    }
-
-    pub(crate) fn effective<'a>(&'a self, legacy: &'a OrderPersistence) -> &'a OrderPersistence {
+    pub(crate) fn effective<'a>(&'a self, requests: &'a OrderPersistence) -> &'a OrderPersistence {
         match self {
             Self::Candidate(neural) => neural,
-            Self::Legacy => legacy,
+            Self::Legacy => requests,
         }
     }
 
@@ -67,12 +60,12 @@ impl PolicyOrderBookkeeping {
 
     pub(crate) fn record_sent(
         &mut self,
-        legacy: &mut OrderPersistence,
+        requests: &mut OrderPersistence,
         sequence: u32,
         issued: IssuedOrder,
         tracker: &StateTracker,
     ) -> Result<bool, PersistenceError> {
-        record_sent_for_ledgers(legacy, self.neural_mut(), sequence, issued, tracker)
+        record_sent_for_ledgers(requests, self.neural_mut(), sequence, issued, tracker)
     }
 
     pub(crate) fn reconcile(

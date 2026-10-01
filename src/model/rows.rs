@@ -1,9 +1,9 @@
-//! Encoder inputs packed once per frame, on the thread that encoded it.
+//! Encoder inputs packed per frame: for inference on the thread that encoded
+//! the frame, for training again when the update is staged.
 //!
 //! A row holds one frame's encoder parts in device buffer order. Frames are
-//! already scaled and one-hot, so packing only masks absent tokens.
-//! Batches concatenate rows part by part, so a batch built from rows equals the
-//! historical per-batch staging value for value.
+//! already scaled and one-hot, so packing only zeroes absent tokens and builds
+//! the presence and unit-group masks. Batches concatenate rows part by part.
 
 use super::*;
 
@@ -76,7 +76,6 @@ impl EncoderRow {
         }
     }
 
-    /// A packed copy of one frame.
     pub fn from_frame(frame: &FeatureFrame) -> Result<Self, ModelError> {
         let mut row = Self::new();
         row.pack(frame)?;

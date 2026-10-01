@@ -46,9 +46,9 @@ impl Knob {
 
 /// Knobs every rule policy has: how often it decides and how often it acts at random.
 pub(crate) const NOISE_KNOBS: [Knob; 2] = [
-    // Decisions per acted decision; the others keep the running order.
+    // Decisions per acted decision; skipped decisions keep the running order.
     Knob::new("period", 1, (1, 4), (1, 2)),
-    // Chance in a thousand that a decision is a random legal tactical action.
+    // Chance in a thousand that an acted decision is a random legal tactical action.
     Knob::new("epsilon", 0, (0, 500), (0, 40)),
 ];
 

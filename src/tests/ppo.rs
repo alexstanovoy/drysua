@@ -9,7 +9,7 @@ use super::feature::{encode, tracker_with_view, world_view};
 use crate::{
     ActionSpace, BehavioralTarget, ControlledUnit, LocalPolicyState, MODEL_TRAINING_BATCH,
     PolicyModel, PpoConfig, PpoOutcome, PpoPolicyChoice, PpoRng, PpoRollout, PpoTrainer,
-    StructuredAction, clipped_surrogate, tick_discount,
+    StructuredAction, tick_discount,
 };
 
 #[path = "ppo_capacity.rs"]
@@ -361,14 +361,11 @@ fn explained_variance_separates_exact_blind_and_undefined_critics() {
 }
 
 #[test]
-fn sampling_and_surrogate_boundaries_match_independent_references() {
+fn uniform_draws_stay_open_and_tick_discount_compounds_per_tick() {
     let (minimum, maximum) = crate::ppo::open_unit_bounds_for_test();
     assert!(minimum > 0.0);
     assert!(maximum < 1.0);
     assert!((tick_discount(0.99, 3).expect("discount") - 0.970_299).abs() < 1.0e-6);
-    for (ratio, advantage, expected) in [(1.5, 2.0, 2.4), (0.5, -2.0, -1.6), (1.1, 2.0, 2.2)] {
-        assert!((clipped_surrogate(ratio, advantage, 0.2) - expected).abs() < 1.0e-6);
-    }
 }
 
 #[test]

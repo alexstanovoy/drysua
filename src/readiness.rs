@@ -3,19 +3,17 @@ use bota_proto::{ItemId, ItemSlot, Order};
 use crate::tracker::HERO_ITEM_SLOTS;
 use crate::{ActionSpace, ControlledUnit, IssuedOrder};
 
-/// Ticks an item stays muted after leaving the backpack in the drysua schema.
+/// Ticks an item stays muted after leaving the backpack.
 pub const BACKPACK_MUTE_TICKS: u32 = 180;
-/// Town Portal Scroll in the drysua item schema.
+/// Town Portal Scroll item id.
 pub const TOWN_PORTAL_SCROLL: ItemId = ItemId(8);
 /// Body-wide Town Portal Scroll wait in ticks.
 pub const TOWN_PORTAL_WAIT_TICKS: u32 = 2_100;
 /// Items with a body-wide wait and their wait in ticks.
 pub const SHARED_WAITS: [(ItemId, u32); 1] = [(TOWN_PORTAL_SCROLL, TOWN_PORTAL_WAIT_TICKS)];
-/// Maximum recent timer replacements retained for exact rejection rollback.
-///
-/// Rejection is supported for these retained requests. An older effective
-/// timer is retained as a base but its already-evicted sequence is not
-/// rejectable under the one-outstanding-request protocol.
+/// Recent timers kept per journal so a rejected order's timers can be rolled
+/// back. An evicted timer becomes the base and can no longer be rejected; with
+/// one order outstanding at a time that is never needed.
 pub const MAX_READINESS_TIMER_HISTORY: usize = 8;
 
 const INVENTORY_SLOTS: usize = 6;

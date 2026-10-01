@@ -1,4 +1,4 @@
-//! Native, read-only checkpoint projection; no model, optimizer or device is constructed.
+//! Read-only checkpoint inspection as JSON; no model, optimizer or device is constructed.
 use super::*;
 use serde_json::{Value, json};
 use std::io::Write;
@@ -21,19 +21,12 @@ const MAX_SNAPSHOTS: u64 = 10_000;
 const MAX_FILES: usize = MAX_SNAPSHOTS as usize + 4;
 const CHANGED: &str = "checkpoint changed during inspection";
 
-impl TrainingArtifact {
-    /// Validates and describes checkpoint files without restoring a model or writing files.
-    pub fn inspect(directory: &Path) -> Result<Vec<u8>, CheckpointError> {
-        checkpoint_inspect(directory)
-    }
-}
-
-/// Returns one bounded JSON document and newline, or an error without output or writes.
+/// Returns one JSON document of at most 4 MiB plus a newline; never writes files.
 pub fn checkpoint_inspect(directory: &Path) -> Result<Vec<u8>, CheckpointError> {
     inspect_with_hook(directory, || {})
 }
 
-/// Describes the exact current build's checkpoint identities without filesystem or device I/O.
+/// Describes this build's checkpoint schema identities; performs no filesystem or device I/O.
 pub fn checkpoint_inspection_contract() -> Result<Vec<u8>, CheckpointError> {
     json_bytes(projection::contract())
 }
@@ -46,7 +39,8 @@ fn inspect_with_hook(
     let manifest = read_manifest(&root)?;
     let inspected = inspect_manifest(&root, &manifest);
     after_inventory();
-    // Re-read even after a payload error: a new commit is not a corrupt old commit.
+    // Re-read even after a payload error, so a concurrent commit is reported as a change
+    // rather than as corruption.
     let current = read_manifest(&root).map_err(|_| CheckpointError::InvalidManifest(CHANGED))?;
     if current != manifest {
         return Err(CheckpointError::InvalidManifest(CHANGED));
@@ -94,8 +88,7 @@ fn load_payload(
     if sha256(&tensors) != artifact.tensor_hash {
         return Err(CheckpointError::TensorHashMismatch);
     }
-    // Reuse the native codecs and full artifact validation, not a second binary parser.
-    // Unlike load's pathname reopens, every inspection read remains descriptor-anchored.
+    // Reuse the checkpoint codecs and full artifact validation rather than a separate parser.
     let decoded = decode_training_tensors(&tensors)?;
     artifact.parameters = decoded.parameters;
     artifact.optimizer.first_moment = decoded.first_moment;

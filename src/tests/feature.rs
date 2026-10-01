@@ -284,26 +284,6 @@ fn projectile_capacity_view(team: Team, count: u32) -> WorldView {
 }
 
 #[test]
-fn feature_observation_history_has_an_exact_fixed_capacity() {
-    let mut tracker = tracker_with_view(Team::Radiant, world_view(Team::Radiant, 1));
-    let mut encoder = FeatureEncoder::new(&tracker);
-    encoder.observe(&tracker).expect("first observation");
-    for tick in 2..=18 {
-        tracker
-            .observe_snapshot(&world_view(Team::Radiant, tick))
-            .expect("new snapshot");
-        encoder.observe(&tracker).expect("new observation");
-    }
-    let latest = encode_with_encoder(&tracker, &mut encoder);
-    assert_eq!(
-        encoder.rollback(2).expect_err("before horizon").to_string(),
-        "feature observation rollback tick 2 is older than earliest supported tick 3"
-    );
-    assert_eq!(encode_with_encoder(&tracker, &mut encoder), latest);
-    encoder.rollback(3).expect("oldest retained observation");
-}
-
-#[test]
 fn ragged_feature_arena_rejects_corrupt_offsets() {
     let frame = encoded_frame(Team::Radiant, world_view(Team::Radiant, 1));
     let mut arena = RaggedFeatureArena::new(1).expect("arena");

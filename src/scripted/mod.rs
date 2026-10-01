@@ -24,9 +24,9 @@ use crate::{
 };
 
 /// A rule policy that can hold any seat: training opponent, duel side or live player.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 pub enum ScriptKind {
-    /// The original rule teacher.
+    /// The Shadow Fiend lane rule policy used as the training teacher.
     Teacher,
     /// Zones the enemy hero off the lane with stacked razes, then pushes the tower.
     HarassPush,
@@ -86,7 +86,7 @@ struct Noise {
 }
 
 impl ScriptedPolicy {
-    /// Creates a canonical policy with empty per-match memory.
+    /// A policy of the canonical style, which has no noise.
     pub fn new(kind: ScriptKind) -> Self {
         Self::styled(kind, &StyleValues::canonical(kind), 0)
     }
@@ -123,7 +123,7 @@ impl ScriptedPolicy {
         policy
     }
 
-    /// Selects an action and returns the exact action space used to select it.
+    /// Returns the selected action together with the action space it was selected in.
     pub fn decide(
         &mut self,
         tracker: &StateTracker,
@@ -182,7 +182,7 @@ impl ScriptedPolicy {
         }
     }
 
-    /// Rolls back bounded local memory created by one rejected sequence.
+    /// Rolls back memory created by one rejected sequence; returns whether anything changed.
     pub fn note_rejected(&mut self, sequence: u32) -> bool {
         match &mut self.brain {
             Brain::Teacher(teacher) => teacher.note_rejected(sequence),

@@ -59,8 +59,8 @@ const AGGRO_KNOB: Knob = Knob::new("aggro", 90, (90, 3_600), (90, 900));
 pub(crate) const STYLE_KNOBS: [Knob; 8] = [
     // Health share at or below which it walks home.
     Knob::new("retreat", 40, (10, 70), (25, 55)),
-    // Health share below which a started walk home continues; at or below `retreat` the
-    // canonical Teacher has no hysteresis.
+    // Health share below which a started walk home continues; the default equals `retreat`,
+    // so the canonical Teacher has no hysteresis.
     Knob::new("return", 40, (10, 100), (40, 90)),
     // Health and mana share it holds for at the fountain.
     Knob::new("fountain", 95, (40, 100), (60, 100)),
@@ -170,7 +170,7 @@ struct OrderNote {
     tick: u32,
 }
 
-/// Deterministic bounded Shadow Fiend rule policy used as a training teacher.
+/// Deterministic rule-based Shadow Fiend policy used as a training teacher.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Teacher {
     hero_notes: [Option<OrderNote>; ORDER_NOTE_LIMIT],
@@ -198,12 +198,11 @@ impl Default for Teacher {
 }
 
 impl Teacher {
-    /// Creates a canonical teacher with empty per-match order and purchase memory.
+    /// A teacher of the canonical style.
     pub fn new() -> Self {
         Self::with_style(TeacherStyle::default())
     }
 
-    /// Creates a teacher of one drawn style with empty per-match memory.
     pub fn with_style(style: TeacherStyle) -> Self {
         Self {
             hero_notes: [None; ORDER_NOTE_LIMIT],
@@ -238,7 +237,7 @@ impl Teacher {
         teacher
     }
 
-    /// Selects an action and returns the exact action space used to select it.
+    /// Returns the selected action together with the action space it was selected in.
     pub fn decide(
         &mut self,
         tracker: &StateTracker,
@@ -275,8 +274,8 @@ impl Teacher {
         )
     }
 
-    /// Selects channel, sustain, bounded finishing, navigation cancellation, or retreat work.
-    /// Stages bookkeeping for `note_sent`, just like `decide`.
+    /// Selects only mandatory work: channel protection, unsafe-order cancellation, sustain,
+    /// finishing, combat cancellation or retreat. Stages bookkeeping for `note_sent` like `decide`.
     #[cfg(test)]
     pub fn safety_action(
         &mut self,
@@ -362,7 +361,7 @@ impl Teacher {
                 .body
                 .is_some_and(|note| note.issued == plan.issued)
         {
-            // Safety/deployment callers also suppress identical body orders without note_sent.
+            // Persistence suppresses a repeated identical body order, so `note_sent` never sees it.
             self.accept_combat_plan(plan);
             self.combat_proposal = None;
         }
@@ -397,8 +396,8 @@ impl Teacher {
         })
     }
 
-    /// Records a sent order and the snapshot tick of the space that decoded it.
-    /// Item classification uses the latest decision, safety, or deployment snapshot.
+    /// Records a sent order; `tick` is the snapshot tick of the space that decoded it, and
+    /// order timers run from it.
     pub fn note_sent(&mut self, sequence: u32, issued: IssuedOrder, tick: u32) {
         self.note_combat_sent(sequence, issued, tick);
         if is_notable_order(issued.order) {
@@ -424,7 +423,7 @@ impl Teacher {
         }
     }
 
-    /// Rolls back bounded local memory created by one rejected sequence.
+    /// Rolls back memory created by one rejected sequence; returns whether anything changed.
     pub fn note_rejected(&mut self, sequence: u32) -> bool {
         let mut changed = false;
         if let Some((rejected, previous)) = self.combat_rollback
@@ -1610,8 +1609,8 @@ fn safe_kill_opportunity(tracker: &StateTracker, space: &ActionSpace, hero: &Uni
     })
 }
 
-// This is a bounded trial estimate, not an observed attack phase. Half an interval
-// budgets unknown cooldown; the fixed deadline and range abort prevent an open-ended chase.
+// An estimate, not an observed attack phase: half an attack interval stands in for the unknown
+// attack cooldown. The fixed deadline and the range abort keep the chase finite.
 fn finish_estimated_ticks(hero: &UnitView, enemy: &UnitView) -> u32 {
     let turn = attack_turn_ticks(hero, enemy);
     let distance = isqrt(hero.pos.distance_squared(enemy.pos) as u64);
@@ -1640,7 +1639,7 @@ fn finish_risk_acceptable(
         | bota_proto::StatusFlags::DOT
         | bota_proto::StatusFlags::CHANNELLING;
     let reach = hero.attack_range + hero.bound + enemy.bound - movement_guard(enemy);
-    // Keep restoration separate from the wire-truncation and natural-regeneration margin.
+    // The base margin covers wire truncation and natural regeneration; item restoration is extra.
     let health_margin = (2 + ticks.div_ceil(10) as i32)
         .saturating_add(finish_item_restoration(tracker, enemy, ticks));
     if hero.statuses.bits & disabled != 0
@@ -1713,8 +1712,8 @@ fn finish_raze_budget(
             );
         }
     }
-    // All eight subsets fit in constant work. Slot-order greed can spend mana on a weaker raze.
-    // Each raze's 300-tick cooldown exceeds the entire finish window, so it can cast only once.
+    // Try all eight subsets: slot-order greed can spend mana on a weaker raze. Each raze's
+    // 300-tick cooldown exceeds the finish window, so each raze casts at most once.
     let mut maximum = 0;
     for subset in 0..(1 << SHADOWRAZES.len()) {
         let (mut cost, mut damage) = (0i32, 0i32);
@@ -1735,7 +1734,7 @@ fn possible_finish_raze(source: &UnitView, hero: &UnitView, reach: i32, ticks: u
     assert!(SHADOWRAZES.iter().any(|(_, distance)| *distance == reach));
     assert!(ticks <= FINISH_LIMIT_TICKS);
     let distance = isqrt(source.pos.distance_squared(hero.pos) as u64) as i64;
-    // Facing is not a promise: allow the caster to turn/walk, plus both bodies' separation.
+    // Facing is not a promise: allow the caster to walk at move speed plus 8 units per tick.
     let movement = (i64::from(source.move_speed.raw.max(0)) / 30
         + i64::from(Fixed::from_int(8).raw))
         * i64::from(ticks);
@@ -1750,8 +1749,9 @@ fn finish_mana_budget(tracker: &StateTracker, source: &UnitView, ticks: u32) -> 
     if source.effects.iter().any(|effect| effect.id == EffectId(3)) {
         return i32::MAX;
     }
-    // Audited SF regeneration is (0.25 + intelligence / 20 + Sage's Masks) mana/second.
-    // Readiness within the window permits a whole-window upper estimate of regeneration.
+    // SF regeneration is (0.25 + intelligence / 20 + Sage's Masks) mana/second; Treads not on
+    // Intelligence may switch for 10 more. Items ready within the window count for all of it,
+    // an upper estimate.
     let masks = finish_eligible_items(source, ticks)
         .filter(|item| item.id == ItemId(26))
         .count() as u64;

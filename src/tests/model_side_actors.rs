@@ -718,7 +718,7 @@ fn assert_single(
     model: &PolicyModel,
     frame: &FeatureFrame,
     space: &ActionSpace,
-    expected: &PpoPolicyChoice,
+    expected: &crate::PpoPolicyChoice,
     mut random: PpoRng,
     expected_random: &PpoRng,
 ) {

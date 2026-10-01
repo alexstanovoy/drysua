@@ -1,4 +1,5 @@
 use super::*;
+use crate::PolicyIdentity;
 
 /// A private test directory that is removed with its contents when dropped,
 /// so a panicking test cannot leak it.
@@ -71,4 +72,85 @@ impl PpoBatch {
     pub(crate) fn replace_advantage_for_test(&mut self, index: usize, value: f32) -> f32 {
         std::mem::replace(&mut self.samples[index].advantage, value)
     }
+}
+
+/// Observed outcome that closes one sampled decision into a rollout transition.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PpoOutcome {
+    pub stream: usize,
+    pub decision: u32,
+    pub ticks: u32,
+    pub next_value: f32,
+    pub reward: f32,
+    pub terminal: bool,
+}
+
+impl PpoPolicyChoice {
+    pub(crate) const fn action(&self) -> StructuredAction {
+        self.action
+    }
+
+    pub(crate) const fn policy(&self) -> PolicyIdentity {
+        self.policy
+    }
+
+    pub(crate) const fn log_probability(&self) -> f32 {
+        self.log_probability
+    }
+
+    pub(crate) const fn entropy(&self) -> f32 {
+        self.entropy
+    }
+
+    pub(crate) const fn value(&self) -> f32 {
+        self.value
+    }
+
+    pub(crate) fn finish(
+        self,
+        behaviour: u64,
+        outcome: PpoOutcome,
+    ) -> Result<PpoTransition, PpoError> {
+        let transition = PpoTransition {
+            frame: self.frame,
+            target: self.target,
+            shadow: None,
+            action: self.action,
+            behaviour,
+            stream: outcome.stream,
+            decision: outcome.decision,
+            ticks: outcome.ticks,
+            old_log_probability: self.log_probability,
+            old_value: self.value,
+            next_value: outcome.next_value,
+            reward: outcome.reward,
+            terminal: outcome.terminal,
+        };
+        validate_transition(&transition)?;
+        Ok(transition)
+    }
+}
+
+impl PpoPreparedSample {
+    pub(crate) const fn return_value(&self) -> f32 {
+        self.return_value
+    }
+}
+
+impl PpoRng {
+    pub(crate) const fn draws(&self) -> u64 {
+        self.draws
+    }
+}
+
+/// Sampled action and old-policy statistics returned by the model.
+#[derive(Clone, Debug)]
+pub struct PpoPolicyChoice {
+    pub(crate) frame: FeatureFrame,
+    pub(crate) target: BehavioralTarget,
+    pub(crate) action: StructuredAction,
+    pub(crate) policy: PolicyIdentity,
+    pub(crate) log_probability: f32,
+    pub(crate) entropy: f32,
+    pub(crate) value: f32,
 }
