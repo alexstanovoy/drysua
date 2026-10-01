@@ -154,7 +154,8 @@ impl Wire for Link {
                 Ok(None) => {}
                 Err(error) => {
                     return Err(std::io::Error::other(format!(
-                        "failed to decode server message: {error}"
+                        "failed to decode server message: {error}; likely a bota/drysua protocol mismatch, \
+build both from matching commits"
                     )));
                 }
             }

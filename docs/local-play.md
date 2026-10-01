@@ -103,21 +103,20 @@ The canonical tracked entry point is `drysua/scripts/play.sh`; the workspace-roo
 `root` the workspace directory containing both repositories, explicit weights select
 `$root/drysua/target/release/drysua`, not a pinned historical executable.
 
-By default the launcher builds **only missing** release binaries: no cargo
-invocation runs when all three executables exist, and only the affected workspace is
-built when one is missing or not executable. `--build` forces the two release
-builds below before launching; `--no-build` never builds and checks **all three**
-existing release executables after weights preflight and before logs. `--build` and
-`--no-build` are mutually exclusive.
+By default the launcher runs both incremental release builds below before every launch
+(a near no-op when up to date), so bota and drysua always match. `--no-build` never
+builds, checks **all three** existing release executables after weights preflight and
+before logs, and refuses bota binaries older than the bota HEAD commit (a stale wire
+protocol); drop `--no-build` to rebuild.
 
 ```sh
-# bota workspace: only for --build or a missing bota binary
+# bota workspace
 CARGO_TARGET_DIR="$root/bota/target" \
 cargo build --release --locked --quiet \
   --manifest-path "$root/bota/Cargo.toml" \
   -p bota-server -p bota-client --bin bota-server --bin bota-client
 
-# Working directory: "$root/drysua"; only for --build or a missing bot binary
+# Working directory: "$root/drysua"
 CARGO_TARGET_DIR="$root/drysua/target" \
 cargo build --release --locked --quiet --bin drysua --no-default-features
 ```
@@ -125,10 +124,7 @@ cargo build --release --locked --quiet --bin drysua --no-default-features
 Each build has a 20-minute deadline. Inherited `CARGO_TARGET_DIR` does not redirect
 build or launch paths. There are no debug, builtin simulator, CUDA, training, or
 full-workspace bot builds. No historical frozen executable is overwritten. Cargo's
-normal release build can need its existing registry/cache. An existing target path
-alone does not prove freshness or compatibility: the default path deliberately
-reuses existing binaries and never recompiles; pass `--build` after source changes,
-or `--no-build` to forbid builds explicitly.
+normal release build can need its existing registry/cache. `--no-build` trusts existing binaries beyond the bota-age check, so use it only offline.
 
 The protocol/slot mapping is for bota commit
 `78427bb80eb716f851cb039ade33e2964bbf3c11`. Keep the server/client and current drysua
