@@ -11,15 +11,16 @@ use bota_proto::{EntityId, EventKind, MatchInfo, SlotId};
 use observation::{Role, SnapshotFacts, TowerFact};
 
 /// Version of the Map2 reward definition, recorded with checkpoints and reward reports.
-pub const MAP2_REWARD_VERSION: u32 = 8;
+pub const MAP2_REWARD_VERSION: u32 = 9;
 /// Per-tick discount required for exact potential cancellation.
 pub const MAP2_REWARD_GAMMA_TICK: f32 = 1.0;
 /// Terminal reward for an authoritative win, before the fast-win bonus.
 pub const MAP2_REWARD_WIN: f64 = 1.0;
 /// Terminal reward for an authoritative loss.
 pub const MAP2_REWARD_LOSS: f64 = -1.0;
-/// Terminal reward for a native draw (cap or simultaneous losses) or a learner time cap.
-pub const MAP2_REWARD_DRAW: f64 = 0.0;
+/// Terminal reward for a native draw (cap or simultaneous losses) or a learner time cap;
+/// loss-ish so that stalemates are not a safe harbour.
+pub const MAP2_REWARD_DRAW: f64 = -0.5;
 /// Extra win reward at the end of pregame, falling linearly to zero at the native cap.
 pub const MAP2_REWARD_FAST_WIN_BONUS: f64 = 0.5;
 /// Potential per unit of (own - enemy) weakest-tower HP fraction; the first tower lost decides.
@@ -61,7 +62,6 @@ const POTENTIAL_BOUND: f64 = MAP2_REWARD_TOWER_WEIGHT
     + MAP2_REWARD_HEALTH_WEIGHT
     + MAP2_REWARD_XP_WEIGHT;
 
-const _: () = assert!(MAP2_REWARD_WIN + MAP2_REWARD_LOSS == 0.0);
 const _: () = assert!(MAP2_REWARD_LOSS < MAP2_REWARD_DRAW);
 const _: () = assert!(MAP2_REWARD_DRAW < MAP2_REWARD_WIN);
 const _: () = assert!(MAP2_REWARD_FAST_WIN_BONUS >= 0.0);

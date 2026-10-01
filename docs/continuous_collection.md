@@ -94,7 +94,7 @@ Every published update gets its own mixture (`src/ppo_arena/opponents.rs`). With
 100 games against that opponent; `fixed` keeps the weights. Weights are exact
 integers computed after update `u` from the games of updates up to `u` and apply
 to update `u + 2`, so they are a pure function of the run. After each update the
-trainer logs `event=opponent_pool update=… scope=<opponent> games= score= win_rate=
+trainer logs `event=opponent_pool update=… scope=<opponent> games= wins= win_rate=
 probability=`; the dashboard charts win rate and probability per opponent, with
 league snapshots (`u0040`) folded into one `league` series.
 

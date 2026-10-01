@@ -14,7 +14,7 @@ r_T = Φ(s_T) − Φ(s_{T−1}) − Φ(s_T) + R(end)   final tick: Φ(terminal) 
 
 R(Win)  = +1 + 0.5 · min(1, (27900 − T) / 27000)
 R(Loss) = −1
-R(Draw) = R(TimeCap) = 0
+R(Draw) = R(TimeCap) = −0.5   (loss-ish: a stalemate must not be safe)
 
 Φ = 0.75 · (own weakest tower HP fraction − enemy weakest tower HP fraction)
   + 0.40 · (enemy hero deaths − own hero deaths)          deaths capped at 2
@@ -83,7 +83,7 @@ policy seat cannot see because it only shapes training games: nothing reaches th
 policy's input, the runtime weights, `play` or evaluation.
 
 - Each finished training game contributes a sample every 30 s of game clock and its
-  score (win 1, draw or cap ½, loss 0). Every `--win-model-every` updates (10) the
+  score (win 1, draw or cap ½, loss 0; unchanged by the draw reward). Every `--win-model-every` updates (10) the
   learner refits on the last `--win-model-games` games (1024) with the seat-swapped
   copy of every sample, 12 ridge-regularized Newton steps in f64: a pure function of
   the run.
