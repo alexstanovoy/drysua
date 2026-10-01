@@ -449,16 +449,13 @@ impl AnnealedSession {
             .train_update(&self.state.model, &batch, objective);
         timing.set_optimizer_step(self.state.trainer.optimizer_step());
         self.state.latest = optimized?;
-        let memory = self
-            .state
-            .model
-            .release_cached_memory()
-            .map_err(text_error)?;
-        if let Some(memory) = memory {
+        if let Some(usage) = crate::model::vram_usage().map_err(text_error)? {
             crate::telemetry::log_line!(
-                "level=INFO event=device_memory update={update} pool_reserved_mib={} pool_used_mib={}",
-                memory.reserved >> 20,
-                memory.used >> 20,
+                "level=INFO event=device_memory update={update} budget_mib={} reserved_mib={} used_mib={} used_high_mib={}",
+                usage.budget >> 20,
+                usage.reserved >> 20,
+                usage.used >> 20,
+                usage.used_high >> 20,
             );
         }
         log_ppo_update(

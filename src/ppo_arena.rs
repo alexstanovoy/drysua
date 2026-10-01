@@ -2,6 +2,7 @@ use std::collections::VecDeque;
 mod annealed;
 pub(crate) use annealed::preflight_annealed_resume;
 pub(crate) use annealed::validate_annealed;
+pub(crate) use annealed::vram_budget_estimate;
 pub use annealed::{
     AnnealedJobConfig, AnnealedJobReport, run_annealed_job_on_with_initial_weights,
 };

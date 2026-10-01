@@ -16,6 +16,12 @@ mod ppo_objective;
 mod rows;
 mod sampling;
 mod side_actors;
+#[cfg(all(
+    feature = "builtin",
+    feature = "cuda",
+    any(target_os = "linux", target_os = "windows")
+))]
+pub(crate) mod vram;
 pub use device_learner::MODEL_PPO_MAX_MICROBATCH;
 pub(crate) use device_learner::StagedPpoBatch;
 pub use rows::EncoderRow;
@@ -1072,66 +1078,54 @@ fn cuda_device(ordinal: usize) -> Result<Device, ModelError> {
     Ok(device)
 }
 
-/// Bytes the device memory pool holds and the bytes of it in live tensors.
+// Budget constants, measured on CUDA by
+// `vram_budget_constants_bound_measured_peaks` (which keeps them upper
+// bounds) with about 5% headroom; rows have a fixed token capacity.
+/// Device bytes one staged training row holds (measured 130,443 with shadow labels).
+#[cfg(feature = "builtin")]
+pub(crate) const VRAM_STAGED_ROW_BYTES: u64 = 132 << 10;
+/// Learner transient bytes of one Adam step beyond its rows' share (measured ~25 MB).
+#[cfg(feature = "builtin")]
+pub(crate) const VRAM_LEARNER_FIXED_BYTES: u64 = 64 << 20;
+/// Learner transient bytes per microbatch row, activations and gradients
+/// (measured 4.84 MB with imitation, 4.74 MB without).
+#[cfg(feature = "builtin")]
+pub(crate) const VRAM_LEARNER_ROW_BYTES: u64 = 5 << 20;
+/// Inference transient bytes of one sampling call beyond its rows' share (measured ~0).
+#[cfg(feature = "builtin")]
+pub(crate) const VRAM_INFERENCE_FIXED_BYTES: u64 = 16 << 20;
+/// Inference transient bytes per sampled row (measured 1.63 MB).
+#[cfg(feature = "builtin")]
+pub(crate) const VRAM_INFERENCE_ROW_BYTES: u64 = 7 << 18;
+
+/// What the trainer's VRAM budget pool holds and has held, in bytes.
 #[cfg(feature = "builtin")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct DevicePoolUsage {
+pub(crate) struct VramUsage {
+    pub budget: u64,
     pub reserved: u64,
     pub used: u64,
+    pub used_high: u64,
 }
 
-/// Returns the device memory pool's free blocks to the driver and reports
-/// what the pool still holds.
-///
-/// candle allocates from the device's default stream-ordered pool, which
-/// every lane and the learner share. The learner's large transient blocks get
-/// interleaved with longer-lived ones, so freed memory stays reserved in
-/// partly used chunks and the pool's footprint creeps up update after update
-/// while live memory stays flat. Trimming once per update bounds it.
+/// Reserves a `bytes` VRAM budget on CUDA device `ordinal` for the rest of
+/// the process; see [`vram`].
 #[cfg(all(
     feature = "builtin",
     feature = "cuda",
     any(target_os = "linux", target_os = "windows")
 ))]
-fn trim_cuda_pool(device: &Device) -> Result<DevicePoolUsage, ModelError> {
-    use candle_core::cuda_backend::cudarc::driver::sys;
-    let cuda = device.as_cuda_device()?;
-    // Frees enqueued on this thread's stream must complete to be releasable.
-    device.synchronize()?;
-    let context = cuda.cuda_stream().context().clone();
-    context
-        .bind_to_thread()
-        .map_err(|error| ModelError::Backend(error.to_string()))?;
-    let check = |result: sys::CUresult| match result {
-        sys::cudaError_enum::CUDA_SUCCESS => Ok(()),
-        error => Err(ModelError::Backend(format!("CUDA memory pool: {error:?}"))),
-    };
-    let mut pool = std::ptr::null_mut();
-    let mut usage = [0_u64; 2];
-    // SAFETY: plain driver calls on the bound context's device; the pool is
-    // the device's default pool, which outlives the calls, and each attribute
-    // is a u64 written into its own element.
-    unsafe {
-        check(sys::cuDeviceGetDefaultMemPool(
-            &mut pool,
-            context.cu_device(),
-        ))?;
-        check(sys::cuMemPoolTrimTo(pool, 0))?;
-        for (value, attribute) in usage.iter_mut().zip([
-            sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_RESERVED_MEM_CURRENT,
-            sys::CUmemPool_attribute::CU_MEMPOOL_ATTR_USED_MEM_CURRENT,
-        ]) {
-            check(sys::cuMemPoolGetAttribute(
-                pool,
-                attribute,
-                std::ptr::from_mut(value).cast(),
-            ))?;
-        }
-    }
-    Ok(DevicePoolUsage {
-        reserved: usage[0],
-        used: usage[1],
-    })
+pub(crate) fn reserve_vram_budget(ordinal: usize, bytes: u64) -> Result<VramUsage, ModelError> {
+    vram::reserve(ordinal, bytes)
+}
+
+/// The VRAM budget's usage, when the process reserved one.
+#[cfg(feature = "builtin")]
+pub(crate) fn vram_usage() -> Result<Option<VramUsage>, ModelError> {
+    #[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
+    return vram::usage();
+    #[cfg(not(all(feature = "cuda", any(target_os = "linux", target_os = "windows"))))]
+    Ok(None)
 }
 
 /// F32 DeepSets policy with an autoregressive masked decoder.
@@ -1193,7 +1187,25 @@ impl PolicyModel {
 
     /// Deterministic parameters from `seed` on `device`.
     pub fn fresh_on(seed: u64, device: PolicyDevice) -> Result<Self, ModelError> {
-        let tensor_device = device.candle()?;
+        Self::fresh_with(seed, device, device.candle()?)
+    }
+
+    /// Deterministic parameters from `seed` on `sibling`'s device handle.
+    ///
+    /// A CUDA handle carries its own cuBLAS handle and workspace, cuRAND state
+    /// and loaded kernel modules, all outside the memory pool; models one
+    /// thread uses together share one handle so replicas created mid-run
+    /// allocate none of that again.
+    #[cfg(feature = "builtin")]
+    pub(crate) fn fresh_beside(seed: u64, sibling: &Self) -> Result<Self, ModelError> {
+        Self::fresh_with(seed, sibling.device_kind, sibling.tensor_device.clone())
+    }
+
+    fn fresh_with(
+        seed: u64,
+        device: PolicyDevice,
+        tensor_device: Device,
+    ) -> Result<Self, ModelError> {
         let mut generator = Initializer::new(seed);
         let unit = Mlp::fresh(
             &[(UNIT_FEATURES, 64), (64, 128), (128, 128)],
@@ -1293,17 +1305,6 @@ impl PolicyModel {
 
     fn tensor_device(&self) -> &Device {
         &self.tensor_device
-    }
-
-    /// Returns cached free device memory to the driver and reports the pool's
-    /// remaining footprint; see [`trim_cuda_pool`]. Nothing on the CPU.
-    #[cfg(feature = "builtin")]
-    pub(crate) fn release_cached_memory(&self) -> Result<Option<DevicePoolUsage>, ModelError> {
-        match self.device_kind {
-            PolicyDevice::Cpu => Ok(None),
-            #[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
-            PolicyDevice::Cuda { .. } => trim_cuda_pool(&self.tensor_device).map(Some),
-        }
     }
 
     /// Returns the process-local lineage and exact current parameter revision.

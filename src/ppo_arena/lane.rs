@@ -103,7 +103,6 @@ pub(super) struct LaneLinks<'a> {
 }
 
 struct LaneModels {
-    device: PolicyDevice,
     actor: PolicyModel,
     version: u64,
     snapshots: Vec<PolicyModel>,
@@ -116,20 +115,21 @@ struct LaneModels {
 }
 
 /// Retired league replicas a lane keeps for reuse.
-const MAX_SPARE_REPLICAS: usize = 16;
+pub(super) const MAX_SPARE_REPLICAS: usize = 16;
 
 impl LaneModels {
     fn new(settings: &LaneSettings, config: &PartConfig) -> Result<Self, PpoError> {
-        let device = settings.device;
+        let actor = PolicyModel::fresh_on(0, settings.device).map_err(text_error)?;
+        actor.import_parameters(&config.actor).map_err(text_error)?;
+        let snapshots = settings
+            .snapshots
+            .iter()
+            .map(|parameters| load_beside(&actor, parameters))
+            .collect::<Result<_, _>>()?;
         let mut models = Self {
-            device,
-            actor: load_model(device, &config.actor)?,
+            actor,
             version: config.version,
-            snapshots: settings
-                .snapshots
-                .iter()
-                .map(|parameters| load_model(device, parameters))
-                .collect::<Result<_, _>>()?,
+            snapshots,
             league: BTreeMap::new(),
             spare: Vec::new(),
         };
@@ -167,7 +167,7 @@ impl LaneModels {
                         model.import_parameters(parameters).map_err(text_error)?;
                         model
                     }
-                    None => load_model(self.device, parameters)?,
+                    None => load_beside(&self.actor, parameters)?,
                 };
                 self.league.insert(*milestone, model);
             }
@@ -190,8 +190,9 @@ impl LaneModels {
     }
 }
 
-fn load_model(device: PolicyDevice, parameters: &[f32]) -> Result<PolicyModel, PpoError> {
-    let model = PolicyModel::fresh_on(0, device).map_err(text_error)?;
+/// A replica of `parameters` on the actor's device handle.
+fn load_beside(actor: &PolicyModel, parameters: &[f32]) -> Result<PolicyModel, PpoError> {
+    let model = PolicyModel::fresh_beside(0, actor).map_err(text_error)?;
     model.import_parameters(parameters).map_err(text_error)?;
     Ok(model)
 }

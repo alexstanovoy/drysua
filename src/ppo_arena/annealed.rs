@@ -201,6 +201,56 @@ where
     )
 }
 
+/// Upper bound, in bytes, on the CUDA memory one training process of
+/// `settings` allocates: parameter replicas at their caps, the learner's
+/// optimizer state, the staged update at rollout capacity, one Adam step's
+/// transients at the full microbatch and every lane's sampling call at its
+/// largest batch (policy plus self-play rows), plus a quarter for pool
+/// fragmentation. Encoder rows have a fixed token capacity, so per-row bytes
+/// do not depend on what a frame holds.
+pub(crate) fn vram_budget_estimate(settings: &AnnealedJobConfig) -> u64 {
+    use crate::model::{
+        VRAM_INFERENCE_FIXED_BYTES, VRAM_INFERENCE_ROW_BYTES, VRAM_LEARNER_FIXED_BYTES,
+        VRAM_LEARNER_ROW_BYTES, VRAM_STAGED_ROW_BYTES,
+    };
+    let parameters = crate::MODEL_PARAMETER_COUNT as u64 * 4;
+    let lanes = settings.lanes.max(1) as u64;
+    let lane_slots = (settings.slots / settings.lanes.max(1)) as u64;
+    let count = |wanted: fn(&AnnealedOpponent) -> bool| {
+        settings
+            .opponents
+            .iter()
+            .filter(|(opponent, _)| wanted(opponent))
+            .count() as u64
+    };
+    let weights = count(|opponent| matches!(opponent, AnnealedOpponent::Weights(_)));
+    // Live league replicas: the mixture's milestones plus older ones in-flight
+    // games still play (at most one per slot), and the retired spares.
+    let league = if count(|opponent| matches!(opponent, AnnealedOpponent::League)) > 0 {
+        settings.league_size as u64 + lane_slots + super::lane::MAX_SPARE_REPLICAS as u64
+    } else {
+        0
+    };
+    let replicas = lanes * (1 + weights + league) * parameters;
+    let microbatch = settings
+        .execution
+        .training_microbatch
+        .min(settings.ppo.minibatch) as u64;
+    let learner = LEARNER_PARAMETER_COPIES * parameters
+        + settings.ppo.rollout_capacity(settings.slots) as u64 * VRAM_STAGED_ROW_BYTES
+        + VRAM_LEARNER_FIXED_BYTES
+        + microbatch * VRAM_LEARNER_ROW_BYTES;
+    let inference =
+        lanes * (VRAM_INFERENCE_FIXED_BYTES + 2 * lane_slots * VRAM_INFERENCE_ROW_BYTES);
+    let total = replicas + learner + inference;
+    total + total / 4
+}
+
+/// Parameter-sized learner tensors alive at once during an Adam step: the
+/// parameters, summed gradients, both moments, their successors, the flat
+/// rollback copy, flat gradients and the step's elementwise temporaries.
+const LEARNER_PARAMETER_COPIES: u64 = 16;
+
 /// Runs the annealed loop under an invocation-only test harness.
 pub(crate) fn run_annealed_job_harnessed<F>(
     settings: AnnealedJobConfig,

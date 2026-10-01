@@ -862,3 +862,90 @@ fn assert_both_kind_heads_have_moments(model: &PolicyModel, adam: &crate::AdamSt
         }
     }
 }
+
+/// Measures the device pool's live peak of each budget component on CUDA
+/// (run alone: the pool is per process) and checks the budget constants bound
+/// them; prints the measurements for recalibration.
+#[cfg(all(feature = "builtin", feature = "cuda"))]
+#[test]
+#[ignore = "exclusive CUDA: measures the process-wide memory pool"]
+fn vram_budget_constants_bound_measured_peaks() {
+    use crate::model::vram::current_pool_usage;
+    let device = PolicyDevice::Cuda { ordinal: 0 };
+    let model = PolicyModel::fresh_on(9001, device).expect("model");
+    let (frames, spaces) = native_inputs();
+    let base = ppo_samples();
+    let config = PpoConfig {
+        target_kl: 1.0e3,
+        ..PpoConfig::default()
+    };
+    let mut adam = model.claim_optimizer(config.adam()).expect("Adam");
+    for (rows, imitation) in [(256_usize, false), (512, false), (256, true), (512, true)] {
+        let samples: Vec<_> = (0..rows)
+            .map(|row| {
+                let mut sample = base[row % 2].clone();
+                if imitation {
+                    sample.transition.shadow = Some(sample.transition.target.clone());
+                }
+                sample
+            })
+            .collect();
+        let (before, _) = current_pool_usage(0, true);
+        let mut staging = model.ppo_staging(rows, imitation).expect("staging");
+        for sample in &samples {
+            staging.push(sample).expect("push");
+        }
+        let staged = model.stage_ppo_batch(staging).expect("stage");
+        let (after, _) = current_pool_usage(0, false);
+        let staged_row = (after - before) / rows as u64;
+        let (resting, _) = current_pool_usage(0, true);
+        let indices: Vec<_> = (0..rows).collect();
+        model
+            .ppo_update_staged(
+                &staged,
+                &indices,
+                &mut adam,
+                (
+                    config,
+                    crate::UpdateObjective {
+                        imitation: if imitation { 1.0 } else { 0.0 },
+                        critic_only: false,
+                    },
+                ),
+                (rows, crate::KlGuard::PostStep),
+            )
+            .expect("step");
+        let (_, high) = current_pool_usage(0, false);
+        let learner_row = (high - resting) / rows as u64;
+        eprintln!(
+            "vram rows={rows} staged_row={staged_row} learner_peak={} learner_row={learner_row}",
+            high - resting
+        );
+        assert!(staged_row <= crate::model::VRAM_STAGED_ROW_BYTES);
+        assert!(
+            high - resting
+                <= crate::model::VRAM_LEARNER_FIXED_BYTES
+                    + rows as u64 * crate::model::VRAM_LEARNER_ROW_BYTES
+        );
+    }
+    for rows in [64_usize, 128] {
+        let encoded: Vec<_> = (0..rows)
+            .map(|row| EncoderRow::from_frame(&frames[row % 2]).expect("row"))
+            .collect();
+        let references: Vec<_> = encoded.iter().collect();
+        let space_refs: Vec<_> = (0..rows).map(|row| &spaces[row % 2]).collect();
+        let mut random: Vec<_> = (0..rows).map(|row| PpoRng::new(row as u64)).collect();
+        let wanted = vec![true; rows];
+        let (resting, _) = current_pool_usage(0, true);
+        model
+            .sample_rows(&references, &space_refs, &mut random, &wanted)
+            .expect("inference");
+        let (_, high) = current_pool_usage(0, false);
+        eprintln!("vram inference rows={rows} peak={}", high - resting);
+        assert!(
+            high - resting
+                <= crate::model::VRAM_INFERENCE_FIXED_BYTES
+                    + rows as u64 * crate::model::VRAM_INFERENCE_ROW_BYTES
+        );
+    }
+}

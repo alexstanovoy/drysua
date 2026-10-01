@@ -119,12 +119,19 @@ exceeds `--target-kl`, and taken steps are kept. Imitation and critic warm-up
 change only the loss, so they work the same under either guard. The
 loss definitions live only in `src/model/ppo_objective.rs`.
 
-Device memory: lanes and the learner share the device's stream-ordered
-memory pool. After each update the learner trims the pool's free blocks back
-to the driver and logs `event=device_memory` with the pool's reserved and live
-MiB; lanes reload retired league replicas in place instead of allocating new
-ones. Without both, interleaved long-lived and transient blocks kept freed
-memory reserved and the pool footprint crept up over a session.
+Device memory: a CUDA trainer reserves a fixed VRAM budget at startup
+(`--vram-budget-mib`, default the configuration's worst case from
+`vram_budget_estimate`: parameter replicas at their caps, the staged update at
+rollout capacity, one Adam step at the full microbatch and every lane's largest
+sampling call, plus a quarter for fragmentation; per-row costs are measured by
+`vram_budget_constants_bound_measured_peaks`). The budget becomes the device's
+allocation pool, capped, filled up front and never released; streams reuse
+only their own freed blocks, so each lane and the learner settle into a steady
+state and the process footprint is the budget plus the CUDA context from the
+first update on. An allocation beyond it fails instead of growing. Each update
+logs `event=device_memory` with the budget, reserved, live and peak live MiB.
+Lanes reload retired league replicas in place and share one CUDA handle per
+lane.
 
 ## What changed numerically
 

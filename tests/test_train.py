@@ -281,6 +281,7 @@ class CampaignTests(unittest.TestCase):
                 ({"training_args": ["--updates", "9"]}, "controller-owned or unreviewed argument: --updates"),
                 ({"training_args": ["--resume"]}, "controller-owned or unreviewed argument: --resume"),
                 ({"mode": "gpu"}, "gpu_uuid must be a full GPU UUID"),
+                ({"vram_budget_mib": 4096}, "vram_budget_mib needs gpu mode"),
                 ({"stop_seconds": 1}, "stop_seconds must be an integer in 5..3600"),
                 ({"checkpoint_seconds": 59}, "checkpoint_seconds must be an integer in 60..86400"),
                 ({"training_args": ["--checkpoint-interval-seconds", "60"]},

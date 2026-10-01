@@ -292,6 +292,10 @@ struct TrainAnnealedArgs {
     /// CUDA device ordinal.
     #[arg(long, default_value_t = 0)]
     device_ordinal: usize,
+    /// CUDA memory (MiB) reserved at startup for the whole run; nothing is
+    /// allocated beyond it. Defaults to the configuration's computed worst case.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..=1 << 20))]
+    vram_budget_mib: Option<u64>,
 }
 
 /// Optimizer controls for resumable training.
@@ -482,6 +486,7 @@ fn run_train_annealed_with_settings(
         .map_err(std::io::Error::other)?;
     }
     log_annealed_start(&arguments, &settings);
+    reserve_vram_budget(&arguments, &settings, device)?;
     let report = crate::run_annealed_job_on_with_initial_weights(
         settings,
         device,
@@ -490,7 +495,20 @@ fn run_train_annealed_with_settings(
         arguments.checkpoint.initial_weights.as_deref(),
         report_training_checkpoint,
     )
-    .map_err(std::io::Error::other)?;
+    .map_err(|error| {
+        let text = error.to_string();
+        // An allocation beyond the reserved budget fails rather than growing it.
+        if text.contains("CUDA_ERROR_OUT_OF_MEMORY")
+            && let Ok(Some(usage)) = crate::model::vram_usage()
+        {
+            return std::io::Error::other(format!(
+                "{text}; the VRAM budget of {} MiB is exhausted (peak live {} MiB): raise --vram-budget-mib",
+                usage.budget >> 20,
+                usage.used_high >> 20
+            ));
+        }
+        std::io::Error::other(text)
+    })?;
     log_annealed_report(&report);
     if crate::training_signals::stop_requested() {
         crate::telemetry::log_line!(
@@ -498,6 +516,37 @@ fn run_train_annealed_with_settings(
             report.completed_updates
         );
     }
+    Ok(())
+}
+
+/// Reserves the run's CUDA memory budget before any training tensor exists.
+#[cfg(feature = "builtin")]
+fn reserve_vram_budget(
+    arguments: &TrainAnnealedArgs,
+    settings: &crate::AnnealedJobConfig,
+    device: crate::PolicyDevice,
+) -> std::io::Result<()> {
+    #[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
+    if let crate::PolicyDevice::Cuda { ordinal } = device {
+        let estimate = crate::ppo_arena::vram_budget_estimate(settings);
+        let bytes = arguments.vram_budget_mib.map_or(estimate, |mib| mib << 20);
+        let usage =
+            crate::model::reserve_vram_budget(ordinal, bytes).map_err(std::io::Error::other)?;
+        crate::telemetry::log_line!(
+            "level=INFO event=vram_budget budget_mib={} estimate_mib={} explicit={}",
+            usage.budget >> 20,
+            estimate >> 20,
+            arguments.vram_budget_mib.is_some(),
+        );
+        return Ok(());
+    }
+    if arguments.vram_budget_mib.is_some() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "--vram-budget-mib needs --device cuda",
+        ));
+    }
+    let _ = (settings, device);
     Ok(())
 }
 
