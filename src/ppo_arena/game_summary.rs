@@ -91,6 +91,11 @@ impl SeatCombat {
         }
     }
 
+    /// Gold paid to this seat for its own last hits and kills so far.
+    pub(super) const fn bounty(&self) -> i32 {
+        self.bounty
+    }
+
     /// Folds one tick of this seat's events; the tick's snapshot is already observed.
     pub(super) fn observe(&mut self, tracker: &StateTracker, events: &[EventKind]) {
         let own_team = tracker.team();
@@ -352,12 +357,17 @@ fn hero_summary(seat: &super::ArenaSeatPolicy) -> HeroSummary {
         deaths: player.map_or(0, |player| player.deaths),
         level: player.map_or(0, |player| player.level),
         xp: player.map_or(0, |player| player.xp),
-        tower_hp: if seat.combat.tower_lost {
-            0.0
-        } else {
-            weakest_tower_fraction(tracker, tracker.team())
-        },
+        tower_hp: own_tower_fraction(seat),
         combat: seat.combat,
+    }
+}
+
+/// The seat's weakest own tower HP fraction; zero once one fell.
+pub(super) fn own_tower_fraction(seat: &super::ArenaSeatPolicy) -> f64 {
+    if seat.combat.tower_lost {
+        0.0
+    } else {
+        weakest_tower_fraction(&seat.tracker, seat.tracker.team())
     }
 }
 

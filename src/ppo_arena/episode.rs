@@ -12,7 +12,10 @@
 //! transition whose reward is the discounted sum of its per-decision rewards,
 //! bootstrapped from the value of the decision that closed it.
 
+use std::sync::Arc;
+
 use super::game_summary::GameSummary;
+use super::win_model::{self, WinFeatures, WinGame, WinModel};
 use super::*;
 
 #[cfg(test)]
@@ -54,11 +57,27 @@ pub(super) struct EpisodeStream {
     decisions: usize,
     retained: u32,
     done: bool,
+    /// The game's learned potential and its value at the last observed state.
+    learned: Option<(Arc<WinModel>, f64)>,
+    /// Win-model samples every [`win_model::SAMPLE_TICKS`] of game clock, when the run learns one.
+    win_samples: Option<Vec<WinFeatures>>,
 }
 
 impl EpisodeStream {
-    pub(super) fn new() -> Self {
+    /// A stream shaped by `learned` (else the hand potential) that samples
+    /// win-model features when `sample` holds.
+    pub(super) fn new(
+        environment: &TrainingEnvironment,
+        learned: Option<Arc<WinModel>>,
+        sample: bool,
+    ) -> Self {
+        let learned = learned.map(|model| {
+            let start = model.potential(&win_model::features(environment));
+            (model, start)
+        });
         Self {
+            learned,
+            win_samples: sample.then(Vec::new),
             map2_reward: Map2TrainingReward::default(),
             elapsed_ticks: 0,
             raw_return: 0.0,
@@ -154,15 +173,41 @@ impl EpisodeStream {
         assert_eq!(gamma, MAP2_REWARD_GAMMA_TICK);
         let end = map2_reward_end(outcome).or_else(|| self.done.then_some(Map2RewardEnd::TimeCap));
         let reward = take_map2_reward(environment, end, ticks)?;
-        self.map2_reward.record(reward)?;
-        let emitted = reward.total;
+        let step = self.learned_step(environment, end.is_some());
+        let emitted = self.map2_reward.record(reward, step)?;
+        self.sample_win_features(environment);
         self.raw_return += emitted;
         self.discounted_return += f64::from(gamma).powi(self.elapsed_ticks as i32) * emitted;
-        self.shaping_return += reward.total - reward.terminal;
+        self.shaping_return += emitted - reward.terminal;
         self.terminal_reward = reward.terminal as f32;
         self.elapsed_ticks += ticks;
         assert_eq!(self.raw_return, self.discounted_return);
         Ok(emitted)
+    }
+
+    /// `Φ(s') − Φ(s)` of the learned potential, with `Φ = 0` at the game's end.
+    fn learned_step(&mut self, environment: &TrainingEnvironment, end: bool) -> Option<f64> {
+        let (model, previous) = self.learned.as_mut()?;
+        let next = if end {
+            0.0
+        } else {
+            model.potential(&win_model::features(environment))
+        };
+        Some(next - std::mem::replace(previous, next))
+    }
+
+    fn sample_win_features(&mut self, environment: &TrainingEnvironment) {
+        let Some(samples) = &mut self.win_samples else {
+            return;
+        };
+        let tick = environment.seats[environment.policy_seat]
+            .tracker
+            .current()
+            .map_or(0, |view| view.tick);
+        let due = crate::MAP2_PREGAME_TICKS + samples.len() as u32 * win_model::SAMPLE_TICKS;
+        if tick >= due && samples.len() < win_model::MAX_GAME_SAMPLES {
+            samples.push(win_model::features(environment));
+        }
     }
 
     /// Closes the open interval: terminal at the game's end, otherwise
@@ -235,9 +280,18 @@ impl EpisodeStream {
         let summary = format!(
             "level=INFO event=episode_summary slot={slot} game={game} opponent={label} {summary}"
         );
+        let win = self.win_samples.as_ref().map(|samples| WinGame {
+            samples: samples.clone(),
+            score: match advanced.outcome {
+                Some(PpoTerminalOutcome::Win) => 2,
+                Some(PpoTerminalOutcome::Loss) => 0,
+                Some(PpoTerminalOutcome::Draw) | None => 1,
+            },
+        });
         EpisodeRecord {
             opponent,
             outcome: advanced.outcome,
+            win,
             elapsed_ticks: u64::from(self.elapsed_ticks),
             map2_reward: self.map2_reward,
             lines: [episode, reward, summary],
@@ -289,6 +343,8 @@ pub(super) struct CompletedAdvance {
 pub(super) struct EpisodeRecord {
     pub(super) opponent: super::slot::OpponentKind,
     pub(super) outcome: Option<PpoTerminalOutcome>,
+    /// The game's win-model samples and score, when the run learns a potential.
+    pub(super) win: Option<WinGame>,
     elapsed_ticks: u64,
     map2_reward: Map2TrainingReward,
     lines: [String; 3],

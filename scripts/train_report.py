@@ -526,6 +526,22 @@ def pool_charts(records, keys, used):
     return charts
 
 
+def potential_charts(records, keys, used):
+    """Held-out win-ranking AUC of the learned and the hand potential, by game minute."""
+    charts = []
+    for kind in ("learned", "hand"):
+        pattern = re.compile(rf"win_model\.auc_{kind}_m(\d+)")
+        selected = sorted((key for key in keys if pattern.fullmatch(key)),
+                          key=lambda key: int(pattern.fullmatch(key).group(1)))
+        used.update(selected)
+        if selected:
+            charts.append(chart(f"{kind} potential AUC by game minute", "lines",
+                                [series(f"min {pattern.fullmatch(key).group(1)}", held(metric(records, key)))
+                                 for key in selected], domain=[0.3, 1.0],
+                                note="On the games finished since the previous refit; 0.5 is chance."))
+    return charts
+
+
 def dashboard_sections(records, window):
     """Chart sections; every numeric series appears exactly once, known ones in curated charts."""
     keys = sorted({key for record in records for key in record["metrics"]})[:MAX_SERIES]
@@ -552,6 +568,7 @@ def dashboard_sections(records, window):
         sections.append(("Episodes", True, [chart("Episode length (ticks)", "lines", [length],
                                                   note="Band: shortest to longest.")]
                          + category_charts(records) + singles(others)))
+    sections.append(("Learned potential", True, potential_charts(records, keys, used)))
     sections.append(("PPO", True, singles([key for key in keys if PPO_PATTERN.search(key)])))
     sections.append(("Opponents", True, pool_charts(records, keys, used)))
     environment = [key for key in ENVIRONMENT_KEYS if key in keys]

@@ -16,6 +16,7 @@ fn schedule(decision_cap: usize) -> GameSchedule {
             ..PpoConfig::default()
         },
         shadow: None,
+        potentials: None,
     }
 }
 
@@ -26,6 +27,7 @@ fn next_game() -> NextGame {
         mixture: std::sync::Arc::new(
             OpponentMixture::new(vec![(OpponentKind::Teacher, 1)]).expect("mixture"),
         ),
+        potential: 0,
     }
 }
 

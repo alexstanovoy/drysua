@@ -133,6 +133,8 @@ pub(crate) struct GamePlan {
     pub(crate) opponent: OpponentKind,
     /// Decisions after which the game ends as if the tick cap were reached.
     pub(crate) decision_cap: usize,
+    /// Learned-potential version shaping the game; 0 is the hand potential.
+    pub(crate) potential: u64,
 }
 
 impl GamePlan {
@@ -148,7 +150,7 @@ impl GamePlan {
             schedule,
             slot,
             game,
-            (next.update, next.spec),
+            (next.update, next.spec, next.potential),
             opponent,
         ))
     }
@@ -158,7 +160,7 @@ impl GamePlan {
         schedule: &GameSchedule,
         slot: usize,
         game: u64,
-        (start_update, spec): (u64, ModifierSpec),
+        (start_update, spec, potential): (u64, ModifierSpec, u64),
         opponent: OpponentKind,
     ) -> Self {
         Self {
@@ -169,6 +171,7 @@ impl GamePlan {
             seat: (slot + game as usize % 2) % 2,
             opponent,
             decision_cap: schedule.decision_cap,
+            potential,
         }
     }
 
@@ -187,6 +190,8 @@ pub(crate) struct GameSchedule {
     pub(crate) seed: u64,
     pub(crate) decision_cap: usize,
     pub(crate) config: PpoConfig,
+    /// Learned potentials games may reference; present when the run learns one.
+    pub(crate) potentials: Option<super::win_model::WinModels>,
     pub(crate) shadow: Option<ShadowLabels>,
 }
 
@@ -260,6 +265,8 @@ pub(crate) struct NextGame {
     pub(crate) update: u64,
     pub(crate) spec: ModifierSpec,
     pub(crate) mixture: std::sync::Arc<OpponentMixture>,
+    /// Learned-potential version of games starting now; 0 is the hand potential.
+    pub(crate) potential: u64,
 }
 
 /// The sampled decision a lane hands back to its slot.
@@ -310,6 +317,15 @@ impl Slot {
             runtime,
             annealed::spawn_modifiers_for(plan.spec),
         )?;
+        let learned = match &schedule.potentials {
+            Some(models) => super::win_model::lookup(models, plan.potential)?,
+            None if plan.potential == 0 => None,
+            None => {
+                return Err(PpoError::InvalidConfig(
+                    "learned potential without a registry",
+                ));
+            }
+        };
         let policy_seat = plan.seat;
         if let Some(labels) = schedule.shadow
             && plan.start_update < labels.until_update
@@ -323,10 +339,11 @@ impl Slot {
             )?),
             _ => None,
         };
+        let stream = EpisodeStream::new(&environment, learned, schedule.potentials.is_some());
         Ok(Box::new(Self {
             plan,
             environment,
-            stream: EpisodeStream::new(),
+            stream,
             policy,
             opponent,
             actor_random: PpoRng::new(plan.seed(seed, ACTOR_DOMAIN)?),
@@ -502,7 +519,7 @@ impl Slot {
             schedule,
             plan.slot,
             plan.game,
-            (plan.start_update, plan.spec),
+            (plan.start_update, plan.spec, plan.potential),
             plan.opponent,
         );
         if rederived != plan {

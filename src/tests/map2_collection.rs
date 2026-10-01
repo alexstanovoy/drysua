@@ -13,23 +13,26 @@ fn reward_rejection_preserves_accumulated_credit_and_allows_recovery() {
         ..crate::Map2RewardBreakdown::default()
     };
     let mut aggregate = Map2TrainingReward::default();
-    aggregate.record(interval).expect("initial credit");
+    aggregate.record(interval, None).expect("initial credit");
     let before = aggregate;
     for total in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
         let error = aggregate
-            .record(crate::Map2RewardBreakdown { total, ..interval })
+            .record(crate::Map2RewardBreakdown { total, ..interval }, None)
             .expect_err("nonfinite reward");
         assert_eq!(error.to_string(), "PPO Map2 reward telemetry is non-finite");
         assert_eq!(aggregate, before);
     }
-    aggregate.record(interval).expect("recovery");
+    aggregate.record(interval, None).expect("recovery");
     assert_eq!(aggregate.ticks, 6);
     assert_eq!(aggregate.components[2], 0.04);
     aggregate.observations.hero_damage_dealt = u64::MAX;
     let before = aggregate;
     let mut overflow = interval;
     overflow.observations.hero_damage_dealt = 1;
-    assert_eq!(aggregate.record(overflow), Err(PpoError::CounterOverflow));
+    assert_eq!(
+        aggregate.record(overflow, None),
+        Err(PpoError::CounterOverflow)
+    );
     assert_eq!(aggregate, before);
 }
 
@@ -154,7 +157,7 @@ fn final_native_damage_is_rewarded_before_draw_finalization() {
             DamageKind::Pure,
         );
     });
-    let mut stream = EpisodeStream::new();
+    let mut stream = EpisodeStream::new(&environment, None, false);
     let completed = step_policy(&mut environment, &mut stream, &model, false);
     assert_eq!(completed.ticks, 1);
     assert_eq!(completed.outcome, Some(PpoTerminalOutcome::Draw));
@@ -177,7 +180,7 @@ fn final_native_damage_is_rewarded_before_draw_finalization() {
 fn learner_deadline_zero_bootstraps_without_inventing_match_over() {
     let model = stop_model();
     let mut environment = configured_environment(1, 0, OpponentRuntime::Idle, |_| {});
-    let mut stream = EpisodeStream::new();
+    let mut stream = EpisodeStream::new(&environment, None, false);
     let completed = step_policy(&mut environment, &mut stream, &model, true);
     assert_eq!(completed.outcome, None);
     assert_eq!((completed.end_tick, completed.ticks), (4, 3));
