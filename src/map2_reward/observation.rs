@@ -24,6 +24,8 @@ pub(super) struct SnapshotFacts {
     pub tick: u32,
     pub xp: [u32; 2],
     pub deaths: [u16; 2],
+    /// Public scoreboard last hits, then denies.
+    pub farm: [[u16; 2]; 2],
     /// Scoreboard hero bodies; absent while dead.
     pub heroes: [Option<EntityId>; 2],
     /// HP fraction of each hero body visible in this snapshot.
@@ -74,7 +76,12 @@ pub(super) fn snapshot_into(
         return invalid("Snapshot tick outside 1..=27900");
     }
     limit("visible units", view.units.len(), MAP2_REWARD_MAX_UNITS)?;
-    let (xp, deaths, heroes) = scoreboard(view, roles)?;
+    let Scoreboard {
+        xp,
+        deaths,
+        farm,
+        heroes,
+    } = scoreboard(view, roles)?;
     let mut hero_health = [None; 2];
     towers.clear();
     for unit in &view.units {
@@ -103,13 +110,19 @@ pub(super) fn snapshot_into(
         tick: view.tick,
         xp,
         deaths,
+        farm,
         heroes,
         hero_health,
         towers,
     })
 }
 
-type Scoreboard = ([u32; 2], [u16; 2], [Option<EntityId>; 2]);
+struct Scoreboard {
+    xp: [u32; 2],
+    deaths: [u16; 2],
+    farm: [[u16; 2]; 2],
+    heroes: [Option<EntityId>; 2],
+}
 
 fn scoreboard(view: &WorldView, roles: [Role; 2]) -> Result<Scoreboard, Map2RewardError> {
     if view.players.len() != 2 {
@@ -117,6 +130,7 @@ fn scoreboard(view: &WorldView, roles: [Role; 2]) -> Result<Scoreboard, Map2Rewa
     }
     let mut xp = [0; 2];
     let mut deaths = [0; 2];
+    let mut farm = [[0; 2]; 2];
     let mut heroes = [None; 2];
     for (index, role) in roles.iter().enumerate() {
         let player = view
@@ -134,12 +148,18 @@ fn scoreboard(view: &WorldView, roles: [Role; 2]) -> Result<Scoreboard, Map2Rewa
         }
         xp[index] = u32::try_from(player.xp).expect("validated scoreboard XP");
         deaths[index] = player.deaths;
+        farm[index] = [player.last_hits, player.denies];
         heroes[index] = player.unit;
     }
     if heroes[0].is_some() && heroes[0] == heroes[1] {
         return invalid("opposing heroes share one handle");
     }
-    Ok((xp, deaths, heroes))
+    Ok(Scoreboard {
+        xp,
+        deaths,
+        farm,
+        heroes,
+    })
 }
 
 fn validate_hero(unit: &UnitView, role: Role) -> Result<(), Map2RewardError> {

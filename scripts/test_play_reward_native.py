@@ -130,15 +130,15 @@ class CompleteNativeRewardTests(NativeFixtureMixin, unittest.TestCase):
                 self.assertEqual(report["reward_ticks"], result["ticks"] - 1)
                 self.assertFalse(report["pending_events"])
                 self.assertEqual(list(report["components"]),
-                                 ["towers", "deaths", "health", "xp", "closure", "terminal", "fast_win"])
-                self.assertEqual(report["profile_version"], 8)
+                                 ["towers", "deaths", "health", "xp", "farm", "closure", "terminal", "fast_win"])
+                self.assertEqual(report["profile_version"], 10)
                 self.assertEqual(report["team"], ("Radiant", "Dire")[report["slot"]])
                 outcome = "Draw" if result["winner"] == 2 else (
                     "Win" if report["slot"] == result["winner"] else "Loss")
                 self.assertEqual(report["outcome"], outcome)
-                self.assertEqual(report["components"]["terminal"], {"Draw": 0, "Win": 1, "Loss": -1}[outcome])
+                self.assertEqual(report["components"]["terminal"], {"Draw": -0.5, "Win": 1, "Loss": -1}[outcome])
                 self.assertAlmostEqual(report["total"], sum(report["components"].values()), places=10)
-                shaping = sum(report["components"][name] for name in ("towers", "deaths", "health", "xp"))
+                shaping = sum(report["components"][name] for name in ("towers", "deaths", "health", "xp", "farm"))
                 self.assertAlmostEqual(shaping + report["components"]["closure"], 0, places=6)
                 self.assertAlmostEqual(report["total_without_terminal"],
                                        report["total"] - report["components"]["terminal"], places=10)

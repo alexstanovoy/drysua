@@ -11,7 +11,7 @@ use bota_proto::{EntityId, EventKind, MatchInfo, SlotId};
 use observation::{Role, SnapshotFacts, TowerFact};
 
 /// Version of the Map2 reward definition, recorded with checkpoints and reward reports.
-pub const MAP2_REWARD_VERSION: u32 = 9;
+pub const MAP2_REWARD_VERSION: u32 = 10;
 /// Per-tick discount required for exact potential cancellation.
 pub const MAP2_REWARD_GAMMA_TICK: f32 = 1.0;
 /// Terminal reward for an authoritative win, before the fast-win bonus.
@@ -33,20 +33,29 @@ pub const MAP2_REWARD_HEALTH_WEIGHT: f64 = 0.2;
 pub const MAP2_REWARD_XP_WEIGHT: f64 = 0.2;
 /// Experience lead at which the experience potential saturates.
 pub const MAP2_REWARD_XP_SCALE: u32 = 1_000;
+/// Potential of a full clamped farm lead: public last hits, own minus enemy. A deny
+/// counts through the last hit it takes from the enemy (and the experience it halves).
+pub const MAP2_REWARD_FARM_WEIGHT: f64 = 0.25;
+/// Last-hit lead at which the farm potential saturates.
+pub const MAP2_REWARD_FARM_SCALE: u32 = 20;
 /// Maximum events consumed atomically in one seat-visible tick.
 pub const MAP2_REWARD_MAX_EVENTS: usize = 4096;
 /// Maximum visible units accepted in one snapshot.
 pub const MAP2_REWARD_MAX_UNITS: usize = 4096;
 /// Reward components in report and log order; `total` is their sum.
-pub const MAP2_REWARD_COMPONENTS: [&str; 7] = [
-    "towers", "deaths", "health", "xp", "closure", "terminal", "fast_win",
+pub const MAP2_REWARD_COMPONENTS: [&str; 8] = [
+    "towers", "deaths", "health", "xp", "farm", "closure", "terminal", "fast_win",
 ];
 /// Additive seat-visible diagnostic counters in report and log order.
-pub const MAP2_REWARD_COUNTERS: [&str; 9] = [
+pub const MAP2_REWARD_COUNTERS: [&str; 13] = [
     "own_deaths",
     "enemy_deaths",
     "own_xp_gained",
     "enemy_xp_gained",
+    "own_last_hits",
+    "enemy_last_hits",
+    "own_denies",
+    "enemy_denies",
     "hero_damage_dealt",
     "hero_damage_taken",
     "tower_damage_taken",
@@ -57,10 +66,13 @@ pub const MAP2_REWARD_COUNTERS: [&str; 9] = [
 const MAX_TOWERS: usize = 64;
 const MAX_AMOUNT: i32 = 1_000_000;
 const MAX_XP: i32 = 1_000_000_000;
-const POTENTIAL_BOUND: f64 = MAP2_REWARD_TOWER_WEIGHT
-    + MAP2_REWARD_DEATH_WEIGHT * crate::MAP2_DEATH_LIMIT as f64
+const POTENTIAL_BOUND: f64 = RUNNING_POTENTIAL_BOUND + MAP2_REWARD_DEATH_WEIGHT;
+/// While the game runs the death lead stays below the limit, which ends it.
+const RUNNING_POTENTIAL_BOUND: f64 = MAP2_REWARD_TOWER_WEIGHT
+    + MAP2_REWARD_DEATH_WEIGHT * (crate::MAP2_DEATH_LIMIT - 1) as f64
     + MAP2_REWARD_HEALTH_WEIGHT
-    + MAP2_REWARD_XP_WEIGHT;
+    + MAP2_REWARD_XP_WEIGHT
+    + MAP2_REWARD_FARM_WEIGHT;
 
 const _: () = assert!(MAP2_REWARD_LOSS < MAP2_REWARD_DRAW);
 const _: () = assert!(MAP2_REWARD_DRAW < MAP2_REWARD_WIN);
@@ -69,9 +81,12 @@ const _: () = assert!(MAP2_REWARD_FAST_WIN_BONUS < MAP2_REWARD_WIN);
 // A kill must stay worth more than the damage it took to land it.
 const _: () = assert!(MAP2_REWARD_HEALTH_WEIGHT < MAP2_REWARD_DEATH_WEIGHT);
 const _: () = assert!(MAP2_REWARD_XP_WEIGHT < MAP2_REWARD_DEATH_WEIGHT);
-// Shaping redistributes credit in time; it never outweighs the outcome.
-const _: () = assert!(POTENTIAL_BOUND < 2.0 * MAP2_REWARD_WIN);
+const _: () = assert!(MAP2_REWARD_FARM_WEIGHT < MAP2_REWARD_DEATH_WEIGHT);
+// Shaping redistributes credit in time; the potential of any running game, which the
+// final step returns, never outweighs the gap between a win and a loss.
+const _: () = assert!(RUNNING_POTENTIAL_BOUND < MAP2_REWARD_WIN - MAP2_REWARD_LOSS);
 const _: () = assert!(MAP2_REWARD_XP_SCALE > 0);
+const _: () = assert!(MAP2_REWARD_FARM_SCALE > 0);
 const _: () = assert!(crate::MAP2_TICK_CAP > crate::MAP2_PREGAME_TICKS);
 
 /// Native game result or learner time cap; never a technical failure.
@@ -90,6 +105,10 @@ pub struct Map2RewardObservations {
     pub enemy_deaths: u64,
     pub own_xp_gained: u64,
     pub enemy_xp_gained: u64,
+    pub own_last_hits: u64,
+    pub enemy_last_hits: u64,
+    pub own_denies: u64,
+    pub enemy_denies: u64,
     /// Own hero damage to the enemy hero.
     pub hero_damage_dealt: u64,
     /// Enemy hero damage to the own hero.
@@ -110,6 +129,10 @@ impl Map2RewardObservations {
             self.enemy_deaths,
             self.own_xp_gained,
             self.enemy_xp_gained,
+            self.own_last_hits,
+            self.enemy_last_hits,
+            self.own_denies,
+            self.enemy_denies,
             self.hero_damage_dealt,
             self.hero_damage_taken,
             self.tower_damage_taken,
@@ -125,6 +148,10 @@ impl Map2RewardObservations {
             enemy_deaths: self.enemy_deaths.checked_add(other.enemy_deaths)?,
             own_xp_gained: self.own_xp_gained.checked_add(other.own_xp_gained)?,
             enemy_xp_gained: self.enemy_xp_gained.checked_add(other.enemy_xp_gained)?,
+            own_last_hits: self.own_last_hits.checked_add(other.own_last_hits)?,
+            enemy_last_hits: self.enemy_last_hits.checked_add(other.enemy_last_hits)?,
+            own_denies: self.own_denies.checked_add(other.own_denies)?,
+            enemy_denies: self.enemy_denies.checked_add(other.enemy_denies)?,
             hero_damage_dealt: self
                 .hero_damage_dealt
                 .checked_add(other.hero_damage_dealt)?,
@@ -156,6 +183,8 @@ pub struct Map2RewardBreakdown {
     pub health: f64,
     /// Potential steps of the clamped experience lead.
     pub xp: f64,
+    /// Potential steps of the clamped last-hit lead.
+    pub farm: f64,
     /// Terminal return of the whole potential, so shaping sums to minus the initial potential.
     pub closure: f64,
     pub terminal: f64,
@@ -174,6 +203,7 @@ impl Map2RewardBreakdown {
             self.deaths,
             self.health,
             self.xp,
+            self.farm,
             self.closure,
             self.terminal,
             self.fast_win,
@@ -242,11 +272,12 @@ struct Potential {
     deaths: f64,
     health: f64,
     xp: f64,
+    farm: f64,
 }
 
 impl Potential {
     fn total(self) -> f64 {
-        self.towers + self.deaths + self.health + self.xp
+        self.towers + self.deaths + self.health + self.xp + self.farm
     }
 }
 
@@ -343,6 +374,7 @@ impl Map2Reward {
             self.interval.deaths += potential.deaths - self.potential.deaths;
             self.interval.health += potential.health - self.potential.health;
             self.interval.xp += potential.xp - self.potential.xp;
+            self.interval.farm += potential.farm - self.potential.farm;
             self.interval.ticks += 1;
         }
         self.potential = potential;
@@ -434,6 +466,9 @@ impl Map2Reward {
             if (0..2).any(|role| pending.deaths[role] < current.deaths[role]) {
                 return invalid("public hero deaths decreased");
             }
+            if (0..2).any(|role| pending.farm[role] < current.farm[role]) {
+                return invalid("public last hits or denies decreased");
+            }
         }
         let new = pending
             .towers
@@ -493,11 +528,15 @@ impl Map2Reward {
             .map(|count| f64::from(count.min(crate::MAP2_DEATH_LIMIT)));
         let lead = f64::from(pending.xp[0]) - f64::from(pending.xp[1]);
         let xp = (lead / f64::from(MAP2_REWARD_XP_SCALE)).clamp(-1.0, 1.0);
+        let last_hits = pending.farm.map(|[last_hits, _]| f64::from(last_hits));
+        let farm =
+            ((last_hits[0] - last_hits[1]) / f64::from(MAP2_REWARD_FARM_SCALE)).clamp(-1.0, 1.0);
         Potential {
             towers: MAP2_REWARD_TOWER_WEIGHT * (self.weakest_tower(0) - self.weakest_tower(1)),
             deaths: MAP2_REWARD_DEATH_WEIGHT * (deaths[1] - deaths[0]),
             health: MAP2_REWARD_HEALTH_WEIGHT * (self.hero_health[0] - self.hero_health[1]),
             xp: MAP2_REWARD_XP_WEIGHT * xp,
+            farm: MAP2_REWARD_FARM_WEIGHT * farm,
         }
     }
 
@@ -555,6 +594,13 @@ fn observe_scoreboard(
     observations.enemy_deaths += u64::from(pending.deaths[1] - previous.deaths[1]);
     observations.own_xp_gained += u64::from(pending.xp[0] - previous.xp[0]);
     observations.enemy_xp_gained += u64::from(pending.xp[1] - previous.xp[1]);
+    let gained = |role: usize, index: usize| {
+        u64::from(pending.farm[role][index] - previous.farm[role][index])
+    };
+    observations.own_last_hits += gained(0, 0);
+    observations.enemy_last_hits += gained(1, 0);
+    observations.own_denies += gained(0, 1);
+    observations.enemy_denies += gained(1, 1);
 }
 
 /// Win-only bonus: full at the end of pregame, linear to zero at the native cap.

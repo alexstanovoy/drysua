@@ -622,7 +622,7 @@ fn assert_teacher_map2_returns(
             crate::Map2RewardEnd::Loss
         };
         accumulate(total, seat.tracker.finish_map2_reward(end).expect("finish"));
-        let shaping = total.towers + total.deaths + total.health + total.xp;
+        let shaping = total.towers + total.deaths + total.health + total.xp + total.farm;
         assert!(
             (shaping - potential).abs() < 1.0e-6,
             "{shaping} {potential}"
@@ -643,6 +643,12 @@ fn assert_teacher_map2_returns(
         returns[0].observations.own_deaths,
         returns[1].observations.enemy_deaths
     );
+    // Both seats read the same public scoreboard, so their farm shaping mirrors.
+    assert_eq!(
+        returns[0].observations.own_last_hits,
+        returns[1].observations.enemy_last_hits
+    );
+    assert!((returns[0].farm + returns[1].farm).abs() < 1.0e-9);
 }
 
 fn accumulate(total: &mut crate::Map2RewardBreakdown, interval: crate::Map2RewardBreakdown) {
@@ -650,6 +656,7 @@ fn accumulate(total: &mut crate::Map2RewardBreakdown, interval: crate::Map2Rewar
     total.deaths += interval.deaths;
     total.health += interval.health;
     total.xp += interval.xp;
+    total.farm += interval.farm;
     total.closure += interval.closure;
     total.terminal += interval.terminal;
     total.fast_win += interval.fast_win;

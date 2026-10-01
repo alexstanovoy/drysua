@@ -17,7 +17,7 @@ const MAX_MESSAGES: usize = 1_000_000;
 const MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const REPORT_LIMIT: usize = 1024 * 1024;
 const COMPONENTS: usize = MAP2_REWARD_COMPONENTS.len();
-const TERMINAL: usize = 5;
+const TERMINAL: usize = 6;
 const _: () = assert!(matches!(
     MAP2_REWARD_COMPONENTS[TERMINAL].as_bytes(),
     b"terminal"
