@@ -8,8 +8,12 @@ const CANDIDATE_SEED: u64 = 5;
 const OPPONENT_SEED: u64 = 6;
 
 fn fresh_weights(seed: u64) -> crate::TestDirectory {
+    layout_weights(seed, crate::SideNetworks::Shared)
+}
+
+fn layout_weights(seed: u64, side_networks: crate::SideNetworks) -> crate::TestDirectory {
     let directory = crate::test_directory("evaluation-weights");
-    let model = PolicyModel::fresh(seed).expect("model");
+    let model = PolicyModel::fresh_networks(seed, side_networks, PolicyDevice::Cpu).expect("model");
     crate::TrainingArtifact::save_runtime_weights(&model, &directory).expect("runtime weights");
     directory
 }
@@ -53,8 +57,11 @@ fn settings(
     }
 }
 
+/// The neural opponent has separate side networks, so batches mix one shared
+/// model's rows with rows each of its networks takes on its own.
 fn play(parallel: usize, groups: usize) -> Vec<(PlannedGame, GameSummary)> {
-    let (candidate, opponent) = (fresh_weights(CANDIDATE_SEED), fresh_weights(OPPONENT_SEED));
+    let candidate = fresh_weights(CANDIDATE_SEED);
+    let opponent = layout_weights(OPPONENT_SEED, crate::SideNetworks::Separate);
     let settings = settings(&candidate, &opponent, parallel, groups);
     let load = |spec| load_player(spec, settings.device).expect("player");
     let models = Models {

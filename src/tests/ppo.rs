@@ -273,13 +273,16 @@ fn gae_discounts_elapsed_ticks_and_stops_bootstrapping_at_terminal() {
             .expect("push");
     }
     let batch = rollout
-        .finish(PpoConfig {
-            samples_per_update: 2,
-            minibatch: 1,
-            gamma_tick: 0.9,
-            gae_lambda_tick: 0.8,
-            ..PpoConfig::default()
-        })
+        .finish(
+            PpoConfig {
+                samples_per_update: 2,
+                minibatch: 1,
+                gamma_tick: 0.9,
+                gae_lambda_tick: 0.8,
+                ..PpoConfig::default()
+            },
+            crate::SideNetworks::Shared,
+        )
         .expect("batch");
     assert!((batch.sample(0).expect("first").return_value() - 2.44).abs() < 1.0e-5);
     assert_eq!(batch.sample(1).expect("terminal").return_value(), 2.0);
@@ -312,7 +315,10 @@ fn explained_variance_separates_exact_blind_and_undefined_critics() {
             minibatch: 4,
             ..PpoConfig::default()
         };
-        rollout.finish(config).expect("batch").explained_variance()
+        rollout
+            .finish(config, crate::SideNetworks::Shared)
+            .expect("batch")
+            .explained_variance()
     };
     // Single terminal samples: the lambda and Monte Carlo returns are both the reward.
     let exact = batch(returns, returns);
@@ -358,7 +364,9 @@ fn compact_rollout_storage_preserves_frame_target_and_behavior_statistics() {
         .expect("push");
     assert_eq!(packed.unpack(), target);
     assert!(std::mem::size_of_val(&packed) < std::mem::size_of::<ActionHeadTargets>());
-    let batch = rollout.finish(smoke_config()).expect("batch");
+    let batch = rollout
+        .finish(smoke_config(), crate::SideNetworks::Shared)
+        .expect("batch");
     let sample = batch.sample(0).expect("materialized");
     assert_eq!(sample.transition.frame, frame);
     assert_eq!(sample.transition.target, target);
@@ -487,7 +495,9 @@ fn bandit_batch(
             )
             .expect("push");
     }
-    rollout.finish(config).expect("batch")
+    rollout
+        .finish(config, crate::SideNetworks::Shared)
+        .expect("batch")
 }
 
 #[test]
@@ -530,7 +540,9 @@ fn full_monte_carlo_returns_ignore_intermediate_bootstraps_but_not_truncation() 
                 .expect("push");
         }
     }
-    let batch = rollout.finish(config).expect("MC batch");
+    let batch = rollout
+        .finish(config, crate::SideNetworks::Shared)
+        .expect("MC batch");
     for index in 0..batch.len() {
         let sample = batch.sample(index).expect("sample");
         let expected = if index.is_multiple_of(2) { 1.0 } else { -1.0 };
@@ -552,7 +564,7 @@ fn full_monte_carlo_returns_ignore_intermediate_bootstraps_but_not_truncation() 
         .push(sampled.finish(0, outcome).expect("timeout"))
         .expect("push");
     let sample = truncated
-        .finish(config)
+        .finish(config, crate::SideNetworks::Shared)
         .expect("timeout MC")
         .sample(0)
         .expect("sample");

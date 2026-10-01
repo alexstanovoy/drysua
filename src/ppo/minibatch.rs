@@ -196,7 +196,9 @@ mod tests {
                 .expect("transition");
             rollout.push(transition).expect("push");
         }
-        rollout.finish(config).expect("batch")
+        rollout
+            .finish(config, crate::SideNetworks::Shared)
+            .expect("batch")
     }
 
     fn choice(model: &PolicyModel) -> PpoPolicyChoice {

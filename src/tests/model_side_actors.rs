@@ -130,6 +130,18 @@ fn mixed_side_ppo_accepts_then_restores_both_head_moments_on_rejection_and_error
     assert_ppo_rollback(PolicyDevice::Cpu);
 }
 
+#[cfg(feature = "builtin")]
+#[test]
+fn separate_networks_train_only_on_their_own_side_rows() {
+    assert_separate_isolation(PolicyDevice::Cpu);
+}
+
+#[cfg(feature = "builtin")]
+#[test]
+fn separate_networks_from_shared_weights_act_like_the_shared_model_in_one_batch() {
+    assert_separate_matches_shared(PolicyDevice::Cpu);
+}
+
 #[cfg(all(
     feature = "builtin",
     feature = "cuda",
@@ -146,6 +158,8 @@ fn cuda_side_actors_preserve_routing_gradients_and_ppo_rollback() {
     assert_unused_family_skipping(device);
     assert_value_rejection(device);
     assert_ppo_rollback(device);
+    assert_separate_isolation(device);
+    assert_separate_matches_shared(device);
 }
 
 fn side_frame(dire: bool) -> FeatureFrame {
@@ -332,7 +346,7 @@ fn assert_mixed_gradients(device: PolicyDevice) {
     let output = model
         .training_forward(&frames, &prefixes)
         .expect("mixed forward");
-    let state = model
+    let state = model.networks[0]
         .forward_frames(&frames)
         .expect("full-batch reference tokens");
     for (head, name, selected) in [
@@ -340,7 +354,8 @@ fn assert_mixed_gradients(device: PolicyDevice) {
         (10, "entity_query", output.entity_pointer()),
         (11, "point_query", output.point_pointer()),
     ] {
-        let reference = reference_head(head, &output.tensors.side_raw[head], &state);
+        let raw = &output.tensors.actor_raw[2 * head..2 * head + 2];
+        let reference = reference_head(head, &[raw[0].1.clone(), raw[1].1.clone()], &state);
         assert_bits(
             &selected.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
             &reference.flatten_all().unwrap().to_vec1::<f32>().unwrap(),
@@ -770,6 +785,112 @@ fn assert_ppo_rollback(device: PolicyDevice) {
     assert_ne!(after.parameters, before.parameters);
 }
 
+/// One Adam step on Radiant rows, Dire rows and both: a network whose side has
+/// no rows keeps every parameter bit and zero moments; the other network moves.
+#[cfg(feature = "builtin")]
+fn assert_separate_isolation(device: PolicyDevice) {
+    let samples = ppo_samples();
+    let config = PpoConfig {
+        learning_rate: 0.01,
+        target_kl: 1.0e3,
+        ..PpoConfig::default()
+    };
+    for (rows, trained) in [
+        (&samples[..1], [true, false]),
+        (&samples[1..], [false, true]),
+        (&samples[..], [true, true]),
+    ] {
+        let model = PolicyModel::fresh_networks(9001, SideNetworks::Separate, device)
+            .expect("separate model");
+        let mut adam = model.claim_optimizer(config.adam()).expect("Adam");
+        let before = model.export_parameters().expect("before");
+        let report = model
+            .ppo_update(&rows.iter().collect::<Vec<_>>(), &mut adam, config)
+            .expect("step");
+        assert!(report.applied);
+        let after = model.coherent_snapshot(&adam).expect("after");
+        let (first, second) = after.adam.moments().expect("moments");
+        let mut moved = [false; 2];
+        let mut offset = 0;
+        for (name, shape) in model.parameter_schema().expect("schema") {
+            let range = offset..offset + shape.iter().product::<usize>();
+            let network = usize::from(name.starts_with("dire."));
+            let changed = before[range.clone()]
+                .iter()
+                .zip(&after.parameters[range.clone()])
+                .any(|(before, after)| before.to_bits() != after.to_bits());
+            if !trained[network] {
+                assert!(!changed, "{name}");
+                assert!(
+                    first[range.clone()]
+                        .iter()
+                        .chain(&second[range.clone()])
+                        .all(|value| value.to_bits() == 0),
+                    "{name}"
+                );
+            }
+            moved[network] |= changed;
+            offset = range.end;
+        }
+        assert_eq!(moved, trained);
+    }
+}
+
+/// Separate networks warm-started from shared weights sample, value and decode
+/// a mixed-side batch like the shared model: Radiant rows reach the Radiant
+/// network with the Radiant heads, Dire rows the Dire network with the Dire
+/// heads, each network once per batch.
+#[cfg(feature = "builtin")]
+fn assert_separate_matches_shared(device: PolicyDevice) {
+    let directory = crate::ppo::test_directory("separate-from-shared");
+    let shared = routing_model(device);
+    crate::TrainingArtifact::save_runtime_weights(&shared, &directory).expect("shared weights");
+    let separate = crate::TrainingArtifact::initialize_from_weights(
+        &directory,
+        7,
+        SideNetworks::Separate,
+        device,
+    )
+    .expect("warm start");
+    let (frames, spaces) = native_inputs();
+    let mut expected_rngs = [PpoRng::new(41), PpoRng::new(42)];
+    let mut actual_rngs = expected_rngs.clone();
+    let expected = shared
+        .sample_batch(&frames, &spaces, &mut expected_rngs)
+        .expect("shared sample");
+    take_encoder_forwards_for_test();
+    let actual = separate
+        .sample_batch(&frames, &spaces, &mut actual_rngs)
+        .expect("separate sample");
+    assert_eq!(take_encoder_forwards_for_test(), 2, "one batch per network");
+    assert_eq!(actual_rngs, expected_rngs);
+    let greedy = separate.choose_batch(&frames, &spaces).expect("greedy");
+    for index in 0..2 {
+        assert_eq!(
+            actual[index].action().kind(),
+            [ActionKind::Continue, ActionKind::Stop][index]
+        );
+        assert_eq!(actual[index].action(), expected[index].action());
+        assert_eq!(greedy[index].action, expected[index].action());
+        for (actual, expected) in [
+            (actual[index].value, expected[index].value),
+            (
+                actual[index].log_probability,
+                expected[index].log_probability,
+            ),
+        ] {
+            assert!(
+                (actual - expected).abs() <= 1.0e-6,
+                "batch versus side batch"
+            );
+        }
+        let single = separate
+            .choose(&frames[index], &spaces[index])
+            .expect("single greedy");
+        assert_eq!(single.action, expected[index].action());
+    }
+}
+
 #[cfg(feature = "builtin")]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Candidate {
@@ -866,14 +987,21 @@ fn assert_both_kind_heads_have_moments(model: &PolicyModel, adam: &crate::AdamSt
 
 /// Measures the device pool's live peak of each budget component on CUDA
 /// (run alone: the pool is per process) and checks the budget constants bound
-/// them; prints the measurements for recalibration.
+/// them in both side-network layouts; prints the measurements for recalibration.
 #[cfg(all(feature = "builtin", feature = "cuda"))]
 #[test]
 #[ignore = "exclusive CUDA: measures the process-wide memory pool"]
 fn vram_budget_constants_bound_measured_peaks() {
+    for side_networks in [SideNetworks::Shared, SideNetworks::Separate] {
+        assert_vram_budget_constants(side_networks);
+    }
+}
+
+#[cfg(all(feature = "builtin", feature = "cuda"))]
+fn assert_vram_budget_constants(side_networks: SideNetworks) {
     use crate::model::vram::current_pool_usage;
     let device = PolicyDevice::Cuda { ordinal: 0 };
-    let model = PolicyModel::fresh_on(9001, device).expect("model");
+    let model = PolicyModel::fresh_networks(9001, side_networks, device).expect("model");
     let (frames, spaces) = native_inputs();
     let base = ppo_samples();
     let config = PpoConfig {
@@ -927,7 +1055,8 @@ fn vram_budget_constants_bound_measured_peaks() {
             .expect("step");
         let (_, high) = current_pool_usage(0, false);
         eprintln!(
-            "vram rows={rows} microbatch={microbatch} imitation={imitation} staged_row={staged_row} learner_peak={}",
+            "vram side_networks={} rows={rows} microbatch={microbatch} imitation={imitation} staged_row={staged_row} learner_peak={}",
+            side_networks.label(),
             high - resting
         );
         assert!(staged_row <= crate::model::VRAM_STAGED_ROW_BYTES);
@@ -952,7 +1081,11 @@ fn vram_budget_constants_bound_measured_peaks() {
             .sample_rows(&references, &space_refs, &mut random, &wanted)
             .expect("inference");
         let (_, high) = current_pool_usage(0, false);
-        eprintln!("vram inference rows={rows} peak={}", high - resting);
+        eprintln!(
+            "vram side_networks={} inference rows={rows} peak={}",
+            side_networks.label(),
+            high - resting
+        );
         assert!(
             high - resting
                 <= crate::model::VRAM_INFERENCE_FIXED_BYTES

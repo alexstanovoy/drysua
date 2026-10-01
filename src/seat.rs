@@ -95,8 +95,7 @@ pub fn play_neural(
     limit: Option<u32>,
     weights_directory: &Path,
 ) -> std::io::Result<Outcome> {
-    let model = PolicyModel::fresh(0).map_err(std::io::Error::other)?;
-    TrainingArtifact::load_runtime_weights(&model, weights_directory)
+    let model = TrainingArtifact::load_runtime_model(weights_directory, crate::PolicyDevice::Cpu)
         .map_err(std::io::Error::other)?;
     let (mut link, seated) = Link::join(address, name)?;
     play_neural_on(&mut link, seated, limit, &model)

@@ -126,7 +126,9 @@ both guards; `--kl-guard early-stop` (recorded in the run scope; default
 first minibatch whose KL before its step, from the gradient's own forward pass,
 exceeds `--target-kl`, and taken steps are kept. Imitation and critic warm-up
 change only the loss, so they work the same under either guard. The
-loss definitions live only in `src/model/ppo_objective.rs`.
+loss definitions live only in `src/model/ppo_objective.rs`. With
+`--side-networks separate` each network trains on its own side's rows of every
+minibatch ([model](model.md#side-networks)).
 
 Device memory: a CUDA trainer reserves a fixed VRAM budget at startup
 (`--vram-budget-mib`, default from `vram_budget_estimate`: the sum of every
@@ -134,7 +136,8 @@ stream's own high-water mark, because streams do not share freed memory: the
 learner's optimizer state, staged update at rollout capacity and one Adam step
 at the full microbatch, each lane's largest sampling call, and the replicas the
 configuration keeps (per lane the actor, frozen weights opponents and, with a
-league, three times its size: current, still-played and spare milestones),
+league, three times its size: current, still-played and spare milestones; each
+in its side-network layout, a separate model holding 1.89 times the parameters),
 plus 5% for block rounding; per-row costs are measured by
 `vram_budget_constants_bound_measured_peaks`). Production (24k samples, 256
 slots, microbatch 2048, league 4) reserves 15,008 MiB against a measured

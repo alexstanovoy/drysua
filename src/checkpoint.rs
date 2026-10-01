@@ -26,9 +26,9 @@ mod capacity_tests;
 mod runtime;
 use crate::{
     ACTION_SCHEMA_HASH, ACTION_SCHEMA_VERSION, FEATURE_SCHEMA_HASH, FEATURE_SCHEMA_VERSION,
-    MAP2_REWARD_VERSION, MAX_TRAINING_COUNTER, MODEL_MAX_OPTIMIZER_STEP, MODEL_PARAMETER_COUNT,
-    MODEL_SCHEMA_HASH, MODEL_SCHEMA_VERSION, PPO_RULES_AUDIT_VERSION, PPO_SCHEMA_HASH,
-    PPO_SCHEMA_VERSION, PolicyDevice, PolicyModel, PpoConfig, PpoTrainer, SHADOW_FIEND,
+    MAP2_REWARD_VERSION, MAX_TRAINING_COUNTER, MODEL_MAX_OPTIMIZER_STEP, MODEL_SCHEMA_HASH,
+    MODEL_SCHEMA_VERSION, PPO_RULES_AUDIT_VERSION, PPO_SCHEMA_HASH, PPO_SCHEMA_VERSION,
+    PolicyDevice, PolicyModel, PpoConfig, PpoTrainer, SHADOW_FIEND, SideNetworks,
 };
 
 pub use adaptive::AdaptiveEnvironmentCheckpoint;
@@ -70,9 +70,11 @@ pub(crate) const MAX_COLLECTION_STATE_BYTES: usize = 64
 pub(crate) const MAX_WIN_MODEL_STATE_BYTES: usize = 9 * 1024 * 1024;
 /// Bound of the collection state's opponent mixture and outcome window.
 pub(crate) const MAX_OPPONENT_STATE_BYTES: usize = 64 * 1024;
+/// Parameters of the largest side-network layout.
+const MAX_PARAMETER_COUNT: usize = SideNetworks::Separate.parameter_count();
 pub(crate) const MAX_TRAINING_TENSOR_BYTES: u64 =
-    MODEL_PARAMETER_COUNT as u64 * 16 + MAX_COLLECTION_STATE_BYTES as u64 + 64 * 1024;
-const MAX_RUNTIME_TENSOR_BYTES: u64 = MODEL_PARAMETER_COUNT as u64 * 4 + 64 * 1024;
+    MAX_PARAMETER_COUNT as u64 * 16 + MAX_COLLECTION_STATE_BYTES as u64 + 64 * 1024;
+const MAX_RUNTIME_TENSOR_BYTES: u64 = MAX_PARAMETER_COUNT as u64 * 4 + 64 * 1024;
 const MAX_TEXT_BYTES: usize = 4_096;
 const MAX_RNG_STATES: usize = 32;
 const MAX_LEAGUE_REFERENCES: usize = 32;
@@ -343,6 +345,12 @@ impl TrainingArtifact {
         Ok(artifact)
     }
 
+    /// The side-network layout of the checkpointed model.
+    pub fn side_networks(&self) -> SideNetworks {
+        SideNetworks::from_parameter_count(self.parameters.len())
+            .expect("a validated artifact has one layout's parameter count")
+    }
+
     /// The collection state the next update starts from.
     pub fn collection(&self) -> &CollectionCheckpoint {
         &self.collection
@@ -484,27 +492,48 @@ impl TrainingArtifact {
         let parameters = model
             .export_parameters()
             .map_err(|error| CheckpointError::Model(error.to_string()))?;
-        save_runtime(&parameter_schema(model)?, &parameters, directory)
+        save_runtime(model.side_networks(), &parameters, directory)
     }
 
-    /// Saves exported parameters as deployment weights of this build.
+    /// Saves exported parameters, in the layout their count names, as
+    /// deployment weights of this build.
     #[cfg(feature = "builtin")]
     pub(crate) fn save_runtime_parameters(
         parameters: &[f32],
         directory: &Path,
     ) -> Result<(), CheckpointError> {
-        save_runtime(&current_parameter_schema()?, parameters, directory)
+        save_runtime(parameter_layout(parameters)?, parameters, directory)
     }
 
-    /// Parameters of runtime weights whose metadata, names and shapes match this build.
+    /// Parameters of runtime weights whose metadata, names and shapes match
+    /// this build in the side-network layout the file records.
     #[cfg(feature = "builtin")]
     pub(crate) fn load_runtime_parameters(directory: &Path) -> Result<Vec<f32>, CheckpointError> {
-        validate_directory(directory)?;
-        let bytes = read_bounded(
-            &directory.join(RUNTIME_TENSOR_FILE),
-            MAX_RUNTIME_TENSOR_BYTES,
-        )?;
-        decode_runtime_parameters(&bytes)
+        decode_runtime_parameters(&read_runtime(directory)?)
+    }
+
+    /// A model of the side-network layout the runtime weights record, loaded
+    /// strictly: `play`, `eval` and frozen training opponents all use it.
+    pub fn load_runtime_model(
+        directory: &Path,
+        device: PolicyDevice,
+    ) -> Result<PolicyModel, CheckpointError> {
+        let bytes = read_runtime(directory)?;
+        let side_networks = runtime::stored_side_networks(&bytes)?;
+        let model = PolicyModel::fresh_networks(0, side_networks, device)
+            .map_err(|error| CheckpointError::Model(error.to_string()))?;
+        let parameters =
+            runtime::decode_strict(&bytes, layout_schema(side_networks)?, side_networks)?;
+        model
+            .import_parameters(&parameters)
+            .map_err(|error| CheckpointError::Model(error.to_string()))?;
+        Ok(model)
+    }
+
+    /// The side-network layout runtime weights record.
+    #[cfg(feature = "builtin")]
+    pub(crate) fn runtime_side_networks(directory: &Path) -> Result<SideNetworks, CheckpointError> {
+        runtime::stored_side_networks(&read_runtime(directory)?)
     }
 
     /// Constructs a fresh current model, reusing every runtime-weights tensor
@@ -513,23 +542,25 @@ impl TrainingArtifact {
     /// Unlike deployment loading, the linked action, feature, reward and PPO
     /// schemas may differ: a warm start only needs parameters. Tensors the file
     /// lacks keep their seeded initialization; the load is logged tensor by tensor.
+    /// A separate model's Dire network takes each tensor the file lacks under
+    /// its `dire.` name from the shared tensor of the same name, so a shared
+    /// model starts both networks from its shared tensors and each side's
+    /// actor heads from its own.
     #[cfg(feature = "builtin")]
     pub(crate) fn initialize_from_weights(
         directory: &Path,
         seed: u64,
+        side_networks: SideNetworks,
         device: PolicyDevice,
     ) -> Result<PolicyModel, CheckpointError> {
-        let model = PolicyModel::fresh_on(seed, device)
+        let model = PolicyModel::fresh_networks(seed, side_networks, device)
             .map_err(|error| CheckpointError::Model(error.to_string()))?;
-        validate_directory(directory)?;
-        let bytes = read_bounded(
-            &directory.join(RUNTIME_TENSOR_FILE),
-            MAX_RUNTIME_TENSOR_BYTES,
-        )?;
+        let bytes = read_runtime(directory)?;
         let fresh = model
             .export_parameters()
             .map_err(|error| CheckpointError::Model(error.to_string()))?;
-        let warm = runtime::decode_warm_start(&bytes, &parameter_schema(&model)?, &fresh)?;
+        let warm =
+            runtime::decode_warm_start(&bytes, &parameter_schema(&model)?, &fresh, side_networks)?;
         model
             .import_parameters(&warm.parameters)
             .map_err(|error| CheckpointError::Model(error.to_string()))?;
@@ -541,10 +572,12 @@ impl TrainingArtifact {
             }
         };
         crate::telemetry::log_line!(
-            "level=INFO event=initial_weights_loaded path={} reused_tensors={} reused_parameters={} reinitialized_tensors={} reinitialized={} dropped_tensors={} differing_metadata={}",
+            "level=INFO event=initial_weights_loaded path={} side_networks={} reused_tensors={} reused_parameters={} from_shared_tensors={} reinitialized_tensors={} reinitialized={} dropped_tensors={} differing_metadata={}",
             directory.display(),
+            side_networks.label(),
             warm.reused_tensors,
             warm.reused_parameters,
+            warm.from_shared_tensors,
             warm.reinitialized.len(),
             listed(
                 warm.reinitialized
@@ -558,17 +591,15 @@ impl TrainingArtifact {
         Ok(model)
     }
 
-    /// Loads runtime weights whose metadata, names and shapes match this build exactly.
+    /// Loads runtime weights whose metadata, side-network layout, names and
+    /// shapes match this build and `model` exactly.
     pub fn load_runtime_weights(
         model: &PolicyModel,
         directory: &Path,
     ) -> Result<(), CheckpointError> {
-        validate_directory(directory)?;
-        let bytes = read_bounded(
-            &directory.join(RUNTIME_TENSOR_FILE),
-            MAX_RUNTIME_TENSOR_BYTES,
-        )?;
-        let parameters = runtime::decode_strict(&bytes, &parameter_schema(model)?)?;
+        let bytes = read_runtime(directory)?;
+        let parameters =
+            runtime::decode_strict(&bytes, &parameter_schema(model)?, model.side_networks())?;
         model
             .import_parameters(&parameters)
             .map_err(|error| CheckpointError::Model(error.to_string()))
@@ -582,15 +613,16 @@ impl TrainingArtifact {
         validate_tensor_values("adam.first_moment", &self.optimizer.first_moment)?;
         validate_tensor_values("adam.second_moment", &self.optimizer.second_moment)?;
         validate_tensor_values("actor.parameters", &self.collection.actor)?;
-        if self.collection.actor.len() != MODEL_PARAMETER_COUNT
+        let count = self.parameters.len();
+        if self.collection.actor.len() != count
             || self.collection.state.is_empty()
             || self.collection.state.len() > MAX_COLLECTION_STATE_BYTES
         {
             return Err(CheckpointError::TensorContract("collection state"));
         }
-        if self.parameters.len() != MODEL_PARAMETER_COUNT
-            || self.optimizer.first_moment.len() != MODEL_PARAMETER_COUNT
-            || self.optimizer.second_moment.len() != MODEL_PARAMETER_COUNT
+        if SideNetworks::from_parameter_count(count).is_none()
+            || self.optimizer.first_moment.len() != count
+            || self.optimizer.second_moment.len() != count
         {
             return Err(CheckpointError::TensorContract("element count"));
         }
@@ -734,36 +766,62 @@ fn validate_text(field: &'static str, value: &str) -> Result<(), CheckpointError
 }
 
 fn save_runtime(
-    schema: &[(&'static str, Vec<usize>)],
+    side_networks: SideNetworks,
     parameters: &[f32],
     directory: &Path,
 ) -> Result<(), CheckpointError> {
     validate_directory(directory)?;
     validate_tensor_values("model.parameters", parameters)?;
-    let bytes = runtime::serialize(schema, parameters)?;
+    let bytes = runtime::serialize(layout_schema(side_networks)?, parameters, side_networks)?;
     replace_file(&directory.join(RUNTIME_TENSOR_FILE), &bytes)?;
     Ok(crate::durability::sync_directory(directory)?)
 }
 
-/// Strictly decoded runtime weights, for readers without a live model.
+fn read_runtime(directory: &Path) -> Result<Vec<u8>, CheckpointError> {
+    validate_directory(directory)?;
+    read_bounded(
+        &directory.join(RUNTIME_TENSOR_FILE),
+        MAX_RUNTIME_TENSOR_BYTES,
+    )
+}
+
+/// Strictly decoded runtime weights in the layout they record, for readers
+/// without a live model.
 fn decode_runtime_parameters(bytes: &[u8]) -> Result<Vec<f32>, CheckpointError> {
-    runtime::decode_strict(bytes, &current_parameter_schema()?)
+    let side_networks = runtime::stored_side_networks(bytes)?;
+    runtime::decode_strict(bytes, layout_schema(side_networks)?, side_networks)
 }
 
-fn current_parameter_schema() -> Result<Vec<(&'static str, Vec<usize>)>, CheckpointError> {
-    PolicyModel::fresh(0)
+/// The layout a parameter vector's length names.
+fn parameter_layout(parameters: &[f32]) -> Result<SideNetworks, CheckpointError> {
+    SideNetworks::from_parameter_count(parameters.len())
+        .ok_or(CheckpointError::TensorContract("element count"))
+}
+
+/// Stable parameter names and shapes in export order.
+type ParameterSchema = Vec<(&'static str, Vec<usize>)>;
+
+/// Names and shapes of one layout, built once per process.
+fn layout_schema(side_networks: SideNetworks) -> Result<&'static ParameterSchema, CheckpointError> {
+    static SCHEMAS: [std::sync::OnceLock<ParameterSchema>; 2] =
+        [std::sync::OnceLock::new(), std::sync::OnceLock::new()];
+    let cell = &SCHEMAS[usize::from(side_networks == SideNetworks::Separate)];
+    if let Some(schema) = cell.get() {
+        return Ok(schema);
+    }
+    let schema = PolicyModel::fresh_networks(0, side_networks, PolicyDevice::Cpu)
         .and_then(|model| model.parameter_schema())
-        .map_err(|error| CheckpointError::Model(error.to_string()))
+        .map_err(|error| CheckpointError::Model(error.to_string()))?;
+    Ok(cell.get_or_init(|| schema))
 }
 
-/// Runtime weights bytes of `parameters` in this build's layout.
+/// Runtime weights bytes of `parameters` in the layout their count names.
 fn serialize_runtime_tensor(parameters: &[f32]) -> Result<Vec<u8>, CheckpointError> {
-    runtime::serialize(&current_parameter_schema()?, parameters)
+    let side_networks = parameter_layout(parameters)?;
+    runtime::serialize(layout_schema(side_networks)?, parameters, side_networks)
 }
 
-fn parameter_schema(
-    model: &PolicyModel,
-) -> Result<Vec<(&'static str, Vec<usize>)>, CheckpointError> {
+fn parameter_schema(model: &PolicyModel) -> Result<ParameterSchema, CheckpointError> {
     model
         .parameter_schema()
         .map_err(|error| CheckpointError::Model(error.to_string()))
@@ -861,12 +919,13 @@ fn decode_training_tensors(bytes: &[u8]) -> Result<DecodedTensors, CheckpointErr
     {
         return Err(CheckpointError::TensorContract("collection state"));
     }
+    let count = layout_parameter_count(&tensors)?;
     Ok(DecodedTensors {
-        parameters: decode_tensor(&tensors, "model.parameters")?,
-        first_moment: decode_tensor(&tensors, "adam.first_moment")?,
-        second_moment: decode_tensor(&tensors, "adam.second_moment")?,
+        parameters: decode_tensor_count(&tensors, "model.parameters", count)?,
+        first_moment: decode_tensor_count(&tensors, "adam.first_moment", count)?,
+        second_moment: decode_tensor_count(&tensors, "adam.second_moment", count)?,
         collection: CollectionCheckpoint {
-            actor: decode_tensor(&tensors, "actor.parameters")?,
+            actor: decode_tensor_count(&tensors, "actor.parameters", count)?,
             state: state.data().to_vec(),
         },
     })
@@ -883,11 +942,17 @@ fn validate_names(tensors: &SafeTensors<'_>, expected: &[&str]) -> Result<(), Ch
     Ok(())
 }
 
-fn decode_tensor(
-    tensors: &SafeTensors<'_>,
-    name: &'static str,
-) -> Result<Vec<f32>, CheckpointError> {
-    decode_tensor_count(tensors, name, MODEL_PARAMETER_COUNT)
+/// The `model.parameters` element count, which must be one side-network layout's.
+fn layout_parameter_count(tensors: &SafeTensors<'_>) -> Result<usize, CheckpointError> {
+    let tensor = tensors
+        .tensor("model.parameters")
+        .map_err(|error| CheckpointError::Backend(error.to_string()))?;
+    match tensor.shape() {
+        [count] => SideNetworks::from_parameter_count(*count)
+            .map(SideNetworks::parameter_count)
+            .ok_or(CheckpointError::TensorContract("dtype or shape")),
+        _ => Err(CheckpointError::TensorContract("dtype or shape")),
+    }
 }
 
 fn decode_tensor_count(

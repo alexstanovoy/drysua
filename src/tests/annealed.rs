@@ -1,5 +1,6 @@
 //! Durable update, replay and rejection contracts; helper layouts are not contracts.
 
+use crate::PolicyModel;
 use crate::ppo::test_directory;
 use std::path::PathBuf;
 
@@ -153,6 +154,129 @@ fn initial_weights_then_resume_matches_uninterrupted_parameters_optimizer_and_rn
         exported.export_parameters().expect("exported parameters"),
         checkpoint.parameters
     );
+}
+
+/// Separate side networks warm-started from shared (M25) weights: both networks
+/// start from the shared tensors and each side's actor heads from its own; both
+/// networks train against self-play, their own league snapshots and frozen
+/// weights of either layout; a resume replays bit-exactly and refuses the shared
+/// layout; `play`, `eval` and frozen opponents load the export strictly.
+#[test]
+fn separate_side_networks_warm_start_train_both_and_resume_exactly() {
+    let weights = test_directory("separate-initial-weights");
+    let shared = PolicyModel::fresh(23_081).expect("shared model");
+    TrainingArtifact::save_runtime_weights(&shared, &weights).expect("shared weights");
+    let frozen = test_directory("separate-frozen-weights");
+    let separate = crate::SideNetworks::Separate;
+    let frozen_model =
+        PolicyModel::fresh_networks(23_082, separate, PolicyDevice::Cpu).expect("frozen model");
+    TrainingArtifact::save_runtime_weights(&frozen_model, &frozen).expect("frozen weights");
+    let mut config = settings(23_083, 4);
+    config.side_networks = separate;
+    config.league_size = 2;
+    config.league_every = 1;
+    config.opponents = vec![
+        (AnnealedOpponent::SelfPlay, one()),
+        (AnnealedOpponent::League, one()),
+        (AnnealedOpponent::Weights(frozen.to_path_buf()), one()),
+        (AnnealedOpponent::Weights(weights.to_path_buf()), one()),
+    ];
+    let start = |directory: &std::path::Path, stop_after| {
+        run_annealed_job_harnessed(
+            config.clone(),
+            AnnealedHarness {
+                stop_after,
+                ..harness()
+            },
+            PolicyDevice::Cpu,
+            directory,
+            false,
+            Some(&weights),
+            |_| {},
+        )
+        .expect("separate run from shared weights")
+    };
+    let initial = separate_from_shared(&shared);
+    let uninterrupted = test_directory("separate-uninterrupted");
+    let reference = start(&uninterrupted, None);
+    assert_eq!(
+        reference.starting_policy_fingerprint,
+        crate::model::parameter_fingerprint_of(&initial)
+    );
+    let resumed = test_directory("separate-resumed");
+    start(&resumed, Some(2));
+    let before = checkpoint_digests(&resumed);
+    let mut shared_layout = config.clone();
+    shared_layout.side_networks = crate::SideNetworks::Shared;
+    let error = run(shared_layout, &resumed, true).expect_err("shared resume");
+    assert!(
+        error
+            .to_string()
+            .contains("--side-networks: recorded separate"),
+        "{error}"
+    );
+    assert_eq!(checkpoint_digests(&resumed), before);
+    run(config, &resumed, true).expect("resume");
+    assert_trajectory_equal(&uninterrupted, &resumed);
+    assert_artifact_bits(&uninterrupted, &resumed, PolicyDevice::Cpu);
+    let artifact = TrainingArtifact::load(&resumed).expect("checkpoint");
+    assert_eq!(artifact.side_networks(), separate);
+    let (trained, _, _) = restored_state(&artifact, PolicyDevice::Cpu);
+    for name in ["trunk.0.weight", "value.1.weight", "kind.bias"] {
+        for network in ["", "dire."] {
+            let name = format!("{network}{name}");
+            assert_ne!(
+                tensor(&frozen_model, &initial, &name),
+                tensor(&frozen_model, &trained.parameters, &name),
+                "{name} trains"
+            );
+        }
+    }
+    let exported =
+        TrainingArtifact::load_runtime_model(&resumed, PolicyDevice::Cpu).expect("play loader");
+    assert_eq!(exported.side_networks(), separate);
+    assert_eq!(
+        exported.export_parameters().expect("exported"),
+        trained.parameters
+    );
+    assert_eq!(
+        TrainingArtifact::load_runtime_weights(&PolicyModel::fresh(0).expect("shared"), &resumed),
+        Err(crate::CheckpointError::SchemaMismatch),
+        "a shared model never loads separate weights"
+    );
+}
+
+/// The separate layout a shared model warm-starts: every tensor under its own
+/// name, a Dire network tensor the shared model lacks under its shared name.
+fn separate_from_shared(shared: &PolicyModel) -> Vec<f32> {
+    let parameters = shared.export_parameters().expect("shared parameters");
+    let schema = shared.parameter_schema().expect("shared schema");
+    let separate = PolicyModel::fresh_networks(0, crate::SideNetworks::Separate, PolicyDevice::Cpu)
+        .expect("separate layout");
+    let mut values = Vec::with_capacity(crate::SideNetworks::Separate.parameter_count());
+    for (name, _) in separate.parameter_schema().expect("separate schema") {
+        let source = if schema.iter().any(|(shared, _)| *shared == name) {
+            name
+        } else {
+            name.strip_prefix("dire.")
+                .expect("only dire tensors are new")
+        };
+        values.extend_from_slice(tensor(shared, &parameters, source));
+    }
+    values
+}
+
+/// One named tensor's values within `parameters` of `model`'s layout.
+fn tensor<'a>(model: &PolicyModel, parameters: &'a [f32], name: &str) -> &'a [f32] {
+    let mut offset = 0;
+    for (tensor, shape) in model.parameter_schema().expect("schema") {
+        let end = offset + shape.iter().product::<usize>();
+        if tensor == name {
+            return &parameters[offset..end];
+        }
+        offset = end;
+    }
+    panic!("no tensor {name}")
 }
 
 /// Logged decisions of the games in flight at the committed boundary.
@@ -383,6 +507,7 @@ fn settings(seed: u64, updates: u64) -> AnnealedJobConfig {
     AnnealedJobConfig {
         environment_schedule: crate::EnvironmentSchedule::Fixed,
         execution: crate::TrainingExecutionOptions::default(),
+        side_networks: crate::SideNetworks::Shared,
         updates,
         invocation_updates: None,
         history: None,
@@ -608,7 +733,8 @@ fn restored_state(
     artifact: &TrainingArtifact,
     device: PolicyDevice,
 ) -> (crate::model::ModelAdamSnapshot, (u64, u64), u64) {
-    let model = PolicyModel::fresh_on(9001, device).expect("restore device");
+    let model = PolicyModel::fresh_networks(9001, artifact.side_networks(), device)
+        .expect("restore device");
     let restored = artifact.restore(&model, artifact.run()).expect("restore");
     (
         restored

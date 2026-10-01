@@ -51,7 +51,7 @@ impl AnnealedSession {
         random_directory: &Path,
     ) -> Result<Self, PpoError> {
         let mut state = TrainingSession::initialize(
-            device,
+            (device, settings.side_networks),
             directory,
             resume,
             initial_weights_directory,
@@ -147,7 +147,12 @@ impl AnnealedSession {
                 lanes,
                 pools,
                 &schedule,
-                (self.state.completed_updates, settings.slots, settings.ppo),
+                (
+                    self.state.completed_updates,
+                    settings.slots,
+                    settings.ppo,
+                    settings.side_networks,
+                ),
             )?;
             let mut pipeline = Pipeline {
                 collector,

@@ -70,8 +70,13 @@ fn warm_start_reuses_named_tensors_reinitializes_the_rest_and_refuses_unrelated_
     let path = directory.join("drysua.weights.safetensors");
     fs::write(&path, older_critic_runtime(&parameters, &schema)).expect("fixture");
 
-    let model = TrainingArtifact::initialize_from_weights(&directory, 5, crate::PolicyDevice::Cpu)
-        .expect("warm start across schemas");
+    let model = TrainingArtifact::initialize_from_weights(
+        &directory,
+        5,
+        crate::SideNetworks::Shared,
+        crate::PolicyDevice::Cpu,
+    )
+    .expect("warm start across schemas");
 
     let fresh = PolicyModel::fresh(5)
         .expect("fresh")
@@ -100,7 +105,13 @@ fn warm_start_reuses_named_tensors_reinitializes_the_rest_and_refuses_unrelated_
     )
     .expect("flat fixture");
     assert_eq!(
-        TrainingArtifact::initialize_from_weights(&directory, 5, crate::PolicyDevice::Cpu).err(),
+        TrainingArtifact::initialize_from_weights(
+            &directory,
+            5,
+            crate::SideNetworks::Shared,
+            crate::PolicyDevice::Cpu,
+        )
+        .err(),
         Some(CheckpointError::TensorContract("names")),
         "a file sharing no tensor is no warm start"
     );
@@ -450,5 +461,10 @@ fn checkpoint_batch(
             .push(choice.finish(0, outcome).expect("transition"))
             .expect("push");
     }
-    (rollout.finish(checkpoint_config()).expect("batch"), actions)
+    (
+        rollout
+            .finish(checkpoint_config(), crate::SideNetworks::Shared)
+            .expect("batch"),
+        actions,
+    )
 }

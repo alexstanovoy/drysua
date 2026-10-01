@@ -160,6 +160,12 @@ enum KlGuardArg {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum SideNetworksArg {
+    Shared,
+    Separate,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum PotentialArg {
     Hand,
     Learned,
@@ -195,6 +201,12 @@ struct TrainAnnealedArgs {
     /// gradient pass's KL. Recorded in checkpoint scope.
     #[arg(long, value_enum, default_value_t = KlGuardArg::PostStep)]
     kl_guard: KlGuardArg,
+    /// shared: one network with per-side actor heads (M25); separate: one
+    /// complete network per side, each trained only on its side's samples.
+    /// Recorded in checkpoint scope; --initial-weights from a shared model
+    /// starts both networks from its shared tensors.
+    #[arg(long, value_enum, default_value_t = SideNetworksArg::Shared)]
+    side_networks: SideNetworksArg,
     /// Total PPO updates; each may perform multiple Adam minibatch steps.
     #[arg(long)]
     updates: u64,
@@ -533,7 +545,8 @@ fn reserve_vram_budget(
 ) -> std::io::Result<()> {
     #[cfg(all(feature = "cuda", any(target_os = "linux", target_os = "windows")))]
     if let crate::PolicyDevice::Cuda { ordinal } = device {
-        let estimate = crate::ppo_arena::vram_budget_estimate(settings);
+        let estimate =
+            crate::ppo_arena::vram_budget_estimate(settings).map_err(std::io::Error::other)?;
         let bytes = arguments.vram_budget_mib.map_or(estimate, |mib| mib << 20);
         let usage =
             crate::model::reserve_vram_budget(ordinal, bytes).map_err(std::io::Error::other)?;
@@ -692,6 +705,10 @@ impl TrainAnnealedArgs {
         Ok(crate::AnnealedJobConfig {
             environment_schedule,
             execution: self.execution_options(),
+            side_networks: match self.side_networks {
+                SideNetworksArg::Shared => crate::SideNetworks::Shared,
+                SideNetworksArg::Separate => crate::SideNetworks::Separate,
+            },
             updates: self.updates,
             invocation_updates: self.invocation_updates,
             history: self.checkpoint.history()?,

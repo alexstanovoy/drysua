@@ -46,7 +46,13 @@ fn full_rollout_retains_every_bounded_sample_and_rejects_the_next() {
         rollout.push(sample),
         Err(PpoError::RolloutFull { capacity })
     );
-    assert_eq!(rollout.finish(config).expect("full batch").len(), capacity);
+    assert_eq!(
+        rollout
+            .finish(config, crate::SideNetworks::Shared)
+            .expect("full batch")
+            .len(),
+        capacity
+    );
 }
 
 #[test]
@@ -56,7 +62,9 @@ fn behaviour_policy_from_the_future_is_rejected_without_mutating_trainer_state()
     sample.behaviour = 1;
     let mut rollout = PpoRollout::new(1).expect("rollout");
     rollout.push(sample).expect("push");
-    let batch = rollout.finish(annealed_config()).expect("batch");
+    let batch = rollout
+        .finish(annealed_config(), crate::SideNetworks::Shared)
+        .expect("batch");
     let mut trainer = PpoTrainer::new(&model, annealed_config(), 1).expect("trainer");
     let before = trainer.checkpoint_snapshot(&model).expect("before");
     let random = trainer.rng_checkpoint();

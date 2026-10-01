@@ -254,7 +254,11 @@ fn load_average(members: &[PathBuf], device: PolicyDevice) -> Result<Player, Ppo
         if sum.is_empty() {
             sum = vec![0.0; parameters.len()];
         }
-        assert_eq!(sum.len(), parameters.len());
+        if sum.len() != parameters.len() {
+            return Err(PpoError::InvalidConfig(
+                "averaged weights mix side-network layouts",
+            ));
+        }
         for (total, value) in sum.iter_mut().zip(parameters) {
             *total += f64::from(value);
         }
@@ -264,7 +268,9 @@ fn load_average(members: &[PathBuf], device: PolicyDevice) -> Result<Player, Ppo
         .into_iter()
         .map(|total| (total / count) as f32)
         .collect();
-    let model = PolicyModel::fresh_on(0, device).map_err(super::text_error)?;
+    let side_networks = crate::SideNetworks::from_parameter_count(mean.len())
+        .ok_or(PpoError::InvalidConfig("averaged parameter count"))?;
+    let model = PolicyModel::fresh_networks(0, side_networks, device).map_err(super::text_error)?;
     model.import_parameters(&mean).map_err(super::text_error)?;
     Ok(Player {
         key: format!("average:{}", hex(&Sha256::digest(hashes.join(",")))),
@@ -273,14 +279,12 @@ fn load_average(members: &[PathBuf], device: PolicyDevice) -> Result<Player, Ppo
 }
 
 fn load_model(directory: &Path, device: PolicyDevice) -> Result<PolicyModel, PpoError> {
-    let model = PolicyModel::fresh_on(0, device).map_err(super::text_error)?;
-    TrainingArtifact::load_runtime_weights(&model, directory).map_err(|error| {
+    TrainingArtifact::load_runtime_model(directory, device).map_err(|error| {
         PpoError::Model(format!(
             "{}: {error}",
             directory.join(RUNTIME_FILE).display()
         ))
-    })?;
-    Ok(model)
+    })
 }
 
 fn weights_sha256(directory: &Path) -> Result<String, PpoError> {

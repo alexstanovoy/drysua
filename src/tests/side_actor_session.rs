@@ -22,7 +22,7 @@ fn fresh_session_imports_only_initial_parameters_and_resets_all_training_state()
     .unwrap();
     let config = PpoConfig::default();
     let session = TrainingSession::initialize(
-        PolicyDevice::Cpu,
+        (PolicyDevice::Cpu, crate::SideNetworks::Shared),
         &target_directory,
         false,
         Some(&source_directory),
