@@ -12,7 +12,7 @@ use std::sync::Arc;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::{PolicyDevice, PolicyModel, PpoError, ScriptKind, TrainingArtifact};
+use crate::{PolicyDevice, PolicyModel, PpoError, ScriptKind, StyledScript, TrainingArtifact};
 
 const POOL_SCHEMA: &str = "drysua-eval-pool/v1";
 pub(crate) const MAX_POOL_ENTRIES: usize = 16;
@@ -27,7 +27,7 @@ const MAX_EXECUTABLE_BYTES: u64 = 1024 * 1024 * 1024;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum PlayerSpec {
     Script(ScriptKind),
-    Styled(ScriptKind),
+    Styled(StyledScript),
     Weights(PathBuf),
     Average(Vec<PathBuf>),
 }
@@ -40,11 +40,10 @@ impl PlayerSpec {
             )
         };
         match value.split_once(':') {
-            None => match ScriptKind::parse_label(value) {
-                Some((kind, false)) => Ok(Self::Script(kind)),
-                Some((kind, true)) => Ok(Self::Styled(kind)),
-                None => Err(invalid()),
-            },
+            None => ScriptKind::from_label(value)
+                .map(Self::Script)
+                .or_else(|| StyledScript::from_label(value).map(Self::Styled))
+                .ok_or_else(invalid),
             Some(("weights", directory)) if !directory.is_empty() => {
                 Ok(Self::Weights(directory.into()))
             }
@@ -85,7 +84,7 @@ impl PlayerSpec {
         };
         match self {
             Self::Script(kind) => kind.label().to_owned(),
-            Self::Styled(kind) => kind.styled_label().to_owned(),
+            Self::Styled(script) => script.label().to_owned(),
             Self::Weights(directory) => format!("weights:{}", directory.display()),
             Self::Average(members) => format!("average:{}", join(members)),
         }
@@ -201,7 +200,7 @@ fn parse_pool(value: &Value, base: &Path) -> Result<Vec<PoolEntry>, String> {
 /// How a loaded player acts.
 pub(crate) enum Policy {
     Script(ScriptKind),
-    Styled(ScriptKind),
+    Styled(StyledScript),
     Neural(Arc<PolicyModel>),
 }
 
@@ -225,9 +224,9 @@ pub(crate) fn load_player(spec: &PlayerSpec, device: PolicyDevice) -> Result<Pla
             key: format!("script:{}", kind.label()),
             policy: Policy::Script(*kind),
         }),
-        PlayerSpec::Styled(kind) => Ok(Player {
-            key: format!("script:{}", kind.styled_label()),
-            policy: Policy::Styled(*kind),
+        PlayerSpec::Styled(script) => Ok(Player {
+            key: format!("script:{}", script.label()),
+            policy: Policy::Styled(*script),
         }),
         PlayerSpec::Weights(directory) => Ok(Player {
             key: format!("weights:{}", weights_sha256(directory)?),

@@ -37,7 +37,8 @@ Both rule policies take style knobs (`retreat`, `hover`, `items`, `epsilon`, ...
 knob name lists them). `--policy-style` and `--opponent-style` fix a knob (`knob=value`) or
 draw it per game (`knob=low..high`); a leading `styled` draws every knob from its styled
 range. The canonical style is the default. Training draws the styled preset per game with
-`--opponent teacher-styled:<weight>` or `harass-push-styled:<weight>`:
+`--opponent teacher-styled:<weight>` or `harass-push-styled:<weight>`, and opponents
+that barely retreat with `teacher-fighter:<weight>` or `harass-push-fighter:<weight>`:
 
 ```sh
 cargo run --release --features builtin -- duel --policy harass-push --opponent teacher \

@@ -3675,9 +3675,9 @@ fn recent_possible_attack(
     })
 }
 
-fn own_asset_value(tracker: &StateTracker) -> i64 {
-    let mut total = 0i64;
-    for item in own_hero_items(tracker)
+/// Every item the seat owns: carried (or held by its dead hero), stashed, or on its courier.
+pub(crate) fn own_items(tracker: &StateTracker) -> impl Iterator<Item = &ItemView> {
+    own_hero_items(tracker)
         .into_iter()
         .flat_map(|(items, _)| items)
         .chain(
@@ -3689,7 +3689,12 @@ fn own_asset_value(tracker: &StateTracker) -> i64 {
         )
         .chain(own_courier_items(tracker).into_iter().flatten())
         .flatten()
-    {
+}
+
+/// Whole shop cost of every item the seat owns.
+pub(crate) fn own_asset_value(tracker: &StateTracker) -> i64 {
+    let mut total = 0i64;
+    for item in own_items(tracker) {
         if let Some(entry) = tracker.shop().iter().find(|entry| entry.id == item.id) {
             total = total.saturating_add(i64::from(entry.cost));
         }

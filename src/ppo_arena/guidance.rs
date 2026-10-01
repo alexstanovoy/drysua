@@ -22,6 +22,9 @@ pub struct ImitationSchedule {
     pub end: EnvironmentDecimal,
     /// Updates over which the coefficient moves linearly from `start` to `end`.
     pub updates: u64,
+    /// Power of the inverse imitation-class frequency each label is weighted by:
+    /// 0 weighs every label alike, 1 every present class equally.
+    pub balance: EnvironmentDecimal,
 }
 
 /// The aids of one run; the default trains plain PPO.
@@ -46,6 +49,9 @@ impl TrainingGuidance {
             {
                 return Err(PpoError::InvalidConfig("imitation coefficient above 10"));
             }
+            if schedule.balance.units() > EnvironmentDecimal::SCALE {
+                return Err(PpoError::InvalidConfig("imitation balance above 1"));
+            }
         }
         Ok(())
     }
@@ -56,6 +62,9 @@ impl TrainingGuidance {
             imitation: self
                 .imitation
                 .map_or(0.0, |schedule| coefficient(schedule, update)),
+            imitation_balance: self
+                .imitation
+                .map_or(0.0, |schedule| decimal(schedule.balance)),
             critic_only: update < self.critic_warmup_updates,
         }
     }
@@ -77,11 +86,12 @@ impl TrainingGuidance {
     pub(crate) fn append_scope(&self, command_line: &mut String) {
         if let Some(schedule) = self.imitation {
             command_line.push_str(&format!(
-                " --imitation-coefficient {}:{}:{} --imitation-shadow {}",
+                " --imitation-coefficient {}:{}:{} --imitation-shadow {} --imitation-balance {}",
                 schedule.start,
                 schedule.end,
                 schedule.updates,
-                schedule.shadow.label()
+                schedule.shadow.label(),
+                schedule.balance
             ));
         }
         if self.critic_warmup_updates > 0 {
@@ -107,4 +117,12 @@ fn coefficient(schedule: ImitationSchedule, update: u64) -> f32 {
     let units = start + (end - start) * done / i128::from(schedule.updates);
     assert!((0..=i128::from(MAX_IMITATION_UNITS)).contains(&units));
     (units as f64 / EnvironmentDecimal::SCALE as f64) as f32
+}
+
+#[allow(
+    clippy::float_arithmetic,
+    reason = "exact millionths become a loss setting once"
+)]
+fn decimal(value: EnvironmentDecimal) -> f32 {
+    (value.units() as f64 / EnvironmentDecimal::SCALE as f64) as f32
 }

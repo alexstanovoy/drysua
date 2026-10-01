@@ -131,11 +131,11 @@ impl StagedPpoBatch {
 
 impl PolicyModel {
     /// Empty staging for at most `capacity` rows, allocated on the learner device;
-    /// with `imitation` it also stages every row's shadow label.
+    /// with `imitation` (the class balance power) it also stages every row's shadow label.
     pub(crate) fn ppo_staging(
         &self,
         capacity: usize,
-        imitation: bool,
+        imitation: Option<f32>,
     ) -> Result<PpoStaging, ModelError> {
         if capacity == 0 || capacity > MODEL_MAX_STAGED_ROWS {
             return Err(ModelError::InvalidModelState("PPO staging capacity"));
@@ -153,7 +153,7 @@ impl PolicyModel {
             chunk_rows: 0,
             sides: Vec::with_capacity(capacity),
             prefixes: Vec::with_capacity(capacity),
-            shadow_prefixes: imitation.then(|| Vec::with_capacity(capacity)),
+            shadow_prefixes: imitation.map(|_| Vec::with_capacity(capacity)),
             targets: HostTargets::with_capacity(capacity, imitation),
             row: EncoderRow::new(),
             capacity,
@@ -195,7 +195,7 @@ impl PolicyModel {
         &self,
         examples: &[&PpoPreparedSample],
     ) -> Result<StagedPpoBatch, ModelError> {
-        let mut staging = self.ppo_staging(examples.len().max(1), false)?;
+        let mut staging = self.ppo_staging(examples.len().max(1), None)?;
         for sample in examples {
             staging.push(sample)?;
         }

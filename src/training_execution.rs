@@ -90,7 +90,7 @@ pub enum AnnealedOpponent {
     /// The HarassPush rule policy.
     HarassPush,
     /// A rule policy whose style is drawn from its styled preset per game.
-    Styled(crate::ScriptKind),
+    Styled(crate::StyledScript),
     /// A runtime weights directory, loaded once and never updated.
     Weights(std::path::PathBuf),
     /// The actor weights the learner's own seat samples from.

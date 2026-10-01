@@ -163,7 +163,7 @@ fn final_native_damage_is_rewarded_before_draw_finalization() {
     assert_eq!(completed.outcome, Some(PpoTerminalOutcome::Draw));
     assert!(stream.done());
     let reward = stream.map2_reward();
-    assert_eq!(reward.components[5], -0.5);
+    assert_eq!(reward.components[6], -0.5);
     assert!(reward.components[2] > 0.0);
     assert_eq!(reward.observations.hero_damage_dealt, 100);
     assert_eq!(
@@ -188,7 +188,7 @@ fn learner_deadline_zero_bootstraps_without_inventing_match_over() {
     assert!(transition.terminal);
     assert_eq!(transition.next_value, 0.0);
     assert_eq!(transition.ticks, 3);
-    assert_eq!(stream.map2_reward().components[5], -0.5);
+    assert_eq!(stream.map2_reward().components[6], -0.5);
     let summary = crate::ppo_arena::game_summary::GameSummary::capture(&environment, None, 4);
     let record = stream.record(
         0,

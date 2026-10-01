@@ -5,8 +5,9 @@
 
 use super::fixtures;
 use crate::{
-    MAP2_REWARD_DEATH_WEIGHT, MAP2_REWARD_HEALTH_WEIGHT, MAP2_REWARD_TOWER_WEIGHT, Map2Reward,
-    Map2RewardBreakdown, Map2RewardEnd,
+    MAP2_REWARD_DEATH_WEIGHT, MAP2_REWARD_FARM_SCALE, MAP2_REWARD_FARM_WEIGHT,
+    MAP2_REWARD_HEALTH_WEIGHT, MAP2_REWARD_TOWER_WEIGHT, Map2Reward, Map2RewardBreakdown,
+    Map2RewardEnd,
 };
 use bota_proto::{
     Attributes, DamageKind, EntityId, EventKind, HeroId, MapId, MatchInfo, PlayerView, SlotId,
@@ -57,6 +58,41 @@ fn weakest_tower_drives_potential_and_finish_returns_it() {
         finished.total,
         1.0 + finished.fast_win - MAP2_REWARD_TOWER_WEIGHT,
     );
+}
+
+/// Public last hits of both seats drive the farm lead (denies are only counted); it
+/// saturates at the scale, a falling count is rejected, and the closure returns the lead.
+#[test]
+fn farm_lead_counts_both_scoreboards_saturates_and_closes() {
+    let mut reward = initialized();
+    let scale = f64::from(MAP2_REWARD_FARM_SCALE);
+    let mut view = snapshot(2);
+    view.players[0].last_hits = 3;
+    view.players[0].denies = 1;
+    view.players[1].last_hits = 1;
+    let ahead = advance(&mut reward, &view, &[]);
+    assert_close(ahead.farm, MAP2_REWARD_FARM_WEIGHT * 2.0 / scale);
+    assert_eq!(
+        (
+            ahead.observations.own_last_hits,
+            ahead.observations.own_denies
+        ),
+        (3, 1)
+    );
+    let mut far = snapshot(3);
+    far.players[0].last_hits = 3 + 2 * MAP2_REWARD_FARM_SCALE as u16;
+    far.players[0].denies = 1;
+    far.players[1].last_hits = 1;
+    let saturated = advance(&mut reward, &far, &[]);
+    assert_close(
+        saturated.farm,
+        MAP2_REWARD_FARM_WEIGHT * (1.0 - 2.0 / scale),
+    );
+    let mut fallen = snapshot(4);
+    fallen.players[0].last_hits = 1;
+    reward.observe_snapshot(&fallen).unwrap_err();
+    let finished = reward.finish(Map2RewardEnd::Draw).unwrap();
+    assert_close(finished.closure, -MAP2_REWARD_FARM_WEIGHT);
 }
 
 fn assert_close(actual: f64, expected: f64) {

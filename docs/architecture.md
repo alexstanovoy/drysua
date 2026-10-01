@@ -61,7 +61,8 @@ These rules keep the policy from winning through simulator leaks rather than pla
 
 - `--slots` worlds (default 64) each always hold a live game against an opponent
   drawn per game from `--opponent` (`teacher`, `harass-push`, their styled variants
-  `teacher-styled` and `harass-push-styled` that draw a new style per game, `self`, frozen
+  `teacher-styled` and `harass-push-styled` that draw a new style per game, the
+  `teacher-fighter` and `harass-push-fighter` presets that barely retreat, `self`, frozen
   `weights:`, `league` snapshots of the learner), weighted by PFSP per update.
 - `--lanes` inference threads (default 2) batch their slots through a weight replica;
   a shared pool steps the simulations.

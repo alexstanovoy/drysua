@@ -9,6 +9,7 @@ use bota_proto::{AbilityId, DamageKind, EventKind, Order, Target, Team, UnitKind
 use serde_json::{Value, json};
 
 use super::TrainingEnvironment;
+use super::economy::{EconomyStanding, PLACE_LABELS, SeatEconomy};
 use crate::{IssuedOrder, PpoTerminalOutcome, StateTracker};
 
 /// Shadowraze near, medium, far, then Requiem of Souls.
@@ -20,7 +21,7 @@ const RAZE_COUNT: usize = 3;
 const RAZE_MODE_LABELS: [&str; 3] = ["none", "entity", "point"];
 /// Game-clock minutes (after the pregame) at which both seats record their standing;
 /// early leads decide most games.
-const MILESTONE_MINUTES: [u32; 3] = [2, 3, 5];
+const MILESTONE_MINUTES: [u32; 4] = [2, 3, 5, 10];
 
 const fn milestone_tick(minutes: u32) -> u32 {
     crate::MAP2_PREGAME_TICKS + minutes * 60 * crate::MAP2_TICK_RATE
@@ -37,6 +38,7 @@ pub(crate) struct Standing {
     tower_bp: u16,
     /// Own hero's HP in basis points; zero while dead.
     hp_bp: u16,
+    economy: EconomyStanding,
 }
 
 /// Own minus enemy standing at one milestone.
@@ -50,9 +52,12 @@ pub(crate) struct Lead {
     pub tower_bp: i32,
     /// Own minus enemy hero HP in basis points.
     pub hp_bp: i32,
+    pub last_hits: i32,
+    pub denies: i32,
+    pub net_worth: i32,
 }
 
-/// Casts and structure losses one seat observed over its whole game.
+/// Casts, structure losses and economy one seat observed over its whole game.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct SeatCombat {
     casts: [u32; TRACKED_ABILITIES.len()],
@@ -65,6 +70,7 @@ pub(crate) struct SeatCombat {
     tower_lost: bool,
     bounty: i32,
     standings: [Option<Standing>; MILESTONE_MINUTES.len()],
+    economy: SeatEconomy,
 }
 
 impl SeatCombat {
@@ -135,6 +141,7 @@ impl SeatCombat {
                 _ => {}
             }
         }
+        self.economy.observe(tracker, events);
         self.record_standings(tracker);
         // Razes land on their effect tick, so a same-tick magical hero hit belongs to them.
         if hero_hit {
@@ -169,6 +176,7 @@ impl SeatCombat {
                     deaths: player.map_or(0, |player| player.deaths),
                     tower_bp: basis_points(tower),
                     hp_bp: basis_points(hero_fraction(tracker)),
+                    economy: self.economy.standing(tracker),
                 });
             }
         }
@@ -204,6 +212,7 @@ pub(crate) struct HeroSummary {
     pub xp: i32,
     /// Weakest own tower's HP fraction to four decimals; the mid tier-one tower in the mid-only map.
     pub tower_hp: f64,
+    pub economy: EconomyStanding,
     pub combat: SeatCombat,
 }
 
@@ -270,6 +279,9 @@ impl GameSummary {
                 deaths: i32::from(enemy.deaths) - i32::from(own.deaths),
                 tower_bp: i32::from(own.tower_bp) - i32::from(enemy.tower_bp),
                 hp_bp: i32::from(own.hp_bp) - i32::from(enemy.hp_bp),
+                last_hits: i32::from(own.economy.last_hits) - i32::from(enemy.economy.last_hits),
+                denies: i32::from(own.economy.denies) - i32::from(enemy.economy.denies),
+                net_worth: own.economy.net_worth - enemy.economy.net_worth,
             })
         })
     }
@@ -289,7 +301,9 @@ impl GameSummary {
                 .map(|(minutes, lead)| {
                     let lead = lead.map(|lead| {
                         json!({"xp": lead.xp, "gold": lead.gold, "deaths": lead.deaths,
-                               "tower_bp": lead.tower_bp, "hp_bp": lead.hp_bp})
+                               "tower_bp": lead.tower_bp, "hp_bp": lead.hp_bp,
+                               "last_hits": lead.last_hits, "denies": lead.denies,
+                               "net_worth": lead.net_worth})
                     });
                     (format!("{minutes}m"), lead.unwrap_or(Value::Null))
                 })
@@ -335,18 +349,58 @@ impl fmt::Display for GameSummary {
             for (label, casts) in CAST_LABELS.iter().zip(hero.combat.casts) {
                 write!(formatter, " {prefix}_casts_{label}={casts}")?;
             }
+            write_economy(formatter, prefix, hero)?;
         }
         for (minutes, lead) in MILESTONE_MINUTES.iter().zip(self.leads()) {
             if let Some(lead) = lead {
                 write!(
                     formatter,
-                    " lead_{minutes}m_xp={} lead_{minutes}m_gold={} lead_{minutes}m_deaths={} lead_{minutes}m_tower_bp={} lead_{minutes}m_hp_bp={}",
-                    lead.xp, lead.gold, lead.deaths, lead.tower_bp, lead.hp_bp
+                    " lead_{minutes}m_xp={} lead_{minutes}m_gold={} lead_{minutes}m_deaths={} lead_{minutes}m_tower_bp={} lead_{minutes}m_hp_bp={} lead_{minutes}m_last_hits={} lead_{minutes}m_denies={} lead_{minutes}m_net_worth={}",
+                    lead.xp,
+                    lead.gold,
+                    lead.deaths,
+                    lead.tower_bp,
+                    lead.hp_bp,
+                    lead.last_hits,
+                    lead.denies,
+                    lead.net_worth
                 )?;
             }
         }
         Ok(())
     }
+}
+
+/// End economy, its totals and the places of one hero for the episode log line.
+fn write_economy(
+    formatter: &mut fmt::Formatter<'_>,
+    prefix: &str,
+    hero: &HeroSummary,
+) -> fmt::Result {
+    let (economy, combat) = (hero.economy, &hero.combat.economy);
+    write!(
+        formatter,
+        " {prefix}_last_hits={} {prefix}_denies={} {prefix}_gold_earned={} {prefix}_net_worth={} {prefix}_items_bought={} {prefix}_consumables_used={}",
+        economy.last_hits,
+        economy.denies,
+        economy.gold_earned,
+        economy.net_worth,
+        combat.items_bought(),
+        combat.consumables_used()
+    )?;
+    for (label, ticks) in PLACE_LABELS.iter().zip(combat.places()) {
+        write!(formatter, " {prefix}_ticks_{label}={ticks}")?;
+    }
+    for (minutes, standing) in MILESTONE_MINUTES.iter().zip(hero.combat.standings) {
+        if let Some(standing) = standing {
+            write!(
+                formatter,
+                " {prefix}_net_worth_{minutes}m={} {prefix}_last_hits_{minutes}m={}",
+                standing.economy.net_worth, standing.economy.last_hits
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn hero_summary(seat: &super::ArenaSeatPolicy) -> HeroSummary {
@@ -358,6 +412,7 @@ fn hero_summary(seat: &super::ArenaSeatPolicy) -> HeroSummary {
         level: player.map_or(0, |player| player.level),
         xp: player.map_or(0, |player| player.xp),
         tower_hp: own_tower_fraction(seat),
+        economy: seat.combat.economy.standing(tracker),
         combat: seat.combat,
     }
 }
@@ -430,6 +485,16 @@ fn hero_json(hero: &HeroSummary) -> Value {
             .iter()
             .zip(hero.combat.raze_modes)
             .map(|(label, count)| ((*label).to_owned(), json!(count)))
+            .collect::<serde_json::Map<String, Value>>(),
+        "economy": hero.economy.json(),
+        "spending": hero.combat.economy.json(),
+        "minutes": MILESTONE_MINUTES
+            .iter()
+            .zip(hero.combat.standings)
+            .map(|(minutes, standing)| {
+                let value = standing.map_or(Value::Null, |standing| standing.economy.json());
+                (format!("{minutes}m"), value)
+            })
             .collect::<serde_json::Map<String, Value>>(),
     })
 }

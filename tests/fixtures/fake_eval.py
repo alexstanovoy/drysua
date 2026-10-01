@@ -40,9 +40,14 @@ def game(candidate, opponent, seed, side):
     hero = {"kills": 1, "deaths": 0, "level": 6, "xp": 1000, "tower_hp": 0.5,
             "casts": {"raze_near": 2, "raze_mid": 1, "raze_far": 1, "requiem": 0},
             "raze_hero_hits": 1, "raze_hits": 2, "raze_modes": {"none": 4, "entity": 0, "point": 0}}
-    lead = {"xp": 50 if won else -50, "gold": 10, "deaths": 0, "tower_bp": 0, "hp_bp": 100}
+    economy = {"last_hits": 20 if won else 10, "denies": 2, "gold_earned": 1500, "net_worth": 2000}
+    hero = dict(hero, economy=economy, minutes={"2m": economy, "3m": economy, "5m": None, "10m": None},
+                spending={"items_bought": {"2": 4, "7": 1}, "consumables_used": {"2": 3},
+                          "places": {"dead": 0, "fountain": 100, "base": 900, "lane": 8000, "enemy_base": 0}})
+    lead = {"xp": 50 if won else -50, "gold": 10, "deaths": 0, "tower_bp": 0, "hp_bp": 100,
+            "last_hits": 5, "denies": 0, "net_worth": 100}
     return {"side": side, "outcome": "win" if won else "loss", "end_reason": "tower", "ticks": 9000,
-            "own": hero, "enemy": hero, "leads": {"2m": lead, "3m": lead, "5m": None}}
+            "own": hero, "enemy": hero, "leads": {"2m": lead, "3m": lead, "5m": None, "10m": None}}
 
 
 def main(arguments):

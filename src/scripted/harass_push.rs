@@ -115,6 +115,11 @@ pub(crate) const STYLE_KNOBS: [Knob; 9] = [
     Knob::new("razes_first", 1, (0, 1), (0, 1)),
 ];
 
+/// The fighter preset: walks home only near death, hovers inside raze reach and
+/// fights whenever its ready razes take the enemy to 60-100% health.
+pub(crate) const FIGHTER_STYLE: &str =
+    "styled,retreat=5..15,return=45..80,hover=600..1000,engage=60..100,razes_first=1";
+
 /// One game's HarassPush knobs, typed; see [`STYLE_KNOBS`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct HarassStyle {

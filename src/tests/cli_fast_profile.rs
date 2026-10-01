@@ -113,6 +113,8 @@ fn annealed_cli_parses_an_ordered_opponent_mixture_with_colon_paths() {
         "harass-push:0.25",
         "--opponent",
         "teacher-styled:0.5",
+        "--opponent",
+        "harass-push-fighter",
     ]);
     let decimal = crate::EnvironmentDecimal::from_units;
     assert_eq!(
@@ -126,8 +128,18 @@ fn annealed_cli_parses_an_ordered_opponent_mixture_with_colon_paths() {
             (crate::AnnealedOpponent::SelfPlay, decimal(1_000_000)),
             (crate::AnnealedOpponent::HarassPush, decimal(250_000)),
             (
-                crate::AnnealedOpponent::Styled(crate::ScriptKind::Teacher),
+                crate::AnnealedOpponent::Styled(crate::StyledScript::new(
+                    crate::ScriptKind::Teacher,
+                    crate::StylePreset::Styled
+                )),
                 decimal(500_000)
+            ),
+            (
+                crate::AnnealedOpponent::Styled(crate::StyledScript::new(
+                    crate::ScriptKind::HarassPush,
+                    crate::StylePreset::Fighter
+                )),
+                decimal(1_000_000)
             ),
         ]
     );

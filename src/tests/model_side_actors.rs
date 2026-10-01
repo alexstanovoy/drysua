@@ -892,7 +892,9 @@ fn vram_budget_constants_bound_measured_peaks() {
             })
             .collect();
         let (before, _) = current_pool_usage(0, true);
-        let mut staging = model.ppo_staging(rows, imitation).expect("staging");
+        let mut staging = model
+            .ppo_staging(rows, imitation.then_some(0.5))
+            .expect("staging");
         for sample in &samples {
             staging.push(sample).expect("push");
         }
@@ -910,6 +912,7 @@ fn vram_budget_constants_bound_measured_peaks() {
                     config,
                     crate::UpdateObjective {
                         imitation: if imitation { 1.0 } else { 0.0 },
+                        imitation_balance: 0.5,
                         critic_only: false,
                     },
                 ),

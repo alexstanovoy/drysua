@@ -569,7 +569,7 @@ fn load_opponents(settings: &AnnealedJobConfig) -> Result<OpponentPool, PpoError
         let kind = match opponent {
             AnnealedOpponent::Teacher => OpponentKind::Teacher,
             AnnealedOpponent::HarassPush => OpponentKind::HarassPush,
-            AnnealedOpponent::Styled(kind) => OpponentKind::Styled(*kind),
+            AnnealedOpponent::Styled(script) => OpponentKind::Styled(*script),
             AnnealedOpponent::SelfPlay => OpponentKind::SelfPlay,
             AnnealedOpponent::League => {
                 league = Some(League {
@@ -706,8 +706,8 @@ fn append_opponent_scope(
             AnnealedOpponent::HarassPush => {
                 command_line.push_str(&format!(" --opponent harass-push:{weight}"))
             }
-            AnnealedOpponent::Styled(kind) => {
-                command_line.push_str(&format!(" --opponent {}:{weight}", kind.styled_label()))
+            AnnealedOpponent::Styled(script) => {
+                command_line.push_str(&format!(" --opponent {}:{weight}", script.label()))
             }
             AnnealedOpponent::League => {
                 let league = pool
@@ -1083,8 +1083,9 @@ fn imitation_fields(report: &crate::PpoUpdateReport) -> String {
         return String::new();
     }
     let mut fields = format!(
-        " imitation_coefficient={} imitation_loss={:.6} imitation_labeled={} imitation_agree={:.6}",
+        " imitation_coefficient={} imitation_balance={} imitation_loss={:.6} imitation_labeled={} imitation_agree={:.6}",
         report.objective.imitation,
+        report.objective.imitation_balance,
         imitation.cross_entropy / imitation.labeled,
         imitation.labeled,
         imitation.action_agreements / imitation.labeled,
@@ -1094,6 +1095,16 @@ fn imitation_fields(report: &crate::PpoUpdateReport) -> String {
             fields.push_str(&format!(
                 " imitation_agree_{name}={:.6}",
                 imitation.head_agreements[head] / imitation.head_labels[head]
+            ));
+        }
+    }
+    for (class, name) in crate::IMITATION_CLASSES.iter().enumerate() {
+        let labels = imitation.class_labels[class];
+        if labels > 0.0 {
+            fields.push_str(&format!(
+                " imitation_class_agree_{name}={:.6} imitation_class_share_{name}={:.6}",
+                imitation.class_agreements[class] / labels,
+                labels / imitation.labeled
             ));
         }
     }

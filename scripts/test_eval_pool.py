@@ -107,6 +107,11 @@ class DriverTests(unittest.TestCase):
         self.assertEqual(candidate["all"]["games"], 8 * 2 * 2)
         self.assertEqual(candidate["leads"]["2m"]["games"], 32)
         self.assertNotIn("5m", candidate["leads"])
+        own = candidate["economy"]["own"]
+        self.assertEqual((own["games"], own["items_bought"]), (32, {"salve": 4, "tango": 1}))
+        self.assertAlmostEqual(own["places"]["lane"], 8000 / 9000)
+        self.assertIsNone(own["minutes"]["5m"]["net_worth"])
+        self.assertIn("bought/game salve 4.00", eval_pool.format_report(value))
         ratings = {value["names"][key]: rating for key, rating in value["ratings"].items()}
         self.assertTrue(ratings["teacher"]["anchor"])
         self.assertGreater(ratings["strong"]["elo"], ratings["harass"]["elo"])

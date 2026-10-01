@@ -12,6 +12,7 @@ use std::sync::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use candle_core::{DType, Device, Tensor, Var};
 
 mod device_learner;
+mod imitation_class;
 mod ppo_objective;
 mod rows;
 mod sampling;
@@ -24,6 +25,7 @@ mod side_actors;
 pub(crate) mod vram;
 pub use device_learner::MODEL_PPO_MAX_MICROBATCH;
 pub(crate) use device_learner::StagedPpoBatch;
+pub use imitation_class::IMITATION_CLASSES;
 pub use rows::EncoderRow;
 #[cfg(test)]
 pub(crate) use side_actors::take_encoder_forwards_for_test;

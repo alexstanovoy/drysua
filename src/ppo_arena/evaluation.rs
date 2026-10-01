@@ -298,7 +298,7 @@ const fn opponent_runtime(policy: &Policy) -> OpponentRuntime {
         Policy::Neural(_) => OpponentRuntime::Neural,
         Policy::Script(ScriptKind::Teacher) => OpponentRuntime::Teacher,
         Policy::Script(ScriptKind::HarassPush) => OpponentRuntime::HarassPush,
-        Policy::Styled(kind) => OpponentRuntime::Styled(*kind),
+        Policy::Styled(script) => OpponentRuntime::Styled(*script),
     }
 }
 
@@ -314,9 +314,9 @@ fn start_game(game: PlannedGame, models: &Models) -> Result<LiveWorld, PpoError>
     )?;
     match models.candidate.policy {
         Policy::Script(kind) => environment.seats[game.seat].script = ScriptedPolicy::new(kind),
-        Policy::Styled(kind) => {
+        Policy::Styled(script) => {
             environment.seats[game.seat].script =
-                ScriptedPolicy::styled_preset(kind, crate::seat_seed(arena_seed, game.seat));
+                ScriptedPolicy::styled_preset(script, crate::seat_seed(arena_seed, game.seat));
         }
         Policy::Neural(_) => {}
     }

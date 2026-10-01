@@ -1,4 +1,4 @@
-# Map2 reward (version 8)
+# Map2 reward (version 10)
 
 The objective is to win Map2, and to win early. Under Map2 rules a side loses when it
 loses any tower or when its hero dies for the second time. A game that reaches the
@@ -20,6 +20,7 @@ R(Draw) = R(TimeCap) = −0.5   (loss-ish: a stalemate must not be safe)
   + 0.40 · (enemy hero deaths − own hero deaths)          deaths capped at 2
   + 0.20 · (own hero HP fraction − enemy hero HP fraction)
   + 0.20 · clamp((own XP − enemy XP) / 1000, −1, 1)
+  + 0.25 · clamp((own last hits − enemy last hits) / 20, −1, 1)
 ```
 
 - **Towers.** Buildings are always visible to both sides, so every tower is observed.
@@ -29,6 +30,10 @@ R(Draw) = R(TimeCap) = −0.5   (loss-ish: a stalemate must not be safe)
   its full next life. A kill therefore turns the HP lead built by harassing into a
   death lead.
 - **XP.** This is public cumulative scoreboard XP.
+- **Farm.** Public scoreboard last hits. A deny is not counted itself: it takes a
+  last hit from the enemy and halves its experience, which the farm and XP leads
+  already see. Gold is private and net worth needs the enemy's items, so the
+  public last-hit count is the seat-visible economy.
 
 Constants are `MAP2_REWARD_*` in `src/map2_reward.rs`. `MAP2_REWARD_VERSION` is
 recorded in checkpoints, runtime weights and reward reports.
@@ -45,11 +50,24 @@ recorded in checkpoints, runtime weights and reward reports.
    (240 U200v2-vs-Teacher and 400 Teacher-mirror games), set conservatively: the
    weakest-tower lead predicts best (0.8–1.0), XP predicts in the Teacher matchup,
    deaths and HP in the mirror. By the rules one death is half a loss. Assertions
-   keep `health < deaths`, `xp < deaths` and `|Φ| < 2`, so shaping never outweighs
-   the gap between a win and a loss.
-3. **Win fast.** The bonus falls linearly from +0.5 after pregame to 0 at the cap;
+   keep `health`, `xp` and `farm` below `deaths`, and `|Φ| < 2` in every running
+   game (its death lead is at most one, as the second death ends it), so shaping
+   never outweighs the gap between a win and a loss.
+3. **Farm wins games.** Reward 9 paid farming, denying and buying only through
+   the distant outcome; the policy stopped last-hitting (u297: 0 denies, 1.3 last
+   hits at 2 minutes to its rule opponents' 2.5, one boots bought in 128 games) and lost
+   to a human who out-farmed it 29 to 6. Refit on 4,096 styled and fighter
+   rule-policy games (seeds 4000000:128, every preset pair), the last-hit lead per
+   20 last hits gets +0.78 at 3 minutes and +0.56 at 5 next to tower 0.75, deaths
+   0.15–0.37, HP 0.12–0.15 and XP 0.25–0.33; on 128 u297 games against Teacher and
+   HarassPush +0.42 and +0.30. Denies fit with inconsistent signs (confounded by
+   who denies: Teacher denies and loses to HarassPush), so they stay out. The weight
+   is set conservatively at about half the fit. Adding the term raises the AUC of Φ
+   for the outcome from 0.778/0.807 to 0.788/0.822 at 3/5 minutes on the rule
+   games and from 0.600/0.638 to 0.637/0.688 on the u297 games.
+4. **Win fast.** The bonus falls linearly from +0.5 after pregame to 0 at the cap;
    winning five minutes earlier is worth about +0.17.
-4. **Reward 7 was removed.** Its ten diminishing channels (gold, XP, damage, creeps,
+5. **Reward 7 was removed.** Its ten diminishing channels (gold, XP, damage, creeps,
    towers, mana) and its lane, pregame, position and stagnation terms were not
    potential-based, were net-negative in wins and losses, and charged for harassing
    and pushing. Its tower term averaged 11 towers, so the deciding tower paid
@@ -59,12 +77,13 @@ recorded in checkpoints, runtime weights and reward reports.
 
 - Per episode, `level=INFO event=map2_episode_reward` carries:
   - `reward_version`, `reward_ticks` and `reward_total`;
-  - `reward_<component>` for `towers`, `deaths`, `health`, `xp`, `closure`,
+  - `reward_<component>` for `towers`, `deaths`, `health`, `xp`, `farm`, `closure`,
     `terminal` and `fast_win`;
   - the counters `own_deaths`, `enemy_deaths`, `own_xp_gained`, `enemy_xp_gained`,
+    `own_last_hits`, `enemy_last_hits`, `own_denies`, `enemy_denies`,
     `hero_damage_dealt`, `hero_damage_taken`, `tower_damage_taken`,
     `other_damage_taken` and `structure_damage_dealt`.
-- `reward_towers + reward_deaths + reward_health + reward_xp` is the potential
+- `reward_towers + reward_deaths + reward_health + reward_xp + reward_farm` is the potential
   progress made before the end. It is positive when the seat was ahead.
   `reward_closure` returns it.
 - `event=map2_training_reward` carries the same fields summed per checkpoint or
@@ -72,9 +91,9 @@ recorded in checkpoints, runtime weights and reward reports.
 - `drysua reward-observer` (`play.sh --reward-report`) writes the same components and
   counters for each seat of a human game ([human reward play](human-reward-play.md)).
 
-## Reward 9: learned potential (`--potential learned`)
+## Learned potential (`--potential learned`)
 
-Reward 9 keeps the terminal ±1 and the fast-win bonus and replaces the hand
+The learned potential keeps the terminal reward and the fast-win bonus and replaces the hand
 potential with `Φ9(s) = P(win | s) − ½` (`src/ppo_arena/win_model.rs`). P is a
 logistic model over 17 features of both seats — the clock; the XP, level, last-hit,
 deny, bounty-gold and hand-potential leads; own and enemy deaths, weakest-tower HP,
@@ -102,7 +121,9 @@ policy's input, the runtime weights, `play` or evaluation.
 
 The global `MAP2_*` features carry the potential's inputs (own and enemy
 weakest-tower HP, deaths over 2, last-seen hero HP, the clamped XP lead) and Φ
-itself, so a linear critic can subtract the shaping.
+itself, so a linear critic can subtract the shaping. The farm term has no slot of
+its own (own last hits are a global feature; the enemy's enter through Φ), which
+keeps the input layout of reward-9 weights.
 
 ## Offline check
 
