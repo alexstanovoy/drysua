@@ -4,7 +4,7 @@
 //! Every published update gets its own per-game mixture. Its entries are the
 //! configured opponents plus, with a league, the `size` latest league snapshots
 //! of this run. Under PFSP each entry's configured weight is scaled
-//! by `(1 - p)^2`, at least 1/10, where `p` is the Laplace-smoothed score (win 1, draw 1/2)
+//! by `(1 - p)^2`, at least 1/10, where `p` is the Laplace-smoothed score (win 1, draw or loss 0)
 //! of the learner's last [`PFSP_WINDOW`] games against it. Weights are exact
 //! integers computed from logged outcomes of updates every lane has finished,
 //! so the schedule is a pure function of the run and resumes identically.
@@ -78,7 +78,7 @@ impl League {
 /// The learner's recent results against each opponent, oldest first.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct OutcomeWindow {
-    /// Scores in half points: win 2, draw 1, loss or time cap 0.
+    /// Scores: win 1, draw, time cap or loss 0.
     pub(crate) entries: Vec<(OpponentKind, VecDeque<u8>)>,
 }
 
@@ -90,9 +90,8 @@ impl OutcomeWindow {
         outcome: Option<PpoTerminalOutcome>,
     ) -> Result<(), PpoError> {
         let score = match outcome {
-            Some(PpoTerminalOutcome::Win) => 2,
-            Some(PpoTerminalOutcome::Draw) => 1,
-            Some(PpoTerminalOutcome::Loss) | None => 0,
+            Some(PpoTerminalOutcome::Win) => 1,
+            Some(PpoTerminalOutcome::Draw | PpoTerminalOutcome::Loss) | None => 0,
         };
         let index = match self.entries.iter().position(|(kind, _)| *kind == opponent) {
             Some(index) => index,
@@ -113,7 +112,7 @@ impl OutcomeWindow {
         Ok(())
     }
 
-    /// Games and half-point score against `opponent`.
+    /// Games and wins against `opponent`.
     pub(crate) fn tally(&self, opponent: OpponentKind) -> (u64, u64) {
         self.entries
             .iter()
@@ -151,11 +150,11 @@ pub(crate) fn schedule_mixture(
     OpponentMixture::new(weighted)
 }
 
-/// `weight * max((1 - p)^2, 1/10)` with `p = (score / 2 + 1) / (games + 2)`, at least one unit.
-fn pfsp_weight(weight: u64, (games, score): (u64, u64)) -> u64 {
-    assert!(score <= 2 * games);
-    let numerator = u128::from(2 * games + 2 - score);
-    let denominator = u128::from(2 * games + 4);
+/// `weight * max((1 - p)^2, 1/10)` with `p = (wins + 1) / (games + 2)`, at least one unit.
+fn pfsp_weight(weight: u64, (games, wins): (u64, u64)) -> u64 {
+    assert!(wins <= games);
+    let numerator = u128::from(games + 1 - wins);
+    let denominator = u128::from(games + 2);
     let scaled = u128::from(weight) * numerator * numerator / (denominator * denominator);
     u64::try_from(scaled)
         .expect("never above the configured weight")
@@ -166,16 +165,15 @@ fn pfsp_weight(weight: u64, (games, score): (u64, u64)) -> u64 {
 /// Logs each entry's recent record and its share of the next mixture.
 pub(crate) fn log_pool(update: u64, mixture: &OpponentMixture, window: &OutcomeWindow) {
     for &(kind, weight) in mixture.entries() {
-        let (games, score) = window.tally(kind);
+        let (games, wins) = window.tally(kind);
         let win_rate = if games == 0 {
             "nan".to_owned()
         } else {
-            format!("{:.4}", score as f64 / (2 * games) as f64)
+            format!("{:.4}", wins as f64 / games as f64)
         };
         eprintln!(
-            "level=INFO event=opponent_pool update={update} scope={} games={games} score={:.1} win_rate={win_rate} probability={:.4}",
+            "level=INFO event=opponent_pool update={update} scope={} games={games} wins={wins} win_rate={win_rate} probability={:.4}",
             kind.label(),
-            score as f64 / 2.0,
             weight as f64 / mixture.total() as f64,
         );
     }

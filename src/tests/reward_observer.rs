@@ -18,7 +18,7 @@ fn native_arena_frames_close_observers_with_seat_relative_wins_losses_and_draws(
             let mut observer = Observer::new();
             consume(&mut Fragmented(&wire), &mut observer, 30, &mut Vec::new()).unwrap();
             let (end, terminal) = match loser {
-                None => (Map2RewardEnd::Draw, 0.0),
+                None => (Map2RewardEnd::Draw, -0.5),
                 Some(loser) if loser == team => (Map2RewardEnd::Loss, -1.0),
                 _ => (Map2RewardEnd::Win, 1.0),
             };

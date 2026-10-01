@@ -205,17 +205,17 @@ def opponent_group(label):
 
 def pool_metrics(lines):
     """Per-opponent PFSP window win rate and sampling probability of the last published mixture."""
-    games, score, probability = defaultdict(float), defaultdict(float), defaultdict(float)
+    games, wins, probability = defaultdict(float), defaultdict(float), defaultdict(float)
     last = max((fields.get("update", 0.0) for fields in lines), default=0.0)
     for fields in lines:
         if fields.get("update", 0.0) != last or not isinstance(fields.get("scope"), str):
             continue
         group = opponent_group(fields["scope"])
         games[group] += fields.get("games", 0.0)
-        score[group] += fields.get("score", 0.0)
+        wins[group] += fields.get("wins", 0.0)
         probability[group] += fields.get("probability", 0.0)
     metrics = {f"opponent_pool.{group}.probability": value for group, value in probability.items()}
-    metrics.update({f"opponent_pool.{group}.win_rate": score[group] / count
+    metrics.update({f"opponent_pool.{group}.win_rate": wins[group] / count
                     for group, count in games.items() if count})
     return metrics
 

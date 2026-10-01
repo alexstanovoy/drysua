@@ -104,8 +104,8 @@ fn reward_drain_preserves_frames_but_each_terminal_invalidates_pairings_exactly_
     for (end, terminal) in [
         (Map2RewardEnd::Win, 1.0),
         (Map2RewardEnd::Loss, -1.0),
-        (Map2RewardEnd::Draw, 0.0),
-        (Map2RewardEnd::TimeCap, 0.0),
+        (Map2RewardEnd::Draw, -0.5),
+        (Map2RewardEnd::TimeCap, -0.5),
     ] {
         let (mut view, mut tracker) = initial(Team::Radiant);
         let visible = frame(&tracker);

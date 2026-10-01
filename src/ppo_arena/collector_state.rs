@@ -345,7 +345,7 @@ impl Reader<'_> {
             let scores = (0..length)
                 .map(|_| {
                     let [score] = self.take::<1>()?;
-                    if score > 2 { Err(invalid()) } else { Ok(score) }
+                    if score > 1 { Err(invalid()) } else { Ok(score) }
                 })
                 .collect::<Result<VecDeque<_>, PpoError>>()?;
             window.entries.push((kind, scores));

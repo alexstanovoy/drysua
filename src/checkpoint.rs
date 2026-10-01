@@ -35,7 +35,7 @@ pub use adaptive::AdaptiveEnvironmentCheckpoint;
 
 const CHECKPOINT_MAGIC: &[u8; 8] = b"DRYCKP22";
 /// Version of the strict on-disk tensor and manifest contract.
-pub const CHECKPOINT_SCHEMA_VERSION: u32 = 22;
+pub const CHECKPOINT_SCHEMA_VERSION: u32 = 23;
 /// Canonical strict checkpoint contract descriptor.
 pub const CHECKPOINT_SCHEMA_DESCRIPTOR: &str = concat!(
     "bota-drysua-checkpoint/v22;linked_schemas=action,feature,model,ppo;linked_hash=fnv1a_descriptor_then_ordered_version_le32_hash_le64_then_map2_reward_version_le32;files=checkpoint.meta,drysua.weights.safetensors,immutable_sha256_tensor_generation;",
