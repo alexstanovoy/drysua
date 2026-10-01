@@ -960,7 +960,7 @@ fn log_ppo_update(
     reason = "per-row means of summed statistics"
 )]
 fn side_fields(report: &crate::PpoUpdateReport, sides: [crate::BatchSideStatistics; 2]) -> String {
-    const HEADS: [&str; crate::MODEL_BEHAVIORAL_HEADS] = [
+    const HEADS: [&str; crate::MODEL_ACTION_HEADS] = [
         "kind",
         "unit",
         "ability",

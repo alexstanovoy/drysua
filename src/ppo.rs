@@ -626,7 +626,7 @@ impl ImitationReport {
 pub const SIDE_QUANTITIES: usize = 8;
 
 /// Columns of one [`SideReport`] row: the side quantities, then every head's entropy.
-const SIDE_COLUMNS: usize = SIDE_QUANTITIES + crate::MODEL_BEHAVIORAL_HEADS;
+const SIDE_COLUMNS: usize = SIDE_QUANTITIES + crate::MODEL_ACTION_HEADS;
 
 /// Sums over optimized rows of every row and of the dire rows alone; a radiant
 /// sum is the difference. The KL is the gradient forward's, before the step.
